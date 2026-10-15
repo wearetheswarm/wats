@@ -88,6 +88,11 @@ pub struct NodeConfig {
     /// bytes. A crude stand-in for the Phase 2 "give" quota: when the blob
     /// store is over it, the node refuses to fetch more. Unlimited if unset.
     pub blob_quota: Option<u64>,
+    /// Disk budget for the whole data directory (events, index, blobs), in
+    /// bytes. At it, the node stops fetching blobs and replicas; above
+    /// [`HARD_CEILING_PERCENT`] of it, it also refuses events from others.
+    /// Unlimited if unset. Eviction comes in Phase 2.
+    pub storage_max: Option<u64>,
     /// Replication factor k for blobs: how many peers are asked to hold a
     /// blob at publish time (SPEC §2.5, §7).
     pub replication: usize,
@@ -106,6 +111,7 @@ impl NodeConfig {
             min_pow_bits: 12,
             max_blob_bytes: 256 * 1024 * 1024,
             blob_quota: None,
+            storage_max: None,
             replication: 3,
             bootstrap: Vec::new(),
             port: None,
@@ -162,8 +168,51 @@ pub fn is_valid_profile(name: &str) -> bool {
             .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_' || b == b'-')
 }
 
-/// Total size of the regular files under `dir`.
-fn dir_size(dir: &Path) -> u64 {
+/// Events from others are refused above this share of `storage_max`.
+pub const HARD_CEILING_PERCENT: u64 = 110;
+
+/// How often the data directory is measured.
+const STORAGE_MEASURE_SECS: u64 = 30;
+
+/// Where the data directory stands against `storage_max`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StorageState {
+    Ok,
+    /// At `storage_max`: no more blob fetches or replicas.
+    Full,
+    /// Above the hard ceiling: no more events from others either.
+    OverCeiling,
+}
+
+pub fn storage_state(used: u64, max: Option<u64>) -> StorageState {
+    match max {
+        Some(max) if used.saturating_mul(100) >= max.saturating_mul(HARD_CEILING_PERCENT) => {
+            StorageState::OverCeiling
+        }
+        Some(max) if used >= max => StorageState::Full,
+        _ => StorageState::Ok,
+    }
+}
+
+/// `1.2 GiB`.
+pub fn format_bytes(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
+    let mut value = bytes as f64;
+    let mut unit = 0;
+    while value >= 1024.0 && unit < UNITS.len() - 1 {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{bytes} B")
+    } else {
+        format!("{value:.1} {}", UNITS[unit])
+    }
+}
+
+/// Total size of the regular files under `dir`: the data directory's disk
+/// usage when given the data directory.
+pub fn dir_size(dir: &Path) -> u64 {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return 0;
     };
@@ -209,6 +258,10 @@ pub struct Node {
     peer_info: std::sync::Mutex<HashMap<EndpointId, NodeInfo>>,
     /// Cached blob store size: (when measured, bytes).
     usage: std::sync::Mutex<Option<(std::time::Instant, u64)>>,
+    /// Size of the whole data directory, measured every 30 s.
+    storage_bytes: std::sync::atomic::AtomicU64,
+    /// When we last logged that storage is full (rate limit).
+    storage_logged: std::sync::Mutex<Option<std::time::Instant>>,
     /// Exclusive lock on the data directory, released by `shutdown`.
     lock: std::sync::Mutex<Option<std::fs::File>>,
 }
@@ -345,8 +398,21 @@ impl Node {
             hints: Default::default(),
             peer_info: Default::default(),
             usage: Default::default(),
+            storage_bytes: Default::default(),
+            storage_logged: Default::default(),
             lock: std::sync::Mutex::new(Some(lock)),
         });
+        node.measure_storage().await;
+        if node.config.storage_max.is_some() {
+            let weak = Arc::downgrade(&node);
+            tokio::spawn(async move {
+                loop {
+                    tokio::time::sleep(Duration::from_secs(STORAGE_MEASURE_SECS)).await;
+                    let Some(node) = weak.upgrade() else { break };
+                    node.measure_storage().await;
+                }
+            });
+        }
         protocol.set_node(&node);
         for (net, receiver) in receivers {
             tokio::spawn(Arc::clone(&node).receive_loop(net, receiver));
@@ -576,6 +642,42 @@ impl Node {
             }
         }
         confirmed
+    }
+
+    async fn measure_storage(&self) {
+        let dir = self.config.data_dir.clone();
+        let bytes = tokio::task::spawn_blocking(move || dir_size(&dir))
+            .await
+            .unwrap_or(0);
+        self.storage_bytes
+            .store(bytes, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Bytes used by the data directory (events, index, blobs), as last
+    /// measured.
+    pub fn storage_usage(&self) -> u64 {
+        self.storage_bytes
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub fn storage_state(&self) -> StorageState {
+        storage_state(self.storage_usage(), self.config.storage_max)
+    }
+
+    /// Log, at most every 5 minutes, that storage is full.
+    fn log_storage(&self, what: &str) {
+        let Ok(mut last) = self.storage_logged.lock() else {
+            return;
+        };
+        if last.is_some_and(|t| t.elapsed() < Duration::from_secs(300)) {
+            return;
+        }
+        *last = Some(std::time::Instant::now());
+        warn!(
+            used = %format_bytes(self.storage_usage()),
+            max = %format_bytes(self.config.storage_max.unwrap_or(0)),
+            "storage.max reached: {what} (raise storage.max or free space)"
+        );
     }
 
     /// Bytes used by the blob store on disk, recomputed at most every 30 s.
@@ -832,6 +934,10 @@ impl Node {
         if event.ts() > now_secs() + MAX_CLOCK_SKEW_SECS {
             bail!("event timestamp is in the future");
         }
+        if self.storage_state() == StorageState::OverCeiling {
+            self.log_storage("refusing events from others too");
+            bail!("storage full");
+        }
         let inserted = match &event {
             AnyEvent::Known(e) => self.store.insert(e, now_secs())?,
             AnyEvent::Opaque(r) => {
@@ -1032,6 +1138,10 @@ impl Node {
         let Ok(hash) = blob.hash.parse::<Hash>() else {
             return false;
         };
+        if self.storage_state() != StorageState::Ok {
+            self.log_storage("not fetching blobs or replicas");
+            return false;
+        }
         if let Some(quota) = self.config.blob_quota {
             let used = self.blob_usage().await;
             if used.saturating_add(blob.size) > quota {
@@ -1075,6 +1185,23 @@ impl Node {
             lock.unlock().ok();
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod storage_tests {
+    use super::*;
+
+    #[test]
+    fn states_and_formats() {
+        assert_eq!(storage_state(5, None), StorageState::Ok);
+        assert_eq!(storage_state(99, Some(100)), StorageState::Ok);
+        assert_eq!(storage_state(100, Some(100)), StorageState::Full);
+        assert_eq!(storage_state(109, Some(100)), StorageState::Full);
+        assert_eq!(storage_state(110, Some(100)), StorageState::OverCeiling);
+        assert_eq!(format_bytes(512), "512 B");
+        assert_eq!(format_bytes(10 << 30), "10.0 GiB");
+        assert_eq!(format_bytes(1536 << 20), "1.5 GiB");
     }
 }
 

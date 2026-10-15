@@ -25,3 +25,4 @@ wrong, the ADR says so and the question goes back to the spec owners.
 | [0009](0009-relay-and-dns-infrastructure.md) | Relay and address-lookup infrastructure | Provisional |
 | [0010](0010-hardening-the-core-before-the-freeze.md) | Hardening the invariant core before the freeze | Provisional |
 | [0011](0011-heartbeat-agent-runner.md) | A minimal heartbeat agent runner | Provisional |
+| [0012](0012-storage-budget.md) | A disk budget for the data directory | Provisional |

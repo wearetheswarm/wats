@@ -165,3 +165,62 @@ async fn blob_quota_refuses_replicas() -> anyhow::Result<()> {
     publisher.shutdown().await?;
     Ok(())
 }
+
+/// storage.max: at the limit, a node still takes events but no blobs or
+/// replicas; above the hard ceiling (110 %), it refuses events from others
+/// too. Its own posts are never refused.
+#[tokio::test(flavor = "multi_thread")]
+async fn storage_max_refuses_blobs_then_events() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let start = |name: &str, max: Option<u64>| {
+        let mut config = NodeConfig::new(dir.path().join(name));
+        config.mode = NetworkMode::Loopback;
+        config.pow_bits = 0;
+        config.min_pow_bits = 0;
+        config.storage_max = max;
+        Node::start(config)
+    };
+    // Measure what an empty node uses, then cap it exactly there: full,
+    // but under the hard ceiling.
+    let probe = start("full", None).await?;
+    probe.shutdown().await?;
+    let used = wats::node::dir_size(&dir.path().join("full"));
+    let full = start("full", Some(used)).await?;
+    assert_eq!(full.storage_state(), wats::node::StorageState::Full);
+    let over = start("over", Some(1)).await?;
+    assert_eq!(over.storage_state(), wats::node::StorageState::OverCeiling);
+
+    let publisher = node(&dir.path().join("publisher"), &[&full, &over], 3).await?;
+    publisher
+        .wait_for_neighbor(PUBLIC_NET, Duration::from_secs(10))
+        .await?;
+    let file = dir.path().join("big.bin");
+    std::fs::write(&file, vec![1u8; 4096])?;
+    let event = publisher
+        .publish(
+            note("Storage limits."),
+            &[Attachment {
+                path: file,
+                name: None,
+            }],
+        )
+        .await?;
+    eventually("the full node takes the event", async || {
+        full.store().get(&event.id).unwrap().is_some()
+    })
+    .await;
+    let report = publisher.replicate(&event).await;
+    assert!(report.is_empty(), "no replica anywhere: {report:?}");
+    assert!(full.blob_bytes(&event.blobs[0].hash).await?.is_none());
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(
+        over.store().get(&event.id)?.is_none(),
+        "over the hard ceiling, events from others are refused"
+    );
+    // Its own posts still go through.
+    over.publish(note("mine"), &[]).await?;
+    for n in [full, over, publisher] {
+        n.shutdown().await?;
+    }
+    Ok(())
+}
