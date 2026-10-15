@@ -119,8 +119,26 @@ https://download.docker.com/linux/debian $(. /etc/os-release && echo "$VERSION_C
   | sudo tee /etc/apt/sources.list.d/docker.list >/dev/null
 sudo apt-get update
 sudo apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
-sudo docker run --rm hello-world
+sudo usermod -aG docker "$USER"     # then log out and back in
+docker run --rm hello-world
 ```
+
+The rest of this runbook runs `docker` as that user, without sudo, so that
+the GHCR login (step 5) and `docker compose` use the same credentials.
+
+### Kernel and clock
+
+QUIC benefits from larger UDP buffers than Debian's defaults. With host
+networking the router uses the host's settings:
+
+```sh
+printf 'net.core.rmem_max = 7500000\nnet.core.wmem_max = 7500000\n' \
+  | sudo tee /etc/sysctl.d/90-quic.conf >/dev/null
+sudo sysctl --system
+```
+
+Keep NTP on (`systemd-timesyncd`, the Debian default, is enough). Nodes
+reject events dated more than 10 minutes in the future.
 
 ### Firewall
 
@@ -146,15 +164,22 @@ open.
 
 ### The compose files
 
+The compose project lives in `/opt/wearetheswarm`, owned by `root:docker`
+with mode `2775`, so members of the `docker` group can manage it. The
+provisioning creates it; otherwise:
+
+```sh
+sudo install -d -o root -g docker -m 2775 /opt/wearetheswarm
+```
+
 The repository is private, so copy the two files from your Mac:
 
 ```sh
-ssh vps 'mkdir -p ~/wats'
-scp deploy/compose/compose.router.yaml deploy/compose/router.env.example vps:~/wats/
-ssh vps 'cd ~/wats && cp router.env.example .env'
+scp deploy/compose/compose.router.yaml deploy/compose/router.env.example vps:/opt/wearetheswarm/
+ssh vps 'cd /opt/wearetheswarm && cp router.env.example .env && chmod 0640 .env'
 ```
 
-Edit `~/wats/.env` on the VM:
+Edit `/opt/wearetheswarm/.env` on the VM (it holds no secret):
 
 - `WATS_VERSION`: the release from step 1, e.g. `0.1.0`.
 - `WATS_BLOB_QUOTA` and `WATS_MAX_BLOB_SIZE`: the disk guards. See "Disk
@@ -180,13 +205,13 @@ sudo chmod 0400 /etc/wats/secret.key
 # Pull access to the private package: a classic personal access token with
 # only the read:packages scope (GitHub > Settings > Developer settings >
 # Personal access tokens (classic)).
-sudo docker login ghcr.io -u <your-github-user>
+docker login ghcr.io -u <your-github-user>
 
-cd ~/wats
-sudo docker compose -f compose.router.yaml up -d
-sudo docker compose -f compose.router.yaml logs              # "node started id=<endpoint id>"
-sudo docker compose -f compose.router.yaml exec router wats id   # must print the id from step 2
-sudo ss -ulpn | grep 7842                                    # listening on 0.0.0.0:7842 and [::]:7842
+cd /opt/wearetheswarm
+docker compose -f compose.router.yaml up -d
+docker compose -f compose.router.yaml logs              # "node started id=<endpoint id>"
+docker compose -f compose.router.yaml exec router wats id   # must print the id from step 2
+sudo ss -ulpn | grep 7842                               # listening on 0.0.0.0:7842 and [::]:7842
 ```
 
 How the router runs:
@@ -255,12 +280,14 @@ report.
 
 ## Operations
 
-- **Updates.** Cut a new release, set `WATS_VERSION` in `~/wats/.env`, then
+- **Updates.** Cut a new release, set `WATS_VERSION` in
+  `/opt/wearetheswarm/.env`, then
   run:
 
   ```sh
-  sudo docker compose -f compose.router.yaml pull
-  sudo docker compose -f compose.router.yaml up -d
+  cd /opt/wearetheswarm
+  docker compose -f compose.router.yaml pull
+  docker compose -f compose.router.yaml up -d
   ```
 
   On SIGTERM the node stops cleanly within the 30 s grace period. To roll
@@ -268,7 +295,8 @@ report.
 - **Backups.** Only the key matters, and it is in the password manager. The
   `/data` volume is a cache of the swarm: losing it costs a resync, nothing
   more.
-- **Logs.** `sudo docker compose -f compose.router.yaml logs -f`. Docker
+- **Logs.** `docker compose -f compose.router.yaml logs -f`, from
+  `/opt/wearetheswarm`. Docker
   rotates them: 5 files of 20 MB.
 - **Health.** Check that the container is running
   (`docker compose ps`) and that UDP 7842 is listening (`ss -ulpn`). There
@@ -295,5 +323,5 @@ Watch usage with:
 
 ```sh
 sudo du -sh /var/lib/docker/volumes/wats-router_router-data
-sudo docker system df
+docker system df
 ```

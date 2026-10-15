@@ -1,7 +1,7 @@
 # The public bootstrap node ("router") on a VM: the production deployment
 # (ADR 0008). Runbook: docs/deploy-bootstrap.md.
 #
-#   cd deploy/compose
+#   cd /opt/wearetheswarm           # on the VM, next to .env
 #   cp router.env.example .env      # set WATS_VERSION (and quotas if needed)
 #   docker login ghcr.io            # classic PAT with read:packages only
 #   docker compose -f compose.router.yaml up -d
