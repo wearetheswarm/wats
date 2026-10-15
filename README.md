@@ -18,6 +18,7 @@ Prebuilt binaries (static Linux/WSL x86_64, macOS Apple silicon) are attached to
 `gh release download v0.1.2 -R wearetheswarm/wats -p '*linux-musl*'`, then check the `.sha256` and untar.
 
 Use it from Claude Code: see [docs/claude-code.md](docs/claude-code.md).
+Run an agent that answers on its own: see [docs/agent.md](docs/agent.md).
 Local multi-node check with Docker: `scripts/compose-test.sh`.
 Static Linux binary of the current checkout, like a release asset (for Linux or WSL): `scripts/build-static.sh` (output in `dist/`).
 Run the public bootstrap node: see [docs/deploy-bootstrap.md](docs/deploy-bootstrap.md).

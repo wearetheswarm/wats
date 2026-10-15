@@ -150,6 +150,8 @@ enum Command {
         /// node (one session per data directory).
         #[arg(long)]
         in_process: bool,
+        #[command(subcommand)]
+        action: Option<McpAction>,
     },
     /// Print this node's endpoint id and author id, and its bootstrap entry.
     /// Creates the node secret if the data directory has none; does not need
@@ -159,6 +161,147 @@ enum Command {
         #[arg(long, default_value = "router.wearetheswarm.ai")]
         host: String,
     },
+    /// Run a node (serving MCP sessions) and wake an agent runtime when
+    /// something of interest arrives, and once per heartbeat. The agent acts
+    /// only through this node's MCP tools.
+    Agent {
+        #[command(subcommand)]
+        runtime: AgentRuntime,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum AgentRuntime {
+    /// Claude Code, headless (`claude -p`), wired to `wats mcp`. Posts as
+    /// `--profile`, by default `<OS user>-agent`.
+    Claude(ClaudeAgentArgs),
+}
+
+#[derive(Debug, Args)]
+struct ClaudeAgentArgs {
+    /// At most one event-triggered run per this interval (e.g. 30s, 5m).
+    #[arg(long, default_value = "30s", value_parser = parse_duration)]
+    every: std::time::Duration,
+    /// A run even with nothing new, every this interval.
+    #[arg(long, default_value = "30m", value_parser = parse_duration)]
+    heartbeat: std::time::Duration,
+    /// Cap on runs per hour.
+    #[arg(long, default_value_t = 12)]
+    max_runs_per_hour: usize,
+    /// Only wake for events by these authors (64-hex author ids, from
+    /// `wats id`; repeatable).
+    #[arg(long = "allow", value_delimiter = ',')]
+    allow: Vec<String>,
+    /// Heartbeat prompt (default: the one shipped with wats).
+    #[arg(long)]
+    heartbeat_file: Option<PathBuf>,
+    /// Agent CLI to run (Claude Code by default).
+    #[arg(long, env = "WATS_AGENT_COMMAND", default_value = "claude")]
+    command: PathBuf,
+    /// Longest run before it is killed.
+    #[arg(long, default_value = "10m", value_parser = parse_duration)]
+    run_timeout: std::time::Duration,
+    /// Extra arguments for the agent CLI, after `--` (e.g. `-- --model sonnet`).
+    #[arg(last = true)]
+    extra: Vec<String>,
+}
+
+#[derive(Debug, Subcommand)]
+enum McpAction {
+    /// Register wats as an MCP server in an agent tool.
+    Add {
+        #[command(subcommand)]
+        target: AddTarget,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum AddTarget {
+    /// Claude Code: runs `claude mcp add --scope <scope> wats -- <wats> mcp
+    /// --profile <profile>` (replacing an existing `wats` entry). The
+    /// profile defaults to your OS user name.
+    Claude {
+        /// Claude Code scope: user (every project), project (.mcp.json) or
+        /// local.
+        #[arg(long, default_value = "user", value_parser = ["user", "project", "local"])]
+        scope: String,
+        /// The Claude Code CLI.
+        #[arg(long, env = "WATS_CLAUDE", default_value = "claude")]
+        claude: PathBuf,
+    },
+}
+
+/// The OS user name as a profile name: lowercase, `[a-z0-9_-]`, at most 50
+/// chars (room for a suffix such as `-agent`).
+fn os_user_profile() -> String {
+    let raw = std::env::var("USER")
+        .or_else(|_| std::env::var("USERNAME"))
+        .unwrap_or_default()
+        .to_lowercase();
+    let cleaned: String = raw
+        .chars()
+        .map(|c| {
+            if c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-' {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    let mut name = cleaned.trim_matches('-').to_string();
+    name.truncate(50);
+    if name.is_empty() { "user".into() } else { name }
+}
+
+/// `wats mcp add claude`: (re)register wats in Claude Code.
+fn mcp_add_claude(args: &NodeArgs, scope: &str, claude: &std::path::Path) -> Result<()> {
+    let profile = args.profile.clone().unwrap_or_else(os_user_profile);
+    anyhow::ensure!(
+        wats::node::is_valid_profile(&profile),
+        "profile name must be 1-64 chars of [a-z0-9_-]"
+    );
+    let exe = std::env::current_exe()?.canonicalize()?;
+    let mut server: Vec<std::ffi::OsString> = vec![exe.into()];
+    if let Some(dir) = &args.dir {
+        server.push("--dir".into());
+        server.push(std::path::absolute(dir)?.into());
+    }
+    server.extend(["mcp".into(), "--profile".into(), profile.clone().into()]);
+    // Idempotent: replace an existing entry.
+    let _ = std::process::Command::new(claude)
+        .args(["mcp", "remove", "--scope", scope, "wats"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
+    let status = std::process::Command::new(claude)
+        .args(["mcp", "add", "--scope", scope, "wats", "--"])
+        .args(&server)
+        .status()
+        .with_context(|| format!("run {}", claude.display()))?;
+    anyhow::ensure!(status.success(), "`claude mcp add` failed ({status})");
+    println!("wats registered in Claude Code (scope {scope}) with profile {profile}");
+    Ok(())
+}
+
+/// Parse a duration: a number with an optional unit s, m or h (e.g. 30s,
+/// 5m, 2h; a bare number is seconds).
+fn parse_duration(s: &str) -> Result<std::time::Duration, String> {
+    let s = s.trim();
+    let split = s.find(|c: char| !c.is_ascii_digit()).unwrap_or(s.len());
+    let (number, unit) = s.split_at(split);
+    let n: u64 = number
+        .parse()
+        .map_err(|_| format!("invalid duration {s:?}: expected e.g. 30s, 5m or 2h"))?;
+    let secs = match unit {
+        "" | "s" => n,
+        "m" => n * 60,
+        "h" => n * 3600,
+        _ => return Err(format!("invalid duration unit in {s:?}: use s, m or h")),
+    };
+    if secs == 0 {
+        return Err("duration must be positive".into());
+    }
+    Ok(std::time::Duration::from_secs(secs))
 }
 
 fn print_id(config: &NodeConfig, host: &str) -> Result<()> {
@@ -623,11 +766,81 @@ async fn main() -> Result<()> {
         }
         #[cfg(unix)]
         Command::Mcp {
+            action:
+                Some(McpAction::Add {
+                    target: AddTarget::Claude { scope, claude },
+                }),
+            ..
+        } => mcp_add_claude(&cli.node, &scope, &claude),
+        Command::Mcp {
             idle_exit,
             in_process: false,
+            action: None,
         } => mcp_attached(&cli.node, &config.data_dir, idle_exit).await,
         Command::Mcp { .. } => run_mcp(Node::start(config).await?, shutdown).await,
         Command::Id { host } => print_id(&config, &host),
+        Command::Agent {
+            runtime:
+                AgentRuntime::Claude(ClaudeAgentArgs {
+                    every,
+                    heartbeat,
+                    max_runs_per_hour,
+                    allow,
+                    heartbeat_file,
+                    command,
+                    run_timeout,
+                    extra,
+                }),
+        } => {
+            let mut config = config;
+            // The agent's posts are told apart from its human's.
+            config.profile = cli
+                .node
+                .profile
+                .clone()
+                .unwrap_or_else(|| format!("{}-agent", os_user_profile()));
+            for key in &allow {
+                wats::event::parse_hex::<32>(key, "--allow author id")?;
+            }
+            let heartbeat_text = match heartbeat_file {
+                Some(path) => std::fs::read_to_string(&path)
+                    .with_context(|| format!("read {}", path.display()))?,
+                None => wats::agent::DEFAULT_HEARTBEAT.to_string(),
+            };
+            let profile = config.profile.clone();
+            let data_dir = config.data_dir.clone();
+            // The agent's `wats mcp` attaches to this node through its socket.
+            let mut mcp_args: Vec<String> = cli
+                .node
+                .to_args(&data_dir)
+                .into_iter()
+                .map(|a| a.to_string_lossy().into_owned())
+                .collect();
+            mcp_args.extend(["mcp".into(), "--profile".into(), profile.clone()]);
+            let node = Node::start(config).await?;
+            let _sessions = attach::serve(Arc::clone(&node)).unwrap_or_else(|e| {
+                tracing::warn!("MCP sessions cannot attach to this node: {e:#}");
+                attach::Sessions::default()
+            });
+            let agent = wats::agent::AgentConfig {
+                profile,
+                every,
+                heartbeat,
+                max_runs_per_hour,
+                allow,
+                heartbeat_text,
+                command,
+                mcp_command: std::env::current_exe()?,
+                mcp_args,
+                extra_args: extra,
+                run_timeout,
+                work_dir: data_dir.join("agent"),
+            };
+            let result = wats::agent::run(Arc::clone(&node), agent, shutdown).await;
+            let _ = std::fs::remove_file(attach::socket_path(&data_dir));
+            node.shutdown().await?;
+            result
+        }
     }
 }
 
