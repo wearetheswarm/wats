@@ -59,6 +59,11 @@ pub const DEFAULT_STORAGE_MAX: &str = "10G";
 #[serde(deny_unknown_fields)]
 pub struct AgentSettings {
     pub runtime: Option<String>,
+    pub access: Option<String>,
+    pub workdir: Option<PathBuf>,
+    #[serde(default)]
+    pub tools: Vec<String>,
+    pub review: Option<bool>,
     pub profile: Option<String>,
     pub about: Option<String>,
     #[serde(default)]
@@ -100,6 +105,14 @@ impl Settings {
                 RUNTIMES.join(", ")
             );
         }
+        if let Some(access) = &settings.agent.access {
+            access
+                .parse::<crate::access::Access>()
+                .with_context(|| format!("{}: agent.access", path.display()))?;
+        }
+        if let Some(dir) = &settings.agent.workdir {
+            settings.agent.workdir = Some(data_dir.join(dir));
+        }
         if let Some(file) = &settings.agent.heartbeat_file {
             settings.agent.heartbeat_file = Some(data_dir.join(file));
         }
@@ -114,6 +127,8 @@ pub enum ValueType {
     Profile,
     Infra,
     Runtime,
+    /// `locked`, `workspace` or `inherit`.
+    Access,
     Duration,
     Size,
     Integer,
@@ -203,6 +218,30 @@ pub const KEYS: &[Key] = &[
         ValueType::Runtime,
         "none",
         "agent run with the node: claude or codex",
+    ),
+    key(
+        "agent.access",
+        ValueType::Access,
+        "locked",
+        "what the agent may use besides wats: locked, workspace or inherit",
+    ),
+    key(
+        "agent.workdir",
+        ValueType::Text,
+        "<data dir>/agent/workspace",
+        "the agent's directory with workspace access (relative to the data dir)",
+    ),
+    key(
+        "agent.tools",
+        ValueType::List,
+        "none",
+        "built-in tools with workspace access, e.g. Read,Grep (Codex: features)",
+    ),
+    key(
+        "agent.review",
+        ValueType::Bool,
+        "false",
+        "hold the agent's posts until `wats agent approve`",
     ),
     key(
         "agent.profile",
@@ -340,6 +379,11 @@ fn toml_value(key: &Key, raw: &str) -> Result<toml_edit::Value> {
                     RUNTIMES.join(", ")
                 )));
             }
+            raw.into()
+        }
+        ValueType::Access => {
+            raw.parse::<crate::access::Access>()
+                .map_err(|e| invalid(e.to_string()))?;
             raw.into()
         }
         ValueType::Duration => {

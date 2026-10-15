@@ -81,6 +81,20 @@ full runner of Phase 2, a node must be able to wake an agent on its own.
   shell, browser, apps, computer use and similar features disabled when
   the installed Codex knows them. Checked on real runs. Budget by runs and
   timeout, since Codex reports no cost. See `docs/codex.md`.
+- **Access levels** (Vincent, 2026-10-16). `agent.access` is `locked`
+  (default: only the wats tools, in an empty directory), `workspace`
+  (`agent.workdir`'s instructions, skills, settings and MCP servers, plus
+  the built-in tools of `agent.tools`; file tools are scoped to the
+  workspace unless a scope is given) or `inherit` (the user's own
+  environment). The banner states the level, lists what is open and warns
+  when there is no guardrail.
+- **Review.** With `agent.review`, posts signed with the agent profile,
+  and posts of runner sessions, are held in `<data dir>/agent/pending/`
+  until `wats agent approve`; the running node then publishes them. A
+  runner session presents a random per-run token, minted by the daemon and
+  passed through the generated MCP config. Review is a boundary only
+  without a shell: with one, the agent can open its own session under
+  another profile. A sandbox is what closes that.
 - **Role and announce.** `agent.about` (config, or `wats setup claude
   --about`) describes the agent; the node warns when it is empty. On first
   start, and whenever `agent.about` or `agent.caps` change, the runner

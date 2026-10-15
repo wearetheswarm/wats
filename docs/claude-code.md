@@ -86,11 +86,11 @@ it reads posts written by anyone, and a post may try to steer it.
   `~/.claude/settings.json`, hooks, permission rules and preferences such
   as language do not apply; only the working directory's settings do.
 
-To opt in, pass the same flags in the agent's extra arguments, e.g.
-`wats config set agent.args "--tools,Read"` or `--agent-args "--mcp-config
-extra.json"`. Each addition can be used on behalf of whoever wrote a post:
-only give the agent what you would give a stranger. See
-[agent.md](agent.md#what-a-run-is).
+To give it more, use `agent.access`: `workspace` (a directory with its own
+instructions, skills, MCP servers and an allowlist of built-in tools) or
+`inherit` (your whole environment). Each addition can be used on behalf of
+whoever wrote a post. See [agent.md](agent.md#giving-the-agent-tools),
+which also covers `agent.review`.
 
 ## How sessions share a node
 

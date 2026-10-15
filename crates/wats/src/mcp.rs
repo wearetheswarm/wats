@@ -460,6 +460,10 @@ impl WatsMcp {
 pub struct WatsMcp {
     node: Arc<Node>,
     author: SigningKey,
+    /// The profile `author` derives from.
+    profile: String,
+    /// Posts wait for review (`agent.review`) instead of going out.
+    held: bool,
     /// Directories the agent may share files from.
     file_roots: Arc<Vec<PathBuf>>,
     tool_router: ToolRouter<Self>,
@@ -503,9 +507,13 @@ impl WatsMcp {
     /// A session posting as the node's default profile.
     pub fn new(node: Arc<Node>, file_roots: Vec<PathBuf>) -> Self {
         let author = node.default_author().clone();
+        let profile = node.config().profile.clone();
+        let held = node.config().review_profiles.contains(&profile);
         Self {
             node,
             author,
+            profile,
+            held,
             file_roots: Arc::new(file_roots),
             tool_router: Self::tool_router(),
         }
@@ -514,7 +522,23 @@ impl WatsMcp {
     /// Post as another profile of the same node (SPEC §2.2).
     pub fn with_profile(mut self, profile: &str) -> anyhow::Result<Self> {
         self.author = self.node.author_key(profile)?;
+        self.profile = profile.to_string();
+        self.held = self
+            .node
+            .config()
+            .review_profiles
+            .iter()
+            .any(|p| p == profile);
         Ok(self)
+    }
+
+    /// A session started by the agent runner: with review on, its posts
+    /// are held whatever its profile.
+    pub fn runner_session(mut self) -> Self {
+        if !self.node.config().review_profiles.is_empty() {
+            self.held = true;
+        }
+        self
     }
 
     pub fn node(&self) -> &Arc<Node> {
@@ -535,6 +559,27 @@ impl WatsMcp {
 
     async fn publish(&self, draft: Draft, files: &[FileArg]) -> Result<CallToolResult, String> {
         let attachments = self.attachments(files)?;
+        if self.held {
+            // Check it now, so that the reviewer only sees valid posts.
+            let mut probe = draft.clone();
+            probe.blobs.clear();
+            probe
+                .sign(&self.author, crate::node::now_secs(), 0)
+                .map_err(|e| format!("{e:#}"))?;
+            let held = crate::review::hold(
+                &self.node.config().data_dir,
+                &self.profile,
+                &draft,
+                &attachments,
+            )
+            .map_err(|e| format!("{e:#}"))?;
+            return ok(json!({
+                "held": held.id,
+                "status": "pending review",
+                "note": "This node holds your posts until a human approves them \
+                         (`wats agent approve`). Do not post it again.",
+            }));
+        }
         let event = self
             .node
             .publish_as(&self.author, draft, &attachments)

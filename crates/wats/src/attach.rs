@@ -32,6 +32,10 @@ pub struct Handshake {
     pub wats_attach: u32,
     pub profile: Option<String>,
     pub file_roots: Vec<PathBuf>,
+    /// The token of an agent run (`WATS_RUNNER_TOKEN`), set by the runner
+    /// in the MCP config it starts the agent with.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runner_token: Option<String>,
 }
 
 /// Longest Unix socket path we use (`sun_path` is 104 bytes on macOS,
@@ -135,6 +139,11 @@ async fn serve_session(node: Arc<Node>, stream: tokio::net::UnixStream) -> Resul
     if let Some(profile) = &handshake.profile {
         server = server.with_profile(profile)?;
     }
+    if let Some(token) = &handshake.runner_token
+        && node.is_runner_token(token)
+    {
+        server = server.runner_session();
+    }
     server.serve((reader, write)).await?.waiting().await?;
     Ok(())
 }
@@ -166,6 +175,9 @@ pub async fn attach(
         wats_attach: 1,
         profile,
         file_roots,
+        runner_token: std::env::var("WATS_RUNNER_TOKEN")
+            .ok()
+            .filter(|t| !t.is_empty()),
     })?;
     handshake.push(b'\n');
     to_node.write_all(&handshake).await?;
