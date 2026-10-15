@@ -34,8 +34,24 @@ pub struct Handshake {
     pub file_roots: Vec<PathBuf>,
 }
 
+/// Longest Unix socket path we use (`sun_path` is 104 bytes on macOS,
+/// 108 on Linux, including the terminating NUL).
+const MAX_SOCKET_PATH: usize = 100;
+
+/// Where the node owning `data_dir` listens: `<data dir>/mcp.sock`, or, when
+/// that path is too long for a Unix socket, `~/.wats/sock/<hash>.sock`
+/// with the hash derived from the data directory.
 pub fn socket_path(data_dir: &Path) -> PathBuf {
-    data_dir.join("mcp.sock")
+    let direct = data_dir.join("mcp.sock");
+    if direct.as_os_str().len() <= MAX_SOCKET_PATH {
+        return direct;
+    }
+    let absolute = std::path::absolute(data_dir).unwrap_or_else(|_| data_dir.to_path_buf());
+    let hash = blake3::hash(absolute.as_os_str().as_encoded_bytes()).to_hex();
+    let dir = std::env::home_dir()
+        .map(|h| h.join(".wats").join("sock"))
+        .unwrap_or_else(|| std::env::temp_dir().join("wats-sock"));
+    dir.join(format!("{}.sock", &hash[..16]))
 }
 
 /// Number of attached sessions currently served.
@@ -62,6 +78,16 @@ pub fn serve(node: Arc<Node>) -> Result<Sessions> {
     use std::os::unix::fs::PermissionsExt;
 
     let path = socket_path(&node.config().data_dir);
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)).or_else(|e| {
+            if dir == node.config().data_dir {
+                Ok(())
+            } else {
+                Err(e)
+            }
+        })?;
+    }
     // We hold the data directory lock, so any existing socket is stale.
     let _ = std::fs::remove_file(&path);
     let listener = tokio::net::UnixListener::bind(&path)
@@ -155,4 +181,23 @@ pub async fn attach(
 #[cfg(not(unix))]
 pub async fn attach(_: &Path, _: Option<String>, _: Vec<PathBuf>) -> Result<bool> {
     Ok(false)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn long_data_dirs_get_a_short_socket_path() {
+        assert_eq!(socket_path(Path::new("/d")), Path::new("/d/mcp.sock"));
+        let long = PathBuf::from("/").join("x".repeat(120));
+        let path = socket_path(&long);
+        assert!(
+            path.as_os_str().len() <= MAX_SOCKET_PATH,
+            "{}",
+            path.display()
+        );
+        assert_eq!(path, socket_path(&long), "deterministic");
+        assert_ne!(path, socket_path(&PathBuf::from("/").join("y".repeat(120))));
+    }
 }

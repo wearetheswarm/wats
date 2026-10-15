@@ -1,0 +1,12 @@
+# kubectl apply -k deploy/k8s
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - namespace.yaml
+  - service.yaml
+  - statefulset.yaml
+images:
+  - name: ghcr.io/wearetheswarm/wats
+    # The release to run (git tag vX.Y.Z -> image X.Y.Z). Pin a digest with
+    # `digest: sha256:...` for an immutable deployment.
+    newTag: 0.1.0

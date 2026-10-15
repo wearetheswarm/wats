@@ -26,6 +26,7 @@ use n0_future::StreamExt;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
 
+use crate::bootstrap::BootstrapEntry;
 use crate::event::{BlobRef, Draft, Event, is_safe_blob_name};
 use crate::identity::{DEFAULT_PROFILE, RootSecret, author_id};
 use crate::proto::{self, NodeInfo, Request, Response, WatsProtocol};
@@ -62,6 +63,16 @@ pub struct NodeConfig {
     pub nets: Vec<String>,
     /// Bootstrap peers.
     pub peers: Vec<EndpointAddr>,
+    /// Bootstrap entries resolved by DNS at startup, ids pinned (ADR 0008).
+    pub bootstrap: Vec<BootstrapEntry>,
+    /// Fixed UDP port for IPv4 (0.0.0.0), e.g. behind a load balancer.
+    /// Random when unset.
+    pub port: Option<u16>,
+    /// Public addresses to advertise, e.g. a load balancer's.
+    pub external_addrs: Vec<std::net::SocketAddr>,
+    /// Read the root secret from this file (which must exist) instead of
+    /// `<data dir>/secret.key`, e.g. a Kubernetes Secret.
+    pub secret_file: Option<PathBuf>,
     /// Author profile used for posts (SPEC §2.2).
     pub profile: String,
     /// Proof-of-work difficulty mined on our own posts.
@@ -87,6 +98,10 @@ impl NodeConfig {
             min_pow_bits: 12,
             max_blob_bytes: 256 * 1024 * 1024,
             replication: 3,
+            bootstrap: Vec::new(),
+            port: None,
+            external_addrs: Vec::new(),
+            secret_file: None,
         }
     }
 }
@@ -192,23 +207,47 @@ fn lock_data_dir(dir: &Path) -> Result<std::fs::File> {
 impl Node {
     pub async fn start(config: NodeConfig) -> Result<Arc<Self>> {
         let lock = lock_data_dir(&config.data_dir)?;
-        let root = RootSecret::load_or_create(&config.data_dir.join("secret.key"))?;
+        let root = match &config.secret_file {
+            Some(path) => RootSecret::load(path)?,
+            None => RootSecret::load_or_create(&config.data_dir.join("secret.key"))?,
+        };
         let author = root.profile_key(&config.profile);
         let secret = SecretKey::from_bytes(&root.transport_key_bytes());
 
         let lookup = MemoryLookup::new();
-        let builder = match config.mode {
-            NetworkMode::Internet => Endpoint::builder(presets::N0),
+        let port = config.port.unwrap_or(0);
+        let mut builder = match config.mode {
+            NetworkMode::Internet => {
+                let builder = Endpoint::builder(presets::N0);
+                if port == 0 {
+                    builder
+                } else {
+                    // Replaces the default IPv4 socket only; IPv6 stays on a
+                    // random port and may fail to bind.
+                    builder.bind_addr((std::net::Ipv4Addr::UNSPECIFIED, port))?
+                }
+            }
             NetworkMode::Loopback => Endpoint::builder(presets::Minimal)
                 .clear_ip_transports()
-                .bind_addr("127.0.0.1:0")?,
+                .bind_addr((std::net::Ipv4Addr::LOCALHOST, port))?,
         };
+        for addr in &config.external_addrs {
+            builder = builder.external_addr(*addr);
+        }
         let endpoint = builder
             .secret_key(secret)
             .address_lookup(lookup.clone())
             .bind()
             .await?;
-        for peer in &config.peers {
+        let mut peers = config.peers.clone();
+        for entry in &config.bootstrap {
+            match entry.resolve().await {
+                Ok(addr) if addr.id == endpoint.id() => {}
+                Ok(addr) => peers.push(addr),
+                Err(e) => warn!(%entry, "bootstrap peer unavailable: {e:#}"),
+            }
+        }
+        for peer in &peers {
             lookup.add_endpoint_info(peer.clone());
         }
 
@@ -227,7 +266,7 @@ impl Node {
         }
         let router = router.spawn();
 
-        let bootstrap: Vec<EndpointId> = config.peers.iter().map(|p| p.id).collect();
+        let bootstrap: Vec<EndpointId> = peers.iter().map(|p| p.id).collect();
         let mut senders = HashMap::new();
         let mut receivers = Vec::new();
         for net in &config.nets {

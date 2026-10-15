@@ -43,6 +43,28 @@ struct NodeArgs {
     /// Loopback only: no relays, no DNS (tests and local demos).
     #[arg(long, global = true)]
     loopback: bool,
+    /// Bootstrap node `<endpoint-id>@<host>:<port>` (repeatable); the host
+    /// is resolved by DNS, the id is pinned.
+    #[arg(long, global = true, env = "WATS_BOOTSTRAP", value_delimiter = ',')]
+    bootstrap: Vec<String>,
+    /// Do not use the bootstrap nodes built into this binary.
+    #[arg(long, global = true, env = "WATS_NO_DEFAULT_BOOTSTRAP")]
+    no_default_bootstrap: bool,
+    /// Fixed UDP port to listen on (IPv4, all interfaces). Random if unset.
+    #[arg(long, global = true, env = "WATS_PORT")]
+    port: Option<u16>,
+    /// Read the node secret from this file instead of `<dir>/secret.key`
+    /// (e.g. a mounted Kubernetes Secret). The file must exist.
+    #[arg(long, global = true, env = "WATS_SECRET_FILE")]
+    secret_file: Option<PathBuf>,
+    /// Public address to advertise, e.g. a load balancer's (repeatable).
+    #[arg(
+        long = "external-addr",
+        global = true,
+        env = "WATS_EXTERNAL_ADDR",
+        value_delimiter = ','
+    )]
+    external_addrs: Vec<std::net::SocketAddr>,
     /// Networks to join (repeatable). Defaults to "public".
     #[arg(long = "net", global = true, value_delimiter = ',')]
     nets: Vec<String>,
@@ -93,6 +115,41 @@ enum Command {
         #[arg(long)]
         in_process: bool,
     },
+    /// Print this node's endpoint id and author id, and its bootstrap entry.
+    /// Creates the node secret if the data directory has none; does not need
+    /// the node to be stopped.
+    Id {
+        /// Host name to show in the bootstrap entry.
+        #[arg(long, default_value = "router.wearetheswarm.ai")]
+        host: String,
+    },
+}
+
+fn print_id(config: &NodeConfig, host: &str) -> Result<()> {
+    let (root, path, existed) = match &config.secret_file {
+        Some(file) => (wats::identity::RootSecret::load(file)?, file.clone(), true),
+        None => {
+            let path = config.data_dir.join("secret.key");
+            let existed = path.exists();
+            (
+                wats::identity::RootSecret::load_or_create(&path)?,
+                path,
+                existed,
+            )
+        }
+    };
+    if !existed {
+        eprintln!("created a new node secret at {}", path.display());
+    }
+    let endpoint = iroh::SecretKey::from_bytes(&root.transport_key_bytes()).public();
+    let author = wats::identity::author_id(&root.profile_key(&config.profile));
+    let port = config
+        .port
+        .unwrap_or(wats::bootstrap::DEFAULT_BOOTSTRAP_PORT);
+    println!("endpoint_id: {endpoint}");
+    println!("author_id: {author} (profile {})", config.profile);
+    println!("bootstrap_entry: {endpoint}@{host}:{port}");
+    Ok(())
 }
 
 fn default_dir() -> Result<PathBuf> {
@@ -110,7 +167,19 @@ impl NodeArgs {
         let mut config = NodeConfig::new(dir);
         if self.loopback {
             config.mode = NetworkMode::Loopback;
+        } else if !self.no_default_bootstrap {
+            config.bootstrap = wats::bootstrap::defaults();
         }
+        for entry in &self.bootstrap {
+            config.bootstrap.push(
+                entry
+                    .parse()
+                    .with_context(|| format!("invalid bootstrap entry {entry:?}"))?,
+            );
+        }
+        config.port = self.port;
+        config.secret_file = self.secret_file.clone();
+        config.external_addrs = self.external_addrs.clone();
         if !self.nets.is_empty() {
             config.nets = self.nets.clone();
         }
@@ -156,6 +225,23 @@ impl NodeArgs {
         }
         if let Some(bits) = self.min_pow_bits {
             args.push(format!("--min-pow-bits={bits}").into());
+        }
+        for entry in &self.bootstrap {
+            args.push(format!("--bootstrap={entry}").into());
+        }
+        if self.no_default_bootstrap {
+            args.push("--no-default-bootstrap".into());
+        }
+        if let Some(port) = self.port {
+            args.push(format!("--port={port}").into());
+        }
+        if let Some(file) = &self.secret_file {
+            let mut arg = std::ffi::OsString::from("--secret-file=");
+            arg.push(file);
+            args.push(arg);
+        }
+        for addr in &self.external_addrs {
+            args.push(format!("--external-addr={addr}").into());
         }
         args
     }
@@ -208,6 +294,28 @@ async fn mcp_attached(args: &NodeArgs, dir: &std::path::Path, idle_exit: u64) ->
     )
 }
 
+type Shutdown = std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>;
+
+/// Resolves on Ctrl-C, or SIGTERM on Unix (what Kubernetes, Docker and
+/// systemd send). Handlers are registered right away: a process running as
+/// PID 1 in a container ignores signals it has no handler for.
+fn shutdown_signal() -> Shutdown {
+    #[cfg(unix)]
+    let term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).ok();
+    let ctrl_c = tokio::signal::ctrl_c();
+    Box::pin(async move {
+        #[cfg(unix)]
+        if let Some(mut term) = term {
+            tokio::select! {
+                _ = ctrl_c => {}
+                _ = term.recv() => {}
+            }
+            return;
+        }
+        let _ = ctrl_c.await;
+    })
+}
+
 fn print_line(value: serde_json::Value) {
     println!("{value}");
 }
@@ -221,7 +329,7 @@ struct NodeRun {
     idle_exit: Option<u64>,
 }
 
-async fn run_node(node: Arc<Node>, run: NodeRun) -> Result<()> {
+async fn run_node(node: Arc<Node>, run: NodeRun, mut shutdown: Shutdown) -> Result<()> {
     let NodeRun {
         post,
         kind,
@@ -235,17 +343,22 @@ async fn run_node(node: Arc<Node>, run: NodeRun) -> Result<()> {
             print_line(value);
         }
     };
-    let sessions = attach::serve(Arc::clone(&node))?;
+    let sessions = attach::serve(Arc::clone(&node)).unwrap_or_else(|e| {
+        tracing::warn!("MCP sessions cannot attach to this node: {e:#}");
+        attach::Sessions::default()
+    });
     let mut events = node.store().subscribe();
     let mut fetched = node.subscribe_fetched();
     let mut idle_since = tokio::time::Instant::now();
     let mut tick = tokio::time::interval(Duration::from_secs(1));
-    print_line(json!({
-        "type": "ready",
-        "endpoint": node.endpoint_id().to_string(),
-        "author": node.author_id(),
-        "ticket": node.ticket().await.to_string(),
-    }));
+    if !quiet {
+        print_line(json!({
+            "type": "ready",
+            "endpoint": node.endpoint_id().to_string(),
+            "author": node.author_id(),
+            "ticket": node.ticket().await.to_string(),
+        }));
+    }
 
     if let Some(text) = post {
         let node = Arc::clone(&node);
@@ -295,26 +408,29 @@ async fn run_node(node: Arc<Node>, run: NodeRun) -> Result<()> {
                     break;
                 }
             },
-            _ = tokio::signal::ctrl_c() => break,
+            _ = &mut shutdown => break,
         }
     }
     let _ = std::fs::remove_file(attach::socket_path(&node.config().data_dir));
     node.shutdown().await
 }
 
-async fn run_mcp(node: Arc<Node>) -> Result<()> {
-    let sessions = attach::serve(Arc::clone(&node))?;
+async fn run_mcp(node: Arc<Node>, mut shutdown: Shutdown) -> Result<()> {
+    let sessions = attach::serve(Arc::clone(&node)).unwrap_or_else(|e| {
+        tracing::warn!("MCP sessions cannot attach to this node: {e:#}");
+        attach::Sessions::default()
+    });
     let server = WatsMcp::new(Arc::clone(&node), default_file_roots());
     let service = server.serve(rmcp::transport::stdio()).await?;
     tokio::select! {
         result = service.waiting() => { result?; }
-        _ = tokio::signal::ctrl_c() => {}
+        _ = &mut shutdown => return node.shutdown().await,
     }
     // Other sessions attached to this node: keep serving them.
     while sessions.active() > 0 {
         tokio::select! {
             _ = tokio::time::sleep(Duration::from_millis(500)) => {}
-            _ = tokio::signal::ctrl_c() => break,
+            _ = &mut shutdown => break,
         }
     }
     let _ = std::fs::remove_file(attach::socket_path(&node.config().data_dir));
@@ -332,6 +448,7 @@ async fn main() -> Result<()> {
         )
         .init();
 
+    let shutdown = shutdown_signal();
     let cli = Cli::parse();
     let config = cli.node.config()?;
     match cli.command {
@@ -352,13 +469,14 @@ async fn main() -> Result<()> {
                 quiet,
                 idle_exit,
             };
-            run_node(node, run).await
+            run_node(node, run, shutdown).await
         }
         #[cfg(unix)]
         Command::Mcp {
             idle_exit,
             in_process: false,
         } => mcp_attached(&cli.node, &config.data_dir, idle_exit).await,
-        Command::Mcp { .. } => run_mcp(Node::start(config).await?).await,
+        Command::Mcp { .. } => run_mcp(Node::start(config).await?, shutdown).await,
+        Command::Id { host } => print_id(&config, &host),
     }
 }

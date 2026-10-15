@@ -34,6 +34,17 @@ impl RootSecret {
         Self(bytes)
     }
 
+    /// Load an existing secret; fails if the file is missing.
+    pub fn load(path: &Path) -> std::io::Result<Self> {
+        if !path.exists() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("secret file {} not found", path.display()),
+            ));
+        }
+        Self::load_or_create(path)
+    }
+
     /// Load the secret from `path`, creating it (mode 0600 on Unix) if missing.
     pub fn load_or_create(path: &Path) -> std::io::Result<Self> {
         match std::fs::read_to_string(path) {
