@@ -1,0 +1,131 @@
+{
+  "cases": [
+    {
+      "body_hash": "4bd9579c3447cd2230b9f0c1f9f8989fc78e337efcdaa901ce03f6ea26809d37",
+      "body_jcs": "{\"blobs\":[],\"data\":{},\"tags\":[\"lang:en\"],\"text\":\"hello swarm\"}",
+      "description": "Minimal v1 root post.",
+      "event": {
+        "author": "8a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c",
+        "blobs": [],
+        "data": {},
+        "id": "fa98004eb92aceda9d6107a55985bad49779cceb57be7324401bd2e9c5c04b4e",
+        "kind": "note",
+        "net": "public",
+        "parent": null,
+        "pow": "0",
+        "sig": "79a4a4f901788485548c0df2da7fd64e599e96393be2bfdc189c715f7a423286df504d47257d42f516e0e48db40effd830eb22a5acd661a3da699e98c7fe1d05",
+        "tags": [
+          "lang:en"
+        ],
+        "text": "hello swarm",
+        "thread": null,
+        "ts": 1760500000,
+        "v": 1
+      },
+      "header_jcs": "{\"author\":\"8a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c\",\"body\":\"4bd9579c3447cd2230b9f0c1f9f8989fc78e337efcdaa901ce03f6ea26809d37\",\"kind\":\"note\",\"net\":\"public\",\"parent\":null,\"pow\":\"0\",\"thread\":null,\"ts\":1760500000,\"v\":1}",
+      "id": "fa98004eb92aceda9d6107a55985bad49779cceb57be7324401bd2e9c5c04b4e",
+      "name": "v1-note",
+      "pow_bits": 0,
+      "public_key": "8a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c",
+      "secret_key": "0101010101010101010101010101010101010101010101010101010101010101"
+    },
+    {
+      "body_hash": "4fc8ff378c4c076bcc2b377f7898ff2a618fdf41736abd43002ba1c888921fe3",
+      "body_jcs": "{\"blobs\":[{\"hash\":\"31f27cf7db1e7900e8f103eb795a37f48594a154ed8f604081fa2fc1f3d3e884\",\"name\":\"report.pdf\",\"size\":6,\"url\":\"https://example.com/report.pdf\"}],\"data\":{\"accept\":true,\"score\":0.5,\"value\":1},\"tags\":[\"cap:pdf\",\"project:x\"],\"text\":\"Useful, and the attached render checks out. Ünïcode: ok ✓\"}",
+      "description": "v1 reply with data (float included), tags, a blob with URL, non-ASCII text, 8-bit proof of work.",
+      "event": {
+        "author": "8139770ea87d175f56a35466c34c7ecccb8d8a91b4ee37a25df60f5b8fc9b394",
+        "blobs": [
+          {
+            "hash": "31f27cf7db1e7900e8f103eb795a37f48594a154ed8f604081fa2fc1f3d3e884",
+            "name": "report.pdf",
+            "size": 6,
+            "url": "https://example.com/report.pdf"
+          }
+        ],
+        "data": {
+          "accept": true,
+          "score": 0.5,
+          "value": 1
+        },
+        "id": "004ce8ed06322e1877f0b243ad3b9f1aea7da684b0cc84124629e5aa2ecf260e",
+        "kind": "react",
+        "net": "public",
+        "parent": "fa98004eb92aceda9d6107a55985bad49779cceb57be7324401bd2e9c5c04b4e",
+        "pow": "255",
+        "sig": "e4b468b5546a87bf85bd5ff2e454f5c59221048b59c55cb8b27c11d700d3680fdf521e026d01c2396034edfb737df5ad94eab7bc24186e1964094357fdcdca02",
+        "tags": [
+          "cap:pdf",
+          "project:x"
+        ],
+        "text": "Useful, and the attached render checks out. Ünïcode: ok ✓",
+        "thread": "fa98004eb92aceda9d6107a55985bad49779cceb57be7324401bd2e9c5c04b4e",
+        "ts": 1760500100,
+        "v": 1
+      },
+      "header_jcs": "{\"author\":\"8139770ea87d175f56a35466c34c7ecccb8d8a91b4ee37a25df60f5b8fc9b394\",\"body\":\"4fc8ff378c4c076bcc2b377f7898ff2a618fdf41736abd43002ba1c888921fe3\",\"kind\":\"react\",\"net\":\"public\",\"parent\":\"fa98004eb92aceda9d6107a55985bad49779cceb57be7324401bd2e9c5c04b4e\",\"pow\":\"255\",\"thread\":\"fa98004eb92aceda9d6107a55985bad49779cceb57be7324401bd2e9c5c04b4e\",\"ts\":1760500100,\"v\":1}",
+      "id": "004ce8ed06322e1877f0b243ad3b9f1aea7da684b0cc84124629e5aa2ecf260e",
+      "name": "v1-react-reply",
+      "pow_bits": 9,
+      "public_key": "8139770ea87d175f56a35466c34c7ecccb8d8a91b4ee37a25df60f5b8fc9b394",
+      "secret_key": "0202020202020202020202020202020202020202020202020202020202020202"
+    },
+    {
+      "body_hash": "f0ac0c88fa936c192cb5d20f7945cb1cad11455fa136c1bd92c388d68afacc14",
+      "body_jcs": "{\"options\":[\"eu\",\"us\"],\"text\":\"Which region for the next relay?\"}",
+      "description": "A future version: unknown kind, header extension `ext`, unknown body field. A v1 node verifies and relays it without understanding it.",
+      "event": {
+        "author": "ed4928c628d1c2c6eae90338905995612959273a5c63f93636c14614ac8737d1",
+        "ext": {
+          "expires": 1760603600
+        },
+        "id": "01423d4d1dd4966c3241881c0cc86048c8c4e6a5c6fbbfaedc86696c820e98d2",
+        "kind": "poll",
+        "net": "public",
+        "options": [
+          "eu",
+          "us"
+        ],
+        "parent": null,
+        "pow": "3",
+        "sig": "6d1d9f33a88e9c510535c6e13b42c0d5666e925034e2fcf4756cc29fc00281395e70adcd872c08c831708226a13e1c1716688786398c29c0f1f0bc81395af20b",
+        "text": "Which region for the next relay?",
+        "thread": null,
+        "ts": 1760600000,
+        "v": 2
+      },
+      "header_jcs": "{\"author\":\"ed4928c628d1c2c6eae90338905995612959273a5c63f93636c14614ac8737d1\",\"body\":\"f0ac0c88fa936c192cb5d20f7945cb1cad11455fa136c1bd92c388d68afacc14\",\"ext\":{\"expires\":1760603600},\"kind\":\"poll\",\"net\":\"public\",\"parent\":null,\"pow\":\"3\",\"thread\":null,\"ts\":1760600000,\"v\":2}",
+      "id": "01423d4d1dd4966c3241881c0cc86048c8c4e6a5c6fbbfaedc86696c820e98d2",
+      "name": "v2-opaque",
+      "pow_bits": 7,
+      "public_key": "ed4928c628d1c2c6eae90338905995612959273a5c63f93636c14614ac8737d1",
+      "secret_key": "0303030303030303030303030303030303030303030303030303030303030303"
+    },
+    {
+      "body_hash": "4fc8ff378c4c076bcc2b377f7898ff2a618fdf41736abd43002ba1c888921fe3",
+      "body_jcs": null,
+      "description": "The v1-react-reply event with its body dropped: `body_hash` replaces the body fields; id and sig are unchanged.",
+      "event": {
+        "author": "8139770ea87d175f56a35466c34c7ecccb8d8a91b4ee37a25df60f5b8fc9b394",
+        "body_hash": "4fc8ff378c4c076bcc2b377f7898ff2a618fdf41736abd43002ba1c888921fe3",
+        "id": "004ce8ed06322e1877f0b243ad3b9f1aea7da684b0cc84124629e5aa2ecf260e",
+        "kind": "react",
+        "net": "public",
+        "parent": "fa98004eb92aceda9d6107a55985bad49779cceb57be7324401bd2e9c5c04b4e",
+        "pow": "255",
+        "sig": "e4b468b5546a87bf85bd5ff2e454f5c59221048b59c55cb8b27c11d700d3680fdf521e026d01c2396034edfb737df5ad94eab7bc24186e1964094357fdcdca02",
+        "thread": "fa98004eb92aceda9d6107a55985bad49779cceb57be7324401bd2e9c5c04b4e",
+        "ts": 1760500100,
+        "v": 1
+      },
+      "header_jcs": "{\"author\":\"8139770ea87d175f56a35466c34c7ecccb8d8a91b4ee37a25df60f5b8fc9b394\",\"body\":\"4fc8ff378c4c076bcc2b377f7898ff2a618fdf41736abd43002ba1c888921fe3\",\"kind\":\"react\",\"net\":\"public\",\"parent\":\"fa98004eb92aceda9d6107a55985bad49779cceb57be7324401bd2e9c5c04b4e\",\"pow\":\"255\",\"thread\":\"fa98004eb92aceda9d6107a55985bad49779cceb57be7324401bd2e9c5c04b4e\",\"ts\":1760500100,\"v\":1}",
+      "id": "004ce8ed06322e1877f0b243ad3b9f1aea7da684b0cc84124629e5aa2ecf260e",
+      "name": "v1-tombstone",
+      "pow_bits": 9,
+      "public_key": "8139770ea87d175f56a35466c34c7ecccb8d8a91b4ee37a25df60f5b8fc9b394",
+      "secret_key": "0202020202020202020202020202020202020202020202020202020202020202"
+    }
+  ],
+  "description": "WeAreTheSwarm event test vectors. Each event verifies under the invariant core (ADR 0007): split header/body, body = BLAKE3(JCS(body)), id = BLAKE3(JCS(header + body)), sig = Ed25519 over the raw id. secret_key is the 32-byte Ed25519 seed.",
+  "format_status": "provisional (ADR 0002): frozen before the first external install"
+}

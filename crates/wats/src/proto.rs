@@ -6,9 +6,16 @@
 //! - `replicate`: ask a peer to hold the blobs of an event (SPEC §2.5,
 //!   replication k at publish time).
 //!
+//! - `hello`: exchange supported protocol and event versions and features
+//!   (ADR 0007).
+//!
 //! One request per QUIC bi-stream: the requester writes a JSON request and
 //! finishes the stream, the responder writes a JSON response. See
-//! `docs/adr/0005-sync-and-replication.md`.
+//! `docs/adr/0005-sync-and-replication.md` and
+//! `docs/adr/0007-protocol-evolution.md`.
+//!
+//! Forward compatibility: unknown request types get `unsupported`, unknown
+//! fields are ignored, and every node serves each ALPN in [`ALPNS`].
 
 use std::sync::{Arc, OnceLock, Weak};
 
@@ -19,10 +26,19 @@ use iroh::{Endpoint, EndpointId};
 use serde::{Deserialize, Serialize};
 use tracing::debug;
 
-use crate::event::Event;
-use crate::node::Node;
+use serde_json::Value;
 
-pub const ALPN: &[u8] = b"/wats/1";
+use crate::node::Node;
+use crate::wire::{MAX_RELAY_VERSION, UNDERSTOOD_VERSIONS};
+
+/// Protocol versions this node speaks, newest first. `/wats/2` goes in
+/// front of `/wats/1` when it exists; both are then served side by side
+/// for the deprecation window of ADR 0007.
+pub const ALPNS: &[&[u8]] = &[b"/wats/1"];
+/// The same, as numbers, for `hello`.
+pub const PROTOCOL_VERSIONS: &[u32] = &[1];
+/// Optional capabilities, for `hello`.
+pub const FEATURES: &[&str] = &["sync", "replicate"];
 
 /// Largest request a node accepts.
 const MAX_REQUEST_BYTES: usize = 1024 * 1024;
@@ -33,9 +49,45 @@ pub const MAX_SYNC_PAGE: u32 = 256;
 /// Most requests served on one connection.
 const MAX_REQUESTS_PER_CONNECTION: usize = 1024;
 
+/// What a node says about itself in `hello`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct NodeInfo {
+    /// Free-form software name and version, e.g. `wats/0.0.1`.
+    pub software: String,
+    /// `/wats/N` protocol versions spoken.
+    pub protocols: Vec<u32>,
+    /// Event versions understood (indexed and shown), inclusive.
+    pub events_min: u64,
+    pub events_max: u64,
+    /// Highest event version stored and relayed as opaque data.
+    pub relay_max: u64,
+    pub features: Vec<String>,
+}
+
+impl NodeInfo {
+    pub fn ours() -> Self {
+        Self {
+            software: format!("wats/{}", env!("CARGO_PKG_VERSION")),
+            protocols: PROTOCOL_VERSIONS.to_vec(),
+            events_min: UNDERSTOOD_VERSIONS.0,
+            events_max: UNDERSTOOD_VERSIONS.1,
+            relay_max: MAX_RELAY_VERSION,
+            features: FEATURES.iter().map(|f| f.to_string()).collect(),
+        }
+    }
+
+    /// Whether two nodes understand at least one common event version.
+    pub fn shares_event_version(&self, other: &NodeInfo) -> bool {
+        self.events_min <= other.events_max && other.events_min <= self.events_max
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+#[serde(tag = "type", rename_all = "snake_case")]
 pub enum Request {
+    Hello {
+        info: NodeInfo,
+    },
     /// Events of `net` strictly after `(after_ts, after_id)` in `(ts, id)`
     /// order.
     Sync {
@@ -46,25 +98,59 @@ pub enum Request {
     },
     /// Store `event` and fetch the listed blobs of it from the requester.
     Replicate {
-        event: Box<Event>,
+        event: Value,
         hashes: Vec<String>,
     },
+    /// A request type from a newer protocol revision.
+    #[serde(other)]
+    Unsupported,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+#[serde(tag = "type", rename_all = "snake_case")]
 pub enum Response {
-    SyncPage { events: Vec<Event>, more: bool },
-    Replicated { hashes: Vec<String> },
-    Refused { reason: String },
+    Hello {
+        info: NodeInfo,
+    },
+    /// Events as wire JSON: understood or not, they are all relayed.
+    SyncPage {
+        events: Vec<Value>,
+        more: bool,
+    },
+    Replicated {
+        hashes: Vec<String>,
+    },
+    Refused {
+        reason: String,
+    },
+    /// The peer does not know this request type.
+    Unsupported,
+    /// A response type from a newer protocol revision.
+    #[serde(other)]
+    Unknown,
 }
 
 /// Send one request to a peer and wait for the response.
 pub async fn call(endpoint: &Endpoint, peer: EndpointId, request: &Request) -> Result<Response> {
-    let conn = endpoint
-        .connect(peer, ALPN)
-        .await
-        .with_context(|| format!("connect to {}", peer.fmt_short()))?;
+    // Newest protocol first; fall back to older ones.
+    let mut last_err = None;
+    let mut connected = None;
+    for alpn in ALPNS {
+        match endpoint.connect(peer, alpn).await {
+            Ok(conn) => {
+                connected = Some(conn);
+                break;
+            }
+            Err(e) => last_err = Some(e),
+        }
+    }
+    let conn = match (connected, last_err) {
+        (Some(conn), _) => conn,
+        (None, Some(e)) => {
+            return Err(e).with_context(|| format!("connect to {}", peer.fmt_short()));
+        }
+        (None, None) => bail!("no protocol version configured"),
+    };
     let (mut send, mut recv) = conn.open_bi().await?;
     send.write_all(&serde_json::to_vec(request)?).await?;
     send.finish()?;
@@ -96,6 +182,7 @@ impl WatsProtocol {
             };
             let bytes = recv.read_to_end(MAX_REQUEST_BYTES).await?;
             let response = match serde_json::from_slice::<Request>(&bytes) {
+                Ok(Request::Unsupported) => Response::Unsupported,
                 Ok(request) => node.handle_request(peer, request).await,
                 Err(e) => Response::Refused {
                     reason: format!("malformed request: {e}"),
@@ -156,6 +243,36 @@ mod tests {
         assert_eq!(closest(&hash, &peers[..2], 3).len(), 2);
         let d0 = distance(&hash, &a[0]);
         assert!(peers.iter().all(|p| distance(&hash, p) >= d0));
+    }
+
+    #[test]
+    fn newer_peers_are_understood() {
+        // A hello from a future node, with fields this version ignores.
+        let hello: Request = serde_json::from_str(
+            r#"{"type":"hello","info":{"software":"wats/9.0.0","protocols":[2,1],
+                "events_min":1,"events_max":3,"relay_max":65535,
+                "features":["sync","replicate","reconcile"],"region":"eu"}}"#,
+        )
+        .unwrap();
+        let Request::Hello { info } = hello else {
+            panic!("hello expected");
+        };
+        assert!(NodeInfo::ours().shares_event_version(&info));
+        let old = NodeInfo {
+            events_min: 5,
+            events_max: 6,
+            ..info
+        };
+        assert!(!NodeInfo::ours().shares_event_version(&old));
+        // Unknown request and response types do not break the parser.
+        assert!(matches!(
+            serde_json::from_str::<Request>(r#"{"type":"reconcile","ranges":[]}"#).unwrap(),
+            Request::Unsupported
+        ));
+        assert!(matches!(
+            serde_json::from_str::<Response>(r#"{"type":"fingerprint","x":1}"#).unwrap(),
+            Response::Unknown
+        ));
     }
 
     #[test]

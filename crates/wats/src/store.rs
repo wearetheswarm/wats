@@ -12,9 +12,12 @@ use rusqlite::types::Value as SqlValue;
 use rusqlite::{Connection, OptionalExtension, params, params_from_iter};
 use tokio::sync::broadcast;
 
-use crate::event::{Event, Kind};
+use serde_json::Value;
 
-const SCHEMA_VERSION: i64 = 1;
+use crate::event::{Event, Kind};
+use crate::wire::RawEvent;
+
+const SCHEMA_VERSION: i64 = 2;
 
 const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS events (
@@ -29,7 +32,11 @@ CREATE TABLE IF NOT EXISTS events (
     text        TEXT NOT NULL,
     tags        TEXT NOT NULL,
     json        TEXT NOT NULL,
-    received_at INTEGER NOT NULL
+    received_at INTEGER NOT NULL,
+    v           INTEGER NOT NULL DEFAULT 1,
+    -- 1 when this node does not understand the event (ADR 0007): stored
+    -- and relayed, not indexed, not returned by search or wait.
+    opaque      INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS events_net_ts ON events (net, ts, id);
 CREATE INDEX IF NOT EXISTS events_thread ON events (thread);
@@ -100,6 +107,7 @@ impl Filter {
 
     /// Append SQL conditions on table alias `e` and their parameters.
     fn to_sql(&self, conds: &mut Vec<String>, args: &mut Vec<SqlValue>) {
+        conds.push("e.opaque = 0".into());
         if let Some(net) = &self.net {
             conds.push("e.net = ?".into());
             args.push(net.clone().into());
@@ -174,6 +182,13 @@ impl Store {
         let version: i64 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
         if version > SCHEMA_VERSION {
             bail!("store schema version {version} is newer than this wats ({SCHEMA_VERSION})");
+        }
+        if version == 1 {
+            // v1 -> v2: opaque events (ADR 0007).
+            conn.execute_batch(
+                "ALTER TABLE events ADD COLUMN v INTEGER NOT NULL DEFAULT 1;
+                 ALTER TABLE events ADD COLUMN opaque INTEGER NOT NULL DEFAULT 0;",
+            )?;
         }
         conn.execute_batch(SCHEMA)?;
         conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
@@ -275,10 +290,72 @@ impl Store {
         Ok(out)
     }
 
+    /// Raw wire JSON of rows, understood or opaque.
+    fn query_raw(&self, sql: &str, args: Vec<SqlValue>) -> Result<Vec<Value>> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare_cached(sql)?;
+        let rows = stmt.query_map(params_from_iter(args), |r| r.get::<_, String>(1))?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(serde_json::from_str(&row?).context("corrupt stored event")?);
+        }
+        Ok(out)
+    }
+
+    /// Store an event this node does not understand (ADR 0007). It is
+    /// served to peers (sync) and to `read`, never indexed.
+    pub fn insert_raw(&self, raw: &RawEvent, received_at: u64) -> Result<Inserted> {
+        let conn = self.conn();
+        let changed = conn.execute(
+            "INSERT OR IGNORE INTO events (id, author, ts, net, thread, parent, kind, text, tags, json, received_at, v, opaque)
+             VALUES (?, ?, ?, ?, ?, ?, ?, '', '', ?, ?, ?, 1)",
+            params![
+                raw.id,
+                raw.author,
+                raw.ts as i64,
+                raw.net,
+                raw.thread,
+                raw.parent,
+                raw.kind,
+                serde_json::to_string(&raw.wire)?,
+                received_at as i64,
+                raw.v as i64,
+            ],
+        )?;
+        Ok(if changed == 0 {
+            Inserted::Duplicate
+        } else {
+            Inserted::New(conn.last_insert_rowid())
+        })
+    }
+
+    /// Any stored event, understood or not, as raw wire JSON with its version.
+    pub fn get_raw(&self, id: &str) -> Result<Option<(u64, bool, Value)>> {
+        let conn = self.conn();
+        let row: Option<(i64, i64, String)> = conn
+            .query_row(
+                "SELECT v, opaque, json FROM events WHERE id = ?",
+                [id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .optional()?;
+        row.map(|(v, opaque, json)| Ok((v as u64, opaque != 0, serde_json::from_str(&json)?)))
+            .transpose()
+    }
+
+    /// Opaque events of a thread, as raw wire JSON, oldest first.
+    pub fn thread_opaque(&self, root: &str, limit: usize) -> Result<Vec<Value>> {
+        self.query_raw(
+            "SELECT seq, json FROM events WHERE (id = ?1 OR thread = ?1) AND opaque = 1
+             ORDER BY ts, seq LIMIT ?2",
+            vec![root.to_string().into(), (limit as i64).into()],
+        )
+    }
+
     pub fn get(&self, id: &str) -> Result<Option<Stored>> {
         Ok(self
             .query(
-                "SELECT seq, json FROM events WHERE id = ?",
+                "SELECT seq, json FROM events WHERE id = ? AND opaque = 0",
                 vec![id.to_string().into()],
             )?
             .pop())
@@ -287,7 +364,8 @@ impl Store {
     /// The root and every reply of a thread, oldest first.
     pub fn thread(&self, root: &str, limit: usize) -> Result<Vec<Stored>> {
         self.query(
-            "SELECT seq, json FROM events WHERE id = ?1 OR thread = ?1 ORDER BY ts, seq LIMIT ?2",
+            "SELECT seq, json FROM events WHERE (id = ?1 OR thread = ?1) AND opaque = 0
+             ORDER BY ts, seq LIMIT ?2",
             vec![root.to_string().into(), (limit as i64).into()],
         )
     }
@@ -344,8 +422,8 @@ impl Store {
         after_ts: u64,
         after_id: &str,
         limit: usize,
-    ) -> Result<Vec<Stored>> {
-        self.query(
+    ) -> Result<Vec<Value>> {
+        self.query_raw(
             "SELECT seq, json FROM events WHERE net = ?1 AND (ts > ?2 OR (ts = ?2 AND id > ?3))
              ORDER BY ts, id LIMIT ?4",
             vec![
@@ -389,7 +467,7 @@ impl Store {
             &format!(
                 "SELECT e.seq, e.json FROM events e WHERE {} AND e.ts = (
                      SELECT max(a.ts) FROM events a WHERE a.author = e.author
-                     AND a.kind = 'announce' AND a.net = e.net)
+                     AND a.kind = 'announce' AND a.net = e.net AND a.opaque = 0)
                  GROUP BY e.author, e.net ORDER BY e.ts DESC LIMIT ?",
                 conds.join(" AND ")
             ),
@@ -589,13 +667,79 @@ mod tests {
         assert_eq!(store.last_ts("public").unwrap(), Some(20));
         let page = store.page_after("public", 10, "", 10).unwrap();
         assert_eq!(page.len(), 3);
-        let first = &page[0].event;
-        let rest = store.page_after("public", first.ts, &first.id, 10).unwrap();
+        let first = &page[0];
+        let rest = store
+            .page_after(
+                "public",
+                first["ts"].as_u64().unwrap(),
+                first["id"].as_str().unwrap(),
+                10,
+            )
+            .unwrap();
         assert_eq!(rest.len(), 2);
         assert_eq!(store.sync_watermark("public").unwrap(), 0);
         store.set_sync_watermark("public", 50).unwrap();
         store.set_sync_watermark("public", 40).unwrap();
         assert_eq!(store.sync_watermark("public").unwrap(), 50);
+    }
+
+    #[test]
+    fn opaque_events_are_kept_but_not_indexed() {
+        let store = Store::open_in_memory().unwrap();
+        let v2 = crate::wire::sign_value(
+            serde_json::json!({"v": 2, "ts": 30, "net": "public", "thread": null,
+                               "parent": null, "kind": "announce"})
+            .as_object()
+            .unwrap()
+            .clone(),
+            serde_json::json!({"text": "future announce with pdf", "tags": ["cap:pdf"]})
+                .as_object()
+                .unwrap()
+                .clone(),
+            &SigningKey::from_bytes(&[5; 32]),
+            0,
+        )
+        .unwrap();
+        let raw = RawEvent::from_value(v2.clone()).unwrap();
+        assert!(matches!(
+            store.insert_raw(&raw, 30).unwrap(),
+            Inserted::New(_)
+        ));
+        assert_eq!(store.insert_raw(&raw, 30).unwrap(), Inserted::Duplicate);
+        assert!(store.get(&raw.id).unwrap().is_none());
+        assert_eq!(store.get_raw(&raw.id).unwrap().unwrap(), (2, true, v2));
+        assert!(
+            store
+                .search(Some("pdf"), &Filter::default(), 10)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            store
+                .latest_announces(&Filter::default(), 10)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(store.since(0, &Filter::default(), 10).unwrap().is_empty());
+        assert_eq!(store.page_after("public", 0, "", 10).unwrap().len(), 1);
+        assert_eq!(store.thread_opaque(&raw.id, 10).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn migrates_schema_v1() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE events (seq INTEGER PRIMARY KEY AUTOINCREMENT, id TEXT NOT NULL UNIQUE,
+             author TEXT NOT NULL, ts INTEGER NOT NULL, net TEXT NOT NULL, thread TEXT, parent TEXT,
+             kind TEXT NOT NULL, text TEXT NOT NULL, tags TEXT NOT NULL, json TEXT NOT NULL,
+             received_at INTEGER NOT NULL); PRAGMA user_version = 1;",
+        )
+        .unwrap();
+        let store = Store::init(conn).unwrap();
+        store
+            .insert(&post(1, 10, Kind::Note, &[], "after migration"), 10)
+            .unwrap();
+        assert_eq!(store.count().unwrap(), 1);
     }
 
     #[test]
