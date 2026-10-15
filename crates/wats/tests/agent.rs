@@ -31,7 +31,7 @@ fn fake_agent(dir: &Path) -> std::path::PathBuf {
     std::fs::write(
         &script,
         format!(
-            "#!/bin/sh\n[ \"$1\" = mcp ] && exit 0\nn=$(ls {out} | grep -c prompt)\ncat > {out}/run-$n.tmp\necho \"$@\" > {out}/run-$n.args\nmv {out}/run-$n.tmp {out}/run-$n.prompt\necho '{{\"type\":\"assistant\",\"message\":{{\"content\":[{{\"type\":\"tool_use\",\"name\":\"mcp__wats__who\",\"input\":{{}}}}]}}}}'\necho '{{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"num_turns\":2,\"total_cost_usd\":0.0125}}'\n",
+            "#!/bin/sh\n[ \"$1\" = mcp ] && exit 0\nn=$(ls {out} | grep -c prompt)\ncat > {out}/run-$n.tmp\necho \"$@\" > {out}/run-$n.args\npwd > {out}/run-$n.cwd\nmv {out}/run-$n.tmp {out}/run-$n.prompt\necho '{{\"type\":\"assistant\",\"message\":{{\"content\":[{{\"type\":\"tool_use\",\"name\":\"mcp__wats__who\",\"input\":{{}}}}]}}}}'\necho '{{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"num_turns\":2,\"total_cost_usd\":0.0125}}'\n",
             out = out.display()
         ),
     )
@@ -111,6 +111,9 @@ async fn agent_wakes_on_asks_and_heartbeats() -> anyhow::Result<()> {
         max_turns: 10,
         budget: wats::budget::Budget::default(),
         codex_disable: vec![],
+        access: wats::access::Access::Locked,
+        workdir: std::path::PathBuf::from("/nonexistent"),
+        tools: vec![],
         work_dir: dir.path().join("work"),
         keep_runs: 2,
         keep_days: 30,
@@ -632,6 +635,9 @@ async fn budget_pauses_the_agent() -> anyhow::Result<()> {
             ..Default::default()
         },
         codex_disable: vec![],
+        access: wats::access::Access::Locked,
+        workdir: std::path::PathBuf::from("/nonexistent"),
+        tools: vec![],
         work_dir: dir.path().join("work"),
         keep_runs: 100,
         keep_days: 30,
@@ -784,6 +790,9 @@ echo '{{"type":"turn.completed","usage":{{"input_tokens":10,"output_tokens":2}}}
         max_turns: 10,
         budget: wats::budget::Budget::default(),
         codex_disable: vec![],
+        access: wats::access::Access::Locked,
+        workdir: std::path::PathBuf::from("/nonexistent"),
+        tools: vec![],
         work_dir: work.clone(),
         keep_runs: 100,
         keep_days: 30,
@@ -841,4 +850,282 @@ echo '{{"type":"turn.completed","usage":{{"input_tokens":10,"output_tokens":2}}}
     assert!(wats::budget::spend(&work, now).uncosted_today >= 1);
     a.shutdown().await?;
     Ok(())
+}
+
+/// `agent.access = workspace`: the run starts in the workspace (created
+/// with stub instructions), with its MCP servers merged into the generated
+/// config next to wats (which carries the run's token), and the listed
+/// built-in tools.
+#[tokio::test(flavor = "multi_thread")]
+async fn workspace_access_opens_the_workspace() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let a = node(&dir.path().join("a"), &[]).await?;
+    let workdir = dir.path().join("ws");
+    std::fs::create_dir_all(&workdir)?;
+    std::fs::write(
+        workdir.join(".mcp.json"),
+        r#"{"mcpServers": {"docs": {"command": "docs-mcp"}, "wats": {"command": "evil"}}}"#,
+    )?;
+    let work = dir.path().join("work");
+    let config = AgentConfig {
+        runtime: "claude".into(),
+        profile: "agent".into(),
+        user: "alice".into(),
+        about: String::new(),
+        caps: vec![],
+        every: Duration::from_secs(1),
+        heartbeat: Duration::from_secs(1),
+        max_runs_per_hour: 100,
+        allow: vec![],
+        heartbeat_text: DEFAULT_HEARTBEAT.into(),
+        command: fake_agent(dir.path()),
+        mcp_command: "/opt/wats".into(),
+        mcp_args: vec!["mcp".into()],
+        extra_args: vec![],
+        run_timeout: Duration::from_secs(10),
+        max_turns: 10,
+        budget: wats::budget::Budget::default(),
+        codex_disable: vec![],
+        access: wats::access::Access::Workspace,
+        workdir: workdir.clone(),
+        tools: vec!["Read".into(), "Grep".into()],
+        work_dir: work.clone(),
+        keep_runs: 100,
+        keep_days: 30,
+    };
+    let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+    let runner = tokio::spawn(wats::agent::run(Arc::clone(&a), config, async {
+        let _ = stopped.await;
+    }));
+    eventually("a run", || !runs(dir.path()).is_empty()).await;
+    let _ = stop.send(());
+    runner.await??;
+    let (_, args) = runs(dir.path()).remove(0);
+    assert!(args.contains("--tools Read,Grep"), "{args}");
+    assert!(
+        args.contains("--allowedTools mcp__wats__*,mcp__docs__*,Read(./**),Grep(./**)"),
+        "{args}"
+    );
+    assert!(args.contains("--strict-mcp-config"), "{args}");
+    let cwd = std::fs::read_to_string(dir.path().join("runs/run-0.cwd"))?;
+    assert_eq!(
+        std::fs::canonicalize(cwd.trim())?,
+        std::fs::canonicalize(&workdir)?
+    );
+    assert!(workdir.join("CLAUDE.md").exists() && workdir.join("AGENTS.md").exists());
+    let mcp: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(work.join("mcp-agent.json"))?)?;
+    assert_eq!(mcp["mcpServers"]["docs"]["command"], "docs-mcp");
+    assert_eq!(
+        mcp["mcpServers"]["wats"]["command"], "/opt/wats",
+        "wats wins"
+    );
+    assert_eq!(
+        mcp["mcpServers"]["wats"]["env"]["WATS_RUNNER_TOKEN"]
+            .as_str()
+            .unwrap()
+            .len(),
+        32
+    );
+    a.shutdown().await?;
+    Ok(())
+}
+
+/// `agent.review`: posts by the agent's profile, and by any runner session
+/// (identified by the run's token), are held; `approve` publishes them,
+/// `reject` drops them; other sessions publish directly.
+#[tokio::test(flavor = "multi_thread")]
+async fn review_holds_the_agents_posts() -> anyhow::Result<()> {
+    use rmcp::ServiceExt;
+    let dir = tempfile::tempdir()?;
+    let mut config = NodeConfig::new(dir.path().join("a"));
+    config.mode = NetworkMode::Loopback;
+    config.pow_bits = 0;
+    config.min_pow_bits = 0;
+    config.review_profiles = vec!["agent".into()];
+    let a = Node::start(config).await?;
+    let client = |server: wats::mcp::WatsMcp| async move {
+        let (server_io, client_io) = tokio::io::duplex(64 * 1024);
+        tokio::spawn(async move {
+            if let Ok(running) = server.serve(server_io).await {
+                let _ = running.waiting().await;
+            }
+        });
+        ().serve(client_io).await
+    };
+    let agent =
+        client(wats::mcp::WatsMcp::new(Arc::clone(&a), vec![]).with_profile("agent")?).await?;
+    let human =
+        client(wats::mcp::WatsMcp::new(Arc::clone(&a), vec![]).with_profile("human")?).await?;
+    let runner = client(
+        wats::mcp::WatsMcp::new(Arc::clone(&a), vec![])
+            .with_profile("human")?
+            .runner_session(),
+    )
+    .await?;
+    let held = call_post(&agent, "from the agent").await;
+    assert_eq!(held["status"], "pending review", "{held}");
+    let direct = call_post(&human, "from the human").await;
+    assert!(direct["id"].is_string(), "{direct}");
+    let by_runner = call_post(&runner, "from a runner session").await;
+    assert_eq!(by_runner["status"], "pending review", "{by_runner}");
+
+    let data = dir.path().join("a");
+    let queue = wats::review::list(&data);
+    assert_eq!(queue.len(), 2);
+    assert!(
+        a.store()
+            .search(Some("agent"), &Default::default(), 10)?
+            .is_empty()
+    );
+    wats::review::approve(&data, held["held"].as_str().unwrap())?;
+    wats::review::reject(&data, by_runner["held"].as_str().unwrap())?;
+    assert_eq!(wats::review::publish_approved(&a).await, 1);
+    let published = a.store().search(None, &Default::default(), 10)?;
+    assert!(
+        published
+            .iter()
+            .any(|s| s.event.title.as_deref() == Some("from the agent"))
+    );
+    assert!(
+        !published
+            .iter()
+            .any(|s| s.event.title.as_deref() == Some("from a runner session"))
+    );
+    assert!(wats::review::list(&data).is_empty());
+    for c in [agent, human, runner] {
+        c.cancel().await?;
+    }
+    a.shutdown().await?;
+    Ok(())
+}
+
+async fn call_post(
+    client: &rmcp::service::RunningService<rmcp::RoleClient, ()>,
+    title: &str,
+) -> serde_json::Value {
+    let args = serde_json::json!({"title": title, "text": "body", "kind": "note"});
+    client
+        .call_tool(
+            rmcp::model::CallToolRequestParams::new("post")
+                .with_arguments(args.as_object().unwrap().clone()),
+        )
+        .await
+        .unwrap()
+        .structured_content
+        .unwrap()
+}
+
+/// The runner token travels through the socket: a `wats mcp` process with
+/// a valid `WATS_RUNNER_TOKEN` is a runner session (held, whatever its
+/// profile); without it, or with a made-up one, it is not.
+#[tokio::test(flavor = "multi_thread")]
+async fn runner_token_marks_the_session_over_the_socket() -> anyhow::Result<()> {
+    use rmcp::ServiceExt;
+    use rmcp::transport::TokioChildProcess;
+    let dir = tempfile::tempdir()?;
+    let data = dir.path().join("n");
+    let mut config = NodeConfig::new(&data);
+    config.mode = NetworkMode::Loopback;
+    config.pow_bits = 0;
+    config.min_pow_bits = 0;
+    config.review_profiles = vec!["agent".into()];
+    let node = Node::start(config).await?;
+    let _sessions = wats::attach::serve(Arc::clone(&node))?;
+    let token = node.new_runner_token();
+    let session = |token: Option<&str>| {
+        let mut cmd = tokio::process::Command::new(env!("CARGO_BIN_EXE_wats"));
+        cmd.args(["--loopback", "--profile", "human", "--dir"])
+            .arg(&data)
+            .args(["mcp", "--idle-exit", "1"]);
+        match token {
+            Some(t) => cmd.env("WATS_RUNNER_TOKEN", t),
+            None => cmd.env_remove("WATS_RUNNER_TOKEN"),
+        };
+        cmd
+    };
+    for (token, held) in [
+        (Some(token.as_str()), true),
+        (Some("00ff"), false),
+        (None, false),
+    ] {
+        let client = ().serve(TokioChildProcess::new(session(token))?).await?;
+        let result = call_post(&client, "via the socket").await;
+        assert_eq!(result.get("held").is_some(), held, "{token:?}: {result}");
+        client.cancel().await?;
+    }
+    node.end_runner_token(&token);
+    let client = ().serve(TokioChildProcess::new(session(Some(&token)))?).await?;
+    let result = call_post(&client, "after the run").await;
+    assert!(
+        result.get("held").is_none(),
+        "an ended run's token is void: {result}"
+    );
+    client.cancel().await?;
+    node.shutdown().await?;
+    Ok(())
+}
+
+/// `wats setup claude --access workspace --tools Read` writes the keys and
+/// creates the workspace; `wats agent pending | approve | reject` manage
+/// the review queue.
+#[test]
+fn setup_access_and_review_queue() {
+    let dir = tempfile::tempdir().unwrap();
+    let (fake, _log) = logging_claude(dir.path());
+    let data = dir.path().join("data");
+    let wats = |args: &[&str]| {
+        let out = std::process::Command::new(env!("CARGO_BIN_EXE_wats"))
+            .env("HOME", dir.path())
+            .arg("--dir")
+            .arg(&data)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8(out.stdout).unwrap()
+    };
+    let said = wats(&[
+        "setup",
+        "claude",
+        "--agent",
+        "--access",
+        "workspace",
+        "--tools",
+        "Read,Grep",
+        "--claude",
+        fake.to_str().unwrap(),
+    ]);
+    assert!(said.contains("agent workspace:"), "{said}");
+    assert!(data.join("agent/workspace/CLAUDE.md").exists());
+    let config = std::fs::read_to_string(data.join("config.toml")).unwrap();
+    assert!(config.contains("access = \"workspace\""), "{config}");
+    assert!(config.contains("tools = [\"Read\", \"Grep\"]"), "{config}");
+    assert!(wats(&["config", "list"]).contains("agent.access"));
+
+    let draft = Draft {
+        net: PUBLIC_NET.into(),
+        kind: Some(Kind::Note),
+        title: Some("held title".into()),
+        text: "held text".into(),
+        ..Draft::default()
+    };
+    let one = wats::review::hold(&data, "agent", &draft, &[]).unwrap();
+    let two = wats::review::hold(&data, "agent", &draft, &[]).unwrap();
+    let pending = wats(&["agent", "pending"]);
+    assert!(
+        pending.contains(&one.id) && pending.contains("held title"),
+        "{pending}"
+    );
+    assert!(wats(&["agent", "approve", &one.id]).contains("approved"));
+    assert!(wats(&["agent", "reject", &two.id]).contains("rejected"));
+    let pending = wats(&["agent", "pending"]);
+    assert!(
+        pending.contains("[approved]") && !pending.contains(&two.id),
+        "{pending}"
+    );
 }

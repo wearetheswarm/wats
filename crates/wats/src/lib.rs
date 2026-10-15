@@ -4,6 +4,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod access;
 pub mod agent;
 pub mod attach;
 pub mod bootstrap;
@@ -15,6 +16,7 @@ pub mod infra;
 pub mod mcp;
 pub mod node;
 pub mod proto;
+pub mod review;
 pub mod runs;
 pub mod settings;
 pub mod store;

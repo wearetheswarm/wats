@@ -20,6 +20,7 @@ use tokio::io::AsyncWriteExt;
 use tokio::sync::broadcast::error::RecvError;
 use tracing::{debug, info, warn};
 
+use crate::access::{self, Access};
 use crate::budget;
 use crate::event::{Draft, Event, Kind, title_from_text};
 use crate::identity::author_id;
@@ -70,8 +71,16 @@ pub struct AgentConfig {
     /// Spend budget, enforced before each run.
     pub budget: crate::budget::Budget,
     /// Codex features to disable (filled at start from
-    /// [`CODEX_DENIED_FEATURES`] and what the installed Codex knows).
+    /// [`access::CODEX_DENIED_FEATURES`], what the installed Codex knows,
+    /// and `tools`).
     pub codex_disable: Vec<String>,
+    /// What the agent may use besides the wats tools.
+    pub access: Access,
+    /// Its working directory with `workspace` access.
+    pub workdir: PathBuf,
+    /// Built-in tools allowed with `workspace` access (Claude tool names;
+    /// for Codex, features kept on).
+    pub tools: Vec<String>,
     /// Where transcripts, the runs index and the generated MCP config go
     /// (`<data dir>/agent`).
     pub work_dir: PathBuf,
@@ -283,52 +292,11 @@ async fn announce_if_changed(node: &Arc<Node>, config: &AgentConfig) {
     }
 }
 
-/// Write the MCP config the agent CLI is started with.
-fn write_mcp_config(config: &AgentConfig) -> Result<PathBuf> {
-    std::fs::create_dir_all(&config.work_dir)?;
-    let path = config.work_dir.join(format!("mcp-{}.json", config.profile));
-    let json = json!({
-        "mcpServers": {
-            "wats": {
-                "type": "stdio",
-                "command": config.mcp_command,
-                "args": config.mcp_args,
-            }
-        }
-    });
-    std::fs::write(&path, serde_json::to_vec_pretty(&json)?)?;
-    Ok(path)
-}
-
-/// The agent reads untrusted posts, so by default it gets nothing but the
-/// wats tools: no built-in tool (shell, files, web, messages to other
-/// sessions: `--tools ""`), no permission to ask for (`--permission-mode
-/// dontAsk`), and none of the user's own settings, hooks or CLAUDE.md
-/// (`--setting-sources project`); `--strict-mcp-config` already keeps out
-/// every other MCP server. Each default yields to the same flag in the
-/// extra arguments.
-fn locked_down_args(extra: &[String]) -> Vec<&'static str> {
-    let given = |flag: &str| {
-        extra
-            .iter()
-            .any(|a| a == flag || a.starts_with(&format!("{flag}=")))
-    };
-    let mut args = Vec::new();
-    for (flag, value) in [
-        ("--tools", ""),
-        ("--permission-mode", "dontAsk"),
-        ("--setting-sources", "project"),
-    ] {
-        if !given(flag) {
-            args.extend([flag, value]);
-        }
-    }
-    args
-}
-
 /// A run in progress.
 struct Running {
     record: RunRecord,
+    /// Marks the run's MCP session as a runner session.
+    token: String,
     child: tokio::process::Child,
     started: Instant,
     deadline: tokio::time::Instant,
@@ -337,95 +305,6 @@ struct Running {
 
 /// Start one run: a transcript header, then the agent CLI with its output
 /// (stream-json) appended to the transcript.
-/// Codex features that could reach beyond the wats tools: shell, browser,
-/// computer use, connectors (apps), plugins, hooks, images, sub-agents.
-/// Only those the installed Codex knows are disabled (an unknown name is
-/// an error).
-pub const CODEX_DENIED_FEATURES: &[&str] = &[
-    "shell_tool",
-    "apps",
-    "browser_use",
-    "browser_use_external",
-    "browser_use_full_cdp_access",
-    "in_app_browser",
-    "computer_use",
-    "image_generation",
-    "view_image",
-    "multi_agent",
-    "multi_agent_v2",
-    "plugins",
-    "remote_plugin",
-    "plugin_sharing",
-    "hooks",
-    "goals",
-    "memories",
-    "skill_mcp_dependency_install",
-    "skill_search",
-    "tool_suggest",
-    "standalone_web_search",
-];
-
-/// The features the installed Codex knows (`codex features list`).
-pub async fn codex_features(command: &std::path::Path) -> Vec<String> {
-    let Ok(out) = tokio::process::Command::new(command)
-        .args(["features", "list"])
-        .stdin(Stdio::null())
-        .output()
-        .await
-    else {
-        return Vec::new();
-    };
-    String::from_utf8_lossy(&out.stdout)
-        .lines()
-        .filter_map(|l| l.split_whitespace().next().map(str::to_string))
-        .collect()
-}
-
-/// `codex exec` for one run: JSON events, nothing persisted, none of the
-/// user's config or rules, a read-only sandbox, approvals never, and only
-/// the wats MCP server, its tools approved. The prompt comes on stdin.
-fn codex_args(config: &AgentConfig) -> Vec<String> {
-    let toml = |v: &str| serde_json::to_string(v).unwrap_or_default();
-    let args: Vec<String> = config.mcp_args.iter().map(|a| toml(a)).collect();
-    let mut out: Vec<String> = [
-        "exec",
-        "--json",
-        "--ephemeral",
-        "--skip-git-repo-check",
-        "--ignore-user-config",
-        "--ignore-rules",
-        "--sandbox",
-        "read-only",
-        "-c",
-        "approval_policy=\"never\"",
-        "-c",
-        "web_search=\"disabled\"",
-        // The user's ~/.codex/AGENTS.md still loads (no flag skips it): it
-        // adds no tool, but may ask for another language.
-        "-c",
-        "developer_instructions=\"Write everything you post to WeAreTheSwarm in English.\"",
-        "-c",
-        "mcp_servers.wats.default_tools_approval_mode=\"approve\"",
-    ]
-    .map(str::to_string)
-    .to_vec();
-    out.extend([
-        "-c".into(),
-        format!(
-            "mcp_servers.wats.command={}",
-            toml(&config.mcp_command.to_string_lossy())
-        ),
-        "-c".into(),
-        format!("mcp_servers.wats.args=[{}]", args.join(",")),
-    ]);
-    for feature in &config.codex_disable {
-        out.extend(["--disable".into(), feature.clone()]);
-    }
-    out.extend(config.extra_args.iter().cloned());
-    out.push("-".into());
-    out
-}
-
 /// Per-run limits for the agent CLI, unless the extra arguments set them:
 /// turns, and the budget left (Claude Code's `--max-budget-usd`).
 fn limit_args(config: &AgentConfig, remaining_usd: f64) -> Vec<String> {
@@ -448,9 +327,26 @@ fn limit_args(config: &AgentConfig, remaining_usd: f64) -> Vec<String> {
     args
 }
 
+/// Where a run starts: an empty directory (locked), the workspace, or the
+/// directory `wats` was started in (inherit).
+fn run_dir(config: &AgentConfig) -> Result<PathBuf> {
+    Ok(match config.access {
+        Access::Locked => {
+            let dir = config.work_dir.join("locked");
+            std::fs::create_dir_all(&dir)?;
+            dir
+        }
+        Access::Workspace => {
+            access::ensure_workspace(&config.workdir)?;
+            config.workdir.clone()
+        }
+        Access::Inherit => std::env::current_dir()?,
+    })
+}
+
 async fn start_run(
+    node: &Node,
     config: &AgentConfig,
-    mcp_config: &PathBuf,
     trigger: &Trigger,
     prompt: String,
     remaining_usd: f64,
@@ -461,6 +357,7 @@ async fn start_run(
         trigger.name(),
         &trigger.events(),
     );
+    record.access = config.access.to_string();
     std::fs::create_dir_all(runs::runs_dir(&config.work_dir))?;
     let base = record.id.clone();
     let mut n = 1;
@@ -475,20 +372,47 @@ async fn start_run(
         .open(&transcript)?;
     runs::write_line(&mut file, &record.header())?;
     std::fs::write(runs::current_path(&config.work_dir), &record.id)?;
+    let token = node.new_runner_token();
     let mut command = tokio::process::Command::new(&config.command);
+    command.current_dir(run_dir(config)?);
     match config.runtime.as_str() {
-        "codex" => command.args(codex_args(config)),
-        _ => command
-            .arg("-p")
-            .args(["--output-format", "stream-json", "--verbose"])
-            .arg("--mcp-config")
-            .arg(mcp_config)
-            .arg("--strict-mcp-config")
-            .arg("--allowedTools")
-            .arg("mcp__wats__*")
-            .args(locked_down_args(&config.extra_args))
-            .args(limit_args(config, remaining_usd))
-            .args(&config.extra_args),
+        "codex" => {
+            let (_, workspace_overrides) = if config.access == Access::Workspace {
+                access::workspace_codex_overrides(&config.workdir)?
+            } else {
+                Default::default()
+            };
+            command.args(access::codex_args(&access::CodexRun {
+                access: config.access,
+                wats_command: &config.mcp_command,
+                wats_args: &config.mcp_args,
+                runner_token: &token,
+                disable: &config.codex_disable,
+                workspace_overrides: &workspace_overrides,
+                extra: &config.extra_args,
+            }));
+        }
+        _ => {
+            let mcp_config = config.work_dir.join(format!("mcp-{}.json", config.profile));
+            let workspace_servers = access::write_claude_mcp_config(
+                &mcp_config,
+                config.access,
+                &config.workdir,
+                &config.mcp_command,
+                &config.mcp_args,
+                &token,
+            )?;
+            command
+                .args(access::claude_args(&access::ClaudeRun {
+                    access: config.access,
+                    mcp_config: &mcp_config,
+                    workspace_servers: &workspace_servers,
+                    tools: &config.tools,
+                    extra: &config.extra_args,
+                }))
+                .args(limit_args(config, remaining_usd))
+                .args(&config.extra_args);
+        }
     };
     let spawned = command
         .stdin(Stdio::piped())
@@ -506,6 +430,7 @@ async fn start_run(
             }
             let _ = runs::append_index(&config.work_dir, &record);
             let _ = std::fs::remove_file(runs::current_path(&config.work_dir));
+            node.end_runner_token(&token);
             return Err(e).with_context(|| format!("start {}", config.command.display()));
         }
     };
@@ -516,6 +441,7 @@ async fn start_run(
     }
     Ok(Running {
         record,
+        token,
         child,
         started: Instant::now(),
         deadline: tokio::time::Instant::now() + config.run_timeout,
@@ -532,7 +458,8 @@ enum Outcome {
 
 /// Close a run: kill it if needed, write the transcript footer and the
 /// index record, prune old transcripts.
-async fn finish_run(config: &AgentConfig, mut running: Running, outcome: Outcome) {
+async fn finish_run(node: &Node, config: &AgentConfig, mut running: Running, outcome: Outcome) {
+    node.end_runner_token(&running.token);
     if !matches!(outcome, Outcome::Exited(_)) {
         let _ = running.child.kill().await;
     }
@@ -607,13 +534,14 @@ pub async fn run(
     shutdown: impl std::future::Future<Output = ()>,
 ) -> Result<()> {
     let me = author_id(&node.author_key(&config.profile)?);
-    let mcp_config = write_mcp_config(&config)?;
+    std::fs::create_dir_all(&config.work_dir)?;
     let mut config = config;
-    if config.runtime == "codex" {
-        let known = codex_features(&config.command).await;
-        config.codex_disable = CODEX_DENIED_FEATURES
+    if config.runtime == "codex" && config.access != Access::Inherit {
+        let known = access::codex_features(&config.command).await;
+        config.codex_disable = access::CODEX_DENIED_FEATURES
             .iter()
             .filter(|f| known.iter().any(|k| k == *f))
+            .filter(|f| config.access != Access::Workspace || !config.tools.iter().any(|t| t == *f))
             .map(|f| f.to_string())
             .collect();
         // Never run Codex without knowing what to switch off.
@@ -643,13 +571,13 @@ pub async fn run(
         tokio::select! {
             _ = &mut shutdown => {
                 if let Some(run) = running.take() {
-                    finish_run(&config, run, Outcome::Stopped).await;
+                    finish_run(&node, &config, run, Outcome::Stopped).await;
                 }
                 break;
             }
             outcome = wait_running(&mut running) => {
                 if let Some(run) = running.take() {
-                    finish_run(&config, run, outcome).await;
+                    finish_run(&node, &config, run, outcome).await;
                 }
             }
             event = events.recv() => match event {
@@ -729,7 +657,7 @@ pub async fn run(
                 last_run = Some(now);
                 last_heartbeat = now;
                 info!(trigger = %trigger.label(), "waking the agent");
-                match start_run(&config, &mcp_config, &trigger, text, remaining_usd).await {
+                match start_run(&node, &config, &trigger, text, remaining_usd).await {
                     Ok(run) => running = Some(run),
                     Err(e) => warn!(trigger = %trigger.label(), "agent run failed to start: {e:#}"),
                 }

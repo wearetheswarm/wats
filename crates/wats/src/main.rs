@@ -89,6 +89,11 @@ struct AgentArgs {
     /// Do not run the agents enabled in config.toml.
     #[arg(long, conflicts_with = "agents")]
     no_agent: bool,
+    /// What the agent may use besides the wats tools: locked (only them,
+    /// the default), workspace (agent.workdir's instructions, skills, MCP
+    /// servers, and agent.tools) or inherit (your whole environment).
+    #[arg(long, value_parser = wats::access::LEVELS)]
+    access: Option<String>,
     /// Profile the agent posts as [default: <OS user>-agent].
     #[arg(long)]
     agent_profile: Option<String>,
@@ -275,6 +280,32 @@ enum AgentAction {
     /// Follow the run in progress live, then the next ones (waits for the
     /// next run when none is in progress).
     Attach,
+    /// Posts of the agent held for review (agent.review).
+    Pending,
+    /// Publish a held post (the running node signs and sends it).
+    Approve { id: String },
+    /// Drop a held post.
+    Reject { id: String },
+}
+
+/// Agent keys `wats setup` can write to config.toml.
+#[derive(Debug, Clone, Args)]
+struct SetupKeys {
+    /// Who the agent is and what it can do (agent.about): its role in every
+    /// run, and the text of the announce it posts.
+    #[arg(long)]
+    about: Option<String>,
+    /// What the agent may use besides the wats tools (agent.access):
+    /// locked, workspace or inherit.
+    #[arg(long, value_parser = wats::access::LEVELS)]
+    access: Option<String>,
+    /// The agent's directory with workspace access (agent.workdir).
+    #[arg(long)]
+    workdir: Option<PathBuf>,
+    /// Built-in tools allowed with workspace access (agent.tools), e.g.
+    /// Read,Grep.
+    #[arg(long)]
+    tools: Option<String>,
 }
 
 #[derive(Debug, Subcommand)]
@@ -291,9 +322,8 @@ enum SetupTool {
         /// "codex"): a bare `wats` then runs it.
         #[arg(long)]
         agent: bool,
-        /// Who the agent is and what it can do (agent.about).
-        #[arg(long)]
-        about: Option<String>,
+        #[command(flatten)]
+        keys: SetupKeys,
         /// The Codex CLI.
         #[arg(long, env = "WATS_CODEX", default_value = "codex")]
         codex: PathBuf,
@@ -310,10 +340,8 @@ enum SetupTool {
         /// "claude"): a bare `wats` then runs it.
         #[arg(long)]
         agent: bool,
-        /// Who the agent is and what it can do (agent.about): its role in
-        /// every run, and the text of the announce it posts.
-        #[arg(long)]
-        about: Option<String>,
+        #[command(flatten)]
+        keys: SetupKeys,
         /// Claude Code scope of the MCP server: user (every project) or
         /// project (.mcp.json in the current directory).
         #[arg(long, default_value = "user", value_parser = ["user", "project"])]
@@ -474,7 +502,7 @@ fn setup_tool(
     data_dir: &std::path::Path,
     runtime: &str,
     (mcp, agent): (bool, bool),
-    about: Option<&str>,
+    keys: &SetupKeys,
     register: impl FnOnce(&str) -> Result<bool>,
 ) -> Result<()> {
     let (mcp, agent) = if mcp || agent {
@@ -500,15 +528,46 @@ fn setup_tool(
             }
         );
     }
-    if agent || about.is_some() {
+    let workdir = match &keys.workdir {
+        Some(dir) => Some(std::path::absolute(dir)?),
+        None => None,
+    };
+    let pairs: Vec<(&str, String)> = [
+        ("agent.about", keys.about.clone()),
+        ("agent.access", keys.access.clone()),
+        (
+            "agent.workdir",
+            workdir.as_ref().map(|d| d.display().to_string()),
+        ),
+        ("agent.tools", keys.tools.clone()),
+    ]
+    .into_iter()
+    .filter_map(|(k, v)| v.map(|v| (k, v)))
+    .collect();
+    if agent || !pairs.is_empty() {
         let mut file = ConfigFile::open(data_dir)?;
         if agent {
             file.set("agent.runtime", runtime)?;
         }
-        if let Some(about) = about {
-            file.set("agent.about", about)?;
+        for (key, value) in &pairs {
+            file.set(key, value)?;
         }
         file.save()?;
+        let settings = Settings::load(data_dir)?;
+        if settings.agent.access.as_deref() == Some("workspace") {
+            let dir = settings
+                .agent
+                .workdir
+                .clone()
+                .unwrap_or_else(|| data_dir.join("agent").join("workspace"));
+            wats::access::ensure_workspace(&dir)?;
+            println!(
+                "agent workspace: {}\n  instructions: CLAUDE.md / AGENTS.md\n  skills: .claude/skills/\n  \
+                 MCP servers: .mcp.json (Claude), .codex/config.toml (Codex)\n  \
+                 built-in tools: wats config set agent.tools Read,Grep",
+                dir.display()
+            );
+        }
         if agent {
             println!(
                 "{}: agent.runtime = \"{runtime}\"; `wats` now runs the node with a {name} agent",
@@ -698,6 +757,14 @@ impl NodeArgs {
         if let Some(bits) = self.min_pow_bits {
             config.min_pow_bits = bits;
         }
+        if file.agent.review == Some(true) {
+            config.review_profiles.push(
+                file.agent
+                    .profile
+                    .clone()
+                    .unwrap_or_else(|| format!("{}-agent", os_user_profile())),
+            );
+        }
         if let Some(profile) = self.profile.as_ref().or(file.profile.as_ref()) {
             anyhow::ensure!(
                 wats::node::is_valid_profile(profile),
@@ -882,6 +949,16 @@ async fn run_node(node: Arc<Node>, run: NodeRun, mut shutdown: Shutdown) -> Resu
     let mut fetched = node.subscribe_fetched();
     let mut idle_since = tokio::time::Instant::now();
     let mut tick = tokio::time::interval(Duration::from_secs(1));
+    // Posts approved with `wats agent approve` go out from here.
+    let reviewed = {
+        let node = Arc::clone(&node);
+        tokio::spawn(async move {
+            loop {
+                wats::review::publish_approved(&node).await;
+                tokio::time::sleep(Duration::from_secs(2)).await;
+            }
+        })
+    };
     let (stop_agent, agent_stopped) = tokio::sync::watch::channel(false);
     let agent = agent.map(|config| {
         let mut stopped = agent_stopped;
@@ -961,6 +1038,7 @@ async fn run_node(node: Arc<Node>, run: NodeRun, mut shutdown: Shutdown) -> Resu
             _ = &mut shutdown => break,
         }
     }
+    reviewed.abort();
     if let Some(agent) = agent {
         let _ = stop_agent.send(true);
         match agent.await {
@@ -1039,9 +1117,21 @@ fn agent_config(
         .clone()
         .or(file.command.clone())
         .unwrap_or_else(|| runtime_default_command(&runtime));
+    let access: wats::access::Access = args
+        .access
+        .as_deref()
+        .or(file.access.as_deref())
+        .unwrap_or("locked")
+        .parse()?;
     Ok(Some(wats::agent::AgentConfig {
         runtime,
         codex_disable: Vec::new(),
+        access,
+        workdir: file
+            .workdir
+            .clone()
+            .unwrap_or_else(|| data_dir.join("agent").join("workspace")),
+        tools: file.tools.clone(),
         profile,
         user: std::env::var("USER")
             .or_else(|_| std::env::var("USERNAME"))
@@ -1148,6 +1238,28 @@ fn print_banner(config: &NodeConfig, agent: Option<&wats::agent::AgentConfig>) {
         None => eprintln!("agent: off (wats --agent claude, or wats setup claude)"),
     }
     if let Some(agent) = agent {
+        let summary = wats::access::describe(&wats::access::Describe {
+            runtime: &agent.runtime,
+            access: agent.access,
+            workdir: &agent.workdir,
+            tools: &agent.tools,
+            allow: &agent.allow,
+            review: config.review_profiles.contains(&agent.profile),
+        });
+        eprintln!(
+            "agent access: {}{}",
+            summary.line,
+            if config.review_profiles.contains(&agent.profile) {
+                " · review on: its posts wait for `wats agent approve`"
+            } else {
+                ""
+            }
+        );
+        for warning in summary.warnings {
+            eprintln!("warning: {warning}");
+        }
+    }
+    if let Some(agent) = agent {
         let spend = wats::budget::spend(&agent.work_dir, unix_now());
         if agent.runtime == "codex" {
             // Codex reports tokens, not dollars: runs are what is counted.
@@ -1191,16 +1303,21 @@ async fn agent_watch(data_dir: &std::path::Path, action: AgentAction) -> Result<
             } else {
                 let mut result = writeln!(
                     out,
-                    "{:<32} {:<20} {:<10} {:>8} {:>6} {:>9}",
-                    "RUN", "STARTED", "STATUS", "SECONDS", "TURNS", "COST"
+                    "{:<32} {:<20} {:<9} {:<10} {:>8} {:>6} {:>9}",
+                    "RUN", "STARTED", "ACCESS", "STATUS", "SECONDS", "TURNS", "COST"
                 );
                 for r in shown {
                     result = result.and_then(|()| {
                         writeln!(
                             out,
-                            "{:<32} {:<20} {:<10} {:>8} {:>6} {:>9}",
+                            "{:<32} {:<20} {:<9} {:<10} {:>8} {:>6} {:>9}",
                             r.id,
                             runs::format_time(r.started),
+                            if r.access.is_empty() {
+                                "locked"
+                            } else {
+                                &r.access
+                            },
                             r.status,
                             r.seconds.map(|s| format!("{s:.1}")).unwrap_or_default(),
                             r.turns.map(|t| t.to_string()).unwrap_or_default(),
@@ -1254,6 +1371,53 @@ async fn agent_watch(data_dir: &std::path::Path, action: AgentAction) -> Result<
             } else {
                 printed
             }
+        }
+        AgentAction::Pending => {
+            let held = wats::review::list(data_dir);
+            if held.is_empty() {
+                writeln!(out, "nothing held for review")
+            } else {
+                held.iter().try_for_each(|h| {
+                    writeln!(
+                        out,
+                        "{}  {}  {} as {}{}\n  {}\n  {}",
+                        h.id,
+                        runs::format_time(h.created),
+                        h.kind,
+                        h.profile,
+                        match h.status.as_str() {
+                            "pending" => String::new(),
+                            other => format!(
+                                " [{other}{}]",
+                                h.error
+                                    .as_ref()
+                                    .map(|e| format!(": {e}"))
+                                    .unwrap_or_default()
+                            ),
+                        },
+                        h.title
+                            .clone()
+                            .unwrap_or_else(|| wats::event::title_from_text(&h.text)),
+                        h.text.lines().next().unwrap_or("")
+                    )
+                })
+            }
+        }
+        AgentAction::Approve { id } => {
+            let held = wats::review::approve(data_dir, &id)?;
+            writeln!(
+                out,
+                "approved {} ({} as {}): the running node publishes it, or the next one to start",
+                held.id, held.kind, held.profile
+            )
+        }
+        AgentAction::Reject { id } => {
+            let held = wats::review::reject(data_dir, &id)?;
+            writeln!(
+                out,
+                "rejected {} ({} as {})",
+                held.id, held.kind, held.profile
+            )
         }
         AgentAction::Attach => {
             let start = runs::current(&work_dir).map(|id| (id, 0));
@@ -1335,7 +1499,7 @@ async fn main() -> Result<()> {
                 SetupTool::Claude {
                     mcp,
                     agent,
-                    about,
+                    keys,
                     scope,
                     claude,
                 },
@@ -1345,7 +1509,7 @@ async fn main() -> Result<()> {
                 &data_dir,
                 "claude",
                 (mcp, agent),
-                about.as_deref(),
+                &keys,
                 |profile| register_in_claude(&cli.node, profile, &scope, &claude),
             );
         }
@@ -1354,7 +1518,7 @@ async fn main() -> Result<()> {
                 SetupTool::Codex {
                     mcp,
                     agent,
-                    about,
+                    keys,
                     codex,
                 },
         }) => {
@@ -1363,14 +1527,14 @@ async fn main() -> Result<()> {
                 &data_dir,
                 "codex",
                 (mcp, agent),
-                about.as_deref(),
+                &keys,
                 |profile| register_in_codex(&cli.node, profile, &codex),
             );
         }
         _ => {}
     }
     let settings = Settings::load(&data_dir)?;
-    let config = cli.node.config(&settings)?;
+    let mut config = cli.node.config(&settings)?;
     let (daemon, json_lines) = match cli.command {
         None => (cli.daemon, false),
         Some(Command::Node { daemon }) => (*daemon, true),
@@ -1385,6 +1549,12 @@ async fn main() -> Result<()> {
         }
     };
     let agent = agent_config(&cli.node, &daemon.agent, &settings.agent, &data_dir)?;
+    if let Some(agent) = &agent
+        && settings.agent.review == Some(true)
+        && !config.review_profiles.contains(&agent.profile)
+    {
+        config.review_profiles.push(agent.profile.clone());
+    }
     // `--agent claude|codex` also makes sure that tool's sessions see the
     // swarm.
     if let Some(agent) = &agent

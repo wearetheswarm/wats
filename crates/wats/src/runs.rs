@@ -24,6 +24,9 @@ pub struct RunRecord {
     pub id: String,
     pub runtime: String,
     pub profile: String,
+    /// `locked`, `workspace` or `inherit`.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub access: String,
     /// `events` or `heartbeat`.
     pub trigger: String,
     /// The events that woke the agent.
@@ -116,7 +119,7 @@ impl RunRecord {
     pub fn header(&self) -> Value {
         json!({
             "type": "wats_run", "id": self.id, "runtime": self.runtime,
-            "profile": self.profile, "trigger": self.trigger,
+            "profile": self.profile, "access": self.access, "trigger": self.trigger,
             "events": self.events, "started": self.started,
         })
     }

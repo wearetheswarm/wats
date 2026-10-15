@@ -93,6 +93,10 @@ pub struct NodeConfig {
     /// [`HARD_CEILING_PERCENT`] of it, it also refuses events from others.
     /// Unlimited if unset. Eviction comes in Phase 2.
     pub storage_max: Option<u64>,
+    /// Profiles whose posts through MCP are held for review instead of
+    /// published (`agent.review`: the agent's profile). Non-empty also
+    /// holds the posts of every runner session.
+    pub review_profiles: Vec<String>,
     /// Replication factor k for blobs: how many peers are asked to hold a
     /// blob at publish time (SPEC §2.5, §7).
     pub replication: usize,
@@ -112,6 +116,7 @@ impl NodeConfig {
             max_blob_bytes: 256 * 1024 * 1024,
             blob_quota: None,
             storage_max: None,
+            review_profiles: Vec::new(),
             replication: 3,
             bootstrap: Vec::new(),
             port: None,
@@ -262,6 +267,9 @@ pub struct Node {
     storage_bytes: std::sync::atomic::AtomicU64,
     /// When we last logged that storage is full (rate limit).
     storage_logged: std::sync::Mutex<Option<std::time::Instant>>,
+    /// Tokens of the agent runs in progress: an MCP session presenting one
+    /// is a runner session.
+    runner_tokens: std::sync::Mutex<HashSet<String>>,
     /// Exclusive lock on the data directory, released by `shutdown`.
     lock: std::sync::Mutex<Option<std::fs::File>>,
 }
@@ -400,6 +408,7 @@ impl Node {
             usage: Default::default(),
             storage_bytes: Default::default(),
             storage_logged: Default::default(),
+            runner_tokens: Default::default(),
             lock: std::sync::Mutex::new(Some(lock)),
         });
         node.measure_storage().await;
@@ -642,6 +651,29 @@ impl Node {
             }
         }
         confirmed
+    }
+
+    /// A token for one agent run, valid until [`Node::end_runner_token`].
+    pub fn new_runner_token(&self) -> String {
+        let mut bytes = [0u8; 16];
+        let _ = getrandom::fill(&mut bytes);
+        let token = hex::encode(bytes);
+        if let Ok(mut tokens) = self.runner_tokens.lock() {
+            tokens.insert(token.clone());
+        }
+        token
+    }
+
+    pub fn end_runner_token(&self, token: &str) {
+        if let Ok(mut tokens) = self.runner_tokens.lock() {
+            tokens.remove(token);
+        }
+    }
+
+    pub fn is_runner_token(&self, token: &str) -> bool {
+        self.runner_tokens
+            .lock()
+            .is_ok_and(|tokens| tokens.contains(token))
     }
 
     async fn measure_storage(&self) {
