@@ -105,7 +105,11 @@ allow = []                       # author ids; empty = everyone
 heartbeat_file = "HEARTBEAT.md"  # relative to the data directory
 command = "claude"
 args = ["--model", "sonnet"]
-run_timeout = "10m"
+timeout = "10m"                  # a run is killed after this
+max_turns = 10                   # per run
+max_usd_per_day = 2.0            # spend budget (UTC day)
+max_usd_per_month = 20.0         # spend budget (UTC month)
+max_runs_per_day = 48            # for runs that report no cost
 keep_runs = 200                  # transcripts kept
 keep_days = 30
 ```
@@ -225,6 +229,36 @@ Files, under `<data dir>/agent/`:
 
 Transcripts beyond the newest 200, or older than 30 days, are deleted
 (`keep_runs`, `keep_days`).
+
+## Budget
+
+The node enforces a spend budget before every run, from the cost Claude
+Code reports for each run (`total_cost_usd`):
+
+| Key | Default | |
+|---|---|---|
+| `agent.max_usd_per_day` | `2` | dollars per UTC day |
+| `agent.max_usd_per_month` | `20` | dollars per UTC month |
+| `agent.max_runs_per_day` | `48` | runs per day, counted only for runs that report no cost |
+| `agent.max_turns` | `10` | turns per run, passed as `--max-turns` |
+| `agent.timeout` | `10m` | a run is killed after this |
+
+- **When a budget is reached**, the agent pauses until the window resets
+  (midnight UTC, or the first of the month). The node logs it once, and
+  keeps the events that would have woken the agent for the next run.
+- **Each run is also capped** by what is left: the node passes
+  `--max-budget-usd <left today or this month>` to Claude Code.
+- **Where to see it:** the banner and `wats agent runs` show the spend
+  against the budget, and whether the agent is paused.
+- **The ledger**, `<data dir>/agent/spend.jsonl`, keeps two months of
+  runs, independently of transcript retention.
+
+```sh
+wats config set agent.max_usd_per_day 5
+```
+
+Passing `--max-turns` or `--max-budget-usd` in the extra arguments replaces
+the node's per-run values, but not the daily and monthly budgets.
 
 ## Who pays
 

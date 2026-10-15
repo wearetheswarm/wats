@@ -61,7 +61,11 @@ pub struct AgentSettings {
     pub command: Option<PathBuf>,
     #[serde(default)]
     pub args: Vec<String>,
-    pub run_timeout: Option<String>,
+    pub timeout: Option<String>,
+    pub max_turns: Option<u32>,
+    pub max_usd_per_day: Option<f64>,
+    pub max_usd_per_month: Option<f64>,
+    pub max_runs_per_day: Option<usize>,
     pub keep_runs: Option<usize>,
     pub keep_days: Option<u64>,
 }
@@ -102,6 +106,8 @@ pub enum ValueType {
     Duration,
     Size,
     Integer,
+    /// A non-negative number, e.g. dollars.
+    Float,
     Bool,
     /// Comma-separated on the command line, an array of strings in the file.
     List,
@@ -237,10 +243,34 @@ pub const KEYS: &[Key] = &[
         "extra arguments for the agent CLI",
     ),
     key(
-        "agent.run_timeout",
+        "agent.timeout",
         ValueType::Duration,
         "10m",
         "a run is killed after this",
+    ),
+    key(
+        "agent.max_turns",
+        ValueType::Integer,
+        "10",
+        "turns per run (passed to the agent CLI)",
+    ),
+    key(
+        "agent.max_usd_per_day",
+        ValueType::Float,
+        "2",
+        "spend budget per UTC day, from the cost the agent CLI reports",
+    ),
+    key(
+        "agent.max_usd_per_month",
+        ValueType::Float,
+        "20",
+        "spend budget per UTC month",
+    ),
+    key(
+        "agent.max_runs_per_day",
+        ValueType::Integer,
+        "48",
+        "runs per day that report no cost",
     ),
     key(
         "agent.keep_runs",
@@ -303,6 +333,15 @@ fn toml_value(key: &Key, raw: &str) -> Result<toml_edit::Value> {
                 .parse()
                 .map_err(|_| invalid(format!("{raw:?} is not an integer")))?;
             if n < 0 || (key.name == "port" && n > i64::from(u16::MAX)) {
+                return Err(invalid(format!("{n} is out of range")));
+            }
+            n.into()
+        }
+        ValueType::Float => {
+            let n: f64 = raw
+                .parse()
+                .map_err(|_| invalid(format!("{raw:?} is not a number")))?;
+            if !n.is_finite() || n < 0.0 {
                 return Err(invalid(format!("{n} is out of range")));
             }
             n.into()

@@ -7,6 +7,7 @@
 pub mod agent;
 pub mod attach;
 pub mod bootstrap;
+pub mod budget;
 pub mod event;
 pub mod grease;
 pub mod identity;

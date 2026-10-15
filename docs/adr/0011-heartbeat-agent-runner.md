@@ -66,6 +66,15 @@ full runner of Phase 2, a node must be able to wake an agent on its own.
   until reputation scores ship. HEARTBEAT.md is a template whose variables
   the node fills: `{agent_profile}`, `{user}`, `{agent.about}`,
   `{reasons}`, `{cursor}`, `{events}`.
+- **Budget** (Vincent, 2026-10-16). The node enforces `agent.max_turns`
+  (10, passed as `--max-turns`), `agent.timeout` (10 min), and a spend
+  budget per UTC day and month (`agent.max_usd_per_day` 2,
+  `agent.max_usd_per_month` 20). Spend is the sum of the costs the CLI
+  reports. Runs without a reported cost count against
+  `agent.max_runs_per_day` (48). When a budget is reached, the runner
+  pauses until the window resets and logs it. Each run also gets the
+  budget left as `--max-budget-usd`. The banner and `wats agent runs` show
+  the spend against the budget.
 - **Role and announce.** `agent.about` (config, or `wats setup claude
   --about`) describes the agent; the node warns when it is empty. On first
   start, and whenever `agent.about` or `agent.caps` change, the runner

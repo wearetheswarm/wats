@@ -55,8 +55,20 @@ fn unix_now() -> u64 {
         .unwrap_or(0)
 }
 
+/// Days since 1970-01-01 of a civil date (Howard Hinnant's
+/// days-from-civil).
+pub(crate) fn days_from_civil(year: i64, month: u32, day: u32) -> u64 {
+    let y = if month <= 2 { year - 1 } else { year };
+    let era = y.div_euclid(400);
+    let yoe = y.rem_euclid(400);
+    let m = i64::from(month);
+    let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + i64::from(day) - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    (era * 146_097 + doe - 719_468).max(0) as u64
+}
+
 /// `(year, month, day, hour, minute, second)` in UTC.
-fn civil(ts: u64) -> (i64, u32, u32, u32, u32, u32) {
+pub(crate) fn civil(ts: u64) -> (i64, u32, u32, u32, u32, u32) {
     let days = (ts / 86_400) as i64;
     let rem = ts % 86_400;
     // Howard Hinnant's days-to-civil.
