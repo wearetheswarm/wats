@@ -94,6 +94,9 @@ async fn agent_wakes_on_asks_and_heartbeats() -> anyhow::Result<()> {
     let config = AgentConfig {
         runtime: "claude".into(),
         profile: "agent".into(),
+        user: "alice".into(),
+        about: "I review CSV files.\nAsk me about data quality.".into(),
+        caps: vec!["csv".into(), "lang:en".into()],
         every: Duration::from_secs(1),
         heartbeat: Duration::from_secs(4),
         max_runs_per_hour: 100,
@@ -110,7 +113,7 @@ async fn agent_wakes_on_asks_and_heartbeats() -> anyhow::Result<()> {
         keep_days: 30,
     };
     let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
-    let runner = tokio::spawn(wats::agent::run(Arc::clone(&a), config, async {
+    let runner = tokio::spawn(wats::agent::run(Arc::clone(&a), config.clone(), async {
         let _ = stopped.await;
     }));
     tokio::time::sleep(Duration::from_millis(300)).await;
@@ -128,7 +131,24 @@ async fn agent_wakes_on_asks_and_heartbeats() -> anyhow::Result<()> {
     let (prompt, args) = runs(dir.path()).remove(0);
     assert!(prompt.starts_with(DEFAULT_HEARTBEAT.lines().next().unwrap()));
     assert!(prompt.contains(&wanted.id), "{prompt}");
-    assert!(prompt.contains("New events of interest"));
+    assert!(
+        prompt.contains("You are agent, an autonomous agent serving the swarm from alice's node."),
+        "{prompt}"
+    );
+    assert!(
+        prompt.contains("Your role: I review CSV files.\nAsk me about data quality."),
+        "{prompt}"
+    );
+    assert!(
+        prompt.contains("You were woken because: 1 new ask."),
+        "{prompt}"
+    );
+    assert!(
+        prompt.contains(&format!("- {} · ask · ", wanted.id)),
+        "{prompt}"
+    );
+    assert!(prompt.contains("Who can review my CSV?"), "{prompt}");
+    assert!(!prompt.contains('{'), "every variable is filled: {prompt}");
     assert!(!prompt.contains(&own.id), "own posts never wake the agent");
     assert!(
         !prompt.contains(&other.id),
@@ -143,6 +163,7 @@ async fn agent_wakes_on_asks_and_heartbeats() -> anyhow::Result<()> {
         args.contains("--output-format stream-json --verbose"),
         "{args}"
     );
+    assert!(args.contains("--setting-sources project"), "{args}");
     assert!(args.contains("--model test-model"), "{args}");
     let mcp_config: serde_json::Value =
         serde_json::from_slice(&std::fs::read(dir.path().join("work/mcp-agent.json"))?)?;
@@ -152,7 +173,7 @@ async fn agent_wakes_on_asks_and_heartbeats() -> anyhow::Result<()> {
     eventually("a heartbeat run", || {
         runs(dir.path())
             .iter()
-            .any(|(p, _)| p.contains("Heartbeat: nothing specific woke you"))
+            .any(|(p, _)| p.contains("woken because: the heartbeat"))
     })
     .await;
 
@@ -178,8 +199,42 @@ async fn agent_wakes_on_asks_and_heartbeats() -> anyhow::Result<()> {
     assert_eq!(first["type"], "wats_run", "{transcript}");
     assert!(transcript.contains("\"type\":\"wats_end\""), "{transcript}");
 
+    // The agent announced itself once, from its own profile.
+    let agent_id = wats::identity::author_id(&a.author_key("agent")?);
+    let announces = |node: &Node| {
+        node.store()
+            .search(
+                None,
+                &wats::store::Filter {
+                    kinds: vec![Kind::Announce],
+                    author: Some(agent_id.clone()),
+                    ..Default::default()
+                },
+                10,
+            )
+            .unwrap()
+    };
+    let posted = announces(&a);
+    assert_eq!(posted.len(), 1);
+    assert_eq!(
+        posted[0].event.title.as_deref(),
+        Some("I review CSV files.")
+    );
+    assert_eq!(posted[0].event.tags, ["cap:csv", "lang:en"]);
+
     let _ = stop.send(());
     runner.await??;
+    // Restarting with the same description does not announce again.
+    let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+    let mut again = config.clone();
+    again.heartbeat = Duration::from_secs(3600);
+    let runner = tokio::spawn(wats::agent::run(Arc::clone(&a), again, async {
+        let _ = stopped.await;
+    }));
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let _ = stop.send(());
+    runner.await??;
+    assert_eq!(announces(&a).len(), 1);
     for n in [a, b, c] {
         n.shutdown().await?;
     }
@@ -348,6 +403,14 @@ fn setup_claude_registers_and_enables() {
     std::fs::remove_file(data.join("config.toml")).unwrap();
     let said = setup(&["--agent"]);
     assert!(said.contains("agent.runtime"), "{said}");
+    assert!(said.contains("Describe its role"), "{said}");
+    let said = setup(&["--agent", "--about", "I translate French."]);
+    assert!(!said.contains("Describe its role"), "{said}");
+    let config = std::fs::read_to_string(data.join("config.toml")).unwrap();
+    assert!(
+        config.contains("about = \"I translate French.\""),
+        "{config}"
+    );
     assert!(!log.exists());
     setup(&["--mcp", "--scope", "project"]);
     let calls = std::fs::read_to_string(&log).unwrap();

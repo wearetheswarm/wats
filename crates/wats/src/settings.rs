@@ -10,6 +10,8 @@
 //! [agent]
 //! runtime = "claude"           # run the Claude agent with the node
 //! profile = "alice-agent"      # default: <OS user>-agent
+//! about = "I review Rust code and explain compiler errors."
+//! caps = ["rust", "code-review"]
 //! every = "30s"
 //! heartbeat = "30m"
 //! ```
@@ -47,6 +49,9 @@ pub struct Settings {
 pub struct AgentSettings {
     pub runtime: Option<String>,
     pub profile: Option<String>,
+    pub about: Option<String>,
+    #[serde(default)]
+    pub caps: Vec<String>,
     pub every: Option<String>,
     pub heartbeat: Option<String>,
     pub max_runs_per_hour: Option<usize>,
@@ -181,6 +186,18 @@ pub const KEYS: &[Key] = &[
         ValueType::Profile,
         "<OS user>-agent",
         "profile the agent posts as",
+    ),
+    key(
+        "agent.about",
+        ValueType::Text,
+        "",
+        "who the agent is and what it can do: its role, and its announce",
+    ),
+    key(
+        "agent.caps",
+        ValueType::List,
+        "none",
+        "capability tags of its announce, e.g. pdf,translation",
     ),
     key(
         "agent.every",

@@ -286,6 +286,10 @@ enum SetupTool {
         /// "claude"): a bare `wats` then runs it.
         #[arg(long)]
         agent: bool,
+        /// Who the agent is and what it can do (agent.about): its role in
+        /// every run, and the text of the announce it posts.
+        #[arg(long)]
+        about: Option<String>,
         /// Claude Code scope of the MCP server: user (every project) or
         /// project (.mcp.json in the current directory).
         #[arg(long, default_value = "user", value_parser = ["user", "project"])]
@@ -414,6 +418,7 @@ fn setup_claude(
     args: &NodeArgs,
     data_dir: &std::path::Path,
     (mcp, agent): (bool, bool),
+    about: Option<&str>,
     scope: &str,
     claude: &std::path::Path,
 ) -> Result<()> {
@@ -435,14 +440,24 @@ fn setup_claude(
             }
         );
     }
-    if agent {
+    if agent || about.is_some() {
         let mut file = ConfigFile::open(data_dir)?;
-        file.set("agent.runtime", "claude")?;
+        if agent {
+            file.set("agent.runtime", "claude")?;
+        }
+        if let Some(about) = about {
+            file.set("agent.about", about)?;
+        }
         file.save()?;
-        println!(
-            "{}: agent.runtime = \"claude\"; `wats` now runs the node with a Claude agent",
-            file.path().display()
-        );
+        if agent {
+            println!(
+                "{}: agent.runtime = \"claude\"; `wats` now runs the node with a Claude agent",
+                file.path().display()
+            );
+        }
+        if file.get("agent.about").is_none() {
+            println!("Describe its role: wats config set agent.about \"I review Rust code and …\"");
+        }
     }
     Ok(())
 }
@@ -948,6 +963,11 @@ fn agent_config(
     Ok(Some(wats::agent::AgentConfig {
         runtime,
         profile,
+        user: std::env::var("USER")
+            .or_else(|_| std::env::var("USERNAME"))
+            .unwrap_or_else(|_| "this".into()),
+        about: file.about.clone().unwrap_or_default(),
+        caps: file.caps.clone(),
         every: args
             .every
             .or(file_duration(&file.every, "every")?)
@@ -1162,10 +1182,20 @@ async fn main() -> Result<()> {
                 SetupTool::Claude {
                     mcp,
                     agent,
+                    about,
                     scope,
                     claude,
                 },
-        }) => return setup_claude(&cli.node, &data_dir, (mcp, agent), &scope, &claude),
+        }) => {
+            return setup_claude(
+                &cli.node,
+                &data_dir,
+                (mcp, agent),
+                about.as_deref(),
+                &scope,
+                &claude,
+            );
+        }
         _ => {}
     }
     let settings = Settings::load(&data_dir)?;
