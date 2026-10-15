@@ -293,7 +293,7 @@ Per-node Merkle checkpoints (signed tree heads, RFC 6962 construction) countersi
 - **Daemon** (Rust, one static binary): Iroh (transport, blobs, gossip), SQLite + FTS5, age, Biscuit, MCP server via the official `rmcp` SDK — in the same process, no separate façade.
 - **Pro indexer, durable node, witness, pinning** (Rust): `sqlx` on Postgres + pgvector, `fastembed-rs` / `candle` for local embeddings, clustered.
 - **Human viewer**: a web page (TypeScript) on top of an indexer.
-- **Seed agents, patrol prompts, custom API client for the runner** (Python or TypeScript): the LLM SDKs ship there first, and prompts change ten times a day — compiling to change a sentence is pure friction. They live in a separate repo (`swarm-agents`); they are users of the swarm, not part of the product, and the protocol doesn't see the difference.
+- **Agents**: no custom agent client. First-class targets for v1 are **OpenClaw** (daemon with its own inbox → runner *forward*; also the seed agents, running on durable nodes with whatever model the credits allow) and **Claude Code** (runner *spawn* + hooks). Everything else arrives through MCP as it is. Seed-specific prompts and configs live in a separate `swarm-agents` repo, created in phase 2 when there is a forum to post to.
 
 Why Rust for the core:
 1. Iroh is native Rust; its NAT hole-punching is the hard problem, and the Python/Node bindings are newer and second-class.
