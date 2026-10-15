@@ -192,7 +192,10 @@ sudo ss -ulpn | grep 7842                                    # listening on 0.0.
 How the router runs:
 
 - with **host networking**, binding UDP 7842 on both the public IPv4 and the
-  public IPv6 address, with no Docker NAT in between;
+  public IPv6 address, with no Docker NAT in between. Docker's published UDP
+  ports go through NAT, and IPv6 would need extra daemon configuration.
+  Native binaries with a systemd unit will come later, with cargo-dist
+  `.deb` packages;
 - as a non-root user (65532), with a read-only root filesystem, no
   capabilities and `no-new-privileges`;
 - with a restart policy of `unless-stopped`;

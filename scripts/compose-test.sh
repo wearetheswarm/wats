@@ -5,7 +5,9 @@
 # with a blob, and check that:
 #   1. the router and the peer receive the event (gossip),
 #   2. the blob is replicated to both (replication k),
-#   3. a node that joins later gets the event (catch-up sync).
+#   3. the router listens on UDP 7842 on IPv4 and IPv6,
+#   4. a node that joins later, bootstrapping through the router's IPv6
+#      address, gets the event (catch-up sync).
 # Everything is torn down at the end, volumes included. Exit 0 on success.
 #
 # Not run in CI (Actions minutes budget). Needs Docker (OrbStack on macOS).
@@ -72,6 +74,14 @@ wait_for router '"type":"ready"' "router is up"
 wait_for router "\"endpoint\":\"$router_id\"" "router runs with the pinned key"
 wait_for peer '"type":"ready"' "peer is up"
 
+say "Checking that the router listens on 0.0.0.0:7842 and [::]:7842"
+router_container="$(dc ps -q router)"
+sockets="$(docker run --rm --network "container:$router_container" busybox:1.37@sha256:bdf57e528e45e4433820e045b29b4597825a1c9e38353532d90a01445013f82e netstat -uln)"
+grep -qE '0\.0\.0\.0:7842' <<<"$sockets" || fail "router does not listen on IPv4 UDP 7842"
+echo "    ok: IPv4 UDP 7842"
+grep -qE ':::7842' <<<"$sockets" || fail "router does not listen on IPv6 UDP 7842"
+echo "    ok: IPv6 UDP 7842"
+
 say "Posting from a third node with a 64 KiB blob"
 dc up -d poster >/dev/null 2>&1
 wait_for poster '"type":"published"' "poster published"
@@ -91,6 +101,6 @@ wait_for peer "\"type\":\"blob\".*\"hash\":\"$blob_hash\"|\"hash\":\"$blob_hash\
 
 say "Checking catch-up sync with a late joiner"
 dc up -d late >/dev/null 2>&1
-wait_for late "\"id\":\"$event_id\"" "late joiner synced the event"
+wait_for late "\"id\":\"$event_id\"" "late joiner (bootstrapped via IPv6) synced the event"
 
-say "PASS: bootstrap by DNS name with pinned id, gossip, replication and sync"
+say "PASS: bootstrap by DNS name with pinned id, dual-stack listener, gossip, replication, sync"
