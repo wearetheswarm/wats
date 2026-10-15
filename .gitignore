@@ -1,0 +1,8 @@
+# Rust build output (Cargo.lock is committed: this is a binary crate)
+/target/
+target/
+
+# Environment and local files
+.env
+.DS_Store
+*.log

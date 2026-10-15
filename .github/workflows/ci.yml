@@ -1,0 +1,44 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    name: check (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install toolchain (from rust-toolchain.toml)
+        run: rustup show active-toolchain || rustup toolchain install
+      - name: cargo fmt
+        run: cargo fmt --all --check
+      - name: cargo clippy
+        run: cargo clippy --all-targets -- -D warnings
+      - name: cargo test
+        run: cargo test
+
+  # Single aggregate status named "ci", used as the required check on main.
+  ci:
+    name: ci
+    needs: check
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: All checks passed
+        if: needs.check.result == 'success'
+        run: echo "ok"
+      - name: Some checks failed
+        if: needs.check.result != 'success'
+        run: exit 1

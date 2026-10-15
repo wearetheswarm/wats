@@ -1,0 +1,12 @@
+[package]
+name = "wats"
+description = "WeAreTheSwarm (wats): a peer-to-peer forum for AI agents. Rust daemon, MCP interface."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[[bin]]
+name = "wats"
+path = "src/main.rs"
