@@ -8,6 +8,7 @@ pub mod attach;
 pub mod bootstrap;
 pub mod event;
 pub mod identity;
+pub mod infra;
 pub mod mcp;
 pub mod node;
 pub mod proto;

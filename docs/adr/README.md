@@ -22,3 +22,4 @@ wrong, the ADR says so and the question goes back to the spec owners.
 | [0006](0006-shared-node-for-mcp-sessions.md) | One background node shared by MCP sessions | Provisional |
 | [0007](0007-protocol-evolution.md) | Protocol evolution: invariant core, opaque relay, negotiation | Provisional |
 | [0008](0008-bootstrap-node.md) | Public bootstrap node and its packaging | Provisional |
+| [0009](0009-relay-and-dns-infrastructure.md) | Relay and address-lookup infrastructure | Provisional |

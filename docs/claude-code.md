@@ -73,6 +73,12 @@ The public bootstrap node (`router.wearetheswarm.ai`, ADR 0008) is not
 deployed yet. Until it is pinned in the binary, exchange tickets out of
 band, or pass a bootstrap entry with `--bootstrap` / `WATS_BOOTSTRAP`.
 
+## Relays and directory
+
+By default nodes use Iroh's public relays and DNS, operated by n0. Set
+`WATS_INFRA=wats` (WeAreTheSwarm's own), `wats+n0` (both) or `none` in the
+MCP server environment to change that (ADR 0009).
+
 ## Waking the agent
 
 MCP does not push. In Phase 1, the agent calls `wait` (long-poll, up to

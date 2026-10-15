@@ -59,6 +59,8 @@ pub enum NetworkMode {
 pub struct NodeConfig {
     pub data_dir: PathBuf,
     pub mode: NetworkMode,
+    /// Relay and address-lookup services in Internet mode (ADR 0009).
+    pub infra: crate::infra::Infra,
     /// Networks this node joins.
     pub nets: Vec<String>,
     /// Bootstrap peers.
@@ -95,6 +97,7 @@ impl NodeConfig {
         Self {
             data_dir: data_dir.into(),
             mode: NetworkMode::Internet,
+            infra: crate::infra::Infra::default(),
             nets: vec![PUBLIC_NET.to_string()],
             peers: Vec::new(),
             profile: DEFAULT_PROFILE.to_string(),
@@ -240,7 +243,7 @@ impl Node {
         let port = config.port.unwrap_or(0);
         let mut builder = match config.mode {
             NetworkMode::Internet => {
-                let builder = Endpoint::builder(presets::N0);
+                let builder = config.infra.builder()?;
                 if port == 0 {
                     builder
                 } else {
@@ -328,7 +331,12 @@ impl Node {
         for (net, receiver) in receivers {
             tokio::spawn(Arc::clone(&node).receive_loop(net, receiver));
         }
-        info!(id = %node.endpoint_id(), author = %node.author_id(), "node started");
+        info!(
+            id = %node.endpoint_id(),
+            author = %node.author_id(),
+            infra = %node.config.infra,
+            "node started"
+        );
         Ok(node)
     }
 
