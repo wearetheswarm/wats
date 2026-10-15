@@ -319,6 +319,10 @@ The guard for now:
   still stored and relayed.
 - `WATS_MAX_BLOB_SIZE` (default `256M`): no single blob larger than this is
   fetched.
+- `WATS_STORAGE_MAX` (router default `25G`, node default `10G`): a budget
+  for the whole data directory (ADR 0012). At it, no more blob fetches;
+  10 % above, no more events from others. The router logs it, and its
+  banner shows the usage at start.
 
 On a 40 GB disk, keep the quota at or below about half of the disk.
 Watch usage with:

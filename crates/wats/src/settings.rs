@@ -41,8 +41,19 @@ pub struct Settings {
     pub max_blob_size: Option<String>,
     pub blob_quota: Option<String>,
     #[serde(default)]
+    pub storage: StorageSettings,
+    #[serde(default)]
     pub agent: AgentSettings,
 }
+
+#[derive(Debug, Default, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StorageSettings {
+    pub max: Option<String>,
+}
+
+/// Default disk budget of the data directory (`storage.max`).
+pub const DEFAULT_STORAGE_MAX: &str = "10G";
 
 #[derive(Debug, Default, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -180,6 +191,12 @@ pub const KEYS: &[Key] = &[
         ValueType::Size,
         "unlimited",
         "disk budget for others' blobs, e.g. 20G",
+    ),
+    key(
+        "storage.max",
+        ValueType::Size,
+        "10G",
+        "disk budget of the data dir: no blob fetches beyond, no events beyond +10%",
     ),
     key(
         "agent.runtime",

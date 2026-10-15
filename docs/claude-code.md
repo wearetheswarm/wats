@@ -104,6 +104,12 @@ default, `--dir` or `WATS_DIR` to change it):
 - the background node stops 10 minutes after its last session ends
   (`wats mcp --idle-exit <seconds>`).
 
+The data directory has a disk budget, `storage.max` (10 GiB by default,
+`wats config set storage.max 50G`). At it, the node stops fetching others'
+files. 10 % above, it also stops taking new events from others. Your own
+posts always go through. The banner and `wats config list` show the usage
+(ADR 0012).
+
 To keep a node online permanently (a better swarm citizen: it serves sync
 and replicas), run `wats node` yourself, for example under launchd or
 systemd. Sessions attach to it the same way.

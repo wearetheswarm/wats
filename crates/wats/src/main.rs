@@ -167,6 +167,11 @@ struct NodeArgs {
     /// 20G. Over it, the node stops fetching. Unlimited if unset.
     #[arg(long, global = true, env = "WATS_BLOB_QUOTA", value_parser = parse_size)]
     blob_quota: Option<u64>,
+    /// Disk budget for the whole data directory, e.g. 10G (the default).
+    /// At it, the node stops fetching blobs and replicas; 10% above, it
+    /// also refuses events from others.
+    #[arg(long, global = true, env = "WATS_STORAGE_MAX", value_parser = parse_size)]
+    storage_max: Option<u64>,
     /// Read the node secret from this file instead of `<dir>/secret.key`
     /// (e.g. a key file mounted read-only into a container). The file must
     /// exist.
@@ -538,6 +543,11 @@ fn config_command(data_dir: &std::path::Path, action: ConfigAction) -> Result<()
         }
         ConfigAction::List => {
             println!("# {}", file.path().display());
+            println!(
+                "# storage: {} used in {}",
+                wats::node::format_bytes(wats::node::dir_size(data_dir)),
+                data_dir.display()
+            );
             for key in wats::settings::KEYS {
                 let value = match file.get(key.name) {
                     Some(value) => value,
@@ -659,6 +669,12 @@ impl NodeArgs {
         config.blob_quota = self
             .blob_quota
             .or(file_size(&file.blob_quota, "blob_quota")?);
+        config.storage_max = Some(
+            self.storage_max
+                .or(file_size(&file.storage.max, "storage.max")?)
+                .map_or_else(|| parse_size(wats::settings::DEFAULT_STORAGE_MAX), Ok)
+                .map_err(|e| anyhow::anyhow!(e))?,
+        );
         for addr in &self.external_addrs {
             config.external_addrs.push(
                 addr.parse()
@@ -728,6 +744,9 @@ impl NodeArgs {
         }
         if let Some(quota) = self.blob_quota {
             args.push(format!("--blob-quota={quota}").into());
+        }
+        if let Some(max) = self.storage_max {
+            args.push(format!("--storage-max={max}").into());
         }
         if let Some(file) = &self.secret_file {
             let mut arg = std::ffi::OsString::from("--secret-file=");
@@ -1096,6 +1115,19 @@ fn print_banner(config: &NodeConfig, agent: Option<&wats::agent::AgentConfig>) {
         env!("CARGO_PKG_VERSION"),
         config.infra,
         config.profile
+    );
+    let used = wats::node::dir_size(&config.data_dir);
+    let max = config.storage_max.unwrap_or(u64::MAX);
+    eprintln!(
+        "storage: {} of {}{}",
+        wats::node::format_bytes(used),
+        wats::node::format_bytes(max),
+        match wats::node::storage_state(used, config.storage_max) {
+            wats::node::StorageState::Ok => "",
+            wats::node::StorageState::Full => " · FULL: no more blob fetches or replicas",
+            wats::node::StorageState::OverCeiling =>
+                " · FULL: refusing blobs and events from others",
+        }
     );
     match agent {
         Some(agent) => eprintln!(
