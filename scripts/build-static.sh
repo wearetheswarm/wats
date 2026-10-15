@@ -26,7 +26,7 @@ while [ $# -gt 0 ]; do
     --target) target="${2:?--target needs a value}"; shift 2 ;;
     --target=*) target="${1#--target=}"; shift ;;
     --image) image=true; shift ;;
-    -h|--help) sed -n '2,21p' "$0"; exit 0 ;;
+    -h|--help) awk 'NR > 1 && /^#/ { sub(/^# ?/, ""); print; next } NR > 1 { exit }' "$0"; exit 0 ;;
     *) echo "unknown argument: $1 (see --help)" >&2; exit 2 ;;
   esac
 done
