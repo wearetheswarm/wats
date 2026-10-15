@@ -1,0 +1,98 @@
+# Local test of the bootstrap path (OrbStack or any Docker): a router with a
+# pinned key, a peer, a poster and a late joiner. Peers reach the router by
+# its compose DNS name, so this is the real path: DNS resolution, then the
+# pinned endpoint id. The router also publishes UDP 7842 on the host, so a
+# Mac-native `wats --bootstrap <id>@localhost:7842 node` can join.
+#
+# One command does everything: scripts/compose-test.sh
+#
+# By hand (from the repository root):
+#   docker build -t wats:dev .
+#   mkdir -p /tmp/wats-key && chmod 777 /tmp/wats-key
+#   docker run --rm -v /tmp/wats-key:/key wats:dev --dir /key id
+#   export WATS_ROUTER_KEY=/tmp/wats-key/secret.key WATS_ROUTER_ID=<endpoint_id>
+#   export WATS_TEST_FILES=/tmp/wats-files   # holds the blob to post
+#   docker compose -f deploy/compose/compose.yaml up router peer
+#   docker compose -f deploy/compose/compose.yaml --profile post up poster
+#
+# The production router on a VM is compose.router.yaml.
+
+name: wats-local
+
+x-hardening: &hardening
+  read_only: true
+  cap_drop: [ALL]
+  security_opt: ["no-new-privileges:true"]
+  user: "65532:65532"
+  tmpfs: ["/tmp"]
+
+x-peer: &peer
+  <<: *hardening
+  image: wats:dev
+  depends_on: [router]
+  environment: &peer-env
+    WATS_DIR: /data/wats
+    WATS_NO_DEFAULT_BOOTSTRAP: "true"
+    WATS_BOOTSTRAP: "${WATS_ROUTER_ID:-set-WATS_ROUTER_ID}@router:7842"
+    RUST_LOG: wats=info
+
+services:
+  router:
+    <<: *hardening
+    build: ../..
+    image: wats:dev
+    command: ["node"]
+    environment:
+      WATS_DIR: /data/wats
+      WATS_SECRET_FILE: /etc/wats/secret.key
+      WATS_PORT: "7842"
+      WATS_NO_DEFAULT_BOOTSTRAP: "true"
+      RUST_LOG: wats=info
+    ports:
+      - "${WATS_ROUTER_HOST_PORT:-7842}:7842/udp"
+    volumes:
+      - router-data:/data
+      - "${WATS_ROUTER_KEY:-./missing-router-key}:/etc/wats/secret.key:ro"
+
+  # A peer that only listens: it must receive the poster's event (gossip)
+  # and hold its blob (replication k).
+  peer:
+    <<: *peer
+    command: ["node"]
+    volumes:
+      - peer-data:/data
+
+  # Publishes one post with a blob once it knows two peers, then keeps
+  # serving the blob.
+  poster:
+    <<: *peer
+    profiles: [post]
+    command:
+      - node
+      - --post
+      - "${WATS_TEST_TEXT:-Hello from the compose poster}"
+      - --kind
+      - note
+      - --tag
+      - test:compose
+      - --blob
+      - /files/test.bin
+      - --wait-peers
+      - "2"
+    volumes:
+      - poster-data:/data
+      - "${WATS_TEST_FILES:-./missing-test-files}:/files:ro"
+
+  # Starts after the post: it gets it only through catch-up sync.
+  late:
+    <<: *peer
+    profiles: [late]
+    command: ["node"]
+    volumes:
+      - late-data:/data
+
+volumes:
+  router-data:
+  peer-data:
+  poster-data:
+  late-data:

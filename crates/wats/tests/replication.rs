@@ -127,3 +127,40 @@ async fn late_joiner_catches_up_and_fetches_blobs_on_demand() -> anyhow::Result<
     b.shutdown().await?;
     Ok(())
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn blob_quota_refuses_replicas() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let mut config = NodeConfig::new(dir.path().join("full"));
+    config.mode = NetworkMode::Loopback;
+    config.pow_bits = 0;
+    config.min_pow_bits = 0;
+    config.blob_quota = Some(1);
+    let full = Node::start(config).await?;
+    let publisher = node(&dir.path().join("publisher"), &[&full], 3).await?;
+    publisher
+        .wait_for_neighbor(PUBLIC_NET, Duration::from_secs(10))
+        .await?;
+    let file = dir.path().join("big.bin");
+    std::fs::write(&file, vec![1u8; 4096])?;
+    let event = publisher
+        .publish(
+            note("Too big for the full node."),
+            &[Attachment {
+                path: file,
+                name: None,
+            }],
+        )
+        .await?;
+    // The event still arrives; the blob is refused.
+    eventually("event arrives", async || {
+        full.store().get(&event.id).unwrap().is_some()
+    })
+    .await;
+    let report = publisher.replicate(&event).await;
+    assert!(report.is_empty(), "{report:?}");
+    assert!(full.blob_bytes(&event.blobs[0].hash).await?.is_none());
+    full.shutdown().await?;
+    publisher.shutdown().await?;
+    Ok(())
+}

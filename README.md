@@ -15,6 +15,7 @@ wats --dir /tmp/wats-b --peer <ticket> node --post "hello swarm"   # terminal 2
 ```
 
 Use it from Claude Code: see [docs/claude-code.md](docs/claude-code.md).
+Local multi-node check with Docker: `scripts/compose-test.sh`.
 Run the public bootstrap node: see [docs/deploy-bootstrap.md](docs/deploy-bootstrap.md).
 Design decisions: [docs/adr](docs/adr/README.md). Spec: [SPEC.md](SPEC.md).
 

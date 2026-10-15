@@ -1,17 +1,20 @@
 # 0008. Public bootstrap node and its packaging
 
-Status: Provisional (2026-10-15).
+Status: Provisional (2026-10-15, revised the same day: docker compose on a
+VM replaces Kubernetes).
 
-Code: `crates/wats/src/bootstrap.rs`, `Dockerfile`, `deploy/k8s/`,
+Code: `crates/wats/src/bootstrap.rs`, `Dockerfile`, `deploy/compose/`,
 `.github/workflows/release.yml`. Runbook: `docs/deploy-bootstrap.md`.
 
 ## Context
 
 New nodes need a first peer. Until now, peers exchanged tickets by hand.
-The user operates a Kubernetes cluster (OVH) and the `wearetheswarm.ai`
-zone (Gandi). Their bootstrap node must be reachable by name, keep a
-stable identity, and must not be a trust anchor: a hijacked DNS record
-must not let someone else pose as the router.
+The bootstrap node must:
+
+- be reachable by name (the `wearetheswarm.ai` zone is at Gandi);
+- keep a stable identity;
+- not be a trust anchor: a hijacked DNS record must not let someone else
+  pose as the router.
 
 ## Decision
 
@@ -19,9 +22,9 @@ must not let someone else pose as the router.
 
 - **Format.** `<endpoint-id>@<host>:<port>`.
 - **Resolution.** The host is resolved with DNS at startup, so the IP can
-  move. The endpoint id is pinned: Iroh authenticates every QUIC
-  connection against the dialed key, so a host answering with another key
-  is never connected to.
+  move. The endpoint id is pinned: Iroh authenticates every QUIC connection
+  against the dialed key, so a host answering with another key is never
+  connected to.
 - **Built-in list.** `DEFAULT_BOOTSTRAP` is compiled in, and stays empty
   until the router's id is known (TODO in the code).
 - **Overrides.**
@@ -31,23 +34,25 @@ must not let someone else pose as the router.
   - `--loopback` never uses it.
 - **Failure handling.** A node skips itself, and skips entries that fail to
   resolve.
+- **Empty values.** Empty `WATS_*` values (common in `.env` files) count as
+  unset.
 
 ### Router configuration
 
-- **Port.** A fixed UDP port, **7842**: `--port` / `WATS_PORT` binds
-  `0.0.0.0:<port>`, while IPv6 stays on a random port.
+- **Port.** A fixed UDP port, **7842**. `--port` / `WATS_PORT` binds
+  `0.0.0.0:<port>` (required) and `[::]:<port>` (best effort), so that both
+  the A and the AAAA record work.
 - **Public address.** `--external-addr` / `WATS_EXTERNAL_ADDR` advertises a
-  load balancer address.
+  public address when the node sits behind NAT.
 
 ### Identity
 
 - **Where it is read from.** `--secret-file` / `WATS_SECRET_FILE` reads the
   root secret from a file that must exist, instead of `<data dir>/secret.key`.
-  For the router it is a Kubernetes Secret.
-- **Where it is generated.** On the operator's machine, which is the
-  backup. The image is distroless (no shell, no `tar`), so copying a secret
-  out of a pod would be awkward. A missing secret file is an error, never a
-  silently fresh identity.
+  For the router it is `/etc/wats/secret.key` on the VM, mounted read-only.
+- **Where it is generated.** On the operator's machine. That copy goes to a
+  password manager and is the only backup that matters. A missing secret
+  file is an error, never a silently fresh identity.
 - **Printing it.** `wats id` prints the endpoint id, the author id and the
   bootstrap entry. It does not need the node to be stopped.
 
@@ -57,28 +62,52 @@ must not let someone else pose as the router.
 - **Registration.** Handlers are registered at startup, because a process
   running as PID 1 in a container ignores signals it has no handler for.
 
+### Disk guard (stopgap)
+
+`--blob-quota` / `WATS_BLOB_QUOTA` stops fetching blobs for others once the
+blob store is over budget. `--max-blob-size` / `WATS_MAX_BLOB_SIZE` caps
+single blobs. The router is a frequent replica, so it needs this until the
+Phase 2 give quota exists.
+
 ### Packaging
 
 - **Image.** Multi-stage Dockerfile:
   - Rust 1.99 on Debian trixie for the build, distroless `cc-debian13:nonroot`
     at runtime, both pinned by digest;
-  - user 65532, data on a `/data` volume, `wats node --quiet` in the
-    foreground.
+  - user 65532, data on a `/data` volume, `wats node` in the foreground.
 - **Release.** `release.yml` builds linux/amd64 only and pushes
   `ghcr.io/wearetheswarm/wats:<version>` and `:sha-<commit>` to a private
   GHCR package, with OCI labels.
   - It runs on `release: published` or by hand, and checks that the tag
     matches `Cargo.toml`.
-  - There is no `latest` tag: deployments pin a version, ideally a digest.
+  - There is no `latest` tag: deployments pin a version.
   - No image is built on pull requests or pushes (CI budget).
-- **Kubernetes.**
-  - Namespace `wats` (restricted Pod Security Standard).
-  - A one-replica StatefulSet with a PVC for data and the key from a
-    Secret; non-root, read-only root filesystem, no capabilities, seccomp
-    RuntimeDefault, resource requests and limits.
-  - A LoadBalancer Service on UDP 7842 with `externalTrafficPolicy: Local`,
-    a headless Service, and an image pull secret `ghcr-pull`.
-  - A kustomization pins the image tag and digest.
+- **Production: docker compose on a VM** (`deploy/compose/compose.router.yaml`).
+  - OVH VPS, Debian 13, fixed public IPv4 and IPv6.
+  - Host networking, so UDP 7842 sits on the public addresses with no
+    Docker NAT.
+  - `restart: unless-stopped`, a named volume for `/data`, and the key
+    file mounted read-only.
+  - Same hardening as before: non-root, read-only root filesystem, no
+    capabilities, `no-new-privileges`, resource limits, rotated logs.
+- **Local test** (`deploy/compose/compose.yaml`, `scripts/compose-test.sh`):
+  - a router, a peer, a poster and a late joiner on a compose network,
+    bootstrapping through `<router-id>@router:7842`;
+  - it exercises DNS resolution and the pinned id, gossip, replication and
+    sync, in one command;
+  - it is not run in CI.
+
+### Why not Kubernetes
+
+A first version shipped Kubernetes manifests (StatefulSet, UDP
+LoadBalancer). They were dropped for three reasons:
+
+- QUIC needs a public UDP port.
+- UDP listeners on the OVH managed Kubernetes LoadBalancer are uncertain,
+  and Ingress does not apply to QUIC at all.
+- The router is a single stateful node that wants a fixed IP. A VM gives it
+  exactly that, with fewer moving parts. Kubernetes can come back for
+  durable nodes at scale.
 
 ## Consequences
 
@@ -89,5 +118,7 @@ must not let someone else pose as the router.
 - **Key rotation.** Rotating the router key means a new release with a new
   pinned id. Old binaries then fail to bootstrap through it, though they
   keep any peers they already know.
-- **Later options.** arm64 images on a native runner, probes once a health
-  endpoint exists, and several routers in other regions.
+- **Disk.** Until Phase 2 quotas, the router's disk use is bounded only by
+  the blob quota.
+- **Later options.** arm64 images on a native runner, a health endpoint,
+  metrics, and several routers in other regions.

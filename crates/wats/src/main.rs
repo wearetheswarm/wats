@@ -53,10 +53,18 @@ struct NodeArgs {
     /// Fixed UDP port to listen on (IPv4, all interfaces). Random if unset.
     #[arg(long, global = true, env = "WATS_PORT")]
     port: Option<u16>,
+    /// Largest blob this node publishes or fetches, e.g. 256M or 1G.
+    #[arg(long, global = true, env = "WATS_MAX_BLOB_SIZE", value_parser = parse_size)]
+    max_blob_size: Option<u64>,
+    /// Disk budget for blobs fetched from others (replicas and reads), e.g.
+    /// 20G. Over it, the node stops fetching. Unlimited if unset.
+    #[arg(long, global = true, env = "WATS_BLOB_QUOTA", value_parser = parse_size)]
+    blob_quota: Option<u64>,
     /// Read the node secret from this file instead of `<dir>/secret.key`
-    /// (e.g. a mounted Kubernetes Secret). The file must exist.
+    /// (e.g. a key file mounted read-only into a container). The file must
+    /// exist.
     #[arg(long, global = true, env = "WATS_SECRET_FILE")]
-    secret_file: Option<PathBuf>,
+    secret_file: Option<String>,
     /// Public address to advertise, e.g. a load balancer's (repeatable).
     #[arg(
         long = "external-addr",
@@ -64,7 +72,7 @@ struct NodeArgs {
         env = "WATS_EXTERNAL_ADDR",
         value_delimiter = ','
     )]
-    external_addrs: Vec<std::net::SocketAddr>,
+    external_addrs: Vec<String>,
     /// Networks to join (repeatable). Defaults to "public".
     #[arg(long = "net", global = true, value_delimiter = ',')]
     nets: Vec<String>,
@@ -87,6 +95,10 @@ enum Command {
         /// Publish one post once a peer is connected.
         #[arg(long)]
         post: Option<String>,
+        /// With --post: wait until this many peers are known (up to 60 s),
+        /// so that replication k can reach them.
+        #[arg(long, default_value_t = 1)]
+        wait_peers: usize,
         /// Kind of the post.
         #[arg(long, default_value = "note")]
         kind: String,
@@ -152,6 +164,33 @@ fn print_id(config: &NodeConfig, host: &str) -> Result<()> {
     Ok(())
 }
 
+/// Parse a byte size: a number with an optional binary suffix K, M, G or T
+/// (also KiB, MB...), e.g. `512M`, `20G`, `1048576`.
+fn parse_size(s: &str) -> Result<u64, String> {
+    let s = s.trim();
+    let split = s.find(|c: char| !c.is_ascii_digit()).unwrap_or(s.len());
+    let (number, unit) = s.split_at(split);
+    let number: u64 = number
+        .parse()
+        .map_err(|_| format!("invalid size {s:?}: expected e.g. 512M or 20G"))?;
+    let shift = match unit
+        .trim()
+        .to_ascii_uppercase()
+        .trim_end_matches("IB")
+        .trim_end_matches('B')
+    {
+        "" => 0,
+        "K" => 10,
+        "M" => 20,
+        "G" => 30,
+        "T" => 40,
+        _ => return Err(format!("invalid size unit in {s:?}: use K, M, G or T")),
+    };
+    number
+        .checked_mul(1u64 << shift)
+        .ok_or_else(|| format!("size {s:?} is too large"))
+}
+
 fn default_dir() -> Result<PathBuf> {
     std::env::home_dir()
         .map(|h| h.join(".wats"))
@@ -159,6 +198,25 @@ fn default_dir() -> Result<PathBuf> {
 }
 
 impl NodeArgs {
+    /// Treat empty values (e.g. `WATS_EXTERNAL_ADDR=` in a compose or env
+    /// file) as unset.
+    fn normalize(&mut self) {
+        for list in [
+            &mut self.peers,
+            &mut self.nets,
+            &mut self.bootstrap,
+            &mut self.external_addrs,
+        ] {
+            list.retain(|v| !v.trim().is_empty());
+        }
+        if self.secret_file.as_ref().is_some_and(|p| p.is_empty()) {
+            self.secret_file = None;
+        }
+        if self.profile.as_ref().is_some_and(|p| p.is_empty()) {
+            self.profile = None;
+        }
+    }
+
     fn config(&self) -> Result<NodeConfig> {
         let dir = match &self.dir {
             Some(dir) => dir.clone(),
@@ -178,8 +236,17 @@ impl NodeArgs {
             );
         }
         config.port = self.port;
-        config.secret_file = self.secret_file.clone();
-        config.external_addrs = self.external_addrs.clone();
+        config.secret_file = self.secret_file.as_ref().map(PathBuf::from);
+        if let Some(size) = self.max_blob_size {
+            config.max_blob_bytes = size;
+        }
+        config.blob_quota = self.blob_quota;
+        for addr in &self.external_addrs {
+            config.external_addrs.push(
+                addr.parse()
+                    .with_context(|| format!("invalid external address {addr:?}"))?,
+            );
+        }
         if !self.nets.is_empty() {
             config.nets = self.nets.clone();
         }
@@ -234,6 +301,12 @@ impl NodeArgs {
         }
         if let Some(port) = self.port {
             args.push(format!("--port={port}").into());
+        }
+        if let Some(size) = self.max_blob_size {
+            args.push(format!("--max-blob-size={size}").into());
+        }
+        if let Some(quota) = self.blob_quota {
+            args.push(format!("--blob-quota={quota}").into());
         }
         if let Some(file) = &self.secret_file {
             let mut arg = std::ffi::OsString::from("--secret-file=");
@@ -322,6 +395,7 @@ fn print_line(value: serde_json::Value) {
 
 struct NodeRun {
     post: Option<String>,
+    wait_peers: usize,
     kind: String,
     tags: Vec<String>,
     blobs: Vec<PathBuf>,
@@ -332,6 +406,7 @@ struct NodeRun {
 async fn run_node(node: Arc<Node>, run: NodeRun, mut shutdown: Shutdown) -> Result<()> {
     let NodeRun {
         post,
+        wait_peers,
         kind,
         tags,
         blobs,
@@ -368,6 +443,17 @@ async fn run_node(node: Arc<Node>, run: NodeRun, mut shutdown: Shutdown) -> Resu
             let result = async {
                 node.wait_for_neighbor(&net, Duration::from_secs(60))
                     .await?;
+                let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+                while node.known_peers().len() < wait_peers {
+                    if tokio::time::Instant::now() >= deadline {
+                        tracing::warn!(
+                            known = node.known_peers().len(),
+                            "posting before {wait_peers} peers are known"
+                        );
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(200)).await;
+                }
                 let attachments: Vec<Attachment> = blobs
                     .into_iter()
                     .map(|path| Attachment { path, name: None })
@@ -449,11 +535,13 @@ async fn main() -> Result<()> {
         .init();
 
     let shutdown = shutdown_signal();
-    let cli = Cli::parse();
+    let mut cli = Cli::parse();
+    cli.node.normalize();
     let config = cli.node.config()?;
     match cli.command {
         Command::Node {
             post,
+            wait_peers,
             kind,
             tags,
             blobs,
@@ -463,6 +551,7 @@ async fn main() -> Result<()> {
             let node = Node::start(config).await?;
             let run = NodeRun {
                 post,
+                wait_peers,
                 kind,
                 tags,
                 blobs,
@@ -478,5 +567,21 @@ async fn main() -> Result<()> {
         } => mcp_attached(&cli.node, &config.data_dir, idle_exit).await,
         Command::Mcp { .. } => run_mcp(Node::start(config).await?, shutdown).await,
         Command::Id { host } => print_id(&config, &host),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_size;
+
+    #[test]
+    fn sizes() {
+        assert_eq!(parse_size("1024"), Ok(1024));
+        assert_eq!(parse_size("512M"), Ok(512 << 20));
+        assert_eq!(parse_size("20G"), Ok(20 << 30));
+        assert_eq!(parse_size("20GiB"), Ok(20 << 30));
+        assert_eq!(parse_size("1 kb"), Ok(1024));
+        assert!(parse_size("ten").is_err());
+        assert!(parse_size("5X").is_err());
     }
 }

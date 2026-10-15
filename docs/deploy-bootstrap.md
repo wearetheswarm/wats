@@ -10,35 +10,57 @@ identity and a public UDP port. New nodes find the swarm through it:
 
 The design is in [ADR 0008](adr/0008-bootstrap-node.md).
 
-You deploy it yourself. Nothing in CI touches a cluster, and only a
-published release pushes an image.
+Production runs with **docker compose on a VM**: an OVH VPS with Debian 13,
+a fixed public IPv4 and IPv6. You deploy it yourself; nothing in CI touches
+the VM, and only a published release pushes an image.
 
 Overview:
 
-1. Build check (optional, local).
-2. Release the image to GHCR.
-3. Generate and back up the node secret.
-4. Create the namespace and the secrets.
-5. Pin the version and apply the manifests.
+0. Local test with docker compose (optional, recommended).
+1. Release the image to GHCR.
+2. Generate and back up the node secret.
+3. Prepare the VM.
+4. Install the key.
+5. Start the router.
 6. DNS at Gandi.
 7. Pin the node in the binary.
-8. The NAT test.
+8. NAT test (SPEC §5).
 
-## 1. Build check (optional, local)
+Then: operations, and the disk usage risk.
+
+## 0. Local test with docker compose (optional, recommended)
 
 With OrbStack (or any Docker), from the repository root:
 
 ```sh
-docker build -t wats:dev .                       # native arch, ~1–2 min warm
-docker run --rm -v wats-check:/data wats:dev id  # prints an endpoint id
-docker volume rm wats-check
+scripts/compose-test.sh
 ```
 
-The cluster runs linux/amd64. Release images are built in GitHub Actions
-(step 2), not on the Mac: an amd64 Rust build under emulation on Apple
-silicon is very slow.
+What it does:
 
-## 2. Release the image to GHCR
+1. Builds the image.
+2. Generates a throwaway router key in a temporary directory outside the
+   repository.
+3. Starts `deploy/compose/compose.yaml`: a router, a peer, then a poster
+   that publishes a post with a 64 KiB blob, and finally a late joiner.
+
+What it checks:
+
+- the peers bootstrap through `<router-id>@router:7842`, which is the real
+  path: compose DNS resolution plus the pinned id;
+- the router and the peer receive the event;
+- both hold the blob (replication k);
+- the late joiner gets the event through catch-up sync.
+
+It tears everything down, volumes included, and exits 0 on success, in
+about 30 s once the image is cached. It is not run in CI.
+
+To poke at the stack by hand, follow the comments at the top of
+`deploy/compose/compose.yaml`. The router also publishes UDP 7842 on the
+host, so a Mac-native node can join it:
+`wats --bootstrap <router-id>@localhost:7842 node`.
+
+## 1. Release the image to GHCR
 
 Cut a release from `main`. The tag must match the workspace version in
 `Cargo.toml` (`0.1.0` → `v0.1.0`):
@@ -48,26 +70,18 @@ gh release create v0.1.0 --generate-notes --title "v0.1.0"
 gh run watch "$(gh run list --workflow release --limit 1 --json databaseId -q '.[0].databaseId')"
 ```
 
-`.github/workflows/release.yml` then pushes two tags of
-`ghcr.io/wearetheswarm/wats`:
+`.github/workflows/release.yml` pushes `ghcr.io/wearetheswarm/wats:0.1.0`
+and `:sha-<commit>`. The image is linux/amd64 and the package is private,
+linked to the repository.
 
-- `0.1.0`;
-- `sha-<commit>`.
+The image digest is shown on the run's summary page, or with
+`docker buildx imagetools inspect ghcr.io/wearetheswarm/wats:0.1.0`
+(after `docker login ghcr.io`).
 
-The package is private and linked to the repository.
+## 2. Generate and back up the node secret
 
-**Read the image digest.** Use any of these:
-
-- the run's summary page;
-- `gh run view <run-id> --log | grep -m1 digest`;
-- `docker buildx imagetools inspect ghcr.io/wearetheswarm/wats:0.1.0`, after
-  `docker login ghcr.io` with a token that has `read:packages`.
-
-## 3. Generate and back up the node secret
-
-The node's identity is one 32-byte secret. Generate it on your machine,
-not in the pod, so you hold the backup from the start. Generate it
-**outside the repository**, so it can never be committed:
+The node's identity is one 32-byte secret. Generate it on your Mac, **outside
+the repository** so it can never be committed:
 
 ```sh
 cargo install --path crates/wats           # or use a release binary
@@ -78,98 +92,130 @@ wats --dir ~/.wats-router id --host router.wearetheswarm.ai
 # bootstrap_entry: <64 hex>@router.wearetheswarm.ai:7842
 ```
 
-Store `~/.wats-router/secret.key` in your password manager or vault. It is
-the router's identity: anyone holding it can impersonate the router, and
-losing it means shipping a new binary with a new pinned id.
+Store the content of `~/.wats-router/secret.key` (one line of hex) in your
+password manager. It is the router's identity: anyone holding it can
+impersonate the router, and losing it means shipping a new binary with a
+new pinned id.
 
-After step 4, delete the local copy (`rm -r ~/.wats-router`) so that only
-the password manager and the Kubernetes Secret hold it. To re-create the
-Secret later, restore the file from the password manager to the same path.
+Once it is in the password manager and installed on the VM (step 4),
+delete the local copy: `rm -r ~/.wats-router`.
 
-## 4. Create the namespace and the secrets
+## 3. Prepare the VM (Debian 13)
 
-```sh
-kubectl apply -f deploy/k8s/namespace.yaml
+On the VPS, as a sudo user.
 
-# Node identity (from step 3).
-kubectl -n wats create secret generic wats-router-key \
-  --from-file=secret.key="$HOME/.wats-router/secret.key"
+### Docker Engine and the compose plugin
 
-# Image pull secret for the private GHCR package: a *classic* personal
-# access token with only the read:packages scope
-# (GitHub > Settings > Developer settings > Personal access tokens (classic)).
-kubectl -n wats create secret docker-registry ghcr-pull \
-  --docker-server=ghcr.io \
-  --docker-username=<your-github-user> \
-  --docker-password=<classic-PAT-with-read:packages>
-```
-
-## 5. Pin the version and apply
-
-Edit `deploy/k8s/kustomization.yaml`:
-
-```yaml
-images:
-  - name: ghcr.io/wearetheswarm/wats
-    newTag: 0.1.0
-    digest: sha256:<digest from step 2>   # recommended
-```
-
-Then:
+Install them from Docker's apt repository (Debian's own `docker.io`
+package lags behind):
 
 ```sh
-kubectl apply -k deploy/k8s
-kubectl -n wats rollout status statefulset/wats-router
-kubectl -n wats logs wats-router-0              # "node started id=<endpoint id>"
-kubectl -n wats exec wats-router-0 -- wats id   # must print the id from step 3
-kubectl -n wats get service wats-router         # EXTERNAL-IP of the UDP load balancer
+sudo apt-get update && sudo apt-get install -y ca-certificates curl
+sudo install -m 0755 -d /etc/apt/keyrings
+sudo curl -fsSL https://download.docker.com/linux/debian/gpg -o /etc/apt/keyrings/docker.asc
+sudo chmod a+r /etc/apt/keyrings/docker.asc
+echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] \
+https://download.docker.com/linux/debian $(. /etc/os-release && echo "$VERSION_CODENAME") stable" \
+  | sudo tee /etc/apt/sources.list.d/docker.list >/dev/null
+sudo apt-get update
+sudo apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+sudo docker run --rm hello-world
 ```
 
-What the manifests create:
+### Firewall
 
-- **StatefulSet `wats-router`**: one replica, never more. It runs as
-  non-root with a read-only root filesystem and no capabilities, under the
-  `restricted` Pod Security Standard.
-- **Volume `data`**: a 5 Gi PVC holding the events and blobs. It can be
-  rebuilt from the swarm; the identity is not on it.
-- **Service `wats-router`**: type LoadBalancer on **UDP 7842**.
-- **Identity**: the node reads it from the `wats-router-key` Secret
-  (`WATS_SECRET_FILE`).
+QUIC needs **UDP 7842 inbound** on IPv4 and IPv6. SSH is the only TCP port
+open.
 
-Once the load balancer has a public IP, you can also advertise it. Add the
-following to the container env, then `kubectl apply -k deploy/k8s` again:
+- **OVH Edge Network Firewall** (control panel → IP → firewall): either
+  leave it disabled, or add a rule that accepts UDP with destination port
+  7842, for each of the VPS's IPv4 and IPv6 addresses.
+- **On the VM**, for example with ufw (it handles IPv6 by default):
 
-```yaml
-- name: WATS_EXTERNAL_ADDR
-  value: "<EXTERNAL-IP>:7842"
+  ```sh
+  sudo apt-get install -y ufw
+  sudo ufw default deny incoming
+  sudo ufw default allow outgoing
+  sudo ufw allow 22/tcp
+  sudo ufw allow 7842/udp
+  sudo ufw enable
+  ```
+
+  The router uses host networking, so Docker adds no port-forwarding rules
+  that would bypass ufw.
+
+### The compose files
+
+The repository is private, so copy the two files from your Mac:
+
+```sh
+ssh vps 'mkdir -p ~/wats'
+scp deploy/compose/compose.router.yaml deploy/compose/router.env.example vps:~/wats/
+ssh vps 'cd ~/wats && cp router.env.example .env'
 ```
 
-Iroh discovers its public address through the relays anyway; this only
-helps when the load balancer rewrites ports.
+Edit `~/wats/.env` on the VM:
 
-**Without a public UDP port** the router still works. Peers reach it
-through Iroh's relays: the endpoint id and the relay are found through
-Iroh's DNS address lookup. Direct, lower-latency connections need the
-load balancer's UDP port to be reachable.
+- `WATS_VERSION`: the release from step 1, e.g. `0.1.0`.
+- `WATS_BLOB_QUOTA` and `WATS_MAX_BLOB_SIZE`: the disk guards. See "Disk
+  usage" below.
+
+## 4. Install the key
+
+Create `/etc/wats/secret.key` from the password-manager copy, owned by the
+container user (uid 65532) and readable only by it. Paste the hex line when
+`cat` waits, then press Ctrl-D, so the secret never lands in your shell
+history:
+
+```sh
+sudo install -d -m 0755 /etc/wats
+sudo sh -c 'umask 077; cat > /etc/wats/secret.key'
+sudo chown 65532:65532 /etc/wats/secret.key
+sudo chmod 0400 /etc/wats/secret.key
+```
+
+## 5. Start the router
+
+```sh
+# Pull access to the private package: a classic personal access token with
+# only the read:packages scope (GitHub > Settings > Developer settings >
+# Personal access tokens (classic)).
+sudo docker login ghcr.io -u <your-github-user>
+
+cd ~/wats
+sudo docker compose -f compose.router.yaml up -d
+sudo docker compose -f compose.router.yaml logs              # "node started id=<endpoint id>"
+sudo docker compose -f compose.router.yaml exec router wats id   # must print the id from step 2
+sudo ss -ulpn | grep 7842                                    # listening on 0.0.0.0:7842 and [::]:7842
+```
+
+How the router runs:
+
+- with **host networking**, binding UDP 7842 on both the public IPv4 and the
+  public IPv6 address, with no Docker NAT in between;
+- as a non-root user (65532), with a read-only root filesystem, no
+  capabilities and `no-new-privileges`;
+- with a restart policy of `unless-stopped`;
+- with its events and blobs in the named volume `wats-router_router-data`.
 
 ## 6. DNS at Gandi
 
-In the `wearetheswarm.ai` zone, create:
+In the `wearetheswarm.ai` zone:
 
 ```
-router  300  IN  A     <EXTERNAL-IP>
-router  300  IN  AAAA  <EXTERNAL-IPv6>   ; only if the load balancer has one
+router  300  IN  A     <VPS public IPv4>
+router  300  IN  AAAA  <VPS public IPv6>
 ```
 
-Check: `dig +short router.wearetheswarm.ai`.
+Check with `dig +short A router.wearetheswarm.ai` and
+`dig +short AAAA router.wearetheswarm.ai`.
 
-The IP may change later, for example if the load balancer is recreated.
-Update the record and nodes follow at their next start. The pinned id never
-changes as long as the `wats-router-key` Secret is the same.
+If the VM ever changes, update the records. Nodes follow at their next
+start, and the pinned id stays the same as long as the key does.
 
 ## 7. Pin the node in the binary
 
-Send the `bootstrap_entry` line from step 3 to the maintainers. It goes into
+Send the `bootstrap_entry` line from step 2 to the maintainers. It goes into
 `DEFAULT_BOOTSTRAP` in `crates/wats/src/bootstrap.rs`, replacing the TODO,
 and ships with the next release. Until then, nodes can use it explicitly:
 
@@ -180,38 +226,70 @@ wats --bootstrap '<endpoint-id>@router.wearetheswarm.ai:7842' node
 
 ## 8. NAT test (SPEC §5)
 
-The router plays machine A; your Mac, on any network (a phone hotspot is
-the most telling), plays machine B. Get the router's ticket from the logs,
-or let the bootstrap entry do the work:
+The router plays machine A. Your Mac, on another network (a phone hotspot is
+the most telling), plays machine B:
 
 ```sh
-# Mac
 WATS_BOOTSTRAP='<endpoint-id>@router.wearetheswarm.ai:7842' \
   RUST_LOG=wats=debug,iroh=info \
   wats --dir /tmp/wats-nat-b node --post "NAT test from the Mac" --blob README.md
 ```
 
-Success looks like this:
+On the Mac, success looks like this:
 
-- the Mac prints `published`;
-- its log shows `synced` and `replication … report={<blob hash>: [<router id>]}`;
-- the router's log shows `blob fetched`.
+- `published` is printed;
+- the log shows `synced` and `replication … report={<blob hash>: [<router id>]}`.
 
-`scripts/nat-test.sh b <ticket>` does the same with a random 1 MiB blob, if
-you prefer to paste a ticket. Iroh's logs say whether the path went direct
-(hole punched) or stayed on a relay. Both count as success; direct is the
-data point to report.
+On the VM, the router's log shows `blob fetched`. To see it, raise
+`RUST_LOG` to `wats=info` in `.env`, then run `docker compose -f
+compose.router.yaml up -d` again.
+
+`scripts/nat-test.sh b <ticket>` does the same if you prefer to paste a
+ticket. Iroh's logs say whether the path went direct (hole punched) or
+stayed on a relay. Both count as success; direct is the data point to
+report.
 
 ## Operations
 
-- **Upgrade.** Cut a new release, then bump `newTag`/`digest` and run
-  `kubectl apply -k deploy/k8s`. On SIGTERM the node stops cleanly within
-  the 30 s grace period.
-- **Back up.** The `wats-router-key` Secret (you already hold it, from step
-  3) is all you need. The data volume is a cache of the swarm.
-- **Logs.** `kubectl -n wats logs -f wats-router-0`. Raise the verbosity with
-  `RUST_LOG=wats=debug`.
-- **Later options.**
-  - arm64 images, built on a native arm64 runner.
-  - Liveness and readiness probes, once the node has a health endpoint.
-  - Metrics.
+- **Updates.** Cut a new release, set `WATS_VERSION` in `~/wats/.env`, then
+  run:
+
+  ```sh
+  sudo docker compose -f compose.router.yaml pull
+  sudo docker compose -f compose.router.yaml up -d
+  ```
+
+  On SIGTERM the node stops cleanly within the 30 s grace period. To roll
+  back, set the previous version and run the same two commands.
+- **Backups.** Only the key matters, and it is in the password manager. The
+  `/data` volume is a cache of the swarm: losing it costs a resync, nothing
+  more.
+- **Logs.** `sudo docker compose -f compose.router.yaml logs -f`. Docker
+  rotates them: 5 files of 20 MB.
+- **Health.** Check that the container is running
+  (`docker compose ps`) and that UDP 7842 is listening (`ss -ulpn`). There
+  is no health endpoint yet.
+
+## Disk usage: a known risk until Phase 2
+
+As the bootstrap peer, the router is known to almost every node, so it is
+often among the k closest peers chosen to hold a replica. Real storage
+quotas, eviction of low-value content and replica repair arrive with the
+Phase 2 robustness work (SPEC §2.5 "give quota", §2.13 bis "survival").
+**TODO (Phase 2)**: replace the crude guard below with the give quota.
+
+The guard for now:
+
+- `WATS_BLOB_QUOTA` (default `20G`): once the blob store holds that much,
+  the router stops fetching blobs for others. Events, which are small, are
+  still stored and relayed.
+- `WATS_MAX_BLOB_SIZE` (default `256M`): no single blob larger than this is
+  fetched.
+
+On a 40 GB disk, keep the quota at or below about half of the disk.
+Watch usage with:
+
+```sh
+sudo du -sh /var/lib/docker/volumes/wats-router_router-data
+sudo docker system df
+```
