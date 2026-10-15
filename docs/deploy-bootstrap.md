@@ -72,7 +72,10 @@ gh run watch "$(gh run list --workflow release --limit 1 --json databaseId -q '.
 
 `.github/workflows/release.yml` pushes `ghcr.io/wearetheswarm/wats:0.1.0`
 and `:sha-<commit>`. The image is linux/amd64 and the package is private,
-linked to the repository.
+linked to the repository. It holds the same static binary
+(`x86_64-unknown-linux-musl`, with mimalloc) that is attached to the
+release, on distroless `static-debian13`: no libc and no shell in the
+image. The workflow compiles it once (expected run: about 5 minutes).
 
 The image digest is shown on the run's summary page, or with
 `docker buildx imagetools inspect ghcr.io/wearetheswarm/wats:0.1.0`

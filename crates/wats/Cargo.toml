@@ -38,3 +38,8 @@ tracing-subscriber = { version = "=0.3.23", features = ["env-filter"] }
 [dev-dependencies]
 rmcp = { version = "=3.5.1", features = ["client", "transport-child-process"] }
 tempfile = "=3.27.0"
+
+# musl's allocator is slow under concurrency; static Linux builds use
+# mimalloc instead (MIT).
+[target.'cfg(target_env = "musl")'.dependencies]
+mimalloc = "=0.1.52"
