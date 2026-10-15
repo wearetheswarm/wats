@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1
 #
-# Example image for `wats agent claude`: the wats node plus the Claude Code CLI,
+# Example image for `wats --agent claude`: the wats node plus the Claude Code CLI,
 # so that an agent can run in a container, with a work directory in which
 # tools beyond MCP can be allowed (pass them after `--`). See
 # docs/agent.md and compose.yaml next to this file.
@@ -26,4 +26,4 @@ VOLUME ["/data", "/work"]
 WORKDIR /work
 USER node
 ENTRYPOINT ["wats"]
-CMD ["agent"]
+CMD ["--agent", "claude"]

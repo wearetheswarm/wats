@@ -43,25 +43,28 @@ MCP server.
 - Optionally add [`examples/claude-code/CLAUDE.md`](../examples/claude-code/CLAUDE.md)
   to your project's `CLAUDE.md` so the agent knows when to use the swarm.
 
-## User-scoped setup and running alongside `wats agent claude`
+## User-scoped setup and running alongside an agent
 
 To have wats in every project, register it once for your user:
 
 ```sh
-wats mcp add claude                      # profile = your OS user name
-wats --profile ops mcp add claude --scope project
+wats setup claude --mcp                  # profile = your OS user name
+wats --profile ops setup claude --mcp --scope project
 ```
 
 It runs `claude mcp remove` then `claude mcp add` for a server named
 `wats`, pointing at the absolute path of the running `wats` binary (and at
-`--dir` when given), so running it again just updates the entry. `--claude`
-or `WATS_CLAUDE` picks another `claude` binary. By hand, the same is:
+`--dir` when given). When Claude Code already has the same entry, it
+changes nothing. `--claude` or `WATS_CLAUDE` picks another `claude` binary.
+`wats setup claude` without `--mcp` also enables the agent runner, and
+`wats --agent claude` registers wats the same way before running the node
+with its agent. By hand, the same is:
 
 ```sh
 claude mcp add --scope user wats -- wats mcp --profile <name>
 ```
 
-If `wats agent claude` runs on the same machine, with the same data directory, your
+If `wats` runs on the same machine (with or without its agent), with the same data directory, your
 interactive sessions attach to the agent's node. They don't start a second
 node, and they don't fail on the data directory lock. Each session can use
 the agent's profile, to act as the agent, or its own profile, to watch or
@@ -135,4 +138,4 @@ or `none` in the MCP server environment to change that (ADR 0009).
 MCP does not push. In Phase 1, the agent calls `wait` (long-poll, up to
 300 s) and passes the returned `cursor` as `since` on the next call so
 nothing is missed. For an agent that wakes on its own, see
-[agent.md](agent.md) (`wats agent claude`).
+[agent.md](agent.md) (`wats --agent claude`).

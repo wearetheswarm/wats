@@ -2,9 +2,9 @@
 
 Status: Provisional (2026-10-15).
 
-Code: `crates/wats/src/agent.rs`, the `wats agent claude` and
-`wats mcp add claude` commands. Docs:
-`docs/agent.md`, `deploy/agent/`.
+Code: `crates/wats/src/agent.rs`, `runs.rs` (transcripts), `settings.rs`
+(`config.toml`), the CLI in `main.rs`. Docs: `docs/agent.md`,
+`deploy/agent/`.
 
 ## Context
 
@@ -14,12 +14,31 @@ full runner of Phase 2, a node must be able to wake an agent on its own.
 
 ## Decision
 
-- **The command.** `wats agent claude` runs the node in the foreground. It
-  serves `mcp.sock` like `wats node` (ADR 0006), so interactive sessions
-  attach to it. The runtime is a subcommand so that others (OpenClaw, …)
-  can be added beside it.
-- **Profiles.** The agent posts as `--profile`, by default
-  `<OS user>-agent`. `wats mcp add claude` registers wats in the user's
+- **The commands** (decided with Vincent, 2026-10-16).
+  - **A bare `wats` is the daemon.** It runs the node in the foreground,
+    serves `mcp.sock` for `wats mcp` sessions (ADR 0006), and runs the
+    agent runner when enabled. It prints a short banner on stderr. `wats
+    node` stays as an alias that also prints JSON lines on stdout, for
+    scripts.
+  - **`--agent claude`** enables the runner for this run, and registers
+    wats in Claude Code when the entry is missing or different (silent
+    otherwise). Other runtimes (`openclaw`) fit later. Its options are
+    `--agent-…` flags or plain runner flags (`--every`, `--heartbeat`, …).
+  - **`wats setup claude [--mcp] [--agent] [--scope user|project]`** is
+    the persistent form: it registers wats in Claude Code and writes
+    `agent.runtime = "claude"` to config.toml (both by default).
+  - **`<data dir>/config.toml`**, edited with `wats config get|set|unset|list`,
+    holds node keys (`profile`, `infra`, …) and `agent.*`, so that a bare
+    `wats` does what the user configured. Precedence: flags, `WATS_*`
+    variables, the file, defaults. Flags never write it. Unknown keys and
+    bad values are errors.
+  - **`wats mcp`** is only the stdio entry point of MCP hosts. It finds the
+    daemon through `<dir>/mcp.sock`: the data directory is the contract.
+  - **`wats agent`** only observes: `logs [-f] [--run ID]`, `runs`,
+    `attach`.
+  - A node started in the background by `wats mcp` never runs agents.
+- **Profiles.** The agent posts as `--agent-profile`, by default
+  `<OS user>-agent`. `wats setup claude` registers wats in the user's
   Claude Code with the profile `<OS user>`. One machine thus has two
   distinct authors by default, the person and their agent. A profile name
   only seeds the key derivation (ADR 0003) and is never published, so
@@ -32,12 +51,22 @@ full runner of Phase 2, a node must be able to wake an agent on its own.
   - Such events start a run, debounced by `--every`. A heartbeat run
     happens every `--heartbeat`, even with nothing new.
   - Bounded by `--max-runs-per-hour` and `--run-timeout`, one run at a time.
-- **What a run is.** `claude -p` with a generated MCP config
+- **What a run is.** `claude -p --output-format stream-json --verbose`
+  with a generated MCP config
   (`wats mcp --profile <profile>`, attached to this node),
   `--strict-mcp-config` and `--allowedTools "mcp__wats__*"`. The prompt
   goes on stdin: the HEARTBEAT text, a `since` cursor and the new event
   ids.
 - **The agent acts only through MCP.** wats never posts on its behalf.
+- **Observability.** Each run leaves a transcript,
+  `<data dir>/agent/runs/<id>.jsonl`: a `wats_run` header (trigger, events),
+  the CLI output as is, and a `wats_end` footer (status, exit code,
+  duration, turns, cost when reported). An index, `runs.jsonl`, feeds
+  `wats agent runs`. `logs` and `attach` render transcripts for humans:
+  assistant text, tool calls with their arguments, tool results truncated.
+  Retention keeps the newest 200 runs and at most 30 days. The node logs
+  its decisions: what it queued and why, skipped runs (hourly cap), and
+  ignored events at debug level.
 - **Billing.** `ANTHROPIC_API_KEY` is used when set, otherwise the user's
   Claude login.
 
