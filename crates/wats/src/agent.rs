@@ -20,7 +20,7 @@ use tokio::io::AsyncWriteExt;
 use tokio::sync::broadcast::error::RecvError;
 use tracing::{debug, info, warn};
 
-use crate::event::{Event, Kind};
+use crate::event::{Draft, Event, Kind, title_from_text};
 use crate::identity::author_id;
 use crate::node::Node;
 use crate::runs::{self, RunRecord};
@@ -38,6 +38,13 @@ pub struct AgentConfig {
     pub runtime: String,
     /// Author profile the agent posts as.
     pub profile: String,
+    /// Whose node this is (the OS user), for the prompt.
+    pub user: String,
+    /// Who the agent is and what it can do (`agent.about`): its role in the
+    /// prompt, and the text of its `announce`.
+    pub about: String,
+    /// Capability tags of its `announce` (`agent.caps`; `pdf` → `cap:pdf`).
+    pub caps: Vec<String>,
     /// Debounce: at most one event-triggered run per this interval.
     pub every: Duration,
     /// A run even with nothing new, every this interval.
@@ -69,7 +76,8 @@ pub struct AgentConfig {
 /// Why a run happened.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Trigger {
-    Events(Vec<String>),
+    /// Event ids, each with why it is of interest.
+    Events(Vec<(String, &'static str)>),
     Heartbeat,
 }
 
@@ -88,13 +96,16 @@ impl Trigger {
         }
     }
 
-    fn events(&self) -> &[String] {
+    fn events(&self) -> Vec<String> {
         match self {
-            Trigger::Events(ids) => ids,
-            Trigger::Heartbeat => &[],
+            Trigger::Events(ids) => ids.iter().map(|(id, _)| id.clone()).collect(),
+            Trigger::Heartbeat => Vec::new(),
         }
     }
 }
+
+const WHY_ASK: &str = "ask";
+const WHY_REPLY: &str = "reply in a thread where the agent posted";
 
 /// What the runner makes of a new event.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -114,7 +125,7 @@ pub fn interest(node: &Node, me: &str, allow: &[String], event: &Event) -> Inter
         return Interest::Ignore("author not in --allow");
     }
     if event.kind == Kind::Ask {
-        return Interest::Wake("ask");
+        return Interest::Wake(WHY_ASK);
     }
     let Some(root) = &event.thread else {
         return Interest::Ignore("not an ask, not a reply");
@@ -125,9 +136,7 @@ pub fn interest(node: &Node, me: &str, allow: &[String], event: &Event) -> Inter
         ..Filter::default()
     };
     match node.store().search(None, &mine, 1) {
-        Ok(found) if !found.is_empty() => {
-            Interest::Wake("reply in a thread where the agent posted")
-        }
+        Ok(found) if !found.is_empty() => Interest::Wake(WHY_REPLY),
         _ => Interest::Ignore("reply in a thread the agent is not part of"),
     }
 }
@@ -136,32 +145,134 @@ pub fn is_interesting(node: &Node, me: &str, allow: &[String], event: &Event) ->
     matches!(interest(node, me, allow, event), Interest::Wake(_))
 }
 
-/// The prompt of one run: the heartbeat text, then what is new.
-pub fn prompt(config: &AgentConfig, me: &str, since: i64, trigger: &Trigger) -> String {
-    let mut prompt = config.heartbeat_text.trim_end().to_string();
-    prompt.push_str("\n\n---\n");
-    prompt.push_str(&format!("Your author id: {me}\n"));
-    prompt.push_str(&format!(
-        "Cursor: events newer than `since={since}` (pass it to `wait` or compare with `search`).\n"
-    ));
-    match trigger {
+/// `n thing` / `n things`.
+fn count(n: usize, one: &str, many: &str) -> String {
+    format!("{n} {}", if n == 1 { one } else { many })
+}
+
+/// The prompt of one run: the heartbeat template (HEARTBEAT.md) with its
+/// variables filled: `{agent_profile}`, `{user}`, `{agent.about}`,
+/// `{reasons}`, `{cursor}` and `{events}` (one line per event: id · kind ·
+/// author · title). A template without `{events}` gets that context
+/// appended.
+pub fn prompt(node: &Node, config: &AgentConfig, since: i64, trigger: &Trigger) -> String {
+    let (reasons, events) = match trigger {
         Trigger::Events(ids) => {
-            prompt.push_str("New events of interest (open them with `read`):\n");
-            for id in ids.iter().take(MAX_IDS_IN_PROMPT) {
-                prompt.push_str(&format!("- {id}\n"));
+            let asks = ids.iter().filter(|(_, why)| *why == WHY_ASK).count();
+            let replies = ids.len() - asks;
+            let mut reasons = Vec::new();
+            if asks > 0 {
+                reasons.push(count(asks, "new ask", "new asks"));
             }
+            if replies > 0 {
+                reasons.push(count(
+                    replies,
+                    "reply in a thread where you posted",
+                    "replies in threads where you posted",
+                ));
+            }
+            let mut lines: Vec<String> = ids
+                .iter()
+                .take(MAX_IDS_IN_PROMPT)
+                .map(|(id, _)| match node.store().get(id) {
+                    Ok(Some(stored)) => {
+                        let e = &stored.event;
+                        let title = e.title.clone().unwrap_or_else(|| title_from_text(&e.text));
+                        format!("- {id} · {} · {} · {title}", e.kind, short(&e.author))
+                    }
+                    _ => format!("- {id}"),
+                })
+                .collect();
             if ids.len() > MAX_IDS_IN_PROMPT {
-                prompt.push_str(&format!(
-                    "- … and {} more: use `search`\n",
+                lines.push(format!(
+                    "- … and {} more: use `search`",
                     ids.len() - MAX_IDS_IN_PROMPT
                 ));
             }
+            (reasons.join(", "), lines.join("\n"))
         }
-        Trigger::Heartbeat => {
-            prompt.push_str("Heartbeat: nothing specific woke you. Look around briefly.\n");
-        }
+        Trigger::Heartbeat => (
+            "the heartbeat, with nothing specific: look around briefly".to_string(),
+            "(nothing of interest; `wait` or `search` if you want to look)".to_string(),
+        ),
+    };
+    let about = if config.about.trim().is_empty() {
+        "(not described: `agent.about` is empty, so act as a careful general assistant)"
+    } else {
+        config.about.trim()
+    };
+    let cursor = format!("since={since}");
+    let template = config.heartbeat_text.trim_end();
+    let mut prompt = template
+        .replace("{agent_profile}", &config.profile)
+        .replace("{user}", &config.user)
+        .replace("{agent.about}", about)
+        .replace("{reasons}", &reasons)
+        .replace("{cursor}", &cursor)
+        .replace("{events}", &events);
+    if !template.contains("{events}") {
+        prompt.push_str(&format!(
+            "\n\n---\nYou are {}. You were woken because: {reasons}.\nNew since your last run ({cursor}):\n{events}\n",
+            config.profile
+        ));
     }
     prompt
+}
+
+/// Post an `announce` from the agent profile on first start, and again
+/// whenever its description changes: title = the first line of
+/// `agent.about`, text = `agent.about`, tags = `agent.caps`.
+async fn announce_if_changed(node: &Arc<Node>, config: &AgentConfig) {
+    let about = config.about.trim();
+    if about.is_empty() {
+        warn!(
+            "agent.about is empty: describe the agent's role with \
+             `wats config set agent.about \"…\"`, so that it knows what to answer \
+             and others find it with `who`"
+        );
+        return;
+    }
+    let tags: Vec<String> = config
+        .caps
+        .iter()
+        .map(|c| {
+            if c.contains(':') {
+                c.clone()
+            } else {
+                format!("cap:{c}")
+            }
+        })
+        .collect();
+    let fingerprint = blake3::hash(json!([config.profile, about, tags]).to_string().as_bytes())
+        .to_hex()
+        .to_string();
+    let marker = config
+        .work_dir
+        .join(format!("announced-{}", config.profile));
+    if std::fs::read_to_string(&marker).is_ok_and(|f| f.trim() == fingerprint) {
+        return;
+    }
+    let draft = Draft {
+        net: node.config().nets[0].clone(),
+        kind: Some(Kind::Announce),
+        title: Some(title_from_text(about)),
+        text: about.to_string(),
+        tags,
+        ..Draft::default()
+    };
+    let published = match node.author_key(&config.profile) {
+        Ok(key) => node.publish_as(&key, draft, &[]).await,
+        Err(e) => Err(e),
+    };
+    match published {
+        Ok(event) => {
+            info!(event = short(&event.id), "announced the agent");
+            if let Err(e) = std::fs::write(&marker, &fingerprint) {
+                warn!("cannot record the announce: {e}");
+            }
+        }
+        Err(e) => warn!("could not announce the agent: {e:#}"),
+    }
 }
 
 /// Write the MCP config the agent CLI is started with.
@@ -202,7 +313,7 @@ async fn start_run(
         &config.runtime,
         &config.profile,
         trigger.name(),
-        trigger.events(),
+        &trigger.events(),
     );
     std::fs::create_dir_all(runs::runs_dir(&config.work_dir))?;
     let base = record.id.clone();
@@ -226,6 +337,15 @@ async fn start_run(
         .arg("--strict-mcp-config")
         .arg("--allowedTools")
         .arg("mcp__wats__*")
+        // The user's own Claude Code settings (language, hooks, permission
+        // rules) are not the agent's: only the working directory's apply,
+        // unless the extra arguments say otherwise.
+        .args(
+            (!config.extra_args.iter().any(|a| a == "--setting-sources"))
+                .then_some(["--setting-sources", "project"])
+                .into_iter()
+                .flatten(),
+        )
         .args(&config.extra_args)
         .stdin(Stdio::piped())
         .stdout(file.try_clone()?)
@@ -341,10 +461,11 @@ pub async fn run(
 ) -> Result<()> {
     let me = author_id(&node.author_key(&config.profile)?);
     let mcp_config = write_mcp_config(&config)?;
+    announce_if_changed(&node, &config).await;
     // A marker left by a run that did not finish (crash, kill -9).
     let _ = std::fs::remove_file(runs::current_path(&config.work_dir));
     let mut events = node.store().subscribe();
-    let mut pending: Vec<String> = Vec::new();
+    let mut pending: Vec<(String, &'static str)> = Vec::new();
     let mut since = node.store().last_seq()?;
     let mut last_run: Option<Instant> = None;
     let mut last_heartbeat = Instant::now();
@@ -373,9 +494,9 @@ pub async fn run(
                     let event = &stored.event;
                     match interest(&node, &me, &config.allow, event) {
                         Interest::Wake(why) => {
-                            if !pending.contains(&event.id) {
+                            if !pending.iter().any(|(id, _)| *id == event.id) {
                                 info!(event = short(&event.id), kind = event.kind.as_str(), "queued for the agent: {why}");
-                                pending.push(event.id.clone());
+                                pending.push((event.id.clone(), why));
                             }
                         }
                         Interest::Ignore(why) => {
@@ -415,7 +536,7 @@ pub async fn run(
                     continue;
                 }
                 capped = false;
-                let text = prompt(&config, &me, since, &trigger);
+                let text = prompt(&node, &config, since, &trigger);
                 // Everything up to now is covered by this run.
                 since = node.store().last_seq()?;
                 runs.push_back(now);
@@ -430,4 +551,13 @@ pub async fn run(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn heartbeat_opens_like_the_mcp_instructions() {
+        let words = |s: &str| s.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(words(super::DEFAULT_HEARTBEAT).starts_with(&words(crate::mcp::OPENING)));
+    }
 }
