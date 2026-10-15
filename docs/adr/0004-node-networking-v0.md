@@ -39,8 +39,10 @@ Code: `crates/wats/src/node.rs`.
   disabled because it depends on `attohttpc` (MPL-2.0), outside our
   permissive license allowlist. NAT traversal relies on QUIC hole punching
   with relay fallback, which is Iroh's primary mechanism; port mapping only
-  improves the odds of a direct path behind some home routers. Revisit if
-  the cross-NAT tests show too many relayed connections.
+  improves the odds of a direct path behind some home routers. Kept
+  disabled (decision of 2026-10-15: SPEC §2.16 requires permissive
+  dependencies; hole punching plus relays suffice for v1). Revisit only if
+  cross-NAT tests show poor direct-connection rates.
 
 ## Known limitations
 

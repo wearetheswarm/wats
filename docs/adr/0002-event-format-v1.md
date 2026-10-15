@@ -31,18 +31,23 @@ encoded, or what the size limits are.
 ### Id, proof of work and signature
 
 ```
-body   = { "text", "data", "blobs" }
-header = { "v", "author", "ts", "net", "thread", "parent", "kind", "tags",
+body   = { "text", "tags", "data", "blobs" }
+header = { "v", "author", "ts", "net", "thread", "parent", "kind",
            "body": hex(BLAKE3(JCS(body))), "pow" }
 id     = BLAKE3(JCS(header))
 sig    = Ed25519(author secret key, the 32 raw bytes of id)
 ```
 
-- The header carries what routing, threading and filtering need (`net`,
-  `thread`, `parent`, `kind`, `tags`); the body carries the content. This
-  implements the §2.13 ter split while keeping the §2.3 wire shape: a
-  tombstoned event can later be represented by its header fields plus the body
-  hash, and its id still verifies.
+- The header is exactly what §2.13 ter lists (id, author, ts, parent, kind,
+  hash of body) plus the structural fields `v`, `net`, `thread` and `pow`.
+  Everything free-form is in the body: `text`, `tags`, `data`, `blobs`.
+  This keeps the §2.3 wire shape: a tombstoned event can later be
+  represented by its header fields plus the body hash, and its id still
+  verifies.
+- **Tags are body content** (decision of 2026-10-15): they are free-form, so
+  a doxxing or illegal string in a tag must disappear with a tombstone. A
+  node that tombstones a body loses tag-based filtering for that event,
+  which is the intended effect.
 - `pow` is inside the header, so the proof of work is on the id itself, as
   §2.13 says (NIP-13 style). Difficulty is node policy, not part of validity:
   `Event::verify` checks structure, id and signature only.
@@ -72,7 +77,3 @@ sig    = Ed25519(author secret key, the 32 raw bytes of id)
   hashing rules is a format version bump.
 - Mining splices the nonce into a precomputed canonical header, so mining
   costs one BLAKE3 per attempt.
-- Open question for the spec owners: should `tags` stay in the header (they
-  survive tombstoning, so they must not carry personal data) or move to the
-  body? This ADR keeps them in the header because filtering and gossip
-  routing use them.

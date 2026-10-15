@@ -4,8 +4,8 @@
 //! is the flat JSON object of §2.3; for hashing it is split in two:
 //!
 //! ```text
-//! body   = { text, data, blobs }
-//! header = { v, author, ts, net, thread, parent, kind, tags, body: hex(BLAKE3(JCS(body))), pow }
+//! body   = { text, tags, data, blobs }
+//! header = { v, author, ts, net, thread, parent, kind, body: hex(BLAKE3(JCS(body))), pow }
 //! id     = BLAKE3(JCS(header))
 //! sig    = Ed25519(author key, id as 32 raw bytes)
 //! ```
@@ -178,6 +178,7 @@ fn invalid(msg: impl Into<String>) -> EventError {
 #[derive(Serialize)]
 struct BodyRef<'a> {
     text: &'a str,
+    tags: &'a [String],
     data: &'a Map<String, Value>,
     blobs: &'a [BlobRef],
 }
@@ -191,7 +192,6 @@ struct HeaderRef<'a> {
     thread: Option<&'a str>,
     parent: Option<&'a str>,
     kind: Kind,
-    tags: &'a [String],
     body: &'a str,
     pow: &'a str,
 }
@@ -370,6 +370,7 @@ impl Draft {
     fn body_hash(&self) -> Result<String, EventError> {
         let body = BodyRef {
             text: &self.text,
+            tags: &self.tags,
             data: &self.data,
             blobs: &self.blobs,
         };
@@ -400,7 +401,6 @@ impl Draft {
             thread: self.thread.as_deref(),
             parent: self.parent.as_deref(),
             kind,
-            tags: &self.tags,
             body: &body,
             pow: "",
         })?;
@@ -492,7 +492,6 @@ impl Event {
             thread: self.thread.as_deref(),
             parent: self.parent.as_deref(),
             kind: self.kind,
-            tags: &self.tags,
             body: &body,
             pow: &self.pow,
         })?;
@@ -725,11 +724,12 @@ mod tests {
         }
         .sign(&key(7), 1_760_500_000, 0)
         .unwrap();
-        let body = blake3::hash(br#"{"blobs":[],"data":{},"text":"hello swarm"}"#)
-            .to_hex()
-            .to_string();
+        let body =
+            blake3::hash(br#"{"blobs":[],"data":{},"tags":["lang:en"],"text":"hello swarm"}"#)
+                .to_hex()
+                .to_string();
         let header = format!(
-            r#"{{"author":"{}","body":"{body}","kind":"note","net":"public","parent":null,"pow":"0","tags":["lang:en"],"thread":null,"ts":1760500000,"v":1}}"#,
+            r#"{{"author":"{}","body":"{body}","kind":"note","net":"public","parent":null,"pow":"0","thread":null,"ts":1760500000,"v":1}}"#,
             event.author
         );
         assert_eq!(
