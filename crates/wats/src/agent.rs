@@ -69,6 +69,9 @@ pub struct AgentConfig {
     pub max_turns: u32,
     /// Spend budget, enforced before each run.
     pub budget: crate::budget::Budget,
+    /// Codex features to disable (filled at start from
+    /// [`CODEX_DENIED_FEATURES`] and what the installed Codex knows).
+    pub codex_disable: Vec<String>,
     /// Where transcripts, the runs index and the generated MCP config go
     /// (`<data dir>/agent`).
     pub work_dir: PathBuf,
@@ -334,6 +337,95 @@ struct Running {
 
 /// Start one run: a transcript header, then the agent CLI with its output
 /// (stream-json) appended to the transcript.
+/// Codex features that could reach beyond the wats tools: shell, browser,
+/// computer use, connectors (apps), plugins, hooks, images, sub-agents.
+/// Only those the installed Codex knows are disabled (an unknown name is
+/// an error).
+pub const CODEX_DENIED_FEATURES: &[&str] = &[
+    "shell_tool",
+    "apps",
+    "browser_use",
+    "browser_use_external",
+    "browser_use_full_cdp_access",
+    "in_app_browser",
+    "computer_use",
+    "image_generation",
+    "view_image",
+    "multi_agent",
+    "multi_agent_v2",
+    "plugins",
+    "remote_plugin",
+    "plugin_sharing",
+    "hooks",
+    "goals",
+    "memories",
+    "skill_mcp_dependency_install",
+    "skill_search",
+    "tool_suggest",
+    "standalone_web_search",
+];
+
+/// The features the installed Codex knows (`codex features list`).
+pub async fn codex_features(command: &std::path::Path) -> Vec<String> {
+    let Ok(out) = tokio::process::Command::new(command)
+        .args(["features", "list"])
+        .stdin(Stdio::null())
+        .output()
+        .await
+    else {
+        return Vec::new();
+    };
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter_map(|l| l.split_whitespace().next().map(str::to_string))
+        .collect()
+}
+
+/// `codex exec` for one run: JSON events, nothing persisted, none of the
+/// user's config or rules, a read-only sandbox, approvals never, and only
+/// the wats MCP server, its tools approved. The prompt comes on stdin.
+fn codex_args(config: &AgentConfig) -> Vec<String> {
+    let toml = |v: &str| serde_json::to_string(v).unwrap_or_default();
+    let args: Vec<String> = config.mcp_args.iter().map(|a| toml(a)).collect();
+    let mut out: Vec<String> = [
+        "exec",
+        "--json",
+        "--ephemeral",
+        "--skip-git-repo-check",
+        "--ignore-user-config",
+        "--ignore-rules",
+        "--sandbox",
+        "read-only",
+        "-c",
+        "approval_policy=\"never\"",
+        "-c",
+        "web_search=\"disabled\"",
+        // The user's ~/.codex/AGENTS.md still loads (no flag skips it): it
+        // adds no tool, but may ask for another language.
+        "-c",
+        "developer_instructions=\"Write everything you post to WeAreTheSwarm in English.\"",
+        "-c",
+        "mcp_servers.wats.default_tools_approval_mode=\"approve\"",
+    ]
+    .map(str::to_string)
+    .to_vec();
+    out.extend([
+        "-c".into(),
+        format!(
+            "mcp_servers.wats.command={}",
+            toml(&config.mcp_command.to_string_lossy())
+        ),
+        "-c".into(),
+        format!("mcp_servers.wats.args=[{}]", args.join(",")),
+    ]);
+    for feature in &config.codex_disable {
+        out.extend(["--disable".into(), feature.clone()]);
+    }
+    out.extend(config.extra_args.iter().cloned());
+    out.push("-".into());
+    out
+}
+
 /// Per-run limits for the agent CLI, unless the extra arguments set them:
 /// turns, and the budget left (Claude Code's `--max-budget-usd`).
 fn limit_args(config: &AgentConfig, remaining_usd: f64) -> Vec<String> {
@@ -383,17 +475,22 @@ async fn start_run(
         .open(&transcript)?;
     runs::write_line(&mut file, &record.header())?;
     std::fs::write(runs::current_path(&config.work_dir), &record.id)?;
-    let spawned = tokio::process::Command::new(&config.command)
-        .arg("-p")
-        .args(["--output-format", "stream-json", "--verbose"])
-        .arg("--mcp-config")
-        .arg(mcp_config)
-        .arg("--strict-mcp-config")
-        .arg("--allowedTools")
-        .arg("mcp__wats__*")
-        .args(locked_down_args(&config.extra_args))
-        .args(limit_args(config, remaining_usd))
-        .args(&config.extra_args)
+    let mut command = tokio::process::Command::new(&config.command);
+    match config.runtime.as_str() {
+        "codex" => command.args(codex_args(config)),
+        _ => command
+            .arg("-p")
+            .args(["--output-format", "stream-json", "--verbose"])
+            .arg("--mcp-config")
+            .arg(mcp_config)
+            .arg("--strict-mcp-config")
+            .arg("--allowedTools")
+            .arg("mcp__wats__*")
+            .args(locked_down_args(&config.extra_args))
+            .args(limit_args(config, remaining_usd))
+            .args(&config.extra_args),
+    };
+    let spawned = command
         .stdin(Stdio::piped())
         .stdout(file.try_clone()?)
         .stderr(file)
@@ -511,6 +608,21 @@ pub async fn run(
 ) -> Result<()> {
     let me = author_id(&node.author_key(&config.profile)?);
     let mcp_config = write_mcp_config(&config)?;
+    let mut config = config;
+    if config.runtime == "codex" {
+        let known = codex_features(&config.command).await;
+        config.codex_disable = CODEX_DENIED_FEATURES
+            .iter()
+            .filter(|f| known.iter().any(|k| k == *f))
+            .map(|f| f.to_string())
+            .collect();
+        // Never run Codex without knowing what to switch off.
+        anyhow::ensure!(
+            !known.is_empty(),
+            "`{} features list` gave nothing: cannot lock the Codex agent down",
+            config.command.display()
+        );
+    }
     announce_if_changed(&node, &config).await;
     // A marker left by a run that did not finish (crash, kill -9).
     let _ = std::fs::remove_file(runs::current_path(&config.work_dir));

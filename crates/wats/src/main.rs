@@ -279,11 +279,21 @@ enum AgentAction {
 
 #[derive(Debug, Subcommand)]
 enum SetupTool {
-    /// OpenAI Codex CLI: register wats as its MCP server (`codex mcp add
-    /// wats -- <this wats> mcp --profile <profile>`), unless it already has
-    /// the same entry. The profile is --profile, else config.toml's, else
-    /// your OS user name. (A Codex agent runner comes later.)
+    /// OpenAI Codex CLI. With neither --mcp nor --agent, does both.
     Codex {
+        /// Register wats as an MCP server of Codex: `codex mcp add wats --
+        /// <this wats> mcp --profile <profile>`, unless it already has the
+        /// same entry. The profile is --profile, else config.toml's, else
+        /// your OS user name.
+        #[arg(long)]
+        mcp: bool,
+        /// Enable the Codex agent runner in config.toml (agent.runtime =
+        /// "codex"): a bare `wats` then runs it.
+        #[arg(long)]
+        agent: bool,
+        /// Who the agent is and what it can do (agent.about).
+        #[arg(long)]
+        about: Option<String>,
         /// The Codex CLI.
         #[arg(long, env = "WATS_CODEX", default_value = "codex")]
         codex: PathBuf,
@@ -457,41 +467,32 @@ fn register_in_codex(args: &NodeArgs, profile: &str, codex: &std::path::Path) ->
     Ok(true)
 }
 
-/// `wats setup codex`.
-fn setup_codex(args: &NodeArgs, data_dir: &std::path::Path, codex: &std::path::Path) -> Result<()> {
-    let profile = human_profile(args, &Settings::load(data_dir)?)?;
-    let changed = register_in_codex(args, &profile, codex)?;
-    println!(
-        "Codex: wats MCP server {} (profile {profile})",
-        if changed {
-            "registered"
-        } else {
-            "already registered"
-        }
-    );
-    Ok(())
-}
-
-/// `wats setup claude`.
-fn setup_claude(
+/// `wats setup claude | codex`: register wats as the tool's MCP server
+/// and/or enable its agent runner in config.toml (both by default).
+fn setup_tool(
     args: &NodeArgs,
     data_dir: &std::path::Path,
+    runtime: &str,
     (mcp, agent): (bool, bool),
     about: Option<&str>,
-    scope: &str,
-    claude: &std::path::Path,
+    register: impl FnOnce(&str) -> Result<bool>,
 ) -> Result<()> {
     let (mcp, agent) = if mcp || agent {
         (mcp, agent)
     } else {
         (true, true)
     };
+    let name = if runtime == "codex" {
+        "Codex"
+    } else {
+        "Claude Code"
+    };
     let settings = Settings::load(data_dir)?;
     if mcp {
         let profile = human_profile(args, &settings)?;
-        let changed = register_in_claude(args, &profile, scope, claude)?;
+        let changed = register(&profile)?;
         println!(
-            "Claude Code: wats MCP server {} (scope {scope}, profile {profile})",
+            "{name}: wats MCP server {} (profile {profile})",
             if changed {
                 "registered"
             } else {
@@ -502,7 +503,7 @@ fn setup_claude(
     if agent || about.is_some() {
         let mut file = ConfigFile::open(data_dir)?;
         if agent {
-            file.set("agent.runtime", "claude")?;
+            file.set("agent.runtime", runtime)?;
         }
         if let Some(about) = about {
             file.set("agent.about", about)?;
@@ -510,7 +511,7 @@ fn setup_claude(
         file.save()?;
         if agent {
             println!(
-                "{}: agent.runtime = \"claude\"; `wats` now runs the node with a Claude agent",
+                "{}: agent.runtime = \"{runtime}\"; `wats` now runs the node with a {name} agent",
                 file.path().display()
             );
         }
@@ -1033,8 +1034,14 @@ fn agent_config(
         .map(|a| a.to_string_lossy().into_owned())
         .collect();
     mcp_args.extend(["mcp".into(), "--profile".into(), profile.clone()]);
+    let command = args
+        .agent_command
+        .clone()
+        .or(file.command.clone())
+        .unwrap_or_else(|| runtime_default_command(&runtime));
     Ok(Some(wats::agent::AgentConfig {
         runtime,
+        codex_disable: Vec::new(),
         profile,
         user: std::env::var("USER")
             .or_else(|_| std::env::var("USERNAME"))
@@ -1055,11 +1062,7 @@ fn agent_config(
             .unwrap_or(12),
         allow,
         heartbeat_text,
-        command: args
-            .agent_command
-            .clone()
-            .or(file.command.clone())
-            .unwrap_or_else(|| "claude".into()),
+        command,
         mcp_command: std::env::current_exe()?,
         mcp_args,
         extra_args,
@@ -1082,6 +1085,11 @@ fn short_duration(d: Duration) -> String {
         s if s % 60 == 0 => format!("{}m", s / 60),
         s => format!("{s}s"),
     }
+}
+
+/// The CLI of an agent runtime: `claude` or `codex`.
+fn runtime_default_command(runtime: &str) -> PathBuf {
+    runtime.into()
 }
 
 /// The spend budget from config.toml, or the defaults.
@@ -1141,12 +1149,22 @@ fn print_banner(config: &NodeConfig, agent: Option<&wats::agent::AgentConfig>) {
     }
     if let Some(agent) = agent {
         let spend = wats::budget::spend(&agent.work_dir, unix_now());
-        eprintln!(
-            "agent budget: {} · {} turns and {} per run",
-            wats::budget::describe(&agent.budget, &spend),
-            agent.max_turns,
-            short_duration(agent.run_timeout)
-        );
+        if agent.runtime == "codex" {
+            // Codex reports tokens, not dollars: runs are what is counted.
+            eprintln!(
+                "agent budget: {} of {} runs today (Codex reports no cost) · {} per run",
+                spend.uncosted_today,
+                agent.budget.max_runs_per_day,
+                short_duration(agent.run_timeout)
+            );
+        } else {
+            eprintln!(
+                "agent budget: {} · {} turns and {} per run",
+                wats::budget::describe(&agent.budget, &spend),
+                agent.max_turns,
+                short_duration(agent.run_timeout)
+            );
+        }
     }
     eprintln!("Ctrl-C to stop · wats --help");
 }
@@ -1190,7 +1208,10 @@ async fn agent_watch(data_dir: &std::path::Path, action: AgentAction) -> Result<
                         )
                     });
                 }
-                let cost: f64 = shown.iter().filter_map(|r| r.cost_usd).sum();
+                let cost = shown
+                    .iter()
+                    .filter_map(|r| r.cost_usd)
+                    .fold(0.0, |a, b| a + b);
                 // A config.toml that does not load must not hide the runs.
                 let budget = Settings::load(data_dir)
                     .map(|s| budget_of(&s.agent))
@@ -1319,18 +1340,33 @@ async fn main() -> Result<()> {
                     claude,
                 },
         }) => {
-            return setup_claude(
+            return setup_tool(
                 &cli.node,
                 &data_dir,
+                "claude",
                 (mcp, agent),
                 about.as_deref(),
-                &scope,
-                &claude,
+                |profile| register_in_claude(&cli.node, profile, &scope, &claude),
             );
         }
         Some(Command::Setup {
-            tool: SetupTool::Codex { codex },
-        }) => return setup_codex(&cli.node, &data_dir, &codex),
+            tool:
+                SetupTool::Codex {
+                    mcp,
+                    agent,
+                    about,
+                    codex,
+                },
+        }) => {
+            return setup_tool(
+                &cli.node,
+                &data_dir,
+                "codex",
+                (mcp, agent),
+                about.as_deref(),
+                |profile| register_in_codex(&cli.node, profile, &codex),
+            );
+        }
         _ => {}
     }
     let settings = Settings::load(&data_dir)?;
@@ -1349,19 +1385,30 @@ async fn main() -> Result<()> {
         }
     };
     let agent = agent_config(&cli.node, &daemon.agent, &settings.agent, &data_dir)?;
-    // `--agent claude` also makes sure Claude Code sees the swarm.
-    if daemon.agent.agents.iter().any(|a| a == "claude")
-        && let Some(agent) = &agent
+    // `--agent claude|codex` also makes sure that tool's sessions see the
+    // swarm.
+    if let Some(agent) = &agent
+        && daemon.agent.agents.contains(&agent.runtime)
     {
         let profile = human_profile(&cli.node, &settings)?;
+        let (name, registered) = if agent.runtime == "codex" {
+            (
+                "Codex",
+                register_in_codex(&cli.node, &profile, &agent.command),
+            )
+        } else {
+            (
+                "Claude Code",
+                register_in_claude(&cli.node, &profile, "user", &agent.command),
+            )
+        };
         // Not fatal: the agent itself does not need it (e.g. in a container).
-        match register_in_claude(&cli.node, &profile, "user", &agent.command) {
+        match registered {
             Ok(true) => eprintln!(
-                "wats registered in Claude Code (scope user, profile {profile}): \
-                 new Claude Code sessions see the swarm"
+                "wats registered in {name} (profile {profile}): new {name} sessions see the swarm"
             ),
             Ok(false) => {}
-            Err(e) => tracing::warn!("could not register wats in Claude Code: {e:#}"),
+            Err(e) => tracing::warn!("could not register wats in {name}: {e:#}"),
         }
     }
     if !daemon.quiet {

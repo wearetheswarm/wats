@@ -27,7 +27,7 @@ use serde::Deserialize;
 pub const FILE_NAME: &str = "config.toml";
 
 /// The agent runtimes wats can run.
-pub const RUNTIMES: [&str; 1] = ["claude"];
+pub const RUNTIMES: [&str; 2] = ["claude", "codex"];
 
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -202,7 +202,7 @@ pub const KEYS: &[Key] = &[
         "agent.runtime",
         ValueType::Runtime,
         "none",
-        "agent run with the node: claude",
+        "agent run with the node: claude or codex",
     ),
     key(
         "agent.profile",
@@ -252,7 +252,12 @@ pub const KEYS: &[Key] = &[
         "shipped",
         "heartbeat prompt, relative to the data dir",
     ),
-    key("agent.command", ValueType::Text, "claude", "the agent CLI"),
+    key(
+        "agent.command",
+        ValueType::Text,
+        "the runtime's",
+        "the agent CLI (claude, codex)",
+    ),
     key(
         "agent.args",
         ValueType::List,

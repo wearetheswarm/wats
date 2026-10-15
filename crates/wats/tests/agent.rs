@@ -110,6 +110,7 @@ async fn agent_wakes_on_asks_and_heartbeats() -> anyhow::Result<()> {
         run_timeout: Duration::from_secs(10),
         max_turns: 10,
         budget: wats::budget::Budget::default(),
+        codex_disable: vec![],
         work_dir: dir.path().join("work"),
         keep_runs: 2,
         keep_days: 30,
@@ -374,7 +375,7 @@ fn setup_claude_registers_and_enables() {
     };
     let said = setup(&[]);
     assert!(
-        said.contains("registered (scope user, profile vincent-carluer)"),
+        said.contains("registered (profile vincent-carluer)"),
         "{said}"
     );
     let calls = std::fs::read_to_string(&log).unwrap();
@@ -630,6 +631,7 @@ async fn budget_pauses_the_agent() -> anyhow::Result<()> {
             max_usd_per_day: 0.02,
             ..Default::default()
         },
+        codex_disable: vec![],
         work_dir: dir.path().join("work"),
         keep_runs: 100,
         keep_days: 30,
@@ -697,7 +699,12 @@ fn setup_codex_registers_once() {
         );
         String::from_utf8(out.stdout).unwrap()
     };
-    assert!(setup().contains("registered (profile alice)"));
+    let said = setup();
+    assert!(
+        said.contains("Codex: wats MCP server registered (profile alice)"),
+        "{said}"
+    );
+    assert!(said.contains("agent.runtime = \"codex\""), "{said}");
     let calls = std::fs::read_to_string(&log).unwrap();
     let add = calls.lines().last().unwrap();
     assert!(add.starts_with("mcp add wats -- /"), "{add}");
@@ -714,6 +721,124 @@ fn setup_codex_registers_once() {
     std::fs::write(&current, entry.to_string()).unwrap();
     std::fs::remove_file(&log).unwrap();
     assert!(setup().contains("already registered"));
+    let config = std::fs::read_to_string(data.join("config.toml")).unwrap();
+    assert!(config.contains("runtime = \"codex\""), "{config}");
     let calls = std::fs::read_to_string(&log).unwrap();
     assert!(!calls.contains("mcp add"), "{calls}");
+}
+
+/// The Codex runtime: `codex exec` locked down (JSON events, ephemeral, no
+/// user config, read-only sandbox, approvals never, only the wats MCP
+/// server with its tools approved, the risky features the installed Codex
+/// knows switched off), and its JSON events rendered in the transcript.
+#[tokio::test(flavor = "multi_thread")]
+async fn codex_runs_locked_down() -> anyhow::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir()?;
+    let out = dir.path().join("out");
+    std::fs::create_dir_all(&out)?;
+    let fake = dir.path().join("codex");
+    std::fs::write(
+        &fake,
+        format!(
+            r#"#!/bin/sh
+if [ "$1" = features ]; then
+  printf 'apps   stable true\nshell_tool  stable true\ncode_mode_host stable true\n'
+  exit 0
+fi
+echo "$@" > {out}/args
+cat > {out}/prompt
+echo '{{"type":"thread.started","thread_id":"0199aaaa-bbbb"}}'
+echo '{{"type":"item.completed","item":{{"id":"i1","type":"mcp_tool_call","server":"wats","tool":"who","arguments":{{}},"result":{{"content":[{{"type":"text","text":"{{\\"agents\\":[]}}"}}]}},"error":null,"status":"completed"}}}}'
+echo '{{"type":"item.completed","item":{{"id":"i2","type":"agent_message","text":"Nothing to do."}}}}'
+echo '{{"type":"turn.completed","usage":{{"input_tokens":10,"output_tokens":2}}}}'
+"#,
+            out = out.display()
+        ),
+    )?;
+    std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755))?;
+    let a = node(&dir.path().join("a"), &[]).await?;
+    let work = dir.path().join("work");
+    let config = AgentConfig {
+        runtime: "codex".into(),
+        profile: "agent".into(),
+        user: "alice".into(),
+        about: String::new(),
+        caps: vec![],
+        every: Duration::from_secs(1),
+        heartbeat: Duration::from_secs(1),
+        max_runs_per_hour: 100,
+        allow: vec![],
+        heartbeat_text: DEFAULT_HEARTBEAT.into(),
+        command: fake,
+        mcp_command: "/opt/wats".into(),
+        mcp_args: vec![
+            "--dir".into(),
+            "/d".into(),
+            "mcp".into(),
+            "--profile".into(),
+            "agent".into(),
+        ],
+        extra_args: vec!["-m".into(), "gpt-test".into()],
+        run_timeout: Duration::from_secs(10),
+        max_turns: 10,
+        budget: wats::budget::Budget::default(),
+        codex_disable: vec![],
+        work_dir: work.clone(),
+        keep_runs: 100,
+        keep_days: 30,
+    };
+    let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+    let runner = tokio::spawn(wats::agent::run(Arc::clone(&a), config, async {
+        let _ = stopped.await;
+    }));
+    eventually("a codex run is indexed", || {
+        wats::runs::list(&work).iter().any(|r| r.status == "ok")
+    })
+    .await;
+    let _ = stop.send(());
+    runner.await??;
+    let args = std::fs::read_to_string(out.join("args"))?;
+    for expected in [
+        "exec --json --ephemeral --skip-git-repo-check --ignore-user-config --ignore-rules --sandbox read-only",
+        "-c approval_policy=\"never\"",
+        "-c mcp_servers.wats.default_tools_approval_mode=\"approve\"",
+        "-c mcp_servers.wats.command=\"/opt/wats\"",
+        "-c mcp_servers.wats.args=[\"--dir\",\"/d\",\"mcp\",\"--profile\",\"agent\"]",
+        "--disable shell_tool --disable apps",
+        "-m gpt-test -",
+    ] {
+        assert!(args.contains(expected), "missing {expected:?} in {args}");
+    }
+    assert!(
+        !args.contains("browser_use"),
+        "unknown features are not passed: {args}"
+    );
+    assert!(
+        !args.contains("code_mode_host"),
+        "MCP calls need code mode: {args}"
+    );
+    assert!(std::fs::read_to_string(out.join("prompt"))?.contains("WeAreTheSwarm"));
+    let record = wats::runs::list(&work)
+        .into_iter()
+        .find(|r| r.status == "ok")
+        .unwrap();
+    assert_eq!(record.turns, Some(1));
+    assert_eq!(record.cost_usd, None);
+    let mut rendered = Vec::new();
+    wats::runs::print_runs(
+        &work,
+        std::slice::from_ref(&record.id),
+        wats::runs::Style { color: false },
+        &mut rendered,
+    )?;
+    let rendered = String::from_utf8(rendered)?;
+    assert!(rendered.contains("→ wats.who {}"), "{rendered}");
+    assert!(rendered.contains("  Nothing to do."), "{rendered}");
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_secs();
+    assert!(wats::budget::spend(&work, now).uncosted_today >= 1);
+    a.shutdown().await?;
+    Ok(())
 }
