@@ -11,8 +11,10 @@
 #   dist/wats-<version>-<target>.tar.gz and .sha256
 #
 # Note: on Apple silicon the default x86_64 build runs under emulation
-# (linux/amd64): expect it to be slow, roughly 10x a native build the first
-# time. Rebuilds are incremental: the cargo registry and the target directory
+# (linux/amd64), so it is slower: measured cold on an M-series Mac with
+# OrbStack, about 2.5 min for x86_64 against 1 min for the native aarch64
+# build. Slower emulators (QEMU) can take much longer. Rebuilds are
+# incremental: the cargo registry and the target directory
 # live in Docker volumes (wats-static-*). Remove them with
 #   docker volume rm $(docker volume ls -q --filter name=wats-static-)
 set -euo pipefail
@@ -24,7 +26,7 @@ while [ $# -gt 0 ]; do
     --target) target="${2:?--target needs a value}"; shift 2 ;;
     --target=*) target="${1#--target=}"; shift ;;
     --image) image=true; shift ;;
-    -h|--help) sed -n '2,19p' "$0"; exit 0 ;;
+    -h|--help) sed -n '2,21p' "$0"; exit 0 ;;
     *) echo "unknown argument: $1 (see --help)" >&2; exit 2 ;;
   esac
 done
