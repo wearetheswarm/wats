@@ -112,10 +112,14 @@ enum Command {
         /// Publish one post once a peer is connected.
         #[arg(long)]
         post: Option<String>,
-        /// With --post: wait until this many peers are known (up to 60 s),
-        /// so that replication k can reach them.
+        /// With --post: wait until this many peers are known (up to
+        /// --wait-timeout), so that replication k can reach them.
         #[arg(long, default_value_t = 1)]
         wait_peers: usize,
+        /// With --post: how long to wait for a peer and for --wait-peers, in
+        /// seconds, before posting anyway.
+        #[arg(long, default_value_t = 60)]
+        wait_timeout: u64,
         /// Kind of the post.
         #[arg(long, default_value = "note")]
         kind: String,
@@ -422,6 +426,7 @@ fn print_line(value: serde_json::Value) {
 struct NodeRun {
     post: Option<String>,
     wait_peers: usize,
+    wait_timeout: u64,
     kind: String,
     tags: Vec<String>,
     blobs: Vec<PathBuf>,
@@ -433,6 +438,7 @@ async fn run_node(node: Arc<Node>, run: NodeRun, mut shutdown: Shutdown) -> Resu
     let NodeRun {
         post,
         wait_peers,
+        wait_timeout,
         kind,
         tags,
         blobs,
@@ -467,9 +473,9 @@ async fn run_node(node: Arc<Node>, run: NodeRun, mut shutdown: Shutdown) -> Resu
         tokio::spawn(async move {
             let net = node.config().nets[0].clone();
             let result = async {
-                node.wait_for_neighbor(&net, Duration::from_secs(60))
-                    .await?;
-                let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+                let wait = Duration::from_secs(wait_timeout);
+                node.wait_for_neighbor(&net, wait).await?;
+                let deadline = tokio::time::Instant::now() + wait;
                 while node.known_peers().len() < wait_peers {
                     if tokio::time::Instant::now() >= deadline {
                         tracing::warn!(
@@ -549,15 +555,34 @@ async fn run_mcp(node: Arc<Node>, mut shutdown: Shutdown) -> Result<()> {
     node.shutdown().await
 }
 
+/// `RUST_LOG`, or `wats=info` by default. Unless `RUST_LOG` already
+/// mentions Iroh's structured events, two of them are always shown: the
+/// network path chosen for each peer (`path::selected`: an IP address means
+/// a direct connection, a relay URL means relayed) and home relay changes.
+/// They are what a NAT test needs to see.
+fn log_filter() -> EnvFilter {
+    let mut filter =
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("wats=info"));
+    if !std::env::var("RUST_LOG").is_ok_and(|v| v.contains("_events")) {
+        for directive in [
+            "iroh::_events::path::selected=debug",
+            "iroh::_events::relay::home_changed=debug",
+        ] {
+            if let Ok(directive) = directive.parse() {
+                filter = filter.add_directive(directive);
+            }
+        }
+    }
+    filter
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     // Logs go to stderr: stdout is the protocol channel in `wats mcp`.
     tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
         .with_ansi(std::io::IsTerminal::is_terminal(&std::io::stderr()))
-        .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("wats=info")),
-        )
+        .with_env_filter(log_filter())
         .init();
 
     let shutdown = shutdown_signal();
@@ -568,6 +593,7 @@ async fn main() -> Result<()> {
         Command::Node {
             post,
             wait_peers,
+            wait_timeout,
             kind,
             tags,
             blobs,
@@ -578,6 +604,7 @@ async fn main() -> Result<()> {
             let run = NodeRun {
                 post,
                 wait_peers,
+                wait_timeout,
                 kind,
                 tags,
                 blobs,

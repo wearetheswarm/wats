@@ -258,28 +258,27 @@ wats --bootstrap '<endpoint-id>@router.wearetheswarm.ai:7842' node
 
 ## 8. NAT test (SPEC §5)
 
-The router plays machine A. Your Mac, on another network (a phone hotspot is
-the most telling), plays machine B:
+Copy `scripts/nat-test.sh` to two machines on different networks (a phone
+hotspot is the most telling) and run the same command on both:
 
 ```sh
-WATS_BOOTSTRAP='<endpoint-id>@router.wearetheswarm.ai:7842' \
-  RUST_LOG=wats=debug,iroh=info \
-  wats --dir /tmp/wats-nat-b node --post "NAT test from the Mac" --blob README.md
+./nat-test.sh
 ```
 
-On the Mac, success looks like this:
+How the test runs:
 
-- `published` is printed;
-- the log shows `synced` and `replication … report={<blob hash>: [<router id>]}`.
+- Both nodes meet through the router, which is built into the binary, and
+  use our relay and DNS (`infra=wats`).
+- Each node publishes a post with a 1 MiB blob, then prints a summary after
+  3 minutes, or on Ctrl-C.
+- The summary lists the path to the other machine: `direct Ip(...)` when
+  hole punching worked, `relay Relay(...)` when traffic went through
+  `relay.wearetheswarm.ai`.
+- Logs go to `./wats-nat-<role>-<time>.log`.
 
-On the VM, the router's log shows `blob fetched`. To see it, raise
-`RUST_LOG` to `wats=info` in `.env`, then run `docker compose -f
-compose.router.yaml up -d` again.
-
-`scripts/nat-test.sh b <ticket>` does the same if you prefer to paste a
-ticket. Iroh's logs say whether the path went direct (hole punched) or
-stayed on a relay. Both count as success; direct is the data point to
-report.
+The script finds a `wats` binary on its own, or downloads the release asset
+for the platform with `gh`. `./nat-test.sh a` and `./nat-test.sh b <ticket>`
+run a strict, direct-dial test without the router.
 
 ## Operations
 
