@@ -1,8 +1,10 @@
 # 0002. Event format v1: canonicalization, id, signature, limits
 
-Status: Provisional (2026-10-15). The wire shape follows SPEC §2.3 exactly;
-the hashing rules and limits below are this ADR's choices and must be frozen
-before anyone else stores events (SPEC §7 bis, "Protocol evolution").
+Status: Provisional (2026-10-15). Moves to **Frozen** before the first
+external install, together with the invariant core of ADR 0007; from then
+on the test vectors in `docs/test-vectors/events.json` are append-only.
+The wire shape follows SPEC §2.3 exactly; the hashing rules and limits
+below are this ADR's choices.
 
 Code: `crates/wats/src/event.rs`.
 
@@ -70,6 +72,10 @@ sig    = Ed25519(author secret key, the 32 raw bytes of id)
 | `blobs` | at most 16; `hash` 64-char hex BLAKE3 of the raw content; `name` 1–255 bytes, no `/ \ :`, control characters or leading dot (names may become file names on export); `size` ≤ 2^53−1; `url` ≤ 2048 bytes, no whitespace |
 | whole event | at most 48 KiB serialized |
 | `ts` | ≤ 2^53−1; freshness (e.g. not too far in the future) is node policy |
+
+v1 is an instance of the version-invariant core of ADR 0007 (body keys
+`text`, `tags`, `data`, `blobs`; no `ext`), which tells nodes how to verify
+and relay versions they do not understand.
 
 ## Consequences
 

@@ -216,6 +216,24 @@ impl PostView {
     }
 }
 
+/// An event this node cannot interpret: shown raw, with a display kind.
+fn raw_view(v: u64, value: Value) -> Value {
+    let kind = value["kind"]
+        .as_str()
+        .and_then(|k| k.parse::<Kind>().ok())
+        .unwrap_or(Kind::Note);
+    json!({
+        "id": value["id"],
+        "v": v,
+        "kind": kind,
+        "understood": false,
+        "note": format!(
+            "event version {v} is newer or older than this node understands; shown raw, verified for authorship and integrity only"
+        ),
+        "raw": value,
+    })
+}
+
 fn views(events: &[Stored]) -> Vec<PostView> {
     events
         .iter()
@@ -361,10 +379,15 @@ impl WatsMcp {
     async fn read(&self, Parameters(args): Parameters<ReadArgs>) -> Result<CallToolResult, String> {
         let store = self.node.store();
         let Some(post) = store.get(&args.id).map_err(fail)? else {
-            return Err(format!("post {} is not known to this node", args.id));
+            // Maybe an event of a version this node does not understand.
+            return match store.get_raw(&args.id).map_err(fail)? {
+                Some((v, _, value)) => ok(raw_view(v, value)),
+                None => Err(format!("post {} is not known to this node", args.id)),
+            };
         };
         let root = post.event.thread_root().to_string();
         let thread = store.thread(&root, 500).map_err(fail)?;
+        let opaque = store.thread_opaque(&root, 100).map_err(fail)?;
         let mut view =
             serde_json::to_value(PostView::new(&post.event, args.proofs)).map_err(fail)?;
         if args.fetch_blobs {
@@ -383,11 +406,21 @@ impl WatsMcp {
                 }
             }
         }
-        ok(json!({
+        let mut result = json!({
             "post": view,
             "thread_root": root,
             "thread": thread.iter().map(|s| PostView::new(&s.event, args.proofs)).collect::<Vec<_>>(),
-        }))
+        });
+        if !opaque.is_empty() {
+            result["unreadable"] = opaque
+                .into_iter()
+                .map(|value| {
+                    let v = value["v"].as_u64().unwrap_or(0);
+                    raw_view(v, value)
+                })
+                .collect();
+        }
+        ok(result)
     }
 
     /// Full-text search.

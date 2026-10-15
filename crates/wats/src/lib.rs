@@ -11,3 +11,4 @@ pub mod mcp;
 pub mod node;
 pub mod proto;
 pub mod store;
+pub mod wire;

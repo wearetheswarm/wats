@@ -28,8 +28,9 @@ use tracing::{debug, info, warn};
 
 use crate::event::{BlobRef, Draft, Event, is_safe_blob_name};
 use crate::identity::{DEFAULT_PROFILE, RootSecret, author_id};
-use crate::proto::{self, Request, Response, WatsProtocol};
+use crate::proto::{self, NodeInfo, Request, Response, WatsProtocol};
 use crate::store::{Inserted, Store};
+use crate::wire::AnyEvent;
 
 /// The public network id (ring zero, SPEC §2.4). Provisional, ADR 0004.
 pub const PUBLIC_NET: &str = "public";
@@ -90,11 +91,17 @@ impl NodeConfig {
     }
 }
 
+/// Version of the gossip envelope (ADR 0007). Receivers accept any
+/// version ≥ 1 and ignore unknown envelope fields; `event` and `providers`
+/// keep their meaning in every version.
+pub const ENVELOPE_VERSION: u32 = 1;
+
 /// What travels over gossip.
 #[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 struct Envelope {
-    event: Event,
+    ev: u32,
+    /// The event as wire JSON, of any version.
+    event: serde_json::Value,
     /// Endpoint ids (hex) of nodes that can serve the event's blobs.
     providers: Vec<String>,
 }
@@ -143,6 +150,8 @@ pub struct Node {
     peers: std::sync::Mutex<HashMap<EndpointId, u64>>,
     /// Blob hash -> nodes that announced they hold it (hints, unverified).
     hints: std::sync::Mutex<HashMap<String, Vec<EndpointId>>>,
+    /// What peers said in `hello`.
+    peer_info: std::sync::Mutex<HashMap<EndpointId, NodeInfo>>,
     /// Exclusive lock on the data directory, released by `shutdown`.
     lock: std::sync::Mutex<Option<std::fs::File>>,
 }
@@ -210,11 +219,13 @@ impl Node {
             .spawn(endpoint.clone());
         let downloader = blobs.downloader(&endpoint);
         let protocol = WatsProtocol::default();
-        let router = Router::builder(endpoint)
+        let mut router = Router::builder(endpoint)
             .accept(iroh_gossip::ALPN, gossip.clone())
-            .accept(iroh_blobs::ALPN, BlobsProtocol::new(&blobs, None))
-            .accept(proto::ALPN, protocol.clone())
-            .spawn();
+            .accept(iroh_blobs::ALPN, BlobsProtocol::new(&blobs, None));
+        for alpn in proto::ALPNS {
+            router = router.accept(alpn, protocol.clone());
+        }
+        let router = router.spawn();
 
         let bootstrap: Vec<EndpointId> = config.peers.iter().map(|p| p.id).collect();
         let mut senders = HashMap::new();
@@ -243,6 +254,7 @@ impl Node {
             fetched: tokio::sync::broadcast::channel(256).0,
             peers: std::sync::Mutex::new(bootstrap.iter().map(|id| (*id, now_secs())).collect()),
             hints: Default::default(),
+            peer_info: Default::default(),
             lock: std::sync::Mutex::new(Some(lock)),
         });
         protocol.set_node(&node);
@@ -410,7 +422,8 @@ impl Node {
         let event = tokio::task::spawn_blocking(move || draft.sign(&key, ts, pow_bits)).await??;
         self.store.insert(&event, ts)?;
         let envelope = Envelope {
-            event: event.clone(),
+            ev: ENVELOPE_VERSION,
+            event: serde_json::to_value(&event)?,
             providers: vec![self.endpoint_id().to_string()],
         };
         sender
@@ -443,7 +456,7 @@ impl Node {
         }
         let calls = targets.into_iter().map(|(peer, hashes)| {
             let request = Request::Replicate {
-                event: Box::new(event.clone()),
+                event: serde_json::to_value(event).unwrap_or_default(),
                 hashes,
             };
             async move {
@@ -625,6 +638,11 @@ impl Node {
                     let node = Arc::clone(&self);
                     let net = net.clone();
                     tokio::spawn(async move {
+                        if node.peer_info(&id).is_none()
+                            && let Err(e) = node.hello(id).await
+                        {
+                            debug!(peer = %id.fmt_short(), "hello failed: {e:#}");
+                        }
                         match node.sync_from(id, &net).await {
                             Ok(n) => debug!(%net, peer = %id.fmt_short(), new = n, "synced"),
                             Err(e) => debug!(%net, peer = %id.fmt_short(), "sync failed: {e:#}"),
@@ -650,46 +668,122 @@ impl Node {
 
     async fn handle_message(&self, net: &str, bytes: &[u8], from: EndpointId) -> Result<()> {
         let envelope: Envelope = serde_json::from_slice(bytes)?;
-        let event = envelope.event;
-        if event.net != net {
-            bail!("event for net {:?} on topic {net:?}", event.net);
+        if envelope.ev < 1 {
+            bail!("bad envelope version {}", envelope.ev);
         }
-        if !self.accept_event(&event)? {
+        let Some((event, new)) = self.accept_value(envelope.event)? else {
             return Ok(());
+        };
+        if event.net() != net {
+            bail!("event for net {:?} on topic {net:?}", event.net());
         }
-        let mut providers: Vec<EndpointId> = envelope
-            .providers
-            .iter()
-            .take(8)
-            .filter_map(|p| p.parse().ok())
-            .collect();
-        providers.push(from);
-        for blob in &event.blobs {
-            self.add_hints(&blob.hash, &providers);
+        if let (true, AnyEvent::Known(event)) = (new, &event) {
+            let mut providers: Vec<EndpointId> = envelope
+                .providers
+                .iter()
+                .take(8)
+                .filter_map(|p| p.parse().ok())
+                .collect();
+            providers.push(from);
+            for blob in &event.blobs {
+                self.add_hints(&blob.hash, &providers);
+            }
         }
         Ok(())
     }
 
-    /// Node policy for events from other nodes, then store. Returns whether
-    /// the event is new.
-    fn accept_event(&self, event: &Event) -> Result<bool> {
-        event.verify()?;
-        if !self.senders.contains_key(&event.net) {
-            bail!("not a member of network {:?}", event.net);
+    /// Verify an untrusted wire event, apply node policy, store it.
+    /// Events of versions this node does not understand are verified
+    /// against the invariant core and stored opaque (ADR 0007). Returns the
+    /// event and whether it is new; `None` if the policy rejects it.
+    fn accept_value(&self, value: serde_json::Value) -> Result<Option<(AnyEvent, bool)>> {
+        let event = AnyEvent::from_value(value)?;
+        if !self.senders.contains_key(event.net()) {
+            bail!("not a member of network {:?}", event.net());
         }
         if event.pow_bits() < self.config.min_pow_bits {
             bail!("insufficient proof of work");
         }
-        if event.ts > now_secs() + MAX_CLOCK_SKEW_SECS {
+        if event.ts() > now_secs() + MAX_CLOCK_SKEW_SECS {
             bail!("event timestamp is in the future");
         }
-        Ok(self.store.insert(event, now_secs())? != Inserted::Duplicate)
+        let inserted = match &event {
+            AnyEvent::Known(e) => self.store.insert(e, now_secs())?,
+            AnyEvent::Opaque(r) => {
+                debug!(id = %r.id, v = r.v, "storing opaque event");
+                self.store.insert_raw(r, now_secs())?
+            }
+        };
+        let new = inserted != Inserted::Duplicate;
+        Ok(Some((event, new)))
+    }
+
+    /// Store and broadcast an event that is already signed (any version),
+    /// e.g. a repost or an event produced by another tool.
+    pub async fn publish_signed(&self, value: serde_json::Value) -> Result<AnyEvent> {
+        let Some((event, _)) = self.accept_value(value.clone())? else {
+            bail!("rejected by node policy");
+        };
+        let Some(sender) = self.senders.get(event.net()) else {
+            bail!("this node has not joined network {:?}", event.net());
+        };
+        let envelope = Envelope {
+            ev: ENVELOPE_VERSION,
+            event: value,
+            providers: vec![self.endpoint_id().to_string()],
+        };
+        sender
+            .broadcast(serde_json::to_vec(&envelope)?.into())
+            .await?;
+        Ok(event)
+    }
+
+    /// Exchange `hello` with a peer and remember what it speaks.
+    pub async fn hello(&self, peer: EndpointId) -> Result<NodeInfo> {
+        let request = Request::Hello {
+            info: NodeInfo::ours(),
+        };
+        let info = match proto::call(self.endpoint(), peer, &request).await? {
+            Response::Hello { info } => info,
+            other => bail!("unexpected hello response: {other:?}"),
+        };
+        if !NodeInfo::ours().shares_event_version(&info) {
+            warn!(
+                peer = %peer.fmt_short(),
+                software = %info.software,
+                "peer understands event versions {}..={}, we understand {}..={}; \
+                 its events are relayed as opaque data. Consider upgrading.",
+                info.events_min, info.events_max,
+                NodeInfo::ours().events_min, NodeInfo::ours().events_max,
+            );
+        }
+        if let Ok(mut infos) = self.peer_info.lock() {
+            if infos.len() >= 10_000 {
+                infos.clear();
+            }
+            infos.insert(peer, info.clone());
+        }
+        Ok(info)
+    }
+
+    /// What a peer said in `hello`, if we talked to it.
+    pub fn peer_info(&self, peer: &EndpointId) -> Option<NodeInfo> {
+        self.peer_info.lock().ok()?.get(peer).cloned()
     }
 
     /// Serve a `/wats/1` request from `peer`.
     pub(crate) async fn handle_request(&self, peer: EndpointId, request: Request) -> Response {
         self.seen(peer);
         match request {
+            Request::Hello { info } => {
+                if let Ok(mut infos) = self.peer_info.lock() {
+                    infos.insert(peer, info);
+                }
+                Response::Hello {
+                    info: NodeInfo::ours(),
+                }
+            }
+            Request::Unsupported => Response::Unsupported,
             Request::Sync {
                 net,
                 after_ts,
@@ -708,7 +802,7 @@ impl Node {
                 {
                     Ok(page) => Response::SyncPage {
                         more: page.len() == limit as usize,
-                        events: page.into_iter().map(|s| (*s.event).clone()).collect(),
+                        events: page,
                     },
                     Err(e) => Response::Refused {
                         reason: format!("{e:#}"),
@@ -716,11 +810,23 @@ impl Node {
                 }
             }
             Request::Replicate { event, hashes } => {
-                if let Err(e) = self.accept_event(&event) {
-                    return Response::Refused {
-                        reason: format!("{e:#}"),
-                    };
-                }
+                let event = match self.accept_value(event) {
+                    Ok(Some((AnyEvent::Known(event), _))) => event,
+                    // Opaque events are stored; their blobs are unknown to us.
+                    Ok(Some((AnyEvent::Opaque(_), _))) => {
+                        return Response::Replicated { hashes: vec![] };
+                    }
+                    Ok(None) => {
+                        return Response::Refused {
+                            reason: "rejected by node policy".into(),
+                        };
+                    }
+                    Err(e) => {
+                        return Response::Refused {
+                            reason: format!("{e:#}"),
+                        };
+                    }
+                };
                 let mut stored = Vec::new();
                 for blob in event.blobs.iter().filter(|b| hashes.contains(&b.hash)) {
                     if blob.url.is_some() || blob.size > self.config.max_blob_bytes {
@@ -755,24 +861,32 @@ impl Node {
                 Response::SyncPage { events, more } => (events, more),
                 other => bail!("unexpected sync response: {other:?}"),
             };
-            for event in &events {
-                if event.net != net
-                    || (event.ts, event.id.as_str()) <= (after_ts, after_id.as_str())
+            let mut last = None;
+            for value in events {
+                let (Some(ts), Some(id)) = (
+                    value.get("ts").and_then(serde_json::Value::as_u64),
+                    value
+                        .get("id")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_string),
+                ) else {
+                    bail!("peer sent a malformed sync page");
+                };
+                if value.get("net").and_then(serde_json::Value::as_str) != Some(net)
+                    || (ts, id.as_str()) <= (after_ts, after_id.as_str())
                 {
                     bail!("peer sent an out-of-order sync page");
                 }
-                match self.accept_event(event) {
-                    Ok(true) => new += 1,
-                    Ok(false) => {}
-                    Err(e) => debug!(id = %event.id, "sync: rejected event: {e:#}"),
+                match self.accept_value(value) {
+                    Ok(Some((_, true))) => new += 1,
+                    Ok(_) => {}
+                    Err(e) => debug!(%id, "sync: rejected event: {e:#}"),
                 }
+                (after_ts, after_id) = (ts, id.clone());
+                last = Some(id);
             }
-            match events.last() {
-                Some(last) if more => {
-                    after_ts = last.ts;
-                    after_id = last.id.clone();
-                }
-                _ => break,
+            if last.is_none() || !more {
+                break;
             }
         }
         self.store.set_sync_watermark(net, started)?;
