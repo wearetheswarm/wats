@@ -25,8 +25,8 @@ The bootstrap node must:
   move. The endpoint id is pinned: Iroh authenticates every QUIC connection
   against the dialed key, so a host answering with another key is never
   connected to.
-- **Built-in list.** `DEFAULT_BOOTSTRAP` is compiled in, and stays empty
-  until the router's id is known (TODO in the code).
+- **Built-in list.** `DEFAULT_BOOTSTRAP` is compiled in. Since v0.1.1 it
+  holds `router.wearetheswarm.ai` (id `9132c3e3…d603d8`, deployed 2026-10-15).
 - **Overrides.**
   - `--bootstrap` / `WATS_BOOTSTRAP` add entries.
   - `--no-default-bootstrap` / `WATS_NO_DEFAULT_BOOTSTRAP` disable the
