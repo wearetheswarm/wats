@@ -1265,3 +1265,37 @@ async fn review_tools_are_for_humans_only() -> anyhow::Result<()> {
     a.shutdown().await?;
     Ok(())
 }
+
+/// `wats agent attach` and `logs -f` follow forever: Ctrl-C (SIGINT) and
+/// SIGTERM end them.
+#[test]
+fn follow_stops_on_signals() {
+    let dir = tempfile::tempdir().unwrap();
+    for (args, signal) in [(&["attach"][..], "-INT"), (&["logs", "-f"][..], "-TERM")] {
+        let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_wats"))
+            .arg("--dir")
+            .arg(dir.path())
+            .arg("agent")
+            .args(args)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        std::thread::sleep(Duration::from_millis(800));
+        std::process::Command::new("kill")
+            .args([signal, &child.id().to_string()])
+            .status()
+            .unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if child.try_wait().unwrap().is_some() {
+                break;
+            }
+            if std::time::Instant::now() > deadline {
+                let _ = child.kill();
+                panic!("`wats agent {args:?}` ignored {signal}");
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+}

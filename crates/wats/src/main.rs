@@ -1720,7 +1720,14 @@ async fn main() -> Result<()> {
     // Commands that work even when config.toml does not load.
     match cli.command {
         Some(Command::Config { action }) => return config_command(&data_dir, action),
-        Some(Command::Agent { action }) => return agent_watch(&data_dir, action).await,
+        // `logs -f` and `attach` follow forever: Ctrl-C (whose handler is
+        // installed above) must end them.
+        Some(Command::Agent { action }) => {
+            return tokio::select! {
+                result = agent_watch(&data_dir, action) => result,
+                _ = shutdown => Ok(()),
+            };
+        }
         Some(Command::Setup {
             tool:
                 SetupTool::Claude {
