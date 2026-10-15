@@ -6,3 +6,6 @@
 
 pub mod event;
 pub mod identity;
+pub mod mcp;
+pub mod node;
+pub mod store;

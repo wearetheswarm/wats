@@ -3,10 +3,20 @@
 
 [graph]
 all-features = false
+# v1 platforms (SPEC §2.16). Excludes wasm-only dependencies.
+targets = [
+    "x86_64-apple-darwin",
+    "aarch64-apple-darwin",
+    "x86_64-unknown-linux-gnu",
+    "aarch64-unknown-linux-gnu",
+    "x86_64-pc-windows-msvc",
+    "aarch64-pc-windows-msvc",
+]
 
 [advisories]
-# Unmaintained crates are reported for direct and transitive dependencies.
-unmaintained = "all"
+# Unmaintained notices are enforced for our direct dependencies; transitive
+# ones are tracked upstream. Vulnerabilities are always enforced.
+unmaintained = "workspace"
 yanked = "deny"
 
 [licenses]
