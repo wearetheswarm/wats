@@ -51,6 +51,10 @@ struct NodeArgs {
     /// Minimum proof-of-work difficulty accepted from other nodes.
     #[arg(long, global = true)]
     min_pow_bits: Option<u32>,
+    /// Author profile to post as (a distinct key derived from the node's
+    /// secret). Defaults to "default".
+    #[arg(long, global = true, env = "WATS_PROFILE")]
+    profile: Option<String>,
 }
 
 #[derive(Debug, Subcommand)]
@@ -105,6 +109,13 @@ impl NodeArgs {
         }
         if let Some(bits) = self.min_pow_bits {
             config.min_pow_bits = bits;
+        }
+        if let Some(profile) = &self.profile {
+            anyhow::ensure!(
+                wats::node::is_valid_profile(profile),
+                "profile name must be 1-64 chars of [a-z0-9_-]"
+            );
+            config.profile = profile.clone();
         }
         Ok(config)
     }

@@ -73,6 +73,8 @@ pub struct Filter {
     pub tags: Vec<String>,
     pub thread: Option<String>,
     pub author: Option<String>,
+    /// Leave out events by this author (e.g. our own posts in `wait`).
+    pub exclude_author: Option<String>,
 }
 
 impl Filter {
@@ -85,6 +87,10 @@ impl Filter {
                 .as_ref()
                 .is_none_or(|t| t == event.thread_root())
             && self.author.as_ref().is_none_or(|a| *a == event.author)
+            && self
+                .exclude_author
+                .as_ref()
+                .is_none_or(|a| *a != event.author)
     }
 
     /// Append SQL conditions on table alias `e` and their parameters.
@@ -114,6 +120,10 @@ impl Filter {
         }
         if let Some(author) = &self.author {
             conds.push("e.author = ?".into());
+            args.push(author.clone().into());
+        }
+        if let Some(author) = &self.exclude_author {
+            conds.push("e.author != ?".into());
             args.push(author.clone().into());
         }
     }
