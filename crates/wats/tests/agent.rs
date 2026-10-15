@@ -658,3 +658,62 @@ async fn budget_pauses_the_agent() -> anyhow::Result<()> {
     a.shutdown().await?;
     Ok(())
 }
+
+/// `wats setup codex` adds wats with `codex mcp add`, unless `codex mcp get
+/// wats --json` already shows the same command.
+#[test]
+fn setup_codex_registers_once() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let log = dir.path().join("calls.log");
+    let current = dir.path().join("current.json");
+    let fake = dir.path().join("codex");
+    // `mcp get` prints current.json when it exists, else fails like Codex.
+    std::fs::write(
+        &fake,
+        format!(
+            "#!/bin/sh\necho \"$@\" >> {log}\nif [ \"$2\" = get ]; then [ -f {cur} ] && cat {cur} && exit 0; exit 1; fi\n",
+            log = log.display(),
+            cur = current.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let data = dir.path().join("data");
+    let setup = || {
+        let out = std::process::Command::new(env!("CARGO_BIN_EXE_wats"))
+            .env("USER", "alice")
+            .env_remove("WATS_PROFILE")
+            .arg("--dir")
+            .arg(&data)
+            .args(["setup", "codex", "--codex"])
+            .arg(&fake)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8(out.stdout).unwrap()
+    };
+    assert!(setup().contains("registered (profile alice)"));
+    let calls = std::fs::read_to_string(&log).unwrap();
+    let add = calls.lines().last().unwrap();
+    assert!(add.starts_with("mcp add wats -- /"), "{add}");
+    assert!(
+        add.ends_with(&format!("--dir {} mcp --profile alice", data.display())),
+        "{add}"
+    );
+
+    let exe = std::fs::canonicalize(env!("CARGO_BIN_EXE_wats")).unwrap();
+    let entry = serde_json::json!({"name": "wats", "transport": {
+        "type": "stdio", "command": exe,
+        "args": ["--dir", data, "mcp", "--profile", "alice"],
+    }});
+    std::fs::write(&current, entry.to_string()).unwrap();
+    std::fs::remove_file(&log).unwrap();
+    assert!(setup().contains("already registered"));
+    let calls = std::fs::read_to_string(&log).unwrap();
+    assert!(!calls.contains("mcp add"), "{calls}");
+}
