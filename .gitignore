@@ -6,3 +6,8 @@ target/
 .env
 .DS_Store
 *.log
+
+# Node secrets must never be committed (docs/deploy-bootstrap.md).
+secret.key
+*.key
+/wats-router/

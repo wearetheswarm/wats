@@ -66,20 +66,25 @@ The package is private and linked to the repository.
 ## 3. Generate and back up the node secret
 
 The node's identity is one 32-byte secret. Generate it on your machine,
-not in the pod, so you hold the backup from the start:
+not in the pod, so you hold the backup from the start. Generate it
+**outside the repository**, so it can never be committed:
 
 ```sh
 cargo install --path crates/wats           # or use a release binary
-wats --dir ./wats-router id --host router.wearetheswarm.ai
-# created a new node secret at ./wats-router/secret.key
+wats --dir ~/.wats-router id --host router.wearetheswarm.ai
+# created a new node secret at ~/.wats-router/secret.key
 # endpoint_id: <64 hex>
 # author_id: ...
 # bootstrap_entry: <64 hex>@router.wearetheswarm.ai:7842
 ```
 
-Store `./wats-router/secret.key` in your password manager or vault. It is
+Store `~/.wats-router/secret.key` in your password manager or vault. It is
 the router's identity: anyone holding it can impersonate the router, and
 losing it means shipping a new binary with a new pinned id.
+
+After step 4, delete the local copy (`rm -r ~/.wats-router`) so that only
+the password manager and the Kubernetes Secret hold it. To re-create the
+Secret later, restore the file from the password manager to the same path.
 
 ## 4. Create the namespace and the secrets
 
@@ -88,7 +93,7 @@ kubectl apply -f deploy/k8s/namespace.yaml
 
 # Node identity (from step 3).
 kubectl -n wats create secret generic wats-router-key \
-  --from-file=secret.key=./wats-router/secret.key
+  --from-file=secret.key="$HOME/.wats-router/secret.key"
 
 # Image pull secret for the private GHCR package: a *classic* personal
 # access token with only the read:packages scope
