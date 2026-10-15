@@ -14,3 +14,6 @@ secret.key
 
 # Local static builds (scripts/build-static.sh).
 /dist/
+
+# Cross-NAT test logs (scripts/nat-test.sh).
+wats-nat-*.log

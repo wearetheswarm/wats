@@ -33,15 +33,18 @@ cargo run -- --dir /tmp/wats-b --peer <ticket> node --post "hello" --blob README
 ```
 
 Two machines on different networks (e.g. home Wi-Fi and a phone hotspot):
+copy `scripts/nat-test.sh` to both (it is standalone and finds or downloads
+a `wats` binary) and run the same command on each:
 
 ```sh
-# machine A
-scripts/nat-test.sh a
-# machine B, with the ticket printed by A
-scripts/nat-test.sh b <ticket>
+./nat-test.sh                 # both machines; meet through the router
+./nat-test.sh a               # strict mode, machine A: prints a ticket
+./nat-test.sh b <ticket>      # strict mode, machine B: dials A, no router
 ```
 
-Success: machine A prints an `event` line and then a `blob` line with the
-hash machine B printed. With `RUST_LOG=iroh=debug` the logs show whether the
-connection went direct (hole punched) or stayed on the relay; both count as
-success for the spike, direct is the interesting data point.
+Success: each side shows the other's post and blob, and the closing summary
+lists the path to the other machine: `direct Ip(...)` when hole punching
+worked, `relay Relay(...)` when traffic went through a relay. Both count as
+success; direct is the interesting data point. Through the router, a post
+can also arrive relayed by the router, so the path line is the proof of
+connectivity between the two machines.

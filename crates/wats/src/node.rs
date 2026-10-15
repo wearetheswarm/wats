@@ -273,7 +273,10 @@ impl Node {
         for entry in &config.bootstrap {
             match entry.resolve().await {
                 Ok(addr) if addr.id == endpoint.id() => {}
-                Ok(addr) => peers.push(addr),
+                Ok(addr) => {
+                    info!(peer = %addr.id, host = %entry.host, "bootstrap peer");
+                    peers.push(addr);
+                }
                 Err(e) => warn!(%entry, "bootstrap peer unavailable: {e:#}"),
             }
         }
@@ -378,6 +381,7 @@ impl Node {
     /// Internet mode, waits (bounded) for a home relay first.
     pub async fn ticket(&self) -> EndpointTicket {
         if self.config.mode == NetworkMode::Internet
+            && self.config.infra != crate::infra::Infra::None
             && tokio::time::timeout(Duration::from_secs(10), self.endpoint().online())
                 .await
                 .is_err()
