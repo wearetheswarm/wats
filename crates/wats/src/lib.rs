@@ -7,6 +7,7 @@
 pub mod attach;
 pub mod bootstrap;
 pub mod event;
+pub mod grease;
 pub mod identity;
 pub mod infra;
 pub mod mcp;
