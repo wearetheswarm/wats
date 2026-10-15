@@ -127,6 +127,22 @@ struct Envelope {
     event: serde_json::Value,
     /// Endpoint ids (hex) of nodes that can serve the event's blobs.
     providers: Vec<String>,
+    /// Fields of later envelope versions, and GREASE: ignored.
+    #[serde(flatten)]
+    extra: serde_json::Map<String, serde_json::Value>,
+}
+
+impl Envelope {
+    fn new(event: serde_json::Value, provider: EndpointId) -> Self {
+        let mut extra = serde_json::Map::new();
+        crate::grease::maybe_add_field(&mut extra);
+        Envelope {
+            ev: ENVELOPE_VERSION,
+            event,
+            providers: vec![provider.to_string()],
+            extra,
+        }
+    }
 }
 
 /// A blob to attach to a new post: a local file.
@@ -500,11 +516,7 @@ impl Node {
         let ts = now_secs();
         let event = tokio::task::spawn_blocking(move || draft.sign(&key, ts, pow_bits)).await??;
         self.store.insert(&event, ts)?;
-        let envelope = Envelope {
-            ev: ENVELOPE_VERSION,
-            event: serde_json::to_value(&event)?,
-            providers: vec![self.endpoint_id().to_string()],
-        };
+        let envelope = Envelope::new(serde_json::to_value(&event)?, self.endpoint_id());
         sender
             .broadcast(serde_json::to_vec(&envelope)?.into())
             .await?;
@@ -825,11 +837,7 @@ impl Node {
         let Some(sender) = self.senders.get(event.net()) else {
             bail!("this node has not joined network {:?}", event.net());
         };
-        let envelope = Envelope {
-            ev: ENVELOPE_VERSION,
-            event: value,
-            providers: vec![self.endpoint_id().to_string()],
-        };
+        let envelope = Envelope::new(value, self.endpoint_id());
         sender
             .broadcast(serde_json::to_vec(&envelope)?.into())
             .await?;
@@ -838,13 +846,23 @@ impl Node {
 
     /// Exchange `hello` with a peer and remember what it speaks.
     pub async fn hello(&self, peer: EndpointId) -> Result<NodeInfo> {
+        // GREASE a whole request type now and then: peers must answer
+        // `unsupported` and keep going.
+        if crate::grease::roll() {
+            let request = serde_json::json!({ "type": crate::grease::name() });
+            match proto::call_value(self.endpoint(), peer, request).await {
+                Ok(Response::Unsupported) => {}
+                other => debug!(peer = %peer.fmt_short(), "GREASE request answered with {other:?}"),
+            }
+        }
         let request = Request::Hello {
-            info: NodeInfo::ours(),
+            info: NodeInfo::ours_greased(),
         };
-        let info = match proto::call(self.endpoint(), peer, &request).await? {
+        let mut info = match proto::call(self.endpoint(), peer, &request).await? {
             Response::Hello { info } => info,
             other => bail!("unexpected hello response: {other:?}"),
         };
+        crate::grease::strip(&mut info.features);
         if !NodeInfo::ours().shares_event_version(&info) {
             warn!(
                 peer = %peer.fmt_short(),
@@ -873,12 +891,13 @@ impl Node {
     pub(crate) async fn handle_request(&self, peer: EndpointId, request: Request) -> Response {
         self.seen(peer);
         match request {
-            Request::Hello { info } => {
+            Request::Hello { mut info } => {
+                crate::grease::strip(&mut info.features);
                 if let Ok(mut infos) = self.peer_info.lock() {
                     infos.insert(peer, info);
                 }
                 Response::Hello {
-                    info: NodeInfo::ours(),
+                    info: NodeInfo::ours_greased(),
                 }
             }
             Request::Unsupported => Response::Unsupported,
@@ -1041,5 +1060,26 @@ impl Node {
             lock.unlock().ok();
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn envelopes_ignore_unknown_and_grease_fields() {
+        let bytes =
+            br#"{"ev":1,"event":{"x":1},"providers":[],"_grease_1a2b":[1,"x"],"route":"later"}"#;
+        let envelope: Envelope = crate::strict_json::from_slice(bytes).unwrap();
+        assert_eq!(envelope.ev, 1);
+        assert_eq!(envelope.extra.len(), 2);
+        crate::grease::set_rate(1);
+        let e = Envelope::new(
+            serde_json::json!({}),
+            SecretKey::from_bytes(&[1; 32]).public(),
+        );
+        crate::grease::set_rate(crate::grease::DEFAULT_RATE);
+        assert!(e.extra.keys().all(|k| crate::wire::is_grease(k)) && e.extra.len() == 1);
     }
 }

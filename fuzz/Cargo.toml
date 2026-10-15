@@ -1,0 +1,32 @@
+# Fuzz targets (ADR 0010, process): run with cargo-fuzz on nightly, e.g.
+#   cargo +nightly fuzz run event_bytes -- -max_total_time=300
+# Not part of the workspace and not run in CI (Actions budget).
+[package]
+name = "wats-fuzz"
+version = "0.0.0"
+edition = "2024"
+license = "Apache-2.0"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "=0.4.13"
+serde_json = "=1.0.154"
+serde_json_canonicalizer = "=0.4.1"
+wats = { path = "../crates/wats" }
+
+[[bin]]
+name = "event_bytes"
+path = "fuzz_targets/event_bytes.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "strict_json"
+path = "fuzz_targets/strict_json.rs"
+test = false
+doc = false
+bench = false

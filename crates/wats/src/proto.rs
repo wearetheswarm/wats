@@ -65,6 +65,15 @@ pub struct NodeInfo {
 }
 
 impl NodeInfo {
+    /// [`NodeInfo::ours`], with a GREASE feature now and then.
+    pub fn ours_greased() -> Self {
+        let mut info = Self::ours();
+        if crate::grease::roll() {
+            info.features.push(crate::grease::name());
+        }
+        info
+    }
+
     pub fn ours() -> Self {
         Self {
             software: format!("wats/{}", env!("CARGO_PKG_VERSION")),
@@ -132,6 +141,13 @@ pub enum Response {
 
 /// Send one request to a peer and wait for the response.
 pub async fn call(endpoint: &Endpoint, peer: EndpointId, request: &Request) -> Result<Response> {
+    let mut value = serde_json::to_value(request)?;
+    crate::grease::maybe_add_to(&mut value);
+    call_value(endpoint, peer, value).await
+}
+
+/// Send a request given as JSON (used for GREASE request types).
+pub async fn call_value(endpoint: &Endpoint, peer: EndpointId, request: Value) -> Result<Response> {
     // Newest protocol first; fall back to older ones.
     let mut last_err = None;
     let mut connected = None;
@@ -152,7 +168,7 @@ pub async fn call(endpoint: &Endpoint, peer: EndpointId, request: &Request) -> R
         (None, None) => bail!("no protocol version configured"),
     };
     let (mut send, mut recv) = conn.open_bi().await?;
-    send.write_all(&serde_json::to_vec(request)?).await?;
+    send.write_all(&serde_json::to_vec(&request)?).await?;
     send.finish()?;
     let bytes = recv.read_to_end(MAX_RESPONSE_BYTES).await?;
     conn.close(0u32.into(), b"done");
@@ -189,6 +205,8 @@ impl WatsProtocol {
                     reason: format!("malformed request: {e}"),
                 },
             };
+            let mut response = serde_json::to_value(&response)?;
+            crate::grease::maybe_add_to(&mut response);
             send.write_all(&serde_json::to_vec(&response)?).await?;
             send.finish()?;
         }
@@ -274,6 +292,23 @@ mod tests {
             serde_json::from_str::<Response>(r#"{"type":"fingerprint","x":1}"#).unwrap(),
             Response::Unknown
         ));
+    }
+
+    #[test]
+    fn grease_is_ignored_in_requests_and_responses() {
+        let request: Request = crate::strict_json::from_slice(
+            br#"{"type":"sync","net":"public","after_ts":0,"after_id":"","limit":5,"_grease_0a1b":{"_grease_x":1}}"#,
+        )
+        .unwrap();
+        assert!(matches!(request, Request::Sync { limit: 5, .. }));
+        let grease_type: Request =
+            crate::strict_json::from_slice(br#"{"type":"_grease_9c3d"}"#).unwrap();
+        assert!(matches!(grease_type, Request::Unsupported));
+        let response: Response = crate::strict_json::from_slice(
+            br#"{"type":"replicated","hashes":[],"_grease_77":true}"#,
+        )
+        .unwrap();
+        assert!(matches!(response, Response::Replicated { .. }));
     }
 
     #[test]
