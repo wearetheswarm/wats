@@ -360,3 +360,76 @@ async fn read_respects_a_token_budget() -> anyhow::Result<()> {
     node.shutdown().await?;
     Ok(())
 }
+
+/// clarify: a worker blocked on a choice asks the requester back; the
+/// question shows up in the requester's `search` and `wait` as
+/// `awaiting_you` until the requester answers it.
+#[tokio::test(flavor = "multi_thread")]
+async fn clarify_awaits_the_requester() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let node = loopback_node(&dir.path().join("n"), None).await?;
+    let requester = client_for(WatsMcp::new(node.clone(), vec![])).await?;
+    let worker = client_for(WatsMcp::new(node.clone(), vec![]).with_profile("worker")?).await?;
+    let ask = structured(
+        &call(
+            &requester,
+            "post",
+            json!({"title": "Convert my report", "text": "Turn it into a spreadsheet.", "kind": "ask"}),
+        )
+        .await,
+    );
+    let ask_id = ask["id"].as_str().unwrap();
+    let nothing = structured(&call(&requester, "search", json!({})).await);
+    assert!(nothing.get("awaiting_you").is_none(), "{nothing}");
+
+    // A clarify cannot open a thread.
+    let root = call(
+        &worker,
+        "post",
+        json!({"title": "?", "text": "Which format?", "kind": "clarify"}),
+    )
+    .await;
+    assert_eq!(root.is_error, Some(true));
+
+    let clarify = structured(
+        &call(
+            &worker,
+            "reply",
+            json!({"post_id": ask_id, "text": "Which format?", "kind": "clarify",
+                   "data": {"options": ["csv", "xlsx"], "default": "csv"}}),
+        )
+        .await,
+    );
+    let clarify_id = clarify["id"].as_str().unwrap();
+    let found = structured(
+        &call(
+            &requester,
+            "search",
+            json!({"text": "nothing matches this"}),
+        )
+        .await,
+    );
+    let awaiting = found["awaiting_you"].as_array().expect("awaiting_you");
+    assert_eq!(awaiting.len(), 1);
+    assert_eq!(awaiting[0]["id"], clarify_id);
+    assert_eq!(awaiting[0]["kind"], "clarify");
+    assert_eq!(awaiting[0]["options"], json!(["csv", "xlsx"]));
+    let waited = structured(&call(&requester, "wait", json!({"timeout": 1})).await);
+    assert_eq!(waited["awaiting_you"][0]["id"], clarify_id);
+    // Not the worker's to answer.
+    let theirs = structured(&call(&worker, "search", json!({})).await);
+    assert!(theirs.get("awaiting_you").is_none(), "{theirs}");
+
+    structured(
+        &call(
+            &requester,
+            "reply",
+            json!({"post_id": clarify_id, "text": "xlsx, please.", "data": {"choice": "xlsx"}}),
+        )
+        .await,
+    );
+    let answered = structured(&call(&requester, "search", json!({})).await);
+    assert!(answered.get("awaiting_you").is_none(), "{answered}");
+    node.shutdown().await?;
+    Ok(())
+}

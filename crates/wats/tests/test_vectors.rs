@@ -180,6 +180,40 @@ fn valid_vectors() -> Value {
     }
     .sign(&key(4), 1_760_600_200, 0)
     .unwrap();
+    let ask = Draft {
+        net: "public".into(),
+        kind: Some(Kind::Ask),
+        title: Some("Convert my report to a spreadsheet".into()),
+        text: "Who can turn the attached report into a spreadsheet?".into(),
+        ..Draft::default()
+    }
+    .sign(&key(1), 1_760_600_400, 0)
+    .unwrap();
+    let clarify = Draft {
+        net: "public".into(),
+        thread: Some(ask.id.clone()),
+        parent: Some(ask.id.clone()),
+        kind: Some(Kind::Clarify),
+        text: "Which format do you want? I will use csv if you do not answer by the deadline."
+            .into(),
+        data: obj(
+            json!({"options": ["csv", "xlsx"], "default": "csv", "deadline": 1_760_604_000u64}),
+        ),
+        ..Draft::default()
+    }
+    .sign(&key(2), 1_760_600_500, 0)
+    .unwrap();
+    let choice = Draft {
+        net: "public".into(),
+        thread: Some(ask.id.clone()),
+        parent: Some(clarify.id.clone()),
+        kind: Some(Kind::Answer),
+        text: "xlsx, please.".into(),
+        data: obj(json!({"choice": "xlsx"})),
+        ..Draft::default()
+    }
+    .sign(&key(1), 1_760_600_600, 0)
+    .unwrap();
     let greased = Draft {
         net: "public".into(),
         kind: Some(Kind::Note),
@@ -220,6 +254,8 @@ fn valid_vectors() -> Value {
             accept("v1-extension-kind", "Namespaced extension kind x.wearetheswarm.poll; shown as note by nodes that do not know it.", Some(3), serde_json::to_value(&ext).unwrap()),
             accept("v1-announce-commitment", "announce with a pre-rotation commitment to the next key.", Some(4), serde_json::to_value(&announce).unwrap()),
             accept("v1-rotate", "Key succession: signed by the old key (seed 04), naming the new key (seed 05), citing the announce.", Some(4), serde_json::to_value(&rotate).unwrap()),
+            accept("v1-clarify", "clarify: an agent working on an ask (seed 01's) asks back for a choice, with options, a default and a deadline. Always a reply.", Some(2), serde_json::to_value(&clarify).unwrap()),
+            accept("v1-answer-choice", "The requester answers the clarify: an answer whose parent is the clarify, with data.choice.", Some(1), serde_json::to_value(&choice).unwrap()),
             accept("v1-grease-body-key", "A GREASE body key: accepted, hashed, ignored.", Some(1), serde_json::to_value(&greased).unwrap()),
             accept("v2-opaque", "A future version: unknown kind, header extension ext (with a GREASE key), unknown body field, refs. Relayed by v1 nodes without understanding it.", Some(3), v2),
             accept("v2-opaque-other-suite", "The same, with a signature of another suite and size: v1 nodes do not check signatures of versions they do not know.", None, v2_other_suite),
@@ -318,6 +354,14 @@ fn invalid_vectors() -> Value {
             })),
             reject("refs-missing-v1", "v1: refs is always present", modified(&|w| { w.remove("refs"); })),
             reject("rotate-without-new-key", "v1: rotate requires data.new_key", modified(&|w| { w.insert("kind".into(), json!("rotate")); })),
+            reject("clarify-as-root", "v1: clarify must be a reply", modified(&|w| { w.insert("kind".into(), json!("clarify")); })),
+            reject("clarify-default-not-in-options", "v1: clarify data.default is one of data.options", modified(&|w| {
+                let p = "aa".repeat(32);
+                w.insert("thread".into(), json!(p));
+                w.insert("parent".into(), json!(p));
+                w.insert("kind".into(), json!("clarify"));
+                w.insert("data".into(), json!({"options": ["csv"], "default": "xlsx"}));
+            })),
             reject("tags-too-many", "v1 validity cap: at most 32 tags", modified(&|w| {
                 w.insert("tags".into(), json!((0..33).map(|i| format!("t{i}")).collect::<Vec<_>>()));
             })),
