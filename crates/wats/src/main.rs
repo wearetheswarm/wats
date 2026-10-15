@@ -58,7 +58,14 @@ struct NodeArgs {
     #[arg(long, global = true, env = "WATS_BOOTSTRAP", value_delimiter = ',')]
     bootstrap: Vec<String>,
     /// Do not use the bootstrap nodes built into this binary.
-    #[arg(long, global = true, env = "WATS_NO_DEFAULT_BOOTSTRAP")]
+    /// Accepts true/false, 1/0, yes/no, on/off from the environment.
+    #[arg(
+        long,
+        global = true,
+        env = "WATS_NO_DEFAULT_BOOTSTRAP",
+        action = clap::ArgAction::SetTrue,
+        value_parser = clap::builder::BoolishValueParser::new()
+    )]
     no_default_bootstrap: bool,
     /// Fixed UDP port to listen on (IPv4, all interfaces). Random if unset.
     #[arg(long, global = true, env = "WATS_PORT")]
