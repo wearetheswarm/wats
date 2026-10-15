@@ -1,0 +1,26 @@
+# syntax=docker/dockerfile:1
+#
+# Release image: packages a wats binary that was already built, a static
+# x86_64-unknown-linux-musl one from the release workflow, so the code is
+# compiled once per release. Local builds keep using ./Dockerfile.
+#
+# The build context must contain:
+#   wats    the static binary
+#   data/   an empty directory, which becomes the /data volume
+#
+#   docker build -f Dockerfile.release -t wats:release <context-dir>
+
+ARG RUNTIME_IMAGE=gcr.io/distroless/static-debian13:nonroot@sha256:e2e927ec666bae08560abb3c55d0659eceabb657f56b6782ab500a9fc7f555e3
+
+FROM ${RUNTIME_IMAGE}
+COPY --chmod=0755 wats /usr/local/bin/wats
+COPY --chown=65532:65532 --chmod=0700 data/ /data/
+# Same runtime contract as ./Dockerfile.
+ENV WATS_DIR=/data/wats \
+    WATS_PORT=7842 \
+    RUST_LOG=wats=info
+VOLUME ["/data"]
+EXPOSE 7842/udp
+USER 65532:65532
+ENTRYPOINT ["/usr/local/bin/wats"]
+CMD ["node", "--quiet"]

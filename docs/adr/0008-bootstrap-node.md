@@ -71,13 +71,20 @@ Phase 2 give quota exists.
 
 ### Packaging
 
-- **Image.** Multi-stage Dockerfile:
-  - Rust 1.99 on Debian trixie for the build, distroless `cc-debian13:nonroot`
-    at runtime, both pinned by digest;
-  - user 65532, data on a `/data` volume, `wats node` in the foreground.
-- **Release.** `release.yml` builds linux/amd64 only and pushes
-  `ghcr.io/wearetheswarm/wats:<version>` and `:sha-<commit>` to a private
-  GHCR package, with OCI labels.
+- **Images.** Two Dockerfiles, same runtime contract (user 65532, data
+  on a `/data` volume, `wats node` in the foreground):
+  - `Dockerfile` for local builds and the compose test: a multi-stage build,
+    Rust 1.99 on Debian trixie, then distroless `cc-debian13:nonroot`;
+  - `Dockerfile.release` for published images: it packages the static
+    `x86_64-unknown-linux-musl` binary the release already built onto
+    distroless `static-debian13:nonroot`. Base images are pinned by digest.
+- **Static binaries.** musl builds use `mimalloc` (MIT) as the global
+  allocator, because musl's allocator is slow under concurrency. Release
+  binaries are stripped.
+- **Release.** `release.yml` compiles each target once (static Linux, macOS
+  arm64), attaches the binaries to the release, and pushes the Linux one as
+  a linux/amd64 image, `ghcr.io/wearetheswarm/wats:<version>` and
+  `:sha-<commit>`, to a private GHCR package with OCI labels.
   - It runs on `release: published` or by hand, and checks that the tag
     matches `Cargo.toml`.
   - There is no `latest` tag: deployments pin a version.

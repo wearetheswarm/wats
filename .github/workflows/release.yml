@@ -1,34 +1,36 @@
 name: release
 
-# Builds the node image and pushes it to GHCR (private package) when a
-# release is published, or by hand. Not run on pull requests or pushes:
-# image builds stay out of the CI budget.
+# Builds release binaries and the node image when a release is published,
+# or by hand. Not run on pull requests or pushes: release builds stay out of
+# the CI budget.
 #
-#   release vX.Y.Z  ->  ghcr.io/wearetheswarm/wats:X.Y.Z and :sha-<short>
-#
-# It also attaches prebuilt binaries to the release (job `binaries`):
-#   wats-X.Y.Z-x86_64-unknown-linux-musl.tar.gz  static, any Linux / WSL
-#   wats-X.Y.Z-aarch64-apple-darwin.tar.gz       Apple silicon
-# each with a .sha256. Download: gh release download vX.Y.Z -R wearetheswarm/wats
+# Each target is compiled once:
+#   x86_64-unknown-linux-musl  static, any Linux / WSL; the same binary is
+#                              packaged into the image (Dockerfile.release,
+#                              distroless static) and pushed to GHCR:
+#                              ghcr.io/wearetheswarm/wats:X.Y.Z and :sha-<short>
+#   aarch64-apple-darwin       Apple silicon (macOS minutes cost ~10x; once
+#                              per release)
+# Each binary is attached to the release as wats-X.Y.Z-<target>.tar.gz plus
+# a .sha256. Download: gh release download vX.Y.Z -R wearetheswarm/wats
 # Windows native and the cargo-dist installers come with the public launch
-# (installers need public releases). The macOS build costs ~10x minutes, once
-# per release.
+# (installers need public releases).
 #
 # No `latest` tag: deployments pin a version (WATS_VERSION in the router .env).
-# linux/amd64 only (the OVH nodes). arm64 is a later option, on a native
-# arm64 runner rather than under QEMU, which would be slow and costly.
+# The image is linux/amd64 only (the OVH VM). arm64 is a later option, built
+# on a native arm64 runner rather than under QEMU, which would be slow and
+# costly. No cache warming on main: it would spend minutes on every push.
 on:
   release:
     types: [published]
   workflow_dispatch:
     inputs:
       version:
-        description: "Image version without the v (must match Cargo.toml), e.g. 0.1.0"
+        description: "Version without the v (must match Cargo.toml), e.g. 0.1.0"
         required: true
 
 permissions:
   contents: read
-  packages: write
 
 concurrency:
   group: release-${{ github.ref }}
@@ -36,76 +38,11 @@ concurrency:
 
 env:
   IMAGE: ghcr.io/wearetheswarm/wats
+  IMAGE_TARGET: x86_64-unknown-linux-musl
 
 jobs:
-  image:
-    name: image (linux/amd64)
-    runs-on: ubuntu-latest
-    timeout-minutes: 45
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-
-      - name: Version
-        id: version
-        env:
-          RELEASE_TAG: ${{ github.event.release.tag_name }}
-          INPUT_VERSION: ${{ inputs.version }}
-        run: |
-          version="${RELEASE_TAG#v}"
-          [ -n "$version" ] || version="$INPUT_VERSION"
-          crate="$(grep -m1 '^version = ' Cargo.toml | cut -d'"' -f2)"
-          if [ "$version" != "$crate" ]; then
-            echo "::error::version $version does not match Cargo.toml ($crate)"
-            exit 1
-          fi
-          echo "version=$version" >> "$GITHUB_OUTPUT"
-          echo "short=$(git rev-parse --short=12 HEAD)" >> "$GITHUB_OUTPUT"
-          echo "created=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
-
-      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
-
-      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Build and push
-        id: build
-        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
-        with:
-          context: .
-          platforms: linux/amd64
-          push: true
-          tags: |
-            ${{ env.IMAGE }}:${{ steps.version.outputs.version }}
-            ${{ env.IMAGE }}:sha-${{ steps.version.outputs.short }}
-          labels: |
-            org.opencontainers.image.source=https://github.com/wearetheswarm/wats
-            org.opencontainers.image.title=wats
-            org.opencontainers.image.description=WeAreTheSwarm node: a peer-to-peer forum for AI agents
-            org.opencontainers.image.version=${{ steps.version.outputs.version }}
-            org.opencontainers.image.revision=${{ github.sha }}
-            org.opencontainers.image.created=${{ steps.version.outputs.created }}
-            org.opencontainers.image.licenses=Apache-2.0
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
-
-      - name: Summary
-        env:
-          VERSION: ${{ steps.version.outputs.version }}
-          DIGEST: ${{ steps.build.outputs.digest }}
-        run: |
-          {
-            echo "### ${IMAGE}:${VERSION}"
-            echo ""
-            echo "Digest: \`${DIGEST}\`"
-            echo ""
-            echo "Deploy it by setting WATS_VERSION=${VERSION} in the router .env (docs/deploy-bootstrap.md)."
-          } >> "$GITHUB_STEP_SUMMARY"
-
-  binaries:
-    name: binary (${{ matrix.target }})
+  build:
+    name: build (${{ matrix.target }})
     strategy:
       fail-fast: false
       matrix:
@@ -117,7 +54,8 @@ jobs:
     runs-on: ${{ matrix.os }}
     timeout-minutes: 45
     permissions:
-      contents: write
+      contents: write   # attach binaries to the release
+      packages: write   # push the image (linux leg only)
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -134,7 +72,11 @@ jobs:
             echo "::error::version $version does not match Cargo.toml ($crate)"
             exit 1
           fi
-          echo "version=$version" >> "$GITHUB_OUTPUT"
+          {
+            echo "version=$version"
+            echo "short=$(git rev-parse --short=12 HEAD)"
+            echo "created=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Install musl tools
         if: contains(matrix.target, 'musl')
@@ -178,3 +120,58 @@ jobs:
             ${{ steps.package.outputs.name }}.tar.gz
             ${{ steps.package.outputs.name }}.tar.gz.sha256
           retention-days: 7
+
+      # Image: the static Linux binary built above, on distroless static.
+      - name: Image context
+        if: matrix.target == env.IMAGE_TARGET
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          mkdir -p image-context/data
+          cp "target/$TARGET/release/wats" image-context/wats
+          file image-context/wats
+
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+        if: matrix.target == env.IMAGE_TARGET
+
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        if: matrix.target == env.IMAGE_TARGET
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push the image
+        id: image
+        if: matrix.target == env.IMAGE_TARGET
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: image-context
+          file: Dockerfile.release
+          platforms: linux/amd64
+          push: true
+          tags: |
+            ${{ env.IMAGE }}:${{ steps.version.outputs.version }}
+            ${{ env.IMAGE }}:sha-${{ steps.version.outputs.short }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/wearetheswarm/wats
+            org.opencontainers.image.title=wats
+            org.opencontainers.image.description=WeAreTheSwarm node: a peer-to-peer forum for AI agents
+            org.opencontainers.image.version=${{ steps.version.outputs.version }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.created=${{ steps.version.outputs.created }}
+            org.opencontainers.image.licenses=Apache-2.0
+
+      - name: Summary
+        if: matrix.target == env.IMAGE_TARGET
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          DIGEST: ${{ steps.image.outputs.digest }}
+        run: |
+          {
+            echo "### ${IMAGE}:${VERSION}"
+            echo ""
+            echo "Digest: \`${DIGEST}\`"
+            echo ""
+            echo "Deploy it by setting WATS_VERSION=${VERSION} in the router .env (docs/deploy-bootstrap.md)."
+          } >> "$GITHUB_STEP_SUMMARY"

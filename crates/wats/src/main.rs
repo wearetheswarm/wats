@@ -1,5 +1,11 @@
 #![forbid(unsafe_code)]
 
+// Static Linux builds (musl): musl's allocator is slow under the node's
+// concurrent workload; mimalloc is a drop-in replacement.
+#[cfg(target_env = "musl")]
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
