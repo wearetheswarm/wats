@@ -4,6 +4,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod attach;
 pub mod event;
 pub mod identity;
 pub mod mcp;
