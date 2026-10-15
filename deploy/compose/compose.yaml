@@ -30,6 +30,7 @@ x-peer: &peer
   <<: *hardening
   image: wats:dev
   depends_on: [router]
+  networks: [swarm]
   environment: &peer-env
     WATS_DIR: /data/wats
     WATS_NO_DEFAULT_BOOTSTRAP: "true"
@@ -50,6 +51,11 @@ services:
       RUST_LOG: wats=info
     ports:
       - "${WATS_ROUTER_HOST_PORT:-7842}:7842/udp"
+    networks:
+      swarm:
+        # Fixed IPv6 address: the late joiner bootstraps through it, which
+        # proves the router listens on [::]:7842 as well.
+        ipv6_address: "fd77:7a75:7300::10"
     volumes:
       - router-data:/data
       - "${WATS_ROUTER_KEY:-./missing-router-key}:/etc/wats/secret.key:ro"
@@ -83,13 +89,24 @@ services:
       - poster-data:/data
       - "${WATS_TEST_FILES:-./missing-test-files}:/files:ro"
 
-  # Starts after the post: it gets it only through catch-up sync.
+  # Starts after the post: it gets it only through catch-up sync, and it
+  # reaches the router over IPv6 only.
   late:
     <<: *peer
     profiles: [late]
     command: ["node"]
+    environment:
+      <<: *peer-env
+      WATS_BOOTSTRAP: "${WATS_ROUTER_ID:-set-WATS_ROUTER_ID}@[fd77:7a75:7300::10]:7842"
     volumes:
       - late-data:/data
+
+networks:
+  swarm:
+    enable_ipv6: true
+    ipam:
+      config:
+        - subnet: "fd77:7a75:7300::/64"
 
 volumes:
   router-data:
