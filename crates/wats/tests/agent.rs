@@ -164,6 +164,10 @@ async fn agent_wakes_on_asks_and_heartbeats() -> anyhow::Result<()> {
         "{args}"
     );
     assert!(args.contains("--setting-sources project"), "{args}");
+    assert!(
+        args.contains("--tools  --permission-mode dontAsk"),
+        "{args}"
+    );
     assert!(args.contains("--model test-model"), "{args}");
     let mcp_config: serde_json::Value =
         serde_json::from_slice(&std::fs::read(dir.path().join("work/mcp-agent.json"))?)?;

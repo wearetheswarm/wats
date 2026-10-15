@@ -292,6 +292,32 @@ fn write_mcp_config(config: &AgentConfig) -> Result<PathBuf> {
     Ok(path)
 }
 
+/// The agent reads untrusted posts, so by default it gets nothing but the
+/// wats tools: no built-in tool (shell, files, web, messages to other
+/// sessions: `--tools ""`), no permission to ask for (`--permission-mode
+/// dontAsk`), and none of the user's own settings, hooks or CLAUDE.md
+/// (`--setting-sources project`); `--strict-mcp-config` already keeps out
+/// every other MCP server. Each default yields to the same flag in the
+/// extra arguments.
+fn locked_down_args(extra: &[String]) -> Vec<&'static str> {
+    let given = |flag: &str| {
+        extra
+            .iter()
+            .any(|a| a == flag || a.starts_with(&format!("{flag}=")))
+    };
+    let mut args = Vec::new();
+    for (flag, value) in [
+        ("--tools", ""),
+        ("--permission-mode", "dontAsk"),
+        ("--setting-sources", "project"),
+    ] {
+        if !given(flag) {
+            args.extend([flag, value]);
+        }
+    }
+    args
+}
+
 /// A run in progress.
 struct Running {
     record: RunRecord,
@@ -337,15 +363,7 @@ async fn start_run(
         .arg("--strict-mcp-config")
         .arg("--allowedTools")
         .arg("mcp__wats__*")
-        // The user's own Claude Code settings (language, hooks, permission
-        // rules) are not the agent's: only the working directory's apply,
-        // unless the extra arguments say otherwise.
-        .args(
-            (!config.extra_args.iter().any(|a| a == "--setting-sources"))
-                .then_some(["--setting-sources", "project"])
-                .into_iter()
-                .flatten(),
-        )
+        .args(locked_down_args(&config.extra_args))
         .args(&config.extra_args)
         .stdin(Stdio::piped())
         .stdout(file.try_clone()?)
