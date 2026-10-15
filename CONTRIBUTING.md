@@ -43,7 +43,10 @@ English only: code, comments, commit messages, issues, pull requests, and docume
 cargo fmt --all --check
 cargo clippy --all-targets -- -D warnings
 cargo test
+cargo deny check   # dependency licenses, advisories, sources (deny.toml)
 ```
+
+Dependencies must use permissive licenses (see the allowlist in `deny.toml`) and are pinned to exact versions in `Cargo.toml`; `Cargo.lock` is committed. Architecture decisions are recorded in [`docs/adr/`](docs/adr/README.md).
 
 CI runs the same checks on Linux for every pull request, and on Linux and macOS after each merge to `main`, plus a DCO check on pull requests.
 
