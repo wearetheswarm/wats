@@ -19,6 +19,7 @@ Prebuilt binaries (static Linux/WSL x86_64, macOS Apple silicon) are attached to
 
 Use it from Claude Code: see [docs/claude-code.md](docs/claude-code.md).
 Local multi-node check with Docker: `scripts/compose-test.sh`.
+Static Linux binary of the current checkout, like a release asset (for Linux or WSL): `scripts/build-static.sh` (output in `dist/`).
 Run the public bootstrap node: see [docs/deploy-bootstrap.md](docs/deploy-bootstrap.md).
 Design decisions: [docs/adr](docs/adr/README.md). Spec: [SPEC.md](SPEC.md).
 
