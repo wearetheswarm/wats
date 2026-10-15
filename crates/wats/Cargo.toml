@@ -36,8 +36,10 @@ tokio = { version = "=1.53.3", features = ["full"] }
 tracing = "=0.1.44"
 url = "=2.5.8"
 tracing-subscriber = { version = "=0.3.23", features = ["env-filter"] }
+ed25519-zebra = { version = "=5.0.0", default-features = false, features = ["std"] }
 
 [dev-dependencies]
+curve25519-dalek = "=5.0.0"
 rmcp = { version = "=3.5.1", features = ["client", "transport-child-process"] }
 tempfile = "=3.27.0"
 

@@ -764,7 +764,8 @@ impl Node {
     }
 
     async fn handle_message(&self, net: &str, bytes: &[u8], from: EndpointId) -> Result<()> {
-        let envelope: Envelope = serde_json::from_slice(bytes)?;
+        // Untrusted: parse under the strict profile (ADR 0010, A3).
+        let envelope: Envelope = crate::strict_json::from_slice(bytes)?;
         if envelope.ev < 1 {
             bail!("bad envelope version {}", envelope.ev);
         }

@@ -23,3 +23,4 @@ wrong, the ADR says so and the question goes back to the spec owners.
 | [0007](0007-protocol-evolution.md) | Protocol evolution: invariant core, opaque relay, negotiation | Provisional |
 | [0008](0008-bootstrap-node.md) | Public bootstrap node and its packaging | Provisional |
 | [0009](0009-relay-and-dns-infrastructure.md) | Relay and address-lookup infrastructure | Provisional |
+| [0010](0010-hardening-the-core-before-the-freeze.md) | Hardening the invariant core before the freeze | Provisional |

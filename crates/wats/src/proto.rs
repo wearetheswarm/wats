@@ -156,7 +156,8 @@ pub async fn call(endpoint: &Endpoint, peer: EndpointId, request: &Request) -> R
     send.finish()?;
     let bytes = recv.read_to_end(MAX_RESPONSE_BYTES).await?;
     conn.close(0u32.into(), b"done");
-    Ok(serde_json::from_slice(&bytes)?)
+    // Untrusted: parse under the strict profile (ADR 0010, A3).
+    Ok(crate::strict_json::from_slice(&bytes)?)
 }
 
 /// Serves the protocol for a node. The node is set after it is built, since
@@ -181,7 +182,7 @@ impl WatsProtocol {
                 bail!("node is shutting down");
             };
             let bytes = recv.read_to_end(MAX_REQUEST_BYTES).await?;
-            let response = match serde_json::from_slice::<Request>(&bytes) {
+            let response = match crate::strict_json::from_slice::<Request>(&bytes) {
                 Ok(Request::Unsupported) => Response::Unsupported,
                 Ok(request) => node.handle_request(peer, request).await,
                 Err(e) => Response::Refused {

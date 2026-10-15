@@ -2,6 +2,8 @@
 
 Status: Provisional (2026-10-15).
 
+**Amended by ADR 0010** (2026-10-15): author keys sign `"wats/event/v1" || id` (domain separation), and key succession uses the core kind `rotate` together with a pre-rotation commitment published in `announce`.
+
 Code: `crates/wats/src/identity.rs`.
 
 ## Context
