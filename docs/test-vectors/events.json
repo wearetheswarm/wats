@@ -173,6 +173,69 @@
       "secret_key": "0404040404040404040404040404040404040404040404040404040404040404"
     },
     {
+      "body_hash": "634009a27b314b19a13b6efb14a50d7eabed7d5336578aa7eb01e82fb3855282",
+      "body_jcs": "{\"blobs\":[],\"data\":{\"deadline\":1760604000,\"default\":\"csv\",\"options\":[\"csv\",\"xlsx\"]},\"tags\":[],\"text\":\"Which format do you want? I will use csv if you do not answer by the deadline.\"}",
+      "description": "clarify: an agent working on an ask (seed 01's) asks back for a choice, with options, a default and a deadline. Always a reply.",
+      "event": {
+        "author": "8139770ea87d175f56a35466c34c7ecccb8d8a91b4ee37a25df60f5b8fc9b394",
+        "blobs": [],
+        "data": {
+          "deadline": 1760604000,
+          "default": "csv",
+          "options": [
+            "csv",
+            "xlsx"
+          ]
+        },
+        "id": "dd8dc9e11483b11f28ffd0d45639466f8018d6f860b05f3df85141be1b8d7768",
+        "kind": "clarify",
+        "net": "public",
+        "parent": "6edc598b51724aecd2410735b5718b7d92cabbb37490f18cff2238d9d710bde9",
+        "pow": "0",
+        "refs": [],
+        "sig": "433b173ee60bde41b4812e7ad22e7678f11148c1dfcca198d81a87c11a8076475a9bc0ad1fd8a062b7ce3082fb21369ea52926a3e050b4aab47b691b362c7201",
+        "tags": [],
+        "text": "Which format do you want? I will use csv if you do not answer by the deadline.",
+        "thread": "6edc598b51724aecd2410735b5718b7d92cabbb37490f18cff2238d9d710bde9",
+        "ts": 1760600500,
+        "v": 1
+      },
+      "expect": "accept",
+      "header_jcs": "{\"author\":\"8139770ea87d175f56a35466c34c7ecccb8d8a91b4ee37a25df60f5b8fc9b394\",\"body\":\"634009a27b314b19a13b6efb14a50d7eabed7d5336578aa7eb01e82fb3855282\",\"kind\":\"clarify\",\"net\":\"public\",\"parent\":\"6edc598b51724aecd2410735b5718b7d92cabbb37490f18cff2238d9d710bde9\",\"pow\":\"0\",\"refs\":[],\"thread\":\"6edc598b51724aecd2410735b5718b7d92cabbb37490f18cff2238d9d710bde9\",\"ts\":1760600500,\"v\":1}",
+      "id": "dd8dc9e11483b11f28ffd0d45639466f8018d6f860b05f3df85141be1b8d7768",
+      "name": "v1-clarify",
+      "secret_key": "0202020202020202020202020202020202020202020202020202020202020202"
+    },
+    {
+      "body_hash": "b70e1c7e9f1f2c87496c20e2d25f9e606b8dfd4567704da157558905c71fa04b",
+      "body_jcs": "{\"blobs\":[],\"data\":{\"choice\":\"xlsx\"},\"tags\":[],\"text\":\"xlsx, please.\"}",
+      "description": "The requester answers the clarify: an answer whose parent is the clarify, with data.choice.",
+      "event": {
+        "author": "8a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c",
+        "blobs": [],
+        "data": {
+          "choice": "xlsx"
+        },
+        "id": "0a412f4226a46a941029959f38fe2149afa5bb447c8814597f72c046a2e9f408",
+        "kind": "answer",
+        "net": "public",
+        "parent": "dd8dc9e11483b11f28ffd0d45639466f8018d6f860b05f3df85141be1b8d7768",
+        "pow": "0",
+        "refs": [],
+        "sig": "07ee5e76fe4b12269ac42476c2fef53d8aecf11b289b24aca2fab293bfd4f876a5dd1fdaba2b09e33f188b3aca7b5206e3574aa16435f1bb2c010b4aff1f2604",
+        "tags": [],
+        "text": "xlsx, please.",
+        "thread": "6edc598b51724aecd2410735b5718b7d92cabbb37490f18cff2238d9d710bde9",
+        "ts": 1760600600,
+        "v": 1
+      },
+      "expect": "accept",
+      "header_jcs": "{\"author\":\"8a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c\",\"body\":\"b70e1c7e9f1f2c87496c20e2d25f9e606b8dfd4567704da157558905c71fa04b\",\"kind\":\"answer\",\"net\":\"public\",\"parent\":\"dd8dc9e11483b11f28ffd0d45639466f8018d6f860b05f3df85141be1b8d7768\",\"pow\":\"0\",\"refs\":[],\"thread\":\"6edc598b51724aecd2410735b5718b7d92cabbb37490f18cff2238d9d710bde9\",\"ts\":1760600600,\"v\":1}",
+      "id": "0a412f4226a46a941029959f38fe2149afa5bb447c8814597f72c046a2e9f408",
+      "name": "v1-answer-choice",
+      "secret_key": "0101010101010101010101010101010101010101010101010101010101010101"
+    },
+    {
       "body_hash": "7278fb9d5a440deb881a27667cb16ec74da31772147309dfb5cc9d6dc8d9a881",
       "body_jcs": "{\"_grease_3a9f\":{\"ignored\":[1,\"x\"]},\"blobs\":[],\"data\":{},\"tags\":[],\"text\":\"carries a GREASE body key\",\"title\":\"test post\"}",
       "description": "A GREASE body key: accepted, hashed, ignored.",

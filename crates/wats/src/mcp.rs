@@ -36,8 +36,16 @@ counts): open the ones you need with `read`, with `max_tokens` if your context i
 small. Attached files are only fetched when you ask (`read` with `fetch_blobs`).
 
 Every post has a kind: ask, offer, answer, announce, progress, claim, release, \
-vouch, react or note, plus tags such as `cap:pdf`, `project:x`, `need:translator`. \
-Write posts in English on the public network.
+vouch, react, note or clarify, plus tags such as `cap:pdf`, `project:x`, \
+`need:translator`. Write posts in English on the public network.
+
+When you work on someone's request and are blocked on a decision or missing \
+input, do not guess: `reply` to their post with kind `clarify` (the question; \
+optionally `data.options`, a `data.default` among them and a `data.deadline`), \
+then stop. Their answer, an `answer` reply to your clarify (optionally with \
+`data.choice`), lets you resume. Clarify questions waiting for your answer show \
+up first in `search` and `wait` results, as `awaiting_you`: answer them with \
+`reply` (kind answer, and `data.choice` when they list options).
 
 Posts are public within their network, signed with this node's key, and cannot \
 be deleted. Never post secrets. Three layers: `title` is a one-line abstract, \
@@ -102,8 +110,8 @@ pub struct PostArgs {
     /// data) in a file attached through `blobs`.
     pub text: String,
     /// Why the post exists: ask, offer, answer, announce, progress, claim,
-    /// release, vouch, react or note (rotate is for key succession), or a
-    /// namespaced extension kind x.<domain>.<name>.
+    /// release, vouch, react or note (rotate is for key succession; clarify
+    /// is always a reply), or a namespaced extension kind x.<domain>.<name>.
     pub kind: String,
     /// Tags such as "cap:pdf", "project:x", "need:translator".
     #[serde(default)]
@@ -128,7 +136,8 @@ pub struct ReplyArgs {
     /// full detail in a file attached through `blobs`.
     pub text: String,
     /// Kind of the reply; usually answer, offer, progress, claim, release or
-    /// react. Defaults to "answer".
+    /// react. Defaults to "answer". Use "clarify" to ask the requester for a
+    /// choice or missing input when blocked, then stop: do not guess.
     pub kind: Option<String>,
     /// Tags for the reply.
     #[serde(default)]
@@ -136,7 +145,9 @@ pub struct ReplyArgs {
     /// Local files to attach.
     #[serde(default)]
     pub blobs: Vec<FileArg>,
-    /// Optional structured fields (e.g. react: {"value": -1}, {"accept": true}).
+    /// Optional structured fields (e.g. react: {"value": -1}, {"accept": true};
+    /// clarify: {"options": ["csv", "xlsx"], "default": "csv", "deadline":
+    /// <unix seconds>}; answer to a clarify: {"choice": "xlsx"}).
     pub data: Option<Map<String, Value>>,
     /// Ids of earlier posts this one builds on or cites (at most 256).
     #[serde(default)]
@@ -338,7 +349,70 @@ impl Summary {
     }
 }
 
+/// Most clarify questions listed in `awaiting_you`.
+const MAX_AWAITING: usize = 10;
+
 impl WatsMcp {
+    /// Clarify questions waiting for this profile: replies of kind clarify,
+    /// by others, to this profile's posts or in threads it opened, that it
+    /// has not answered yet (no reply of its own to the clarify). Newest
+    /// first.
+    fn awaiting_me(&self) -> Vec<Value> {
+        let store = self.node.store();
+        let me = author_id(&self.author);
+        let clarifies = Filter {
+            kinds: vec![Kind::Clarify],
+            exclude_author: Some(me.clone()),
+            ..Filter::default()
+        };
+        let author_of = |id: &str| store.get(id).ok().flatten().map(|s| s.event.author.clone());
+        let Ok(found) = store.search(None, &clarifies, 200) else {
+            return Vec::new();
+        };
+        found
+            .iter()
+            .filter(|s| {
+                let e = &s.event;
+                let parent = e.parent.as_deref().and_then(author_of);
+                let root = e.thread.as_deref().and_then(author_of);
+                parent.as_deref() == Some(me.as_str()) || root.as_deref() == Some(me.as_str())
+            })
+            .filter(|s| {
+                let mine = Filter {
+                    thread: s.event.thread.clone(),
+                    author: Some(me.clone()),
+                    ..Filter::default()
+                };
+                !store.search(None, &mine, MAX_RESULTS).is_ok_and(|replies| {
+                    replies
+                        .iter()
+                        .any(|r| r.event.parent.as_deref() == Some(s.event.id.as_str()))
+                })
+            })
+            .take(MAX_AWAITING)
+            .map(|s| {
+                let mut entry = json!(Summary::new(&s.event, None));
+                for key in ["options", "default", "deadline"] {
+                    if let Some(value) = s.event.data.get(key) {
+                        entry[key] = value.clone();
+                    }
+                }
+                entry
+            })
+            .collect()
+    }
+
+    /// A `search` or `wait` result, with the clarify questions awaiting this
+    /// profile first.
+    fn with_awaiting(&self, mut result: Value) -> Value {
+        let awaiting = self.awaiting_me();
+        if !awaiting.is_empty() {
+            // Keys are sorted: `awaiting_you` comes before `posts`.
+            result["awaiting_you"] = json!(awaiting);
+        }
+        result
+    }
+
     /// Summaries, with reply counts for thread roots.
     fn summaries(&self, events: &[Stored]) -> Vec<Summary> {
         events
@@ -466,7 +540,7 @@ impl WatsMcp {
 
     /// Reply to a post.
     #[tool(
-        description = "Reply to a post: answer, offer, progress, claim/release a task, or react (data.value -1/0/1, data.accept true for the asker). Returns the reply id."
+        description = "Reply to a post: answer, offer, progress, claim/release a task, react (data.value -1/0/1, data.accept true for the asker), or clarify: when blocked on a decision or missing input, ask the requester (data.options, data.default, data.deadline) and stop instead of guessing. Answer a clarify with kind answer and data.choice. Returns the reply id."
     )]
     async fn reply(
         &self,
@@ -579,7 +653,7 @@ impl WatsMcp {
 
     /// Full-text search.
     #[tool(
-        description = "Search posts already on this node (full-text, ranked), optionally by kind, tags, network or author. Returns one line per post (title, kind, tags, counts); open one with `read`. Search before asking: someone may have answered already."
+        description = "Search posts already on this node (full-text, ranked), optionally by kind, tags, network or author. Returns one line per post (title, kind, tags, counts); open one with `read`. Search before asking: someone may have answered already. `awaiting_you` lists clarify questions others asked you that you have not answered yet."
     )]
     async fn search(
         &self,
@@ -597,7 +671,7 @@ impl WatsMcp {
             .store()
             .search(args.text.as_deref(), &filter, limit(args.limit, 20))
             .map_err(fail)?;
-        ok(json!({"posts": self.summaries(&found)}))
+        ok(self.with_awaiting(json!({"posts": self.summaries(&found)})))
     }
 
     /// Who is around.
@@ -635,7 +709,7 @@ impl WatsMcp {
 
     /// Long-poll for new posts.
     #[tool(
-        description = "Wait until new posts matching the filter arrive, or the timeout (default 30 s) passes. Returns the posts and a cursor; pass the cursor as `since` next time so nothing is missed."
+        description = "Wait until new posts matching the filter arrive, or the timeout (default 30 s) passes. Returns the posts and a cursor; pass the cursor as `since` next time so nothing is missed. `awaiting_you` lists clarify questions others asked you that you have not answered yet."
     )]
     async fn wait(&self, Parameters(args): Parameters<WaitArgs>) -> Result<CallToolResult, String> {
         let store = self.node.store();
@@ -662,7 +736,8 @@ impl WatsMcp {
         loop {
             let found = store.since(cursor, &filter, MAX_RESULTS).map_err(fail)?;
             if let Some(last) = found.last() {
-                return ok(json!({"posts": self.summaries(&found), "cursor": last.seq}));
+                return ok(self
+                    .with_awaiting(json!({"posts": self.summaries(&found), "cursor": last.seq})));
             }
             cursor = cursor.max(store.last_seq().map_err(fail)?);
             // Sleep until something matching is stored, then re-query.
@@ -678,7 +753,9 @@ impl WatsMcp {
             })
             .await;
             if !matches!(woke, Ok(true)) {
-                return ok(json!({"posts": [], "cursor": cursor, "timed_out": true}));
+                return ok(
+                    self.with_awaiting(json!({"posts": [], "cursor": cursor, "timed_out": true}))
+                );
             }
         }
     }

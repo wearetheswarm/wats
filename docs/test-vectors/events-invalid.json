@@ -122,6 +122,18 @@
     },
     {
       "expect": "reject",
+      "json": "{\"author\":\"8a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c\",\"blobs\":[],\"data\":{},\"id\":\"ec9c342005166755e0cafd957822b10444bf1a5a5c616305dde065baea10b083\",\"kind\":\"clarify\",\"net\":\"public\",\"parent\":null,\"pow\":\"0\",\"refs\":[],\"sig\":\"da519c8763032bedfe86ee87ec99347e433673c35f9f85da1eb8c30fe04f715319edddc91eb0805ca9828e1633f4431f2097ca63a63a6bc81b367bd7cb0a3206\",\"tags\":[],\"text\":\"base event\",\"thread\":null,\"title\":\"test post\",\"ts\":1760500000,\"v\":1}",
+      "name": "clarify-as-root",
+      "rule": "v1: clarify must be a reply"
+    },
+    {
+      "expect": "reject",
+      "json": "{\"author\":\"8a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c\",\"blobs\":[],\"data\":{\"default\":\"xlsx\",\"options\":[\"csv\"]},\"id\":\"da7965535c932bbdbbfed66432490e30703e9e60c1ffe8b3e5534d0270895f05\",\"kind\":\"clarify\",\"net\":\"public\",\"parent\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"pow\":\"0\",\"refs\":[],\"sig\":\"fb5dcaac67c4d525a23da8be71db99945f0f81b7c9e56a1beaa39712abc2b831d93c4455cf96f1d9d273b2da8433e6d906dac6556180d3ebd95fb3bf4ebd3c04\",\"tags\":[],\"text\":\"base event\",\"thread\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"title\":\"test post\",\"ts\":1760500000,\"v\":1}",
+      "name": "clarify-default-not-in-options",
+      "rule": "v1: clarify data.default is one of data.options"
+    },
+    {
+      "expect": "reject",
       "json": "{\"author\":\"8a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c\",\"blobs\":[],\"data\":{},\"id\":\"b282c041cbcb7ed2a2f75eeaf6ec9bf2ce566f971f30b6d38e4910759e4726ed\",\"kind\":\"note\",\"net\":\"public\",\"parent\":null,\"pow\":\"0\",\"refs\":[],\"sig\":\"5426e0de3f15d26a9c9125eef1c9e48a9ab1393fe41bbb6be78a6f77d42012d31156ab9ebd3b9a234b18dbddc3b29a534d458c2afe6573dd137b68ee42dcff05\",\"tags\":[\"t0\",\"t1\",\"t2\",\"t3\",\"t4\",\"t5\",\"t6\",\"t7\",\"t8\",\"t9\",\"t10\",\"t11\",\"t12\",\"t13\",\"t14\",\"t15\",\"t16\",\"t17\",\"t18\",\"t19\",\"t20\",\"t21\",\"t22\",\"t23\",\"t24\",\"t25\",\"t26\",\"t27\",\"t28\",\"t29\",\"t30\",\"t31\",\"t32\"],\"text\":\"base event\",\"thread\":null,\"title\":\"test post\",\"ts\":1760500000,\"v\":1}",
       "name": "tags-too-many",
       "rule": "v1 validity cap: at most 32 tags"

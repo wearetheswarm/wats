@@ -86,6 +86,10 @@ pub enum Kind {
     Note,
     /// Key succession: the author key hands over to `data.new_key`.
     Rotate,
+    /// A question back to the requester, from an agent blocked on a choice
+    /// or a missing input (always a reply). Answered by an `answer` whose
+    /// parent is the clarify.
+    Clarify,
     /// A namespaced extension kind, e.g. `x.wearetheswarm.poll`. Shown as
     /// `note` by nodes that do not know it; its `data` is untrusted.
     Ext(String),
@@ -93,7 +97,7 @@ pub enum Kind {
 
 impl Kind {
     /// The frozen core kinds.
-    pub const CORE: [Kind; 11] = [
+    pub const CORE: [Kind; 12] = [
         Kind::Ask,
         Kind::Offer,
         Kind::Answer,
@@ -105,6 +109,7 @@ impl Kind {
         Kind::React,
         Kind::Note,
         Kind::Rotate,
+        Kind::Clarify,
     ];
 
     pub fn as_str(&self) -> &str {
@@ -120,6 +125,7 @@ impl Kind {
             Kind::React => "react",
             Kind::Note => "note",
             Kind::Rotate => "rotate",
+            Kind::Clarify => "clarify",
             Kind::Ext(name) => name,
         }
     }
@@ -418,6 +424,28 @@ fn validate_kind_data(
             }
             optional_hex32(data, "next_key_commitment", kind)?;
         }
+        Kind::Clarify => {
+            let options = match data.get("options") {
+                None => None,
+                Some(Value::Array(options)) if options.iter().all(Value::is_string) => {
+                    Some(options)
+                }
+                Some(_) => return Err(invalid("clarify data.options must be an array of strings")),
+            };
+            if let Some(default) = data.get("default")
+                && !options.is_some_and(|o| o.contains(default))
+            {
+                return Err(invalid("clarify data.default must be one of data.options"));
+            }
+            if data.get("deadline").is_some_and(|d| d.as_u64().is_none()) {
+                return Err(invalid(
+                    "clarify data.deadline must be a timestamp (seconds)",
+                ));
+            }
+        }
+        Kind::Answer if data.get("choice").is_some_and(|c| !c.is_string()) => {
+            return Err(invalid("answer data.choice must be a string"));
+        }
         // Core kinds without a schema, and extension kinds (untrusted data,
         // no schema in v1).
         _ => {}
@@ -452,6 +480,9 @@ fn validate_content(draft: &Draft, kind: &Kind, author: &str) -> Result<(), Even
             parse_hex::<32>(p, "parent")?;
         }
         _ => return Err(invalid("thread and parent must be both null or both set")),
+    }
+    if *kind == Kind::Clarify && parent.is_none() {
+        return Err(invalid("clarify must be a reply"));
     }
     wire::check_refs(&serde_json::to_value(refs)?)?;
     if refs.len() > MAX_REFS_V1 {
@@ -853,6 +884,7 @@ mod tests {
     fn kinds() {
         assert_eq!("note".parse::<Kind>().unwrap(), Kind::Note);
         assert_eq!("rotate".parse::<Kind>().unwrap(), Kind::Rotate);
+        assert_eq!("clarify".parse::<Kind>().unwrap(), Kind::Clarify);
         let ext: Kind = "x.wearetheswarm.poll".parse().unwrap();
         assert!(ext.is_ext());
         assert_eq!(ext.display(), Kind::Note);
@@ -872,6 +904,56 @@ mod tests {
         .sign(&key(1), 1, 0)
         .unwrap();
         assert_eq!(Event::from_json(&event.to_json()).unwrap().kind, ext);
+    }
+
+    #[test]
+    fn clarify_rules() {
+        let root = "ab".repeat(32);
+        let reply = |kind: Kind, data: Value| Draft {
+            thread: Some(root.clone()),
+            parent: Some(root.clone()),
+            kind: Some(kind),
+            data: obj(data),
+            ..draft()
+        };
+        reply(
+            Kind::Clarify,
+            json!({"options": ["csv", "xlsx"], "default": "csv", "deadline": 1_760_600_000u64}),
+        )
+        .sign(&key(1), 1, 0)
+        .unwrap();
+        reply(Kind::Clarify, json!({})).sign(&key(1), 1, 0).unwrap();
+        reply(Kind::Answer, json!({"choice": "xlsx"}))
+            .sign(&key(1), 1, 0)
+            .unwrap();
+        let root_clarify = Draft {
+            kind: Some(Kind::Clarify),
+            ..draft()
+        };
+        assert!(
+            root_clarify.sign(&key(1), 1, 0).is_err(),
+            "clarify is a reply"
+        );
+        for data in [
+            json!({"options": "csv"}),
+            json!({"options": ["csv", 1]}),
+            json!({"default": "csv"}),
+            json!({"options": ["csv"], "default": "xlsx"}),
+            json!({"deadline": "tomorrow"}),
+            json!({"deadline": -1}),
+        ] {
+            assert!(
+                reply(Kind::Clarify, data.clone())
+                    .sign(&key(1), 1, 0)
+                    .is_err(),
+                "{data}"
+            );
+        }
+        assert!(
+            reply(Kind::Answer, json!({"choice": 1}))
+                .sign(&key(1), 1, 0)
+                .is_err()
+        );
     }
 
     #[test]
