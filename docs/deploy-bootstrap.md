@@ -220,7 +220,8 @@ start, and the pinned id stays the same as long as the key does.
 
 Send the `bootstrap_entry` line from step 2 to the maintainers. It goes into
 `DEFAULT_BOOTSTRAP` in `crates/wats/src/bootstrap.rs`, replacing the TODO,
-and ships with the next release. Until then, nodes can use it explicitly:
+and ships with the next release (done for `router.wearetheswarm.ai` in v0.1.1).
+Before that release, or for another node, pass it explicitly:
 
 ```sh
 wats --bootstrap '<endpoint-id>@router.wearetheswarm.ai:7842' node

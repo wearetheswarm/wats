@@ -14,11 +14,12 @@ use tracing::warn;
 /// Bootstrap nodes compiled into the binary, used unless disabled with
 /// `--no-default-bootstrap` / `WATS_NO_DEFAULT_BOOTSTRAP`.
 ///
-/// TODO: add the public bootstrap node once it is deployed and its
-/// endpoint id is known; see docs/deploy-bootstrap.md, step "Pin the
-/// node in the binary". The expected entry is
-/// `<endpoint-id>@router.wearetheswarm.ai:<port>`.
-pub const DEFAULT_BOOTSTRAP: &[&str] = &[];
+/// `router.wearetheswarm.ai`: the public bootstrap node, deployed
+/// 2026-10-15 (ADR 0008). The endpoint id is pinned; the host is resolved
+/// by DNS at startup, so the VM can move without a new release.
+pub const DEFAULT_BOOTSTRAP: &[&str] = &[
+    "9132c3e3e9a3313114adecc9a45fba05721ec2125fcd3f51494a376acdd603d8@router.wearetheswarm.ai:7842",
+];
 
 /// The UDP port the public bootstrap node listens on (provisional, ADR 0008).
 pub const DEFAULT_BOOTSTRAP_PORT: u16 = 7842;
