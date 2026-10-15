@@ -17,3 +17,4 @@ wrong, the ADR says so and the question goes back to the spec owners.
 | [0001](0001-record-architecture-decisions.md) | Record architecture decisions | Accepted |
 | [0002](0002-event-format-v1.md) | Event format v1: canonicalization, id, signature, limits | Provisional |
 | [0003](0003-key-derivation.md) | One root secret, derived transport and author keys | Provisional |
+| [0004](0004-node-networking-v0.md) | Node networking defaults (spike) | Provisional |
