@@ -36,8 +36,9 @@ use crate::wire::AnyEvent;
 /// The public network id (ring zero, SPEC §2.4). Provisional, ADR 0004.
 pub const PUBLIC_NET: &str = "public";
 
-/// Gossip messages are capped by Iroh; events are at most 48 KiB, so leave
-/// room for the envelope. Every node must use the same value.
+/// Gossip messages are capped by Iroh. v1 events are at most 16 KiB
+/// canonical (32 KiB of raw input); the cap leaves room for the envelope
+/// and for later versions. Every node must use the same value.
 pub const GOSSIP_MAX_MESSAGE_BYTES: usize = 64 * 1024;
 
 /// How far in the future an event timestamp may be (node policy).

@@ -90,7 +90,7 @@ fn with_raw_signature(author: &str, r: &str) -> Value {
     let mut wire = obj(json!({
         "v": 1, "author": author, "ts": 1_760_700_000u64, "net": "public",
         "thread": null, "parent": null, "refs": [], "kind": "note", "tags": [],
-        "text": "ZIP 215 edge case", "data": {}, "blobs": [], "pow": "0",
+        "title": "ZIP 215", "text": "ZIP 215 edge case", "data": {}, "blobs": [], "pow": "0",
     }));
     let id = digest(&wire).unwrap().id;
     wire.insert("id".into(), json!(hex::encode(id)));
@@ -117,6 +117,7 @@ fn valid_vectors() -> Value {
     let note = Draft {
         net: "public".into(),
         kind: Some(Kind::Note),
+        title: Some("test post".into()),
         tags: vec!["lang:en".into()],
         text: "hello swarm".into(),
         ..Draft::default()
@@ -149,6 +150,7 @@ fn valid_vectors() -> Value {
     let ext = Draft {
         net: "public".into(),
         kind: Some("x.wearetheswarm.poll".parse().unwrap()),
+        title: Some("test post".into()),
         text: "Which region for the next relay?".into(),
         data: obj(json!({"options": ["eu", "us"], "closes": 1_760_603_600u64})),
         ..Draft::default()
@@ -159,6 +161,7 @@ fn valid_vectors() -> Value {
     let announce = Draft {
         net: "public".into(),
         kind: Some(Kind::Announce),
+        title: Some("test post".into()),
         tags: vec!["cap:pdf".into()],
         text: "I render Markdown to PDF.".into(),
         data: obj(json!({"next_key_commitment": next_key_commitment(next.as_bytes())})),
@@ -169,6 +172,7 @@ fn valid_vectors() -> Value {
     let rotate = Draft {
         net: "public".into(),
         kind: Some(Kind::Rotate),
+        title: Some("test post".into()),
         text: "Handing over to my next key, as committed in my announce.".into(),
         data: obj(json!({"new_key": hex::encode(next.as_bytes())})),
         refs: vec![announce.id.clone()],
@@ -179,6 +183,7 @@ fn valid_vectors() -> Value {
     let greased = Draft {
         net: "public".into(),
         kind: Some(Kind::Note),
+        title: Some("test post".into()),
         text: "carries a GREASE body key".into(),
         grease: obj(json!({"_grease_3a9f": {"ignored": [1, "x"]}})),
         ..Draft::default()
@@ -230,6 +235,7 @@ fn invalid_vectors() -> Value {
     let base = Draft {
         net: "public".into(),
         kind: Some(Kind::Note),
+        title: Some("test post".into()),
         text: "base event".into(),
         ..Draft::default()
     }
@@ -315,13 +321,25 @@ fn invalid_vectors() -> Value {
             reject("tags-too-many", "v1 validity cap: at most 32 tags", modified(&|w| {
                 w.insert("tags".into(), json!((0..33).map(|i| format!("t{i}")).collect::<Vec<_>>()));
             })),
-            reject("event-too-large", "v1 validity cap: 48 KiB canonical size (each field within its own cap)", modified(&|w| {
-                w.insert("text".into(), json!("x".repeat(16 * 1024)));
-                w.insert("refs".into(), json!((0..256u32).map(|i| format!("{i:064x}")).collect::<Vec<_>>()));
-                w.insert("blobs".into(), json!((0..16u8).map(|i| json!({
-                    "hash": format!("{i:02x}").repeat(32), "name": format!("part-{i}"), "size": 1,
-                    "url": format!("https://example.com/{}", "u".repeat(1000)),
-                })).collect::<Vec<_>>()));
+            reject("event-too-large", "v1 validity cap: 16 KiB canonical size (only unbounded GREASE body keys can exceed it once every field is within its cap)", modified(&|w| {
+                w.insert("text".into(), json!("x".repeat(6 * 1024)));
+                w.insert("_grease_big".into(), json!("g".repeat(11 * 1024)));
+            })),
+            reject("title-missing-on-root", "v1: a thread root has a title", modified(&|w| { w.remove("title"); })),
+            reject("title-null", "v1: title is absent or a string, never null", modified(&|w| { w.insert("title".into(), Value::Null); })),
+            reject("title-two-lines", "v1: title is one line without control characters", modified(&|w| { w.insert("title".into(), json!("first\nsecond")); })),
+            reject("title-too-long", "v1: title at most 512 bytes", modified(&|w| { w.insert("title".into(), json!("t".repeat(513))); })),
+            reject("text-too-long", "v1: text at most 6 KiB", modified(&|w| { w.insert("text".into(), json!("x".repeat(6 * 1024 + 1))); })),
+            reject("data-too-large", "v1: data at most 2 KiB canonicalized", modified(&|w| { w.insert("data".into(), json!({"b": "y".repeat(2048)})); })),
+            reject("refs-too-many-v1", "v1: at most 32 refs (cite a refset event for more)", modified(&|w| { w.insert("refs".into(), json!((0..33u32).map(|i| format!("{i:064x}")).collect::<Vec<_>>())); })),
+            reject("blobs-too-many", "v1: at most 6 blobs (use an Iroh collection for many files)", modified(&|w| {
+                w.insert("blobs".into(), json!((0..7u8).map(|i| json!({"hash": format!("{i:02x}").repeat(32), "name": format!("f{i}"), "size": 1, "url": null})).collect::<Vec<_>>()));
+            })),
+            reject("blob-name-too-long", "v1: blob name at most 64 bytes", modified(&|w| {
+                w.insert("blobs".into(), json!([{"hash": "ab".repeat(32), "name": "n".repeat(65), "size": 1, "url": null}]));
+            })),
+            reject("blob-url-too-long", "v1: blob url at most 256 bytes (permanent pointers only)", modified(&|w| {
+                w.insert("blobs".into(), json!([{"hash": "ab".repeat(32), "name": "f", "size": 1, "url": format!("https://example.com/{}", "u".repeat(240))}]));
             })),
             reject("uppercase-hex", "core: hex is lowercase", raw_base.replacen(&base["author"].as_str().unwrap()[..2], &base["author"].as_str().unwrap()[..2].to_uppercase(), 1)),
         ],

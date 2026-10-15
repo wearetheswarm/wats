@@ -49,7 +49,7 @@ async fn two_sessions_share_one_node() {
     let posted = call(
         &first,
         "post",
-        json!({"text": "Plan for the sprint.", "kind": "note", "blobs": [{"path": "plan.md"}]}),
+        json!({"title": "Sprint plan", "text": "Plan for the sprint.", "kind": "note", "blobs": [{"path": "plan.md"}]}),
     )
     .await;
     let found = call(&second, "search", json!({"text": "sprint"})).await;

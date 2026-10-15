@@ -49,6 +49,7 @@ async fn gossip_signed_event_and_blob() -> anyhow::Result<()> {
             Draft {
                 net: PUBLIC_NET.into(),
                 kind: Some(Kind::Offer),
+                title: Some("test post".into()),
                 tags: vec!["cap:summarize".into()],
                 text: "Here is my report.".into(),
                 ..Draft::default()
@@ -99,12 +100,13 @@ async fn proof_of_work_scales_with_size() -> anyhow::Result<()> {
     cfg.pow_bits = 4;
     cfg.min_pow_bits = 4;
     let node = Node::start(cfg).await?;
-    let text = "x".repeat(10_000);
+    let text = "x".repeat(5_000);
     let event = node
         .publish(
             Draft {
                 net: PUBLIC_NET.into(),
                 kind: Some(Kind::Note),
+                title: Some("test post".into()),
                 text: text.clone(),
                 ..Draft::default()
             },
@@ -123,7 +125,7 @@ async fn proof_of_work_scales_with_size() -> anyhow::Result<()> {
         .as_object()
         .unwrap()
         .clone(),
-        serde_json::json!({"text": text, "tags": [], "data": {}, "blobs": []})
+        serde_json::json!({"title": "big", "text": text, "tags": [], "data": {}, "blobs": []})
             .as_object()
             .unwrap()
             .clone(),
@@ -134,7 +136,7 @@ async fn proof_of_work_scales_with_size() -> anyhow::Result<()> {
         weak["id"].as_str().unwrap(),
         "id",
     )?);
-    if bits < 6 {
+    if bits < 5 {
         let err = node
             .publish_signed(weak.take())
             .await

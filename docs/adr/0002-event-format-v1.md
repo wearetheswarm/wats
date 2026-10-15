@@ -67,12 +67,13 @@ sig    = Ed25519(author secret key, the 32 raw bytes of id)
 | `net` | 1–64 chars of `[a-z0-9._:-]` |
 | `thread`, `parent` | both `null` (root) or both set to a 64-char hex id |
 | `kind` | one of the ten §2.3 values |
-| `tags` | at most 32 (validity cap, ADR 0010; nodes index the first 16 by policy), each 1–64 bytes, no whitespace or control characters, no duplicates |
-| `text` | mandatory (not blank), at most 16 KiB |
-| `data` | JSON object, at most 8 KiB canonicalized; integers within ±(2^53−1), finite numbers only (JCS serializes numbers as doubles; larger integers would hash differently across implementations) |
+| `tags` | at most 32 (nodes index the first 16 by policy), each 1–64 bytes, no whitespace or control characters, no duplicates |
+| `title` | one line, at most 512 bytes, no control characters; required on thread roots, optional on replies, absent or a string (ADR 0010) |
+| `text` | mandatory (not blank), at most 6 KiB (ADR 0010) |
+| `data` | JSON object, at most 2 KiB canonicalized and 16 levels; integers only, within ±(2^53−1) (ADR 0010) |
 | `data` for `react` | `value ∈ {-1, 0, 1}`, `accept` and `still_valid` booleans, `label` string, when present (§2.13 bis, §2.13 ter). Other kinds: free-form until the §7 schemas are decided |
 | `blobs` | at most 16; `hash` 64-char hex BLAKE3 of the raw content; `name` 1–255 bytes, no `/ \ :`, control characters or leading dot (names may become file names on export); `size` ≤ 2^53−1; `url` ≤ 2048 bytes, no whitespace |
-| whole event | at most 48 KiB canonical size, i.e. JCS of the whole wire object (ADR 0010) |
+| whole event | at most 16 KiB canonical size, i.e. JCS of the whole wire object; the field caps sum below it (ADR 0010) |
 | `ts` | ≤ 2^53−1; freshness (e.g. not too far in the future) is node policy |
 
 v1 is an instance of the version-invariant core of ADR 0007 (body keys

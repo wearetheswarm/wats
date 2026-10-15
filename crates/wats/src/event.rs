@@ -25,32 +25,42 @@ use crate::wire;
 /// Current event format version.
 pub const VERSION: u32 = 1;
 
-/// Maximum size of `text`, in bytes (provisional, ADR 0002).
-pub const MAX_TEXT_BYTES: usize = 16 * 1024;
-/// Maximum number of tags: a validity cap (ADR 0010, limits). Nodes index
-/// fewer by policy (`store::INDEXED_TAGS`).
+// Validity caps of v1 (ADR 0010, limits). They are sized so that their
+// sum fits within MAX_EVENT_BYTES (about 15.3 KiB worst case): no field is
+// ever squeezed by the others.
+
+/// Maximum size of `title`, in bytes: one line.
+pub const MAX_TITLE_BYTES: usize = 512;
+/// Maximum size of `text`, in bytes: the summary agents read (~1.5k tokens).
+pub const MAX_TEXT_BYTES: usize = 6 * 1024;
+/// Maximum number of tags. Nodes index fewer by policy
+/// (`store::INDEXED_TAGS`).
 pub const MAX_TAGS: usize = 32;
-/// Maximum size of one tag, in bytes (provisional, ADR 0002).
+/// Maximum size of one tag, in bytes.
 pub const MAX_TAG_BYTES: usize = 64;
-/// Maximum size of a network id, in bytes (provisional, ADR 0002).
+/// Maximum size of a network id, in bytes.
 pub const MAX_NET_BYTES: usize = 64;
-/// Maximum size of `data` once canonicalized, in bytes (provisional, ADR 0002).
-pub const MAX_DATA_BYTES: usize = 8 * 1024;
-/// Deepest nesting of `data`, the object itself counting as 1 (ADR 0010).
+/// Maximum size of `data` once canonicalized, in bytes.
+pub const MAX_DATA_BYTES: usize = 2 * 1024;
+/// Deepest nesting of `data`, the object itself counting as 1.
 pub const MAX_DATA_DEPTH: usize = 16;
-/// Maximum number of blob references (provisional, ADR 0002).
-pub const MAX_BLOBS: usize = 16;
-/// Maximum size of a blob name, in bytes (provisional, ADR 0002).
-pub const MAX_BLOB_NAME_BYTES: usize = 255;
-/// Maximum size of a blob URL, in bytes (provisional, ADR 0002).
-pub const MAX_URL_BYTES: usize = 2048;
+/// Maximum number of refs in v1 (the core allows up to `wire::MAX_REFS`).
+/// More citations: cite a refset event (e.g. kind `x.wats.refset`).
+pub const MAX_REFS_V1: usize = 32;
+/// Maximum number of blob references. A blob may be an Iroh collection:
+/// many files travel as one collection.
+pub const MAX_BLOBS: usize = 6;
+/// Maximum size of a blob name, in bytes.
+pub const MAX_BLOB_NAME_BYTES: usize = 64;
+/// Maximum size of a blob URL, in bytes: permanent pointers only (no
+/// presigned URLs).
+pub const MAX_URL_BYTES: usize = 256;
 /// Maximum size of an event: a validity cap on its canonical size, the
-/// length of JCS(whole wire object) (ADR 0010, limits). The field caps do
-/// not all fit together within it; this total cap binds.
-pub const MAX_EVENT_BYTES: usize = 48 * 1024;
+/// length of JCS(whole wire object).
+pub const MAX_EVENT_BYTES: usize = 16 * 1024;
 /// Largest raw input parsed as one event (whitespace included), before any
 /// check: bounds the parsing cost.
-pub const MAX_RAW_EVENT_BYTES: usize = 64 * 1024;
+pub const MAX_RAW_EVENT_BYTES: usize = 32 * 1024;
 /// Largest integer JSON can carry without losing precision (2^53 - 1).
 /// JCS serializes numbers as IEEE 754 doubles, so anything larger would
 /// hash differently across implementations.
@@ -212,6 +222,10 @@ pub struct Event {
     pub refs: Vec<String>,
     pub kind: Kind,
     pub tags: Vec<String>,
+    /// One-line abstract (body). Required on thread roots, optional on
+    /// replies; absent from the wire when there is none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
     pub text: String,
     pub data: Map<String, Value>,
     pub blobs: Vec<BlobRef>,
@@ -233,6 +247,8 @@ pub struct Draft {
     pub refs: Vec<String>,
     pub kind: Option<Kind>,
     pub tags: Vec<String>,
+    /// One-line abstract: required on thread roots.
+    pub title: Option<String>,
     pub text: String,
     pub data: Map<String, Value>,
     pub blobs: Vec<BlobRef>,
@@ -301,6 +317,30 @@ pub fn required_pow_bits(base: u32, size: usize) -> u32 {
         threshold = threshold.saturating_mul(2);
     }
     bits
+}
+
+/// A title derived from text: its first non-empty line, trimmed to the
+/// title cap on a character boundary. For tools that do not ask for one.
+pub fn title_from_text(text: &str) -> String {
+    let line = text
+        .lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty())
+        .unwrap_or("untitled");
+    let mut title: String = line.chars().filter(|c| !c.is_control()).collect();
+    while title.len() > MAX_TITLE_BYTES {
+        title.pop();
+    }
+    title
+}
+
+/// v1 wire rules that the typed form cannot see: `title`, when present,
+/// is a string (never null).
+pub fn check_v1_wire(wire: &Map<String, Value>) -> Result<(), EventError> {
+    if wire.get("title").is_some_and(|t| !t.is_string()) {
+        return Err(invalid("title must be a string when present"));
+    }
+    Ok(())
 }
 
 /// The pre-rotation commitment to a next key (ADR 0010, A5).
@@ -394,6 +434,7 @@ fn validate_content(draft: &Draft, kind: &Kind, author: &str) -> Result<(), Even
         parent,
         refs,
         tags,
+        title,
         text,
         data,
         blobs,
@@ -413,6 +454,24 @@ fn validate_content(draft: &Draft, kind: &Kind, author: &str) -> Result<(), Even
         _ => return Err(invalid("thread and parent must be both null or both set")),
     }
     wire::check_refs(&serde_json::to_value(refs)?)?;
+    if refs.len() > MAX_REFS_V1 {
+        return Err(invalid(format!(
+            "more than {MAX_REFS_V1} refs: cite a refset event instead"
+        )));
+    }
+    match title {
+        Some(t) => {
+            if t.trim().is_empty() || t.len() > MAX_TITLE_BYTES || t.chars().any(char::is_control) {
+                return Err(invalid(format!(
+                    "title must be one non-empty line of at most {MAX_TITLE_BYTES} bytes"
+                )));
+            }
+        }
+        None if thread.is_none() => {
+            return Err(invalid("title is mandatory on a thread root"));
+        }
+        None => {}
+    }
     if let Some(p) = parent
         && refs.iter().any(|r| r == p)
     {
@@ -467,7 +526,9 @@ fn validate_content(draft: &Draft, kind: &Kind, author: &str) -> Result<(), Even
             .as_ref()
             .is_some_and(|url| !is_clean_token(url) || url.len() > MAX_URL_BYTES)
         {
-            return Err(invalid("blob url must be 1-2048 bytes with no whitespace"));
+            return Err(invalid(format!(
+                "blob url must be 1-{MAX_URL_BYTES} bytes with no whitespace"
+            )));
         }
     }
     if let Some(key) = grease.keys().find(|k| !wire::is_grease(k)) {
@@ -503,6 +564,7 @@ impl Draft {
             refs: self.refs,
             kind,
             tags: self.tags,
+            title: self.title,
             text: self.text,
             data: self.data,
             blobs: self.blobs,
@@ -572,6 +634,7 @@ impl Draft {
             refs: self.refs.clone(),
             kind,
             tags: self.tags.clone(),
+            title: self.title.clone(),
             text: self.text.clone(),
             data: self.data.clone(),
             blobs: self.blobs.clone(),
@@ -612,6 +675,7 @@ impl Event {
             refs: self.refs.clone(),
             kind: Some(self.kind.clone()),
             tags: self.tags.clone(),
+            title: self.title.clone(),
             text: self.text.clone(),
             data: self.data.clone(),
             blobs: self.blobs.clone(),
@@ -694,6 +758,7 @@ mod tests {
             net: "public".into(),
             kind: Some(Kind::Ask),
             tags: vec!["cap:pdf".into(), "project:x".into()],
+            title: Some("Report to PDF".into()),
             text: "Who can turn this report into a PDF?".into(),
             data: obj(json!({"deadline": 1_760_600_000})),
             ..Draft::default()
@@ -866,9 +931,9 @@ mod tests {
             sign(Some(a.clone()), vec![a.clone()]).is_err(),
             "repeats parent"
         );
-        let many: Vec<String> = (0..257u32).map(|i| format!("{i:064x}")).collect();
-        assert!(sign(None, many[..256].to_vec()).is_ok());
-        assert!(sign(None, many).is_err(), "more than 256");
+        let many: Vec<String> = (0..33u32).map(|i| format!("{i:064x}")).collect();
+        assert!(sign(None, many[..32].to_vec()).is_ok());
+        assert!(sign(None, many).is_err(), "more than 32 in v1");
     }
 
     #[test]
@@ -965,13 +1030,18 @@ mod tests {
         assert_eq!(required_pow_bits(12, 4097), 13);
         assert_eq!(required_pow_bits(12, 8192), 13);
         assert_eq!(required_pow_bits(12, 8193), 14);
-        assert_eq!(required_pow_bits(12, MAX_EVENT_BYTES), 16);
+        assert_eq!(required_pow_bits(12, MAX_EVENT_BYTES), 14);
+        assert_eq!(required_pow_bits(12, 48 * 1024), 16);
     }
 
     #[test]
     fn size_caps() {
         // 32 tags is valid, 33 is not.
-        let tags = |n: usize| (0..n).map(|i| format!("t{i}")).collect::<Vec<_>>();
+        let tags = |n: usize| {
+            (0..n)
+                .map(|i| format!("{i:02}{}", "t".repeat(62)))
+                .collect::<Vec<_>>()
+        };
         assert!(
             Draft {
                 tags: tags(32),
@@ -988,23 +1058,37 @@ mod tests {
             .sign(&key(1), 1, 0)
             .is_err()
         );
-        // Each field within its cap, but the total above 48 KiB.
-        let big = Draft {
+        // Every field at its cap at once still fits: no field is squeezed.
+        let full = Draft {
+            title: Some("t".repeat(MAX_TITLE_BYTES)),
             text: "x".repeat(MAX_TEXT_BYTES),
             data: obj(json!({"blob": "y".repeat(MAX_DATA_BYTES - 20)})),
-            refs: (0..256u32).map(|i| format!("{i:064x}")).collect(),
-            tags: tags(32),
-            blobs: (0..8u8)
+            refs: (0..MAX_REFS_V1 as u32)
+                .map(|i| format!("{i:064x}"))
+                .collect(),
+            tags: tags(MAX_TAGS),
+            blobs: (0..MAX_BLOBS as u8)
                 .map(|i| BlobRef {
                     hash: format!("{i:02x}").repeat(32),
-                    name: format!("part-{i}.bin"),
-                    size: 1,
-                    url: Some(format!("https://example.com/{}", "u".repeat(1000))),
+                    name: format!("{i}{}", "n".repeat(MAX_BLOB_NAME_BYTES - 1)),
+                    size: MAX_SAFE_INTEGER,
+                    url: Some(format!(
+                        "https://example.com/{}",
+                        "u".repeat(MAX_URL_BYTES - 20)
+                    )),
                 })
                 .collect(),
             ..draft()
         };
-        let err = big.clone().sign(&key(1), 1, 0).unwrap_err().to_string();
+        let event = full.clone().sign(&key(1), MAX_SAFE_INTEGER, 0).unwrap();
+        let size = event.canonical_size().unwrap();
+        assert!(size <= MAX_EVENT_BYTES, "worst case {size} bytes");
+        // Only unbounded GREASE can push it over the total cap.
+        let over = Draft {
+            grease: obj(json!({"_grease_big": "g".repeat(2048)})),
+            ..full
+        };
+        let err = over.sign(&key(1), 1, 0).unwrap_err().to_string();
         assert!(err.contains("canonicalized"), "{err}");
         // The estimate bounds the real size.
         let small = draft();
@@ -1014,6 +1098,36 @@ mod tests {
             estimate >= real && estimate < real + 64,
             "{estimate} vs {real}"
         );
+    }
+
+    #[test]
+    fn titles() {
+        let root = |title: Option<&str>| {
+            Draft {
+                title: title.map(str::to_string),
+                ..draft()
+            }
+            .sign(&key(1), 1, 0)
+        };
+        assert!(root(None).is_err(), "roots need a title");
+        assert!(root(Some("two\nlines")).is_err());
+        assert!(root(Some("  ")).is_err());
+        assert!(root(Some(&"t".repeat(MAX_TITLE_BYTES + 1))).is_err());
+        let ok = root(Some("Report to PDF")).unwrap();
+        // Replies may omit it.
+        Draft {
+            thread: Some(ok.id.clone()),
+            parent: Some(ok.id.clone()),
+            title: None,
+            ..draft()
+        }
+        .sign(&key(1), 1, 0)
+        .unwrap();
+        // An explicit null on the wire is invalid (it is absent or a string).
+        let mut value = serde_json::to_value(&ok).unwrap();
+        value["title"] = Value::Null;
+        assert!(Event::from_json(&serde_json::to_vec(&value).unwrap()).is_err());
+        assert_eq!(title_from_text("\n\n  First line\nsecond"), "First line");
     }
 
     #[test]
@@ -1031,6 +1145,7 @@ mod tests {
             net: "public".into(),
             kind: Some(Kind::Note),
             tags: vec!["lang:en".into()],
+            title: Some("hello".into()),
             text: "hello swarm".into(),
             ..Draft::default()
         }
@@ -1038,7 +1153,7 @@ mod tests {
         .unwrap();
         let body = hex::encode(blake3::derive_key(
             "wats event body v1",
-            br#"{"blobs":[],"data":{},"tags":["lang:en"],"text":"hello swarm"}"#,
+            br#"{"blobs":[],"data":{},"tags":["lang:en"],"text":"hello swarm","title":"hello"}"#,
         ));
         let header = format!(
             r#"{{"author":"{}","body":"{body}","kind":"note","net":"public","parent":null,"pow":"0","refs":[],"thread":null,"ts":1760500000,"v":1}}"#,

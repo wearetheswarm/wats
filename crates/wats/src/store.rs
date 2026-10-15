@@ -384,6 +384,16 @@ impl Store {
         )
     }
 
+    /// Number of understood replies in a thread (root excluded).
+    pub fn reply_count(&self, root: &str) -> Result<u64> {
+        let n: i64 = self.conn().query_row(
+            "SELECT count(*) FROM events WHERE thread = ? AND opaque = 0",
+            [root],
+            |r| r.get(0),
+        )?;
+        Ok(n as u64)
+    }
+
     /// Full-text search (BM25), newest first among equal ranks. Without
     /// text, the newest matching events.
     pub fn search(&self, text: Option<&str>, filter: &Filter, limit: usize) -> Result<Vec<Stored>> {
@@ -525,6 +535,7 @@ mod tests {
             net: "public".into(),
             kind: Some(kind),
             tags: tags.iter().map(|t| t.to_string()).collect(),
+            title: Some(text.into()),
             text: text.into(),
             ..Draft::default()
         }

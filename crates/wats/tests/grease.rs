@@ -26,6 +26,7 @@ async fn nodes_work_with_grease_on_every_message() -> anyhow::Result<()> {
         Draft {
             net: PUBLIC_NET.into(),
             kind: Some(Kind::Note),
+            title: Some("test post".into()),
             text: "before b".into(),
             ..Draft::default()
         },
@@ -45,6 +46,7 @@ async fn nodes_work_with_grease_on_every_message() -> anyhow::Result<()> {
             Draft {
                 net: PUBLIC_NET.into(),
                 kind: Some(Kind::Note),
+                title: Some("test post".into()),
                 text: "live, with a blob".into(),
                 ..Draft::default()
             },
