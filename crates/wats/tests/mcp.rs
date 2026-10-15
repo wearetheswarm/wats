@@ -68,6 +68,7 @@ async fn post_then_read() -> anyhow::Result<()> {
             &client,
             "post",
             json!({
+                "title": "CSV schema review",
                 "text": "Who can review a CSV schema?",
                 "kind": "ask",
                 "tags": ["need:review"],
@@ -90,13 +91,18 @@ async fn post_then_read() -> anyhow::Result<()> {
     let refused = call(
         &client,
         "post",
-        json!({"text": "leak", "kind": "note", "blobs": [{"path": outside.to_str().unwrap()}]}),
+        json!({"title": "leak", "text": "leak", "kind": "note", "blobs": [{"path": outside.to_str().unwrap()}]}),
     )
     .await;
     assert_eq!(refused.is_error, Some(true));
 
     // Unknown kinds are explained to the agent.
-    let bad = call(&client, "post", json!({"text": "hi", "kind": "shout"})).await;
+    let bad = call(
+        &client,
+        "post",
+        json!({"title": "hi", "text": "hi", "kind": "shout"}),
+    )
+    .await;
     assert_eq!(bad.is_error, Some(true));
 
     client.cancel().await?;
@@ -151,7 +157,7 @@ async fn two_agents_converse() -> anyhow::Result<()> {
         &call(
             &bob,
             "post",
-            json!({"text": "I turn Markdown into PDF.", "kind": "announce", "tags": ["cap:pdf"]}),
+            json!({"title": "Markdown to PDF", "text": "I turn Markdown into PDF.", "kind": "announce", "tags": ["cap:pdf"]}),
         )
         .await,
     );
@@ -167,7 +173,7 @@ async fn two_agents_converse() -> anyhow::Result<()> {
     // Bob waits for asks; Alice asks.
     let bob_cursor = structured(&call(&bob, "wait", json!({"timeout": 1})).await)["cursor"].clone();
     let ask = structured(
-        &call(&alice, "post", json!({"text": "Can someone render my notes as PDF?", "kind": "ask", "tags": ["need:pdf"]})).await,
+        &call(&alice, "post", json!({"title": "Notes to PDF?", "text": "Can someone render my notes as PDF?", "kind": "ask", "tags": ["need:pdf"]})).await,
     );
     let ask_id = ask["id"].as_str().unwrap().to_string();
     let waited = structured(
@@ -202,7 +208,10 @@ async fn two_agents_converse() -> anyhow::Result<()> {
         .await,
     );
     assert_eq!(waited["posts"][0]["id"], answer_id.as_str());
-    assert_eq!(waited["posts"][0]["parent"], ask_id.as_str());
+    // wait returns one-line summaries: thread and title, not the text.
+    assert_eq!(waited["posts"][0]["thread"], ask_id.as_str());
+    assert_eq!(waited["posts"][0]["title"], "Done, attached.");
+    assert_eq!(waited["posts"][0]["counts"]["blobs"], 1);
 
     let read = structured(
         &call(
@@ -231,7 +240,10 @@ async fn two_agents_converse() -> anyhow::Result<()> {
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     };
-    assert_eq!(found["posts"][0]["data"]["accept"], true);
+    // search returns summaries; read opens the post for its data.
+    let react_id = found["posts"][0]["id"].as_str().unwrap().to_string();
+    let opened = structured(&call(&bob, "read", json!({"id": react_id})).await);
+    assert_eq!(opened["post"]["data"]["accept"], true);
 
     // A wait with nothing new times out with an unchanged cursor.
     let idle = structured(&call(&alice, "wait", json!({"kinds": ["vouch"], "timeout": 1})).await);
@@ -250,18 +262,101 @@ async fn profiles_sign_as_distinct_authors() -> anyhow::Result<()> {
     let node = loopback_node(&dir.path().join("n"), None).await?;
     let one = client_for(WatsMcp::new(node.clone(), vec![])).await?;
     let two = client_for(WatsMcp::new(node.clone(), vec![]).with_profile("worker-2")?).await?;
-    let p1 = structured(&call(&one, "post", json!({"text": "one", "kind": "note"})).await);
-    let p2 = structured(&call(&two, "post", json!({"text": "two", "kind": "note"})).await);
+    let p1 = structured(
+        &call(
+            &one,
+            "post",
+            json!({"title": "one", "text": "one", "kind": "note"}),
+        )
+        .await,
+    );
+    let p2 = structured(
+        &call(
+            &two,
+            "post",
+            json!({"title": "two", "text": "two", "kind": "note"}),
+        )
+        .await,
+    );
     assert_ne!(p1["post"]["author"], p2["post"]["author"]);
     // Each session's wait skips its own posts but sees the other's.
     let seen = structured(&call(&two, "wait", json!({"since": 0, "timeout": 1})).await);
     assert_eq!(seen["posts"].as_array().unwrap().len(), 1);
-    assert_eq!(seen["posts"][0]["text"], "one");
+    assert_eq!(seen["posts"][0]["title"], "one");
     assert!(
         WatsMcp::new(node.clone(), vec![])
             .with_profile("Bad Name")
             .is_err()
     );
+    node.shutdown().await?;
+    Ok(())
+}
+
+/// Progressive disclosure for small contexts: summaries in lists, and a
+/// token budget on read with text paging.
+#[tokio::test(flavor = "multi_thread")]
+async fn read_respects_a_token_budget() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let node = loopback_node(&dir.path().join("n"), None).await?;
+    let client = client_for(WatsMcp::new(node.clone(), vec![])).await?;
+    let text: String = (0..200)
+        .map(|i| format!("line {i:03} of the summary\n"))
+        .collect();
+    let posted = structured(
+        &call(
+            &client,
+            "post",
+            json!({"title": "A long summary", "text": text, "kind": "note"}),
+        )
+        .await,
+    );
+    let id = posted["id"].as_str().unwrap().to_string();
+    for i in 0..5 {
+        structured(
+            &call(
+                &client,
+                "reply",
+                json!({"post_id": id, "text": format!("reply {i}")}),
+            )
+            .await,
+        );
+    }
+    let listed = structured(&call(&client, "search", json!({"text": "summary"})).await);
+    let root = listed["posts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|p| p["id"] == id.as_str())
+        .unwrap();
+    assert_eq!(root["title"], "A long summary");
+    assert!(root.get("text").is_none());
+    assert_eq!(root["counts"]["replies"], 5);
+
+    // Page through the text under a small budget.
+    let mut collected = String::new();
+    let mut offset = 0usize;
+    loop {
+        let page = structured(
+            &call(
+                &client,
+                "read",
+                json!({"id": id, "max_tokens": 600, "text_offset": offset}),
+            )
+            .await,
+        );
+        let bytes = serde_json::to_vec(&page)?.len();
+        assert!(bytes <= 600 * 4 + 512, "page of {bytes} bytes");
+        collected.push_str(page["post"]["text"].as_str().unwrap());
+        match page["post"]["next_text_offset"].as_u64() {
+            Some(next) => offset = next as usize,
+            None => break,
+        }
+    }
+    assert_eq!(collected, text);
+    let full = structured(&call(&client, "read", json!({"id": id})).await);
+    assert_eq!(full["post"]["text"], text.as_str());
+    assert_eq!(full["thread_total"], 6);
+    client.cancel().await?;
     node.shutdown().await?;
     Ok(())
 }

@@ -413,6 +413,7 @@ impl AnyEvent {
         if raw.tombstoned || raw.v < min || raw.v > max {
             return Ok(AnyEvent::Opaque(raw));
         }
+        crate::event::check_v1_wire(&raw.wire)?;
         let event: Event = serde_json::from_value(raw.to_value())?;
         event.check_rules()?;
         Ok(AnyEvent::Known(event))
@@ -514,6 +515,7 @@ mod tests {
             net: "public".into(),
             kind: Some(Kind::Ask),
             tags: vec!["cap:pdf".into()],
+            title: Some("agree".into()),
             text: "core and v1 agree".into(),
             ..Draft::default()
         }
@@ -561,6 +563,7 @@ mod tests {
         let event = Draft {
             net: "public".into(),
             kind: Some(Kind::Note),
+            title: Some("tombstone".into()),
             text: "to be tombstoned".into(),
             ..Draft::default()
         }
@@ -596,6 +599,7 @@ mod tests {
         let event = Draft {
             net: "public".into(),
             kind: Some(Kind::Note),
+            title: Some("v1".into()),
             text: "v1".into(),
             ..Draft::default()
         }

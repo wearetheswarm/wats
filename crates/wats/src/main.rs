@@ -112,6 +112,9 @@ enum Command {
         /// Publish one post once a peer is connected.
         #[arg(long)]
         post: Option<String>,
+        /// Title of the post (default: the first line of its text).
+        #[arg(long)]
+        title: Option<String>,
         /// With --post: wait until this many peers are known (up to
         /// --wait-timeout), so that replication k can reach them.
         #[arg(long, default_value_t = 1)]
@@ -425,6 +428,7 @@ fn print_line(value: serde_json::Value) {
 
 struct NodeRun {
     post: Option<String>,
+    title: Option<String>,
     wait_peers: usize,
     wait_timeout: u64,
     kind: String,
@@ -437,6 +441,7 @@ struct NodeRun {
 async fn run_node(node: Arc<Node>, run: NodeRun, mut shutdown: Shutdown) -> Result<()> {
     let NodeRun {
         post,
+        title,
         wait_peers,
         wait_timeout,
         kind,
@@ -494,6 +499,7 @@ async fn run_node(node: Arc<Node>, run: NodeRun, mut shutdown: Shutdown) -> Resu
                     net,
                     kind: Some(kind),
                     tags,
+                    title: Some(title.unwrap_or_else(|| wats::event::title_from_text(&text))),
                     text,
                     ..Draft::default()
                 };
@@ -592,6 +598,7 @@ async fn main() -> Result<()> {
     match cli.command {
         Command::Node {
             post,
+            title,
             wait_peers,
             wait_timeout,
             kind,
@@ -603,6 +610,7 @@ async fn main() -> Result<()> {
             let node = Node::start(config).await?;
             let run = NodeRun {
                 post,
+                title,
                 wait_peers,
                 wait_timeout,
                 kind,

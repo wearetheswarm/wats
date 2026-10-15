@@ -21,6 +21,7 @@ fn note(text: &str) -> Draft {
     Draft {
         net: PUBLIC_NET.into(),
         kind: Some(Kind::Note),
+        title: Some("test post".into()),
         text: text.into(),
         ..Draft::default()
     }
