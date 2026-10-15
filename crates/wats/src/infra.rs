@@ -9,9 +9,9 @@
 //!   its id alone.
 //!
 //! Profiles:
+//! - `wats` (default): WeAreTheSwarm's own relay and DNS, no third party;
 //! - `n0`: Iroh's public services operated by n0 (the Iroh defaults);
-//! - `wats`: WeAreTheSwarm's own relay and DNS, no third party;
-//! - `wats+n0`: both, for redundancy while our relay is a single node;
+//! - `wats+n0`: both (redundancy, at the cost of silent fallback);
 //! - `none`: no relay and no lookup; peers must be dialed by address
 //!   (bootstrap entries, tickets, local networks).
 
@@ -35,10 +35,11 @@ pub const WATS_DNS_ORIGIN: &str = "dns.wearetheswarm.ai";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Infra {
-    /// Iroh's public relays and DNS, operated by n0. Current default.
-    #[default]
+    /// Iroh's public relays and DNS, operated by n0.
     N0,
-    /// WeAreTheSwarm's own relay and DNS only.
+    /// WeAreTheSwarm's own relay and DNS only. Default: failures of our
+    /// infrastructure stay visible instead of falling back to n0.
+    #[default]
     Wats,
     /// Both: our relay and n0's in one relay map, publish and resolve with
     /// both DNS servers.
@@ -136,7 +137,7 @@ mod tests {
             assert_eq!(name.parse::<Infra>().unwrap().to_string(), name);
         }
         assert!("aws".parse::<Infra>().is_err());
-        assert_eq!(Infra::default(), Infra::N0);
+        assert_eq!(Infra::default(), Infra::Wats);
     }
 
     #[test]
