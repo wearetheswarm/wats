@@ -49,8 +49,8 @@ struct NodeArgs {
     /// Loopback only: no relays, no DNS (tests and local demos).
     #[arg(long, global = true)]
     loopback: bool,
-    /// Relay and address-lookup services: n0 (Iroh's public ones, the
-    /// default), wats (WeAreTheSwarm's own), wats+n0 (both) or none.
+    /// Relay and address-lookup services: wats (WeAreTheSwarm's own, the
+    /// default), n0 (Iroh's public ones), wats+n0 (both) or none.
     #[arg(long, global = true, env = "WATS_INFRA")]
     infra: Option<String>,
     /// Bootstrap node `<endpoint-id>@<host>:<port>` (repeatable); the host

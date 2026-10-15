@@ -1,7 +1,7 @@
 # 0009. Relay and address-lookup infrastructure
 
-Status: Provisional (2026-10-15). The default stays `n0` until our own
-endpoints are confirmed live; see "Rollout".
+Status: Provisional (2026-10-15). Default `wats` (decision of 2026-10-15,
+proof-of-concept phase).
 
 Code: `crates/wats/src/infra.rs`.
 
@@ -52,8 +52,8 @@ A node chooses its infrastructure with `--infra` / `WATS_INFRA`:
 
 | Profile | Relays | Publish and resolve | Third party |
 |---|---|---|---|
-| `n0` (default for now) | n0's | n0's pkarr and DNS | n0 |
-| `wats` | ours | ours | none |
+| `wats` (default) | ours | ours | none |
+| `n0` | n0's | n0's pkarr and DNS | n0 |
 | `wats+n0` | ours and n0's, in one relay map | both | n0, as redundancy |
 | `none` | none | none | none: peers must be dialed by address (bootstrap entries, tickets, LAN) |
 
@@ -66,32 +66,35 @@ A node chooses its infrastructure with `--infra` / `WATS_INFRA`:
   URL and DNS origin are constants in `infra.rs`. Arbitrary relay URLs can
   come later, if someone needs to run a private set.
 
-### Fallback to n0
+### Default: `wats`, no fallback to n0
 
-- **Keep n0 as secondary at first (`wats+n0`).** Our relay is a single node,
-  IPv4 only, without monitoring yet. With both in the relay map, Iroh picks
-  the lowest-latency relay as home, so some nodes will home on n0. That is
-  acceptable: relays are open, and any node can reach a peer through that
-  peer's home relay.
-- **Publish to both directories during the transition.** A node that only
-  resolves through our DNS cannot find, by id alone, a peer that only
-  published to n0's DNS, and the reverse. Gossip and bootstrap entries
-  still carry addresses, so the swarm does not split. But id-only lookups
-  need overlap.
-- **Drop n0 (`wats` by default) once we have:**
-  - at least two relays, in different places;
-  - IPv6;
-  - monitoring;
-  - one release cycle in which most nodes publish to our DNS.
+During the proof of concept the default is `wats` alone. `wats+n0` would
+fall back silently: Iroh picks the lowest-latency relay as home, and
+lookups succeed through whichever directory answers, so a broken relay or
+DNS of ours would go unnoticed. With `wats` only, any failure of our
+infrastructure shows up at once in tests and logs. This also proves the
+swarm runs without any third party.
+
+The cost: our relay is a single node, IPv4 only, without monitoring yet.
+If it is down, nodes behind NAT can no longer hole punch or fall back to a
+relay. Nodes with public addresses, and peers already connected, keep
+working.
+
+`wats+n0` stays available as an explicit choice for redundancy. It needs
+both directories published during any transition: a node that only
+resolves through one directory cannot find, by id alone, a peer that only
+published to the other.
 
 ## Rollout
 
-1. This change: the profiles exist, and the default stays `n0`.
-2. When internal confirms that the relay and DNS endpoints are live: check
-   them with `WATS_INFRA=wats wats node` between two machines. Then switch
-   the default to `wats+n0` in a release, and set `WATS_INFRA=wats+n0` on
-   the router VM.
-3. Later: switch the default to `wats`.
+1. The profiles exist (n0 default).
+2. The default is `wats` (this change). The relay `relay.wearetheswarm.ai`
+   is live. Until the pkarr/DNS service `dns.wearetheswarm.ai` is live,
+   nodes log failed pkarr publishes and id-only lookups fail. Discovery
+   through the router, bootstrap entries and gossip is unaffected. The
+   router VM sets `WATS_INFRA=wats` too.
+3. Before the public launch: at least two relays in different places,
+   IPv6, and monitoring. Then reconsider `wats+n0` for resilience.
 
 ## Consequences
 

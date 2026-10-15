@@ -75,9 +75,10 @@ band, or pass a bootstrap entry with `--bootstrap` / `WATS_BOOTSTRAP`.
 
 ## Relays and directory
 
-By default nodes use Iroh's public relays and DNS, operated by n0. Set
-`WATS_INFRA=wats` (WeAreTheSwarm's own), `wats+n0` (both) or `none` in the
-MCP server environment to change that (ADR 0009).
+By default nodes use WeAreTheSwarm's own relay (`relay.wearetheswarm.ai`)
+and directory (`dns.wearetheswarm.ai`), with no third party. Set
+`WATS_INFRA=n0` (Iroh's public services, operated by n0), `wats+n0` (both)
+or `none` in the MCP server environment to change that (ADR 0009).
 
 ## Waking the agent
 

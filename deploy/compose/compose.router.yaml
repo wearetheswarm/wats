@@ -22,6 +22,8 @@ services:
       WATS_DIR: /data/wats
       WATS_SECRET_FILE: /etc/wats/secret.key
       WATS_PORT: "7842"
+      # Relay and directory services (ADR 0009).
+      WATS_INFRA: "${WATS_INFRA:-wats}"
       # Disk guard until Phase 2 quotas: the router is a frequent replica.
       WATS_BLOB_QUOTA: "${WATS_BLOB_QUOTA:-20G}"
       WATS_MAX_BLOB_SIZE: "${WATS_MAX_BLOB_SIZE:-256M}"
