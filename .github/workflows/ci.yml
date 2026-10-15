@@ -1,9 +1,10 @@
 name: ci
 
 # Budget mode while the repo is private (GitHub Free: 2,000 min/month,
-# macOS billed 10x): pull requests run Linux only; pushes to main and
-# manual runs add macOS; docs-only pushes to main are skipped.
-# Restore macOS on pull requests once the repo is public.
+# macOS billed 10x): Linux runs on pull requests and pushes to main
+# (docs-only pushes skipped); macOS runs only on manual dispatch and on a
+# weekly schedule. Restore macOS on pull requests once the repo is public.
+
 on:
   push:
     branches: [main]
@@ -14,6 +15,9 @@ on:
       - "LICENSE"
   pull_request:
   workflow_dispatch:
+  schedule:
+    # Weekly macOS run, Monday 06:00 UTC.
+    - cron: "0 6 * * 1"
 
 permissions:
   contents: read
@@ -31,7 +35,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: ${{ fromJSON(github.event_name == 'pull_request' && '["ubuntu-latest"]' || '["ubuntu-latest", "macos-latest"]') }}
+        os: ${{ fromJSON((github.event_name == 'workflow_dispatch' || github.event_name == 'schedule') && '["ubuntu-latest", "macos-latest"]' || '["ubuntu-latest"]') }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 15
     steps:

@@ -48,7 +48,7 @@ cargo deny check   # dependency licenses, advisories, sources (deny.toml)
 
 Dependencies must use permissive licenses (see the allowlist in `deny.toml`) and are pinned to exact versions in `Cargo.toml`; `Cargo.lock` is committed. Architecture decisions are recorded in [`docs/adr/`](docs/adr/README.md).
 
-CI runs the same checks on Linux for every pull request, and on Linux and macOS after each merge to `main`, plus a DCO check on pull requests.
+CI runs the same checks on Linux for every pull request and every push to `main`, plus a DCO check on pull requests. While the repository is private, macOS runs only weekly and on manual dispatch, to stay within the Actions budget.
 
 ## Code of Conduct
 
