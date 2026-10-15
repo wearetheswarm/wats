@@ -49,6 +49,10 @@ struct NodeArgs {
     /// Loopback only: no relays, no DNS (tests and local demos).
     #[arg(long, global = true)]
     loopback: bool,
+    /// Relay and address-lookup services: n0 (Iroh's public ones, the
+    /// default), wats (WeAreTheSwarm's own), wats+n0 (both) or none.
+    #[arg(long, global = true, env = "WATS_INFRA")]
+    infra: Option<String>,
     /// Bootstrap node `<endpoint-id>@<host>:<port>` (repeatable); the host
     /// is resolved by DNS, the id is pinned.
     #[arg(long, global = true, env = "WATS_BOOTSTRAP", value_delimiter = ',')]
@@ -218,6 +222,9 @@ impl NodeArgs {
         if self.secret_file.as_ref().is_some_and(|p| p.is_empty()) {
             self.secret_file = None;
         }
+        if self.infra.as_ref().is_some_and(|p| p.trim().is_empty()) {
+            self.infra = None;
+        }
         if self.profile.as_ref().is_some_and(|p| p.is_empty()) {
             self.profile = None;
         }
@@ -242,6 +249,9 @@ impl NodeArgs {
             );
         }
         config.port = self.port;
+        if let Some(infra) = &self.infra {
+            config.infra = infra.parse()?;
+        }
         config.secret_file = self.secret_file.as_ref().map(PathBuf::from);
         if let Some(size) = self.max_blob_size {
             config.max_blob_bytes = size;
@@ -307,6 +317,9 @@ impl NodeArgs {
         }
         if let Some(port) = self.port {
             args.push(format!("--port={port}").into());
+        }
+        if let Some(infra) = &self.infra {
+            args.push(format!("--infra={infra}").into());
         }
         if let Some(size) = self.max_blob_size {
             args.push(format!("--max-blob-size={size}").into());

@@ -4261,6 +4261,7 @@ dependencies = [
  "iroh",
  "iroh-blobs",
  "iroh-gossip",
+ "iroh-relay",
  "iroh-tickets",
  "mimalloc",
  "n0-future",
@@ -4275,6 +4276,7 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "url",
 ]
 
 [[package]]
