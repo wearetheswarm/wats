@@ -27,8 +27,9 @@ pub const VERSION: u32 = 1;
 
 /// Maximum size of `text`, in bytes (provisional, ADR 0002).
 pub const MAX_TEXT_BYTES: usize = 16 * 1024;
-/// Maximum number of tags (provisional, ADR 0002).
-pub const MAX_TAGS: usize = 16;
+/// Maximum number of tags: a validity cap (ADR 0010, limits). Nodes index
+/// fewer by policy (`store::INDEXED_TAGS`).
+pub const MAX_TAGS: usize = 32;
 /// Maximum size of one tag, in bytes (provisional, ADR 0002).
 pub const MAX_TAG_BYTES: usize = 64;
 /// Maximum size of a network id, in bytes (provisional, ADR 0002).
@@ -43,8 +44,13 @@ pub const MAX_BLOBS: usize = 16;
 pub const MAX_BLOB_NAME_BYTES: usize = 255;
 /// Maximum size of a blob URL, in bytes (provisional, ADR 0002).
 pub const MAX_URL_BYTES: usize = 2048;
-/// Maximum size of a serialized event, in bytes (provisional, ADR 0002).
+/// Maximum size of an event: a validity cap on its canonical size, the
+/// length of JCS(whole wire object) (ADR 0010, limits). The field caps do
+/// not all fit together within it; this total cap binds.
 pub const MAX_EVENT_BYTES: usize = 48 * 1024;
+/// Largest raw input parsed as one event (whitespace included), before any
+/// check: bounds the parsing cost.
+pub const MAX_RAW_EVENT_BYTES: usize = 64 * 1024;
 /// Largest integer JSON can carry without losing precision (2^53 - 1).
 /// JCS serializes numbers as IEEE 754 doubles, so anything larger would
 /// hash differently across implementations.
@@ -281,6 +287,20 @@ pub fn parse_hex<const N: usize>(s: &str, what: &str) -> Result<[u8; N], EventEr
     let mut out = [0u8; N];
     hex::decode_to_slice(s, &mut out).map_err(|_| invalid(format!("{what} is not hex")))?;
     Ok(out)
+}
+
+/// Proof of work a receiver requires for an event of `size` canonical
+/// bytes: `base` bits, plus one bit per doubling above 4 KiB, i.e.
+/// `base + max(0, ceil(log2(size / 4096)))` (ADR 0010, limits). Node
+/// policy, not validity.
+pub fn required_pow_bits(base: u32, size: usize) -> u32 {
+    let mut bits = base;
+    let mut threshold = 4096usize;
+    while size > threshold {
+        bits += 1;
+        threshold = threshold.saturating_mul(2);
+    }
+    bits
 }
 
 /// The pre-rotation commitment to a next key (ADR 0010, A5).
@@ -523,7 +543,43 @@ impl Draft {
         event.id = hex::encode(id);
         event.pow = pow;
         event.sig = hex::encode(wire::sign_v1(key, &id));
+        let size = event.canonical_size()?;
+        if size > MAX_EVENT_BYTES {
+            return Err(invalid(format!(
+                "event is {size} bytes canonicalized, above {MAX_EVENT_BYTES}: \
+                 keep text short and put long content in a blob"
+            )));
+        }
         Ok(event)
+    }
+
+    /// An upper bound of the canonical size this draft will have once
+    /// signed by `author` (the nonce counted at its longest), so that the
+    /// miner can target the proof of work receivers will require.
+    pub fn estimated_size(&self, author: &SigningKey) -> Result<usize, EventError> {
+        let kind = self
+            .kind
+            .clone()
+            .ok_or_else(|| invalid("kind is mandatory"))?;
+        let event = Event {
+            v: VERSION,
+            id: "0".repeat(64),
+            author: hex::encode(author.verifying_key().as_bytes()),
+            ts: MAX_SAFE_INTEGER,
+            net: self.net.clone(),
+            thread: self.thread.clone(),
+            parent: self.parent.clone(),
+            refs: self.refs.clone(),
+            kind,
+            tags: self.tags.clone(),
+            text: self.text.clone(),
+            data: self.data.clone(),
+            blobs: self.blobs.clone(),
+            pow: "9".repeat(20),
+            sig: "0".repeat(128),
+            grease: self.grease.clone(),
+        };
+        event.canonical_size()
     }
 }
 
@@ -531,8 +587,10 @@ impl Event {
     /// Parse a v1 event from untrusted bytes (strict profile) and fully
     /// verify it.
     pub fn from_json(bytes: &[u8]) -> Result<Event, EventError> {
-        if bytes.len() > MAX_EVENT_BYTES {
-            return Err(invalid(format!("event exceeds {MAX_EVENT_BYTES} bytes")));
+        if bytes.len() > MAX_RAW_EVENT_BYTES {
+            return Err(invalid(format!(
+                "event input exceeds {MAX_RAW_EVENT_BYTES} bytes"
+            )));
         }
         match wire::AnyEvent::from_bytes(bytes)? {
             wire::AnyEvent::Known(event) => Ok(event),
@@ -578,7 +636,20 @@ impl Event {
         if self.v != VERSION {
             return Err(EventError::UnsupportedVersion(self.v.into()));
         }
-        validate_content(&self.draft(), &self.kind, &self.author)
+        validate_content(&self.draft(), &self.kind, &self.author)?;
+        let size = self.canonical_size()?;
+        if size > MAX_EVENT_BYTES {
+            return Err(invalid(format!(
+                "event is {size} bytes canonicalized, above {MAX_EVENT_BYTES}"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Length of JCS(whole wire object): the size used by the validity cap
+    /// and by proof-of-work policy.
+    pub fn canonical_size(&self) -> Result<usize, EventError> {
+        Ok(jcs(&self.wire_map()?)?.len())
     }
 
     /// Check the invariant core, the v1 rules, the id and the signature.
@@ -885,6 +956,64 @@ mod tests {
             ..draft()
         })
         .unwrap();
+    }
+
+    #[test]
+    fn pow_grows_with_size() {
+        assert_eq!(required_pow_bits(12, 100), 12);
+        assert_eq!(required_pow_bits(12, 4096), 12);
+        assert_eq!(required_pow_bits(12, 4097), 13);
+        assert_eq!(required_pow_bits(12, 8192), 13);
+        assert_eq!(required_pow_bits(12, 8193), 14);
+        assert_eq!(required_pow_bits(12, MAX_EVENT_BYTES), 16);
+    }
+
+    #[test]
+    fn size_caps() {
+        // 32 tags is valid, 33 is not.
+        let tags = |n: usize| (0..n).map(|i| format!("t{i}")).collect::<Vec<_>>();
+        assert!(
+            Draft {
+                tags: tags(32),
+                ..draft()
+            }
+            .sign(&key(1), 1, 0)
+            .is_ok()
+        );
+        assert!(
+            Draft {
+                tags: tags(33),
+                ..draft()
+            }
+            .sign(&key(1), 1, 0)
+            .is_err()
+        );
+        // Each field within its cap, but the total above 48 KiB.
+        let big = Draft {
+            text: "x".repeat(MAX_TEXT_BYTES),
+            data: obj(json!({"blob": "y".repeat(MAX_DATA_BYTES - 20)})),
+            refs: (0..256u32).map(|i| format!("{i:064x}")).collect(),
+            tags: tags(32),
+            blobs: (0..8u8)
+                .map(|i| BlobRef {
+                    hash: format!("{i:02x}").repeat(32),
+                    name: format!("part-{i}.bin"),
+                    size: 1,
+                    url: Some(format!("https://example.com/{}", "u".repeat(1000))),
+                })
+                .collect(),
+            ..draft()
+        };
+        let err = big.clone().sign(&key(1), 1, 0).unwrap_err().to_string();
+        assert!(err.contains("canonicalized"), "{err}");
+        // The estimate bounds the real size.
+        let small = draft();
+        let estimate = small.estimated_size(&key(1)).unwrap();
+        let real = small.sign(&key(1), 1, 0).unwrap().canonical_size().unwrap();
+        assert!(
+            estimate >= real && estimate < real + 64,
+            "{estimate} vs {real}"
+        );
     }
 
     #[test]

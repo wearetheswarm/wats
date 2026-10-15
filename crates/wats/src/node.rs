@@ -512,7 +512,9 @@ impl Node {
         };
         draft.blobs.extend(self.import(attachments).await?);
         let key = key.clone();
-        let pow_bits = self.config.pow_bits;
+        // Mine what receivers will require for this size.
+        let pow_bits =
+            crate::event::required_pow_bits(self.config.pow_bits, draft.estimated_size(&key)?);
         let ts = now_secs();
         let event = tokio::task::spawn_blocking(move || draft.sign(&key, ts, pow_bits)).await??;
         self.store.insert(&event, ts)?;
@@ -811,8 +813,20 @@ impl Node {
         if !self.senders.contains_key(event.net()) {
             bail!("not a member of network {:?}", event.net());
         }
-        if event.pow_bits() < self.config.min_pow_bits {
-            bail!("insufficient proof of work");
+        // Proof of work grows with size (ADR 0010, limits): node policy.
+        let size = match &event {
+            AnyEvent::Known(e) => e.canonical_size()?,
+            AnyEvent::Opaque(r) => serde_json_canonicalizer::to_vec(&r.wire)?.len(),
+        };
+        if size > crate::event::MAX_EVENT_BYTES {
+            bail!("event is {size} bytes canonicalized, above the relay limit");
+        }
+        let required = crate::event::required_pow_bits(self.config.min_pow_bits, size);
+        if event.pow_bits() < required {
+            bail!(
+                "insufficient proof of work: {} bits for {size} bytes, {required} required",
+                event.pow_bits()
+            );
         }
         if event.ts() > now_secs() + MAX_CLOCK_SKEW_SECS {
             bail!("event timestamp is in the future");
