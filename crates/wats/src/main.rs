@@ -274,6 +274,15 @@ enum AgentAction {
 
 #[derive(Debug, Subcommand)]
 enum SetupTool {
+    /// OpenAI Codex CLI: register wats as its MCP server (`codex mcp add
+    /// wats -- <this wats> mcp --profile <profile>`), unless it already has
+    /// the same entry. The profile is --profile, else config.toml's, else
+    /// your OS user name. (A Codex agent runner comes later.)
+    Codex {
+        /// The Codex CLI.
+        #[arg(long, env = "WATS_CODEX", default_value = "codex")]
+        codex: PathBuf,
+    },
     /// Claude Code. With neither --mcp nor --agent, does both.
     Claude {
         /// Register wats as an MCP server in Claude Code: `claude mcp add
@@ -411,6 +420,51 @@ fn register_in_claude(
         .with_context(|| format!("run {}", claude.display()))?;
     anyhow::ensure!(status.success(), "`claude mcp add` failed ({status})");
     Ok(true)
+}
+
+/// Register wats as the `wats` MCP server of the Codex CLI, idempotently:
+/// nothing happens when `codex mcp get wats` shows the same command.
+/// Returns whether it changed something.
+fn register_in_codex(args: &NodeArgs, profile: &str, codex: &std::path::Path) -> Result<bool> {
+    let (command, server_args) = mcp_server_command(args, profile)?;
+    let current = std::process::Command::new(codex)
+        .args(["mcp", "get", "wats", "--json"])
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .with_context(|| format!("run {}", codex.display()))?;
+    if current.status.success()
+        && let Ok(entry) = serde_json::from_slice::<serde_json::Value>(&current.stdout)
+        && entry["transport"]["command"] == command.as_str()
+        && entry["transport"]["args"] == json!(server_args)
+    {
+        return Ok(false);
+    }
+    // `codex mcp add` replaces an entry of the same name.
+    let status = std::process::Command::new(codex)
+        .args(["mcp", "add", "wats", "--", &command])
+        .args(&server_args)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .status()
+        .with_context(|| format!("run {}", codex.display()))?;
+    anyhow::ensure!(status.success(), "`codex mcp add` failed ({status})");
+    Ok(true)
+}
+
+/// `wats setup codex`.
+fn setup_codex(args: &NodeArgs, data_dir: &std::path::Path, codex: &std::path::Path) -> Result<()> {
+    let profile = human_profile(args, &Settings::load(data_dir)?)?;
+    let changed = register_in_codex(args, &profile, codex)?;
+    println!(
+        "Codex: wats MCP server {} (profile {profile})",
+        if changed {
+            "registered"
+        } else {
+            "already registered"
+        }
+    );
+    Ok(())
 }
 
 /// `wats setup claude`.
@@ -1242,6 +1296,9 @@ async fn main() -> Result<()> {
                 &claude,
             );
         }
+        Some(Command::Setup {
+            tool: SetupTool::Codex { codex },
+        }) => return setup_codex(&cli.node, &data_dir, &codex),
         _ => {}
     }
     let settings = Settings::load(&data_dir)?;

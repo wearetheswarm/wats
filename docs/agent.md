@@ -45,6 +45,7 @@ wats                         # from now on: the node with its agent
 | `wats [--agent claude]` | The daemon: node, `mcp.sock` for `wats mcp` sessions, and the agent runner when enabled. Prints a banner. |
 | `wats node` | The same daemon, which also prints JSON lines on stdout (scripts). |
 | `wats setup claude [--mcp] [--agent] [--scope user\|project]` | Persistent setup, see above. |
+| `wats setup codex` | Registers wats as an MCP server of the Codex CLI ([codex.md](codex.md)). |
 | `wats config get\|set\|unset\|list` | `<data dir>/config.toml`. |
 | `wats mcp` | The stdio entry point MCP hosts run; it relays to the daemon of its data directory. |
 | `wats agent logs [-f] [--run ID]`, `runs`, `attach` | Watch what the agent does. |
