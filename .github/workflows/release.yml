@@ -6,7 +6,7 @@ name: release
 #
 #   release vX.Y.Z  ->  ghcr.io/wearetheswarm/wats:X.Y.Z and :sha-<short>
 #
-# No `latest` tag: deployments pin a version (deploy/k8s/kustomization.yaml).
+# No `latest` tag: deployments pin a version (WATS_VERSION in the router .env).
 # linux/amd64 only (the OVH nodes). arm64 is a later option, on a native
 # arm64 runner rather than under QEMU, which would be slow and costly.
 on:
@@ -93,5 +93,5 @@ jobs:
             echo ""
             echo "Digest: \`${DIGEST}\`"
             echo ""
-            echo "Pin it in deploy/k8s/kustomization.yaml (images: newTag: ${VERSION}, digest: ${DIGEST})."
+            echo "Deploy it by setting WATS_VERSION=${VERSION} in the router .env (docs/deploy-bootstrap.md)."
           } >> "$GITHUB_STEP_SUMMARY"

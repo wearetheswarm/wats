@@ -1,0 +1,51 @@
+# The public bootstrap node ("router") on a VM: the production deployment
+# (ADR 0008). Runbook: docs/deploy-bootstrap.md.
+#
+#   cd deploy/compose
+#   cp router.env.example .env      # set WATS_VERSION (and quotas if needed)
+#   docker login ghcr.io            # classic PAT with read:packages only
+#   docker compose -f compose.router.yaml up -d
+#
+# Host networking: the node binds UDP 7842 directly on the VM's public IPv4
+# and IPv6 addresses, with no Docker NAT in between. That is what QUIC hole
+# punching and the AAAA record need.
+
+name: wats-router
+
+services:
+  router:
+    image: "ghcr.io/wearetheswarm/wats:${WATS_VERSION:?set WATS_VERSION in .env, e.g. 0.1.0}"
+    command: ["node", "--quiet"]
+    restart: unless-stopped
+    network_mode: host
+    environment:
+      WATS_DIR: /data/wats
+      WATS_SECRET_FILE: /etc/wats/secret.key
+      WATS_PORT: "7842"
+      # Disk guard until Phase 2 quotas: the router is a frequent replica.
+      WATS_BLOB_QUOTA: "${WATS_BLOB_QUOTA:-20G}"
+      WATS_MAX_BLOB_SIZE: "${WATS_MAX_BLOB_SIZE:-256M}"
+      RUST_LOG: "${RUST_LOG:-wats=info,iroh=warn}"
+    volumes:
+      - router-data:/data
+      # Created from the password-manager copy, owned by uid 65532, mode 0400.
+      - "${WATS_ROUTER_KEY:-/etc/wats/secret.key}:/etc/wats/secret.key:ro"
+    read_only: true
+    tmpfs: ["/tmp"]
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    user: "65532:65532"
+    stop_grace_period: 30s
+    deploy:
+      resources:
+        limits:
+          cpus: "1.5"
+          memory: 1G
+    logging:
+      driver: json-file
+      options:
+        max-size: 20m
+        max-file: "5"
+
+volumes:
+  router-data:

@@ -71,7 +71,7 @@ pub struct NodeConfig {
     /// Public addresses to advertise, e.g. a load balancer's.
     pub external_addrs: Vec<std::net::SocketAddr>,
     /// Read the root secret from this file (which must exist) instead of
-    /// `<data dir>/secret.key`, e.g. a Kubernetes Secret.
+    /// `<data dir>/secret.key`, e.g. a key file mounted into a container.
     pub secret_file: Option<PathBuf>,
     /// Author profile used for posts (SPEC §2.2).
     pub profile: String,
@@ -81,6 +81,10 @@ pub struct NodeConfig {
     pub min_pow_bits: u32,
     /// Largest blob this node publishes or fetches, in bytes.
     pub max_blob_bytes: u64,
+    /// Disk budget for blobs fetched from others (replicas and reads), in
+    /// bytes. A crude stand-in for the Phase 2 "give" quota: when the blob
+    /// store is over it, the node refuses to fetch more. Unlimited if unset.
+    pub blob_quota: Option<u64>,
     /// Replication factor k for blobs: how many peers are asked to hold a
     /// blob at publish time (SPEC §2.5, §7).
     pub replication: usize,
@@ -97,6 +101,7 @@ impl NodeConfig {
             pow_bits: 12,
             min_pow_bits: 12,
             max_blob_bytes: 256 * 1024 * 1024,
+            blob_quota: None,
             replication: 3,
             bootstrap: Vec::new(),
             port: None,
@@ -137,6 +142,21 @@ pub fn is_valid_profile(name: &str) -> bool {
             .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_' || b == b'-')
 }
 
+/// Total size of the regular files under `dir`.
+fn dir_size(dir: &Path) -> u64 {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+    entries
+        .flatten()
+        .map(|entry| match entry.file_type() {
+            Ok(t) if t.is_dir() => dir_size(&entry.path()),
+            Ok(t) if t.is_file() => entry.metadata().map(|m| m.len()).unwrap_or(0),
+            _ => 0,
+        })
+        .sum()
+}
+
 pub fn now_secs() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -167,6 +187,8 @@ pub struct Node {
     hints: std::sync::Mutex<HashMap<String, Vec<EndpointId>>>,
     /// What peers said in `hello`.
     peer_info: std::sync::Mutex<HashMap<EndpointId, NodeInfo>>,
+    /// Cached blob store size: (when measured, bytes).
+    usage: std::sync::Mutex<Option<(std::time::Instant, u64)>>,
     /// Exclusive lock on the data directory, released by `shutdown`.
     lock: std::sync::Mutex<Option<std::fs::File>>,
 }
@@ -222,9 +244,14 @@ impl Node {
                 if port == 0 {
                     builder
                 } else {
-                    // Replaces the default IPv4 socket only; IPv6 stays on a
-                    // random port and may fail to bind.
-                    builder.bind_addr((std::net::Ipv4Addr::UNSPECIFIED, port))?
+                    // Same port on IPv4 (required) and IPv6 (best effort:
+                    // hosts without IPv6 still start).
+                    builder
+                        .bind_addr((std::net::Ipv4Addr::UNSPECIFIED, port))?
+                        .bind_addr_with_opts(
+                            (std::net::Ipv6Addr::UNSPECIFIED, port),
+                            iroh::endpoint::BindOpts::default().set_is_required(false),
+                        )?
                 }
             }
             NetworkMode::Loopback => Endpoint::builder(presets::Minimal)
@@ -294,6 +321,7 @@ impl Node {
             peers: std::sync::Mutex::new(bootstrap.iter().map(|id| (*id, now_secs())).collect()),
             hints: Default::default(),
             peer_info: Default::default(),
+            usage: Default::default(),
             lock: std::sync::Mutex::new(Some(lock)),
         });
         protocol.set_node(&node);
@@ -521,6 +549,24 @@ impl Node {
             }
         }
         confirmed
+    }
+
+    /// Bytes used by the blob store on disk, recomputed at most every 30 s.
+    pub async fn blob_usage(&self) -> u64 {
+        if let Ok(cache) = self.usage.lock()
+            && let Some((at, bytes)) = *cache
+            && at.elapsed() < Duration::from_secs(30)
+        {
+            return bytes;
+        }
+        let dir = self.config.data_dir.join("blobs");
+        let bytes = tokio::task::spawn_blocking(move || dir_size(&dir))
+            .await
+            .unwrap_or(0);
+        if let Ok(mut cache) = self.usage.lock() {
+            *cache = Some((std::time::Instant::now(), bytes));
+        }
+        bytes
     }
 
     /// Blobs fetched from other nodes from now on.
@@ -939,6 +985,16 @@ impl Node {
         let Ok(hash) = blob.hash.parse::<Hash>() else {
             return false;
         };
+        if let Some(quota) = self.config.blob_quota {
+            let used = self.blob_usage().await;
+            if used.saturating_add(blob.size) > quota {
+                warn!(
+                    hash = %blob.hash,
+                    used, quota, "blob quota reached, not fetching (raise --blob-quota)"
+                );
+                return false;
+            }
+        }
         let result = async {
             self.downloader.download(hash, providers).await?;
             self.pin(hash).await?;
