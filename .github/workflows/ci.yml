@@ -1,11 +1,26 @@
 name: ci
 
+# Budget mode while the repo is private (GitHub Free: 2,000 min/month,
+# macOS billed 10x): pull requests run Linux only; pushes to main and
+# manual runs add macOS; docs-only pushes to main are skipped.
+# Restore macOS on pull requests once the repo is public.
 on:
   push:
+    branches: [main]
+    paths-ignore:
+      - "**.md"
+      - "brand/**"
+      - "DCO"
+      - "LICENSE"
   pull_request:
+  workflow_dispatch:
 
 permissions:
   contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
 
 env:
   CARGO_TERM_COLOR: always
@@ -16,8 +31,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        os: ${{ fromJSON(github.event_name == 'pull_request' && '["ubuntu-latest"]' || '["ubuntu-latest", "macos-latest"]') }}
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - name: Install toolchain (from rust-toolchain.toml)

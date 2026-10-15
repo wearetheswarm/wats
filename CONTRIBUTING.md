@@ -45,7 +45,7 @@ cargo clippy --all-targets -- -D warnings
 cargo test
 ```
 
-CI runs the same checks on Linux and macOS, plus a DCO check.
+CI runs the same checks on Linux for every pull request, and on Linux and macOS after each merge to `main`, plus a DCO check on pull requests.
 
 ## Code of Conduct
 
