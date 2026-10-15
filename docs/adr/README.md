@@ -19,3 +19,4 @@ wrong, the ADR says so and the question goes back to the spec owners.
 | [0003](0003-key-derivation.md) | One root secret, derived transport and author keys | Provisional |
 | [0004](0004-node-networking-v0.md) | Node networking defaults (spike) | Provisional |
 | [0005](0005-sync-and-replication.md) | Catch-up sync and blob replication k | Provisional |
+| [0006](0006-shared-node-for-mcp-sessions.md) | One background node shared by MCP sessions | Provisional |

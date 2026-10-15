@@ -12,6 +12,7 @@ use rmcp::ServiceExt;
 use serde_json::json;
 use tracing_subscriber::EnvFilter;
 
+use wats::attach;
 use wats::event::{Draft, Kind};
 use wats::mcp::{WatsMcp, default_file_roots};
 use wats::node::{Attachment, NetworkMode, Node, NodeConfig};
@@ -73,9 +74,25 @@ enum Command {
         /// Files to attach to the post (repeatable).
         #[arg(long = "blob")]
         blobs: Vec<PathBuf>,
+        /// Print nothing on stdout (background use).
+        #[arg(long)]
+        quiet: bool,
+        /// Exit after this many seconds without attached MCP sessions.
+        #[arg(long)]
+        idle_exit: Option<u64>,
     },
-    /// Run a node with an MCP server on stdio (for Claude Code and other hosts).
-    Mcp,
+    /// MCP server on stdio (for Claude Code and other hosts). Sessions share
+    /// one node per data directory, started in the background if needed.
+    Mcp {
+        /// Seconds a background node started by `wats mcp` keeps running
+        /// after its last session ends.
+        #[arg(long, default_value_t = 600)]
+        idle_exit: u64,
+        /// Run the node inside this process instead of sharing a background
+        /// node (one session per data directory).
+        #[arg(long)]
+        in_process: bool,
+    },
 }
 
 fn default_dir() -> Result<PathBuf> {
@@ -121,19 +138,108 @@ impl NodeArgs {
     }
 }
 
+impl NodeArgs {
+    /// Arguments that recreate this network configuration in a child process.
+    fn to_args(&self, dir: &std::path::Path) -> Vec<std::ffi::OsString> {
+        let mut args: Vec<std::ffi::OsString> = vec!["--dir".into(), dir.into()];
+        if self.loopback {
+            args.push("--loopback".into());
+        }
+        for net in &self.nets {
+            args.push(format!("--net={net}").into());
+        }
+        for peer in &self.peers {
+            args.push(format!("--peer={peer}").into());
+        }
+        if let Some(bits) = self.pow_bits {
+            args.push(format!("--pow-bits={bits}").into());
+        }
+        if let Some(bits) = self.min_pow_bits {
+            args.push(format!("--min-pow-bits={bits}").into());
+        }
+        args
+    }
+}
+
+/// Start `wats node` for `dir` as a detached background process, logging
+/// to `<dir>/node.log`.
+#[cfg(unix)]
+fn spawn_background_node(args: &NodeArgs, dir: &std::path::Path, idle_exit: u64) -> Result<()> {
+    use std::os::unix::process::CommandExt;
+    std::fs::create_dir_all(dir)?;
+    let log = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(dir.join("node.log"))?;
+    let child = std::process::Command::new(std::env::current_exe()?)
+        .args(args.to_args(dir))
+        .args(["node", "--quiet", "--idle-exit", &idle_exit.to_string()])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(log)
+        // Own process group: the node survives the session that started it.
+        .process_group(0)
+        .spawn()
+        .context("start background node")?;
+    tracing::info!(pid = child.id(), "started background node");
+    // Not waited for on purpose: it outlives this process.
+    drop(child);
+    Ok(())
+}
+
+/// Serve this session through the node that owns `dir`, starting one in
+/// the background if none runs.
+#[cfg(unix)]
+async fn mcp_attached(args: &NodeArgs, dir: &std::path::Path, idle_exit: u64) -> Result<()> {
+    let attach = || attach::attach(dir, args.profile.clone(), default_file_roots());
+    if attach().await? {
+        return Ok(());
+    }
+    spawn_background_node(args, dir, idle_exit)?;
+    for _ in 0..150 {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        if attach().await? {
+            return Ok(());
+        }
+    }
+    anyhow::bail!(
+        "the background node did not start; see {}",
+        dir.join("node.log").display()
+    )
+}
+
 fn print_line(value: serde_json::Value) {
     println!("{value}");
 }
 
-async fn run_node(
-    node: Arc<Node>,
+struct NodeRun {
     post: Option<String>,
     kind: String,
     tags: Vec<String>,
     blobs: Vec<PathBuf>,
-) -> Result<()> {
+    quiet: bool,
+    idle_exit: Option<u64>,
+}
+
+async fn run_node(node: Arc<Node>, run: NodeRun) -> Result<()> {
+    let NodeRun {
+        post,
+        kind,
+        tags,
+        blobs,
+        quiet,
+        idle_exit,
+    } = run;
+    let print_line = move |value: serde_json::Value| {
+        if !quiet {
+            print_line(value);
+        }
+    };
+    let sessions = attach::serve(Arc::clone(&node))?;
     let mut events = node.store().subscribe();
     let mut fetched = node.subscribe_fetched();
+    let mut idle_since = tokio::time::Instant::now();
+    let mut tick = tokio::time::interval(Duration::from_secs(1));
     print_line(json!({
         "type": "ready",
         "endpoint": node.endpoint_id().to_string(),
@@ -164,7 +270,7 @@ async fn run_node(
             };
             match result.await {
                 Ok(event) => print_line(json!({"type": "published", "id": event.id})),
-                Err(e) => print_line(json!({"type": "error", "message": format!("{e:#}")})),
+                Err(e) => tracing::warn!("post failed: {e:#}"),
             }
         });
     }
@@ -181,19 +287,37 @@ async fn run_node(
             blob = fetched.recv() => if let Ok(blob) = blob {
                 print_line(json!({"type": "blob", "hash": blob.hash, "name": blob.name, "size": blob.size}));
             },
+            _ = tick.tick() => if let Some(idle) = idle_exit {
+                if sessions.active() > 0 {
+                    idle_since = tokio::time::Instant::now();
+                } else if idle_since.elapsed() >= Duration::from_secs(idle) {
+                    tracing::info!("no MCP session for {idle} s, exiting");
+                    break;
+                }
+            },
             _ = tokio::signal::ctrl_c() => break,
         }
     }
+    let _ = std::fs::remove_file(attach::socket_path(&node.config().data_dir));
     node.shutdown().await
 }
 
 async fn run_mcp(node: Arc<Node>) -> Result<()> {
+    let sessions = attach::serve(Arc::clone(&node))?;
     let server = WatsMcp::new(Arc::clone(&node), default_file_roots());
     let service = server.serve(rmcp::transport::stdio()).await?;
     tokio::select! {
         result = service.waiting() => { result?; }
         _ = tokio::signal::ctrl_c() => {}
     }
+    // Other sessions attached to this node: keep serving them.
+    while sessions.active() > 0 {
+        tokio::select! {
+            _ = tokio::time::sleep(Duration::from_millis(500)) => {}
+            _ = tokio::signal::ctrl_c() => break,
+        }
+    }
+    let _ = std::fs::remove_file(attach::socket_path(&node.config().data_dir));
     node.shutdown().await
 }
 
@@ -209,14 +333,32 @@ async fn main() -> Result<()> {
         .init();
 
     let cli = Cli::parse();
-    let node = Node::start(cli.node.config()?).await?;
+    let config = cli.node.config()?;
     match cli.command {
         Command::Node {
             post,
             kind,
             tags,
             blobs,
-        } => run_node(node, post, kind, tags, blobs).await,
-        Command::Mcp => run_mcp(node).await,
+            quiet,
+            idle_exit,
+        } => {
+            let node = Node::start(config).await?;
+            let run = NodeRun {
+                post,
+                kind,
+                tags,
+                blobs,
+                quiet,
+                idle_exit,
+            };
+            run_node(node, run).await
+        }
+        #[cfg(unix)]
+        Command::Mcp {
+            idle_exit,
+            in_process: false,
+        } => mcp_attached(&cli.node, &config.data_dir, idle_exit).await,
+        Command::Mcp { .. } => run_mcp(Node::start(config).await?).await,
     }
 }

@@ -157,6 +157,12 @@ impl std::fmt::Debug for Node {
 
 fn lock_data_dir(dir: &Path) -> Result<std::fs::File> {
     std::fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
+    #[cfg(unix)]
+    {
+        // The data directory holds the node secret: owner-only.
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
+    }
     let path = dir.join("lock");
     let file = std::fs::OpenOptions::new()
         .create(true)

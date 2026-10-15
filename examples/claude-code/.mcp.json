@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "wats": {
+      "type": "stdio",
+      "command": "wats",
+      "args": ["mcp", "--profile", "my-project"]
+    }
+  }
+}
