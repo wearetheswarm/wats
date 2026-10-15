@@ -312,6 +312,17 @@ fn invalid_vectors() -> Value {
             })),
             reject("refs-missing-v1", "v1: refs is always present", modified(&|w| { w.remove("refs"); })),
             reject("rotate-without-new-key", "v1: rotate requires data.new_key", modified(&|w| { w.insert("kind".into(), json!("rotate")); })),
+            reject("tags-too-many", "v1 validity cap: at most 32 tags", modified(&|w| {
+                w.insert("tags".into(), json!((0..33).map(|i| format!("t{i}")).collect::<Vec<_>>()));
+            })),
+            reject("event-too-large", "v1 validity cap: 48 KiB canonical size (each field within its own cap)", modified(&|w| {
+                w.insert("text".into(), json!("x".repeat(16 * 1024)));
+                w.insert("refs".into(), json!((0..256u32).map(|i| format!("{i:064x}")).collect::<Vec<_>>()));
+                w.insert("blobs".into(), json!((0..16u8).map(|i| json!({
+                    "hash": format!("{i:02x}").repeat(32), "name": format!("part-{i}"), "size": 1,
+                    "url": format!("https://example.com/{}", "u".repeat(1000)),
+                })).collect::<Vec<_>>()));
+            })),
             reject("uppercase-hex", "core: hex is lowercase", raw_base.replacen(&base["author"].as_str().unwrap()[..2], &base["author"].as_str().unwrap()[..2].to_uppercase(), 1)),
         ],
     })

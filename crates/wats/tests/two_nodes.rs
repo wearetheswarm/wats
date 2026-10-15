@@ -89,3 +89,59 @@ async fn data_dir_is_locked() -> anyhow::Result<()> {
     a.shutdown().await?;
     Ok(())
 }
+
+/// Proof of work grows with size (ADR 0010): the publisher mines what
+/// receivers require, and an under-mined large event is refused.
+#[tokio::test(flavor = "multi_thread")]
+async fn proof_of_work_scales_with_size() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let mut cfg = config(&dir.path().join("n"));
+    cfg.pow_bits = 4;
+    cfg.min_pow_bits = 4;
+    let node = Node::start(cfg).await?;
+    let text = "x".repeat(10_000);
+    let event = node
+        .publish(
+            Draft {
+                net: PUBLIC_NET.into(),
+                kind: Some(Kind::Note),
+                text: text.clone(),
+                ..Draft::default()
+            },
+            &[],
+        )
+        .await?;
+    let size = event.canonical_size()?;
+    assert!(event.pow_bits() >= wats::event::required_pow_bits(4, size));
+    assert!(wats::event::required_pow_bits(4, size) > 4);
+
+    // Signed elsewhere with only the base difficulty: refused.
+    let key = ed25519_dalek::SigningKey::from_bytes(&[3; 32]);
+    let mut weak = wats::wire::sign_value(
+        serde_json::json!({"v": 1, "ts": wats::node::now_secs(), "net": PUBLIC_NET, "thread": null,
+                           "parent": null, "refs": [], "kind": "note"})
+        .as_object()
+        .unwrap()
+        .clone(),
+        serde_json::json!({"text": text, "tags": [], "data": {}, "blobs": []})
+            .as_object()
+            .unwrap()
+            .clone(),
+        &key,
+        4,
+    )?;
+    let bits = wats::event::leading_zero_bits(&wats::event::parse_hex::<32>(
+        weak["id"].as_str().unwrap(),
+        "id",
+    )?);
+    if bits < 6 {
+        let err = node
+            .publish_signed(weak.take())
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("insufficient proof of work"), "{err}");
+    }
+    node.shutdown().await?;
+    Ok(())
+}

@@ -15,6 +15,10 @@ use tokio::sync::broadcast;
 use serde_json::Value;
 
 use crate::event::{Event, Kind};
+
+/// How many tags of an event are indexed (search and filters): node policy,
+/// lower than the validity cap of 32 (ADR 0010, limits).
+pub const INDEXED_TAGS: usize = 16;
 use crate::wire::RawEvent;
 
 const SCHEMA_VERSION: i64 = 3;
@@ -258,13 +262,13 @@ impl Store {
                     event.parent,
                     event.kind.as_str(),
                     event.text,
-                    event.tags.join(" "),
+                    event.tags[..event.tags.len().min(INDEXED_TAGS)].join(" "),
                     String::from_utf8(event.to_json())?,
                     received_at as i64,
                 ],
             )?;
             let seq = tx.last_insert_rowid();
-            for tag in &event.tags {
+            for tag in event.tags.iter().take(INDEXED_TAGS) {
                 tx.execute(
                     "INSERT OR IGNORE INTO event_tags (seq, tag) VALUES (?, ?)",
                     params![seq, tag],
@@ -762,6 +766,31 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    #[test]
+    fn only_the_first_tags_are_indexed() {
+        let store = Store::open_in_memory().unwrap();
+        let tags: Vec<String> = (0..20).map(|i| format!("t{i}")).collect();
+        let refs: Vec<&str> = tags.iter().map(String::as_str).collect();
+        store
+            .insert(&post(1, 10, Kind::Note, &refs, "many tags"), 10)
+            .unwrap();
+        let by_tag = |t: &str| {
+            store
+                .search(
+                    None,
+                    &Filter {
+                        tags: vec![t.into()],
+                        ..Filter::default()
+                    },
+                    10,
+                )
+                .unwrap()
+                .len()
+        };
+        assert_eq!(by_tag("t15"), 1);
+        assert_eq!(by_tag("t16"), 0, "beyond INDEXED_TAGS");
     }
 
     #[test]
