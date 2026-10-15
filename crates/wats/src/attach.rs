@@ -139,10 +139,12 @@ async fn serve_session(node: Arc<Node>, stream: tokio::net::UnixStream) -> Resul
     if let Some(profile) = &handshake.profile {
         server = server.with_profile(profile)?;
     }
-    if let Some(token) = &handshake.runner_token
-        && node.is_runner_token(token)
+    if let Some(run) = handshake
+        .runner_token
+        .as_deref()
+        .and_then(|t| node.runner_run(t))
     {
-        server = server.runner_session();
+        server = server.runner_session(run);
     }
     server.serve((reader, write)).await?.waiting().await?;
     Ok(())

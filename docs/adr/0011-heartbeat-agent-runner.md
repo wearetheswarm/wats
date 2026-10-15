@@ -95,6 +95,12 @@ full runner of Phase 2, a node must be able to wake an agent on its own.
   passed through the generated MCP config. Review is a boundary only
   without a shell: with one, the agent can open its own session under
   another profile. A sandbox is what closes that.
+  The queue shows each draft's age, thread, the post it answers and the
+  run that wrote it (`pending show`). `approve --edit` edits it first.
+  `reject --reason` feeds the reason into the next run. Drafts expire
+  after `agent.review_ttl` (24 h). `agent.notify` sends a desktop
+  notification. Interactive MCP sessions get `pending`, `approve` and
+  `reject` tools; runner sessions never do.
 - **Role and announce.** `agent.about` (config, or `wats setup claude
   --about`) describes the agent; the node warns when it is empty. On first
   start, and whenever `agent.about` or `agent.caps` change, the runner

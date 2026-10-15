@@ -464,6 +464,8 @@ pub struct WatsMcp {
     profile: String,
     /// Posts wait for review (`agent.review`) instead of going out.
     held: bool,
+    /// Set when the session presented a valid agent run token.
+    runner: Option<crate::node::RunnerRun>,
     /// Directories the agent may share files from.
     file_roots: Arc<Vec<PathBuf>>,
     tool_router: ToolRouter<Self>,
@@ -509,13 +511,19 @@ impl WatsMcp {
         let author = node.default_author().clone();
         let profile = node.config().profile.clone();
         let held = node.config().review_profiles.contains(&profile);
+        let node_reviews = !node.config().review_profiles.is_empty();
         Self {
             node,
             author,
             profile,
             held,
+            runner: None,
             file_roots: Arc::new(file_roots),
-            tool_router: Self::tool_router(),
+            tool_router: if node_reviews {
+                Self::tool_router() + Self::review_router()
+            } else {
+                Self::tool_router()
+            },
         }
     }
 
@@ -533,12 +541,44 @@ impl WatsMcp {
     }
 
     /// A session started by the agent runner: with review on, its posts
-    /// are held whatever its profile.
-    pub fn runner_session(mut self) -> Self {
+    /// are held whatever its profile, and it never sees the review tools.
+    pub fn runner_session(mut self, run: crate::node::RunnerRun) -> Self {
         if !self.node.config().review_profiles.is_empty() {
             self.held = true;
         }
+        for name in REVIEW_TOOLS {
+            self.tool_router.remove_route(name);
+        }
+        self.runner = Some(run);
         self
+    }
+
+    /// Where a held draft comes from: the run, and the post it answers.
+    fn origin(&self, draft: &Draft) -> crate::review::Origin {
+        let store = self.node.store();
+        let get = |id: &Option<String>| {
+            id.as_deref()
+                .and_then(|id| store.get(id).ok().flatten())
+                .map(|s| s.event.clone())
+        };
+        let parent = get(&draft.parent);
+        let root = get(&draft.thread);
+        crate::review::Origin {
+            run: self.runner.as_ref().map(|r| r.id.clone()),
+            woke_for: self
+                .runner
+                .as_ref()
+                .map(|r| r.events.clone())
+                .unwrap_or_default(),
+            in_reply_to: parent.map(|e| {
+                json!({
+                    "id": e.id, "kind": e.kind.as_str(), "author": e.author,
+                    "title": e.title.clone().unwrap_or_else(|| title_from_text(&e.text)),
+                    "text": e.text.chars().take(2000).collect::<String>(),
+                })
+            }),
+            thread_title: root.map(|e| e.title.clone().unwrap_or_else(|| title_from_text(&e.text))),
+        }
     }
 
     pub fn node(&self) -> &Arc<Node> {
@@ -571,8 +611,16 @@ impl WatsMcp {
                 &self.profile,
                 &draft,
                 &attachments,
+                self.origin(&draft),
             )
             .map_err(|e| format!("{e:#}"))?;
+            tracing::info!(held = %held.id, kind = %held.kind, "agent post held for review: {}", held.title_line());
+            if self.node.config().review_notify {
+                crate::review::notify(&format!(
+                    "Your agent wants to post: {} (wats agent pending)",
+                    held.title_line()
+                ));
+            }
             return ok(json!({
                 "held": held.id,
                 "status": "pending review",
@@ -829,6 +877,74 @@ impl WatsMcp {
                 );
             }
         }
+    }
+}
+
+/// Review tools: for the human, in interactive sessions only.
+const REVIEW_TOOLS: [&str; 3] = ["pending", "approve", "reject"];
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct ReviewIdArgs {
+    /// Id of a held post, from `pending`.
+    pub id: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct RejectArgs {
+    /// Id of a held post, from `pending`.
+    pub id: String,
+    /// Why: the agent reads it at its next run.
+    pub reason: Option<String>,
+}
+
+#[tool_router(router = review_router)]
+impl WatsMcp {
+    /// The agent's held posts.
+    #[tool(
+        description = "For the human reviewing their own agent (agent.review): list the posts the agent wants to publish, with the post each one answers. Approve or reject them with `approve` and `reject`."
+    )]
+    async fn pending(&self) -> Result<CallToolResult, String> {
+        if self.runner.is_some() {
+            return Err("not available to the agent itself".into());
+        }
+        let held = crate::review::list(&self.node.config().data_dir);
+        ok(json!({"pending": held}))
+    }
+
+    /// Approve a held post.
+    #[tool(
+        description = "For the human reviewing their own agent: publish a held post as it is (the node signs it with the agent's profile). Only when the user asked for it."
+    )]
+    async fn approve(
+        &self,
+        Parameters(args): Parameters<ReviewIdArgs>,
+    ) -> Result<CallToolResult, String> {
+        if self.runner.is_some() {
+            return Err("not available to the agent itself".into());
+        }
+        let held = crate::review::approve(&self.node.config().data_dir, &args.id).map_err(fail)?;
+        crate::review::publish_approved(&self.node).await;
+        ok(json!({"approved": held.id}))
+    }
+
+    /// Reject a held post.
+    #[tool(
+        description = "For the human reviewing their own agent: drop a held post. The optional reason is given to the agent at its next run. Only when the user asked for it."
+    )]
+    async fn reject(
+        &self,
+        Parameters(args): Parameters<RejectArgs>,
+    ) -> Result<CallToolResult, String> {
+        if self.runner.is_some() {
+            return Err("not available to the agent itself".into());
+        }
+        let held = crate::review::reject(
+            &self.node.config().data_dir,
+            &args.id,
+            args.reason.as_deref(),
+        )
+        .map_err(fail)?;
+        ok(json!({"rejected": held.id}))
     }
 }
 

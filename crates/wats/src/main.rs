@@ -265,6 +265,71 @@ enum Command {
 }
 
 #[derive(Debug, Subcommand)]
+enum PendingCommand {
+    /// A held post in full (title, text, data, files), with the post it
+    /// answers.
+    Show { id: String },
+}
+
+/// `3m ago`, `2h ago`.
+fn age(ts: u64) -> String {
+    let secs = unix_now().saturating_sub(ts);
+    match secs {
+        s if s < 120 => format!("{s}s ago"),
+        s if s < 7200 => format!("{}m ago", s / 60),
+        s if s < 172_800 => format!("{}h ago", s / 3600),
+        s => format!("{}d ago", s / 86_400),
+    }
+}
+
+/// Edit a held draft in $VISUAL / $EDITOR: the title on the first line,
+/// a blank line, then the text.
+fn edit_held(data_dir: &std::path::Path, id: &str) -> Result<()> {
+    let held = wats::review::load(data_dir, id)?;
+    let path = std::env::temp_dir().join(format!("wats-held-{id}.md"));
+    std::fs::write(
+        &path,
+        format!(
+            "{}\n\n{}\n",
+            held.title.clone().unwrap_or_default(),
+            held.text
+        ),
+    )?;
+    let editor = std::env::var("VISUAL")
+        .or_else(|_| std::env::var("EDITOR"))
+        .unwrap_or_else(|_| "vi".into());
+    let status = std::process::Command::new("sh")
+        .arg("-c")
+        .arg(format!("{editor} \"$1\""))
+        .arg("sh")
+        .arg(&path)
+        .status()
+        .with_context(|| format!("run {editor}"))?;
+    anyhow::ensure!(status.success(), "{editor} failed ({status})");
+    let edited = std::fs::read_to_string(&path)?;
+    let _ = std::fs::remove_file(&path);
+    let (title, text) = edited.split_once("\n\n").unwrap_or(("", edited.as_str()));
+    let title = Some(title.trim().to_string()).filter(|t| !t.is_empty());
+    wats::review::edit(data_dir, id, title, text.trim().to_string())?;
+    Ok(())
+}
+
+/// Print one line per held post, for logs, attach and the banner.
+fn pending_lines(data_dir: &std::path::Path) -> Vec<String> {
+    wats::review::list(data_dir)
+        .into_iter()
+        .filter(|h| h.status == "pending")
+        .map(|h| {
+            format!(
+                "pending #{}: {}, run `wats agent pending`",
+                h.id,
+                h.title_line()
+            )
+        })
+        .collect()
+}
+
+#[derive(Debug, Subcommand)]
 enum AgentAction {
     /// Show run transcripts: what the agent said, the tools it called and
     /// what they returned (truncated).
@@ -291,12 +356,26 @@ enum AgentAction {
     /// Follow the run in progress live, then the next ones (waits for the
     /// next run when none is in progress).
     Attach,
-    /// Posts of the agent held for review (agent.review).
-    Pending,
+    /// Posts of the agent held for review (agent.review): id, age, kind,
+    /// where it goes, and what woke the agent.
+    Pending {
+        #[command(subcommand)]
+        show: Option<PendingCommand>,
+    },
     /// Publish a held post (the running node signs and sends it).
-    Approve { id: String },
+    Approve {
+        id: String,
+        /// Edit its title and text in $EDITOR first.
+        #[arg(long)]
+        edit: bool,
+    },
     /// Drop a held post.
-    Reject { id: String },
+    Reject {
+        id: String,
+        /// Why: the agent reads it at its next run.
+        #[arg(long)]
+        reason: Option<String>,
+    },
 }
 
 /// Agent keys `wats setup` can write to config.toml.
@@ -795,6 +874,11 @@ impl NodeArgs {
         if let Some(bits) = self.min_pow_bits {
             config.min_pow_bits = bits;
         }
+        if let Some(ttl) = &file.agent.review_ttl {
+            config.review_ttl = parse_duration(ttl)
+                .map_err(|e| anyhow::anyhow!("config.toml agent.review_ttl: {e}"))?;
+        }
+        config.review_notify = file.agent.notify.unwrap_or(false);
         if file.agent.review == Some(true) {
             config.review_profiles.push(
                 file.agent
@@ -995,6 +1079,10 @@ async fn run_node(node: Arc<Node>, run: NodeRun, mut shutdown: Shutdown) -> Resu
         let node = Arc::clone(&node);
         tokio::spawn(async move {
             loop {
+                for held in wats::review::expire(&node.config().data_dir, node.config().review_ttl)
+                {
+                    tracing::warn!(held = %held.id, "held post expired unreviewed: {}", held.title_line());
+                }
                 wats::review::publish_approved(&node).await;
                 tokio::time::sleep(Duration::from_secs(2)).await;
             }
@@ -1304,6 +1392,13 @@ fn print_banner(config: &NodeConfig, agent: Option<&wats::agent::AgentConfig>) {
         for warning in summary.warnings {
             eprintln!("warning: {warning}");
         }
+        let pending = pending_lines(&config.data_dir);
+        if !pending.is_empty() {
+            eprintln!("review: {} posts pending", pending.len());
+            for line in pending.iter().take(5) {
+                eprintln!("  {line}");
+            }
+        }
     }
     if let Some(agent) = agent {
         let spend = wats::budget::spend(&agent.work_dir, unix_now());
@@ -1336,6 +1431,14 @@ async fn agent_watch(data_dir: &std::path::Path, action: AgentAction) -> Result<
         color: std::io::stdout().is_terminal(),
     };
     let mut out = std::io::stdout().lock();
+    // Held posts, each announced once.
+    let mut seen = std::collections::HashSet::new();
+    let mut news = || -> Vec<String> {
+        pending_lines(data_dir)
+            .into_iter()
+            .filter(|line| seen.insert(line.clone()))
+            .collect()
+    };
     let result = match action {
         AgentAction::Runs { last, json } => {
             let all = runs::list(&work_dir);
@@ -1413,22 +1516,80 @@ async fn agent_watch(data_dir: &std::path::Path, action: AgentAction) -> Result<
                 let start = ids
                     .last()
                     .map(|id| (id.clone(), runs::transcript_len(&work_dir, id)));
-                runs::follow(&work_dir, start, style, &mut out).await
+                runs::follow(&work_dir, start, style, &mut out, &mut news).await
             } else {
-                printed
+                printed.and_then(|()| {
+                    news()
+                        .into_iter()
+                        .try_for_each(|line| writeln!(out, "{line}"))
+                })
             }
         }
-        AgentAction::Pending => {
+        AgentAction::Pending {
+            show: Some(PendingCommand::Show { id }),
+        } => {
+            let h = wats::review::load(data_dir, &id)?;
+            let mut text = format!(
+                "{} · {} as {} · {} · status {}\n",
+                h.id,
+                h.kind,
+                h.profile,
+                age(h.created),
+                h.status
+            );
+            if let Some(thread) = &h.thread_title {
+                text.push_str(&format!("thread: {thread}\n"));
+            }
+            if let Some(parent) = &h.in_reply_to {
+                text.push_str(&format!(
+                    "answers {} {} by {}: {}\n  {}\n",
+                    parent["kind"].as_str().unwrap_or("?"),
+                    parent["id"].as_str().unwrap_or("?"),
+                    parent["author"]
+                        .as_str()
+                        .map_or("?", |a| &a[..a.len().min(12)]),
+                    parent["title"].as_str().unwrap_or(""),
+                    parent["text"].as_str().unwrap_or("").replace('\n', "\n  ")
+                ));
+            }
+            if let Some(run) = &h.run {
+                text.push_str(&format!("written by run {run}\n"));
+            }
+            text.push_str(&format!(
+                "\ntitle: {}\n\n{}\n",
+                h.title.clone().unwrap_or_default(),
+                h.text
+            ));
+            if !h.data.is_empty() {
+                text.push_str(&format!(
+                    "\ndata: {}\n",
+                    serde_json::Value::Object(h.data.clone())
+                ));
+            }
+            if !h.tags.is_empty() {
+                text.push_str(&format!("tags: {}\n", h.tags.join(", ")));
+            }
+            for (path, name) in &h.files {
+                text.push_str(&format!(
+                    "file: {}{}\n",
+                    path.display(),
+                    name.as_ref()
+                        .map(|n| format!(" as {n}"))
+                        .unwrap_or_default()
+                ));
+            }
+            write!(out, "{text}")
+        }
+        AgentAction::Pending { show: None } => {
             let held = wats::review::list(data_dir);
             if held.is_empty() {
                 writeln!(out, "nothing held for review")
             } else {
                 held.iter().try_for_each(|h| {
-                    writeln!(
-                        out,
-                        "{}  {}  {} as {}{}\n  {}\n  {}",
+                    let mut lines = vec![format!(
+                        "{}  {}  {} as {}{}",
                         h.id,
-                        runs::format_time(h.created),
+                        age(h.created),
                         h.kind,
                         h.profile,
                         match h.status.as_str() {
@@ -1440,16 +1601,29 @@ async fn agent_watch(data_dir: &std::path::Path, action: AgentAction) -> Result<
                                     .map(|e| format!(": {e}"))
                                     .unwrap_or_default()
                             ),
-                        },
-                        h.title
-                            .clone()
-                            .unwrap_or_else(|| wats::event::title_from_text(&h.text)),
-                        h.text.lines().next().unwrap_or("")
-                    )
-                })
+                        }
+                    )];
+                    lines.push(format!("  draft: {}", h.title_line()));
+                    if let Some(thread) = &h.thread_title {
+                        lines.push(format!("  in: {thread}"));
+                    }
+                    if !h.woke_for.is_empty() {
+                        let ids: Vec<&str> =
+                            h.woke_for.iter().map(|e| &e[..e.len().min(12)]).collect();
+                        lines.push(format!("  woke for: {}", ids.join(", ")));
+                    }
+                    writeln!(out, "{}", lines.join("\n"))
+                })?;
+                writeln!(
+                    out,
+                    "\nwats agent pending show <id> · approve [--edit] <id> · reject <id> [--reason …]"
+                )
             }
         }
-        AgentAction::Approve { id } => {
+        AgentAction::Approve { id, edit } => {
+            if edit {
+                edit_held(data_dir, &id)?;
+            }
             let held = wats::review::approve(data_dir, &id)?;
             writeln!(
                 out,
@@ -1457,12 +1631,19 @@ async fn agent_watch(data_dir: &std::path::Path, action: AgentAction) -> Result<
                 held.id, held.kind, held.profile
             )
         }
-        AgentAction::Reject { id } => {
-            let held = wats::review::reject(data_dir, &id)?;
+        AgentAction::Reject { id, reason } => {
+            let held = wats::review::reject(data_dir, &id, reason.as_deref())?;
             writeln!(
                 out,
-                "rejected {} ({} as {})",
-                held.id, held.kind, held.profile
+                "rejected {} ({} as {}){}",
+                held.id,
+                held.kind,
+                held.profile,
+                if reason.is_some() {
+                    "; the agent reads the reason at its next run"
+                } else {
+                    ""
+                }
             )
         }
         AgentAction::Attach => {
@@ -1470,7 +1651,7 @@ async fn agent_watch(data_dir: &std::path::Path, action: AgentAction) -> Result<
             if start.is_none() {
                 eprintln!("no run in progress; waiting for the next one (Ctrl-C to stop)");
             }
-            runs::follow(&work_dir, start, style, &mut out).await
+            runs::follow(&work_dir, start, style, &mut out, &mut news).await
         }
     };
     match result {

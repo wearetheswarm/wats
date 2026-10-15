@@ -44,6 +44,27 @@ pub struct Held {
     pub error: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub event_id: Option<String>,
+    /// The agent run that wrote it, and the events that woke it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub woke_for: Vec<String>,
+    /// The post it answers, as it was when the draft was held: id, kind,
+    /// author, title, text.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub in_reply_to: Option<Value>,
+    /// The title of the thread it goes into.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thread_title: Option<String>,
+}
+
+/// Where a held draft comes from: filled by the MCP layer.
+#[derive(Debug, Clone, Default)]
+pub struct Origin {
+    pub run: Option<String>,
+    pub woke_for: Vec<String>,
+    pub in_reply_to: Option<Value>,
+    pub thread_title: Option<String>,
 }
 
 pub fn pending_dir(data_dir: &Path) -> PathBuf {
@@ -70,6 +91,7 @@ pub fn hold(
     profile: &str,
     draft: &Draft,
     attachments: &[Attachment],
+    origin: Origin,
 ) -> Result<Held> {
     let mut random = [0u8; 6];
     getrandom::fill(&mut random).map_err(|e| anyhow::anyhow!("random: {e}"))?;
@@ -97,6 +119,10 @@ pub fn hold(
             .collect(),
         error: None,
         event_id: None,
+        run: origin.run,
+        woke_for: origin.woke_for,
+        in_reply_to: origin.in_reply_to,
+        thread_title: origin.thread_title,
     };
     write(&path_of(data_dir, &held.id), &held)?;
     Ok(held)
@@ -116,7 +142,7 @@ pub fn list(data_dir: &Path) -> Vec<Held> {
     all
 }
 
-fn load(data_dir: &Path, id: &str) -> Result<Held> {
+pub fn load(data_dir: &Path, id: &str) -> Result<Held> {
     let bytes = std::fs::read(path_of(data_dir, id))
         .with_context(|| format!("no held post {id:?} (see `wats agent pending`)"))?;
     Ok(serde_json::from_slice(&bytes)?)
@@ -131,16 +157,127 @@ pub fn approve(data_dir: &Path, id: &str) -> Result<Held> {
     Ok(held)
 }
 
-/// Drop a held post (kept under `pending/rejected/`).
-pub fn reject(data_dir: &Path, id: &str) -> Result<Held> {
+/// Change a held draft's title and text before approving it.
+pub fn edit(data_dir: &Path, id: &str, title: Option<String>, text: String) -> Result<Held> {
+    let mut held = load(data_dir, id)?;
+    held.title = title;
+    held.text = text;
+    held.draft()?
+        .sign(
+            &ed25519_dalek::SigningKey::from_bytes(&[1; 32]),
+            now_secs(),
+            0,
+        )
+        .context("the edited draft is not a valid post")?;
+    write(&path_of(data_dir, id), &held)?;
+    Ok(held)
+}
+
+fn feedback_path(data_dir: &Path) -> PathBuf {
+    data_dir.join("agent").join("feedback.jsonl")
+}
+
+/// Drop a held post (kept under `pending/rejected/`). The reason, if any,
+/// goes into the agent's next run.
+pub fn reject(data_dir: &Path, id: &str, reason: Option<&str>) -> Result<Held> {
     let held = load(data_dir, id)?;
+    if let Some(reason) = reason {
+        use std::io::Write;
+        let line = serde_json::json!({
+            "held": held.id, "kind": held.kind,
+            "title": held.title.clone().unwrap_or_else(|| crate::event::title_from_text(&held.text)),
+            "reason": reason,
+        });
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(feedback_path(data_dir))?;
+        writeln!(file, "{line}")?;
+    }
     let to = pending_dir(data_dir).join("rejected");
     std::fs::create_dir_all(&to)?;
     std::fs::rename(path_of(data_dir, id), to.join(format!("{id}.json")))?;
     Ok(held)
 }
 
+/// The reviewer's feedback since the last run, consumed: one line per
+/// rejected post with a reason.
+pub fn take_feedback(data_dir: &Path) -> Vec<String> {
+    let path = feedback_path(data_dir);
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        return Vec::new();
+    };
+    let _ = std::fs::remove_file(&path);
+    text.lines()
+        .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+        .map(|v| {
+            format!(
+                "- Your {} \"{}\" was rejected by your human: {}",
+                v["kind"].as_str().unwrap_or("post"),
+                v["title"].as_str().unwrap_or(""),
+                v["reason"].as_str().unwrap_or("")
+            )
+        })
+        .collect()
+}
+
+/// Move drafts older than `ttl` to `pending/expired/`; returns them.
+pub fn expire(data_dir: &Path, ttl: std::time::Duration) -> Vec<Held> {
+    let cutoff = now_secs().saturating_sub(ttl.as_secs());
+    let mut expired = Vec::new();
+    for held in list(data_dir) {
+        if held.created >= cutoff || held.status == "approved" {
+            continue;
+        }
+        let to = pending_dir(data_dir).join("expired");
+        if std::fs::create_dir_all(&to).is_ok()
+            && std::fs::rename(
+                path_of(data_dir, &held.id),
+                to.join(format!("{}.json", held.id)),
+            )
+            .is_ok()
+        {
+            expired.push(held);
+        }
+    }
+    expired
+}
+
+/// A desktop notification (macOS or Linux), best effort. The text goes as
+/// an argument, never into a script.
+pub fn notify(text: &str) {
+    let text: String = text.chars().take(200).collect();
+    let _ = if cfg!(target_os = "macos") {
+        std::process::Command::new("osascript")
+            .args([
+                "-e",
+                "on run argv",
+                "-e",
+                "display notification (item 1 of argv) with title \"wats\"",
+                "-e",
+                "end run",
+                &text,
+            ])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+    } else {
+        std::process::Command::new("notify-send")
+            .args(["wats", &text])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+    };
+}
+
 impl Held {
+    /// One line: the draft's title, or its text's first line.
+    pub fn title_line(&self) -> String {
+        self.title
+            .clone()
+            .unwrap_or_else(|| crate::event::title_from_text(&self.text))
+    }
+
     fn draft(&self) -> Result<Draft> {
         Ok(Draft {
             net: self.net.clone(),

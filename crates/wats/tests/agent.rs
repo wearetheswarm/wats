@@ -960,7 +960,7 @@ async fn review_holds_the_agents_posts() -> anyhow::Result<()> {
     let runner = client(
         wats::mcp::WatsMcp::new(Arc::clone(&a), vec![])
             .with_profile("human")?
-            .runner_session(),
+            .runner_session(wats::node::RunnerRun::default()),
     )
     .await?;
     let held = call_post(&agent, "from the agent").await;
@@ -979,7 +979,7 @@ async fn review_holds_the_agents_posts() -> anyhow::Result<()> {
             .is_empty()
     );
     wats::review::approve(&data, held["held"].as_str().unwrap())?;
-    wats::review::reject(&data, by_runner["held"].as_str().unwrap())?;
+    wats::review::reject(&data, by_runner["held"].as_str().unwrap(), None)?;
     assert_eq!(wats::review::publish_approved(&a).await, 1);
     let published = a.store().search(None, &Default::default(), 10)?;
     assert!(
@@ -1032,7 +1032,7 @@ async fn runner_token_marks_the_session_over_the_socket() -> anyhow::Result<()> 
     config.review_profiles = vec!["agent".into()];
     let node = Node::start(config).await?;
     let _sessions = wats::attach::serve(Arc::clone(&node))?;
-    let token = node.new_runner_token();
+    let token = node.new_runner_token(wats::node::RunnerRun::default());
     let session = |token: Option<&str>| {
         let mut cmd = tokio::process::Command::new(env!("CARGO_BIN_EXE_wats"));
         cmd.args(["--loopback", "--profile", "human", "--dir"])
@@ -1114,18 +1114,154 @@ fn setup_access_and_review_queue() {
         text: "held text".into(),
         ..Draft::default()
     };
-    let one = wats::review::hold(&data, "agent", &draft, &[]).unwrap();
-    let two = wats::review::hold(&data, "agent", &draft, &[]).unwrap();
+    let one = wats::review::hold(&data, "agent", &draft, &[], Default::default()).unwrap();
+    let two = wats::review::hold(&data, "agent", &draft, &[], Default::default()).unwrap();
     let pending = wats(&["agent", "pending"]);
     assert!(
         pending.contains(&one.id) && pending.contains("held title"),
         "{pending}"
     );
     assert!(wats(&["agent", "approve", &one.id]).contains("approved"));
-    assert!(wats(&["agent", "reject", &two.id]).contains("rejected"));
+    assert!(
+        wats(&["agent", "reject", &two.id, "--reason", "too vague"])
+            .contains("the agent reads the reason")
+    );
     let pending = wats(&["agent", "pending"]);
     assert!(
         pending.contains("[approved]") && !pending.contains(&two.id),
         "{pending}"
     );
+    assert_eq!(
+        wats::review::take_feedback(&data),
+        ["- Your note \"held title\" was rejected by your human: too vague"]
+    );
+    assert!(wats::review::take_feedback(&data).is_empty(), "consumed");
+
+    // show, and approve --edit through $EDITOR.
+    let three = wats::review::hold(&data, "agent", &draft, &[], Default::default()).unwrap();
+    let shown = wats(&["agent", "pending", "show", &three.id]);
+    assert!(
+        shown.contains("title: held title") && shown.contains("held text"),
+        "{shown}"
+    );
+    let editor = dir.path().join("editor.sh");
+    std::fs::write(
+        &editor,
+        "#!/bin/sh\nprintf 'Edited title\\n\\nEdited text.\\n' > \"$1\"\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&editor, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_wats"))
+        .env("EDITOR", &editor)
+        .env_remove("VISUAL")
+        .arg("--dir")
+        .arg(&data)
+        .args(["agent", "approve", "--edit", &three.id])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let edited = wats::review::load(&data, &three.id).unwrap();
+    assert_eq!(edited.title.as_deref(), Some("Edited title"));
+    assert_eq!(edited.text, "Edited text.");
+    assert_eq!(edited.status, "approved");
+
+    // Expiry.
+    let four = wats::review::hold(&data, "agent", &draft, &[], Default::default()).unwrap();
+    std::thread::sleep(Duration::from_millis(2100));
+    let expired = wats::review::expire(&data, Duration::from_secs(1));
+    assert!(expired.iter().any(|h| h.id == four.id));
+    assert!(
+        expired.iter().all(|h| h.id != three.id),
+        "approved ones stay"
+    );
+}
+
+/// MCP review tools: interactive sessions get `pending`, `approve` and
+/// `reject`; runner sessions never see them. A held draft records the run,
+/// what woke it and the post it answers.
+#[tokio::test(flavor = "multi_thread")]
+async fn review_tools_are_for_humans_only() -> anyhow::Result<()> {
+    use rmcp::ServiceExt;
+    let dir = tempfile::tempdir()?;
+    let data = dir.path().join("a");
+    let mut config = NodeConfig::new(&data);
+    config.mode = NetworkMode::Loopback;
+    config.pow_bits = 0;
+    config.min_pow_bits = 0;
+    config.review_profiles = vec!["agent".into()];
+    let a = Node::start(config).await?;
+    let ask = a.publish(ask("Convert my CSV"), &[]).await?;
+    let serve = |server: wats::mcp::WatsMcp| async move {
+        let (server_io, client_io) = tokio::io::duplex(64 * 1024);
+        tokio::spawn(async move {
+            if let Ok(running) = server.serve(server_io).await {
+                let _ = running.waiting().await;
+            }
+        });
+        ().serve(client_io).await
+    };
+    let human = serve(wats::mcp::WatsMcp::new(Arc::clone(&a), vec![])).await?;
+    let run = wats::node::RunnerRun {
+        id: "20261016T000000Z-events".into(),
+        events: vec![ask.id.clone()],
+    };
+    let agent = serve(
+        wats::mcp::WatsMcp::new(Arc::clone(&a), vec![])
+            .with_profile("agent")?
+            .runner_session(run),
+    )
+    .await?;
+    let names = |tools: Vec<rmcp::model::Tool>| -> Vec<String> {
+        tools.into_iter().map(|t| t.name.to_string()).collect()
+    };
+    let human_tools = names(human.list_all_tools().await?);
+    let agent_tools = names(agent.list_all_tools().await?);
+    for tool in ["pending", "approve", "reject"] {
+        assert!(human_tools.iter().any(|t| t == tool), "{human_tools:?}");
+        assert!(!agent_tools.iter().any(|t| t == tool), "{agent_tools:?}");
+    }
+    let reply = agent
+        .call_tool(
+            rmcp::model::CallToolRequestParams::new("reply").with_arguments(
+                serde_json::json!({"post_id": ask.id, "text": "Here is the CSV."})
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            ),
+        )
+        .await?
+        .structured_content
+        .unwrap();
+    let id = reply["held"].as_str().unwrap().to_string();
+    let held = wats::review::load(&data, &id)?;
+    assert_eq!(held.run.as_deref(), Some("20261016T000000Z-events"));
+    assert_eq!(held.woke_for, std::slice::from_ref(&ask.id));
+    assert_eq!(held.thread_title.as_deref(), Some("Convert my CSV"));
+    assert_eq!(held.in_reply_to.as_ref().unwrap()["kind"], "ask");
+
+    let listed = human
+        .call_tool(rmcp::model::CallToolRequestParams::new("pending"))
+        .await?
+        .structured_content
+        .unwrap();
+    assert_eq!(listed["pending"][0]["id"], id.as_str());
+    human
+        .call_tool(
+            rmcp::model::CallToolRequestParams::new("approve")
+                .with_arguments(serde_json::json!({"id": id}).as_object().unwrap().clone()),
+        )
+        .await?;
+    let published = a.store().search(Some("CSV"), &Default::default(), 10)?;
+    assert!(
+        published.iter().any(|s| s.event.text == "Here is the CSV."),
+        "approved from MCP and published"
+    );
+    human.cancel().await?;
+    agent.cancel().await?;
+    a.shutdown().await?;
+    Ok(())
 }
