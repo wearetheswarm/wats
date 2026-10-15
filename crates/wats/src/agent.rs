@@ -20,6 +20,7 @@ use tokio::io::AsyncWriteExt;
 use tokio::sync::broadcast::error::RecvError;
 use tracing::{debug, info, warn};
 
+use crate::budget;
 use crate::event::{Draft, Event, Kind, title_from_text};
 use crate::identity::author_id;
 use crate::node::Node;
@@ -64,6 +65,10 @@ pub struct AgentConfig {
     pub extra_args: Vec<String>,
     /// Longest run before it is killed.
     pub run_timeout: Duration,
+    /// Turns per run, passed to the agent CLI.
+    pub max_turns: u32,
+    /// Spend budget, enforced before each run.
+    pub budget: crate::budget::Budget,
     /// Where transcripts, the runs index and the generated MCP config go
     /// (`<data dir>/agent`).
     pub work_dir: PathBuf,
@@ -329,11 +334,34 @@ struct Running {
 
 /// Start one run: a transcript header, then the agent CLI with its output
 /// (stream-json) appended to the transcript.
+/// Per-run limits for the agent CLI, unless the extra arguments set them:
+/// turns, and the budget left (Claude Code's `--max-budget-usd`).
+fn limit_args(config: &AgentConfig, remaining_usd: f64) -> Vec<String> {
+    let given = |flag: &str| {
+        config
+            .extra_args
+            .iter()
+            .any(|a| a == flag || a.starts_with(&format!("{flag}=")))
+    };
+    let mut args = Vec::new();
+    if !given("--max-turns") {
+        args.extend(["--max-turns".to_string(), config.max_turns.to_string()]);
+    }
+    if !given("--max-budget-usd") {
+        args.extend([
+            "--max-budget-usd".to_string(),
+            format!("{:.2}", remaining_usd.max(0.01)),
+        ]);
+    }
+    args
+}
+
 async fn start_run(
     config: &AgentConfig,
     mcp_config: &PathBuf,
     trigger: &Trigger,
     prompt: String,
+    remaining_usd: f64,
 ) -> Result<Running> {
     let mut record = RunRecord::new(
         &config.runtime,
@@ -364,6 +392,7 @@ async fn start_run(
         .arg("--allowedTools")
         .arg("mcp__wats__*")
         .args(locked_down_args(&config.extra_args))
+        .args(limit_args(config, remaining_usd))
         .args(&config.extra_args)
         .stdin(Stdio::piped())
         .stdout(file.try_clone()?)
@@ -426,6 +455,9 @@ async fn finish_run(config: &AgentConfig, mut running: Running, outcome: Outcome
         .into();
     }
     runs::read_result(&running.transcript, &mut record);
+    if let Err(e) = crate::budget::record(&config.work_dir, record.started, record.cost_usd) {
+        warn!("agent spend ledger: {e}");
+    }
     let footer = record.footer();
     let written = std::fs::OpenOptions::new()
         .append(true)
@@ -490,6 +522,7 @@ pub async fn run(
     let mut runs: VecDeque<Instant> = VecDeque::new();
     let mut running: Option<Running> = None;
     let mut capped = false;
+    let mut paused_until: Option<u64> = None;
     let mut tick = tokio::time::interval(Duration::from_secs(1));
     tokio::pin!(shutdown);
     info!(runtime = %config.runtime, profile = %config.profile, author = %me, "agent runner started");
@@ -554,6 +587,29 @@ pub async fn run(
                     continue;
                 }
                 capped = false;
+                let unix_now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |d| d.as_secs());
+                let spend = budget::spend(&config.work_dir, unix_now);
+                let remaining_usd = match budget::check(&config.budget, &spend, unix_now) {
+                    budget::Verdict::Paused { why, until } => {
+                        if paused_until != Some(until) {
+                            warn!("agent paused, budget reached: {why}; {}", budget::until(until));
+                            paused_until = Some(until);
+                        }
+                        if let Trigger::Events(ids) = trigger {
+                            pending = ids;
+                        }
+                        last_heartbeat = now;
+                        continue;
+                    }
+                    budget::Verdict::Go { remaining_usd } => {
+                        if paused_until.take().is_some() {
+                            info!("agent budget available again: {}", budget::describe(&config.budget, &spend));
+                        }
+                        remaining_usd
+                    }
+                };
                 let text = prompt(&node, &config, since, &trigger);
                 // Everything up to now is covered by this run.
                 since = node.store().last_seq()?;
@@ -561,7 +617,7 @@ pub async fn run(
                 last_run = Some(now);
                 last_heartbeat = now;
                 info!(trigger = %trigger.label(), "waking the agent");
-                match start_run(&config, &mcp_config, &trigger, text).await {
+                match start_run(&config, &mcp_config, &trigger, text, remaining_usd).await {
                     Ok(run) => running = Some(run),
                     Err(e) => warn!(trigger = %trigger.label(), "agent run failed to start: {e:#}"),
                 }

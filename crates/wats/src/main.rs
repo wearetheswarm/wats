@@ -992,9 +992,11 @@ fn agent_config(
         extra_args,
         run_timeout: args
             .run_timeout
-            .or(file_duration(&file.run_timeout, "run_timeout")?)
+            .or(file_duration(&file.timeout, "timeout")?)
             .unwrap_or(Duration::from_secs(10 * 60)),
         work_dir: data_dir.join("agent"),
+        max_turns: file.max_turns.unwrap_or(10),
+        budget: budget_of(file),
         keep_runs: file.keep_runs.unwrap_or(200),
         keep_days: file.keep_days.unwrap_or(30),
     }))
@@ -1007,6 +1009,22 @@ fn short_duration(d: Duration) -> String {
         s if s % 60 == 0 => format!("{}m", s / 60),
         s => format!("{s}s"),
     }
+}
+
+/// The spend budget from config.toml, or the defaults.
+fn budget_of(file: &wats::settings::AgentSettings) -> wats::budget::Budget {
+    let default = wats::budget::Budget::default();
+    wats::budget::Budget {
+        max_usd_per_day: file.max_usd_per_day.unwrap_or(default.max_usd_per_day),
+        max_usd_per_month: file.max_usd_per_month.unwrap_or(default.max_usd_per_month),
+        max_runs_per_day: file.max_runs_per_day.unwrap_or(default.max_runs_per_day),
+    }
+}
+
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
 }
 
 /// What a foreground node prints on start (stderr: stdout may carry JSON).
@@ -1034,6 +1052,15 @@ fn print_banner(config: &NodeConfig, agent: Option<&wats::agent::AgentConfig>) {
             short_duration(agent.heartbeat),
         ),
         None => eprintln!("agent: off (wats --agent claude, or wats setup claude)"),
+    }
+    if let Some(agent) = agent {
+        let spend = wats::budget::spend(&agent.work_dir, unix_now());
+        eprintln!(
+            "agent budget: {} · {} turns and {} per run",
+            wats::budget::describe(&agent.budget, &spend),
+            agent.max_turns,
+            short_duration(agent.run_timeout)
+        );
     }
     eprintln!("Ctrl-C to stop · wats --help");
 }
@@ -1078,7 +1105,26 @@ async fn agent_watch(data_dir: &std::path::Path, action: AgentAction) -> Result<
                     });
                 }
                 let cost: f64 = shown.iter().filter_map(|r| r.cost_usd).sum();
-                result.and_then(|()| writeln!(out, "{} runs, ${cost:.4} reported", shown.len()))
+                // A config.toml that does not load must not hide the runs.
+                let budget = Settings::load(data_dir)
+                    .map(|s| budget_of(&s.agent))
+                    .unwrap_or_default();
+                let now = unix_now();
+                let spend = wats::budget::spend(&work_dir, now);
+                let paused = match wats::budget::check(&budget, &spend, now) {
+                    wats::budget::Verdict::Paused { why, until } => {
+                        format!("\npaused: {why}, {}", wats::budget::until(until))
+                    }
+                    wats::budget::Verdict::Go { .. } => String::new(),
+                };
+                result.and_then(|()| {
+                    writeln!(
+                        out,
+                        "{} runs shown, ${cost:.4} reported\nbudget: {}{paused}",
+                        shown.len(),
+                        wats::budget::describe(&budget, &spend)
+                    )
+                })
             }
         }
         AgentAction::Logs { follow, run, last } => {

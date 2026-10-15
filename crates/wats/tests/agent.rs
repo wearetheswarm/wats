@@ -108,6 +108,8 @@ async fn agent_wakes_on_asks_and_heartbeats() -> anyhow::Result<()> {
         mcp_args: vec!["mcp".into(), "--profile".into(), "agent".into()],
         extra_args: vec!["--model".into(), "test-model".into()],
         run_timeout: Duration::from_secs(10),
+        max_turns: 10,
+        budget: wats::budget::Budget::default(),
         work_dir: dir.path().join("work"),
         keep_runs: 2,
         keep_days: 30,
@@ -164,6 +166,10 @@ async fn agent_wakes_on_asks_and_heartbeats() -> anyhow::Result<()> {
         "{args}"
     );
     assert!(args.contains("--setting-sources project"), "{args}");
+    assert!(
+        args.contains("--max-turns 10 --max-budget-usd 2.00"),
+        "{args}"
+    );
     assert!(
         args.contains("--tools  --permission-mode dontAsk"),
         "{args}"
@@ -594,4 +600,61 @@ async fn bare_wats_runs_agents_from_config_toml() {
         .output()
         .unwrap();
     assert!(!out.status.success(), "a typo in config.toml is an error");
+}
+
+/// The spend budget: once the reported cost reaches the daily budget, the
+/// runner stops starting runs, and the remaining budget caps each run.
+#[tokio::test(flavor = "multi_thread")]
+async fn budget_pauses_the_agent() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let a = node(&dir.path().join("a"), &[]).await?;
+    let config = AgentConfig {
+        runtime: "claude".into(),
+        profile: "agent".into(),
+        user: "alice".into(),
+        about: String::new(),
+        caps: vec![],
+        every: Duration::from_secs(1),
+        heartbeat: Duration::from_secs(1),
+        max_runs_per_hour: 100,
+        allow: vec![],
+        heartbeat_text: DEFAULT_HEARTBEAT.into(),
+        command: fake_agent(dir.path()),
+        mcp_command: "/usr/bin/true".into(),
+        mcp_args: vec![],
+        extra_args: vec![],
+        run_timeout: Duration::from_secs(10),
+        max_turns: 4,
+        // Each fake run reports $0.0125: two runs exhaust it.
+        budget: wats::budget::Budget {
+            max_usd_per_day: 0.02,
+            ..Default::default()
+        },
+        work_dir: dir.path().join("work"),
+        keep_runs: 100,
+        keep_days: 30,
+    };
+    let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+    let runner = tokio::spawn(wats::agent::run(Arc::clone(&a), config, async {
+        let _ = stopped.await;
+    }));
+    eventually("two runs", || runs(dir.path()).len() >= 2).await;
+    tokio::time::sleep(Duration::from_secs(4)).await;
+    let all = runs(dir.path());
+    assert_eq!(all.len(), 2, "paused after the budget is spent");
+    assert!(
+        all[0].1.contains("--max-turns 4 --max-budget-usd 0.02"),
+        "{}",
+        all[0].1
+    );
+    assert!(all[1].1.contains("--max-budget-usd 0.01"), "{}", all[1].1);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_secs();
+    let spend = wats::budget::spend(&dir.path().join("work"), now);
+    assert!((spend.usd_today - 0.025).abs() < 1e-9, "{spend:?}");
+    let _ = stop.send(());
+    runner.await??;
+    a.shutdown().await?;
+    Ok(())
 }
