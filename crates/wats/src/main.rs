@@ -144,6 +144,17 @@ struct NodeArgs {
     /// Loopback only: no relays, no DNS (tests and local demos).
     #[arg(long, global = true)]
     loopback: bool,
+    /// For tests: loopback only, no default bootstrap, and refuse any
+    /// bootstrap or peer that is not on this machine, whatever config.toml
+    /// says. Accepts true/false, 1/0, yes/no, on/off from the environment.
+    #[arg(
+        long,
+        global = true,
+        env = "WATS_HERMETIC",
+        action = clap::ArgAction::SetTrue,
+        value_parser = clap::builder::BoolishValueParser::new()
+    )]
+    hermetic: bool,
     /// Relay and address-lookup services: wats (WeAreTheSwarm's own, the
     /// default), n0 (Iroh's public ones), wats+n0 (both) or none.
     #[arg(long, global = true, env = "WATS_INFRA")]
@@ -649,6 +660,15 @@ fn print_id(config: &NodeConfig, host: &str) -> Result<()> {
     Ok(())
 }
 
+/// `localhost`, or a loopback IP address.
+fn is_local_host(host: &str) -> bool {
+    host == "localhost"
+        || host
+            .trim_matches(|c| c == '[' || c == ']')
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback())
+}
+
 fn default_dir() -> Result<PathBuf> {
     std::env::home_dir()
         .map(|h| h.join(".wats"))
@@ -691,7 +711,7 @@ impl NodeArgs {
         let mut config = NodeConfig::new(self.data_dir()?);
         let no_default_bootstrap =
             self.no_default_bootstrap || file.no_default_bootstrap.unwrap_or(false);
-        if self.loopback {
+        if self.loopback || self.hermetic {
             config.mode = NetworkMode::Loopback;
         } else if !no_default_bootstrap {
             config.bootstrap = wats::bootstrap::defaults();
@@ -751,6 +771,24 @@ impl NodeArgs {
                 .with_context(|| format!("invalid peer ticket {peer:?}"))?;
             config.peers.push(EndpointAddr::from(ticket));
         }
+        if self.hermetic {
+            config.infra = wats::infra::Infra::None;
+            for entry in &config.bootstrap {
+                anyhow::ensure!(
+                    is_local_host(&entry.host),
+                    "--hermetic: bootstrap {} is not on this machine",
+                    entry.host
+                );
+            }
+            for peer in &config.peers {
+                anyhow::ensure!(
+                    peer.ip_addrs().all(|a| a.ip().is_loopback())
+                        && peer.relay_urls().next().is_none(),
+                    "--hermetic: peer {} is not on this machine",
+                    peer.id.fmt_short()
+                );
+            }
+        }
         if let Some(bits) = self.pow_bits {
             config.pow_bits = bits;
         }
@@ -782,6 +820,9 @@ impl NodeArgs {
         let mut args: Vec<std::ffi::OsString> = vec!["--dir".into(), dir.into()];
         if self.loopback {
             args.push("--loopback".into());
+        }
+        if self.hermetic {
+            args.push("--hermetic".into());
         }
         for net in &self.nets {
             args.push(format!("--net={net}").into());
@@ -1209,10 +1250,15 @@ fn print_banner(config: &NodeConfig, agent: Option<&wats::agent::AgentConfig>) {
         None => config.data_dir.display().to_string(),
     };
     eprintln!(
-        "wats {} · data {dir} · infra {} · profile {}",
+        "wats {} · data {dir} · infra {} · profile {}{}",
         env!("CARGO_PKG_VERSION"),
         config.infra,
-        config.profile
+        config.profile,
+        if config.mode == NetworkMode::Loopback {
+            " · LOOPBACK ONLY"
+        } else {
+            ""
+        }
     );
     let used = wats::node::dir_size(&config.data_dir);
     let max = config.storage_max.unwrap_or(u64::MAX);
