@@ -28,6 +28,7 @@ use tracing::{debug, info, warn};
 
 use crate::event::{BlobRef, Draft, Event, is_safe_blob_name};
 use crate::identity::{DEFAULT_PROFILE, RootSecret, author_id};
+use crate::proto::{self, Request, Response, WatsProtocol};
 use crate::store::{Inserted, Store};
 
 /// The public network id (ring zero, SPEC §2.4). Provisional, ADR 0004.
@@ -68,6 +69,9 @@ pub struct NodeConfig {
     pub min_pow_bits: u32,
     /// Largest blob this node publishes or fetches, in bytes.
     pub max_blob_bytes: u64,
+    /// Replication factor k for blobs: how many peers are asked to hold a
+    /// blob at publish time (SPEC §2.5, §7).
+    pub replication: usize,
 }
 
 impl NodeConfig {
@@ -81,6 +85,7 @@ impl NodeConfig {
             pow_bits: 12,
             min_pow_bits: 12,
             max_blob_bytes: 256 * 1024 * 1024,
+            replication: 3,
         }
     }
 }
@@ -134,7 +139,12 @@ pub struct Node {
     senders: HashMap<String, GossipSender>,
     neighbors: std::sync::Mutex<HashMap<String, HashSet<EndpointId>>>,
     fetched: tokio::sync::broadcast::Sender<BlobRef>,
-    _lock: std::fs::File,
+    /// Peers seen recently, with the time we last heard from them.
+    peers: std::sync::Mutex<HashMap<EndpointId, u64>>,
+    /// Blob hash -> nodes that announced they hold it (hints, unverified).
+    hints: std::sync::Mutex<HashMap<String, Vec<EndpointId>>>,
+    /// Exclusive lock on the data directory, released by `shutdown`.
+    lock: std::sync::Mutex<Option<std::fs::File>>,
 }
 
 impl std::fmt::Debug for Node {
@@ -193,9 +203,11 @@ impl Node {
             .max_message_size(GOSSIP_MAX_MESSAGE_BYTES)
             .spawn(endpoint.clone());
         let downloader = blobs.downloader(&endpoint);
+        let protocol = WatsProtocol::default();
         let router = Router::builder(endpoint)
             .accept(iroh_gossip::ALPN, gossip.clone())
             .accept(iroh_blobs::ALPN, BlobsProtocol::new(&blobs, None))
+            .accept(proto::ALPN, protocol.clone())
             .spawn();
 
         let bootstrap: Vec<EndpointId> = config.peers.iter().map(|p| p.id).collect();
@@ -223,8 +235,11 @@ impl Node {
             senders,
             neighbors: Default::default(),
             fetched: tokio::sync::broadcast::channel(256).0,
-            _lock: lock,
+            peers: std::sync::Mutex::new(bootstrap.iter().map(|id| (*id, now_secs())).collect()),
+            hints: Default::default(),
+            lock: std::sync::Mutex::new(Some(lock)),
         });
+        protocol.set_node(&node);
         for (net, receiver) in receivers {
             tokio::spawn(Arc::clone(&node).receive_loop(net, receiver));
         }
@@ -363,14 +378,18 @@ impl Node {
     }
 
     /// Sign with the default profile, store and broadcast a post.
-    pub async fn publish(&self, draft: Draft, attachments: &[Attachment]) -> Result<Event> {
+    pub async fn publish(
+        self: &Arc<Self>,
+        draft: Draft,
+        attachments: &[Attachment],
+    ) -> Result<Event> {
         self.publish_as(&self.author.clone(), draft, attachments)
             .await
     }
 
     /// Sign with `key`, store and broadcast a post.
     pub async fn publish_as(
-        &self,
+        self: &Arc<Self>,
         key: &SigningKey,
         mut draft: Draft,
         attachments: &[Attachment],
@@ -392,7 +411,58 @@ impl Node {
             .broadcast(serde_json::to_vec(&envelope)?.into())
             .await?;
         debug!(id = %event.id, "published");
+        if !event.blobs.is_empty() {
+            let node = Arc::clone(self);
+            let event = event.clone();
+            tokio::spawn(async move {
+                let report = node.replicate(&event).await;
+                info!(id = %event.id, ?report, "replication");
+            });
+        }
         Ok(event)
+    }
+
+    /// Ask the k peers closest to each blob of `event` to hold it (SPEC
+    /// §2.5). Returns, per blob hash, the peers that confirmed.
+    pub async fn replicate(&self, event: &Event) -> HashMap<String, Vec<EndpointId>> {
+        let known = self.known_peers();
+        let mut targets: HashMap<EndpointId, Vec<String>> = HashMap::new();
+        for blob in event.blobs.iter().filter(|b| b.url.is_none()) {
+            let Ok(hash) = crate::event::parse_hex::<32>(&blob.hash, "hash") else {
+                continue;
+            };
+            for peer in proto::closest(&hash, &known, self.config.replication) {
+                targets.entry(peer).or_default().push(blob.hash.clone());
+            }
+        }
+        let calls = targets.into_iter().map(|(peer, hashes)| {
+            let request = Request::Replicate {
+                event: Box::new(event.clone()),
+                hashes,
+            };
+            async move {
+                let result = tokio::time::timeout(
+                    Duration::from_secs(150),
+                    proto::call(self.endpoint(), peer, &request),
+                )
+                .await;
+                (peer, result)
+            }
+        });
+        let mut confirmed: HashMap<String, Vec<EndpointId>> = HashMap::new();
+        for (peer, result) in n0_future::join_all(calls).await {
+            match result {
+                Ok(Ok(Response::Replicated { hashes })) => {
+                    for hash in hashes {
+                        confirmed.entry(hash).or_default().push(peer);
+                    }
+                }
+                Ok(Ok(other)) => debug!(peer = %peer.fmt_short(), "replication refused: {other:?}"),
+                Ok(Err(e)) => debug!(peer = %peer.fmt_short(), "replication failed: {e:#}"),
+                Err(_) => debug!(peer = %peer.fmt_short(), "replication timed out"),
+            }
+        }
+        confirmed
     }
 
     /// Blobs fetched from other nodes from now on.
@@ -421,6 +491,68 @@ impl Node {
         all
     }
 
+    /// Peers heard from recently (gossip neighbors, bootstrap peers, peers
+    /// that contacted us), excluding ourselves.
+    pub fn known_peers(&self) -> Vec<EndpointId> {
+        let me = self.endpoint_id();
+        let mut all: Vec<EndpointId> = self
+            .peers
+            .lock()
+            .map(|p| p.keys().copied().filter(|id| *id != me).collect())
+            .unwrap_or_default();
+        all.sort();
+        all
+    }
+
+    fn seen(&self, peer: EndpointId) {
+        if let Ok(mut peers) = self.peers.lock() {
+            if peers.len() >= 10_000 && !peers.contains_key(&peer) {
+                // Forget the stalest peer.
+                if let Some(oldest) = peers.iter().min_by_key(|(_, t)| **t).map(|(id, _)| *id) {
+                    peers.remove(&oldest);
+                }
+            }
+            peers.insert(peer, now_secs());
+        }
+    }
+
+    fn add_hints(&self, hash: &str, providers: &[EndpointId]) {
+        if let Ok(mut hints) = self.hints.lock() {
+            if hints.len() >= 100_000 {
+                hints.clear();
+            }
+            let entry = hints.entry(hash.to_string()).or_default();
+            for p in providers {
+                if !entry.contains(p) && entry.len() < 16 {
+                    entry.push(*p);
+                }
+            }
+        }
+    }
+
+    /// Where a blob probably is: announced providers first, then the known
+    /// peers closest to its hash (where replication put it), then neighbors.
+    fn providers_for(&self, blob: &BlobRef) -> Vec<EndpointId> {
+        let mut out: Vec<EndpointId> = self
+            .hints
+            .lock()
+            .ok()
+            .and_then(|h| h.get(&blob.hash).cloned())
+            .unwrap_or_default();
+        if let Ok(hash) = crate::event::parse_hex::<32>(&blob.hash, "hash") {
+            out.extend(proto::closest(
+                &hash,
+                &self.known_peers(),
+                self.config.replication * 2,
+            ));
+        }
+        out.extend(self.neighbors());
+        let me = self.endpoint_id();
+        let mut seen = HashSet::new();
+        out.retain(|p| *p != me && seen.insert(*p));
+        out
+    }
+
     /// Make a blob local (downloading it from known peers if needed), then
     /// export it with [`Node::export_blob`].
     pub async fn fetch_and_export(&self, blob: &BlobRef) -> Result<Option<PathBuf>> {
@@ -432,11 +564,10 @@ impl Node {
         }
         let hash: Hash = blob.hash.parse()?;
         if !self.blobs.has(hash).await? {
-            let providers = self.neighbors();
-            if providers.is_empty() {
+            let providers = self.providers_for(blob);
+            if providers.is_empty() || !self.fetch_blob(blob, providers).await {
                 return Ok(None);
             }
-            self.fetch_blob(blob, providers).await;
         }
         self.export_blob(blob).await
     }
@@ -471,6 +602,7 @@ impl Node {
         loop {
             match receiver.next().await {
                 Some(Ok(GossipEvent::Received(msg))) => {
+                    self.seen(msg.delivered_from);
                     if let Err(e) = self
                         .handle_message(&net, &msg.content, msg.delivered_from)
                         .await
@@ -483,6 +615,15 @@ impl Node {
                     if let Ok(mut n) = self.neighbors.lock() {
                         n.entry(net.clone()).or_default().insert(id);
                     }
+                    self.seen(id);
+                    let node = Arc::clone(&self);
+                    let net = net.clone();
+                    tokio::spawn(async move {
+                        match node.sync_from(id, &net).await {
+                            Ok(n) => debug!(%net, peer = %id.fmt_short(), new = n, "synced"),
+                            Err(e) => debug!(%net, peer = %id.fmt_short(), "sync failed: {e:#}"),
+                        }
+                    });
                 }
                 Some(Ok(GossipEvent::NeighborDown(id))) => {
                     debug!(%net, peer = %id, "neighbor down");
@@ -501,25 +642,13 @@ impl Node {
         debug!(%net, "gossip receive loop ended");
     }
 
-    async fn handle_message(
-        self: &Arc<Self>,
-        net: &str,
-        bytes: &[u8],
-        from: EndpointId,
-    ) -> Result<()> {
+    async fn handle_message(&self, net: &str, bytes: &[u8], from: EndpointId) -> Result<()> {
         let envelope: Envelope = serde_json::from_slice(bytes)?;
         let event = envelope.event;
-        event.verify()?;
         if event.net != net {
             bail!("event for net {:?} on topic {net:?}", event.net);
         }
-        if event.pow_bits() < self.config.min_pow_bits {
-            bail!("insufficient proof of work");
-        }
-        if event.ts > now_secs() + MAX_CLOCK_SKEW_SECS {
-            bail!("event timestamp is in the future");
-        }
-        if self.store.insert(&event, now_secs())? == Inserted::Duplicate {
+        if !self.accept_event(&event)? {
             return Ok(());
         }
         let mut providers: Vec<EndpointId> = envelope
@@ -529,23 +658,127 @@ impl Node {
             .filter_map(|p| p.parse().ok())
             .collect();
         providers.push(from);
-        for blob in event.blobs.iter().cloned() {
-            if blob.url.is_some() || blob.size > self.config.max_blob_bytes {
-                continue;
-            }
-            let node = Arc::clone(self);
-            let providers = providers.clone();
-            tokio::spawn(async move { node.fetch_blob(&blob, providers).await });
+        for blob in &event.blobs {
+            self.add_hints(&blob.hash, &providers);
         }
         Ok(())
+    }
+
+    /// Node policy for events from other nodes, then store. Returns whether
+    /// the event is new.
+    fn accept_event(&self, event: &Event) -> Result<bool> {
+        event.verify()?;
+        if !self.senders.contains_key(&event.net) {
+            bail!("not a member of network {:?}", event.net);
+        }
+        if event.pow_bits() < self.config.min_pow_bits {
+            bail!("insufficient proof of work");
+        }
+        if event.ts > now_secs() + MAX_CLOCK_SKEW_SECS {
+            bail!("event timestamp is in the future");
+        }
+        Ok(self.store.insert(event, now_secs())? != Inserted::Duplicate)
+    }
+
+    /// Serve a `/wats/1` request from `peer`.
+    pub(crate) async fn handle_request(&self, peer: EndpointId, request: Request) -> Response {
+        self.seen(peer);
+        match request {
+            Request::Sync {
+                net,
+                after_ts,
+                after_id,
+                limit,
+            } => {
+                if !self.senders.contains_key(&net) {
+                    return Response::Refused {
+                        reason: format!("not a member of network {net:?}"),
+                    };
+                }
+                let limit = limit.clamp(1, proto::MAX_SYNC_PAGE);
+                match self
+                    .store
+                    .page_after(&net, after_ts, &after_id, limit as usize)
+                {
+                    Ok(page) => Response::SyncPage {
+                        more: page.len() == limit as usize,
+                        events: page.into_iter().map(|s| (*s.event).clone()).collect(),
+                    },
+                    Err(e) => Response::Refused {
+                        reason: format!("{e:#}"),
+                    },
+                }
+            }
+            Request::Replicate { event, hashes } => {
+                if let Err(e) = self.accept_event(&event) {
+                    return Response::Refused {
+                        reason: format!("{e:#}"),
+                    };
+                }
+                let mut stored = Vec::new();
+                for blob in event.blobs.iter().filter(|b| hashes.contains(&b.hash)) {
+                    if blob.url.is_some() || blob.size > self.config.max_blob_bytes {
+                        continue;
+                    }
+                    self.add_hints(&blob.hash, &[peer]);
+                    if self.fetch_blob(blob, vec![peer]).await {
+                        stored.push(blob.hash.clone());
+                    }
+                }
+                Response::Replicated { hashes: stored }
+            }
+        }
+    }
+
+    /// Catch up on a network from a peer: page through its events after our
+    /// sync watermark. Returns how many new events were stored.
+    pub async fn sync_from(&self, peer: EndpointId, net: &str) -> Result<usize> {
+        let started = now_secs();
+        let watermark = self.store.sync_watermark(net)?;
+        let (mut after_ts, mut after_id) =
+            (watermark.saturating_sub(MAX_CLOCK_SKEW_SECS), String::new());
+        let mut new = 0;
+        for _ in 0..10_000 {
+            let request = Request::Sync {
+                net: net.to_string(),
+                after_ts,
+                after_id: after_id.clone(),
+                limit: proto::MAX_SYNC_PAGE,
+            };
+            let (events, more) = match proto::call(self.endpoint(), peer, &request).await? {
+                Response::SyncPage { events, more } => (events, more),
+                other => bail!("unexpected sync response: {other:?}"),
+            };
+            for event in &events {
+                if event.net != net
+                    || (event.ts, event.id.as_str()) <= (after_ts, after_id.as_str())
+                {
+                    bail!("peer sent an out-of-order sync page");
+                }
+                match self.accept_event(event) {
+                    Ok(true) => new += 1,
+                    Ok(false) => {}
+                    Err(e) => debug!(id = %event.id, "sync: rejected event: {e:#}"),
+                }
+            }
+            match events.last() {
+                Some(last) if more => {
+                    after_ts = last.ts;
+                    after_id = last.id.clone();
+                }
+                _ => break,
+            }
+        }
+        self.store.set_sync_watermark(net, started)?;
+        Ok(new)
     }
 
     /// Download a blob from providers. BLAKE3 verified streaming makes the
     /// content match the hash; the content itself stays untrusted data and
     /// is never executed (SPEC §2.15).
-    async fn fetch_blob(&self, blob: &BlobRef, providers: Vec<EndpointId>) {
+    async fn fetch_blob(&self, blob: &BlobRef, providers: Vec<EndpointId>) -> bool {
         let Ok(hash) = blob.hash.parse::<Hash>() else {
-            return;
+            return false;
         };
         let result = async {
             self.downloader.download(hash, providers).await?;
@@ -556,9 +789,16 @@ impl Node {
             Ok(Ok(())) => {
                 info!(hash = %blob.hash, name = %blob.name, "blob fetched");
                 let _ = self.fetched.send(blob.clone());
+                true
             }
-            Ok(Err(e)) => warn!(hash = %blob.hash, "blob fetch failed: {e:#}"),
-            Err(_) => warn!(hash = %blob.hash, "blob fetch timed out"),
+            Ok(Err(e)) => {
+                warn!(hash = %blob.hash, "blob fetch failed: {e:#}");
+                false
+            }
+            Err(_) => {
+                warn!(hash = %blob.hash, "blob fetch timed out");
+                false
+            }
         }
     }
 
@@ -567,6 +807,11 @@ impl Node {
         self.router.shutdown().await?;
         // The router shuts the blob protocol down, which also closes the store.
         self.blobs.shutdown().await.ok();
+        // Background tasks may still hold the node; release the data
+        // directory explicitly.
+        if let Some(lock) = self.lock.lock().ok().and_then(|mut l| l.take()) {
+            lock.unlock().ok();
+        }
         Ok(())
     }
 }

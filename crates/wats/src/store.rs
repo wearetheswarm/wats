@@ -31,7 +31,7 @@ CREATE TABLE IF NOT EXISTS events (
     json        TEXT NOT NULL,
     received_at INTEGER NOT NULL
 );
-CREATE INDEX IF NOT EXISTS events_net_ts ON events (net, ts);
+CREATE INDEX IF NOT EXISTS events_net_ts ON events (net, ts, id);
 CREATE INDEX IF NOT EXISTS events_thread ON events (thread);
 CREATE INDEX IF NOT EXISTS events_author_kind ON events (author, kind);
 
@@ -39,6 +39,11 @@ CREATE TABLE IF NOT EXISTS event_tags (
     seq INTEGER NOT NULL REFERENCES events (seq),
     tag TEXT NOT NULL,
     PRIMARY KEY (tag, seq)
+);
+
+CREATE TABLE IF NOT EXISTS sync_state (
+    net       TEXT PRIMARY KEY,
+    watermark INTEGER NOT NULL
 );
 
 CREATE VIRTUAL TABLE IF NOT EXISTS events_fts USING fts5 (
@@ -331,16 +336,47 @@ impl Store {
         )
     }
 
-    /// Events of a network with `ts >= since_ts`, oldest first, for sync.
-    pub fn by_time(&self, net: &str, since_ts: u64, limit: usize) -> Result<Vec<Stored>> {
+    /// Events of a network strictly after `(after_ts, after_id)` in
+    /// `(ts, id)` order, for sync paging.
+    pub fn page_after(
+        &self,
+        net: &str,
+        after_ts: u64,
+        after_id: &str,
+        limit: usize,
+    ) -> Result<Vec<Stored>> {
         self.query(
-            "SELECT seq, json FROM events WHERE net = ? AND ts >= ? ORDER BY ts, seq LIMIT ?",
+            "SELECT seq, json FROM events WHERE net = ?1 AND (ts > ?2 OR (ts = ?2 AND id > ?3))
+             ORDER BY ts, id LIMIT ?4",
             vec![
                 net.to_string().into(),
-                (since_ts as i64).into(),
+                (after_ts as i64).into(),
+                after_id.to_string().into(),
                 (limit as i64).into(),
             ],
         )
+    }
+
+    /// Timestamp up to which this node has synced a network (0 if never).
+    pub fn sync_watermark(&self, net: &str) -> Result<u64> {
+        let ts: Option<i64> = self
+            .conn()
+            .query_row(
+                "SELECT watermark FROM sync_state WHERE net = ?",
+                [net],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(ts.unwrap_or(0).max(0) as u64)
+    }
+
+    pub fn set_sync_watermark(&self, net: &str, ts: u64) -> Result<()> {
+        self.conn().execute(
+            "INSERT INTO sync_state (net, watermark) VALUES (?1, ?2)
+             ON CONFLICT (net) DO UPDATE SET watermark = max(watermark, ?2)",
+            params![net, ts as i64],
+        )?;
+        Ok(())
     }
 
     /// The latest `announce` of each author matching the filter, newest first.
@@ -551,6 +587,15 @@ mod tests {
         assert_eq!(after.len(), 2);
         assert_eq!(store.last_seq().unwrap(), 3);
         assert_eq!(store.last_ts("public").unwrap(), Some(20));
+        let page = store.page_after("public", 10, "", 10).unwrap();
+        assert_eq!(page.len(), 3);
+        let first = &page[0].event;
+        let rest = store.page_after("public", first.ts, &first.id, 10).unwrap();
+        assert_eq!(rest.len(), 2);
+        assert_eq!(store.sync_watermark("public").unwrap(), 0);
+        store.set_sync_watermark("public", 50).unwrap();
+        store.set_sync_watermark("public", 40).unwrap();
+        assert_eq!(store.sync_watermark("public").unwrap(), 50);
     }
 
     #[test]
