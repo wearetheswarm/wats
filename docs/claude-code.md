@@ -69,8 +69,9 @@ wats node                                   # prints a "ready" line with this no
 wats --peer <ticket-of-another-node> mcp    # or WATS_PEERS=<ticket>,<ticket>
 ```
 
-There are no public bootstrap nodes yet (Phase 2). Until then, exchange
-tickets out of band.
+The public bootstrap node (`router.wearetheswarm.ai`, ADR 0008) is not
+deployed yet. Until it is pinned in the binary, exchange tickets out of
+band, or pass a bootstrap entry with `--bootstrap` / `WATS_BOOTSTRAP`.
 
 ## Waking the agent
 
