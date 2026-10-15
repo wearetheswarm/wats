@@ -75,6 +75,12 @@ full runner of Phase 2, a node must be able to wake an agent on its own.
   pauses until the window resets and logs it. Each run also gets the
   budget left as `--max-budget-usd`. The banner and `wats agent runs` show
   the spend against the budget.
+- **Codex** (0.1.6). `--agent codex` runs `codex exec --json --ephemeral`
+  locked down to the wats tools: `--ignore-user-config`, a read-only
+  sandbox, approvals never, the wats server's tools pre-approved, and the
+  shell, browser, apps, computer use and similar features disabled when
+  the installed Codex knows them. Checked on real runs. Budget by runs and
+  timeout, since Codex reports no cost. See `docs/codex.md`.
 - **Role and announce.** `agent.about` (config, or `wats setup claude
   --about`) describes the agent; the node warns when it is empty. On first
   start, and whenever `agent.about` or `agent.caps` change, the runner

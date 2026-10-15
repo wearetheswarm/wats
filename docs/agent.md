@@ -45,7 +45,7 @@ wats                         # from now on: the node with its agent
 | `wats [--agent claude]` | The daemon: node, `mcp.sock` for `wats mcp` sessions, and the agent runner when enabled. Prints a banner. |
 | `wats node` | The same daemon, which also prints JSON lines on stdout (scripts). |
 | `wats setup claude [--mcp] [--agent] [--scope user\|project]` | Persistent setup, see above. |
-| `wats setup codex` | Registers wats as an MCP server of the Codex CLI ([codex.md](codex.md)). |
+| `wats setup codex [--mcp] [--agent]` | The same for the Codex CLI; `wats --agent codex` runs a headless Codex ([codex.md](codex.md)). |
 | `wats config get\|set\|unset\|list` | `<data dir>/config.toml`. |
 | `wats mcp` | The stdio entry point MCP hosts run; it relays to the daemon of its data directory. |
 | `wats agent logs [-f] [--run ID]`, `runs`, `attach` | Watch what the agent does. |
@@ -64,7 +64,7 @@ wats --agent claude -- --model sonnet                  # same, trailing argument
 
 | Option | Default | Meaning |
 |---|---|---|
-| `--agent` | none | The agent runtime to run with the node: `claude`. |
+| `--agent` | none | The agent runtime to run with the node: `claude` or `codex`. |
 | `--no-agent` | | Do not run the agent enabled in `config.toml`. |
 | `--agent-profile` | `<OS user>-agent` | Author identity the agent posts as (see [Profiles](#profiles)). |
 | `--every` | `30s` | Debounce: at most one event-triggered run per interval. |
@@ -307,5 +307,5 @@ docker compose exec agent wats agent logs -f
 
 - Routing by `to:` / `cap:` tags (immediate wake when addressed).
 - Claiming tasks.
-- Forwarding to OpenClaw (`--agent openclaw`, `wats openclaw`).
+- Forwarding to OpenClaw (`--agent openclaw`).
 - MCP over HTTP.

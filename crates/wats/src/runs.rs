@@ -172,6 +172,24 @@ pub fn read_result(transcript: &Path, record: &mut RunRecord) {
         let Ok(value) = serde_json::from_str::<Value>(&line) else {
             continue;
         };
+        // Codex: turns and failures, no cost.
+        match value["type"].as_str() {
+            Some("turn.completed") => {
+                record.turns = Some(record.turns.unwrap_or(0) + 1);
+                continue;
+            }
+            Some("turn.failed") | Some("error") => {
+                if record.status == "ok" {
+                    record.status = "error".into();
+                }
+                record.error = value["error"]["message"]
+                    .as_str()
+                    .or(value["message"].as_str())
+                    .map(|m| m.chars().take(200).collect());
+                continue;
+            }
+            _ => {}
+        }
         if value["type"] != "result" {
             continue;
         }
@@ -474,6 +492,62 @@ pub fn render(line: &str, style: Style) -> Vec<String> {
                 }
             }
         }
+        // Codex (`codex exec --json`).
+        "thread.started" => out.push(style.dim(&format!(
+            "● codex thread {}",
+            value["thread_id"].as_str().map_or("?", |s| &s[..s.len().min(8)])
+        ))),
+        "item.completed" => {
+            let item = &value["item"];
+            match item["type"].as_str() {
+                Some("agent_message") => {
+                    for line in item["text"].as_str().unwrap_or("").trim().lines() {
+                        out.push(format!("  {line}"));
+                    }
+                }
+                Some("mcp_tool_call") => {
+                    out.push(format!(
+                        "{} {}",
+                        style.cyan(&format!(
+                            "→ {}.{}",
+                            item["server"].as_str().unwrap_or("?"),
+                            item["tool"].as_str().unwrap_or("?")
+                        )),
+                        style.dim(&preview(&item["arguments"].to_string(), TOOL_PREVIEW)),
+                    ));
+                    if let Some(error) = item["error"]["message"].as_str() {
+                        out.push(style.red(&format!("← ✗ {}", preview(error, TOOL_PREVIEW))));
+                    } else {
+                        let mut text =
+                            preview(&tool_result_text(&item["result"]["content"]), TOOL_PREVIEW);
+                        if text.is_empty() {
+                            text = "(no text)".into();
+                        }
+                        out.push(style.dim(&format!("← {text}")));
+                    }
+                }
+                Some("command_execution") => out.push(style.yellow(&format!(
+                    "→ shell {} (exit {})",
+                    preview(item["command"].as_str().unwrap_or("?"), TOOL_PREVIEW),
+                    item["exit_code"]
+                ))),
+                Some("file_change") => out.push(style.yellow("→ file change")),
+                Some("error") => out.push(style.red(&format!(
+                    "✗ {}",
+                    item["message"].as_str().unwrap_or("error")
+                ))),
+                _ => {}
+            }
+        }
+        "turn.completed" => out.push(style.green("✓ turn done")),
+        "turn.failed" => out.push(style.red(&format!(
+            "✗ {}",
+            value["error"]["message"].as_str().unwrap_or("turn failed")
+        ))),
+        "error" => out.push(style.red(&format!(
+            "✗ {}",
+            value["message"].as_str().unwrap_or("error")
+        ))),
         "result" => {
             let ok = value["is_error"] != true;
             let label = if ok {
