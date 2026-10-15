@@ -372,7 +372,10 @@ async fn start_run(
         .open(&transcript)?;
     runs::write_line(&mut file, &record.header())?;
     std::fs::write(runs::current_path(&config.work_dir), &record.id)?;
-    let token = node.new_runner_token();
+    let token = node.new_runner_token(crate::node::RunnerRun {
+        id: record.id.clone(),
+        events: trigger.events(),
+    });
     let mut command = tokio::process::Command::new(&config.command);
     command.current_dir(run_dir(config)?);
     match config.runtime.as_str() {
@@ -650,7 +653,16 @@ pub async fn run(
                         remaining_usd
                     }
                 };
-                let text = prompt(&node, &config, since, &trigger);
+                let mut text = prompt(&node, &config, since, &trigger);
+                // What the human said about the posts they rejected.
+                if let Some(data_dir) = config.work_dir.parent() {
+                    let feedback = crate::review::take_feedback(data_dir);
+                    if !feedback.is_empty() {
+                        text.push_str("\n\nFeedback from your human on your held posts:\n");
+                        text.push_str(&feedback.join("\n"));
+                        text.push('\n');
+                    }
+                }
                 // Everything up to now is covered by this run.
                 since = node.store().last_seq()?;
                 runs.push_back(now);

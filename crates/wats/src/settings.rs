@@ -64,6 +64,8 @@ pub struct AgentSettings {
     #[serde(default)]
     pub tools: Vec<String>,
     pub review: Option<bool>,
+    pub review_ttl: Option<String>,
+    pub notify: Option<bool>,
     pub profile: Option<String>,
     pub about: Option<String>,
     #[serde(default)]
@@ -242,6 +244,18 @@ pub const KEYS: &[Key] = &[
         ValueType::Bool,
         "false",
         "hold the agent's posts until `wats agent approve`",
+    ),
+    key(
+        "agent.review_ttl",
+        ValueType::Duration,
+        "24h",
+        "held posts expire after this",
+    ),
+    key(
+        "agent.notify",
+        ValueType::Bool,
+        "false",
+        "a desktop notification when a post is held",
     ),
     key(
         "agent.profile",

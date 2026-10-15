@@ -97,6 +97,10 @@ pub struct NodeConfig {
     /// published (`agent.review`: the agent's profile). Non-empty also
     /// holds the posts of every runner session.
     pub review_profiles: Vec<String>,
+    /// Held drafts older than this expire (`agent.review_ttl`).
+    pub review_ttl: Duration,
+    /// A desktop notification when a draft is held (`agent.notify`).
+    pub review_notify: bool,
     /// Replication factor k for blobs: how many peers are asked to hold a
     /// blob at publish time (SPEC §2.5, §7).
     pub replication: usize,
@@ -117,6 +121,8 @@ impl NodeConfig {
             blob_quota: None,
             storage_max: None,
             review_profiles: Vec::new(),
+            review_ttl: Duration::from_secs(24 * 3600),
+            review_notify: false,
             replication: 3,
             bootstrap: Vec::new(),
             port: None,
@@ -171,6 +177,14 @@ pub fn is_valid_profile(name: &str) -> bool {
         && name
             .bytes()
             .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_' || b == b'-')
+}
+
+/// An agent run, as known to MCP sessions that present its token.
+#[derive(Debug, Clone, Default)]
+pub struct RunnerRun {
+    pub id: String,
+    /// The events that woke it.
+    pub events: Vec<String>,
 }
 
 /// Events from others are refused above this share of `storage_max`.
@@ -269,7 +283,7 @@ pub struct Node {
     storage_logged: std::sync::Mutex<Option<std::time::Instant>>,
     /// Tokens of the agent runs in progress: an MCP session presenting one
     /// is a runner session.
-    runner_tokens: std::sync::Mutex<HashSet<String>>,
+    runner_tokens: std::sync::Mutex<HashMap<String, RunnerRun>>,
     /// Exclusive lock on the data directory, released by `shutdown`.
     lock: std::sync::Mutex<Option<std::fs::File>>,
 }
@@ -654,14 +668,22 @@ impl Node {
     }
 
     /// A token for one agent run, valid until [`Node::end_runner_token`].
-    pub fn new_runner_token(&self) -> String {
+    pub fn new_runner_token(&self, run: RunnerRun) -> String {
         let mut bytes = [0u8; 16];
         let _ = getrandom::fill(&mut bytes);
         let token = hex::encode(bytes);
         if let Ok(mut tokens) = self.runner_tokens.lock() {
-            tokens.insert(token.clone());
+            tokens.insert(token.clone(), run);
         }
         token
+    }
+
+    /// The run a token belongs to, while it runs.
+    pub fn runner_run(&self, token: &str) -> Option<RunnerRun> {
+        self.runner_tokens
+            .lock()
+            .ok()
+            .and_then(|tokens| tokens.get(token).cloned())
     }
 
     pub fn end_runner_token(&self, token: &str) {
@@ -671,9 +693,7 @@ impl Node {
     }
 
     pub fn is_runner_token(&self, token: &str) -> bool {
-        self.runner_tokens
-            .lock()
-            .is_ok_and(|tokens| tokens.contains(token))
+        self.runner_run(token).is_some()
     }
 
     async fn measure_storage(&self) {

@@ -616,6 +616,9 @@ pub async fn follow(
     start: Option<(String, u64)>,
     style: Style,
     out: &mut impl Write,
+    // Extra lines to print as they come (e.g. held posts), checked every
+    // loop.
+    news: &mut dyn FnMut() -> Vec<String>,
 ) -> std::io::Result<()> {
     // The run being followed, its offset, and whether its footer was seen.
     let mut current = start.map(|(id, offset)| (id, offset, false));
@@ -648,6 +651,10 @@ pub async fn follow(
                 continue;
             }
         }
+        for line in news() {
+            writeln!(out, "{}", style.yellow(&line))?;
+        }
+        out.flush()?;
         tokio::time::sleep(Duration::from_millis(300)).await;
     }
 }
