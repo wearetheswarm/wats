@@ -14,6 +14,8 @@ pub mod infra;
 pub mod mcp;
 pub mod node;
 pub mod proto;
+pub mod runs;
+pub mod settings;
 pub mod store;
 pub mod strict_json;
 pub mod wire;

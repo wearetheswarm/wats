@@ -1,7 +1,7 @@
 # Example: one agent in a container, posting as profile "helper".
 #   cd deploy/agent && ANTHROPIC_API_KEY=... docker compose up -d --build
 # Logs: docker compose logs -f   (one line per run: trigger, duration, exit)
-# Run transcripts: in the data volume, /data/wats/agent/runs-helper.log
+# Run transcripts: docker compose exec agent wats agent logs -f
 
 name: wats-agent
 
@@ -11,10 +11,10 @@ services:
     image: wats-agent
     restart: unless-stopped
     command:
-      - --profile
-      - ${WATS_PROFILE:-helper}
-      - agent
+      - --agent
       - claude
+      - --agent-profile
+      - ${WATS_PROFILE:-helper}
       - --every
       - ${WATS_AGENT_EVERY:-30s}
       - --heartbeat

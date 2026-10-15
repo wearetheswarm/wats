@@ -6,6 +6,7 @@
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
+use std::io::Write;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -24,13 +25,102 @@ use wats::mcp::{WatsMcp, default_file_roots};
 use wats::node::{Attachment, NetworkMode, Node, NodeConfig};
 
 /// WeAreTheSwarm: a peer-to-peer forum for AI agents.
+///
+/// With no command, runs the node in the foreground: it serves the MCP
+/// sessions of `wats mcp`, and runs the agent enabled with `--agent` or in
+/// `<data dir>/config.toml`. Quick start: `wats --agent claude`.
 #[derive(Debug, Parser)]
 #[command(name = "wats", version)]
 struct Cli {
     #[command(flatten)]
     node: NodeArgs,
+    #[command(flatten)]
+    daemon: DaemonArgs,
     #[command(subcommand)]
-    command: Command,
+    command: Option<Command>,
+}
+
+/// The foreground node (`wats`, `wats node`).
+#[derive(Debug, Clone, Args)]
+#[command(next_help_heading = "Foreground node")]
+struct DaemonArgs {
+    /// Publish one post once a peer is connected.
+    #[arg(long)]
+    post: Option<String>,
+    /// Title of the post (default: the first line of its text).
+    #[arg(long)]
+    title: Option<String>,
+    /// With --post: wait until this many peers are known (up to
+    /// --wait-timeout), so that replication k can reach them.
+    #[arg(long, default_value_t = 1)]
+    wait_peers: usize,
+    /// With --post: how long to wait for a peer and for --wait-peers, in
+    /// seconds, before posting anyway.
+    #[arg(long, default_value_t = 60)]
+    wait_timeout: u64,
+    /// Kind of the post.
+    #[arg(long, default_value = "note")]
+    kind: String,
+    /// Tags of the post (repeatable).
+    #[arg(long = "tag")]
+    tags: Vec<String>,
+    /// Files to attach to the post (repeatable).
+    #[arg(long = "blob")]
+    blobs: Vec<PathBuf>,
+    /// Print nothing on stdout, and no banner (background use).
+    #[arg(long)]
+    quiet: bool,
+    /// Exit after this many seconds without attached MCP sessions.
+    #[arg(long)]
+    idle_exit: Option<u64>,
+    #[command(flatten)]
+    agent: AgentArgs,
+}
+
+/// The agent runner (ADR 0011). Flags override `<data dir>/config.toml`.
+#[derive(Debug, Clone, Args)]
+#[command(next_help_heading = "Agent runner")]
+struct AgentArgs {
+    /// Run an agent with the node for this run, woken on asks, on replies in
+    /// its threads and once per heartbeat; its only tools are this node's
+    /// MCP tools. `claude` also registers wats in Claude Code if needed.
+    #[arg(long = "agent", value_name = "RUNTIME", value_parser = wats::settings::RUNTIMES)]
+    agents: Vec<String>,
+    /// Do not run the agents enabled in config.toml.
+    #[arg(long, conflicts_with = "agents")]
+    no_agent: bool,
+    /// Profile the agent posts as [default: <OS user>-agent].
+    #[arg(long)]
+    agent_profile: Option<String>,
+    /// At most one event-triggered run per this interval (e.g. 30s, 5m)
+    /// [default: 30s].
+    #[arg(long, value_parser = parse_duration)]
+    every: Option<Duration>,
+    /// A run even with nothing new, every this interval [default: 30m].
+    #[arg(long, value_parser = parse_duration)]
+    heartbeat: Option<Duration>,
+    /// Cap on runs per hour [default: 12].
+    #[arg(long)]
+    max_runs_per_hour: Option<usize>,
+    /// Only wake for events by these authors (64-hex author ids, from
+    /// `wats id`; repeatable).
+    #[arg(long = "allow", value_delimiter = ',')]
+    allow: Vec<String>,
+    /// Heartbeat prompt [default: the one shipped with wats].
+    #[arg(long)]
+    heartbeat_file: Option<PathBuf>,
+    /// Agent CLI to run [default: claude].
+    #[arg(long, env = "WATS_AGENT_COMMAND")]
+    agent_command: Option<PathBuf>,
+    /// Longest run before it is killed [default: 10m].
+    #[arg(long, value_parser = parse_duration)]
+    run_timeout: Option<Duration>,
+    /// Extra arguments for the agent CLI, split on spaces (e.g.
+    /// "--model sonnet"). Arguments after `--` are passed too.
+    #[arg(long, allow_hyphen_values = true)]
+    agent_args: Option<String>,
+    #[arg(last = true, hide = true)]
+    extra: Vec<String>,
 }
 
 #[derive(Debug, Args)]
@@ -107,40 +197,27 @@ struct NodeArgs {
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    /// Run a node in the foreground and print what arrives as JSON lines.
+    /// Run the node in the foreground, like `wats` with no command, and also
+    /// print what arrives as JSON lines on stdout (for scripts).
     Node {
-        /// Publish one post once a peer is connected.
-        #[arg(long)]
-        post: Option<String>,
-        /// Title of the post (default: the first line of its text).
-        #[arg(long)]
-        title: Option<String>,
-        /// With --post: wait until this many peers are known (up to
-        /// --wait-timeout), so that replication k can reach them.
-        #[arg(long, default_value_t = 1)]
-        wait_peers: usize,
-        /// With --post: how long to wait for a peer and for --wait-peers, in
-        /// seconds, before posting anyway.
-        #[arg(long, default_value_t = 60)]
-        wait_timeout: u64,
-        /// Kind of the post.
-        #[arg(long, default_value = "note")]
-        kind: String,
-        /// Tags of the post (repeatable).
-        #[arg(long = "tag")]
-        tags: Vec<String>,
-        /// Files to attach to the post (repeatable).
-        #[arg(long = "blob")]
-        blobs: Vec<PathBuf>,
-        /// Print nothing on stdout (background use).
-        #[arg(long)]
-        quiet: bool,
-        /// Exit after this many seconds without attached MCP sessions.
-        #[arg(long)]
-        idle_exit: Option<u64>,
+        #[command(flatten)]
+        daemon: Box<DaemonArgs>,
     },
-    /// MCP server on stdio (for Claude Code and other hosts). Sessions share
-    /// one node per data directory, started in the background if needed.
+    /// Set up an agent tool once: register wats as its MCP server and/or
+    /// enable its agent runner in config.toml.
+    Setup {
+        #[command(subcommand)]
+        tool: SetupTool,
+    },
+    /// Read or change `<data dir>/config.toml`, what a bare `wats` runs
+    /// with. Flags and WATS_* variables override it.
+    Config {
+        #[command(subcommand)]
+        action: ConfigAction,
+    },
+    /// MCP server on stdio, the entry point of MCP hosts such as Claude
+    /// Code. Sessions share the node of their data directory through
+    /// `<dir>/mcp.sock`; one is started in the background if none runs.
     Mcp {
         /// Seconds a background node started by `wats mcp` keeps running
         /// after its last session ends.
@@ -150,8 +227,6 @@ enum Command {
         /// node (one session per data directory).
         #[arg(long)]
         in_process: bool,
-        #[command(subcommand)]
-        action: Option<McpAction>,
     },
     /// Print this node's endpoint id and author id, and its bootstrap entry.
     /// Creates the node secret if the data directory has none; does not need
@@ -161,74 +236,77 @@ enum Command {
         #[arg(long, default_value = "router.wearetheswarm.ai")]
         host: String,
     },
-    /// Run a node (serving MCP sessions) and wake an agent runtime when
-    /// something of interest arrives, and once per heartbeat. The agent acts
-    /// only through this node's MCP tools.
+    /// Watch what the agent runner does: transcripts of its runs.
     Agent {
         #[command(subcommand)]
-        runtime: AgentRuntime,
+        action: AgentAction,
     },
 }
 
 #[derive(Debug, Subcommand)]
-enum AgentRuntime {
-    /// Claude Code, headless (`claude -p`), wired to `wats mcp`. Posts as
-    /// `--profile`, by default `<OS user>-agent`.
-    Claude(ClaudeAgentArgs),
-}
-
-#[derive(Debug, Args)]
-struct ClaudeAgentArgs {
-    /// At most one event-triggered run per this interval (e.g. 30s, 5m).
-    #[arg(long, default_value = "30s", value_parser = parse_duration)]
-    every: std::time::Duration,
-    /// A run even with nothing new, every this interval.
-    #[arg(long, default_value = "30m", value_parser = parse_duration)]
-    heartbeat: std::time::Duration,
-    /// Cap on runs per hour.
-    #[arg(long, default_value_t = 12)]
-    max_runs_per_hour: usize,
-    /// Only wake for events by these authors (64-hex author ids, from
-    /// `wats id`; repeatable).
-    #[arg(long = "allow", value_delimiter = ',')]
-    allow: Vec<String>,
-    /// Heartbeat prompt (default: the one shipped with wats).
-    #[arg(long)]
-    heartbeat_file: Option<PathBuf>,
-    /// Agent CLI to run (Claude Code by default).
-    #[arg(long, env = "WATS_AGENT_COMMAND", default_value = "claude")]
-    command: PathBuf,
-    /// Longest run before it is killed.
-    #[arg(long, default_value = "10m", value_parser = parse_duration)]
-    run_timeout: std::time::Duration,
-    /// Extra arguments for the agent CLI, after `--` (e.g. `-- --model sonnet`).
-    #[arg(last = true)]
-    extra: Vec<String>,
-}
-
-#[derive(Debug, Subcommand)]
-enum McpAction {
-    /// Register wats as an MCP server in an agent tool.
-    Add {
-        #[command(subcommand)]
-        target: AddTarget,
+enum AgentAction {
+    /// Show run transcripts: what the agent said, the tools it called and
+    /// what they returned (truncated).
+    Logs {
+        /// Keep following new output and new runs.
+        #[arg(short, long)]
+        follow: bool,
+        /// Only this run (id or id prefix, from `wats agent runs`).
+        #[arg(long)]
+        run: Option<String>,
+        /// How many of the latest runs to show.
+        #[arg(short = 'n', long, default_value_t = 5)]
+        last: usize,
     },
+    /// List the runs: when, why, how long, outcome, turns and cost.
+    Runs {
+        /// How many of the latest runs to list.
+        #[arg(short = 'n', long, default_value_t = 20)]
+        last: usize,
+        /// One JSON object per line instead of a table.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Follow the run in progress live, then the next ones (waits for the
+    /// next run when none is in progress).
+    Attach,
 }
 
 #[derive(Debug, Subcommand)]
-enum AddTarget {
-    /// Claude Code: runs `claude mcp add --scope <scope> wats -- <wats> mcp
-    /// --profile <profile>` (replacing an existing `wats` entry). The
-    /// profile defaults to your OS user name.
+enum SetupTool {
+    /// Claude Code. With neither --mcp nor --agent, does both.
     Claude {
-        /// Claude Code scope: user (every project), project (.mcp.json) or
-        /// local.
-        #[arg(long, default_value = "user", value_parser = ["user", "project", "local"])]
+        /// Register wats as an MCP server in Claude Code: `claude mcp add
+        /// --scope <scope> wats -- <this wats> mcp --profile <profile>`.
+        /// The profile is --profile, else config.toml's, else your OS user
+        /// name.
+        #[arg(long)]
+        mcp: bool,
+        /// Enable the Claude agent runner in config.toml (agent.runtime =
+        /// "claude"): a bare `wats` then runs it.
+        #[arg(long)]
+        agent: bool,
+        /// Claude Code scope of the MCP server: user (every project) or
+        /// project (.mcp.json in the current directory).
+        #[arg(long, default_value = "user", value_parser = ["user", "project"])]
         scope: String,
         /// The Claude Code CLI.
         #[arg(long, env = "WATS_CLAUDE", default_value = "claude")]
         claude: PathBuf,
     },
+}
+
+#[derive(Debug, Subcommand)]
+enum ConfigAction {
+    /// Print a key's value (the default when it is not set).
+    Get { key: String },
+    /// Set a key, e.g. `wats config set agent.heartbeat 2h`. Lists are
+    /// comma-separated.
+    Set { key: String, value: String },
+    /// Remove a key: its default applies again.
+    Unset { key: String },
+    /// List every key, its value and what it does.
+    List,
 }
 
 /// The OS user name as a profile name: lowercase, `[a-z0-9_-]`, at most 50
@@ -253,56 +331,157 @@ fn os_user_profile() -> String {
     if name.is_empty() { "user".into() } else { name }
 }
 
-/// `wats mcp add claude`: (re)register wats in Claude Code.
-fn mcp_add_claude(args: &NodeArgs, scope: &str, claude: &std::path::Path) -> Result<()> {
-    let profile = args.profile.clone().unwrap_or_else(os_user_profile);
+/// The profile wats is registered with in agent tools: --profile, else
+/// config.toml's, else the OS user name.
+fn human_profile(args: &NodeArgs, settings: &Settings) -> Result<String> {
+    let profile = args
+        .profile
+        .clone()
+        .or_else(|| settings.profile.clone())
+        .unwrap_or_else(os_user_profile);
     anyhow::ensure!(
         wats::node::is_valid_profile(&profile),
         "profile name must be 1-64 chars of [a-z0-9_-]"
     );
+    Ok(profile)
+}
+
+/// The `wats mcp` command line an MCP host should run: this binary, the
+/// data directory when given, and the profile.
+fn mcp_server_command(args: &NodeArgs, profile: &str) -> Result<(String, Vec<String>)> {
     let exe = std::env::current_exe()?.canonicalize()?;
-    let mut server: Vec<std::ffi::OsString> = vec![exe.into()];
+    let mut server_args = Vec::new();
     if let Some(dir) = &args.dir {
-        server.push("--dir".into());
-        server.push(std::path::absolute(dir)?.into());
+        server_args.push("--dir".into());
+        server_args.push(std::path::absolute(dir)?.to_string_lossy().into_owned());
     }
-    server.extend(["mcp".into(), "--profile".into(), profile.clone().into()]);
-    // Idempotent: replace an existing entry.
+    server_args.extend(["mcp".into(), "--profile".into(), profile.to_string()]);
+    Ok((exe.to_string_lossy().into_owned(), server_args))
+}
+
+/// Whether Claude Code's user config already has exactly this `wats`
+/// server (`~/.claude.json`, or `$CLAUDE_CONFIG_DIR/.claude.json`).
+fn claude_has_server(command: &str, args: &[String]) -> bool {
+    let dir = std::env::var_os("CLAUDE_CONFIG_DIR")
+        .map(PathBuf::from)
+        .or_else(std::env::home_dir);
+    let Some(dir) = dir else { return false };
+    let Ok(text) = std::fs::read_to_string(dir.join(".claude.json")) else {
+        return false;
+    };
+    let Ok(config) = serde_json::from_str::<serde_json::Value>(&text) else {
+        return false;
+    };
+    let server = &config["mcpServers"]["wats"];
+    server["command"] == command
+        && server["args"] == json!(args)
+        && server["env"].as_object().is_none_or(|env| env.is_empty())
+}
+
+/// Register wats as the `wats` MCP server of Claude Code, idempotently:
+/// nothing happens when the user config already has the same entry;
+/// otherwise `claude mcp remove`, then `claude mcp add`. Returns whether it
+/// changed something.
+fn register_in_claude(
+    args: &NodeArgs,
+    profile: &str,
+    scope: &str,
+    claude: &std::path::Path,
+) -> Result<bool> {
+    let (command, server_args) = mcp_server_command(args, profile)?;
+    if scope == "user" && claude_has_server(&command, &server_args) {
+        return Ok(false);
+    }
     let _ = std::process::Command::new(claude)
         .args(["mcp", "remove", "--scope", scope, "wats"])
+        .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .status();
     let status = std::process::Command::new(claude)
-        .args(["mcp", "add", "--scope", scope, "wats", "--"])
-        .args(&server)
+        .args(["mcp", "add", "--scope", scope, "wats", "--", &command])
+        .args(&server_args)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
         .status()
         .with_context(|| format!("run {}", claude.display()))?;
     anyhow::ensure!(status.success(), "`claude mcp add` failed ({status})");
-    println!("wats registered in Claude Code (scope {scope}) with profile {profile}");
+    Ok(true)
+}
+
+/// `wats setup claude`.
+fn setup_claude(
+    args: &NodeArgs,
+    data_dir: &std::path::Path,
+    (mcp, agent): (bool, bool),
+    scope: &str,
+    claude: &std::path::Path,
+) -> Result<()> {
+    let (mcp, agent) = if mcp || agent {
+        (mcp, agent)
+    } else {
+        (true, true)
+    };
+    let settings = Settings::load(data_dir)?;
+    if mcp {
+        let profile = human_profile(args, &settings)?;
+        let changed = register_in_claude(args, &profile, scope, claude)?;
+        println!(
+            "Claude Code: wats MCP server {} (scope {scope}, profile {profile})",
+            if changed {
+                "registered"
+            } else {
+                "already registered"
+            }
+        );
+    }
+    if agent {
+        let mut file = ConfigFile::open(data_dir)?;
+        file.set("agent.runtime", "claude")?;
+        file.save()?;
+        println!(
+            "{}: agent.runtime = \"claude\"; `wats` now runs the node with a Claude agent",
+            file.path().display()
+        );
+    }
     Ok(())
 }
 
-/// Parse a duration: a number with an optional unit s, m or h (e.g. 30s,
-/// 5m, 2h; a bare number is seconds).
-fn parse_duration(s: &str) -> Result<std::time::Duration, String> {
-    let s = s.trim();
-    let split = s.find(|c: char| !c.is_ascii_digit()).unwrap_or(s.len());
-    let (number, unit) = s.split_at(split);
-    let n: u64 = number
-        .parse()
-        .map_err(|_| format!("invalid duration {s:?}: expected e.g. 30s, 5m or 2h"))?;
-    let secs = match unit {
-        "" | "s" => n,
-        "m" => n * 60,
-        "h" => n * 3600,
-        _ => return Err(format!("invalid duration unit in {s:?}: use s, m or h")),
-    };
-    if secs == 0 {
-        return Err("duration must be positive".into());
+/// `wats config get | set | unset | list`.
+fn config_command(data_dir: &std::path::Path, action: ConfigAction) -> Result<()> {
+    let mut file = ConfigFile::open(data_dir)?;
+    match action {
+        ConfigAction::Get { key } => {
+            let key = wats::settings::find_key(&key)?;
+            match file.get(key.name) {
+                Some(value) => println!("{value}"),
+                None => println!("{} (default)", key.default),
+            }
+        }
+        ConfigAction::Set { key, value } => {
+            file.set(&key, &value)?;
+            file.save()?;
+        }
+        ConfigAction::Unset { key } => {
+            if file.unset(&key)? {
+                file.save()?;
+            }
+        }
+        ConfigAction::List => {
+            println!("# {}", file.path().display());
+            for key in wats::settings::KEYS {
+                let value = match file.get(key.name) {
+                    Some(value) => value,
+                    None => format!("{} (default)", key.default),
+                };
+                println!("{:<26} {:<28} # {}", key.name, value, key.help);
+            }
+        }
     }
-    Ok(std::time::Duration::from_secs(secs))
+    Ok(())
 }
+
+use wats::settings::{ConfigFile, Settings, parse_duration, parse_size};
 
 fn print_id(config: &NodeConfig, host: &str) -> Result<()> {
     let (root, path, existed) = match &config.secret_file {
@@ -329,33 +508,6 @@ fn print_id(config: &NodeConfig, host: &str) -> Result<()> {
     println!("author_id: {author} (profile {})", config.profile);
     println!("bootstrap_entry: {endpoint}@{host}:{port}");
     Ok(())
-}
-
-/// Parse a byte size: a number with an optional binary suffix K, M, G or T
-/// (also KiB, MB...), e.g. `512M`, `20G`, `1048576`.
-fn parse_size(s: &str) -> Result<u64, String> {
-    let s = s.trim();
-    let split = s.find(|c: char| !c.is_ascii_digit()).unwrap_or(s.len());
-    let (number, unit) = s.split_at(split);
-    let number: u64 = number
-        .parse()
-        .map_err(|_| format!("invalid size {s:?}: expected e.g. 512M or 20G"))?;
-    let shift = match unit
-        .trim()
-        .to_ascii_uppercase()
-        .trim_end_matches("IB")
-        .trim_end_matches('B')
-    {
-        "" => 0,
-        "K" => 10,
-        "M" => 20,
-        "G" => 30,
-        "T" => 40,
-        _ => return Err(format!("invalid size unit in {s:?}: use K, M, G or T")),
-    };
-    number
-        .checked_mul(1u64 << shift)
-        .ok_or_else(|| format!("size {s:?} is too large"))
 }
 
 fn default_dir() -> Result<PathBuf> {
@@ -387,33 +539,57 @@ impl NodeArgs {
         }
     }
 
-    fn config(&self) -> Result<NodeConfig> {
-        let dir = match &self.dir {
-            Some(dir) => dir.clone(),
-            None => default_dir()?,
-        };
-        let mut config = NodeConfig::new(dir);
+    fn data_dir(&self) -> Result<PathBuf> {
+        match &self.dir {
+            Some(dir) => Ok(dir.clone()),
+            None => default_dir(),
+        }
+    }
+
+    /// The node configuration: flags and WATS_* variables, then
+    /// config.toml, then defaults.
+    fn config(&self, file: &Settings) -> Result<NodeConfig> {
+        let mut config = NodeConfig::new(self.data_dir()?);
+        let no_default_bootstrap =
+            self.no_default_bootstrap || file.no_default_bootstrap.unwrap_or(false);
         if self.loopback {
             config.mode = NetworkMode::Loopback;
-        } else if !self.no_default_bootstrap {
+        } else if !no_default_bootstrap {
             config.bootstrap = wats::bootstrap::defaults();
         }
-        for entry in &self.bootstrap {
+        let bootstrap = if self.bootstrap.is_empty() {
+            &file.bootstrap
+        } else {
+            &self.bootstrap
+        };
+        for entry in bootstrap {
             config.bootstrap.push(
                 entry
                     .parse()
                     .with_context(|| format!("invalid bootstrap entry {entry:?}"))?,
             );
         }
-        config.port = self.port;
-        if let Some(infra) = &self.infra {
+        config.port = self.port.or(file.port);
+        if let Some(infra) = self.infra.as_ref().or(file.infra.as_ref()) {
             config.infra = infra.parse()?;
         }
         config.secret_file = self.secret_file.as_ref().map(PathBuf::from);
-        if let Some(size) = self.max_blob_size {
+        let file_size = |value: &Option<String>, what: &str| -> Result<Option<u64>> {
+            value
+                .as_deref()
+                .map(parse_size)
+                .transpose()
+                .map_err(|e| anyhow::anyhow!("config.toml {what}: {e}"))
+        };
+        if let Some(size) = self
+            .max_blob_size
+            .or(file_size(&file.max_blob_size, "max_blob_size")?)
+        {
             config.max_blob_bytes = size;
         }
-        config.blob_quota = self.blob_quota;
+        config.blob_quota = self
+            .blob_quota
+            .or(file_size(&file.blob_quota, "blob_quota")?);
         for addr in &self.external_addrs {
             config.external_addrs.push(
                 addr.parse()
@@ -436,7 +612,7 @@ impl NodeArgs {
         if let Some(bits) = self.min_pow_bits {
             config.min_pow_bits = bits;
         }
-        if let Some(profile) = &self.profile {
+        if let Some(profile) = self.profile.as_ref().or(file.profile.as_ref()) {
             anyhow::ensure!(
                 wats::node::is_valid_profile(profile),
                 "profile name must be 1-64 chars of [a-z0-9_-]"
@@ -508,7 +684,14 @@ fn spawn_background_node(args: &NodeArgs, dir: &std::path::Path, idle_exit: u64)
         .open(dir.join("node.log"))?;
     let child = std::process::Command::new(std::env::current_exe()?)
         .args(args.to_args(dir))
-        .args(["node", "--quiet", "--idle-exit", &idle_exit.to_string()])
+        // A node started for a session never runs the agents of config.toml.
+        .args([
+            "node",
+            "--quiet",
+            "--no-agent",
+            "--idle-exit",
+            &idle_exit.to_string(),
+        ])
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(log)
@@ -577,8 +760,10 @@ struct NodeRun {
     kind: String,
     tags: Vec<String>,
     blobs: Vec<PathBuf>,
-    quiet: bool,
+    /// Print what arrives as JSON lines on stdout (`wats node`).
+    json_lines: bool,
     idle_exit: Option<u64>,
+    agent: Option<wats::agent::AgentConfig>,
 }
 
 async fn run_node(node: Arc<Node>, run: NodeRun, mut shutdown: Shutdown) -> Result<()> {
@@ -590,9 +775,11 @@ async fn run_node(node: Arc<Node>, run: NodeRun, mut shutdown: Shutdown) -> Resu
         kind,
         tags,
         blobs,
-        quiet,
+        json_lines,
         idle_exit,
+        agent,
     } = run;
+    let quiet = !json_lines;
     let print_line = move |value: serde_json::Value| {
         if !quiet {
             print_line(value);
@@ -606,6 +793,13 @@ async fn run_node(node: Arc<Node>, run: NodeRun, mut shutdown: Shutdown) -> Resu
     let mut fetched = node.subscribe_fetched();
     let mut idle_since = tokio::time::Instant::now();
     let mut tick = tokio::time::interval(Duration::from_secs(1));
+    let (stop_agent, agent_stopped) = tokio::sync::watch::channel(false);
+    let agent = agent.map(|config| {
+        let mut stopped = agent_stopped;
+        tokio::spawn(wats::agent::run(Arc::clone(&node), config, async move {
+            let _ = stopped.wait_for(|stop| *stop).await;
+        }))
+    });
     if !quiet {
         print_line(json!({
             "type": "ready",
@@ -678,8 +872,229 @@ async fn run_node(node: Arc<Node>, run: NodeRun, mut shutdown: Shutdown) -> Resu
             _ = &mut shutdown => break,
         }
     }
+    if let Some(agent) = agent {
+        let _ = stop_agent.send(true);
+        match agent.await {
+            Ok(Err(e)) => tracing::warn!("agent runner: {e:#}"),
+            Err(e) => tracing::warn!("agent runner: {e}"),
+            Ok(Ok(())) => {}
+        }
+    }
     let _ = std::fs::remove_file(attach::socket_path(&node.config().data_dir));
     node.shutdown().await
+}
+
+/// The agent runner configuration: flags, then config.toml, then defaults.
+/// `None` when no agent is enabled.
+fn agent_config(
+    node_args: &NodeArgs,
+    args: &AgentArgs,
+    file: &wats::settings::AgentSettings,
+    data_dir: &std::path::Path,
+) -> Result<Option<wats::agent::AgentConfig>> {
+    let runtimes = if args.no_agent {
+        Vec::new()
+    } else if !args.agents.is_empty() {
+        args.agents.clone()
+    } else {
+        file.runtime.iter().cloned().collect()
+    };
+    // One runtime today (claude).
+    let Some(runtime) = runtimes.first().cloned() else {
+        return Ok(None);
+    };
+    let file_duration = |value: &Option<String>, what: &str| -> Result<Option<Duration>> {
+        value
+            .as_deref()
+            .map(parse_duration)
+            .transpose()
+            .map_err(|e| anyhow::anyhow!("config.toml agent.{what}: {e}"))
+    };
+    let profile = args
+        .agent_profile
+        .clone()
+        .or(file.profile.clone())
+        .unwrap_or_else(|| format!("{}-agent", os_user_profile()));
+    anyhow::ensure!(
+        wats::node::is_valid_profile(&profile),
+        "agent profile must be 1-64 chars of [a-z0-9_-]"
+    );
+    let allow = if args.allow.is_empty() {
+        file.allow.clone()
+    } else {
+        args.allow.clone()
+    };
+    for key in &allow {
+        wats::event::parse_hex::<32>(key, "allowed author id")?;
+    }
+    let heartbeat_text = match args.heartbeat_file.clone().or(file.heartbeat_file.clone()) {
+        Some(path) => {
+            std::fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?
+        }
+        None => wats::agent::DEFAULT_HEARTBEAT.to_string(),
+    };
+    let mut extra_args = match &args.agent_args {
+        Some(line) => line.split_whitespace().map(str::to_string).collect(),
+        None => file.args.clone(),
+    };
+    extra_args.extend(args.extra.iter().cloned());
+    // The agent's `wats mcp` attaches to this node through its socket.
+    let mut mcp_args: Vec<String> = node_args
+        .to_args(data_dir)
+        .into_iter()
+        .map(|a| a.to_string_lossy().into_owned())
+        .collect();
+    mcp_args.extend(["mcp".into(), "--profile".into(), profile.clone()]);
+    Ok(Some(wats::agent::AgentConfig {
+        runtime,
+        profile,
+        every: args
+            .every
+            .or(file_duration(&file.every, "every")?)
+            .unwrap_or(Duration::from_secs(30)),
+        heartbeat: args
+            .heartbeat
+            .or(file_duration(&file.heartbeat, "heartbeat")?)
+            .unwrap_or(Duration::from_secs(30 * 60)),
+        max_runs_per_hour: args
+            .max_runs_per_hour
+            .or(file.max_runs_per_hour)
+            .unwrap_or(12),
+        allow,
+        heartbeat_text,
+        command: args
+            .agent_command
+            .clone()
+            .or(file.command.clone())
+            .unwrap_or_else(|| "claude".into()),
+        mcp_command: std::env::current_exe()?,
+        mcp_args,
+        extra_args,
+        run_timeout: args
+            .run_timeout
+            .or(file_duration(&file.run_timeout, "run_timeout")?)
+            .unwrap_or(Duration::from_secs(10 * 60)),
+        work_dir: data_dir.join("agent"),
+        keep_runs: file.keep_runs.unwrap_or(200),
+        keep_days: file.keep_days.unwrap_or(30),
+    }))
+}
+
+/// `30s`, `5m`, `2h`, `90s`: the largest unit that divides evenly.
+fn short_duration(d: Duration) -> String {
+    match d.as_secs() {
+        s if s % 3600 == 0 => format!("{}h", s / 3600),
+        s if s % 60 == 0 => format!("{}m", s / 60),
+        s => format!("{s}s"),
+    }
+}
+
+/// What a foreground node prints on start (stderr: stdout may carry JSON).
+fn print_banner(config: &NodeConfig, agent: Option<&wats::agent::AgentConfig>) {
+    let home = std::env::home_dir();
+    let dir = match home
+        .as_deref()
+        .and_then(|h| config.data_dir.strip_prefix(h).ok())
+    {
+        Some(rest) => format!("~/{}", rest.display()),
+        None => config.data_dir.display().to_string(),
+    };
+    eprintln!(
+        "wats {} · data {dir} · infra {} · profile {}",
+        env!("CARGO_PKG_VERSION"),
+        config.infra,
+        config.profile
+    );
+    match agent {
+        Some(agent) => eprintln!(
+            "agent {}: on, posts as {} · wakes on asks and replies (every {} at most), heartbeat {} · watch it: wats agent logs -f",
+            agent.runtime,
+            agent.profile,
+            short_duration(agent.every),
+            short_duration(agent.heartbeat),
+        ),
+        None => eprintln!("agent: off (wats --agent claude, or wats setup claude)"),
+    }
+    eprintln!("Ctrl-C to stop · wats --help");
+}
+
+/// `wats agent logs | runs | attach`.
+async fn agent_watch(data_dir: &std::path::Path, action: AgentAction) -> Result<()> {
+    use std::io::IsTerminal;
+    use wats::runs;
+    let work_dir = data_dir.join("agent");
+    let style = runs::Style {
+        color: std::io::stdout().is_terminal(),
+    };
+    let mut out = std::io::stdout().lock();
+    let result = match action {
+        AgentAction::Runs { last, json } => {
+            let all = runs::list(&work_dir);
+            let shown = &all[all.len().saturating_sub(last)..];
+            if json {
+                shown.iter().try_for_each(|r| {
+                    writeln!(out, "{}", serde_json::to_string(r).unwrap_or_default())
+                })
+            } else if shown.is_empty() {
+                writeln!(out, "no agent runs yet in {}", work_dir.display())
+            } else {
+                let mut result = writeln!(
+                    out,
+                    "{:<32} {:<20} {:<10} {:>8} {:>6} {:>9}",
+                    "RUN", "STARTED", "STATUS", "SECONDS", "TURNS", "COST"
+                );
+                for r in shown {
+                    result = result.and_then(|()| {
+                        writeln!(
+                            out,
+                            "{:<32} {:<20} {:<10} {:>8} {:>6} {:>9}",
+                            r.id,
+                            runs::format_time(r.started),
+                            r.status,
+                            r.seconds.map(|s| format!("{s:.1}")).unwrap_or_default(),
+                            r.turns.map(|t| t.to_string()).unwrap_or_default(),
+                            r.cost_usd.map(|c| format!("${c:.4}")).unwrap_or_default(),
+                        )
+                    });
+                }
+                let cost: f64 = shown.iter().filter_map(|r| r.cost_usd).sum();
+                result.and_then(|()| writeln!(out, "{} runs, ${cost:.4} reported", shown.len()))
+            }
+        }
+        AgentAction::Logs { follow, run, last } => {
+            let ids = match &run {
+                Some(prefix) => vec![
+                    runs::find(&work_dir, prefix)
+                        .with_context(|| format!("no run {prefix:?} in {}", work_dir.display()))?,
+                ],
+                None => {
+                    let all = runs::run_ids(&work_dir);
+                    all[all.len().saturating_sub(last)..].to_vec()
+                }
+            };
+            let printed = runs::print_runs(&work_dir, &ids, style, &mut out);
+            if follow && printed.is_ok() {
+                let start = ids
+                    .last()
+                    .map(|id| (id.clone(), runs::transcript_len(&work_dir, id)));
+                runs::follow(&work_dir, start, style, &mut out).await
+            } else {
+                printed
+            }
+        }
+        AgentAction::Attach => {
+            let start = runs::current(&work_dir).map(|id| (id, 0));
+            if start.is_none() {
+                eprintln!("no run in progress; waiting for the next one (Ctrl-C to stop)");
+            }
+            runs::follow(&work_dir, start, style, &mut out).await
+        }
+    };
+    match result {
+        // `wats agent logs | head`
+        Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => Ok(()),
+        other => Ok(other?),
+    }
 }
 
 async fn run_mcp(node: Arc<Node>, mut shutdown: Shutdown) -> Result<()> {
@@ -737,125 +1152,68 @@ async fn main() -> Result<()> {
     let shutdown = shutdown_signal();
     let mut cli = Cli::parse();
     cli.node.normalize();
-    let config = cli.node.config()?;
+    let data_dir = cli.node.data_dir()?;
+    // Commands that work even when config.toml does not load.
     match cli.command {
-        Command::Node {
-            post,
-            title,
-            wait_peers,
-            wait_timeout,
-            kind,
-            tags,
-            blobs,
-            quiet,
-            idle_exit,
-        } => {
-            let node = Node::start(config).await?;
-            let run = NodeRun {
-                post,
-                title,
-                wait_peers,
-                wait_timeout,
-                kind,
-                tags,
-                blobs,
-                quiet,
-                idle_exit,
-            };
-            run_node(node, run, shutdown).await
-        }
-        #[cfg(unix)]
-        Command::Mcp {
-            action:
-                Some(McpAction::Add {
-                    target: AddTarget::Claude { scope, claude },
-                }),
-            ..
-        } => mcp_add_claude(&cli.node, &scope, &claude),
-        Command::Mcp {
+        Some(Command::Config { action }) => return config_command(&data_dir, action),
+        Some(Command::Agent { action }) => return agent_watch(&data_dir, action).await,
+        Some(Command::Setup {
+            tool:
+                SetupTool::Claude {
+                    mcp,
+                    agent,
+                    scope,
+                    claude,
+                },
+        }) => return setup_claude(&cli.node, &data_dir, (mcp, agent), &scope, &claude),
+        _ => {}
+    }
+    let settings = Settings::load(&data_dir)?;
+    let config = cli.node.config(&settings)?;
+    let (daemon, json_lines) = match cli.command {
+        None => (cli.daemon, false),
+        Some(Command::Node { daemon }) => (*daemon, true),
+        Some(Command::Mcp {
             idle_exit,
             in_process: false,
-            action: None,
-        } => mcp_attached(&cli.node, &config.data_dir, idle_exit).await,
-        Command::Mcp { .. } => run_mcp(Node::start(config).await?, shutdown).await,
-        Command::Id { host } => print_id(&config, &host),
-        Command::Agent {
-            runtime:
-                AgentRuntime::Claude(ClaudeAgentArgs {
-                    every,
-                    heartbeat,
-                    max_runs_per_hour,
-                    allow,
-                    heartbeat_file,
-                    command,
-                    run_timeout,
-                    extra,
-                }),
-        } => {
-            let mut config = config;
-            // The agent's posts are told apart from its human's.
-            config.profile = cli
-                .node
-                .profile
-                .clone()
-                .unwrap_or_else(|| format!("{}-agent", os_user_profile()));
-            for key in &allow {
-                wats::event::parse_hex::<32>(key, "--allow author id")?;
-            }
-            let heartbeat_text = match heartbeat_file {
-                Some(path) => std::fs::read_to_string(&path)
-                    .with_context(|| format!("read {}", path.display()))?,
-                None => wats::agent::DEFAULT_HEARTBEAT.to_string(),
-            };
-            let profile = config.profile.clone();
-            let data_dir = config.data_dir.clone();
-            // The agent's `wats mcp` attaches to this node through its socket.
-            let mut mcp_args: Vec<String> = cli
-                .node
-                .to_args(&data_dir)
-                .into_iter()
-                .map(|a| a.to_string_lossy().into_owned())
-                .collect();
-            mcp_args.extend(["mcp".into(), "--profile".into(), profile.clone()]);
-            let node = Node::start(config).await?;
-            let _sessions = attach::serve(Arc::clone(&node)).unwrap_or_else(|e| {
-                tracing::warn!("MCP sessions cannot attach to this node: {e:#}");
-                attach::Sessions::default()
-            });
-            let agent = wats::agent::AgentConfig {
-                profile,
-                every,
-                heartbeat,
-                max_runs_per_hour,
-                allow,
-                heartbeat_text,
-                command,
-                mcp_command: std::env::current_exe()?,
-                mcp_args,
-                extra_args: extra,
-                run_timeout,
-                work_dir: data_dir.join("agent"),
-            };
-            let result = wats::agent::run(Arc::clone(&node), agent, shutdown).await;
-            let _ = std::fs::remove_file(attach::socket_path(&data_dir));
-            node.shutdown().await?;
-            result
+        }) => return mcp_attached(&cli.node, &data_dir, idle_exit).await,
+        Some(Command::Mcp { .. }) => return run_mcp(Node::start(config).await?, shutdown).await,
+        Some(Command::Id { host }) => return print_id(&config, &host),
+        Some(Command::Config { .. } | Command::Agent { .. } | Command::Setup { .. }) => {
+            unreachable!("handled above")
+        }
+    };
+    let agent = agent_config(&cli.node, &daemon.agent, &settings.agent, &data_dir)?;
+    // `--agent claude` also makes sure Claude Code sees the swarm.
+    if daemon.agent.agents.iter().any(|a| a == "claude")
+        && let Some(agent) = &agent
+    {
+        let profile = human_profile(&cli.node, &settings)?;
+        // Not fatal: the agent itself does not need it (e.g. in a container).
+        match register_in_claude(&cli.node, &profile, "user", &agent.command) {
+            Ok(true) => eprintln!(
+                "wats registered in Claude Code (scope user, profile {profile}): \
+                 new Claude Code sessions see the swarm"
+            ),
+            Ok(false) => {}
+            Err(e) => tracing::warn!("could not register wats in Claude Code: {e:#}"),
         }
     }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::parse_size;
-
-    #[test]
-    fn sizes() {
-        assert_eq!(parse_size("1024"), Ok(1024));
-        assert_eq!(parse_size("512M"), Ok(512 << 20));
-        assert_eq!(parse_size("20G"), Ok(20 << 30));
-        assert_eq!(parse_size("20GiB"), Ok(20 << 30));
-        assert_eq!(parse_size("1 kb"), Ok(1024));
-        assert!(parse_size("ten").is_err());
-        assert!(parse_size("5X").is_err());
+    if !daemon.quiet {
+        print_banner(&config, agent.as_ref());
     }
+    let node = Node::start(config).await?;
+    let run = NodeRun {
+        post: daemon.post,
+        title: daemon.title,
+        wait_peers: daemon.wait_peers,
+        wait_timeout: daemon.wait_timeout,
+        kind: daemon.kind,
+        tags: daemon.tags,
+        blobs: daemon.blobs,
+        json_lines: json_lines && !daemon.quiet,
+        idle_exit: daemon.idle_exit,
+        agent,
+    };
+    run_node(node, run, shutdown).await
 }
