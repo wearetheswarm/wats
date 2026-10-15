@@ -24,8 +24,8 @@ Code: `crates/wats/src/node.rs`.
   difficulty. Configurable (`--pow-bits`, `--min-pow-bits`).
 - **Blob size limit** (SPEC §7 "threshold for blob-in-swarm vs external
   URL"): 256 MiB. Larger artifacts must be referenced by URL (SPEC §2.11).
-- **Blob fetching (spike only)**: a node fetches every blob ≤ the limit of
-  every event it receives. Replaced by replication k in Phase 1.
+- **Blob fetching (spike only)**: a node fetched every blob ≤ the limit of
+  every event it received. Superseded by replication k (ADR 0005).
 - **Transport modes**: `Internet` (Iroh N0 preset: public relays, DNS/pkarr
   address lookup, hole punching) and `Loopback` (127.0.0.1, no relays, no
   DNS) for tests.
@@ -46,7 +46,6 @@ Code: `crates/wats/src/node.rs`.
 
 ## Known limitations
 
-- Gossip only carries live messages: a node that is offline misses events
-  until a catch-up protocol exists (Phase 1).
+- Gossip only carries live messages; catch-up is ADR 0005.
 - A blob's real size is only known while downloading; a lying `size` field
   can make a node download up to the time limit. Quotas come in Phase 2.
