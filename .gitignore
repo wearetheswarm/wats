@@ -11,3 +11,6 @@ target/
 secret.key
 *.key
 /wats-router/
+
+# Local static builds (scripts/build-static.sh).
+/dist/
