@@ -6,6 +6,14 @@ name: release
 #
 #   release vX.Y.Z  ->  ghcr.io/wearetheswarm/wats:X.Y.Z and :sha-<short>
 #
+# It also attaches prebuilt binaries to the release (job `binaries`):
+#   wats-X.Y.Z-x86_64-unknown-linux-musl.tar.gz  static, any Linux / WSL
+#   wats-X.Y.Z-aarch64-apple-darwin.tar.gz       Apple silicon
+# each with a .sha256. Download: gh release download vX.Y.Z -R wearetheswarm/wats
+# Windows native and the cargo-dist installers come with the public launch
+# (installers need public releases). The macOS build costs ~10x minutes, once
+# per release.
+#
 # No `latest` tag: deployments pin a version (WATS_VERSION in the router .env).
 # linux/amd64 only (the OVH nodes). arm64 is a later option, on a native
 # arm64 runner rather than under QEMU, which would be slow and costly.
@@ -95,3 +103,78 @@ jobs:
             echo ""
             echo "Deploy it by setting WATS_VERSION=${VERSION} in the router .env (docs/deploy-bootstrap.md)."
           } >> "$GITHUB_STEP_SUMMARY"
+
+  binaries:
+    name: binary (${{ matrix.target }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+          - target: aarch64-apple-darwin
+            os: macos-latest
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Version
+        id: version
+        env:
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          version="${RELEASE_TAG#v}"
+          [ -n "$version" ] || version="$INPUT_VERSION"
+          crate="$(grep -m1 '^version = ' Cargo.toml | cut -d'"' -f2)"
+          if [ "$version" != "$crate" ]; then
+            echo "::error::version $version does not match Cargo.toml ($crate)"
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Install musl tools
+        if: contains(matrix.target, 'musl')
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq musl-tools
+
+      - name: Build
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          rustup target add "$TARGET"
+          cargo build --release --locked --target "$TARGET" -p wats
+
+      - name: Package
+        id: package
+        env:
+          TARGET: ${{ matrix.target }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          name="wats-$VERSION-$TARGET"
+          mkdir "$name"
+          cp "target/$TARGET/release/wats" LICENSE README.md "$name/"
+          tar -czf "$name.tar.gz" "$name"
+          shasum -a 256 "$name.tar.gz" > "$name.tar.gz.sha256"
+          cat "$name.tar.gz.sha256"
+          echo "name=$name" >> "$GITHUB_OUTPUT"
+
+      - name: Attach to the release
+        if: github.event_name == 'release'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.event.release.tag_name }}
+          NAME: ${{ steps.package.outputs.name }}
+        run: gh release upload "$TAG" "$NAME.tar.gz" "$NAME.tar.gz.sha256" --clobber
+
+      - name: Keep as a workflow artifact (manual runs)
+        if: github.event_name != 'release'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ${{ steps.package.outputs.name }}
+          path: |
+            ${{ steps.package.outputs.name }}.tar.gz
+            ${{ steps.package.outputs.name }}.tar.gz.sha256
+          retention-days: 7
