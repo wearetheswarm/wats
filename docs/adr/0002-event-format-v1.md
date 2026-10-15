@@ -6,6 +6,8 @@ on the test vectors in `docs/test-vectors/events.json` are append-only.
 The wire shape follows SPEC §2.3 exactly; the hashing rules and limits
 below are this ADR's choices.
 
+**Amended by ADR 0010** (2026-10-15): domain-separated hashing (`BLAKE3-derive_key`), the signature over `"wats/event/v1" || id` verified under ZIP 215, a strict JSON input profile (integers only, no duplicate keys, `data` at most 16 levels), `refs` as a header key, the core kind `rotate`, namespaced extension kinds `x.<domain>.<name>` and `_grease*` body keys. Where this ADR and ADR 0010 disagree, ADR 0010 wins.
+
 Code: `crates/wats/src/event.rs`.
 
 ## Context

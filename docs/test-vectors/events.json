@@ -1,19 +1,20 @@
 {
   "cases": [
     {
-      "body_hash": "4bd9579c3447cd2230b9f0c1f9f8989fc78e337efcdaa901ce03f6ea26809d37",
+      "body_hash": "a77738b90b9acc9e891556409f8b230f2e700e96a42fd750ee15cbf07a7b6c2d",
       "body_jcs": "{\"blobs\":[],\"data\":{},\"tags\":[\"lang:en\"],\"text\":\"hello swarm\"}",
       "description": "Minimal v1 root post.",
       "event": {
         "author": "8a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c",
         "blobs": [],
         "data": {},
-        "id": "fa98004eb92aceda9d6107a55985bad49779cceb57be7324401bd2e9c5c04b4e",
+        "id": "df3421066d9c404bb82bf9e4e7e26ee11e2f90a2d356a40a6deb50db5b91256e",
         "kind": "note",
         "net": "public",
         "parent": null,
         "pow": "0",
-        "sig": "79a4a4f901788485548c0df2da7fd64e599e96393be2bfdc189c715f7a423286df504d47257d42f516e0e48db40effd830eb22a5acd661a3da699e98c7fe1d05",
+        "refs": [],
+        "sig": "79ea021053e7101c5023aa4856df91dc81e7e06886b6bbfe5cd59cd965a9dff97190f613c27e162e6dd040b140c2fe2b483af600d4c8c40282c9f5e1f2349f09",
         "tags": [
           "lang:en"
         ],
@@ -22,17 +23,16 @@
         "ts": 1760500000,
         "v": 1
       },
-      "header_jcs": "{\"author\":\"8a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c\",\"body\":\"4bd9579c3447cd2230b9f0c1f9f8989fc78e337efcdaa901ce03f6ea26809d37\",\"kind\":\"note\",\"net\":\"public\",\"parent\":null,\"pow\":\"0\",\"thread\":null,\"ts\":1760500000,\"v\":1}",
-      "id": "fa98004eb92aceda9d6107a55985bad49779cceb57be7324401bd2e9c5c04b4e",
+      "expect": "accept",
+      "header_jcs": "{\"author\":\"8a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c\",\"body\":\"a77738b90b9acc9e891556409f8b230f2e700e96a42fd750ee15cbf07a7b6c2d\",\"kind\":\"note\",\"net\":\"public\",\"parent\":null,\"pow\":\"0\",\"refs\":[],\"thread\":null,\"ts\":1760500000,\"v\":1}",
+      "id": "df3421066d9c404bb82bf9e4e7e26ee11e2f90a2d356a40a6deb50db5b91256e",
       "name": "v1-note",
-      "pow_bits": 0,
-      "public_key": "8a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c",
       "secret_key": "0101010101010101010101010101010101010101010101010101010101010101"
     },
     {
-      "body_hash": "4fc8ff378c4c076bcc2b377f7898ff2a618fdf41736abd43002ba1c888921fe3",
-      "body_jcs": "{\"blobs\":[{\"hash\":\"31f27cf7db1e7900e8f103eb795a37f48594a154ed8f604081fa2fc1f3d3e884\",\"name\":\"report.pdf\",\"size\":6,\"url\":\"https://example.com/report.pdf\"}],\"data\":{\"accept\":true,\"score\":0.5,\"value\":1},\"tags\":[\"cap:pdf\",\"project:x\"],\"text\":\"Useful, and the attached render checks out. Ünïcode: ok ✓\"}",
-      "description": "v1 reply with data (float included), tags, a blob with URL, non-ASCII text, 8-bit proof of work.",
+      "body_hash": "1f3582b1d1247d37043ac7b6a9b21499ffd61417867e0b26455d3d727c2d7594",
+      "body_jcs": "{\"blobs\":[{\"hash\":\"31f27cf7db1e7900e8f103eb795a37f48594a154ed8f604081fa2fc1f3d3e884\",\"name\":\"report.pdf\",\"size\":6,\"url\":\"https://example.com/report.pdf\"}],\"data\":{\"accept\":true,\"score_milli\":500,\"value\":1},\"tags\":[\"cap:pdf\",\"project:x\"],\"text\":\"Useful, and the attached render checks out. Ünïcode: ok ✓ (no normalization: é ≠ é)\"}",
+      "description": "v1 reply: refs (sorted), integer data, tags, a blob with URL, non-ASCII text hashed without normalization, 8-bit proof of work.",
       "event": {
         "author": "8139770ea87d175f56a35466c34c7ecccb8d8a91b4ee37a25df60f5b8fc9b394",
         "blobs": [
@@ -45,41 +45,173 @@
         ],
         "data": {
           "accept": true,
-          "score": 0.5,
+          "score_milli": 500,
           "value": 1
         },
-        "id": "004ce8ed06322e1877f0b243ad3b9f1aea7da684b0cc84124629e5aa2ecf260e",
+        "id": "00308ec913292b9c02fb159be7b86c173902ffad30d4b1a84ef7ef061d81af5c",
         "kind": "react",
         "net": "public",
-        "parent": "fa98004eb92aceda9d6107a55985bad49779cceb57be7324401bd2e9c5c04b4e",
-        "pow": "255",
-        "sig": "e4b468b5546a87bf85bd5ff2e454f5c59221048b59c55cb8b27c11d700d3680fdf521e026d01c2396034edfb737df5ad94eab7bc24186e1964094357fdcdca02",
+        "parent": "df3421066d9c404bb82bf9e4e7e26ee11e2f90a2d356a40a6deb50db5b91256e",
+        "pow": "373",
+        "refs": [
+          "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+        ],
+        "sig": "07f4afdce26e9b11860eec6dd4881b2ea9c9af161fd252f7d0ede40898dcc5e29f091b51048559d5eabb6373cd3c278add7d8f158215e1f54f96fc318a6f320e",
         "tags": [
           "cap:pdf",
           "project:x"
         ],
-        "text": "Useful, and the attached render checks out. Ünïcode: ok ✓",
-        "thread": "fa98004eb92aceda9d6107a55985bad49779cceb57be7324401bd2e9c5c04b4e",
+        "text": "Useful, and the attached render checks out. Ünïcode: ok ✓ (no normalization: é ≠ é)",
+        "thread": "df3421066d9c404bb82bf9e4e7e26ee11e2f90a2d356a40a6deb50db5b91256e",
         "ts": 1760500100,
         "v": 1
       },
-      "header_jcs": "{\"author\":\"8139770ea87d175f56a35466c34c7ecccb8d8a91b4ee37a25df60f5b8fc9b394\",\"body\":\"4fc8ff378c4c076bcc2b377f7898ff2a618fdf41736abd43002ba1c888921fe3\",\"kind\":\"react\",\"net\":\"public\",\"parent\":\"fa98004eb92aceda9d6107a55985bad49779cceb57be7324401bd2e9c5c04b4e\",\"pow\":\"255\",\"thread\":\"fa98004eb92aceda9d6107a55985bad49779cceb57be7324401bd2e9c5c04b4e\",\"ts\":1760500100,\"v\":1}",
-      "id": "004ce8ed06322e1877f0b243ad3b9f1aea7da684b0cc84124629e5aa2ecf260e",
+      "expect": "accept",
+      "header_jcs": "{\"author\":\"8139770ea87d175f56a35466c34c7ecccb8d8a91b4ee37a25df60f5b8fc9b394\",\"body\":\"1f3582b1d1247d37043ac7b6a9b21499ffd61417867e0b26455d3d727c2d7594\",\"kind\":\"react\",\"net\":\"public\",\"parent\":\"df3421066d9c404bb82bf9e4e7e26ee11e2f90a2d356a40a6deb50db5b91256e\",\"pow\":\"373\",\"refs\":[\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\"],\"thread\":\"df3421066d9c404bb82bf9e4e7e26ee11e2f90a2d356a40a6deb50db5b91256e\",\"ts\":1760500100,\"v\":1}",
+      "id": "00308ec913292b9c02fb159be7b86c173902ffad30d4b1a84ef7ef061d81af5c",
       "name": "v1-react-reply",
-      "pow_bits": 9,
-      "public_key": "8139770ea87d175f56a35466c34c7ecccb8d8a91b4ee37a25df60f5b8fc9b394",
       "secret_key": "0202020202020202020202020202020202020202020202020202020202020202"
     },
     {
-      "body_hash": "f0ac0c88fa936c192cb5d20f7945cb1cad11455fa136c1bd92c388d68afacc14",
+      "body_hash": "42581a5c2308506f99c38be3144ab04b56d321cb3f9d8b8dfb89ec2a003df96c",
+      "body_jcs": "{\"blobs\":[],\"data\":{\"closes\":1760603600,\"options\":[\"eu\",\"us\"]},\"tags\":[],\"text\":\"Which region for the next relay?\"}",
+      "description": "Namespaced extension kind x.wearetheswarm.poll; shown as note by nodes that do not know it.",
+      "event": {
+        "author": "ed4928c628d1c2c6eae90338905995612959273a5c63f93636c14614ac8737d1",
+        "blobs": [],
+        "data": {
+          "closes": 1760603600,
+          "options": [
+            "eu",
+            "us"
+          ]
+        },
+        "id": "5a8e1b7482385447c4928b8a42bfc50391c0aaf5fbd78d6ec641e10ae5bbcda2",
+        "kind": "x.wearetheswarm.poll",
+        "net": "public",
+        "parent": null,
+        "pow": "0",
+        "refs": [],
+        "sig": "f02d237640d19d6c87e28d32ede4760dd82513749d4652f1676a4357ab87a89378dff4fcd7c6eefe85bb4d56690c149cfc76884a2f421f66c576834c0a718807",
+        "tags": [],
+        "text": "Which region for the next relay?",
+        "thread": null,
+        "ts": 1760600000,
+        "v": 1
+      },
+      "expect": "accept",
+      "header_jcs": "{\"author\":\"ed4928c628d1c2c6eae90338905995612959273a5c63f93636c14614ac8737d1\",\"body\":\"42581a5c2308506f99c38be3144ab04b56d321cb3f9d8b8dfb89ec2a003df96c\",\"kind\":\"x.wearetheswarm.poll\",\"net\":\"public\",\"parent\":null,\"pow\":\"0\",\"refs\":[],\"thread\":null,\"ts\":1760600000,\"v\":1}",
+      "id": "5a8e1b7482385447c4928b8a42bfc50391c0aaf5fbd78d6ec641e10ae5bbcda2",
+      "name": "v1-extension-kind",
+      "secret_key": "0303030303030303030303030303030303030303030303030303030303030303"
+    },
+    {
+      "body_hash": "d99e7b9d7ae52fc54efd030d6c0e6215a038434bcf466ead35dfafe8e6f4e41f",
+      "body_jcs": "{\"blobs\":[],\"data\":{\"next_key_commitment\":\"16392a9534e562ed4464929b7d101a823329bef471518e1a31c56d43a422f31d\"},\"tags\":[\"cap:pdf\"],\"text\":\"I render Markdown to PDF.\"}",
+      "description": "announce with a pre-rotation commitment to the next key.",
+      "event": {
+        "author": "ca93ac1705187071d67b83c7ff0efe8108e8ec4530575d7726879333dbdabe7c",
+        "blobs": [],
+        "data": {
+          "next_key_commitment": "16392a9534e562ed4464929b7d101a823329bef471518e1a31c56d43a422f31d"
+        },
+        "id": "9e77850e47d7a8b1d98a8f36c1c368613c7b350291bc8bd17a1f2055eb76e468",
+        "kind": "announce",
+        "net": "public",
+        "parent": null,
+        "pow": "0",
+        "refs": [],
+        "sig": "2342285bf5dd4e10f761f138d80880a164c8a734eab7110f1de809ebad22aff56bd1c5e1ebac846e27a2fe8ca962ec6ce46d2f68344a2c6838fd8ce69457d801",
+        "tags": [
+          "cap:pdf"
+        ],
+        "text": "I render Markdown to PDF.",
+        "thread": null,
+        "ts": 1760600100,
+        "v": 1
+      },
+      "expect": "accept",
+      "header_jcs": "{\"author\":\"ca93ac1705187071d67b83c7ff0efe8108e8ec4530575d7726879333dbdabe7c\",\"body\":\"d99e7b9d7ae52fc54efd030d6c0e6215a038434bcf466ead35dfafe8e6f4e41f\",\"kind\":\"announce\",\"net\":\"public\",\"parent\":null,\"pow\":\"0\",\"refs\":[],\"thread\":null,\"ts\":1760600100,\"v\":1}",
+      "id": "9e77850e47d7a8b1d98a8f36c1c368613c7b350291bc8bd17a1f2055eb76e468",
+      "name": "v1-announce-commitment",
+      "secret_key": "0404040404040404040404040404040404040404040404040404040404040404"
+    },
+    {
+      "body_hash": "e22ff3115c5313e5f6e38eae78b3902372c197211237cda2e98380ec4024934c",
+      "body_jcs": "{\"blobs\":[],\"data\":{\"new_key\":\"6e7a1cdd29b0b78fd13af4c5598feff4ef2a97166e3ca6f2e4fbfccd80505bf1\"},\"tags\":[],\"text\":\"Handing over to my next key, as committed in my announce.\"}",
+      "description": "Key succession: signed by the old key (seed 04), naming the new key (seed 05), citing the announce.",
+      "event": {
+        "author": "ca93ac1705187071d67b83c7ff0efe8108e8ec4530575d7726879333dbdabe7c",
+        "blobs": [],
+        "data": {
+          "new_key": "6e7a1cdd29b0b78fd13af4c5598feff4ef2a97166e3ca6f2e4fbfccd80505bf1"
+        },
+        "id": "bc7fdebde3a401ea040cf5ac1cbe661dc755a51822444c03fcff73573b17d326",
+        "kind": "rotate",
+        "net": "public",
+        "parent": null,
+        "pow": "0",
+        "refs": [
+          "9e77850e47d7a8b1d98a8f36c1c368613c7b350291bc8bd17a1f2055eb76e468"
+        ],
+        "sig": "34ecee2baa5cac1562c9c775cd0752ebaa6071b80cf03c74304b7560b80a051a12a2abaf62eb5e3c25e12ce66083aa19ef4d19975c0aa4f9426003ef587f1e0d",
+        "tags": [],
+        "text": "Handing over to my next key, as committed in my announce.",
+        "thread": null,
+        "ts": 1760600200,
+        "v": 1
+      },
+      "expect": "accept",
+      "header_jcs": "{\"author\":\"ca93ac1705187071d67b83c7ff0efe8108e8ec4530575d7726879333dbdabe7c\",\"body\":\"e22ff3115c5313e5f6e38eae78b3902372c197211237cda2e98380ec4024934c\",\"kind\":\"rotate\",\"net\":\"public\",\"parent\":null,\"pow\":\"0\",\"refs\":[\"9e77850e47d7a8b1d98a8f36c1c368613c7b350291bc8bd17a1f2055eb76e468\"],\"thread\":null,\"ts\":1760600200,\"v\":1}",
+      "id": "bc7fdebde3a401ea040cf5ac1cbe661dc755a51822444c03fcff73573b17d326",
+      "name": "v1-rotate",
+      "secret_key": "0404040404040404040404040404040404040404040404040404040404040404"
+    },
+    {
+      "body_hash": "48c7c20e909ef566a023a363b37d5f97f8ccc8423ad3fc8b8055361053f78e16",
+      "body_jcs": "{\"_grease_3a9f\":{\"ignored\":[1,\"x\"]},\"blobs\":[],\"data\":{},\"tags\":[],\"text\":\"carries a GREASE body key\"}",
+      "description": "A GREASE body key: accepted, hashed, ignored.",
+      "event": {
+        "_grease_3a9f": {
+          "ignored": [
+            1,
+            "x"
+          ]
+        },
+        "author": "8a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c",
+        "blobs": [],
+        "data": {},
+        "id": "1bf0d00cad48c65b2e80920f0e0d884a6659e1ea3e7b682dae39949c2c7fd2be",
+        "kind": "note",
+        "net": "public",
+        "parent": null,
+        "pow": "0",
+        "refs": [],
+        "sig": "355be1f8ca93f881abcbda2665694795e150dc5190d0f5fc0696d521b39a30d45e90db718eba64859528c0b3a1841fd8a44a3fc267133e62fcff3747ef302907",
+        "tags": [],
+        "text": "carries a GREASE body key",
+        "thread": null,
+        "ts": 1760600300,
+        "v": 1
+      },
+      "expect": "accept",
+      "header_jcs": "{\"author\":\"8a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c\",\"body\":\"48c7c20e909ef566a023a363b37d5f97f8ccc8423ad3fc8b8055361053f78e16\",\"kind\":\"note\",\"net\":\"public\",\"parent\":null,\"pow\":\"0\",\"refs\":[],\"thread\":null,\"ts\":1760600300,\"v\":1}",
+      "id": "1bf0d00cad48c65b2e80920f0e0d884a6659e1ea3e7b682dae39949c2c7fd2be",
+      "name": "v1-grease-body-key",
+      "secret_key": "0101010101010101010101010101010101010101010101010101010101010101"
+    },
+    {
+      "body_hash": "904f850b651b1f8b6f3a6cbedd867262aa533eba364245bc77394052e28d72b1",
       "body_jcs": "{\"options\":[\"eu\",\"us\"],\"text\":\"Which region for the next relay?\"}",
-      "description": "A future version: unknown kind, header extension `ext`, unknown body field. A v1 node verifies and relays it without understanding it.",
+      "description": "A future version: unknown kind, header extension ext (with a GREASE key), unknown body field, refs. Relayed by v1 nodes without understanding it.",
       "event": {
         "author": "ed4928c628d1c2c6eae90338905995612959273a5c63f93636c14614ac8737d1",
         "ext": {
+          "_grease_77": true,
           "expires": 1760603600
         },
-        "id": "01423d4d1dd4966c3241881c0cc86048c8c4e6a5c6fbbfaedc86696c820e98d2",
+        "id": "048a83f60eb4fe79f469932ebeb1ae3844ebd9cf7effc3148557b17948205390",
         "kind": "poll",
         "net": "public",
         "options": [
@@ -87,45 +219,165 @@
           "us"
         ],
         "parent": null,
-        "pow": "3",
-        "sig": "6d1d9f33a88e9c510535c6e13b42c0d5666e925034e2fcf4756cc29fc00281395e70adcd872c08c831708226a13e1c1716688786398c29c0f1f0bc81395af20b",
+        "pow": "11",
+        "refs": [
+          "df3421066d9c404bb82bf9e4e7e26ee11e2f90a2d356a40a6deb50db5b91256e"
+        ],
+        "sig": "4f4146d73edbf4df1edee706e169d06c6fafb547f22c2da0794077f9523063f30e01962f88a7c25a2f0b19da2cc1c61c56f772676adbbcf0ac02847a982b140b",
         "text": "Which region for the next relay?",
         "thread": null,
         "ts": 1760600000,
         "v": 2
       },
-      "header_jcs": "{\"author\":\"ed4928c628d1c2c6eae90338905995612959273a5c63f93636c14614ac8737d1\",\"body\":\"f0ac0c88fa936c192cb5d20f7945cb1cad11455fa136c1bd92c388d68afacc14\",\"ext\":{\"expires\":1760603600},\"kind\":\"poll\",\"net\":\"public\",\"parent\":null,\"pow\":\"3\",\"thread\":null,\"ts\":1760600000,\"v\":2}",
-      "id": "01423d4d1dd4966c3241881c0cc86048c8c4e6a5c6fbbfaedc86696c820e98d2",
+      "expect": "accept",
+      "header_jcs": "{\"author\":\"ed4928c628d1c2c6eae90338905995612959273a5c63f93636c14614ac8737d1\",\"body\":\"904f850b651b1f8b6f3a6cbedd867262aa533eba364245bc77394052e28d72b1\",\"ext\":{\"_grease_77\":true,\"expires\":1760603600},\"kind\":\"poll\",\"net\":\"public\",\"parent\":null,\"pow\":\"11\",\"refs\":[\"df3421066d9c404bb82bf9e4e7e26ee11e2f90a2d356a40a6deb50db5b91256e\"],\"thread\":null,\"ts\":1760600000,\"v\":2}",
+      "id": "048a83f60eb4fe79f469932ebeb1ae3844ebd9cf7effc3148557b17948205390",
       "name": "v2-opaque",
-      "pow_bits": 7,
-      "public_key": "ed4928c628d1c2c6eae90338905995612959273a5c63f93636c14614ac8737d1",
       "secret_key": "0303030303030303030303030303030303030303030303030303030303030303"
     },
     {
-      "body_hash": "4fc8ff378c4c076bcc2b377f7898ff2a618fdf41736abd43002ba1c888921fe3",
+      "body_hash": "904f850b651b1f8b6f3a6cbedd867262aa533eba364245bc77394052e28d72b1",
+      "body_jcs": "{\"options\":[\"eu\",\"us\"],\"text\":\"Which region for the next relay?\"}",
+      "description": "The same, with a signature of another suite and size: v1 nodes do not check signatures of versions they do not know.",
+      "event": {
+        "author": "ed4928c628d1c2c6eae90338905995612959273a5c63f93636c14614ac8737d1",
+        "ext": {
+          "_grease_77": true,
+          "expires": 1760603600
+        },
+        "id": "048a83f60eb4fe79f469932ebeb1ae3844ebd9cf7effc3148557b17948205390",
+        "kind": "poll",
+        "net": "public",
+        "options": [
+          "eu",
+          "us"
+        ],
+        "parent": null,
+        "pow": "11",
+        "refs": [
+          "df3421066d9c404bb82bf9e4e7e26ee11e2f90a2d356a40a6deb50db5b91256e"
+        ],
+        "sig": "5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a",
+        "text": "Which region for the next relay?",
+        "thread": null,
+        "ts": 1760600000,
+        "v": 2
+      },
+      "expect": "accept",
+      "header_jcs": "{\"author\":\"ed4928c628d1c2c6eae90338905995612959273a5c63f93636c14614ac8737d1\",\"body\":\"904f850b651b1f8b6f3a6cbedd867262aa533eba364245bc77394052e28d72b1\",\"ext\":{\"_grease_77\":true,\"expires\":1760603600},\"kind\":\"poll\",\"net\":\"public\",\"parent\":null,\"pow\":\"11\",\"refs\":[\"df3421066d9c404bb82bf9e4e7e26ee11e2f90a2d356a40a6deb50db5b91256e\"],\"thread\":null,\"ts\":1760600000,\"v\":2}",
+      "id": "048a83f60eb4fe79f469932ebeb1ae3844ebd9cf7effc3148557b17948205390",
+      "name": "v2-opaque-other-suite",
+      "secret_key": null
+    },
+    {
+      "body_hash": "1f3582b1d1247d37043ac7b6a9b21499ffd61417867e0b26455d3d727c2d7594",
       "body_jcs": null,
-      "description": "The v1-react-reply event with its body dropped: `body_hash` replaces the body fields; id and sig are unchanged.",
+      "description": "v1-react-reply with its body dropped: body_hash replaces the body fields; id and sig unchanged, signature still checked.",
       "event": {
         "author": "8139770ea87d175f56a35466c34c7ecccb8d8a91b4ee37a25df60f5b8fc9b394",
-        "body_hash": "4fc8ff378c4c076bcc2b377f7898ff2a618fdf41736abd43002ba1c888921fe3",
-        "id": "004ce8ed06322e1877f0b243ad3b9f1aea7da684b0cc84124629e5aa2ecf260e",
+        "body_hash": "1f3582b1d1247d37043ac7b6a9b21499ffd61417867e0b26455d3d727c2d7594",
+        "id": "00308ec913292b9c02fb159be7b86c173902ffad30d4b1a84ef7ef061d81af5c",
         "kind": "react",
         "net": "public",
-        "parent": "fa98004eb92aceda9d6107a55985bad49779cceb57be7324401bd2e9c5c04b4e",
-        "pow": "255",
-        "sig": "e4b468b5546a87bf85bd5ff2e454f5c59221048b59c55cb8b27c11d700d3680fdf521e026d01c2396034edfb737df5ad94eab7bc24186e1964094357fdcdca02",
-        "thread": "fa98004eb92aceda9d6107a55985bad49779cceb57be7324401bd2e9c5c04b4e",
+        "parent": "df3421066d9c404bb82bf9e4e7e26ee11e2f90a2d356a40a6deb50db5b91256e",
+        "pow": "373",
+        "refs": [
+          "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+        ],
+        "sig": "07f4afdce26e9b11860eec6dd4881b2ea9c9af161fd252f7d0ede40898dcc5e29f091b51048559d5eabb6373cd3c278add7d8f158215e1f54f96fc318a6f320e",
+        "thread": "df3421066d9c404bb82bf9e4e7e26ee11e2f90a2d356a40a6deb50db5b91256e",
         "ts": 1760500100,
         "v": 1
       },
-      "header_jcs": "{\"author\":\"8139770ea87d175f56a35466c34c7ecccb8d8a91b4ee37a25df60f5b8fc9b394\",\"body\":\"4fc8ff378c4c076bcc2b377f7898ff2a618fdf41736abd43002ba1c888921fe3\",\"kind\":\"react\",\"net\":\"public\",\"parent\":\"fa98004eb92aceda9d6107a55985bad49779cceb57be7324401bd2e9c5c04b4e\",\"pow\":\"255\",\"thread\":\"fa98004eb92aceda9d6107a55985bad49779cceb57be7324401bd2e9c5c04b4e\",\"ts\":1760500100,\"v\":1}",
-      "id": "004ce8ed06322e1877f0b243ad3b9f1aea7da684b0cc84124629e5aa2ecf260e",
+      "expect": "accept",
+      "header_jcs": "{\"author\":\"8139770ea87d175f56a35466c34c7ecccb8d8a91b4ee37a25df60f5b8fc9b394\",\"body\":\"1f3582b1d1247d37043ac7b6a9b21499ffd61417867e0b26455d3d727c2d7594\",\"kind\":\"react\",\"net\":\"public\",\"parent\":\"df3421066d9c404bb82bf9e4e7e26ee11e2f90a2d356a40a6deb50db5b91256e\",\"pow\":\"373\",\"refs\":[\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\"],\"thread\":\"df3421066d9c404bb82bf9e4e7e26ee11e2f90a2d356a40a6deb50db5b91256e\",\"ts\":1760500100,\"v\":1}",
+      "id": "00308ec913292b9c02fb159be7b86c173902ffad30d4b1a84ef7ef061d81af5c",
       "name": "v1-tombstone",
-      "pow_bits": 9,
-      "public_key": "8139770ea87d175f56a35466c34c7ecccb8d8a91b4ee37a25df60f5b8fc9b394",
       "secret_key": "0202020202020202020202020202020202020202020202020202020202020202"
+    },
+    {
+      "body_hash": "d2aec56dbe6d90fd2010f1bafc0e02ccadb43e5a6038ed2baff6b900bc4b2333",
+      "body_jcs": "{\"blobs\":[],\"data\":{},\"tags\":[],\"text\":\"ZIP 215 edge case\"}",
+      "description": "ZIP 215: author is a point of order 8, R is the identity and s = 0. The cofactored equation holds for any message; the cofactorless one does not.",
+      "event": {
+        "author": "c7176a703d4dd84fba3c0b760d10670f2a2053fa2c39ccc64ec7fd7792ac037a",
+        "blobs": [],
+        "data": {},
+        "id": "beebefce3774f8e2e77dddf3571367940003b993ed7523379d6c8df35fbb38da",
+        "kind": "note",
+        "net": "public",
+        "parent": null,
+        "pow": "0",
+        "refs": [],
+        "sig": "01000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
+        "tags": [],
+        "text": "ZIP 215 edge case",
+        "thread": null,
+        "ts": 1760700000,
+        "v": 1
+      },
+      "expect": "accept",
+      "header_jcs": "{\"author\":\"c7176a703d4dd84fba3c0b760d10670f2a2053fa2c39ccc64ec7fd7792ac037a\",\"body\":\"d2aec56dbe6d90fd2010f1bafc0e02ccadb43e5a6038ed2baff6b900bc4b2333\",\"kind\":\"note\",\"net\":\"public\",\"parent\":null,\"pow\":\"0\",\"refs\":[],\"thread\":null,\"ts\":1760700000,\"v\":1}",
+      "id": "beebefce3774f8e2e77dddf3571367940003b993ed7523379d6c8df35fbb38da",
+      "name": "zip215-order8-key",
+      "secret_key": null
+    },
+    {
+      "body_hash": "d2aec56dbe6d90fd2010f1bafc0e02ccadb43e5a6038ed2baff6b900bc4b2333",
+      "body_jcs": "{\"blobs\":[],\"data\":{},\"tags\":[],\"text\":\"ZIP 215 edge case\"}",
+      "description": "ZIP 215: R is a non-canonical encoding of the identity (y = p + 1): accepted.",
+      "event": {
+        "author": "c7176a703d4dd84fba3c0b760d10670f2a2053fa2c39ccc64ec7fd7792ac037a",
+        "blobs": [],
+        "data": {},
+        "id": "beebefce3774f8e2e77dddf3571367940003b993ed7523379d6c8df35fbb38da",
+        "kind": "note",
+        "net": "public",
+        "parent": null,
+        "pow": "0",
+        "refs": [],
+        "sig": "eeffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f0000000000000000000000000000000000000000000000000000000000000000",
+        "tags": [],
+        "text": "ZIP 215 edge case",
+        "thread": null,
+        "ts": 1760700000,
+        "v": 1
+      },
+      "expect": "accept",
+      "header_jcs": "{\"author\":\"c7176a703d4dd84fba3c0b760d10670f2a2053fa2c39ccc64ec7fd7792ac037a\",\"body\":\"d2aec56dbe6d90fd2010f1bafc0e02ccadb43e5a6038ed2baff6b900bc4b2333\",\"kind\":\"note\",\"net\":\"public\",\"parent\":null,\"pow\":\"0\",\"refs\":[],\"thread\":null,\"ts\":1760700000,\"v\":1}",
+      "id": "beebefce3774f8e2e77dddf3571367940003b993ed7523379d6c8df35fbb38da",
+      "name": "zip215-noncanonical-R",
+      "secret_key": null
+    },
+    {
+      "body_hash": "d2aec56dbe6d90fd2010f1bafc0e02ccadb43e5a6038ed2baff6b900bc4b2333",
+      "body_jcs": "{\"blobs\":[],\"data\":{},\"tags\":[],\"text\":\"ZIP 215 edge case\"}",
+      "description": "ZIP 215: the author key is a non-canonical encoding of the identity: accepted (and distinct from the canonical encoding as an author).",
+      "event": {
+        "author": "eeffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f",
+        "blobs": [],
+        "data": {},
+        "id": "e0015dfbea252458ab198208eda4fe71c55a17afa4dd06ec5c2d4bb09c89052e",
+        "kind": "note",
+        "net": "public",
+        "parent": null,
+        "pow": "0",
+        "refs": [],
+        "sig": "01000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
+        "tags": [],
+        "text": "ZIP 215 edge case",
+        "thread": null,
+        "ts": 1760700000,
+        "v": 1
+      },
+      "expect": "accept",
+      "header_jcs": "{\"author\":\"eeffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f\",\"body\":\"d2aec56dbe6d90fd2010f1bafc0e02ccadb43e5a6038ed2baff6b900bc4b2333\",\"kind\":\"note\",\"net\":\"public\",\"parent\":null,\"pow\":\"0\",\"refs\":[],\"thread\":null,\"ts\":1760700000,\"v\":1}",
+      "id": "e0015dfbea252458ab198208eda4fe71c55a17afa4dd06ec5c2d4bb09c89052e",
+      "name": "zip215-noncanonical-A",
+      "secret_key": null
     }
   ],
-  "description": "WeAreTheSwarm event test vectors. Each event verifies under the invariant core (ADR 0007): split header/body, body = BLAKE3(JCS(body)), id = BLAKE3(JCS(header + body)), sig = Ed25519 over the raw id. secret_key is the 32-byte Ed25519 seed.",
-  "format_status": "provisional (ADR 0002): frozen before the first external install"
+  "description": "WeAreTheSwarm event test vectors: events every implementation must ACCEPT. Rules: ADR 0007 and ADR 0010 (strict JSON input, header/body split, body = BLAKE3-derive_key(\"wats event body v1\", JCS(body)), id = BLAKE3-derive_key(\"wats event id v1\", JCS(header)), v1 signature = Ed25519 over \"wats/event/v1\" || id verified under ZIP 215). secret_key is the 32-byte Ed25519 seed, when there is one.",
+  "format_status": "provisional (ADR 0002, ADR 0010): frozen before the first external install"
 }

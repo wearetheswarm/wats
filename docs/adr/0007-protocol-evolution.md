@@ -4,6 +4,18 @@ Status: Provisional (2026-10-15). The invariant core below becomes Frozen
 together with ADR 0002, before the first external install. Answers SPEC §7
 bis "Protocol evolution".
 
+**Amended by ADR 0010** (2026-10-15):
+
+- The core hashes with `BLAKE3-derive_key` contexts.
+- Input is parsed under a strict JSON profile.
+- `refs` is a core header key.
+- The kind token is `[a-z0-9._-]{1,64}`.
+- `author` and `sig` are hex of any length.
+- **The signature is not checked for versions whose suite the node does not know**: one suite per version.
+- `_grease*` names are reserved.
+
+Where this ADR and ADR 0010 disagree, ADR 0010 wins.
+
 Code: `crates/wats/src/wire.rs`, `crates/wats/src/proto.rs`,
 `crates/wats/src/node.rs`, `crates/wats/src/store.rs`.
 

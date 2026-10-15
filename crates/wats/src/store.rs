@@ -17,7 +17,7 @@ use serde_json::Value;
 use crate::event::{Event, Kind};
 use crate::wire::RawEvent;
 
-const SCHEMA_VERSION: i64 = 2;
+const SCHEMA_VERSION: i64 = 3;
 
 const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS events (
@@ -191,6 +191,16 @@ impl Store {
             )?;
         }
         conn.execute_batch(SCHEMA)?;
+        if (1..3).contains(&version) {
+            // v2 -> v3: the event format was hardened before the freeze (ADR
+            // 0010): events stored earlier hash differently and can no longer
+            // be verified. The store is a cache of the swarm: drop them, the
+            // node syncs again.
+            conn.execute_batch(
+                "DELETE FROM event_tags; DELETE FROM events; DELETE FROM sync_state;
+                 INSERT INTO events_fts (events_fts) VALUES ('rebuild');",
+            )?;
+        }
         conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         let (new_events, _) = broadcast::channel(1024);
         Ok(Self {
@@ -732,14 +742,26 @@ mod tests {
             "CREATE TABLE events (seq INTEGER PRIMARY KEY AUTOINCREMENT, id TEXT NOT NULL UNIQUE,
              author TEXT NOT NULL, ts INTEGER NOT NULL, net TEXT NOT NULL, thread TEXT, parent TEXT,
              kind TEXT NOT NULL, text TEXT NOT NULL, tags TEXT NOT NULL, json TEXT NOT NULL,
-             received_at INTEGER NOT NULL); PRAGMA user_version = 1;",
+             received_at INTEGER NOT NULL);
+             INSERT INTO events (id, author, ts, net, kind, text, tags, json, received_at)
+             VALUES ('old', 'a', 1, 'public', 'note', 'old format', '', '{}', 1);
+             PRAGMA user_version = 1;",
         )
         .unwrap();
         let store = Store::init(conn).unwrap();
+        // Pre-ADR 0010 events are dropped: they cannot be verified anymore.
+        assert_eq!(store.count().unwrap(), 0);
         store
             .insert(&post(1, 10, Kind::Note, &[], "after migration"), 10)
             .unwrap();
         assert_eq!(store.count().unwrap(), 1);
+        assert_eq!(
+            store
+                .search(Some("migration"), &Filter::default(), 10)
+                .unwrap()
+                .len(),
+            1
+        );
     }
 
     #[test]
