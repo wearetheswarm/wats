@@ -102,6 +102,14 @@ pub struct Attachment {
     pub name: Option<String>,
 }
 
+pub fn is_valid_profile(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 64
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_' || b == b'-')
+}
+
 pub fn now_secs() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -120,6 +128,7 @@ pub struct Node {
     blobs: FsStore,
     downloader: Downloader,
     store: Arc<Store>,
+    root: RootSecret,
     author: SigningKey,
     lookup: MemoryLookup,
     senders: HashMap<String, GossipSender>,
@@ -161,7 +170,6 @@ impl Node {
         let root = RootSecret::load_or_create(&config.data_dir.join("secret.key"))?;
         let author = root.profile_key(&config.profile);
         let secret = SecretKey::from_bytes(&root.transport_key_bytes());
-        drop(root);
 
         let lookup = MemoryLookup::new();
         let builder = match config.mode {
@@ -209,6 +217,7 @@ impl Node {
             blobs,
             downloader,
             store,
+            root,
             author,
             lookup,
             senders,
@@ -229,6 +238,20 @@ impl Node {
 
     pub fn endpoint_id(&self) -> EndpointId {
         self.endpoint().id()
+    }
+
+    /// Author key of a profile (SPEC §2.2). Profile names are 1-64 chars of
+    /// `[a-z0-9_-]`.
+    pub fn author_key(&self, profile: &str) -> Result<SigningKey> {
+        if !is_valid_profile(profile) {
+            bail!("profile name must be 1-64 chars of [a-z0-9_-]");
+        }
+        Ok(self.root.profile_key(profile))
+    }
+
+    /// Author key of the configured default profile.
+    pub fn default_author(&self) -> &SigningKey {
+        &self.author
     }
 
     pub fn author_id(&self) -> String {
@@ -339,13 +362,24 @@ impl Node {
         Ok(())
     }
 
-    /// Sign, store and broadcast a post.
-    pub async fn publish(&self, mut draft: Draft, attachments: &[Attachment]) -> Result<Event> {
+    /// Sign with the default profile, store and broadcast a post.
+    pub async fn publish(&self, draft: Draft, attachments: &[Attachment]) -> Result<Event> {
+        self.publish_as(&self.author.clone(), draft, attachments)
+            .await
+    }
+
+    /// Sign with `key`, store and broadcast a post.
+    pub async fn publish_as(
+        &self,
+        key: &SigningKey,
+        mut draft: Draft,
+        attachments: &[Attachment],
+    ) -> Result<Event> {
         let Some(sender) = self.senders.get(&draft.net) else {
             bail!("this node has not joined network {:?}", draft.net);
         };
         draft.blobs.extend(self.import(attachments).await?);
-        let key = self.author.clone();
+        let key = key.clone();
         let pow_bits = self.config.pow_bits;
         let ts = now_secs();
         let event = tokio::task::spawn_blocking(move || draft.sign(&key, ts, pow_bits)).await??;
@@ -373,6 +407,64 @@ impl Node {
             return Ok(None);
         }
         Ok(Some(self.blobs.get_bytes(hash).await?))
+    }
+
+    /// Current gossip neighbors, across networks.
+    pub fn neighbors(&self) -> Vec<EndpointId> {
+        let mut all: Vec<EndpointId> = self
+            .neighbors
+            .lock()
+            .map(|n| n.values().flatten().copied().collect())
+            .unwrap_or_default();
+        all.sort();
+        all.dedup();
+        all
+    }
+
+    /// Make a blob local (downloading it from known peers if needed), then
+    /// export it with [`Node::export_blob`].
+    pub async fn fetch_and_export(&self, blob: &BlobRef) -> Result<Option<PathBuf>> {
+        if blob.size > self.config.max_blob_bytes {
+            bail!(
+                "blob is larger than this node's {} byte limit",
+                self.config.max_blob_bytes
+            );
+        }
+        let hash: Hash = blob.hash.parse()?;
+        if !self.blobs.has(hash).await? {
+            let providers = self.neighbors();
+            if providers.is_empty() {
+                return Ok(None);
+            }
+            self.fetch_blob(blob, providers).await;
+        }
+        self.export_blob(blob).await
+    }
+
+    /// Copy a complete local blob to `<data dir>/inbox/<hash>/<name>`,
+    /// read-only, and return the path. Received files are untrusted data:
+    /// they are exported for reading, never executed (SPEC §2.11, §2.15).
+    pub async fn export_blob(&self, blob: &BlobRef) -> Result<Option<PathBuf>> {
+        if !is_safe_blob_name(&blob.name) {
+            bail!("unsafe blob name {:?}", blob.name);
+        }
+        let hash: Hash = blob.hash.parse()?;
+        if !self.blobs.has(hash).await? {
+            return Ok(None);
+        }
+        let dir = std::path::absolute(self.config.data_dir.join("inbox").join(hash.to_hex()))?;
+        let path = dir.join(&blob.name);
+        if tokio::fs::try_exists(&path).await? {
+            return Ok(Some(path));
+        }
+        tokio::fs::create_dir_all(&dir).await?;
+        let tmp = dir.join(format!(".{}.part", hash.to_hex()));
+        self.blobs.export(hash, &tmp).await?;
+        let mut perms = tokio::fs::metadata(&tmp).await?.permissions();
+        perms.set_readonly(true);
+        tokio::fs::set_permissions(&tmp, perms).await?;
+        tokio::fs::rename(&tmp, &path).await?;
+        Ok(Some(path))
     }
 
     async fn receive_loop(self: Arc<Self>, net: String, mut receiver: GossipReceiver) {
