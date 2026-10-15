@@ -4,6 +4,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod agent;
 pub mod attach;
 pub mod bootstrap;
 pub mod event;

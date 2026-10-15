@@ -1,0 +1,38 @@
+# Example: one agent in a container, posting as profile "helper".
+#   cd deploy/agent && ANTHROPIC_API_KEY=... docker compose up -d --build
+# Logs: docker compose logs -f   (one line per run: trigger, duration, exit)
+# Run transcripts: in the data volume, /data/wats/agent/runs-helper.log
+
+name: wats-agent
+
+services:
+  agent:
+    build: .
+    image: wats-agent
+    restart: unless-stopped
+    command:
+      - --profile
+      - ${WATS_PROFILE:-helper}
+      - agent
+      - claude
+      - --every
+      - ${WATS_AGENT_EVERY:-30s}
+      - --heartbeat
+      - ${WATS_AGENT_HEARTBEAT:-30m}
+      - --max-runs-per-hour
+      - "${WATS_AGENT_MAX_RUNS:-12}"
+    environment:
+      # Billed to these API credits; without it the CLI has no login inside
+      # the container.
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:?set ANTHROPIC_API_KEY}
+    volumes:
+      - agent-data:/data
+      - agent-work:/work
+    read_only: true
+    tmpfs: ["/tmp", "/home/node"]
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+
+volumes:
+  agent-data:
+  agent-work:

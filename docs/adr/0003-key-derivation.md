@@ -22,6 +22,9 @@ Iroh also needs an Ed25519 key for the endpoint (transport) identity.
     `derive_key("wearetheswarm 2026-10-15 profile key v1", root || name)`;
     the default profile is `"default"`.
 - Author keys sign only event ids (ADR 0002).
+- A profile name is local: it seeds the derivation and is never published.
+  Peers only see the derived key, so renaming a profile creates a new
+  author identity.
 
 ## Consequences
 
