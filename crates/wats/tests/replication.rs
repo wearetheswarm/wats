@@ -323,3 +323,51 @@ async fn blobs_must_match_their_declared_size() -> anyhow::Result<()> {
     a.shutdown().await?;
     Ok(())
 }
+
+/// Exporting a blob never follows a symlink planted in the inbox
+/// (security review D).
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn blob_export_never_follows_symlinks() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let data = dir.path().join("a");
+    let a = node(&data, &[], 3).await?;
+    let file = dir.path().join("report.txt");
+    std::fs::write(&file, b"exported safely")?;
+    let event = a
+        .publish(
+            note("Report attached."),
+            &[Attachment {
+                path: file,
+                name: None,
+            }],
+        )
+        .await?;
+    let blob = &event.blobs[0];
+    let elsewhere = dir.path().join("elsewhere");
+    std::fs::create_dir_all(&elsewhere)?;
+    let hash_dir = data.join("inbox").join(&blob.hash);
+
+    // The per-hash directory is a symlink: refused, nothing written there.
+    std::fs::create_dir_all(data.join("inbox"))?;
+    std::os::unix::fs::symlink(&elsewhere, &hash_dir)?;
+    assert!(a.export_blob(blob).await.is_err());
+    assert_eq!(std::fs::read_dir(&elsewhere)?.count(), 0);
+    std::fs::remove_file(&hash_dir)?;
+
+    // The target file is a symlink: refused, its target untouched.
+    std::fs::create_dir_all(&hash_dir)?;
+    let victim = elsewhere.join("victim");
+    std::fs::write(&victim, b"keep me")?;
+    std::os::unix::fs::symlink(&victim, hash_dir.join(&blob.name))?;
+    assert!(a.export_blob(blob).await.is_err());
+    assert_eq!(std::fs::read(&victim)?, b"keep me");
+    std::fs::remove_file(hash_dir.join(&blob.name))?;
+
+    // A clean inbox works, read-only.
+    let path = a.export_blob(blob).await?.expect("exported");
+    assert_eq!(std::fs::read(&path)?, b"exported safely");
+    assert!(std::fs::metadata(&path)?.permissions().readonly());
+    a.shutdown().await?;
+    Ok(())
+}

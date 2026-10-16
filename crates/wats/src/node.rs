@@ -357,6 +357,32 @@ const MAX_PROVIDER_ATTEMPTS: usize = 4;
 const PROVIDER_BACKOFF: Duration = Duration::from_secs(30);
 const PROVIDER_BACKOFF_MAX: Duration = Duration::from_secs(3600);
 
+/// Make sure `dir` is a real directory, creating it if missing: never a
+/// symlink (security review D).
+async fn real_dir(dir: &Path) -> Result<()> {
+    match tokio::fs::symlink_metadata(dir).await {
+        Ok(meta) if meta.file_type().is_dir() => Ok(()),
+        Ok(_) => bail!("{} is not a real directory (a symlink?)", dir.display()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            match tokio::fs::create_dir(dir).await {
+                Ok(()) => Ok(()),
+                // Created concurrently: check it again.
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                    let meta = tokio::fs::symlink_metadata(dir).await?;
+                    anyhow::ensure!(
+                        meta.file_type().is_dir(),
+                        "{} is not a real directory",
+                        dir.display()
+                    );
+                    Ok(())
+                }
+                Err(e) => Err(e.into()),
+            }
+        }
+        Err(e) => Err(e.into()),
+    }
+}
+
 /// How long a provider is skipped after `failures` failed fetches in a row.
 pub fn provider_backoff(failures: u32) -> Duration {
     let doublings = failures.saturating_sub(1).min(16);
@@ -1149,14 +1175,46 @@ impl Node {
         if !self.blob_matches(blob).await {
             return Ok(None);
         }
-        let dir = std::path::absolute(self.config.data_dir.join("inbox").join(hash.to_hex()))?;
+        // Never follow a symlink on the way (security review D): the inbox
+        // and its per-hash directory must be real directories, and the file
+        // is written through a fresh, exclusively created temporary file.
+        let inbox = std::path::absolute(self.config.data_dir.join("inbox"))?;
+        let dir = inbox.join(hash.to_hex());
+        real_dir(&inbox).await?;
+        real_dir(&dir).await?;
         let path = dir.join(&blob.name);
-        if tokio::fs::try_exists(&path).await? {
-            return Ok(Some(path));
+        match tokio::fs::symlink_metadata(&path).await {
+            Ok(meta) if meta.file_type().is_file() => return Ok(Some(path)),
+            Ok(_) => bail!("{} exists and is not a regular file", path.display()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.into()),
         }
-        tokio::fs::create_dir_all(&dir).await?;
-        let tmp = dir.join(format!(".{}.part", hash.to_hex()));
-        self.blobs.export(hash, &tmp).await?;
+        static EXPORTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = EXPORTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let tmp = dir.join(format!(
+            ".{}.{}.{n}.part",
+            hash.to_hex(),
+            std::process::id()
+        ));
+        // create_new: O_CREAT | O_EXCL, which never follows a symlink.
+        let mut file = tokio::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp)
+            .await
+            .with_context(|| format!("create {}", tmp.display()))?;
+        let copied = async {
+            let mut reader = self.blobs.reader(hash);
+            tokio::io::copy(&mut reader, &mut file).await?;
+            file.sync_all().await?;
+            anyhow::Ok(())
+        }
+        .await;
+        drop(file);
+        if let Err(e) = copied {
+            let _ = tokio::fs::remove_file(&tmp).await;
+            return Err(e);
+        }
         let mut perms = tokio::fs::metadata(&tmp).await?.permissions();
         perms.set_readonly(true);
         tokio::fs::set_permissions(&tmp, perms).await?;
