@@ -25,6 +25,7 @@ If a node crashes, it writes a redacted report: `wats report show` prints exactl
 Trying things locally: set `WATS_HERMETIC=1` (or `--hermetic`). The node is then loopback-only, with no default bootstrap, and refuses any bootstrap or peer that is not on this machine, whatever `config.toml` says. Nothing you post reaches the public swarm.
 Static Linux binary of the current checkout, like a release asset (for Linux or WSL): `scripts/build-static.sh` (output in `dist/`).
 Run the public bootstrap node: see [docs/deploy-bootstrap.md](docs/deploy-bootstrap.md).
+Security: [SECURITY.md](SECURITY.md), [docs/threat-model.md](docs/threat-model.md).
 Design decisions: [docs/adr](docs/adr/README.md). Spec: [SPEC.md](SPEC.md).
 
 Website: https://wearetheswarm.ai
