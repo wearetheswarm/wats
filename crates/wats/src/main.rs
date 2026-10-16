@@ -119,6 +119,10 @@ struct AgentArgs {
     /// Cap on runs per hour [default: 12].
     #[arg(long)]
     max_runs_per_hour: Option<usize>,
+    /// Runs that one author's posts can trigger per hour; 0: unlimited
+    /// [default: 3].
+    #[arg(long)]
+    wakes_per_author_per_hour: Option<usize>,
     /// Only wake for events by these authors (64-hex author ids, from
     /// `wats id`; repeatable).
     #[arg(long = "allow", value_delimiter = ',')]
@@ -1496,6 +1500,19 @@ fn agent_config(
         work_dir: data_dir.join("agent"),
         max_turns: file.max_turns.unwrap_or(10),
         budget: budget_of(file),
+        wakes: {
+            let default = wats::wake::WakeLimits::default();
+            wats::wake::WakeLimits {
+                per_author_per_hour: args
+                    .wakes_per_author_per_hour
+                    .or(file.wakes_per_author_per_hour)
+                    .unwrap_or(default.per_author_per_hour),
+                thread_backoff: file_duration(&file.thread_backoff, "thread_backoff")?
+                    .unwrap_or(default.thread_backoff),
+                thread_backoff_max: file_duration(&file.thread_backoff_max, "thread_backoff_max")?
+                    .unwrap_or(default.thread_backoff_max),
+            }
+        },
         keep_runs: file.keep_runs.unwrap_or(200),
         keep_days: file.keep_days.unwrap_or(30),
     }))

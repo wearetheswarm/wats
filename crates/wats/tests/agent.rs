@@ -111,6 +111,7 @@ async fn agent_wakes_on_asks_and_heartbeats() -> anyhow::Result<()> {
         run_timeout: Duration::from_secs(10),
         max_turns: 10,
         budget: wats::budget::Budget::default(),
+        wakes: wats::wake::WakeLimits::unlimited(),
         codex_disable: vec![],
         access: wats::access::Access::Locked,
         workdir: std::path::PathBuf::from("/nonexistent"),
@@ -634,6 +635,7 @@ async fn budget_pauses_the_agent() -> anyhow::Result<()> {
             max_usd_per_day: 0.02,
             ..Default::default()
         },
+        wakes: wats::wake::WakeLimits::unlimited(),
         codex_disable: vec![],
         access: wats::access::Access::Locked,
         workdir: std::path::PathBuf::from("/nonexistent"),
@@ -792,6 +794,7 @@ echo '{{"type":"turn.completed","usage":{{"input_tokens":10,"output_tokens":2}}}
         run_timeout: Duration::from_secs(10),
         max_turns: 10,
         budget: wats::budget::Budget::default(),
+        wakes: wats::wake::WakeLimits::unlimited(),
         codex_disable: vec![],
         access: wats::access::Access::Locked,
         workdir: std::path::PathBuf::from("/nonexistent"),
@@ -891,6 +894,7 @@ async fn workspace_access_opens_the_workspace() -> anyhow::Result<()> {
         run_timeout: Duration::from_secs(10),
         max_turns: 10,
         budget: wats::budget::Budget::default(),
+        wakes: wats::wake::WakeLimits::unlimited(),
         codex_disable: vec![],
         access: wats::access::Access::Workspace,
         workdir: workdir.clone(),
@@ -1360,6 +1364,7 @@ async fn wakes_only_on_what_is_addressed_to_it() -> anyhow::Result<()> {
         run_timeout: Duration::from_secs(10),
         max_turns: 10,
         budget: wats::budget::Budget::default(),
+        wakes: wats::wake::WakeLimits::unlimited(),
         codex_disable: vec![],
         access: wats::access::Access::Locked,
         workdir: std::path::PathBuf::from("/nonexistent"),
@@ -1414,6 +1419,117 @@ async fn wakes_only_on_what_is_addressed_to_it() -> anyhow::Result<()> {
     let _ = stop.send(());
     runner.await??;
     for n in [a, b, c] {
+        n.shutdown().await?;
+    }
+    Ok(())
+}
+
+/// Wake limits: a second reply in the same thread waits for the thread's
+/// backoff, then wakes the agent (deferred, not dropped); after a restart,
+/// the per-author limit still counts the runs of the run index.
+#[tokio::test(flavor = "multi_thread")]
+async fn wake_limits_defer_and_survive_a_restart() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let a = node(&dir.path().join("a"), &[]).await?;
+    let b = node(&dir.path().join("b"), &[&a]).await?;
+    a.wait_for_neighbor(PUBLIC_NET, Duration::from_secs(10))
+        .await?;
+    let reply_to = |parent: &wats::event::Event, text: &str| Draft {
+        net: PUBLIC_NET.into(),
+        thread: Some(parent.thread_root().to_string()),
+        parent: Some(parent.id.clone()),
+        kind: Some(Kind::Answer),
+        text: text.into(),
+        ..Draft::default()
+    };
+    // The agent asked something before the runner starts.
+    let question = a
+        .publish_as(&a.author_key("agent")?, ask("Who has a CSV sample?"), &[])
+        .await?;
+    eventually_async(|| async { b.store().get(&question.id).unwrap().is_some() }).await;
+
+    let config = AgentConfig {
+        runtime: "claude".into(),
+        profile: "agent".into(),
+        user: "alice".into(),
+        about: String::new(),
+        caps: vec![],
+        every: Duration::from_secs(1),
+        heartbeat: Duration::from_secs(3600),
+        max_runs_per_hour: 100,
+        allow: vec![],
+        ignore_local: true,
+        heartbeat_text: DEFAULT_HEARTBEAT.into(),
+        command: fake_agent(dir.path()),
+        mcp_command: "/usr/bin/true".into(),
+        mcp_args: vec![],
+        extra_args: vec![],
+        run_timeout: Duration::from_secs(10),
+        max_turns: 10,
+        budget: wats::budget::Budget::default(),
+        wakes: wats::wake::WakeLimits {
+            per_author_per_hour: 0,
+            thread_backoff: Duration::from_secs(5),
+            thread_backoff_max: Duration::from_secs(60),
+        },
+        codex_disable: vec![],
+        access: wats::access::Access::Locked,
+        workdir: std::path::PathBuf::from("/nonexistent"),
+        tools: vec![],
+        model: None,
+        work_dir: dir.path().join("work"),
+        keep_runs: 100,
+        keep_days: 30,
+    };
+    let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+    let runner = tokio::spawn(wats::agent::run(Arc::clone(&a), config.clone(), async {
+        let _ = stopped.await;
+    }));
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let first = b.publish(reply_to(&question, "I do."), &[]).await?;
+    eventually("a run", || !runs(dir.path()).is_empty()).await;
+    let second = b
+        .publish(reply_to(&question, "Here is another one."), &[])
+        .await?;
+    eventually("the deferred reply's run", || runs(dir.path()).len() >= 2).await;
+    let all = runs(dir.path());
+    assert!(all[0].0.contains(&first.id), "{}", all[0].0);
+    assert!(all[1].0.contains(&second.id), "{}", all[1].0);
+    assert!(!all[1].0.contains(&first.id), "{}", all[1].0);
+    // The second run waited for the thread's backoff (5 s), however fast
+    // the reply arrived.
+    let index = wats::runs::list(&dir.path().join("work"));
+    assert_eq!(index.len(), 2);
+    assert!(
+        index[1].started >= index[0].started + 4,
+        "{} then {}",
+        index[0].started,
+        index[1].started
+    );
+    let _ = stop.send(());
+    runner.await??;
+
+    // Restarted with one run per author and hour: b already had two.
+    let config = AgentConfig {
+        wakes: wats::wake::WakeLimits {
+            per_author_per_hour: 1,
+            ..config.wakes
+        },
+        ..config
+    };
+    let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+    let runner = tokio::spawn(wats::agent::run(Arc::clone(&a), config, async {
+        let _ = stopped.await;
+    }));
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let new_ask = b.publish(ask("A new question"), &[]).await?;
+    eventually_async(|| async { a.store().get(&new_ask.id).unwrap().is_some() }).await;
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert_eq!(runs(dir.path()).len(), 2, "b's runs of the last hour count");
+    let _ = stop.send(());
+    runner.await??;
+    for n in [a, b] {
         n.shutdown().await?;
     }
     Ok(())

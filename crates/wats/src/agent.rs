@@ -5,8 +5,9 @@
 //!
 //! Waking is cheap when idle: the node watches incoming events itself and
 //! only spawns the agent when there is something new (debounced), or when
-//! the heartbeat is due. One run at a time, each with a timeout, and a cap
-//! on runs per hour. Every run leaves a transcript (see [`crate::runs`]).
+//! the heartbeat is due. One run at a time, each with a timeout, a cap on
+//! runs per hour, and wake limits per author and per thread (see
+//! [`crate::wake`]). Every run leaves a transcript (see [`crate::runs`]).
 
 use std::collections::VecDeque;
 use std::path::PathBuf;
@@ -27,6 +28,7 @@ use crate::identity::author_id;
 use crate::node::Node;
 use crate::runs::{self, RunRecord};
 use crate::store::Filter;
+use crate::wake::{WakeLimits, WakeState};
 
 /// Shipped when no `--heartbeat-file` is given (crates/wats/assets/HEARTBEAT.md).
 pub const DEFAULT_HEARTBEAT: &str = include_str!("../assets/HEARTBEAT.md");
@@ -72,6 +74,8 @@ pub struct AgentConfig {
     pub max_turns: u32,
     /// Spend budget, enforced before each run.
     pub budget: crate::budget::Budget,
+    /// Wakes per author and backoff per thread (see [`crate::wake`]).
+    pub wakes: WakeLimits,
     /// Codex features to disable (filled at start from
     /// [`access::CODEX_DENIED_FEATURES`], what the installed Codex knows,
     /// and `tools`).
@@ -614,6 +618,83 @@ fn short(id: &str) -> &str {
     &id[..id.len().min(12)]
 }
 
+/// An event waiting to wake the agent.
+#[derive(Debug, Clone)]
+struct Queued {
+    id: String,
+    why: &'static str,
+    author: String,
+    /// Its thread root.
+    thread: String,
+    /// Whether a hold by the wake limits was logged.
+    held: bool,
+}
+
+/// How far back the wake state is rebuilt from the run index at start.
+const WAKE_HISTORY_SECS: u64 = 86_400;
+
+/// The wake state as the runs of the last day left it: each run triggered
+/// by events counts for their authors and threads, as it did live.
+fn wake_history(node: &Node, config: &AgentConfig, now: u64) -> WakeState {
+    let mut state = WakeState::default();
+    let since = now.saturating_sub(WAKE_HISTORY_SECS);
+    for record in runs::list(&config.work_dir) {
+        if record.trigger != "events" || record.started < since {
+            continue;
+        }
+        let events: Vec<Arc<Event>> = record
+            .events
+            .iter()
+            .filter_map(|id| node.store().get(id).ok().flatten())
+            .map(|stored| stored.event)
+            .collect();
+        state.record(
+            &config.wakes,
+            events.iter().map(|e| e.author.as_str()),
+            events.iter().map(|e| e.thread_root()),
+            record.started,
+        );
+    }
+    state.prune(&config.wakes, now);
+    state
+}
+
+/// The queued events the wake limits let wake the agent at `now`; the
+/// others stay queued, each hold logged once.
+fn ready(
+    queue: &mut [Queued],
+    state: &WakeState,
+    limits: &WakeLimits,
+    now: u64,
+) -> Vec<(String, &'static str)> {
+    let mut ready = Vec::new();
+    for queued in queue.iter_mut() {
+        match state.check(limits, &queued.author, &queued.thread, now) {
+            None => ready.push((queued.id.clone(), queued.why)),
+            Some(hold) => {
+                if !queued.held {
+                    warn!(
+                        event = short(&queued.id),
+                        author = short(&queued.author),
+                        "agent wake deferred: {}; kept for the next allowed run, {}",
+                        hold.describe(limits),
+                        budget::until(hold.until())
+                    );
+                    queued.held = true;
+                }
+            }
+        }
+    }
+    ready
+}
+
+/// Unix seconds now.
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
+}
+
 /// Run the agent loop until `shutdown` resolves. A run in progress is then
 /// killed.
 pub async fn run(
@@ -643,7 +724,8 @@ pub async fn run(
     // A marker left by a run that did not finish (crash, kill -9).
     let _ = std::fs::remove_file(runs::current_path(&config.work_dir));
     let mut events = node.store().subscribe();
-    let mut pending: Vec<(String, &'static str)> = Vec::new();
+    let mut pending: Vec<Queued> = Vec::new();
+    let mut wakes = wake_history(&node, &config, unix_now());
     let mut feedback: Vec<String> = Vec::new();
     let mut since = node.store().last_seq()?;
     let mut last_run: Option<Instant> = None;
@@ -674,9 +756,15 @@ pub async fn run(
                     let event = &stored.event;
                     match interest(&node, &me, &config.allow, config.ignore_local, event) {
                         Interest::Wake(why) => {
-                            if !pending.iter().any(|(id, _)| *id == event.id) {
+                            if !pending.iter().any(|q| q.id == event.id) {
                                 info!(event = short(&event.id), kind = event.kind.as_str(), "queued for the agent: {why}");
-                                pending.push((event.id.clone(), why));
+                                pending.push(Queued {
+                                    id: event.id.clone(),
+                                    why,
+                                    author: event.author.clone(),
+                                    thread: event.thread_root().to_string(),
+                                    held: false,
+                                });
                             }
                         }
                         Interest::Feedback(why) => {
@@ -698,9 +786,17 @@ pub async fn run(
                 while runs.front().is_some_and(|t| now.duration_since(*t) > Duration::from_secs(3600)) {
                     runs.pop_front();
                 }
+                let unix_now = unix_now();
+                wakes.prune(&config.wakes, unix_now);
                 let debounced = last_run.is_none_or(|t| now.duration_since(t) >= config.every);
-                let trigger = if !pending.is_empty() && debounced {
-                    Some(Trigger::Events(std::mem::take(&mut pending)))
+                // Events stay queued until a run actually starts with them.
+                let ready = if debounced {
+                    ready(&mut pending, &wakes, &config.wakes, unix_now)
+                } else {
+                    Vec::new()
+                };
+                let trigger = if !ready.is_empty() {
+                    Some(Trigger::Events(ready))
                 } else if now.duration_since(last_heartbeat) >= config.heartbeat {
                     Some(Trigger::Heartbeat)
                 } else {
@@ -711,29 +807,20 @@ pub async fn run(
                     if !capped {
                         warn!(
                             "agent run skipped: {} runs in the last hour (cap {}); {} pending events kept",
-                            runs.len(), config.max_runs_per_hour, pending.len() + trigger.events().len()
+                            runs.len(), config.max_runs_per_hour, pending.len()
                         );
                         capped = true;
-                    }
-                    if let Trigger::Events(ids) = trigger {
-                        pending = ids;
                     }
                     last_heartbeat = now;
                     continue;
                 }
                 capped = false;
-                let unix_now = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map_or(0, |d| d.as_secs());
                 let spend = budget::spend(&config.work_dir, unix_now);
                 let remaining_usd = match budget::check(&config.budget, &spend, unix_now) {
                     budget::Verdict::Paused { why, until } => {
                         if paused_until != Some(until) {
                             warn!("agent paused, budget reached: {why}; {}", budget::until(until));
                             paused_until = Some(until);
-                        }
-                        if let Trigger::Events(ids) = trigger {
-                            pending = ids;
                         }
                         last_heartbeat = now;
                         continue;
@@ -758,6 +845,20 @@ pub async fn run(
                 }
                 // Everything up to now is covered by this run.
                 since = node.store().last_seq()?;
+                if let Trigger::Events(ids) = &trigger {
+                    let ids: std::collections::HashSet<&str> =
+                        ids.iter().map(|(id, _)| id.as_str()).collect();
+                    let (woke, kept): (Vec<Queued>, Vec<Queued>) = std::mem::take(&mut pending)
+                        .into_iter()
+                        .partition(|q| ids.contains(q.id.as_str()));
+                    pending = kept;
+                    wakes.record(
+                        &config.wakes,
+                        woke.iter().map(|q| q.author.as_str()),
+                        woke.iter().map(|q| q.thread.as_str()),
+                        unix_now,
+                    );
+                }
                 runs.push_back(now);
                 last_run = Some(now);
                 last_heartbeat = now;
