@@ -216,8 +216,15 @@ impl Infra {
                 return;
             }
         };
-        let task = relay_fallback(endpoint.clone(), ours);
-        tokio::spawn(endpoint.closed().run_until(task));
+        let endpoint = endpoint.clone();
+        tokio::spawn(async move {
+            let make = || {
+                let endpoint = endpoint.clone();
+                let task = relay_fallback(endpoint.clone(), ours.clone());
+                async move { endpoint.closed().run_until(task).await }
+            };
+            crate::supervise::supervise("relay fallback", make).await;
+        });
     }
 }
 

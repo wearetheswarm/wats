@@ -16,6 +16,14 @@
 //! [`crate::strict_json`]. The id doubles as the proof-of-work target: `pow`
 //! is a nonce chosen so that the id has N leading zero bits.
 
+// Network input must never panic the node (security review, item D).
+#![deny(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::arithmetic_side_effects
+)]
+
 use ed25519_dalek::SigningKey;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::{Map, Value};
@@ -295,12 +303,12 @@ fn jcs<T: Serialize>(value: &T) -> Result<Vec<u8>, EventError> {
 
 /// Number of leading zero bits of a hash.
 pub fn leading_zero_bits(hash: &[u8; 32]) -> u32 {
-    let mut bits = 0;
+    let mut bits: u32 = 0;
     for byte in hash {
         if *byte == 0 {
-            bits += 8;
+            bits = bits.saturating_add(8);
         } else {
-            bits += byte.leading_zeros();
+            bits = bits.saturating_add(byte.leading_zeros());
             break;
         }
     }
@@ -309,10 +317,10 @@ pub fn leading_zero_bits(hash: &[u8; 32]) -> u32 {
 
 /// Parse a lowercase hex string of exactly `N` bytes.
 pub fn parse_hex<const N: usize>(s: &str, what: &str) -> Result<[u8; N], EventError> {
-    if s.len() != N * 2 || s.bytes().any(|b| b.is_ascii_uppercase()) {
+    let chars = N.saturating_mul(2);
+    if s.len() != chars || s.bytes().any(|b| b.is_ascii_uppercase()) {
         return Err(invalid(format!(
-            "{what} must be {} lowercase hex chars",
-            N * 2
+            "{what} must be {chars} lowercase hex chars"
         )));
     }
     let mut out = [0u8; N];
@@ -328,7 +336,7 @@ pub fn required_pow_bits(base: u32, size: usize) -> u32 {
     let mut bits = base;
     let mut threshold = 4096usize;
     while size > threshold {
-        bits += 1;
+        bits = bits.saturating_add(1);
         threshold = threshold.saturating_mul(2);
     }
     bits
@@ -396,7 +404,7 @@ pub fn next_key_commitment(next_key: &[u8; 32]) -> String {
 /// The message the new key signs in a `rotate`: proof that its holder
 /// accepts the hand-over from `old_key`.
 pub fn rotate_message(old_key: &[u8; 32], new_key: &[u8; 32]) -> Vec<u8> {
-    let mut msg = Vec::with_capacity(ROTATE_SIG_PREFIX.len() + 64);
+    let mut msg = Vec::with_capacity(ROTATE_SIG_PREFIX.len().saturating_add(64));
     msg.extend_from_slice(ROTATE_SIG_PREFIX);
     msg.extend_from_slice(old_key);
     msg.extend_from_slice(new_key);
@@ -746,7 +754,7 @@ impl Draft {
         let split = template
             .windows(marker.len())
             .position(|w| w == marker)
-            .map(|p| p + marker.len() - 1)
+            .map(|p| p.saturating_add(marker.len()).saturating_sub(1))
             .ok_or_else(|| invalid("canonical header has no pow field"))?;
         let (prefix, suffix) = template.split_at(split);
         let mut nonce: u64 = 0;
@@ -825,7 +833,10 @@ impl Event {
     }
 
     /// Serialize to compact JSON (not canonical; the id does not depend on it).
+    #[allow(clippy::expect_used)]
     pub fn to_json(&self) -> Vec<u8> {
+        // SAFETY-ish: every field is a string, an integer or a serde_json map
+        // with string keys, none of which can fail to serialize.
         serde_json::to_vec(self).expect("an Event always serializes")
     }
 
@@ -903,6 +914,12 @@ impl Event {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::arithmetic_side_effects
+)]
 mod tests {
     use super::*;
     use serde_json::json;

@@ -105,40 +105,59 @@ pub fn serve(node: Arc<Node>) -> Result<Sessions> {
     };
     let sessions = Sessions::default();
     let counter = sessions.clone();
+    let listener = Arc::new(listener);
+    let accept_loop = move || {
+        let listener = Arc::clone(&listener);
+        let node = Arc::clone(&node);
+        let counter = counter.clone();
+        async move { accept_sessions(&listener, owner, node, counter).await }
+    };
     tokio::spawn(async move {
-        loop {
-            let stream = match listener.accept().await {
-                Ok((stream, _)) => match stream.peer_cred() {
-                    Ok(cred) if cred.uid() == owner => stream,
-                    Ok(cred) => {
-                        warn!(
-                            uid = cred.uid(),
-                            "mcp socket: refused a connection from another user"
-                        );
-                        continue;
-                    }
-                    Err(e) => {
-                        warn!("mcp socket: refused a connection without peer credentials: {e}");
-                        continue;
-                    }
-                },
-                Err(e) => {
-                    warn!("mcp socket: {e}");
-                    break;
-                }
-            };
-            let node = Arc::clone(&node);
-            counter.0.fetch_add(1, Ordering::SeqCst);
-            let guard = SessionGuard(counter.clone());
-            tokio::spawn(async move {
-                let _guard = guard;
-                if let Err(e) = serve_session(node, stream).await {
-                    debug!("attached session ended: {e:#}");
-                }
-            });
-        }
+        crate::supervise::supervise("mcp socket accept loop", accept_loop).await;
     });
     Ok(sessions)
+}
+
+/// Accept attached MCP sessions on the node's socket, each in its own task,
+/// from processes of `owner` only.
+#[cfg(unix)]
+async fn accept_sessions(
+    listener: &tokio::net::UnixListener,
+    owner: u32,
+    node: Arc<Node>,
+    counter: Sessions,
+) {
+    loop {
+        let stream = match listener.accept().await {
+            Ok((stream, _)) => match stream.peer_cred() {
+                Ok(cred) if cred.uid() == owner => stream,
+                Ok(cred) => {
+                    warn!(
+                        uid = cred.uid(),
+                        "mcp socket: refused a connection from another user"
+                    );
+                    continue;
+                }
+                Err(e) => {
+                    warn!("mcp socket: refused a connection without peer credentials: {e}");
+                    continue;
+                }
+            },
+            Err(e) => {
+                warn!("mcp socket: {e}");
+                break;
+            }
+        };
+        let node = Arc::clone(&node);
+        counter.0.fetch_add(1, Ordering::SeqCst);
+        let guard = SessionGuard(counter.clone());
+        tokio::spawn(async move {
+            let _guard = guard;
+            if let Err(e) = serve_session(node, stream).await {
+                debug!("attached session ended: {e:#}");
+            }
+        });
+    }
 }
 
 #[cfg(unix)]

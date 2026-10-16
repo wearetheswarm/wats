@@ -29,6 +29,14 @@
 //! `ext`, the kind vocabulary, the signature suite and the limits. It may
 //! not change anything above.
 
+// Network input must never panic the node (security review, item D).
+#![deny(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::arithmetic_side_effects
+)]
+
 use ed25519_dalek::{Signer, SigningKey};
 use serde_json::{Map, Value};
 
@@ -336,7 +344,13 @@ impl RawEvent {
         match self.v {
             1 => {
                 let author = parse_hex::<32>(&self.author, "author")?;
-                let sig = parse_hex::<64>(self.wire["sig"].as_str().unwrap_or_default(), "sig")?;
+                let sig = parse_hex::<64>(
+                    self.wire
+                        .get("sig")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default(),
+                    "sig",
+                )?;
                 let id = parse_hex::<32>(&self.id, "id")?;
                 verify_v1(&author, &id, &sig)?;
                 self.signature_checked = true;
@@ -402,7 +416,7 @@ pub fn check_v1_key(key: &[u8; 32], what: &str) -> Result<(), EventError> {
 
 /// The message signed by v1 events.
 pub fn v1_message(id: &[u8; 32]) -> Vec<u8> {
-    let mut msg = Vec::with_capacity(SIG_PREFIX_V1.len() + 32);
+    let mut msg = Vec::with_capacity(SIG_PREFIX_V1.len().saturating_add(32));
     msg.extend_from_slice(SIG_PREFIX_V1);
     msg.extend_from_slice(id);
     msg
@@ -505,7 +519,9 @@ pub fn sign_value(
         if leading_zero_bits(&digest.id) >= pow_bits {
             break digest.id;
         }
-        nonce += 1;
+        nonce = nonce
+            .checked_add(1)
+            .ok_or_else(|| invalid("pow nonce space exhausted"))?;
     };
     wire.insert("id".into(), Value::String(hex::encode(id)));
     wire.insert("sig".into(), Value::String(hex::encode(sign_v1(key, &id))));
@@ -513,6 +529,12 @@ pub fn sign_value(
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::arithmetic_side_effects
+)]
 mod tests {
     use super::*;
     use crate::event::{Draft, Kind};
