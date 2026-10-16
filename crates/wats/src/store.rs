@@ -66,6 +66,15 @@ CREATE TRIGGER IF NOT EXISTS events_fts_insert AFTER INSERT ON events BEGIN
 END;
 "#;
 
+/// SQL condition on a row `e` of the thread rooted at `?1`: not grafted
+/// (B9). A reply belongs to the thread only if its network is the root's
+/// (when we have the root) and its parent, when we have it, is in the same
+/// network and thread.
+const NOT_GRAFTED: &str = "(e.id = ?1 OR (
+    NOT EXISTS (SELECT 1 FROM events r WHERE r.id = ?1 AND r.opaque = 0 AND r.net <> e.net)
+    AND NOT EXISTS (SELECT 1 FROM events p WHERE p.id = e.parent AND p.opaque = 0
+        AND (p.net <> e.net OR COALESCE(p.thread, p.id) <> e.thread))))";
+
 /// Remove an opaque row and its (empty) full-text entry.
 fn delete_opaque_row(tx: &rusqlite::Transaction<'_>, seq: i64) -> Result<()> {
     // Opaque rows are indexed with empty text and tags.
@@ -472,18 +481,48 @@ impl Store {
     }
 
     /// The root and every reply of a thread, oldest first.
+    ///
+    /// Grafted replies are left out (security review B9): a reply whose
+    /// parent we have but sits in another thread or network, or whose
+    /// network differs from the root's. `insert` refuses them when the
+    /// parent is already known; this covers replies that arrived first.
     pub fn thread(&self, root: &str, limit: usize) -> Result<Vec<Stored>> {
         self.query(
-            "SELECT seq, json FROM events WHERE (id = ?1 OR thread = ?1) AND opaque = 0
-             ORDER BY ts, seq LIMIT ?2",
+            &format!(
+                "SELECT e.seq, e.json FROM events e
+                 WHERE (e.id = ?1 OR e.thread = ?1) AND e.opaque = 0 AND {NOT_GRAFTED}
+                 ORDER BY e.ts, e.seq LIMIT ?2"
+            ),
             vec![root.to_string().into(), (limit as i64).into()],
         )
+    }
+
+    /// Whether `event` is a grafted reply (see [`Store::thread`]): shown on
+    /// its own, as an orphan, never inside the thread it claims.
+    pub fn is_grafted(&self, event: &Event) -> Result<bool> {
+        let Some(root) = event.thread.as_deref() else {
+            return Ok(false);
+        };
+        let grafted: bool = self
+            .conn()
+            .query_row(
+                &format!(
+                    "SELECT NOT ({NOT_GRAFTED}) FROM events e WHERE e.id = ?2 AND e.opaque = 0"
+                ),
+                params![root, event.id],
+                |r| r.get(0),
+            )
+            .optional()?
+            .unwrap_or(false);
+        Ok(grafted)
     }
 
     /// Number of understood replies in a thread (root excluded).
     pub fn reply_count(&self, root: &str) -> Result<u64> {
         let n: i64 = self.conn().query_row(
-            "SELECT count(*) FROM events WHERE thread = ? AND opaque = 0",
+            &format!(
+                "SELECT count(*) FROM events e WHERE e.thread = ?1 AND e.opaque = 0 AND {NOT_GRAFTED}"
+            ),
             [root],
             |r| r.get(0),
         )?;
@@ -972,5 +1011,54 @@ mod tests {
         // Indexed like any event.
         let found = store.search(Some("body"), &Filter::default(), 10).unwrap();
         assert_eq!(found.len(), 1);
+    }
+
+    #[test]
+    fn grafted_replies_are_orphans() {
+        let store = Store::open_in_memory().unwrap();
+        let a = post(1, 10, Kind::Ask, &[], "thread A");
+        let b = post(2, 11, Kind::Ask, &[], "thread B");
+        let in_b = reply(&b, 3, 12, "a reply in B");
+        // Claims thread A but answers a post of thread B: arrives before
+        // its parent, so insert cannot refuse it yet.
+        let grafted = Draft {
+            net: a.net.clone(),
+            thread: Some(a.id.clone()),
+            parent: Some(in_b.id.clone()),
+            kind: Some(Kind::Answer),
+            text: "grafted".into(),
+            ..Draft::default()
+        }
+        .sign(&SigningKey::from_bytes(&[4; 32]), 13, 0)
+        .unwrap();
+        let honest = reply(&a, 5, 14, "a reply in A");
+        for e in [&a, &grafted, &b, &in_b, &honest] {
+            store.insert(e, 20).unwrap();
+        }
+        let ids: Vec<String> = store
+            .thread(&a.id, 100)
+            .unwrap()
+            .iter()
+            .map(|s| s.event.id.clone())
+            .collect();
+        assert_eq!(ids, vec![a.id.clone(), honest.id.clone()]);
+        assert_eq!(store.reply_count(&a.id).unwrap(), 1);
+        assert!(store.is_grafted(&grafted).unwrap());
+        assert!(!store.is_grafted(&honest).unwrap());
+        assert!(!store.is_grafted(&a).unwrap());
+        // A reply whose parent we do not have yet is not judged.
+        let unknown_parent = Draft {
+            net: a.net.clone(),
+            thread: Some(a.id.clone()),
+            parent: Some("ab".repeat(32)),
+            kind: Some(Kind::Answer),
+            text: "parent unknown".into(),
+            ..Draft::default()
+        }
+        .sign(&SigningKey::from_bytes(&[6; 32]), 15, 0)
+        .unwrap();
+        store.insert(&unknown_parent, 20).unwrap();
+        assert!(!store.is_grafted(&unknown_parent).unwrap());
+        assert_eq!(store.reply_count(&a.id).unwrap(), 2);
     }
 }
