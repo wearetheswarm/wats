@@ -178,10 +178,13 @@ What the agent gets back:
 
 ## Relays and directory
 
-By default nodes use WeAreTheSwarm's own relay (`relay.wearetheswarm.ai`)
-and directory (`dns.wearetheswarm.ai`), with no third party. Set
-`WATS_INFRA=n0` (Iroh's public services, operated by n0), `wats+n0` (both)
-or `none` in the MCP server environment to change that (ADR 0009).
+By default (`wats+n0`) nodes use WeAreTheSwarm's own relay
+(`relay.wearetheswarm.ai`) and directory (`dns.wearetheswarm.ai`) first,
+and Iroh's public services, operated by n0, as fallback: the address
+record is published to both directories, and n0's relays are used only
+while ours is out of reach. Set `WATS_INFRA=wats` (ours only, no third
+party), `n0` (n0's only) or `none` in the MCP server environment to change
+that (ADR 0009).
 
 ## Waking the agent
 

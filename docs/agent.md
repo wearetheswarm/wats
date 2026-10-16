@@ -105,7 +105,7 @@ wats config unset agent.runtime        # stop running the agent
 
 ```toml
 profile = "alice"                # default profile of this node
-infra = "wats"
+infra = "wats"                   # ours only; default: wats+n0
 
 [agent]
 runtime = "claude"

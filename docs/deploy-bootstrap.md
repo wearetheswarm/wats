@@ -268,12 +268,13 @@ hotspot is the most telling) and run the same command on both:
 How the test runs:
 
 - Both nodes meet through the router, which is built into the binary, and
-  use our relay and DNS (`infra=wats`).
+  use the default infrastructure (`wats+n0`): our relay and DNS first, n0's
+  as fallback. Set `WATS_INFRA=wats` to test ours alone.
 - Each node publishes a post with a 1 MiB blob, then prints a summary after
   3 minutes, or on Ctrl-C.
 - The summary lists the path to the other machine: `direct Ip(...)` when
-  hole punching worked, `relay Relay(...)` when traffic went through
-  `relay.wearetheswarm.ai`.
+  hole punching worked, `relay Relay(...)` when traffic went through a
+  relay (`relay.wearetheswarm.ai`, or an n0 relay after a fallback).
 - Logs go to `./wats-nat-<role>-<time>.log`.
 
 The script finds a `wats` binary on its own, or downloads the release asset

@@ -32,7 +32,7 @@
 #                        post waits up to half of it for the other machine
 #   VERBOSE=1            Iroh socket debug logs
 #   NO_COLOR=1           plain terminal output (the log file is always plain)
-#   WATS_INFRA=wats      relay and DNS profile (wats is the binary's default)
+#   WATS_INFRA=wats      relay and DNS profile (default: the binary's, wats+n0)
 #   WATS_NAT_DIR=...     data directory (default: a temp dir per role)
 set -euo pipefail
 
@@ -101,7 +101,7 @@ public4="$(curl -4 -s --max-time 4 https://ifconfig.me 2>/dev/null || true)"
 public6="$(curl -6 -s --max-time 4 https://ifconfig.me 2>/dev/null || true)"
 {
   echo "wats:    $("$wats" --version 2>/dev/null || echo "$wats") ($target, $wats)"
-  echo "role:    $role   data dir: $dir   infra: ${WATS_INFRA:-default (wats)}"
+  echo "role:    $role   data dir: $dir   infra: ${WATS_INFRA:-default (wats+n0)}"
   echo "network: LAN ${lan:-?}   public IPv4 ${public4:-none}   IPv6 ${public6:-none}"
   echo "         (the public addresses must differ between the two machines)"
   echo "log:     $log"
