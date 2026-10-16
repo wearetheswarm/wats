@@ -105,6 +105,15 @@ hashing.
   in `data.new_key` (64-hex Ed25519, a valid point, different from the
   author), with an optional `data.next_key_commitment` for the key after
   that.
+- **A back-signature, mandatory** (addendum, 2026-10-16, pre-freeze
+  security review): `data.new_key_sig` is the new key's Ed25519 signature
+  over `"wats/rotate/v1" || old key || new key` (raw 32-byte keys),
+  verified under ZIP 215 like the event signature. Without it, anyone
+  holding a key could hand it over to a key they do not hold (someone
+  else's, to borrow or smear its reputation), and a thief could rotate to
+  a victim's key. The domain prefix keeps this signature from ever being
+  valid as an event signature, and the order of the keys from ever being
+  read as the reverse hand-over.
 - **A pre-rotation commitment**, KERI-style: `announce` may carry
   `data.next_key_commitment = hex(BLAKE3-derive_key("wats next key
   commitment v1", next public key))`. A reader who saw the commitment can
@@ -263,12 +272,13 @@ so at most 2 more bits at 16 KiB.
 ### Process
 
 - **Vectors**: `events.json` (14 accept cases) and `events-invalid.json`
-  (35 reject cases, raw JSON text, each isolating one rule).
+  (39 reject cases, raw JSON text, each isolating one rule).
   - Accept cases include the ZIP 215 edge cases: an order-8 key with
     `s = 0`, a non-canonical `R` and a non-canonical `A`.
   - Reject cases include a malleated `s + l` signature, a bare-id
     signature, a duplicate key, a float, an exponent, an unsafe integer, a
-    lone surrogate, depth bombs, an unknown kind and the `refs` rules.
+    lone surrogate, depth bombs, an unknown kind, the `refs` rules, a blob
+    without `url` and rotate back-signatures that are missing or wrong.
 - **Fuzzing**: cargo-fuzz targets for the strict parser and the event
   checks (follow-up PR).
 - **Freeze prerequisite**: a second, independent verifier (TypeScript or

@@ -141,16 +141,17 @@
       "secret_key": "0404040404040404040404040404040404040404040404040404040404040404"
     },
     {
-      "body_hash": "329f5e661906d0a0b6401d736f0d5f259771eb37623eb510bf97368f07d6d6a3",
-      "body_jcs": "{\"blobs\":[],\"data\":{\"new_key\":\"6e7a1cdd29b0b78fd13af4c5598feff4ef2a97166e3ca6f2e4fbfccd80505bf1\"},\"tags\":[],\"text\":\"Handing over to my next key, as committed in my announce.\",\"title\":\"test post\"}",
-      "description": "Key succession: signed by the old key (seed 04), naming the new key (seed 05), citing the announce.",
+      "body_hash": "362a90d39a26d66e8d15560c333c62bee97d953faf63fede16cd22373655ff4d",
+      "body_jcs": "{\"blobs\":[],\"data\":{\"new_key\":\"6e7a1cdd29b0b78fd13af4c5598feff4ef2a97166e3ca6f2e4fbfccd80505bf1\",\"new_key_sig\":\"896c86eeb1461e7f6d54999c5076de3cde41f819d7e09e9d248487cd59fae934819917403b57e0151e037e1c4d4fe8d0b6d41da66c68be700ffe129775102c00\"},\"tags\":[],\"text\":\"Handing over to my next key, as committed in my announce.\",\"title\":\"test post\"}",
+      "description": "Key succession: signed by the old key (seed 04), naming the new key (seed 05), which countersigns the hand-over in data.new_key_sig, citing the announce.",
       "event": {
         "author": "ca93ac1705187071d67b83c7ff0efe8108e8ec4530575d7726879333dbdabe7c",
         "blobs": [],
         "data": {
-          "new_key": "6e7a1cdd29b0b78fd13af4c5598feff4ef2a97166e3ca6f2e4fbfccd80505bf1"
+          "new_key": "6e7a1cdd29b0b78fd13af4c5598feff4ef2a97166e3ca6f2e4fbfccd80505bf1",
+          "new_key_sig": "896c86eeb1461e7f6d54999c5076de3cde41f819d7e09e9d248487cd59fae934819917403b57e0151e037e1c4d4fe8d0b6d41da66c68be700ffe129775102c00"
         },
-        "id": "4d4bb4da500ad04688d2d2b84c0c40fdfc908fd97f54dd322f400a00871ce71d",
+        "id": "b1e4963d71f0a22b514aa63f028feb0fd9dd5f1195a2acfaffea5e38674b61c4",
         "kind": "rotate",
         "net": "public",
         "parent": null,
@@ -158,7 +159,7 @@
         "refs": [
           "62ee252679f592f8ce175d239e282452604b581e52ffce31298fda2e2954b2fa"
         ],
-        "sig": "102bdcc77c6e68c08ba7e74f81eea0afd02311d671b9d28eacda089e73e296c33ac7fd7ad32ba7c3522c79559682b43bc81252a9752adcbe4f0185c8c93e5507",
+        "sig": "3b1944bbd007f545ff965b9f07715fb1eb43f7d313e8c2ba7272dff04547bac0ee8c78dc82b26e13ca467d393c5b4f01676eaf3036c8b383ab95b479f58e180b",
         "tags": [],
         "text": "Handing over to my next key, as committed in my announce.",
         "thread": null,
@@ -167,8 +168,8 @@
         "v": 1
       },
       "expect": "accept",
-      "header_jcs": "{\"author\":\"ca93ac1705187071d67b83c7ff0efe8108e8ec4530575d7726879333dbdabe7c\",\"body\":\"329f5e661906d0a0b6401d736f0d5f259771eb37623eb510bf97368f07d6d6a3\",\"kind\":\"rotate\",\"net\":\"public\",\"parent\":null,\"pow\":\"0\",\"refs\":[\"62ee252679f592f8ce175d239e282452604b581e52ffce31298fda2e2954b2fa\"],\"thread\":null,\"ts\":1760600200,\"v\":1}",
-      "id": "4d4bb4da500ad04688d2d2b84c0c40fdfc908fd97f54dd322f400a00871ce71d",
+      "header_jcs": "{\"author\":\"ca93ac1705187071d67b83c7ff0efe8108e8ec4530575d7726879333dbdabe7c\",\"body\":\"362a90d39a26d66e8d15560c333c62bee97d953faf63fede16cd22373655ff4d\",\"kind\":\"rotate\",\"net\":\"public\",\"parent\":null,\"pow\":\"0\",\"refs\":[\"62ee252679f592f8ce175d239e282452604b581e52ffce31298fda2e2954b2fa\"],\"thread\":null,\"ts\":1760600200,\"v\":1}",
+      "id": "b1e4963d71f0a22b514aa63f028feb0fd9dd5f1195a2acfaffea5e38674b61c4",
       "name": "v1-rotate",
       "secret_key": "0404040404040404040404040404040404040404040404040404040404040404"
     },

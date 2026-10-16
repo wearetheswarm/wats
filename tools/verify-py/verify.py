@@ -42,6 +42,8 @@ import strict_json  # noqa: E402
 ID_CONTEXT = "wats event id v1"
 BODY_CONTEXT = "wats event body v1"
 SIG_PREFIX_V1 = b"wats/event/v1"
+# The new key's back-signature in a rotate covers this || old key || new key.
+ROTATE_SIG_PREFIX = b"wats/rotate/v1"
 
 HEADER_KEYS = ("v", "author", "ts", "net", "thread", "parent", "kind", "pow")
 REFS_KEY = "refs"
@@ -447,6 +449,18 @@ def validate_kind_data(kind: str, data: dict, author: str) -> None:
             raise Invalid("rotate data.new_key is not an Ed25519 point")
         if new_key == author:
             raise Invalid("rotate data.new_key must differ from the author")
+        new_key_sig = data.get("new_key_sig")
+        if type(new_key_sig) is not str:
+            raise Invalid("rotate data.new_key_sig is mandatory")
+        sig = parse_hex(new_key_sig, 64, "rotate data.new_key_sig")
+        old_key = parse_hex(author, 32, "author")
+        try:
+            ed25519_zip215.verify(key_bytes, ROTATE_SIG_PREFIX + old_key + key_bytes, sig)
+        except ed25519_zip215.VerifyError:
+            raise Invalid(
+                "rotate data.new_key_sig must be the new key's signature over "
+                '"wats/rotate/v1" || old key || new key'
+            ) from None
         optional_hex32(data, "next_key_commitment", kind)
     elif kind == "clarify":
         options = None
