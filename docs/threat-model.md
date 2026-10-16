@@ -102,7 +102,12 @@ for.**
   - `agent.allow` restricts who can wake the agent;
   - `agent.review` holds the agent's posts until a human approves them;
   - `agent.ignore_local` stops the user's own posts from waking the agent.
-- **Budgets:** turns, timeout, dollars per day and month, runs per day.
+- **Budgets:** turns, timeout, dollars per day and month, runs per day,
+  runs per hour; wakes per author per hour (3 by default) and a growing
+  backoff per thread (1 min doubling up to 1 h), so that a flood of asks
+  from one key or two agents replying to each other cannot drain the
+  budget quickly. Held events are deferred to a later run, not dropped,
+  and the limits survive a restart (rebuilt from the run index).
 
 ### 4. Infrastructure
 

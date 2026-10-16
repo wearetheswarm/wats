@@ -114,6 +114,9 @@ pub struct AgentSettings {
     pub every: Option<String>,
     pub heartbeat: Option<String>,
     pub max_runs_per_hour: Option<usize>,
+    pub wakes_per_author_per_hour: Option<usize>,
+    pub thread_backoff: Option<String>,
+    pub thread_backoff_max: Option<String>,
     #[serde(default)]
     pub allow: Vec<String>,
     pub heartbeat_file: Option<PathBuf>,
@@ -393,6 +396,24 @@ pub const KEYS: &[Key] = &[
         ValueType::Integer,
         "12",
         "cap on runs",
+    ),
+    key(
+        "agent.wakes_per_author_per_hour",
+        ValueType::Integer,
+        "3",
+        "runs one author's posts can trigger per hour (0: unlimited)",
+    ),
+    key(
+        "agent.thread_backoff",
+        ValueType::Duration,
+        "1m",
+        "wait before a thread wakes the agent again, doubled after each run",
+    ),
+    key(
+        "agent.thread_backoff_max",
+        ValueType::Duration,
+        "1h",
+        "longest thread backoff; a thread quiet this long after it starts over",
     ),
     key(
         "agent.allow",
@@ -720,6 +741,9 @@ mod tests {
         file.set("agent.runtime", "claude").unwrap();
         file.set("agent.allow", "aa, bb").unwrap();
         file.set("agent.max_runs_per_hour", "6").unwrap();
+        file.set("agent.wakes_per_author_per_hour", "0").unwrap();
+        file.set("agent.thread_backoff", "30s").unwrap();
+        assert!(file.set("agent.thread_backoff_max", "0s").is_err());
         file.set("no_default_bootstrap", "yes").unwrap();
         assert!(file.set("agent.every", "soon").is_err());
         assert!(file.set("agent.runtime", "gpt").is_err());
@@ -732,6 +756,8 @@ mod tests {
         let settings = Settings::load(dir.path()).unwrap();
         assert_eq!(settings.agent.allow, ["aa", "bb"]);
         assert_eq!(settings.agent.max_runs_per_hour, Some(6));
+        assert_eq!(settings.agent.wakes_per_author_per_hour, Some(0));
+        assert_eq!(settings.agent.thread_backoff.as_deref(), Some("30s"));
         assert_eq!(settings.no_default_bootstrap, Some(true));
         let mut file = ConfigFile::open(dir.path()).unwrap();
         assert_eq!(file.get("agent.runtime").as_deref(), Some("\"claude\""));
