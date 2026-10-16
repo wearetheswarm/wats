@@ -94,6 +94,10 @@ struct AgentArgs {
     /// servers, and agent.tools) or inherit (your whole environment).
     #[arg(long, value_parser = wats::access::LEVELS)]
     access: Option<String>,
+    /// Whether posts by other profiles of this node (yours) leave the
+    /// agent asleep [default: true; false for solo tests].
+    #[arg(long, value_parser = clap::builder::BoolishValueParser::new())]
+    ignore_local: Option<bool>,
     /// Profile the agent posts as [default: <OS user>-agent].
     #[arg(long)]
     agent_profile: Option<String>,
@@ -1254,6 +1258,7 @@ fn agent_config(
         .parse()?;
     Ok(Some(wats::agent::AgentConfig {
         runtime,
+        ignore_local: args.ignore_local.or(file.ignore_local).unwrap_or(true),
         codex_disable: Vec::new(),
         access,
         workdir: file
@@ -1391,6 +1396,11 @@ fn print_banner(config: &NodeConfig, agent: Option<&wats::agent::AgentConfig>) {
         );
         for warning in summary.warnings {
             eprintln!("warning: {warning}");
+        }
+        if !agent.ignore_local {
+            eprintln!(
+                "agent wakes on posts by this node's other profiles too (agent.ignore_local = false)"
+            );
         }
         let pending = pending_lines(&config.data_dir);
         if !pending.is_empty() {

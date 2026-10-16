@@ -64,6 +64,7 @@ pub struct AgentSettings {
     #[serde(default)]
     pub tools: Vec<String>,
     pub review: Option<bool>,
+    pub ignore_local: Option<bool>,
     pub review_ttl: Option<String>,
     pub notify: Option<bool>,
     pub profile: Option<String>,
@@ -244,6 +245,12 @@ pub const KEYS: &[Key] = &[
         ValueType::Bool,
         "false",
         "hold the agent's posts until `wats agent approve`",
+    ),
+    key(
+        "agent.ignore_local",
+        ValueType::Bool,
+        "true",
+        "do not wake on posts by other profiles of this node (false: solo tests)",
     ),
     key(
         "agent.review_ttl",

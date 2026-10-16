@@ -284,6 +284,8 @@ pub struct Node {
     /// Tokens of the agent runs in progress: an MCP session presenting one
     /// is a runner session.
     runner_tokens: std::sync::Mutex<HashMap<String, RunnerRun>>,
+    /// Author ids of the profiles used on this node (see `author_key`).
+    local_authors: std::sync::Mutex<HashSet<String>>,
     /// Exclusive lock on the data directory, released by `shutdown`.
     lock: std::sync::Mutex<Option<std::fs::File>>,
 }
@@ -423,6 +425,7 @@ impl Node {
             storage_bytes: Default::default(),
             storage_logged: Default::default(),
             runner_tokens: Default::default(),
+            local_authors: Default::default(),
             lock: std::sync::Mutex::new(Some(lock)),
         });
         node.measure_storage().await;
@@ -463,7 +466,21 @@ impl Node {
         if !is_valid_profile(profile) {
             bail!("profile name must be 1-64 chars of [a-z0-9_-]");
         }
-        Ok(self.root.profile_key(profile))
+        let key = self.root.profile_key(profile);
+        if let Ok(mut local) = self.local_authors.lock() {
+            local.insert(crate::identity::author_id(&key));
+        }
+        Ok(key)
+    }
+
+    /// Whether an author id is one of the profiles this node has used
+    /// since it started (its default profile, MCP sessions, the agent).
+    pub fn is_local_author(&self, author: &str) -> bool {
+        author == self.author_id()
+            || self
+                .local_authors
+                .lock()
+                .is_ok_and(|local| local.contains(author))
     }
 
     /// Author key of the configured default profile.

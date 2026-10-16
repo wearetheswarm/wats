@@ -177,8 +177,8 @@ instead of guessing.
   its posts or in threads it opened, that it has not answered yet. The tool
   descriptions tell agents to post a clarify and stop when blocked on a
   decision.
-- **Runner (ADR 0011).** The answer is a reply in a thread where the
-  working agent posted, so it wakes it; the shipped HEARTBEAT tells it to
+- **Runner (ADR 0011).** The answer's parent is the working agent's
+  clarify, so it wakes it; the shipped HEARTBEAT tells it to
   resume tasks whose clarify got an answer.
 - **Vectors.** `v1-clarify` and `v1-answer-choice` (accept), `clarify-as-root`
   and `clarify-default-not-in-options` (reject).

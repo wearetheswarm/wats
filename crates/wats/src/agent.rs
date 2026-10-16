@@ -54,6 +54,8 @@ pub struct AgentConfig {
     pub max_runs_per_hour: usize,
     /// When non-empty, only events by these authors (hex keys) are of interest.
     pub allow: Vec<String>,
+    /// Do not wake on posts by other profiles of this node (the human's).
+    pub ignore_local: bool,
     /// Heartbeat prompt (the file's content, or [`DEFAULT_HEARTBEAT`]).
     pub heartbeat_text: String,
     /// The agent CLI to spawn (`claude` by default).
@@ -122,21 +124,46 @@ impl Trigger {
 }
 
 const WHY_ASK: &str = "ask";
-const WHY_REPLY: &str = "reply in a thread where the agent posted";
+const WHY_REPLY: &str = "reply to one of the agent's posts";
 
 /// What the runner makes of a new event.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Interest {
     Wake(&'static str),
+    /// Feedback on the agent's posts (react, vouch, progress, note…): no
+    /// run for it, but the next run hears about it.
+    Feedback(&'static str),
     Ignore(&'static str),
+}
+
+/// Kinds that ask something of the agent when they reply to its posts.
+/// Reactions, vouches, progress and notes are feedback, not requests: on
+/// the first real exchange, a `vouch` replying to an answer woke the other
+/// agent for nothing.
+fn actionable(kind: &Kind) -> bool {
+    matches!(
+        kind,
+        Kind::Ask | Kind::Answer | Kind::Clarify | Kind::Offer | Kind::Claim | Kind::Release
+    )
 }
 
 /// Whether a new event should wake the agent, and why: not its own; from an
 /// allowed author if a list is set; an `ask`, or a reply in a thread the
 /// agent posted in.
-pub fn interest(node: &Node, me: &str, allow: &[String], event: &Event) -> Interest {
+pub fn interest(
+    node: &Node,
+    me: &str,
+    allow: &[String],
+    ignore_local: bool,
+    event: &Event,
+) -> Interest {
     if event.author == me {
         return Interest::Ignore("own post");
+    }
+    // The human asks their own agent directly; their posts on this node
+    // (another profile) do not wake it.
+    if ignore_local && node.is_local_author(&event.author) {
+        return Interest::Ignore("local author, agent.ignore_local");
     }
     if !allow.is_empty() && !allow.iter().any(|a| a == &event.author) {
         return Interest::Ignore("author not in --allow");
@@ -144,22 +171,40 @@ pub fn interest(node: &Node, me: &str, allow: &[String], event: &Event) -> Inter
     if event.kind == Kind::Ask {
         return Interest::Wake(WHY_ASK);
     }
-    let Some(root) = &event.thread else {
+    let Some(parent) = &event.parent else {
         return Interest::Ignore("not an ask, not a reply");
     };
+    // Only replies addressed to the agent: their parent is one of its
+    // posts (an answer to its clarify included). Other answers in the
+    // thread, such as another agent's answer to the same ask, are not.
+    if node
+        .store()
+        .get(parent)
+        .ok()
+        .flatten()
+        .is_some_and(|p| p.event.author == me)
+    {
+        return if actionable(&event.kind) {
+            Interest::Wake(WHY_REPLY)
+        } else {
+            Interest::Feedback("feedback on the agent's post, not a request")
+        };
+    }
     let mine = Filter {
-        thread: Some(root.clone()),
+        thread: event.thread.clone(),
         author: Some(me.to_string()),
         ..Filter::default()
     };
     match node.store().search(None, &mine, 1) {
-        Ok(found) if !found.is_empty() => Interest::Wake(WHY_REPLY),
+        Ok(found) if !found.is_empty() => {
+            Interest::Ignore("sibling answer, not addressed to the agent")
+        }
         _ => Interest::Ignore("reply in a thread the agent is not part of"),
     }
 }
 
 pub fn is_interesting(node: &Node, me: &str, allow: &[String], event: &Event) -> bool {
-    matches!(interest(node, me, allow, event), Interest::Wake(_))
+    matches!(interest(node, me, allow, true, event), Interest::Wake(_))
 }
 
 /// `n thing` / `n things`.
@@ -172,6 +217,42 @@ fn count(n: usize, one: &str, many: &str) -> String {
 /// `{reasons}`, `{cursor}` and `{events}` (one line per event: id · kind ·
 /// author · title). A template without `{events}` gets that context
 /// appended.
+/// `- id · kind · author · title` for each event.
+fn event_lines(node: &Node, ids: &[String]) -> Vec<String> {
+    let mut lines: Vec<String> = ids
+        .iter()
+        .take(MAX_IDS_IN_PROMPT)
+        .map(|id| match node.store().get(id) {
+            Ok(Some(stored)) => {
+                let e = &stored.event;
+                let title = e.title.clone().unwrap_or_else(|| title_from_text(&e.text));
+                format!("- {id} · {} · {} · {title}", e.kind, short(&e.author))
+            }
+            _ => format!("- {id}"),
+        })
+        .collect();
+    if ids.len() > MAX_IDS_IN_PROMPT {
+        lines.push(format!(
+            "- … and {} more: use `search`",
+            ids.len() - MAX_IDS_IN_PROMPT
+        ));
+    }
+    lines
+}
+
+/// The feedback section of a prompt: reactions and the like to the
+/// agent's posts since its last run.
+pub fn feedback_section(node: &Node, feedback: &[String]) -> String {
+    if feedback.is_empty() {
+        return String::new();
+    }
+    format!(
+        "\n\nFeedback on your posts since your last run (reactions, vouches, progress; \
+         no answer needed):\n{}\n",
+        event_lines(node, feedback).join("\n")
+    )
+}
+
 pub fn prompt(node: &Node, config: &AgentConfig, since: i64, trigger: &Trigger) -> String {
     let (reasons, events) = match trigger {
         Trigger::Events(ids) => {
@@ -184,29 +265,12 @@ pub fn prompt(node: &Node, config: &AgentConfig, since: i64, trigger: &Trigger) 
             if replies > 0 {
                 reasons.push(count(
                     replies,
-                    "reply in a thread where you posted",
-                    "replies in threads where you posted",
+                    "reply to one of your posts",
+                    "replies to your posts",
                 ));
             }
-            let mut lines: Vec<String> = ids
-                .iter()
-                .take(MAX_IDS_IN_PROMPT)
-                .map(|(id, _)| match node.store().get(id) {
-                    Ok(Some(stored)) => {
-                        let e = &stored.event;
-                        let title = e.title.clone().unwrap_or_else(|| title_from_text(&e.text));
-                        format!("- {id} · {} · {} · {title}", e.kind, short(&e.author))
-                    }
-                    _ => format!("- {id}"),
-                })
-                .collect();
-            if ids.len() > MAX_IDS_IN_PROMPT {
-                lines.push(format!(
-                    "- … and {} more: use `search`",
-                    ids.len() - MAX_IDS_IN_PROMPT
-                ));
-            }
-            (reasons.join(", "), lines.join("\n"))
+            let ids: Vec<String> = ids.iter().map(|(id, _)| id.clone()).collect();
+            (reasons.join(", "), event_lines(node, &ids).join("\n"))
         }
         Trigger::Heartbeat => (
             "the heartbeat, with nothing specific: look around briefly".to_string(),
@@ -559,6 +623,7 @@ pub async fn run(
     let _ = std::fs::remove_file(runs::current_path(&config.work_dir));
     let mut events = node.store().subscribe();
     let mut pending: Vec<(String, &'static str)> = Vec::new();
+    let mut feedback: Vec<String> = Vec::new();
     let mut since = node.store().last_seq()?;
     let mut last_run: Option<Instant> = None;
     let mut last_heartbeat = Instant::now();
@@ -586,11 +651,17 @@ pub async fn run(
             event = events.recv() => match event {
                 Ok(stored) => {
                     let event = &stored.event;
-                    match interest(&node, &me, &config.allow, event) {
+                    match interest(&node, &me, &config.allow, config.ignore_local, event) {
                         Interest::Wake(why) => {
                             if !pending.iter().any(|(id, _)| *id == event.id) {
                                 info!(event = short(&event.id), kind = event.kind.as_str(), "queued for the agent: {why}");
                                 pending.push((event.id.clone(), why));
+                            }
+                        }
+                        Interest::Feedback(why) => {
+                            info!(event = short(&event.id), kind = event.kind.as_str(), "kept for the next run: {why}");
+                            if !feedback.contains(&event.id) {
+                                feedback.push(event.id.clone());
                             }
                         }
                         Interest::Ignore(why) => {
@@ -654,6 +725,7 @@ pub async fn run(
                     }
                 };
                 let mut text = prompt(&node, &config, since, &trigger);
+                text.push_str(&feedback_section(&node, &std::mem::take(&mut feedback)));
                 // What the human said about the posts they rejected.
                 if let Some(data_dir) = config.work_dir.parent() {
                     let feedback = crate::review::take_feedback(data_dir);
