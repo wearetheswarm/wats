@@ -415,6 +415,12 @@ impl AnyEvent {
         }
         crate::event::check_v1_wire(&raw.wire)?;
         let event: Event = serde_json::from_value(raw.to_value())?;
+        // The typed event is what this node stores and relays: it must be
+        // exactly the object that was signed, or relayed copies would no
+        // longer match their id.
+        if event.wire_map()? != raw.wire {
+            return Err(invalid("event does not round-trip to the object received"));
+        }
         event.check_rules()?;
         Ok(AnyEvent::Known(event))
     }

@@ -354,7 +354,8 @@ BLOB_FIELDS = ("hash", "name", "size", "url")
 def check_v1_shape(wire: dict) -> None:
     """What serde's deserialization into the typed `Event` enforces: field
     presence and JSON types, the kind vocabulary, the blob reference shape
-    (`deny_unknown_fields`; a missing `url` reads as null)."""
+    (`deny_unknown_fields`), and `check_v1_wire`: every blob field is
+    present, `url` as null when there is none."""
     if "title" in wire and type(wire["title"]) is not str:
         raise Invalid("title must be a string when present")
     for field in V1_FIELDS:
@@ -388,6 +389,8 @@ def check_v1_shape(wire: dict) -> None:
         for key in blob:
             if key not in BLOB_FIELDS:
                 raise Invalid(f"unknown blob field `{key}`")
+        if "url" not in blob:
+            raise Invalid("blob url must be present (null when there is none)")
         for key in ("hash", "name", "size"):
             if key not in blob:
                 raise Invalid(f"missing blob field `{key}`")
@@ -395,7 +398,7 @@ def check_v1_shape(wire: dict) -> None:
             raise Invalid("blob hash and name must be strings")
         if as_u64(blob["size"]) is None:
             raise Invalid("blob size must be a non-negative integer")
-        if blob.get("url") is not None and type(blob["url"]) is not str:
+        if blob["url"] is not None and type(blob["url"]) is not str:
             raise Invalid("blob url must be null or a string")
 
 
@@ -521,7 +524,7 @@ def validate_content(wire: dict) -> None:
             raise Invalid(f"unsafe blob name {blob['name']!r}")
         if blob["size"] > MAX_SAFE_INTEGER:
             raise Invalid("blob size too large")
-        url = blob.get("url")
+        url = blob["url"]
         if url is not None and (not is_clean_token(url) or utf8_len(url) > MAX_URL_BYTES):
             raise Invalid(f"blob url must be 1-{MAX_URL_BYTES} bytes with no whitespace")
     for key in wire:
@@ -530,12 +533,8 @@ def validate_content(wire: dict) -> None:
 
 
 def canonical_size(wire: dict) -> int:
-    """Length of JCS(whole wire object), as the Rust node computes it: on
-    the typed event re-serialized, where a blob without `url` gets
-    `"url": null`."""
-    typed = dict(wire)
-    typed["blobs"] = [{"url": None, **blob} for blob in wire["blobs"]]
-    return len(jcs.canonicalize(typed))
+    """Length of JCS(whole wire object), as received."""
+    return len(jcs.canonicalize(wire))
 
 
 def check_v1(wire: dict) -> None:

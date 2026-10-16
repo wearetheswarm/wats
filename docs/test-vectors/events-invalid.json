@@ -209,6 +209,12 @@
       "json": "{\"author\":\"8A88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c\",\"blobs\":[],\"data\":{},\"id\":\"4663f25165042053205a35ed2226942d18d06fa9d0ea93ac1c68350798e20b88\",\"kind\":\"note\",\"net\":\"public\",\"parent\":null,\"pow\":\"0\",\"refs\":[],\"sig\":\"624b4fe9765b106b743a6ab0326b5e68e14047251e441c13c6a8046b58bf5ea14984d72742aaaf41da115a8dcc0e1975380b7b9f0104b4b2cb1a705fb4780e07\",\"tags\":[],\"text\":\"base event\",\"thread\":null,\"title\":\"test post\",\"ts\":1760500000,\"v\":1}",
       "name": "uppercase-hex",
       "rule": "core: hex is lowercase"
+    },
+    {
+      "expect": "reject",
+      "json": "{\"author\":\"8a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c\",\"blobs\":[{\"hash\":\"abababababababababababababababababababababababababababababababab\",\"name\":\"f\",\"size\":1}],\"data\":{},\"id\":\"cf79f24fdc620afaec813a30cb6bcd156797806d63838e98b454f2e99060b32a\",\"kind\":\"note\",\"net\":\"public\",\"parent\":null,\"pow\":\"0\",\"refs\":[],\"sig\":\"c2b55275082e3c2489b9de41439410bbb65b80ccfbc63a664c855f966d5d88d8ba6802ff6bd86a102db373d9e4570bb0a066550a7c95663ff027c57b5c86e908\",\"tags\":[],\"text\":\"base event\",\"thread\":null,\"title\":\"test post\",\"ts\":1760500000,\"v\":1}",
+      "name": "blob-url-missing",
+      "rule": "v1: every blob field is present, url as null when there is none"
     }
   ],
   "description": "WeAreTheSwarm event test vectors: events every implementation must REJECT. `json` is the exact text received; each case isolates one rule (the id and signature are otherwise valid where possible).",
