@@ -111,6 +111,8 @@ pub struct NodeConfig {
     pub lock_wait: Duration,
     /// Collect crash reports from other nodes (`report.accept`).
     pub report_accept: bool,
+    /// Per-peer rate limits on requests (`[limits]`).
+    pub limits: crate::limits::Limits,
     /// Where this node sends its crash reports (`report.collector`).
     pub report_collector: Option<EndpointId>,
     /// Send them without asking (`report.crashes`).
@@ -144,6 +146,7 @@ impl NodeConfig {
             lock_wait: Duration::ZERO,
             relaunch_args: Vec::new(),
             report_accept: false,
+            limits: Default::default(),
             report_collector: None,
             report_auto: false,
             replication: 3,
@@ -333,6 +336,8 @@ pub struct Node {
     storage_logged: std::sync::Mutex<Option<std::time::Instant>>,
     /// Asked to stop (`start_daemon` hands over to a daemon).
     stop: tokio::sync::Notify,
+    /// Per-peer request limits.
+    limiter: crate::limits::RateLimiter,
     /// Tokens of the agent runs in progress: an MCP session presenting one
     /// is a runner session.
     runner_tokens: std::sync::Mutex<HashMap<String, RunnerRun>>,
@@ -473,6 +478,7 @@ impl Node {
             receivers.push((net.clone(), receiver));
         }
 
+        let limits = config.limits;
         let node = Arc::new(Self {
             config,
             router,
@@ -493,6 +499,7 @@ impl Node {
             storage_bytes: Default::default(),
             storage_logged: Default::default(),
             stop: Default::default(),
+            limiter: crate::limits::RateLimiter::new(limits),
             runner_tokens: Default::default(),
             local_authors: Default::default(),
             lock: std::sync::Mutex::new(Some(lock)),
@@ -1183,6 +1190,20 @@ impl Node {
     /// Serve a `/wats/1` request from `peer`.
     pub(crate) async fn handle_request(&self, peer: EndpointId, request: Request) -> Response {
         self.seen(peer);
+        let kind = match &request {
+            Request::Hello { .. } => Some(crate::limits::Kind::Hello),
+            Request::Sync { .. } => Some(crate::limits::Kind::Sync),
+            Request::Replicate { .. } => Some(crate::limits::Kind::Replicate),
+            Request::CrashReport { .. } => Some(crate::limits::Kind::Report),
+            Request::Unsupported => None,
+        };
+        if let Some(kind) = kind
+            && !self.limiter.allow(peer, kind)
+        {
+            return Response::Refused {
+                reason: format!("rate limited ({}): retry later", kind.as_str()),
+            };
+        }
         match request {
             Request::Hello { mut info } => {
                 crate::grease::strip(&mut info.features);
@@ -1261,6 +1282,10 @@ impl Node {
                         continue;
                     }
                     self.add_hints(&blob.hash, &[peer]);
+                    // At most a few fetches at once for one peer.
+                    let Some(_permit) = self.limiter.blob_fetch(peer) else {
+                        continue;
+                    };
                     if self.fetch_blob(blob, vec![peer]).await {
                         stored.push(blob.hash.clone());
                     }

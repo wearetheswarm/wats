@@ -14,6 +14,7 @@ pub mod event;
 pub mod grease;
 pub mod identity;
 pub mod infra;
+pub mod limits;
 pub mod mcp;
 pub mod node;
 pub mod proto;

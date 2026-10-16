@@ -1057,6 +1057,7 @@ impl NodeArgs {
         }
         config.review_notify = file.agent.notify.unwrap_or(false);
         config.report_accept = self.report_accept || file.report.accept.unwrap_or(false);
+        config.limits = file.limits.limits();
         config.report_auto = file.report.crashes.unwrap_or(false);
         config.report_collector = match &file.report.collector {
             Some(id) => Some(

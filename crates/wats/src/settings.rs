@@ -45,7 +45,36 @@ pub struct Settings {
     #[serde(default)]
     pub report: ReportSettings,
     #[serde(default)]
+    pub limits: LimitsSettings,
+    #[serde(default)]
     pub agent: AgentSettings,
+}
+
+#[derive(Debug, Default, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LimitsSettings {
+    pub hello_per_min: Option<u32>,
+    pub sync_per_min: Option<u32>,
+    pub replicate_per_min: Option<u32>,
+    pub report_per_min: Option<u32>,
+    pub blob_fetches_per_peer: Option<usize>,
+}
+
+impl LimitsSettings {
+    /// The configured limits over the defaults.
+    pub fn limits(&self) -> crate::limits::Limits {
+        let d = crate::limits::Limits::default();
+        crate::limits::Limits {
+            hello_per_min: self.hello_per_min.unwrap_or(d.hello_per_min),
+            sync_per_min: self.sync_per_min.unwrap_or(d.sync_per_min),
+            replicate_per_min: self.replicate_per_min.unwrap_or(d.replicate_per_min),
+            report_per_min: self.report_per_min.unwrap_or(d.report_per_min),
+            blob_fetches_per_peer: self
+                .blob_fetches_per_peer
+                .unwrap_or(d.blob_fetches_per_peer)
+                .max(1),
+        }
+    }
 }
 
 #[derive(Debug, Default, Clone, Deserialize)]
@@ -226,6 +255,36 @@ pub const KEYS: &[Key] = &[
         ValueType::Size,
         "10G",
         "disk budget of the data dir: no blob fetches beyond, no events beyond +10%",
+    ),
+    key(
+        "limits.hello_per_min",
+        ValueType::Integer,
+        "60",
+        "hello requests a peer may make per minute (0: unlimited)",
+    ),
+    key(
+        "limits.sync_per_min",
+        ValueType::Integer,
+        "600",
+        "sync pages a peer may ask per minute (0: unlimited)",
+    ),
+    key(
+        "limits.replicate_per_min",
+        ValueType::Integer,
+        "120",
+        "replication requests a peer may make per minute (0: unlimited)",
+    ),
+    key(
+        "limits.report_per_min",
+        ValueType::Integer,
+        "10",
+        "crash reports a peer may send per minute (collectors)",
+    ),
+    key(
+        "limits.blob_fetches_per_peer",
+        ValueType::Integer,
+        "4",
+        "blobs one peer can make this node fetch at once",
     ),
     key(
         "report.crashes",
