@@ -98,6 +98,10 @@ struct AgentArgs {
     /// agent asleep [default: true; false for solo tests].
     #[arg(long, value_parser = clap::builder::BoolishValueParser::new())]
     ignore_local: Option<bool>,
+    /// The agent's model, e.g. sonnet [default: agent.model, else the
+    /// runtime's own default].
+    #[arg(long)]
+    agent_model: Option<String>,
     /// Profile the agent posts as [default: <OS user>-agent].
     #[arg(long)]
     agent_profile: Option<String>,
@@ -400,6 +404,10 @@ struct SetupKeys {
     /// Read,Grep.
     #[arg(long)]
     tools: Option<String>,
+    /// The agent's model (agent.model), e.g. sonnet; unset uses the
+    /// runtime's default.
+    #[arg(long)]
+    model: Option<String>,
 }
 
 #[derive(Debug, Subcommand)]
@@ -634,6 +642,7 @@ fn setup_tool(
             workdir.as_ref().map(|d| d.display().to_string()),
         ),
         ("agent.tools", keys.tools.clone()),
+        ("agent.model", keys.model.clone()),
     ]
     .into_iter()
     .filter_map(|(k, v)| v.map(|v| (k, v)))
@@ -1259,6 +1268,11 @@ fn agent_config(
     Ok(Some(wats::agent::AgentConfig {
         runtime,
         ignore_local: args.ignore_local.or(file.ignore_local).unwrap_or(true),
+        model: args
+            .agent_model
+            .clone()
+            .or(file.model.clone())
+            .filter(|m| !m.trim().is_empty()),
         codex_disable: Vec::new(),
         access,
         workdir: file
@@ -1368,8 +1382,9 @@ fn print_banner(config: &NodeConfig, agent: Option<&wats::agent::AgentConfig>) {
     );
     match agent {
         Some(agent) => eprintln!(
-            "agent {}: on, posts as {} · wakes on asks and replies (every {} at most), heartbeat {} · watch it: wats agent logs -f",
+            "agent {} ({}): on, posts as {} · wakes on asks and replies (every {} at most), heartbeat {} · watch it: wats agent logs -f",
             agent.runtime,
+            agent.model.as_deref().unwrap_or("default model"),
             agent.profile,
             short_duration(agent.every),
             short_duration(agent.heartbeat),
@@ -1462,14 +1477,14 @@ async fn agent_watch(data_dir: &std::path::Path, action: AgentAction) -> Result<
             } else {
                 let mut result = writeln!(
                     out,
-                    "{:<32} {:<20} {:<9} {:<10} {:>8} {:>6} {:>9}",
-                    "RUN", "STARTED", "ACCESS", "STATUS", "SECONDS", "TURNS", "COST"
+                    "{:<32} {:<20} {:<9} {:<18} {:<10} {:>8} {:>6} {:>9}",
+                    "RUN", "STARTED", "ACCESS", "MODEL", "STATUS", "SECONDS", "TURNS", "COST"
                 );
                 for r in shown {
                     result = result.and_then(|()| {
                         writeln!(
                             out,
-                            "{:<32} {:<20} {:<9} {:<10} {:>8} {:>6} {:>9}",
+                            "{:<32} {:<20} {:<9} {:<18} {:<10} {:>8} {:>6} {:>9}",
                             r.id,
                             runs::format_time(r.started),
                             if r.access.is_empty() {
@@ -1477,6 +1492,7 @@ async fn agent_watch(data_dir: &std::path::Path, action: AgentAction) -> Result<
                             } else {
                                 &r.access
                             },
+                            if r.model.is_empty() { "-" } else { &r.model },
                             r.status,
                             r.seconds.map(|s| format!("{s:.1}")).unwrap_or_default(),
                             r.turns.map(|t| t.to_string()).unwrap_or_default(),

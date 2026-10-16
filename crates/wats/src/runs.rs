@@ -27,6 +27,9 @@ pub struct RunRecord {
     /// `locked`, `workspace` or `inherit`.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub access: String,
+    /// The model: `agent.model`, or what the CLI reported.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub model: String,
     /// `events` or `heartbeat`.
     pub trigger: String,
     /// The events that woke the agent.
@@ -175,6 +178,14 @@ pub fn read_result(transcript: &Path, record: &mut RunRecord) {
         let Ok(value) = serde_json::from_str::<Value>(&line) else {
             continue;
         };
+        // The model Claude Code chose (system init).
+        if value["type"] == "system"
+            && value["subtype"] == "init"
+            && record.model.is_empty()
+            && let Some(model) = value["model"].as_str()
+        {
+            record.model = model.to_string();
+        }
         // Codex: turns and failures, no cost.
         match value["type"].as_str() {
             Some("turn.completed") => {
@@ -197,6 +208,12 @@ pub fn read_result(transcript: &Path, record: &mut RunRecord) {
             continue;
         }
         record.turns = value["num_turns"].as_u64();
+        if record.model.is_empty()
+            && let Some(usage) = value["modelUsage"].as_object()
+            && let Some(model) = usage.keys().next()
+        {
+            record.model = model.clone();
+        }
         record.cost_usd = value["total_cost_usd"].as_f64();
         if value["is_error"] == true && record.status == "ok" {
             record.status = "error".into();

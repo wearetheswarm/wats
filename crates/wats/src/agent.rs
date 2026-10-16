@@ -83,6 +83,9 @@ pub struct AgentConfig {
     /// Built-in tools allowed with `workspace` access (Claude tool names;
     /// for Codex, features kept on).
     pub tools: Vec<String>,
+    /// The model, when set (`agent.model`); otherwise the runtime's own
+    /// default.
+    pub model: Option<String>,
     /// Where transcripts, the runs index and the generated MCP config go
     /// (`<data dir>/agent`).
     pub work_dir: PathBuf,
@@ -369,6 +372,19 @@ struct Running {
 
 /// Start one run: a transcript header, then the agent CLI with its output
 /// (stream-json) appended to the transcript.
+/// `--model <m>` when `agent.model` is set and the extra arguments do not
+/// choose one.
+fn model_args(config: &AgentConfig, flag: &str) -> Vec<String> {
+    let chosen = config
+        .extra_args
+        .iter()
+        .any(|a| a == "--model" || a == "-m" || a.starts_with("--model="));
+    match &config.model {
+        Some(model) if !chosen => vec![flag.to_string(), model.clone()],
+        _ => Vec::new(),
+    }
+}
+
 /// Per-run limits for the agent CLI, unless the extra arguments set them:
 /// turns, and the budget left (Claude Code's `--max-budget-usd`).
 fn limit_args(config: &AgentConfig, remaining_usd: f64) -> Vec<String> {
@@ -422,6 +438,7 @@ async fn start_run(
         &trigger.events(),
     );
     record.access = config.access.to_string();
+    record.model = config.model.clone().unwrap_or_default();
     std::fs::create_dir_all(runs::runs_dir(&config.work_dir))?;
     let base = record.id.clone();
     let mut n = 1;
@@ -449,6 +466,9 @@ async fn start_run(
             } else {
                 Default::default()
             };
+            // `--model` is an option of `codex exec`: it goes after it.
+            let mut extra = model_args(config, "--model");
+            extra.extend(config.extra_args.iter().cloned());
             command.args(access::codex_args(&access::CodexRun {
                 access: config.access,
                 wats_command: &config.mcp_command,
@@ -456,7 +476,7 @@ async fn start_run(
                 runner_token: &token,
                 disable: &config.codex_disable,
                 workspace_overrides: &workspace_overrides,
-                extra: &config.extra_args,
+                extra: &extra,
             }));
         }
         _ => {
@@ -478,6 +498,7 @@ async fn start_run(
                     extra: &config.extra_args,
                 }))
                 .args(limit_args(config, remaining_usd))
+                .args(model_args(config, "--model"))
                 .args(&config.extra_args);
         }
     };

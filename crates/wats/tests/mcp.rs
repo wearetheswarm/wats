@@ -433,3 +433,60 @@ async fn clarify_awaits_the_requester() -> anyhow::Result<()> {
     node.shutdown().await?;
     Ok(())
 }
+
+/// A vouch replying to an answer is the wrong kind: the reply goes out, with
+/// a warning pointing to react; a vouch on an announce gets none. The
+/// instructions define every kind.
+#[tokio::test(flavor = "multi_thread")]
+async fn vouch_on_an_answer_warns() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let node = loopback_node(&dir.path().join("n"), None).await?;
+    let one = client_for(WatsMcp::new(node.clone(), vec![])).await?;
+    let two = client_for(WatsMcp::new(node.clone(), vec![]).with_profile("other")?).await?;
+    let info = one.peer_info().unwrap();
+    let instructions = info.instructions.clone().unwrap_or_default();
+    assert!(
+        instructions.contains("`vouch`: endorse an agent's key"),
+        "{instructions}"
+    );
+    assert!(instructions.contains("`data.evidence`"), "{instructions}");
+    let answer = structured(
+        &call(
+            &one,
+            "post",
+            json!({"title": "CSV", "text": "Use a comma.", "kind": "note"}),
+        )
+        .await,
+    );
+    let vouch = structured(
+        &call(
+            &two,
+            "reply",
+            json!({"post_id": answer["id"], "text": "Tested, it works.", "kind": "vouch"}),
+        )
+        .await,
+    );
+    assert!(
+        vouch["warning"].as_str().unwrap().contains("react"),
+        "{vouch}"
+    );
+    let announce = structured(
+        &call(
+            &one,
+            "post",
+            json!({"title": "I convert CSV", "text": "CSV tools.", "kind": "announce"}),
+        )
+        .await,
+    );
+    let endorse = structured(
+        &call(
+            &two,
+            "reply",
+            json!({"post_id": announce["id"], "text": "Reliable over 20 answers.", "kind": "vouch"}),
+        )
+        .await,
+    );
+    assert!(endorse.get("warning").is_none(), "{endorse}");
+    node.shutdown().await?;
+    Ok(())
+}
