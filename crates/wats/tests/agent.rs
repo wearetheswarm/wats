@@ -115,6 +115,7 @@ async fn agent_wakes_on_asks_and_heartbeats() -> anyhow::Result<()> {
         access: wats::access::Access::Locked,
         workdir: std::path::PathBuf::from("/nonexistent"),
         tools: vec![],
+        model: None,
         work_dir: dir.path().join("work"),
         keep_runs: 2,
         keep_days: 30,
@@ -544,10 +545,7 @@ async fn agent_claude_registers_once_then_runs_the_agent() {
         banner.contains("wats registered in Claude Code"),
         "{banner}"
     );
-    assert!(
-        banner.contains("agent claude: on, posts as tester-agent"),
-        "{banner}"
-    );
+    assert!(banner.contains("on, posts as tester-agent"), "{banner}");
     let calls = std::fs::read_to_string(&log).unwrap();
     assert!(calls.contains("mcp add --scope user wats -- "), "{calls}");
 
@@ -583,10 +581,7 @@ async fn bare_wats_runs_agents_from_config_toml() {
         cmd
     };
     let banner = banner_of(&mut base(&[])).await;
-    assert!(
-        banner.contains("agent claude: on, posts as cfg-agent"),
-        "{banner}"
-    );
+    assert!(banner.contains("on, posts as cfg-agent"), "{banner}");
     assert!(banner.contains("heartbeat 2h"), "{banner}");
     let banner = banner_of(&mut base(&["--agent-profile", "flag-agent"])).await;
     assert!(banner.contains("posts as flag-agent"), "{banner}");
@@ -643,6 +638,7 @@ async fn budget_pauses_the_agent() -> anyhow::Result<()> {
         access: wats::access::Access::Locked,
         workdir: std::path::PathBuf::from("/nonexistent"),
         tools: vec![],
+        model: Some("haiku".into()),
         work_dir: dir.path().join("work"),
         keep_runs: 100,
         keep_days: 30,
@@ -655,6 +651,7 @@ async fn budget_pauses_the_agent() -> anyhow::Result<()> {
     tokio::time::sleep(Duration::from_secs(4)).await;
     let all = runs(dir.path());
     assert_eq!(all.len(), 2, "paused after the budget is spent");
+    assert!(all[0].1.contains("--model haiku"), "{}", all[0].1);
     assert!(
         all[0].1.contains("--max-turns 4 --max-budget-usd 0.02"),
         "{}",
@@ -791,7 +788,7 @@ echo '{{"type":"turn.completed","usage":{{"input_tokens":10,"output_tokens":2}}}
             "--profile".into(),
             "agent".into(),
         ],
-        extra_args: vec!["-m".into(), "gpt-test".into()],
+        extra_args: vec!["--sandbox-note".into()],
         run_timeout: Duration::from_secs(10),
         max_turns: 10,
         budget: wats::budget::Budget::default(),
@@ -799,6 +796,7 @@ echo '{{"type":"turn.completed","usage":{{"input_tokens":10,"output_tokens":2}}}
         access: wats::access::Access::Locked,
         workdir: std::path::PathBuf::from("/nonexistent"),
         tools: vec![],
+        model: Some("gpt-test".into()),
         work_dir: work.clone(),
         keep_runs: 100,
         keep_days: 30,
@@ -821,7 +819,8 @@ echo '{{"type":"turn.completed","usage":{{"input_tokens":10,"output_tokens":2}}}
         "-c mcp_servers.wats.command=\"/opt/wats\"",
         "-c mcp_servers.wats.args=[\"--dir\",\"/d\",\"mcp\",\"--profile\",\"agent\"]",
         "--disable shell_tool --disable apps",
-        "-m gpt-test -",
+        "--model gpt-test",
+        "--sandbox-note -",
     ] {
         assert!(args.contains(expected), "missing {expected:?} in {args}");
     }
@@ -896,6 +895,7 @@ async fn workspace_access_opens_the_workspace() -> anyhow::Result<()> {
         access: wats::access::Access::Workspace,
         workdir: workdir.clone(),
         tools: vec!["Read".into(), "Grep".into()],
+        model: None,
         work_dir: work.clone(),
         keep_runs: 100,
         keep_days: 30,
@@ -1363,6 +1363,7 @@ async fn wakes_only_on_what_is_addressed_to_it() -> anyhow::Result<()> {
         access: wats::access::Access::Locked,
         workdir: std::path::PathBuf::from("/nonexistent"),
         tools: vec![],
+        model: None,
         work_dir: dir.path().join("work"),
         keep_runs: 100,
         keep_days: 30,

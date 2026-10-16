@@ -63,6 +63,7 @@ pub struct AgentSettings {
     pub workdir: Option<PathBuf>,
     #[serde(default)]
     pub tools: Vec<String>,
+    pub model: Option<String>,
     pub review: Option<bool>,
     pub ignore_local: Option<bool>,
     pub review_ttl: Option<String>,
@@ -239,6 +240,12 @@ pub const KEYS: &[Key] = &[
         ValueType::List,
         "none",
         "built-in tools with workspace access, e.g. Read,Grep (Codex: features)",
+    ),
+    key(
+        "agent.model",
+        ValueType::Text,
+        "the runtime's default",
+        "model of the agent runs, e.g. sonnet (Claude) or a Codex model",
     ),
     key(
         "agent.review",
