@@ -1425,3 +1425,103 @@ async fn eventually_async<F: std::future::Future<Output = bool>>(mut check: impl
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
 }
+
+/// `--agents-md` adds a marked block to the tool's global instructions
+/// (replaced in place, never duplicated), `--remove-agents-md` takes it
+/// out and leaves the rest; `setup codex --no-approval` sets the wats
+/// server's approval mode in the Codex config, keeping its comments.
+#[test]
+fn setup_instructions_block_and_codex_approval() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path().join("home");
+    std::fs::create_dir_all(home.join(".claude")).unwrap();
+    std::fs::write(home.join(".claude/CLAUDE.md"), "# Mine\nBe brief.\n").unwrap();
+    let (claude, _) = logging_claude(dir.path());
+    let data = dir.path().join("data");
+    let setup = |args: &[&str]| {
+        let out = std::process::Command::new(env!("CARGO_BIN_EXE_wats"))
+            .env("HOME", &home)
+            .env_remove("CLAUDE_CONFIG_DIR")
+            .env_remove("CODEX_HOME")
+            .arg("--dir")
+            .arg(&data)
+            .arg("setup")
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8(out.stdout).unwrap()
+    };
+    let claude = claude.to_str().unwrap();
+    assert!(setup(&["claude", "--mcp", "--claude", claude]).contains("Tip: add --agents-md"));
+    assert!(
+        setup(&["claude", "--mcp", "--agents-md", "--claude", claude]).contains("wats block added")
+    );
+    assert!(
+        setup(&["claude", "--mcp", "--agents-md", "--claude", claude]).contains("already there")
+    );
+    let text = std::fs::read_to_string(home.join(".claude/CLAUDE.md")).unwrap();
+    assert!(
+        text.starts_with("# Mine\nBe brief.\n\n<!-- wats:begin -->"),
+        "{text}"
+    );
+    assert_eq!(text.matches("wats:begin").count(), 1);
+    assert!(text.contains("\"the swarm\""), "{text}");
+    assert!(
+        setup(&["claude", "--mcp", "--remove-agents-md", "--claude", claude]).contains("removed")
+    );
+    assert_eq!(
+        std::fs::read_to_string(home.join(".claude/CLAUDE.md")).unwrap(),
+        "# Mine\nBe brief.\n"
+    );
+
+    // Codex: the fake's `mcp get` shows the same entry, the config has it.
+    use std::os::unix::fs::PermissionsExt;
+    let exe = std::fs::canonicalize(env!("CARGO_BIN_EXE_wats")).unwrap();
+    let entry = serde_json::json!({"name": "wats", "transport": {"type": "stdio",
+        "command": exe, "args": ["--dir", data, "mcp", "--profile", "alice"]}});
+    let current = dir.path().join("current.json");
+    std::fs::write(&current, entry.to_string()).unwrap();
+    let codex = dir.path().join("codex");
+    std::fs::write(
+        &codex,
+        format!(
+            "#!/bin/sh\n[ \"$2\" = get ] && cat {} && exit 0\nexit 0\n",
+            current.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&codex, std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::fs::create_dir_all(home.join(".codex")).unwrap();
+    std::fs::write(
+        home.join(".codex/config.toml"),
+        "# keep me\n[mcp_servers.wats]\ncommand = \"x\"\n",
+    )
+    .unwrap();
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_wats"))
+        .env("HOME", &home)
+        .env("USER", "alice")
+        .env_remove("CODEX_HOME")
+        .env_remove("WATS_PROFILE")
+        .arg("--dir")
+        .arg(&data)
+        .args(["setup", "codex", "--mcp", "--no-approval", "--codex"])
+        .arg(&codex)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let config = std::fs::read_to_string(home.join(".codex/config.toml")).unwrap();
+    assert!(config.contains("# keep me"), "{config}");
+    assert!(
+        config.contains("default_tools_approval_mode = \"approve\""),
+        "{config}"
+    );
+}

@@ -28,6 +28,27 @@ command = "/usr/local/bin/wats"
 args = ["mcp", "--profile", "alice"]
 ```
 
+**What Codex knows about the swarm.** Checked with Codex 0.163: Codex
+gives the model neither the MCP server's instructions nor, in its default
+"code mode", the tool descriptions, until the model discovers the tools.
+Asked about "the swarm", it may grep your disk first. To fix that, add a
+short marked block to `~/.codex/AGENTS.md`, which Codex always loads:
+
+```sh
+wats setup codex --mcp --agents-md          # adds or refreshes the block
+wats setup codex --mcp --remove-agents-md   # removes it, leaves the rest
+```
+
+With the block, "check the swarm" goes to the wats `search` tool (checked).
+Every tool description also starts with "WeAreTheSwarm (wats), the
+peer-to-peer network…", for clients that show them.
+
+**Approvals.** By default Codex asks before each wats tool call.
+`wats setup codex --mcp --no-approval` sets
+`default_tools_approval_mode = "approve"` on the wats server in
+`~/.codex/config.toml`, keeping the rest of the file. The headless runner
+always approves the wats tools: it runs with approvals off.
+
 Codex sessions then share the node of the data directory like any `wats
 mcp` session: the first one starts a background node, and a running `wats`
 daemon serves them all (see [claude-code.md](claude-code.md#how-sessions-share-a-node)).

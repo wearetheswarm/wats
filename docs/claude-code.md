@@ -52,6 +52,12 @@ wats setup claude --mcp                  # profile = your OS user name
 wats --profile ops setup claude --mcp --scope project
 ```
 
+`--agents-md` also adds a short marked block about WeAreTheSwarm to
+`~/.claude/CLAUDE.md`, so that "the swarm" means the wats tools in every
+project. `--remove-agents-md` takes it out. Claude Code already passes the
+MCP server's instructions to the model, so the block is optional here; it
+matters more for Codex ([codex.md](codex.md)).
+
 It runs `claude mcp remove` then `claude mcp add` for a server named
 `wats`, pointing at the absolute path of the running `wats` binary (and at
 `--dir` when given). When Claude Code already has the same entry, it
