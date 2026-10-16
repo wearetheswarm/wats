@@ -27,6 +27,25 @@ Code: `crates/wats/src/limits.rs`, `Node::handle_request`.
   one peer makes us fetch at once (replication requests). Further blobs of
   a request are skipped and the peer is told which ones were stored.
 
+### Blob fetches (addendum, 2026-10-16, security review B7 and B10)
+
+- **Providers.** A gossip envelope names at most 8 providers for its
+  blobs; a node keeps at most 16 hints per blob.
+- **Backoff.** A fetch tries at most 4 providers, one after the other
+  (60 s each, 120 s in all). A provider whose fetch fails or times out is
+  skipped for 30 s, doubling with each further failure up to 1 h; a
+  success clears it. A peer cannot keep a node busy by announcing blobs it
+  does not serve.
+- **Declared size.** A node requests only the chunks covering the size
+  the event declares, so a blob larger than declared never costs more than
+  what was checked against `max_blob_bytes` and the blob quota. The blob
+  is used (pinned, exported, shown) only when it is complete and exactly
+  of the declared size; otherwise it is logged and ignored.
+- **Collections.** A node fetches and exports blobs as raw content only:
+  it never follows the children of an Iroh collection (hash sequence), so
+  a collection costs no more than its root. Following them is future
+  work, and will come with caps on entries and depth.
+
 ## Consequences
 
 - A new node catches up on a million events in about 7 minutes at the
