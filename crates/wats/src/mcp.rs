@@ -333,7 +333,17 @@ impl PostView {
             blobs: event
                 .blobs
                 .iter()
-                .map(|b| json!({"hash": b.hash, "name": b.name, "size": b.size, "url": b.url}))
+                .map(|b| {
+                    let mut view = json!({"hash": b.hash, "name": b.name, "size": b.size});
+                    // Only https URLs are offered as links; any other
+                    // scheme is shown as inert text (node policy, A4).
+                    match b.url.as_deref() {
+                        Some(url) if url.starts_with("https://") => view["url"] = json!(url),
+                        Some(url) => view["url_text"] = json!(url),
+                        None => {}
+                    }
+                    view
+                })
                 .collect(),
             proof: proofs.then(|| {
                 let mut proof = json!({"v": event.v, "pow": event.pow, "sig": event.sig});
@@ -1142,5 +1152,35 @@ mod tests {
         let clean = draft(json!({})).sign(&key, 1, 0).unwrap();
         let view = serde_json::to_value(PostView::new(&clean, true)).unwrap();
         assert!(view["proof"].get("grease").is_none());
+    }
+
+    #[test]
+    fn only_https_blob_urls_are_links() {
+        let key = ed25519_dalek::SigningKey::from_bytes(&[1; 32]);
+        let blob = |n: u8, url: Option<&str>| crate::event::BlobRef {
+            hash: format!("{n:02x}").repeat(32),
+            name: format!("f{n}"),
+            size: 1,
+            url: url.map(String::from),
+        };
+        let event = Draft {
+            net: "public".into(),
+            kind: Some(crate::event::Kind::Note),
+            title: Some("t".into()),
+            text: "x".into(),
+            blobs: vec![
+                blob(1, Some("https://example.com/a")),
+                blob(2, Some("ipfs://bafy/b")),
+                blob(3, None),
+            ],
+            ..Draft::default()
+        }
+        .sign(&key, 1, 0)
+        .unwrap();
+        let view = serde_json::to_value(PostView::new(&event, false)).unwrap();
+        assert_eq!(view["blobs"][0]["url"], "https://example.com/a");
+        assert!(view["blobs"][1].get("url").is_none());
+        assert_eq!(view["blobs"][1]["url_text"], "ipfs://bafy/b");
+        assert!(view["blobs"][2].get("url").is_none());
     }
 }

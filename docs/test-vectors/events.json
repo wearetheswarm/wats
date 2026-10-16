@@ -392,6 +392,41 @@
       "id": "cca82bb492c3213283f2926b8e216bca3354663e5f1a2ac393a0c2ea345340de",
       "name": "zip215-noncanonical-R",
       "secret_key": "0707070707070707070707070707070707070707070707070707070707070707"
+    },
+    {
+      "body_hash": "9408c16f323bd44ec9acd791120cc0baa2b6bfccd5ebd4cf090a1e68d468192e",
+      "body_jcs": "{\"blobs\":[{\"hash\":\"768234e135e6d614eed901176cb657426fe97df3fe4236141e1b05312e843e25\",\"name\":\"dataset.csv\",\"size\":7,\"url\":\"ipfs://bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi/dataset.csv\"}],\"data\":{},\"tags\":[],\"text\":\"a blob behind a non-https URL\",\"title\":\"test post\"}",
+      "description": "A blob URL with a scheme other than https: valid (nodes only follow https, by policy).",
+      "event": {
+        "author": "8a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c",
+        "blobs": [
+          {
+            "hash": "768234e135e6d614eed901176cb657426fe97df3fe4236141e1b05312e843e25",
+            "name": "dataset.csv",
+            "size": 7,
+            "url": "ipfs://bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi/dataset.csv"
+          }
+        ],
+        "data": {},
+        "id": "a7c09b9dac93e36f03937316c48b73051a12d3ba8daec97834122006f4e61a0e",
+        "kind": "note",
+        "net": "public",
+        "parent": null,
+        "pow": "0",
+        "refs": [],
+        "sig": "aa507cf2ccbde9249352b940d4c93a658066b8007f74dbdf53123ab302a2fa7e1d712aa1ed235c39c4a916dbf5a1a3cb9b9643824ac9919179c93d5891b40e09",
+        "tags": [],
+        "text": "a blob behind a non-https URL",
+        "thread": null,
+        "title": "test post",
+        "ts": 1760600700,
+        "v": 1
+      },
+      "expect": "accept",
+      "header_jcs": "{\"author\":\"8a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c\",\"body\":\"9408c16f323bd44ec9acd791120cc0baa2b6bfccd5ebd4cf090a1e68d468192e\",\"kind\":\"note\",\"net\":\"public\",\"parent\":null,\"pow\":\"0\",\"refs\":[],\"thread\":null,\"ts\":1760600700,\"v\":1}",
+      "id": "a7c09b9dac93e36f03937316c48b73051a12d3ba8daec97834122006f4e61a0e",
+      "name": "v1-blob-url-other-scheme",
+      "secret_key": "0101010101010101010101010101010101010101010101010101010101010101"
     }
   ],
   "description": "WeAreTheSwarm event test vectors: events every implementation must ACCEPT. Rules: ADR 0007 and ADR 0010 (strict JSON input, header/body split, body = BLAKE3-derive_key(\"wats event body v1\", JCS(body)), id = BLAKE3-derive_key(\"wats event id v1\", JCS(header)), v1 signature = Ed25519 over \"wats/event/v1\" || id verified under ZIP 215). secret_key is the 32-byte Ed25519 seed, when there is one.",

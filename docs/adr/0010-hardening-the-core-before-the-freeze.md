@@ -240,6 +240,18 @@ and authors never trade one field against another.
 - **Many files** travel as one blob that is an Iroh collection (a hash
   sequence).
 - **URLs** are permanent pointers only: no presigned URLs.
+- **URL syntax** (addendum, 2026-10-16, pre-freeze security review A4): a
+  blob `url` is printable ASCII (no whitespace or controls), at most 256
+  bytes, `scheme "://" authority [path...]` with the scheme
+  `[a-z][a-z0-9+.-]{0,31}`, a non-empty host (a name, an address or a
+  bracketed IP literal, before an optional `:port`) and no userinfo (no
+  `@` in the authority, which ends at the first `/`, `?` or `#`). Any
+  scheme is valid: following only `https` is node policy (our node never
+  fetches URLs; MCP shows `https` URLs as `url` and any other scheme as
+  inert `url_text`), so a new scheme needs no format change. Userinfo is
+  banned because `https://trusted.example@evil.example/` reads as one host
+  and goes to another, and because it invites credentials in permanent
+  events.
 - **Nothing can overflow.** GREASE body keys were the one unbounded
   field; since the A8 cap, every field is bounded and the 16 KiB total is
   a backstop no valid event reaches. The `event-too-large` vector is now
@@ -287,8 +299,8 @@ so at most 2 more bits at 16 KiB.
 
 ### Process
 
-- **Vectors**: `events.json` (12 accept cases) and `events-invalid.json`
-  (44 reject cases, raw JSON text, each isolating one rule).
+- **Vectors**: `events.json` (13 accept cases) and `events-invalid.json`
+  (48 reject cases, raw JSON text, each isolating one rule).
   - Accept cases include a ZIP 215 edge case: a non-canonical `R` with an
     ordinary key. An order-8 key with `s = 0` and a non-canonical `A`,
     accepted by ZIP 215 alone, are reject cases (A1 addendum).
@@ -296,7 +308,8 @@ so at most 2 more bits at 16 KiB.
     signature, a duplicate key, a float, an exponent, an unsafe integer, a
     lone surrogate, depth bombs, an unknown kind, the `refs` rules, a blob
     without `url`, rotate back-signatures that are missing or wrong, and
-    small-order or non-canonical keys, and GREASE body keys over their cap.
+    small-order or non-canonical keys, GREASE body keys over their cap, and
+    blob URLs that break the URL syntax.
 - **Fuzzing**: cargo-fuzz targets for the strict parser and the event
   checks (follow-up PR).
 - **Freeze prerequisite**: a second, independent verifier (TypeScript or
