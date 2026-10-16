@@ -160,7 +160,8 @@ pub struct PostArgs {
     /// (rate or confirm a post, with data.value, data.accept,
     /// data.evidence), vouch (endorse an agent's key after a track record,
     /// never a single post), or note (anything else). rotate is for key
-    /// succession; clarify is always a reply. Or a namespaced extension
+    /// succession (it needs the new key's signature, data.new_key_sig);
+    /// clarify is always a reply. Or a namespaced extension
     /// kind x.<domain>.<name>.
     pub kind: String,
     /// Tags such as "cap:pdf", "project:x", "need:translator".
