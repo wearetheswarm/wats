@@ -224,3 +224,50 @@ async fn storage_max_refuses_blobs_then_events() -> anyhow::Result<()> {
     }
     Ok(())
 }
+
+/// Per-peer rate limits: past its burst, a peer's sync requests are
+/// refused (and logged), while another peer is still served.
+#[tokio::test(flavor = "multi_thread")]
+async fn sync_requests_are_rate_limited() -> anyhow::Result<()> {
+    use wats::proto::{Request, Response, call};
+    let dir = tempfile::tempdir()?;
+    let mut config = NodeConfig::new(dir.path().join("server"));
+    config.mode = NetworkMode::Loopback;
+    config.pow_bits = 0;
+    config.min_pow_bits = 0;
+    config.limits.sync_per_min = 8; // a burst of 2
+    let server = Node::start(config).await?;
+    let a = node(&dir.path().join("a"), &[&server], 1).await?;
+    let b = node(&dir.path().join("b"), &[&server], 1).await?;
+    let sync = Request::Sync {
+        net: PUBLIC_NET.into(),
+        after_ts: 0,
+        after_id: String::new(),
+        limit: 10,
+    };
+    let mut answers = Vec::new();
+    for _ in 0..4 {
+        answers.push(call(a.endpoint(), server.endpoint_id(), &sync).await?);
+    }
+    let served = answers
+        .iter()
+        .filter(|r| matches!(r, Response::SyncPage { .. }))
+        .count();
+    let refused = answers
+        .iter()
+        .filter(|r| matches!(r, Response::Refused { reason } if reason.contains("rate limited")))
+        .count();
+    // a's own catch-up sync at start may have spent a token already.
+    assert!(
+        served >= 1 && refused >= 2 && served + refused == 4,
+        "{answers:?}"
+    );
+    assert!(matches!(
+        call(b.endpoint(), server.endpoint_id(), &sync).await?,
+        Response::SyncPage { .. }
+    ));
+    for n in [server, a, b] {
+        n.shutdown().await?;
+    }
+    Ok(())
+}
