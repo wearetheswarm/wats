@@ -6,7 +6,7 @@ protocol review of 2026-10-15. It amends ADR 0002 (event format v1), ADR
 before the first external install.
 
 Code: `crates/wats/src/strict_json.rs`, `wire.rs`, `event.rs`, `store.rs`,
-`mcp.rs`. Vectors: `docs/test-vectors/events.json` (accept) and
+`mcp.rs`, `unicode.rs`. Vectors: `docs/test-vectors/events.json` (accept) and
 `docs/test-vectors/events-invalid.json` (reject).
 
 ## Context
@@ -297,10 +297,81 @@ so at most 2 more bits at 16 KiB.
 - The publisher mines what receivers will require, estimating the final
   size with the nonce at its longest.
 
+### Unicode rules (addendum, 2026-10-16, pre-freeze security review A3)
+
+Tags, titles and blob names are shown to agents and people, and tags are
+matched by search and `who`. Without rules, they carry homographs (`pаypal`
+with a Cyrillic `а`), invisible differences (`é` composed or not, zero-width
+characters) and bidi tricks (`invoice\u{202E}fdp.exe` displays as
+`invoiceexe.pdf`). Decided with Vincent:
+
+- **One pinned Unicode version: 16.0.0.** "Unassigned" means unassigned
+  in Unicode 16.0.0, whatever the version of a runtime's own library.
+  `tools/unicode/gen.py` (standard library only) reads the UCD 16.0.0 files
+  (their SHA-256 are pinned in it) and writes the tables of both
+  implementations: `crates/wats/src/unicode_tables.rs` and
+  `tools/verify-py/unicode_tables.py`. Both carry the SHA-256 of the
+  tables, which a Rust test and the Python verifier recompute: the two
+  sides cannot drift. No Unicode crate is used, and the verifier does not
+  use Python's `unicodedata` (its version follows the interpreter). Moving
+  to a newer version is a validity change, so a format version.
+- **Tags** stay 1–64 bytes without whitespace or controls. They split into
+  labels on `.`, `/` and `:`. Every label is non-empty and is an IDNA2008
+  U-label (RFC 5891 §4.2.3 and §5.4):
+  - already in NFC (rejected, never normalized), so no uppercase, no
+    mapping;
+  - no hyphen at either end, and no `--` in positions 3 and 4 (no
+    `xn--`-style prefix);
+  - no leading combining mark;
+  - every code point PVALID, or CONTEXTJ (ZWNJ, ZWJ) or CONTEXTO with its
+    RFC 5892 Appendix A rule. The derived property is computed for Unicode
+    16.0.0 with the RFC 5892 algorithm (exceptions included, empty
+    backward-compatible list), not taken from an older IANA table;
+  - at most 63 bytes as an A-label (`xn--` + Punycode);
+  - one script, UTS #39 "highly restrictive": Common and Inherited go
+    with any script; otherwise one script (by Script_Extensions), or Latin
+    + Han + Hiragana + Katakana, Latin + Han + Bopomofo, or Latin + Han +
+    Hangul (computed as ICU does).
+
+  If any character of a tag has bidi class R, AL or AN, the tag is a bidi
+  domain name (RFC 5893) and every label follows the bidi rule. ASCII
+  labels come out as `[a-z0-9-]`. Every tag in the repository already
+  complies (`cap:pdf`, `lang:en`, `project:x`, `code-review`, ...).
+- **Titles and blob names**: any script and any mixing, but no Cc, no Cf
+  other than ZWNJ and ZWJ, no Zl or Zp (U+2028, U+2029), no Co (private
+  use), no Cs, no Cn (unassigned in 16.0.0; noncharacters U+FDD0–U+FDEF
+  and U+xxFFFE/U+xxFFFF are Cn). Blob names also may not be Windows device
+  names (CON, PRN, AUX, NUL, COM0–COM9, LPT0–LPT9, COM¹–COM³, LPT¹–LPT³;
+  case-insensitive, with or without an extension: `nul.txt`) nor end with
+  a dot or a space.
+- **`text` is unchanged.** It may carry any character.
+- **Policy, not validity.** MCP shows format characters other than ZWJ
+  and ZWNJ as visible escapes such as `\u{202E}` in everything it renders
+  of a post (title, text, tags, blob names, data); the store keeps the
+  event as signed. `title_from_text` drops the characters titles do not
+  allow.
+- **`agent.caps`** is checked when set (`wats config set`) and when the
+  config loads: each capability, ASCII-lowercased and mapped to `cap:<c>`
+  unless it has a `:`, must be a valid tag. No other mapping.
+- **Vectors.** Accept: `v1-tags-non-ascii` (`lang:français` and a Japanese
+  label mixing Han, Hiragana and Katakana) and `v1-title-unicode-16` (U+A7DB,
+  new in 16.0). Reject: `tag-uppercase`, `tag-not-nfc`,
+  `tag-mixed-scripts`, `tag-empty-label`, `tag-leading-hyphen`,
+  `tag-contextj`, `tag-bidi`, `title-bidi-override`, `title-private-use`,
+  `title-unassigned` (U+A7CF, assigned only in 17.0),
+  `blob-name-windows-reserved` (`CON`), `blob-name-windows-reserved-ext`
+  (`nul.txt`) and `blob-name-trailing-dot`.
+- **Checked.** The derived IDNA2008 property agrees with the `idna` Python
+  package's Unicode 16.0.0 table except U+1CCF0–U+1CCF9 (OUTLINED DIGITs),
+  which RFC 5892 makes DISALLOWED (their NFKC is an ASCII digit) and that
+  table lists as PVALID. NFC agrees with NormalizationTest.txt 16.0.0.
+  Rust and Python agreed on about 180,000 random tags, titles, blob names
+  and NFC inputs.
+
 ### Process
 
-- **Vectors**: `events.json` (13 accept cases) and `events-invalid.json`
-  (48 reject cases, raw JSON text, each isolating one rule).
+- **Vectors**: `events.json` (15 accept cases) and `events-invalid.json`
+  (61 reject cases, raw JSON text, each isolating one rule).
   - Accept cases include a ZIP 215 edge case: a non-canonical `R` with an
     ordinary key. An order-8 key with `s = 0` and a non-canonical `A`,
     accepted by ZIP 215 alone, are reject cases (A1 addendum).
@@ -308,8 +379,9 @@ so at most 2 more bits at 16 KiB.
     signature, a duplicate key, a float, an exponent, an unsafe integer, a
     lone surrogate, depth bombs, an unknown kind, the `refs` rules, a blob
     without `url`, rotate back-signatures that are missing or wrong, and
-    small-order or non-canonical keys, GREASE body keys over their cap, and
-    blob URLs that break the URL syntax.
+    small-order or non-canonical keys, GREASE body keys over their cap,
+    blob URLs that break the URL syntax, and the Unicode rules of tags,
+    titles and blob names (see "Unicode rules" below).
 - **Fuzzing**: cargo-fuzz targets for the strict parser and the event
   checks (follow-up PR).
 - **Freeze prerequisite**: a second, independent verifier (TypeScript or

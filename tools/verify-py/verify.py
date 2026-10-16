@@ -8,7 +8,7 @@ library only), checked against the published test vectors.
 It ports the rules of ADR 0002 (event format v1), ADR 0007 (invariant core,
 opaque events) and ADR 0010 (hardening: ZIP 215, domain separation, strict
 JSON, one suite per version, rotate, refs, extension kinds, GREASE, caps,
-titles, clarify), following the Rust implementation in
+titles, clarify, Unicode rules in unicode_rules.py), following the Rust implementation in
 `crates/wats/src/{strict_json,wire,event}.rs`: `check_event` below is the
 counterpart of `wire::AnyEvent::from_bytes`.
 
@@ -36,6 +36,7 @@ import blake3_py  # noqa: E402
 import ed25519_zip215  # noqa: E402
 import jcs  # noqa: E402
 import strict_json  # noqa: E402
+import unicode_rules  # noqa: E402
 
 # --- Invariant core (wire.rs) ------------------------------------------------
 
@@ -445,12 +446,25 @@ def is_clean_token(s: str) -> bool:
 
 
 def is_safe_blob_name(name: str) -> bool:
+    """No path separators or controls, no leading dot, no trailing dot or
+    space, no character titles do not allow, not a Windows device name."""
     return (
         name != ""
         and utf8_len(name) <= MAX_BLOB_NAME_BYTES
         and not name.startswith(".")
+        and not name.endswith((".", " "))
         and not any(is_control(c) or c in "/\\:\0" for c in name)
+        and unicode_rules.forbidden_char(name) is None
+        and not unicode_rules.is_windows_reserved(name)
     )
+
+
+def tag_error(tag: str) -> str | None:
+    """event.rs `tag_error`."""
+    if not is_clean_token(tag) or utf8_len(tag) > MAX_TAG_BYTES:
+        return f"tag {tag!r} must be 1-{MAX_TAG_BYTES} bytes with no whitespace"
+    why = unicode_rules.tag_error(tag)
+    return None if why is None else f"tag {tag!r}: {why}"
 
 
 def optional_hex32(data: dict, field: str, kind: str) -> None:
@@ -539,6 +553,12 @@ def validate_content(wire: dict) -> None:
             or any(is_control(c) for c in title)
         ):
             raise Invalid(f"title must be one non-empty line of at most {MAX_TITLE_BYTES} bytes")
+        bad = unicode_rules.forbidden_char(title)
+        if bad is not None:
+            raise Invalid(
+                f"title has U+{ord(bad):04X}, which is not allowed: format, separator, private-use, "
+                f"unassigned in Unicode {unicode_rules.UNICODE_VERSION} or noncharacter"
+            )
     elif thread is None:
         raise Invalid("title is mandatory on a thread root")
     if parent is not None and parent in refs:
@@ -552,8 +572,9 @@ def validate_content(wire: dict) -> None:
     if len(tags) > MAX_TAGS:
         raise Invalid(f"more than {MAX_TAGS} tags")
     for tag in tags:
-        if not is_clean_token(tag) or utf8_len(tag) > MAX_TAG_BYTES:
-            raise Invalid(f"tag {tag!r} must be 1-{MAX_TAG_BYTES} bytes with no whitespace")
+        why = tag_error(tag)
+        if why is not None:
+            raise Invalid(why)
     if len(set(tags)) != len(tags):
         raise Invalid("duplicate tags")
     data = wire["data"]
@@ -671,6 +692,7 @@ def main(argv: list) -> int:
         print("usage: verify.py VECTORS.json [VECTORS.json ...]", file=sys.stderr)
         return 2
     blake3_py.self_test()
+    unicode_rules.self_test()
     total = agreed = 0
     for path in argv:
         with open(path, encoding="utf-8") as f:

@@ -326,15 +326,15 @@ impl PostView {
             thread: event.thread.clone(),
             parent: event.parent.clone(),
             refs: event.refs.clone(),
-            tags: event.tags.clone(),
-            title: event.title.clone(),
-            text: event.text.clone(),
-            data: event.data.clone(),
+            tags: event.tags.iter().map(|t| shown(t)).collect(),
+            title: event.title.as_deref().map(shown),
+            text: shown(&event.text),
+            data: shown_map(&event.data),
             blobs: event
                 .blobs
                 .iter()
                 .map(|b| {
-                    let mut view = json!({"hash": b.hash, "name": b.name, "size": b.size});
+                    let mut view = json!({"hash": b.hash, "name": shown(&b.name), "size": b.size});
                     // Only https URLs are offered as links; any other
                     // scheme is shown as inert text (node policy, A4).
                     match b.url.as_deref() {
@@ -350,12 +350,35 @@ impl PostView {
                 // Hashed but otherwise ignored: shown so nothing in a post
                 // is invisible to the reader who asks.
                 if !event.grease.is_empty() {
-                    proof["grease"] = Value::Object(event.grease.clone());
+                    proof["grease"] = Value::Object(shown_map(&event.grease));
                 }
                 proof
             }),
         }
     }
+}
+
+/// Display policy (ADR 0010, A3 addendum): what agents are shown of a
+/// post has its format characters, other than ZWJ and ZWNJ, as visible
+/// escapes such as `\u{202E}`. The stored event is unchanged.
+fn shown(s: &str) -> String {
+    crate::unicode::escape_format(s).into_owned()
+}
+
+/// [`shown`] applied to every string of a JSON value, keys included.
+fn shown_value(value: &Value) -> Value {
+    match value {
+        Value::String(s) => Value::String(shown(s)),
+        Value::Array(items) => Value::Array(items.iter().map(shown_value).collect()),
+        Value::Object(map) => Value::Object(shown_map(map)),
+        other => other.clone(),
+    }
+}
+
+fn shown_map(map: &Map<String, Value>) -> Map<String, Value> {
+    map.iter()
+        .map(|(k, v)| (shown(k), shown_value(v)))
+        .collect()
 }
 
 /// An event this node cannot interpret: shown raw, with a display kind.
@@ -373,7 +396,7 @@ fn raw_view(v: u64, value: Value) -> Value {
         "note": format!(
             "event version {v} is newer or older than this node understands; shown raw, verified for authorship and integrity only"
         ),
-        "raw": value,
+        "raw": shown_value(&value),
     })
 }
 
@@ -412,12 +435,19 @@ impl Summary {
             ts: event.ts,
             kind: event.kind.display(),
             ext_kind: event.kind.is_ext().then(|| event.kind.to_string()),
-            title: event
-                .title
-                .clone()
-                .unwrap_or_else(|| title_from_text(&event.text)),
+            title: shown(
+                &event
+                    .title
+                    .clone()
+                    .unwrap_or_else(|| title_from_text(&event.text)),
+            ),
             thread: event.thread.clone(),
-            tags: event.tags.iter().take(INDEXED_TAGS).cloned().collect(),
+            tags: event
+                .tags
+                .iter()
+                .take(INDEXED_TAGS)
+                .map(|t| shown(t))
+                .collect(),
             counts,
         }
     }
@@ -468,7 +498,7 @@ impl WatsMcp {
                 let mut entry = json!(Summary::new(&s.event, None));
                 for key in ["options", "default", "deadline"] {
                     if let Some(value) = s.event.data.get(key) {
-                        entry[key] = value.clone();
+                        entry[key] = shown_value(value);
                     }
                 }
                 entry
@@ -631,11 +661,12 @@ impl WatsMcp {
             in_reply_to: parent.map(|e| {
                 json!({
                     "id": e.id, "kind": e.kind.as_str(), "author": e.author,
-                    "title": e.title.clone().unwrap_or_else(|| title_from_text(&e.text)),
-                    "text": e.text.chars().take(2000).collect::<String>(),
+                    "title": shown(&e.title.clone().unwrap_or_else(|| title_from_text(&e.text))),
+                    "text": shown(&e.text.chars().take(2000).collect::<String>()),
                 })
             }),
-            thread_title: root.map(|e| e.title.clone().unwrap_or_else(|| title_from_text(&e.text))),
+            thread_title: root
+                .map(|e| shown(&e.title.clone().unwrap_or_else(|| title_from_text(&e.text)))),
         }
     }
 
@@ -815,7 +846,9 @@ impl WatsMcp {
                 end -= 1;
             }
         }
-        view["text"] = json!(&text[offset..end]);
+        // Offsets count bytes of the stored text; only the slice shown is
+        // escaped.
+        view["text"] = json!(shown(&text[offset..end]));
         if end < text.len() {
             view["next_text_offset"] = json!(end);
         }
@@ -886,9 +919,9 @@ impl WatsMcp {
                     "author": e.author,
                     "net": e.net,
                     "since": e.ts,
-                    "tags": e.tags,
-                    "text": e.text,
-                    "data": e.data,
+                    "tags": e.tags.iter().map(|t| shown(t)).collect::<Vec<_>>(),
+                    "text": shown(&e.text),
+                    "data": shown_map(&e.data),
                     "announce_id": e.id,
                 })
             })
@@ -1152,6 +1185,37 @@ mod tests {
         let clean = draft(json!({})).sign(&key, 1, 0).unwrap();
         let view = serde_json::to_value(PostView::new(&clean, true)).unwrap();
         assert!(view["proof"].get("grease").is_none());
+    }
+
+    #[test]
+    fn format_characters_are_shown_escaped() {
+        let key = ed25519_dalek::SigningKey::from_bytes(&[1; 32]);
+        // Text may carry format characters (only titles, tags and blob
+        // names may not); data strings too.
+        let event = Draft {
+            net: "public".into(),
+            kind: Some(crate::event::Kind::Note),
+            title: Some("caf\u{e9} \u{915}\u{94d}\u{200d}".into()),
+            text: "see invoice\u{202e}fdp.exe\u{2066} and a\u{200c}b".into(),
+            data: json!({"note\u{200b}": ["x\u{feff}"]})
+                .as_object()
+                .unwrap()
+                .clone(),
+            ..Draft::default()
+        }
+        .sign(&key, 1, 0)
+        .unwrap();
+        let view = serde_json::to_value(PostView::new(&event, false)).unwrap();
+        assert_eq!(
+            view["text"],
+            "see invoice\\u{202E}fdp.exe\\u{2066} and a\u{200c}b"
+        );
+        assert_eq!(view["title"], "caf\u{e9} \u{915}\u{94d}\u{200d}");
+        assert_eq!(view["data"], json!({"note\\u{200B}": ["x\\u{FEFF}"]}));
+        let summary = serde_json::to_value(Summary::new(&event, None)).unwrap();
+        assert_eq!(summary["title"], view["title"]);
+        // The stored event is unchanged.
+        assert!(event.text.contains('\u{202e}'));
     }
 
     #[test]

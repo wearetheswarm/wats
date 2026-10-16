@@ -269,6 +269,29 @@ fn valid_vectors() -> Value {
     }
     .sign(&key(1), 1_760_600_700, 0)
     .unwrap();
+    // Unicode rules (ADR 0010, A3 addendum), pinned to Unicode 16.0.0.
+    let unicode_tags = Draft {
+        net: "public".into(),
+        kind: Some(Kind::Note),
+        title: Some("test post".into()),
+        tags: vec![
+            "lang:fran\u{e7}ais".into(),
+            "topic:\u{65e5}\u{672c}\u{8a9e}\u{306e}\u{30c6}\u{30ad}\u{30b9}\u{30c8}".into(),
+        ],
+        text: "tags with non-ASCII labels".into(),
+        ..Draft::default()
+    }
+    .sign(&key(1), 1_760_600_800, 0)
+    .unwrap();
+    let unicode_16_title = Draft {
+        net: "public".into(),
+        kind: Some(Kind::Note),
+        title: Some("Lambda \u{a7db}".into()),
+        text: "U+A7DB LATIN SMALL LETTER LAMBDA is new in Unicode 16.0".into(),
+        ..Draft::default()
+    }
+    .sign(&key(1), 1_760_600_900, 0)
+    .unwrap();
     let greased = Draft {
         net: "public".into(),
         kind: Some(Kind::Note),
@@ -317,6 +340,8 @@ fn valid_vectors() -> Value {
             accept("v1-tombstone", "v1-react-reply with its body dropped: body_hash replaces the body fields; id and sig unchanged, signature still checked.", Some(2), tombstone(&reply)),
             accept("zip215-noncanonical-R", "ZIP 215: an ordinary author key (seed 07); R is a non-canonical encoding of the identity (y = p + 1) and s = k * a, so the cofactored equation holds. R is hashed as received: accepted.", Some(7), with_noncanonical_r(7)),
             accept("v1-blob-url-other-scheme", "A blob URL with a scheme other than https: valid (nodes only follow https, by policy).", Some(1), serde_json::to_value(&other_scheme).unwrap()),
+            accept("v1-tags-non-ascii", "Tags with non-ASCII labels: each label an IDNA2008 U-label in NFC, of one script (lang:fran\u{e7}ais is Latin; the Japanese label mixes Han, Hiragana and Katakana, which UTS #39 highly restrictive allows).", Some(1), serde_json::to_value(&unicode_tags).unwrap()),
+            accept("v1-title-unicode-16", "A title with U+A7DB LATIN SMALL LETTER LAMBDA, assigned in Unicode 16.0 (unassigned in 15.1): v1 pins Unicode 16.0.0.", Some(1), serde_json::to_value(&unicode_16_title).unwrap()),
         ],
     })
 }
@@ -487,6 +512,25 @@ fn invalid_vectors() -> Value {
             })),
             reject("blob-url-empty-host", "v1: a blob url has a non-empty host", modified(&|w| {
                 w.insert("blobs".into(), json!([{"hash": "ab".repeat(32), "name": "f", "size": 1, "url": "https:///f"}]));
+            })),
+            reject("tag-uppercase", "v1: tag labels are IDNA2008 U-labels: no uppercase (here Lang:en)", modified(&|w| { w.insert("tags".into(), json!(["Lang:en"])); })),
+            reject("tag-not-nfc", "v1: tag labels are already in NFC, never normalized (here c + U+0327 instead of U+00E7)", modified(&|w| { w.insert("tags".into(), json!(["lang:franc\u{327}ais"])); })),
+            reject("tag-mixed-scripts", "v1: one script per tag label, UTS #39 highly restrictive (here Latin with a Cyrillic U+0430)", modified(&|w| { w.insert("tags".into(), json!(["topic:p\u{430}ypal"])); })),
+            reject("tag-empty-label", "v1: tag labels (separated by . / :) are not empty", modified(&|w| { w.insert("tags".into(), json!(["a::b"])); })),
+            reject("tag-leading-hyphen", "v1: a tag label does not start or end with a hyphen", modified(&|w| { w.insert("tags".into(), json!(["topic:-rust"])); })),
+            reject("tag-contextj", "v1: ZWJ in a tag label only after a virama (RFC 5892 CONTEXTJ; here in a Latin label)", modified(&|w| { w.insert("tags".into(), json!(["topic:a\u{200d}b"])); })),
+            reject("tag-bidi", "v1: a tag with right-to-left characters follows the RFC 5893 bidi rule (here a label starting with a digit, then Hebrew)", modified(&|w| { w.insert("tags".into(), json!(["topic:1\u{5e9}\u{5dc}\u{5d5}\u{5dd}"])); })),
+            reject("title-bidi-override", "v1: no format characters in a title other than ZWJ and ZWNJ (here U+202E RIGHT-TO-LEFT OVERRIDE)", modified(&|w| { w.insert("title".into(), json!("invoice\u{202e}fdp.exe")); })),
+            reject("title-private-use", "v1: no private-use characters in a title (here U+E000)", modified(&|w| { w.insert("title".into(), json!("logo \u{e000}")); })),
+            reject("title-unassigned", "v1: no code point unassigned in Unicode 16.0.0 in a title (here U+A7CF, assigned only in Unicode 17.0)", modified(&|w| { w.insert("title".into(), json!("new letter \u{a7cf}")); })),
+            reject("blob-name-windows-reserved", "v1: a blob name is not a Windows device name (here CON)", modified(&|w| {
+                w.insert("blobs".into(), json!([{"hash": "ab".repeat(32), "name": "CON", "size": 1, "url": null}]));
+            })),
+            reject("blob-name-windows-reserved-ext", "v1: a blob name is not a Windows device name, with or without an extension (here nul.txt)", modified(&|w| {
+                w.insert("blobs".into(), json!([{"hash": "ab".repeat(32), "name": "nul.txt", "size": 1, "url": null}]));
+            })),
+            reject("blob-name-trailing-dot", "v1: a blob name does not end with a dot or a space", modified(&|w| {
+                w.insert("blobs".into(), json!([{"hash": "ab".repeat(32), "name": "report.", "size": 1, "url": null}]));
             })),
         ],
     })

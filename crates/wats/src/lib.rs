@@ -24,5 +24,7 @@ pub mod runs;
 pub mod settings;
 pub mod store;
 pub mod strict_json;
+pub mod unicode;
+mod unicode_tables;
 pub mod wake;
 pub mod wire;
