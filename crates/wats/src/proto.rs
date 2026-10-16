@@ -110,6 +110,11 @@ pub enum Request {
         event: Value,
         hashes: Vec<String>,
     },
+    /// A crash report for the collector (`report.accept`). Nodes that do
+    /// not collect answer `Unsupported`, like older nodes.
+    CrashReport {
+        report: Value,
+    },
     /// A request type from a newer protocol revision.
     #[serde(other)]
     Unsupported,
@@ -129,6 +134,8 @@ pub enum Response {
     Replicated {
         hashes: Vec<String>,
     },
+    /// A crash report was stored.
+    Accepted,
     Refused {
         reason: String,
     },

@@ -109,6 +109,12 @@ pub struct NodeConfig {
     /// How long to wait for the data directory lock (a daemon taking over
     /// from a background node). Zero fails at once.
     pub lock_wait: Duration,
+    /// Collect crash reports from other nodes (`report.accept`).
+    pub report_accept: bool,
+    /// Where this node sends its crash reports (`report.collector`).
+    pub report_collector: Option<EndpointId>,
+    /// Send them without asking (`report.crashes`).
+    pub report_auto: bool,
     /// Network arguments that start the same node again (`start_daemon`).
     pub relaunch_args: Vec<std::ffi::OsString>,
     /// Replication factor k for blobs: how many peers are asked to hold a
@@ -137,6 +143,9 @@ impl NodeConfig {
             runner: None,
             lock_wait: Duration::ZERO,
             relaunch_args: Vec::new(),
+            report_accept: false,
+            report_collector: None,
+            report_auto: false,
             replication: 3,
             bootstrap: Vec::new(),
             port: None,
@@ -222,6 +231,11 @@ pub struct RunnerRun {
     /// The events that woke it.
     pub events: Vec<String>,
 }
+
+/// A collector keeps at most this many crash reports per sender and day,
+/// for this many days.
+pub const CRASH_REPORTS_PER_DAY: usize = 10;
+pub const CRASH_REPORT_DAYS: u64 = 90;
 
 /// Events from others are refused above this share of `storage_max`.
 pub const HARD_CEILING_PERCENT: u64 = 110;
@@ -739,6 +753,23 @@ impl Node {
         confirmed
     }
 
+    /// Send a crash report to a collector.
+    pub async fn send_crash_report(
+        &self,
+        collector: EndpointId,
+        report: serde_json::Value,
+    ) -> Result<()> {
+        let request = proto::Request::CrashReport { report };
+        match proto::call(self.endpoint(), collector, &request).await? {
+            proto::Response::Accepted => Ok(()),
+            proto::Response::Unsupported => {
+                bail!("{} does not collect crash reports", collector.fmt_short())
+            }
+            proto::Response::Refused { reason } => bail!("refused: {reason}"),
+            other => bail!("unexpected answer {other:?}"),
+        }
+    }
+
     /// Ask the process running this node to stop (it releases the data
     /// directory, e.g. for a daemon taking over).
     pub fn request_stop(&self) {
@@ -787,6 +818,11 @@ impl Node {
             .unwrap_or(0);
         self.storage_bytes
             .store(bytes, std::sync::atomic::Ordering::Relaxed);
+        crate::crash::note_counts(
+            bytes,
+            self.known_peers().len() as u64,
+            self.store.count().unwrap_or(0),
+        );
     }
 
     /// Bytes used by the data directory (events, index, blobs), as last
@@ -1181,6 +1217,24 @@ impl Node {
                     Err(e) => Response::Refused {
                         reason: format!("{e:#}"),
                     },
+                }
+            }
+            Request::CrashReport { report } => {
+                if !self.config.report_accept {
+                    return Response::Unsupported;
+                }
+                match crate::crash::accept(
+                    &self.config.data_dir,
+                    &peer.to_string(),
+                    &report,
+                    CRASH_REPORTS_PER_DAY,
+                    CRASH_REPORT_DAYS,
+                ) {
+                    Ok(path) => {
+                        info!(peer = %peer.fmt_short(), path = %path.display(), "crash report received");
+                        Response::Accepted
+                    }
+                    Err(reason) => Response::Refused { reason },
                 }
             }
             Request::Replicate { event, hashes } => {
