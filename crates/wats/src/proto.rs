@@ -29,7 +29,7 @@ use tracing::debug;
 use serde_json::Value;
 
 use crate::node::Node;
-use crate::wire::{MAX_RELAY_VERSION, UNDERSTOOD_VERSIONS};
+use crate::wire::{RELAY_VERSIONS_AHEAD, UNDERSTOOD_VERSIONS};
 
 /// Protocol versions this node speaks, newest first. `/wats/2` goes in
 /// front of `/wats/1` when it exists; both are then served side by side
@@ -80,7 +80,7 @@ impl NodeInfo {
             protocols: PROTOCOL_VERSIONS.to_vec(),
             events_min: UNDERSTOOD_VERSIONS.0,
             events_max: UNDERSTOOD_VERSIONS.1,
-            relay_max: MAX_RELAY_VERSION,
+            relay_max: UNDERSTOOD_VERSIONS.1 + RELAY_VERSIONS_AHEAD,
             features: FEATURES.iter().map(|f| f.to_string()).collect(),
         }
     }

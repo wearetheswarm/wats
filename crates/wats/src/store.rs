@@ -5,6 +5,7 @@
 //! The index is computed locally from the events; nothing here is shared.
 
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use anyhow::{Context, Result, bail};
@@ -64,6 +65,17 @@ CREATE TRIGGER IF NOT EXISTS events_fts_insert AFTER INSERT ON events BEGIN
     INSERT INTO events_fts (rowid, text, tags) VALUES (new.seq, new.text, new.tags);
 END;
 "#;
+
+/// Remove an opaque row and its (empty) full-text entry.
+fn delete_opaque_row(tx: &rusqlite::Transaction<'_>, seq: i64) -> Result<()> {
+    // Opaque rows are indexed with empty text and tags.
+    tx.execute(
+        "INSERT INTO events_fts (events_fts, rowid, text, tags) VALUES ('delete', ?, '', '')",
+        [seq],
+    )?;
+    tx.execute("DELETE FROM events WHERE seq = ?", [seq])?;
+    Ok(())
+}
 
 /// An event as stored locally.
 #[derive(Debug, Clone)]
@@ -149,6 +161,8 @@ impl Filter {
 pub struct Store {
     conn: Mutex<Connection>,
     new_events: broadcast::Sender<Stored>,
+    /// Bytes of JSON held by opaque rows (B4 quota).
+    opaque_bytes: AtomicU64,
 }
 
 impl std::fmt::Debug for Store {
@@ -206,10 +220,16 @@ impl Store {
             )?;
         }
         conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+        let opaque_bytes: i64 = conn.query_row(
+            "SELECT COALESCE(SUM(LENGTH(json)), 0) FROM events WHERE opaque = 1",
+            [],
+            |r| r.get(0),
+        )?;
         let (new_events, _) = broadcast::channel(1024);
         Ok(Self {
             conn: Mutex::new(conn),
             new_events,
+            opaque_bytes: AtomicU64::new(opaque_bytes.max(0) as u64),
         })
     }
 
@@ -228,27 +248,24 @@ impl Store {
         let stored = {
             let mut conn = self.conn();
             let tx = conn.transaction()?;
-            let existing: Option<(i64, bool)> = tx
+            let existing: Option<(i64, bool, i64)> = tx
                 .query_row(
-                    "SELECT seq, opaque FROM events WHERE id = ?",
+                    "SELECT seq, opaque, LENGTH(json) FROM events WHERE id = ?",
                     [&event.id],
-                    |r| Ok((r.get(0)?, r.get(1)?)),
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
                 )
                 .optional()?;
+            let mut freed = 0;
             match existing {
-                Some((_, false)) => return Ok(Inserted::Duplicate),
+                Some((_, false, _)) => return Ok(Inserted::Duplicate),
                 // Same id, stored opaque: its tombstone (the id covers the
                 // body through its hash), or the event itself before this
                 // release understood its version. The full, understood
                 // event always replaces it (security review B8); it gets a
                 // new seq, so peers syncing from us receive it again.
-                Some((seq, true)) => {
-                    // Opaque rows are indexed with empty text and tags.
-                    tx.execute(
-                        "INSERT INTO events_fts (events_fts, rowid, text, tags) VALUES ('delete', ?, '', '')",
-                        [seq],
-                    )?;
-                    tx.execute("DELETE FROM events WHERE seq = ?", [seq])?;
+                Some((seq, true, len)) => {
+                    delete_opaque_row(&tx, seq)?;
+                    freed = len.max(0) as u64;
                 }
                 None => {}
             }
@@ -292,6 +309,10 @@ impl Store {
                 )?;
             }
             tx.commit()?;
+            self.opaque_bytes.fetch_sub(
+                freed.min(self.opaque_bytes.load(Ordering::Relaxed)),
+                Ordering::Relaxed,
+            );
             Stored {
                 seq,
                 event: Arc::new(event.clone()),
@@ -339,6 +360,8 @@ impl Store {
     /// full event with the same id (security review B8).
     pub fn insert_raw(&self, raw: &RawEvent, received_at: u64) -> Result<Inserted> {
         let conn = self.conn();
+        let json = serde_json::to_string(&raw.wire)?;
+        let len = json.len() as u64;
         let changed = conn.execute(
             "INSERT OR IGNORE INTO events (id, author, ts, net, thread, parent, kind, text, tags, json, received_at, v, opaque)
              VALUES (?, ?, ?, ?, ?, ?, ?, '', '', ?, ?, ?, 1)",
@@ -350,7 +373,7 @@ impl Store {
                 raw.thread,
                 raw.parent,
                 raw.kind,
-                serde_json::to_string(&raw.wire)?,
+                json,
                 received_at as i64,
                 raw.v as i64,
             ],
@@ -358,8 +381,62 @@ impl Store {
         Ok(if changed == 0 {
             Inserted::Duplicate
         } else {
+            self.opaque_bytes.fetch_add(len, Ordering::Relaxed);
             Inserted::New(conn.last_insert_rowid())
         })
+    }
+
+    /// Bytes of JSON held by opaque events (tombstones included).
+    pub fn opaque_bytes(&self) -> u64 {
+        self.opaque_bytes.load(Ordering::Relaxed)
+    }
+
+    /// Opaque events whose version is in `versions`, as (id, wire JSON):
+    /// the ones a new release may now understand (B4).
+    pub fn opaque_in_versions(
+        &self,
+        versions: std::ops::RangeInclusive<u64>,
+    ) -> Result<Vec<(String, Value)>> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare(
+            "SELECT id, json FROM events WHERE opaque = 1 AND v BETWEEN ?1 AND ?2 ORDER BY seq",
+        )?;
+        let rows = stmt.query_map(
+            params![
+                *versions.start() as i64,
+                (*versions.end()).min(i64::MAX as u64) as i64
+            ],
+            |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
+        )?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (id, json) = row?;
+            out.push((
+                id,
+                serde_json::from_str(&json).context("corrupt stored event")?,
+            ));
+        }
+        Ok(out)
+    }
+
+    /// Drop an opaque event (one that turned out invalid once understood).
+    pub fn delete_opaque(&self, id: &str) -> Result<()> {
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        let row: Option<(i64, i64)> = tx
+            .query_row(
+                "SELECT seq, LENGTH(json) FROM events WHERE id = ? AND opaque = 1",
+                [id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        if let Some((seq, len)) = row {
+            delete_opaque_row(&tx, seq)?;
+            tx.commit()?;
+            let len = (len.max(0) as u64).min(self.opaque_bytes.load(Ordering::Relaxed));
+            self.opaque_bytes.fetch_sub(len, Ordering::Relaxed);
+        }
+        Ok(())
     }
 
     /// Any stored event, understood or not, as raw wire JSON with its version.

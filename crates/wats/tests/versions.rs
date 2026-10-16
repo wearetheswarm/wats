@@ -27,8 +27,13 @@ async fn node(dir: &std::path::Path, peers: &[&Arc<Node>]) -> anyhow::Result<Arc
 /// What a v2 node would publish: a new kind, a header extension and a body
 /// field v1 does not know.
 fn v2_event(text: &str, ts: u64) -> Value {
+    event_of_version(2, text, ts, wats::node::OPAQUE_EXTRA_POW_BITS)
+}
+
+/// The same shape at any version, mined to `bits`.
+fn event_of_version(v: u64, text: &str, ts: u64, bits: u32) -> Value {
     sign_value(
-        json!({"v": 2, "ts": ts, "net": PUBLIC_NET, "thread": null, "parent": null,
+        json!({"v": v, "ts": ts, "net": PUBLIC_NET, "thread": null, "parent": null,
                "kind": "poll", "ext": {"expires": ts + 3600}})
         .as_object()
         .unwrap()
@@ -38,9 +43,69 @@ fn v2_event(text: &str, ts: u64) -> Value {
             .unwrap()
             .clone(),
         &SigningKey::from_bytes(&[42; 32]),
-        0,
+        bits,
     )
     .unwrap()
+}
+
+/// Node policy for events of versions this node does not understand
+/// (security review B4).
+#[tokio::test(flavor = "multi_thread")]
+async fn opaque_events_policy() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let mut config = NodeConfig::new(dir.path());
+    config.mode = NetworkMode::Loopback;
+    config.pow_bits = 0;
+    config.min_pow_bits = 0;
+    // 2 MB: the opaque quota is 5% of it, 100 kB.
+    config.storage_max = Some(2_000_000);
+    let node = Node::start(config).await?;
+    let now = wats::node::now_secs();
+    let bits = wats::node::OPAQUE_EXTRA_POW_BITS;
+
+    // Up to events_max + 2 is relayed; further ahead is not.
+    node.publish_signed(event_of_version(3, "v3", now, bits))
+        .await?;
+    let err = node
+        .publish_signed(event_of_version(4, "v4", now, bits))
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("too far ahead"), "{err:#}");
+
+    // Two more bits of proof of work than a v1 event of the same size.
+    let weak = loop {
+        let candidate = event_of_version(2, &format!("weak {}", rand_text()), now, 0);
+        let id = candidate["id"].as_str().unwrap();
+        if id.starts_with(['8', '9', 'a', 'b', 'c', 'd', 'e', 'f']) {
+            break candidate; // 0 leading zero bits
+        }
+    };
+    let err = node.publish_signed(weak).await.unwrap_err();
+    assert!(err.to_string().contains("proof of work"), "{err:#}");
+
+    // The quota: about ten 10 kB opaque events fit in 100 kB.
+    let big = "x".repeat(10_000);
+    let mut refused = None;
+    for i in 0..20 {
+        // Proof of work also grows with size: mine a little more.
+        let event = event_of_version(2, &format!("{i} {big}"), now, bits + 3);
+        if let Err(e) = node.publish_signed(event).await {
+            refused = Some((i, e));
+            break;
+        }
+    }
+    let (i, err) = refused.expect("the quota must stop opaque events");
+    assert!((8..=10).contains(&i), "refused at {i}");
+    assert!(err.to_string().contains("quota"), "{err:#}");
+    assert!(node.store().opaque_bytes() <= 100_000);
+    node.shutdown().await?;
+    Ok(())
+}
+
+fn rand_text() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static N: AtomicU64 = AtomicU64::new(0);
+    N.fetch_add(1, Ordering::Relaxed).to_string()
 }
 
 async fn eventually(what: &str, mut check: impl AsyncFnMut() -> bool) {
