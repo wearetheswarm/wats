@@ -346,6 +346,17 @@ pub fn check_v1_wire(wire: &Map<String, Value>) -> Result<(), EventError> {
     if wire.get("title").is_some_and(|t| !t.is_string()) {
         return Err(invalid("title must be a string when present"));
     }
+    // Every blob field is present on the wire, `url` as null when there is
+    // none (ADR 0002): serde alone would read a missing `url` as None.
+    if let Some(Value::Array(blobs)) = wire.get("blobs")
+        && blobs
+            .iter()
+            .any(|b| b.as_object().is_some_and(|b| !b.contains_key("url")))
+    {
+        return Err(invalid(
+            "blob url must be present (null when there is none)",
+        ));
+    }
     Ok(())
 }
 
@@ -714,7 +725,7 @@ impl Event {
         }
     }
 
-    fn wire_map(&self) -> Result<Map<String, Value>, EventError> {
+    pub(crate) fn wire_map(&self) -> Result<Map<String, Value>, EventError> {
         match serde_json::to_value(self)? {
             Value::Object(map) => Ok(map),
             _ => Err(invalid("an event serializes to an object")),

@@ -386,6 +386,9 @@ fn invalid_vectors() -> Value {
                 w.insert("blobs".into(), json!([{"hash": "ab".repeat(32), "name": "f", "size": 1, "url": format!("https://example.com/{}", "u".repeat(240))}]));
             })),
             reject("uppercase-hex", "core: hex is lowercase", raw_base.replacen(&base["author"].as_str().unwrap()[..2], &base["author"].as_str().unwrap()[..2].to_uppercase(), 1)),
+            reject("blob-url-missing", "v1: every blob field is present, url as null when there is none", modified(&|w| {
+                w.insert("blobs".into(), json!([{"hash": "ab".repeat(32), "name": "f", "size": 1}]));
+            })),
         ],
     })
 }

@@ -100,7 +100,7 @@ order:
 
    Blobs, unknown keys and size:
    - blobs: at most 6, `hash` 64-hex, a safe `name` of at most 64 bytes,
-     `url` at most 256 bytes with no whitespace;
+     `url` always present, null or at most 256 bytes with no whitespace;
    - unknown body keys other than `_grease*` are invalid;
    - the whole event is at most 16 KiB canonical size.
 
@@ -115,7 +115,7 @@ informative.
 
 ## Status
 
-- All 49 vectors agree: 14 accept and 35 reject. Every reject case fails
+- All 50 vectors agree: 14 accept and 36 reject. Every reject case fails
   for the reason its `rule` names.
 - Differential testing against the Rust crate (`AnyEvent::from_bytes`) was
   run during development:
@@ -148,14 +148,11 @@ This verifier covers event **validity** only, as defined by
 Rust behaviour ported on purpose, which another implementer could easily
 get wrong:
 
-- **A blob reference may omit `url`.** serde reads a missing `Option` field
-  as `None`, so Rust accepts it. The event is hashed as received, without
-  `url`. The 16 KiB size cap, though, is measured on the re-serialized
-  typed event, where that blob gets `"url":null`, 11 bytes more than the
-  wire object. ADR 0002 says all fields are always present, and ADR 0010
-  defines the size as the length of JCS of the whole wire object. This is
-  worth settling before the freeze: either reject a missing `url`, or
-  measure the wire object as received.
+- **A blob reference must carry `url`**, null when there is none. serde
+  would read a missing `Option` field as `None`; Rust rejects it
+  explicitly (ADR 0002: every field is present). This verifier found the
+  gap: Rust used to accept such an event, then store and relay it with
+  `"url":null` added, which no longer matched its id.
 - **`-0` is rejected.** serde_json reads `-0` as the float −0.0, which the
   strict profile then rejects. Plain RFC 8259 parsers read it as the
   integer 0.

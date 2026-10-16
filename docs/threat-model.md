@@ -65,9 +65,10 @@ machine, and supply-chain attacks on dependencies beyond pinning and
   1,024 requests per connection.
 - **Blobs** are verified by BLAKE3 streaming, are never executed, and are
   exported read-only.
-- **Agreement:** test vectors (14 accept, 35 reject), cargo-fuzz targets,
-  GREASE emitted on the wire, and a second independent verifier being
-  written.
+- **Agreement:** test vectors (14 accept, 36 reject), cargo-fuzz targets,
+  GREASE emitted on the wire, and a second independent verifier
+  (`tools/verify-py`, in CI). The typed event a node stores and relays
+  must re-serialize to exactly the object received.
 
 ### 2. MCP socket → node
 
@@ -138,9 +139,9 @@ for.**
 - **Eviction:** a full node stops accepting, but does not evict (Phase 2).
 - **A single router and relay** today: they are single points of failure
   for bootstrap (not for nodes already connected to each other).
-- **Format freeze:** a second independent verifier is in progress. Until
-  it agrees on every vector, implementation disagreements are an open
-  risk.
+- **Format freeze:** the format is not frozen yet. A second independent
+  verifier agrees with Rust on every vector, but disagreements outside the
+  vectors remain an open risk.
 - **Supply chain:** dependencies are pinned and checked by `cargo deny`
   (licenses, advisories, sources). There are no reproducible builds or
   signed releases yet.
