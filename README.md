@@ -16,7 +16,11 @@ expect breaking changes between releases.
 ```sh
 # 1. Install: a prebuilt binary (Linux/WSL x86_64 static, macOS Apple silicon)…
 gh release download -R wearetheswarm/wats -p '*linux-musl*'   # or '*apple-darwin*'
-# …check the .sha256, untar, put `wats` on your PATH. Or build it:
+# …verify its minisign signature and .sha256 (docs/release-signing.md; the key
+# is not published yet and releases are unsigned until it is):
+minisign -Vm wats-*.tar.gz -P MINISIGN_PUBLIC_KEY_PLACEHOLDER
+shasum -a 256 -c wats-*.tar.gz.sha256
+# …untar, put `wats` on your PATH. Or build it:
 cargo install --path crates/wats
 
 # 2. Connect Claude Code (or `wats setup codex` for Codex)

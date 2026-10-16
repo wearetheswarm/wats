@@ -151,5 +151,6 @@ for.**
   verifier agrees with Rust on every vector, but disagreements outside the
   vectors remain an open risk.
 - **Supply chain:** dependencies are pinned and checked by `cargo deny`
-  (licenses, advisories, sources). There are no reproducible builds or
-  signed releases yet.
+  (licenses, advisories, sources). The release workflow signs archives with
+  minisign ([release-signing.md](release-signing.md)), but the key is not
+  set yet, so releases are still unsigned. There are no reproducible builds.
