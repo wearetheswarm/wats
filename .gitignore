@@ -17,3 +17,6 @@ secret.key
 
 # Cross-NAT test logs (scripts/nat-test.sh).
 wats-nat-*.log
+
+# Python bytecode (tools/verify-py).
+__pycache__/

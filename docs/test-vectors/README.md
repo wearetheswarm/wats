@@ -32,3 +32,5 @@ WATS_UPDATE_VECTORS=1 cargo test --test test_vectors
 Once frozen (before the first external install), both files become
 append-only. Freezing also requires a second, independent verifier that
 passes both files.
+[`tools/verify-py`](../../tools/verify-py/) is one, in Python with the
+standard library only; CI runs it against both files.

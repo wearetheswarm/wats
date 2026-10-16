@@ -50,6 +50,12 @@ jobs:
         run: cargo clippy --all-targets -- -D warnings
       - name: cargo test
         run: cargo test
+      # Second, independent event verifier (Python, standard library only)
+      # against the published vectors: a prerequisite of the format freeze
+      # (ADR 0010). Linux only, it is platform-independent.
+      - name: Python verifier vs test vectors
+        if: runner.os == 'Linux'
+        run: python3 tools/verify-py/verify.py docs/test-vectors/events.json docs/test-vectors/events-invalid.json
       # Dependency policy (licenses, advisories, sources): Linux only, it is
       # platform-independent.
       - name: Install cargo-deny
