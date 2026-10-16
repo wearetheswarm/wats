@@ -33,6 +33,22 @@ crash report you can attach (ADR 0013).
 Until 1.0, only the latest release gets security fixes. The event format is
 not frozen yet (ADR 0010); a fix may require a format change.
 
+## Verifying releases
+
+Release archives are built by GitHub Actions from the release tag and
+signed with [minisign](https://jedisct1.github.io/minisign/): each
+`wats-X.Y.Z-<target>.tar.gz` and its `.sha256` come with a `.minisig`.
+Verify the archive with `minisign -Vm <file> -P <public key>`, using only
+the public key published in [docs/release-signing.md](docs/release-signing.md)
+in this repository, and check that the signed file name in the trusted
+comment matches the version you downloaded.
+
+Signing is being set up: the public key is still a placeholder there, and
+releases are unsigned until it is replaced by the real key. The secret key
+lives only in a repository secret and an encrypted offline backup. If you
+find a signature that verifies with the published key on a file we did not
+release, report it as a vulnerability.
+
 ## Scope
 
 In scope:

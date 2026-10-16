@@ -12,7 +12,9 @@ name: release
 #   aarch64-apple-darwin       Apple silicon (macOS minutes cost ~10x; once
 #                              per release)
 # Each binary is attached to the release as wats-X.Y.Z-<target>.tar.gz plus
-# a .sha256. Download: gh release download vX.Y.Z -R wearetheswarm/wats
+# a .sha256, each signed with minisign (.minisig) when the MINISIGN_SECRET_KEY
+# secret is set; without it the signing steps are skipped with a warning
+# (docs/release-signing.md). Download: gh release download vX.Y.Z -R wearetheswarm/wats
 # Windows native and the cargo-dist installers come with the public launch
 # (installers need public releases).
 #
@@ -103,13 +105,105 @@ jobs:
           cat "$name.tar.gz.sha256"
           echo "name=$name" >> "$GITHUB_OUTPUT"
 
+      # Signing (docs/release-signing.md): the archive and its .sha256 get a
+      # minisign .minisig each. The key is a password-less minisign secret
+      # key held only in the MINISIGN_SECRET_KEY repo secret. Until it is
+      # set, signing is skipped with a warning so that releases keep working.
+      - name: Signing key
+        id: signing
+        env:
+          MINISIGN_SECRET_KEY: ${{ secrets.MINISIGN_SECRET_KEY }}
+        run: |
+          if [ -n "$MINISIGN_SECRET_KEY" ]; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::warning::MINISIGN_SECRET_KEY is not set: this release is NOT signed (see docs/release-signing.md)"
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      # A pinned upstream release, checked against a hard-coded SHA-256. The
+      # hashes are those of the 0.12 assets, whose .minisig verify with the
+      # upstream key RWQf6LRCGA9i53mlYecO4IzT51TGPpvWucNSCh1CBM0QTaLn73Y7GFO3
+      # (https://jedisct1.github.io/minisign/). Recheck both when bumping.
+      - name: Install minisign
+        if: steps.signing.outputs.enabled == 'true'
+        env:
+          MINISIGN_VERSION: "0.12"
+          MINISIGN_LINUX_SHA256: 9a599b48ba6eb7b1e80f12f36b94ceca7c00b7a5173c95c3efc88d9822957e73
+          MINISIGN_MACOS_SHA256: 89000b19535765f9cffc65a65d64a820f433ef6db8020667f7570e06bf6aac63
+        run: |
+          case "$RUNNER_OS-$RUNNER_ARCH" in
+            Linux-X64)   asset="minisign-$MINISIGN_VERSION-linux.tar.gz"; sha="$MINISIGN_LINUX_SHA256" ;;
+            macOS-ARM64) asset="minisign-$MINISIGN_VERSION-macos.zip";    sha="$MINISIGN_MACOS_SHA256" ;;
+            *) echo "::error::no pinned minisign for $RUNNER_OS-$RUNNER_ARCH"; exit 1 ;;
+          esac
+          dir="$RUNNER_TEMP/minisign"
+          mkdir -p "$dir/bin"
+          curl -fsSL --proto '=https' --tlsv1.2 -o "$dir/$asset" \
+            "https://github.com/jedisct1/minisign/releases/download/$MINISIGN_VERSION/$asset"
+          echo "$sha  $dir/$asset" | shasum -a 256 -c -
+          case "$asset" in
+            *.tar.gz) tar -xzf "$dir/$asset" -C "$dir"
+                      cp "$dir/minisign-linux/x86_64/minisign" "$dir/bin/minisign" ;;
+            *.zip)    unzip -q "$dir/$asset" minisign -d "$dir/bin" ;;
+          esac
+          chmod +x "$dir/bin/minisign"
+          "$dir/bin/minisign" -v
+          echo "$dir/bin" >> "$GITHUB_PATH"
+
+      # Signs, verifies each signature with the public key derived from the
+      # secret key, and checks that this public key is the one published in
+      # README.md and docs/release-signing.md (a warning while they still hold
+      # the placeholder, an error if they hold another key). A key with a
+      # password fails here: stdin is closed, so minisign cannot prompt.
+      - name: Sign
+        if: steps.signing.outputs.enabled == 'true'
+        env:
+          MINISIGN_SECRET_KEY: ${{ secrets.MINISIGN_SECRET_KEY }}
+          NAME: ${{ steps.package.outputs.name }}
+        run: |
+          key="$RUNNER_TEMP/minisign.key"
+          pubfile="$RUNNER_TEMP/minisign.pub"
+          trap 'rm -f "$key"' EXIT
+          (umask 077 && printf '%s\n' "$MINISIGN_SECRET_KEY" > "$key")
+          if ! minisign -R -s "$key" -p "$pubfile" < /dev/null; then
+            echo "::error::MINISIGN_SECRET_KEY must be a whole minisign secret key file without password (minisign -G -W)"
+            exit 1
+          fi
+          pub="$(tail -n 1 "$pubfile")"
+          for f in "$NAME.tar.gz" "$NAME.tar.gz.sha256"; do
+            minisign -S -s "$key" -m "$f" < /dev/null
+            minisign -V -P "$pub" -m "$f"
+            cat "$f.minisig"
+          done
+          for doc in README.md docs/release-signing.md; do
+            if grep -qF "$pub" "$doc"; then
+              continue
+            elif grep -qF MINISIGN_PUBLIC_KEY_PLACEHOLDER "$doc"; then
+              echo "::warning::$doc still holds the public key placeholder; publish $pub there"
+            else
+              echo "::error::$doc does not publish the signing public key $pub"
+              exit 1
+            fi
+          done
+          {
+            echo "### Signed $NAME"
+            echo ""
+            echo "minisign public key: \`$pub\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
       - name: Attach to the release
         if: github.event_name == 'release'
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ github.event.release.tag_name }}
           NAME: ${{ steps.package.outputs.name }}
-        run: gh release upload "$TAG" "$NAME.tar.gz" "$NAME.tar.gz.sha256" --clobber
+        run: |
+          files=("$NAME.tar.gz" "$NAME.tar.gz.sha256")
+          for f in "$NAME.tar.gz.minisig" "$NAME.tar.gz.sha256.minisig"; do
+            if [ -f "$f" ]; then files+=("$f"); fi
+          done
+          gh release upload "$TAG" "${files[@]}" --clobber
 
       - name: Keep as a workflow artifact (manual runs)
         if: github.event_name != 'release'
@@ -119,6 +213,7 @@ jobs:
           path: |
             ${{ steps.package.outputs.name }}.tar.gz
             ${{ steps.package.outputs.name }}.tar.gz.sha256
+            ${{ steps.package.outputs.name }}.tar.gz*.minisig
           retention-days: 7
 
       # Image: the static Linux binary built above, on distroless static.
