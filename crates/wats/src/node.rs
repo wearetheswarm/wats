@@ -17,6 +17,8 @@ use iroh::endpoint::presets;
 use iroh::protocol::Router;
 use iroh::{Endpoint, EndpointAddr, EndpointId, SecretKey, TransportAddr};
 use iroh_blobs::api::downloader::Downloader;
+use iroh_blobs::api::proto::BlobStatus;
+use iroh_blobs::protocol::{ChunkRanges, ChunkRangesExt, GetRequest};
 use iroh_blobs::store::fs::FsStore;
 use iroh_blobs::{BlobsProtocol, Hash};
 use iroh_gossip::api::{Event as GossipEvent, GossipReceiver, GossipSender};
@@ -346,6 +348,23 @@ fn revalidate_opaque(store: &Store) -> Result<()> {
     Ok(())
 }
 
+/// Providers a gossip envelope may name for its blobs (B7).
+pub const MAX_PROVIDERS_PER_ENVELOPE: usize = 8;
+/// Providers tried, one after the other, for one blob fetch (B7).
+const MAX_PROVIDER_ATTEMPTS: usize = 4;
+/// A provider whose fetch failed is skipped for this long, doubling with
+/// each further failure up to [`PROVIDER_BACKOFF_MAX`] (B7).
+const PROVIDER_BACKOFF: Duration = Duration::from_secs(30);
+const PROVIDER_BACKOFF_MAX: Duration = Duration::from_secs(3600);
+
+/// How long a provider is skipped after `failures` failed fetches in a row.
+pub fn provider_backoff(failures: u32) -> Duration {
+    let doublings = failures.saturating_sub(1).min(16);
+    PROVIDER_BACKOFF
+        .saturating_mul(1 << doublings)
+        .min(PROVIDER_BACKOFF_MAX)
+}
+
 /// How often the peer cache is saved (B1).
 const PEER_CACHE_SAVE_SECS: u64 = 300;
 /// How long peers from the cache have to answer before the built-in
@@ -408,6 +427,8 @@ pub struct Node {
     peers: std::sync::Mutex<HashMap<EndpointId, u64>>,
     /// Blob hash -> nodes that announced they hold it (hints, unverified).
     hints: std::sync::Mutex<HashMap<String, Vec<EndpointId>>>,
+    /// Providers whose last blob fetches failed: (failures, retry after).
+    provider_backoff: std::sync::Mutex<HashMap<EndpointId, (u32, std::time::Instant)>>,
     /// What peers said in `hello`.
     peer_info: std::sync::Mutex<HashMap<EndpointId, NodeInfo>>,
     /// Cached blob store size: (when measured, bytes).
@@ -593,6 +614,7 @@ impl Node {
             fetched: tokio::sync::broadcast::channel(256).0,
             peers: std::sync::Mutex::new(bootstrap.iter().map(|id| (*id, now_secs())).collect()),
             hints: Default::default(),
+            provider_backoff: Default::default(),
             peer_info: Default::default(),
             usage: Default::default(),
             storage_bytes: Default::default(),
@@ -1124,7 +1146,7 @@ impl Node {
             bail!("unsafe blob name {:?}", blob.name);
         }
         let hash: Hash = blob.hash.parse()?;
-        if !self.blobs.has(hash).await? {
+        if !self.blob_matches(blob).await {
             return Ok(None);
         }
         let dir = std::path::absolute(self.config.data_dir.join("inbox").join(hash.to_hex()))?;
@@ -1207,7 +1229,7 @@ impl Node {
             let mut providers: Vec<EndpointId> = envelope
                 .providers
                 .iter()
-                .take(8)
+                .take(MAX_PROVIDERS_PER_ENVELOPE)
                 .filter_map(|p| p.parse().ok())
                 .collect();
             providers.push(from);
@@ -1527,25 +1549,120 @@ impl Node {
                 return false;
             }
         }
-        let result = async {
-            self.downloader.download(hash, providers).await?;
-            self.pin(hash).await?;
-            anyhow::Ok(())
-        };
-        match tokio::time::timeout(Duration::from_secs(120), result).await {
-            Ok(Ok(())) => {
-                info!(hash = %blob.hash, name = %blob.name, "blob fetched");
-                let _ = self.fetched.send(blob.clone());
-                true
-            }
-            Ok(Err(e)) => {
-                warn!(hash = %blob.hash, "blob fetch failed: {e:#}");
-                false
-            }
-            Err(_) => {
+        // B7: one provider at a time, skipping those that failed lately.
+        let candidates: Vec<EndpointId> = providers
+            .into_iter()
+            .filter(|p| !self.provider_backing_off(p))
+            .take(MAX_PROVIDER_ATTEMPTS)
+            .collect();
+        if candidates.is_empty() {
+            debug!(hash = %blob.hash, "no provider to fetch from (all backing off)");
+            return false;
+        }
+        // B10: ask for the declared size only, so a blob larger than its
+        // event says never costs more than what was declared and checked
+        // against the limits.
+        let chunks = blob.size.div_ceil(1024).max(1);
+        let request = GetRequest::builder()
+            .root(ChunkRanges::chunks(..chunks))
+            .build(hash);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
+        for provider in candidates {
+            let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if left.is_zero() {
                 warn!(hash = %blob.hash, "blob fetch timed out");
+                return false;
+            }
+            let attempt = async {
+                self.downloader
+                    .download(request.clone(), vec![provider])
+                    .await?;
+                anyhow::Ok(())
+            };
+            match tokio::time::timeout(left.min(Duration::from_secs(60)), attempt).await {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    debug!(hash = %blob.hash, %provider, "blob fetch failed: {e:#}");
+                    self.provider_failed(provider);
+                    continue;
+                }
+                Err(_) => {
+                    debug!(hash = %blob.hash, %provider, "blob fetch timed out");
+                    self.provider_failed(provider);
+                    continue;
+                }
+            }
+            self.provider_ok(provider);
+            // The content is verified against the hash; its size must also
+            // be the one the event declared (B10).
+            if !self.blob_matches(blob).await {
+                return false;
+            }
+            if let Err(e) = self.pin(hash).await {
+                warn!(hash = %blob.hash, "blob not pinned: {e:#}");
+                return false;
+            }
+            info!(hash = %blob.hash, name = %blob.name, "blob fetched");
+            let _ = self.fetched.send(blob.clone());
+            return true;
+        }
+        warn!(hash = %blob.hash, "blob fetch failed from every provider tried");
+        false
+    }
+
+    /// Whether the local copy of `blob` is complete and of the size its
+    /// event declared (B10). Logs a mismatch: the event lies about its blob.
+    async fn blob_matches(&self, blob: &BlobRef) -> bool {
+        let Ok(hash) = blob.hash.parse::<Hash>() else {
+            return false;
+        };
+        match self.blobs.status(hash).await {
+            Ok(BlobStatus::Complete { size }) if size == blob.size => true,
+            Ok(BlobStatus::Complete { size }) => {
+                warn!(hash = %blob.hash, declared = blob.size, size, "blob size differs from its declaration: not used");
                 false
             }
+            Ok(BlobStatus::NotFound) => false,
+            Ok(BlobStatus::Partial { .. }) => {
+                warn!(hash = %blob.hash, declared = blob.size, "blob incomplete or larger than declared: not used");
+                false
+            }
+            Err(e) => {
+                warn!(hash = %blob.hash, "blob status: {e:#}");
+                false
+            }
+        }
+    }
+
+    fn provider_backing_off(&self, provider: &EndpointId) -> bool {
+        self.provider_backoff
+            .lock()
+            .ok()
+            .and_then(|b| {
+                b.get(provider)
+                    .map(|(_, until)| std::time::Instant::now() < *until)
+            })
+            .unwrap_or(false)
+    }
+
+    fn provider_failed(&self, provider: EndpointId) {
+        if let Ok(mut backoff) = self.provider_backoff.lock() {
+            if backoff.len() >= 10_000 {
+                let now = std::time::Instant::now();
+                backoff.retain(|_, (_, until)| *until > now);
+            }
+            let failures = backoff
+                .get(&provider)
+                .map_or(0, |(n, _)| *n)
+                .saturating_add(1);
+            let until = std::time::Instant::now() + provider_backoff(failures);
+            backoff.insert(provider, (failures, until));
+        }
+    }
+
+    fn provider_ok(&self, provider: EndpointId) {
+        if let Ok(mut backoff) = self.provider_backoff.lock() {
+            backoff.remove(&provider);
         }
     }
 
@@ -1600,6 +1717,15 @@ impl Node {
 #[cfg(test)]
 mod storage_tests {
     use super::*;
+
+    #[test]
+    fn provider_backoff_doubles_up_to_an_hour() {
+        assert_eq!(provider_backoff(1), Duration::from_secs(30));
+        assert_eq!(provider_backoff(2), Duration::from_secs(60));
+        assert_eq!(provider_backoff(4), Duration::from_secs(240));
+        assert_eq!(provider_backoff(10), Duration::from_secs(3600));
+        assert_eq!(provider_backoff(u32::MAX), Duration::from_secs(3600));
+    }
 
     #[test]
     fn opaque_events_of_understood_versions_are_revalidated() {

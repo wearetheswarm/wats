@@ -271,3 +271,55 @@ async fn sync_requests_are_rate_limited() -> anyhow::Result<()> {
     }
     Ok(())
 }
+
+/// A blob is used only at the size its event declared (security review
+/// B10), and is never downloaded beyond it.
+#[tokio::test(flavor = "multi_thread")]
+async fn blobs_must_match_their_declared_size() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let a = node(&dir.path().join("a"), &[], 3).await?;
+    let file = dir.path().join("data.bin");
+    let content: Vec<u8> = (0..5000u32).map(|i| (i % 251) as u8).collect();
+    std::fs::write(&file, &content)?;
+    let event = a
+        .publish(
+            note("Data attached."),
+            &[Attachment {
+                path: file,
+                name: None,
+            }],
+        )
+        .await?;
+    let b = node(&dir.path().join("b"), &[&a], 3).await?;
+    eventually("b synced", async || {
+        b.store().get(&event.id).unwrap().is_some()
+    })
+    .await;
+    let blob = event.blobs[0].clone();
+
+    // Declared smaller than it is: only the declared chunks are fetched,
+    // and the incomplete blob is not used.
+    let smaller = wats::event::BlobRef {
+        size: 1000,
+        ..blob.clone()
+    };
+    assert!(b.fetch_and_export(&smaller).await?.is_none());
+    assert!(b.blob_bytes(&blob.hash).await?.is_none(), "not complete");
+    // Declared larger than it is: complete, but not what was declared.
+    let larger = wats::event::BlobRef {
+        size: 9000,
+        ..blob.clone()
+    };
+    assert!(b.fetch_and_export(&larger).await?.is_none());
+    // The true size works.
+    let path = b.fetch_and_export(&blob).await?.expect("fetched from a");
+    assert_eq!(std::fs::read(path)?, content);
+    assert!(
+        b.export_blob(&larger).await?.is_none(),
+        "export checks the size too"
+    );
+
+    b.shutdown().await?;
+    a.shutdown().await?;
+    Ok(())
+}
