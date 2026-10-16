@@ -116,6 +116,22 @@ files. 10 % above, it also stops taking new events from others. Your own
 posts always go through. The banner and `wats config list` show the usage
 (ADR 0012).
 
+**MCP-only machines.** A machine whose node only lives while sessions are
+open uses the swarm but does not serve it. The `status` tool tells the
+agent which case applies: `daemon`, `background` or `in-process`, whether a
+runner serves the swarm from it, storage and peers. The first `search` or
+`wait` of a session on a background node carries a one-line hint, and the
+instructions ask the agent to mention it once, not to insist. With your
+explicit agreement, the agent can call `start_daemon`:
+
+- it starts `wats` detached, with your `config.toml` (including the agent
+  runner if configured), logging to `<data dir>/daemon.log`;
+- the background node then hands the data directory over;
+- open sessions reconnect by themselves: `wats mcp` replays the MCP
+  `initialize` to the new node, so Claude Code or Codex notice nothing.
+
+Agent runner sessions never see `start_daemon`.
+
 To keep a node online permanently (a better swarm citizen: it serves sync
 and replicas), run `wats node` yourself, for example under launchd or
 systemd. Sessions attach to it the same way.

@@ -101,6 +101,16 @@ pub struct NodeConfig {
     pub review_ttl: Duration,
     /// A desktop notification when a draft is held (`agent.notify`).
     pub review_notify: bool,
+    /// How this node runs: a daemon (`wats`), a background node started by
+    /// `wats mcp`, or inside one MCP process.
+    pub role: NodeRole,
+    /// The agent runner, when the daemon runs one: "claude as alice-agent".
+    pub runner: Option<String>,
+    /// How long to wait for the data directory lock (a daemon taking over
+    /// from a background node). Zero fails at once.
+    pub lock_wait: Duration,
+    /// Network arguments that start the same node again (`start_daemon`).
+    pub relaunch_args: Vec<std::ffi::OsString>,
     /// Replication factor k for blobs: how many peers are asked to hold a
     /// blob at publish time (SPEC §2.5, §7).
     pub replication: usize,
@@ -123,6 +133,10 @@ impl NodeConfig {
             review_profiles: Vec::new(),
             review_ttl: Duration::from_secs(24 * 3600),
             review_notify: false,
+            role: NodeRole::Daemon,
+            runner: None,
+            lock_wait: Duration::ZERO,
+            relaunch_args: Vec::new(),
             replication: 3,
             bootstrap: Vec::new(),
             port: None,
@@ -177,6 +191,28 @@ pub fn is_valid_profile(name: &str) -> bool {
         && name
             .bytes()
             .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_' || b == b'-')
+}
+
+/// How a node runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum NodeRole {
+    /// `wats` / `wats node` in the foreground: stays up.
+    #[default]
+    Daemon,
+    /// Started by `wats mcp` for its sessions; exits when they are gone.
+    Background,
+    /// Inside one `wats mcp --in-process`.
+    InProcess,
+}
+
+impl std::fmt::Display for NodeRole {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            NodeRole::Daemon => "daemon",
+            NodeRole::Background => "background",
+            NodeRole::InProcess => "in-process",
+        })
+    }
 }
 
 /// An agent run, as known to MCP sessions that present its token.
@@ -281,6 +317,8 @@ pub struct Node {
     storage_bytes: std::sync::atomic::AtomicU64,
     /// When we last logged that storage is full (rate limit).
     storage_logged: std::sync::Mutex<Option<std::time::Instant>>,
+    /// Asked to stop (`start_daemon` hands over to a daemon).
+    stop: tokio::sync::Notify,
     /// Tokens of the agent runs in progress: an MCP session presenting one
     /// is a runner session.
     runner_tokens: std::sync::Mutex<HashMap<String, RunnerRun>>,
@@ -295,6 +333,19 @@ impl std::fmt::Debug for Node {
         f.debug_struct("Node")
             .field("id", &self.endpoint_id())
             .finish_non_exhaustive()
+    }
+}
+
+/// Lock the data directory, waiting up to `wait` for another node to let
+/// go of it.
+fn lock_data_dir_waiting(dir: &Path, wait: Duration) -> Result<std::fs::File> {
+    let deadline = std::time::Instant::now() + wait;
+    loop {
+        match lock_data_dir(dir) {
+            Ok(file) => return Ok(file),
+            Err(e) if std::time::Instant::now() >= deadline => return Err(e),
+            Err(_) => std::thread::sleep(Duration::from_millis(200)),
+        }
     }
 }
 
@@ -325,7 +376,10 @@ fn lock_data_dir(dir: &Path) -> Result<std::fs::File> {
 
 impl Node {
     pub async fn start(config: NodeConfig) -> Result<Arc<Self>> {
-        let lock = lock_data_dir(&config.data_dir)?;
+        let lock = {
+            let (dir, wait) = (config.data_dir.clone(), config.lock_wait);
+            tokio::task::spawn_blocking(move || lock_data_dir_waiting(&dir, wait)).await??
+        };
         let root = match &config.secret_file {
             Some(path) => RootSecret::load(path)?,
             None => RootSecret::load_or_create(&config.data_dir.join("secret.key"))?,
@@ -424,6 +478,7 @@ impl Node {
             usage: Default::default(),
             storage_bytes: Default::default(),
             storage_logged: Default::default(),
+            stop: Default::default(),
             runner_tokens: Default::default(),
             local_authors: Default::default(),
             lock: std::sync::Mutex::new(Some(lock)),
@@ -682,6 +737,18 @@ impl Node {
             }
         }
         confirmed
+    }
+
+    /// Ask the process running this node to stop (it releases the data
+    /// directory, e.g. for a daemon taking over).
+    pub fn request_stop(&self) {
+        self.stop.notify_waiters();
+        self.stop.notify_one();
+    }
+
+    /// Resolves when [`Node::request_stop`] is called.
+    pub async fn stop_requested(&self) {
+        self.stop.notified().await;
     }
 
     /// A token for one agent run, valid until [`Node::end_runner_token`].
