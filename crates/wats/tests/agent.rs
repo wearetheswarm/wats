@@ -102,6 +102,7 @@ async fn agent_wakes_on_asks_and_heartbeats() -> anyhow::Result<()> {
         max_runs_per_hour: 100,
         // Only b is allowed: c's asks are ignored.
         allow: vec![b.author_id()],
+        ignore_local: true,
         heartbeat_text: DEFAULT_HEARTBEAT.into(),
         command: fake_agent(dir.path()),
         mcp_command: "/usr/bin/true".into(),
@@ -280,6 +281,9 @@ async fn interactive_session_attaches_while_agent_runs() -> anyhow::Result<()> {
             "claude",
             "--agent-profile",
             "agent",
+            // The human below posts from this same node.
+            "--ignore-local",
+            "false",
             "--every",
             "1s",
             "--heartbeat",
@@ -622,6 +626,7 @@ async fn budget_pauses_the_agent() -> anyhow::Result<()> {
         heartbeat: Duration::from_secs(1),
         max_runs_per_hour: 100,
         allow: vec![],
+        ignore_local: true,
         heartbeat_text: DEFAULT_HEARTBEAT.into(),
         command: fake_agent(dir.path()),
         mcp_command: "/usr/bin/true".into(),
@@ -775,6 +780,7 @@ echo '{{"type":"turn.completed","usage":{{"input_tokens":10,"output_tokens":2}}}
         heartbeat: Duration::from_secs(1),
         max_runs_per_hour: 100,
         allow: vec![],
+        ignore_local: true,
         heartbeat_text: DEFAULT_HEARTBEAT.into(),
         command: fake,
         mcp_command: "/opt/wats".into(),
@@ -877,6 +883,7 @@ async fn workspace_access_opens_the_workspace() -> anyhow::Result<()> {
         heartbeat: Duration::from_secs(1),
         max_runs_per_hour: 100,
         allow: vec![],
+        ignore_local: true,
         heartbeat_text: DEFAULT_HEARTBEAT.into(),
         command: fake_agent(dir.path()),
         mcp_command: "/opt/wats".into(),
@@ -1297,5 +1304,123 @@ fn follow_stops_on_signals() {
             }
             std::thread::sleep(Duration::from_millis(50));
         }
+    }
+}
+
+/// The wake policy, after the first real exchange: an agent wakes on asks
+/// and on actionable direct replies to its own posts. Not on a sibling
+/// answer to the same ask, not on a react to its answer (kept for the next
+/// run as feedback), not on a post by another profile of its own node.
+#[tokio::test(flavor = "multi_thread")]
+async fn wakes_only_on_what_is_addressed_to_it() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let a = node(&dir.path().join("a"), &[]).await?;
+    let b = node(&dir.path().join("b"), &[&a]).await?;
+    let c = node(&dir.path().join("c"), &[&a]).await?;
+    a.wait_for_neighbor(PUBLIC_NET, Duration::from_secs(10))
+        .await?;
+    let reply_to = |parent: &wats::event::Event, kind: Kind, text: &str| Draft {
+        net: PUBLIC_NET.into(),
+        thread: Some(parent.thread_root().to_string()),
+        parent: Some(parent.id.clone()),
+        kind: Some(kind),
+        text: text.into(),
+        ..Draft::default()
+    };
+    // Before the runner starts: b asks, the agent answers.
+    let question = b.publish(ask("Which CSV delimiter?"), &[]).await?;
+    let agent_key = a.author_key("agent")?;
+    eventually_async(|| async { a.store().get(&question.id).unwrap().is_some() }).await;
+    let answer = a
+        .publish_as(
+            &agent_key,
+            reply_to(&question, Kind::Answer, "Use a comma."),
+            &[],
+        )
+        .await?;
+    eventually_async(|| async { b.store().get(&answer.id).unwrap().is_some() }).await;
+
+    let config = AgentConfig {
+        runtime: "claude".into(),
+        profile: "agent".into(),
+        user: "alice".into(),
+        about: String::new(),
+        caps: vec![],
+        every: Duration::from_secs(1),
+        heartbeat: Duration::from_secs(3600),
+        max_runs_per_hour: 100,
+        allow: vec![],
+        ignore_local: true,
+        heartbeat_text: DEFAULT_HEARTBEAT.into(),
+        command: fake_agent(dir.path()),
+        mcp_command: "/usr/bin/true".into(),
+        mcp_args: vec![],
+        extra_args: vec![],
+        run_timeout: Duration::from_secs(10),
+        max_turns: 10,
+        budget: wats::budget::Budget::default(),
+        codex_disable: vec![],
+        access: wats::access::Access::Locked,
+        workdir: std::path::PathBuf::from("/nonexistent"),
+        tools: vec![],
+        work_dir: dir.path().join("work"),
+        keep_runs: 100,
+        keep_days: 30,
+    };
+    let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+    let runner = tokio::spawn(wats::agent::run(Arc::clone(&a), config, async {
+        let _ = stopped.await;
+    }));
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    // None of these wakes it.
+    let sibling = c
+        .publish(reply_to(&question, Kind::Answer, "A semicolon."), &[])
+        .await?;
+    let reaction = b
+        .publish(reply_to(&answer, Kind::React, "Works, thanks."), &[])
+        .await?;
+    let local = a
+        .publish_as(&a.author_key("human")?, ask("My own question"), &[])
+        .await?;
+    eventually_async(|| async {
+        [&sibling.id, &reaction.id, &local.id]
+            .iter()
+            .all(|id| a.store().get(id).unwrap().is_some())
+    })
+    .await;
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert!(
+        runs(dir.path()).is_empty(),
+        "nothing addressed to the agent yet"
+    );
+
+    // A follow-up question to its answer does.
+    let follow_up = b
+        .publish(reply_to(&answer, Kind::Ask, "And for TSV?"), &[])
+        .await?;
+    eventually("a run", || !runs(dir.path()).is_empty()).await;
+    let (prompt, _) = runs(dir.path()).remove(0);
+    assert!(prompt.contains(&follow_up.id), "{prompt}");
+    assert!(prompt.contains("Feedback on your posts"), "{prompt}");
+    assert!(
+        prompt.contains(&reaction.id),
+        "the react comes as feedback: {prompt}"
+    );
+    assert!(!prompt.contains(&sibling.id), "{prompt}");
+    assert!(!prompt.contains(&local.id), "{prompt}");
+    let _ = stop.send(());
+    runner.await??;
+    for n in [a, b, c] {
+        n.shutdown().await?;
+    }
+    Ok(())
+}
+
+async fn eventually_async<F: std::future::Future<Output = bool>>(mut check: impl FnMut() -> F) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    while !check().await {
+        assert!(tokio::time::Instant::now() < deadline, "timed out");
+        tokio::time::sleep(Duration::from_millis(100)).await;
     }
 }
