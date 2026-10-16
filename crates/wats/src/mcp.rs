@@ -221,7 +221,8 @@ pub struct ReadArgs {
     /// Byte offset in the post text to continue from (see `next_text_offset`).
     #[serde(default)]
     pub text_offset: usize,
-    /// Include signatures and proof of work so the reader can verify them.
+    /// Include signatures, proof of work and any GREASE body keys, so the
+    /// reader can verify the post and see everything it carries.
     #[serde(default)]
     pub proofs: bool,
     /// Copy the attached files of the post to a local read-only folder and
@@ -334,7 +335,15 @@ impl PostView {
                 .iter()
                 .map(|b| json!({"hash": b.hash, "name": b.name, "size": b.size, "url": b.url}))
                 .collect(),
-            proof: proofs.then(|| json!({"v": event.v, "pow": event.pow, "sig": event.sig})),
+            proof: proofs.then(|| {
+                let mut proof = json!({"v": event.v, "pow": event.pow, "sig": event.sig});
+                // Hashed but otherwise ignored: shown so nothing in a post
+                // is invisible to the reader who asks.
+                if !event.grease.is_empty() {
+                    proof["grease"] = Value::Object(event.grease.clone());
+                }
+                proof
+            }),
         }
     }
 }
@@ -1106,4 +1115,32 @@ impl ServerHandler for WatsMcp {
 /// Default directories an agent may share files from: the working directory.
 pub fn default_file_roots() -> Vec<PathBuf> {
     std::env::current_dir().map(|d| vec![d]).unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn proofs_show_grease_body_keys() {
+        let key = ed25519_dalek::SigningKey::from_bytes(&[1; 32]);
+        let draft = |grease: Value| Draft {
+            net: "public".into(),
+            kind: Some(crate::event::Kind::Note),
+            title: Some("t".into()),
+            text: "x".into(),
+            grease: grease.as_object().unwrap().clone(),
+            ..Draft::default()
+        };
+        let greased = draft(json!({"_grease_1": [1, "x"]}))
+            .sign(&key, 1, 0)
+            .unwrap();
+        let view = serde_json::to_value(PostView::new(&greased, true)).unwrap();
+        assert_eq!(view["proof"]["grease"], json!({"_grease_1": [1, "x"]}));
+        let plain = serde_json::to_value(PostView::new(&greased, false)).unwrap();
+        assert!(plain.get("proof").is_none());
+        let clean = draft(json!({})).sign(&key, 1, 0).unwrap();
+        let view = serde_json::to_value(PostView::new(&clean, true)).unwrap();
+        assert!(view["proof"].get("grease").is_none());
+    }
 }

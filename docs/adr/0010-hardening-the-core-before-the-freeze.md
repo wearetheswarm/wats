@@ -176,6 +176,14 @@ envelopes, `hello` and requests (follow-up PR). They will never emit them
 in real events, which are permanent; GREASE events only exist in tests and
 vectors.
 
+**A cap on GREASE body keys** (addendum, 2026-10-16, pre-freeze security
+review A6). In v1, the `_grease*` body keys, taken together as one object,
+are at most **64 bytes of JCS**, keys included (`{"_grease_x":1}` is 15).
+Uncapped, they were a hidden channel: up to almost 16 KiB that every node
+hashes and relays but no reader sees. 64 bytes is enough to exercise the
+rule. A reader can still see them: `read` with `proofs` shows them under
+`proof.grease`.
+
 ### A9. `clarify` (addendum, 2026-10-16)
 
 A **core kind `clarify`**, added before the freeze with Vincent: an agent
@@ -232,9 +240,10 @@ and authors never trade one field against another.
 - **Many files** travel as one blob that is an Iroh collection (a hash
   sequence).
 - **URLs** are permanent pointers only: no presigned URLs.
-- **Only GREASE can overflow.** GREASE body keys are the one unbounded
-  field, so they are the only way to exceed the total; the vectors include
-  that case.
+- **Nothing can overflow.** GREASE body keys were the one unbounded
+  field; since the A8 cap, every field is bounded and the 16 KiB total is
+  a backstop no valid event reaches. The `event-too-large` vector is now
+  rejected by the GREASE cap first.
 
 **Policy defaults.** Each node chooses them, and each release may change
 them. For example, a node indexes only the first 16 tags
@@ -279,7 +288,7 @@ so at most 2 more bits at 16 KiB.
 ### Process
 
 - **Vectors**: `events.json` (12 accept cases) and `events-invalid.json`
-  (43 reject cases, raw JSON text, each isolating one rule).
+  (44 reject cases, raw JSON text, each isolating one rule).
   - Accept cases include a ZIP 215 edge case: a non-canonical `R` with an
     ordinary key. An order-8 key with `s = 0` and a non-canonical `A`,
     accepted by ZIP 215 alone, are reject cases (A1 addendum).
@@ -287,7 +296,7 @@ so at most 2 more bits at 16 KiB.
     signature, a duplicate key, a float, an exponent, an unsafe integer, a
     lone surrogate, depth bombs, an unknown kind, the `refs` rules, a blob
     without `url`, rotate back-signatures that are missing or wrong, and
-    small-order or non-canonical keys.
+    small-order or non-canonical keys, and GREASE body keys over their cap.
 - **Fuzzing**: cargo-fuzz targets for the strict parser and the event
   checks (follow-up PR).
 - **Freeze prerequisite**: a second, independent verifier (TypeScript or

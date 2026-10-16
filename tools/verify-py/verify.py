@@ -70,6 +70,8 @@ MAX_TEXT_BYTES = 6 * 1024
 MAX_TAGS = 32
 MAX_TAG_BYTES = 64
 MAX_DATA_BYTES = 2 * 1024
+# JCS of the object the _grease* body keys form, keys included.
+MAX_GREASE_BYTES = 64
 MAX_DATA_DEPTH = 16
 MAX_REFS_V1 = 32
 MAX_BLOBS = 6
@@ -554,6 +556,9 @@ def validate_content(wire: dict) -> None:
     for key in wire:
         if key not in V1_FIELDS and not is_grease(key):
             raise Invalid(f"unknown field {key!r}")
+    grease = {k: v for k, v in wire.items() if k not in V1_FIELDS}
+    if grease and len(jcs.canonicalize(grease)) > MAX_GREASE_BYTES:
+        raise Invalid(f"GREASE body keys exceed {MAX_GREASE_BYTES} bytes canonicalized")
 
 
 def canonical_size(wire: dict) -> int:
