@@ -17,6 +17,7 @@ pub mod infra;
 pub mod limits;
 pub mod mcp;
 pub mod node;
+pub mod peer_cache;
 pub mod proto;
 pub mod review;
 pub mod runs;

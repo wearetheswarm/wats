@@ -15,7 +15,7 @@ use ed25519_dalek::SigningKey;
 use iroh::address_lookup::MemoryLookup;
 use iroh::endpoint::presets;
 use iroh::protocol::Router;
-use iroh::{Endpoint, EndpointAddr, EndpointId, SecretKey};
+use iroh::{Endpoint, EndpointAddr, EndpointId, SecretKey, TransportAddr};
 use iroh_blobs::api::downloader::Downloader;
 use iroh_blobs::store::fs::FsStore;
 use iroh_blobs::{BlobsProtocol, Hash};
@@ -68,6 +68,10 @@ pub struct NodeConfig {
     pub peers: Vec<EndpointAddr>,
     /// Bootstrap entries resolved by DNS at startup, ids pinned (ADR 0008).
     pub bootstrap: Vec<BootstrapEntry>,
+    /// The bootstrap nodes compiled into the binary: dialed at startup only
+    /// when the peer cache is empty, or later when none of its peers
+    /// answered (security review B1).
+    pub default_bootstrap: Vec<BootstrapEntry>,
     /// Fixed UDP port for IPv4 (0.0.0.0), e.g. behind a load balancer.
     /// Random when unset.
     pub port: Option<u16>,
@@ -151,6 +155,7 @@ impl NodeConfig {
             report_auto: false,
             replication: 3,
             bootstrap: Vec::new(),
+            default_bootstrap: Vec::new(),
             port: None,
             external_addrs: Vec::new(),
             secret_file: None,
@@ -298,6 +303,40 @@ pub fn dir_size(dir: &Path) -> u64 {
         .sum()
 }
 
+/// How often the peer cache is saved (B1).
+const PEER_CACHE_SAVE_SECS: u64 = 300;
+/// How long peers from the cache have to answer before the built-in
+/// bootstrap nodes are dialed (B1).
+const BOOTSTRAP_FALLBACK_AFTER: Duration = Duration::from_secs(15);
+
+/// Resolve bootstrap entries concurrently; an entry that does not resolve
+/// is logged and skipped, so one dead seed never blocks the others.
+async fn resolve_bootstrap(entries: &[BootstrapEntry], me: EndpointId) -> Vec<EndpointAddr> {
+    let mut tasks = tokio::task::JoinSet::new();
+    for entry in entries.iter().cloned() {
+        tasks.spawn(async move {
+            let resolved = tokio::time::timeout(Duration::from_secs(10), entry.resolve()).await;
+            (entry, resolved)
+        });
+    }
+    let mut out = Vec::new();
+    while let Some(joined) = tasks.join_next().await {
+        let Ok((entry, resolved)) = joined else {
+            continue;
+        };
+        match resolved {
+            Ok(Ok(addr)) if addr.id == me => {}
+            Ok(Ok(addr)) => {
+                info!(peer = %addr.id, host = %entry.host, "bootstrap peer");
+                out.push(addr);
+            }
+            Ok(Err(e)) => warn!(%entry, "bootstrap peer unavailable: {e:#}"),
+            Err(_) => warn!(%entry, "bootstrap peer unavailable: DNS timeout"),
+        }
+    }
+    out
+}
+
 pub fn now_secs() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -439,17 +478,30 @@ impl Node {
         if config.mode == NetworkMode::Internet {
             config.infra.spawn_relay_fallback(&endpoint);
         }
-        let mut peers = config.peers.clone();
-        for entry in &config.bootstrap {
-            match entry.resolve().await {
-                Ok(addr) if addr.id == endpoint.id() => {}
-                Ok(addr) => {
-                    info!(peer = %addr.id, host = %entry.host, "bootstrap peer");
-                    peers.push(addr);
-                }
-                Err(e) => warn!(%entry, "bootstrap peer unavailable: {e:#}"),
-            }
+        // Peers met before come first (B1); the built-in bootstrap nodes
+        // are dialed now only when there are none.
+        let mut cached = crate::peer_cache::load(&config.data_dir, endpoint.id(), now_secs());
+        if config.mode == NetworkMode::Loopback {
+            // Hermetic: never dial what is not on this machine.
+            cached = crate::peer_cache::loopback_only(cached);
         }
+        let mut peers = config.peers.clone();
+        peers.extend(
+            cached
+                .iter()
+                .filter_map(crate::peer_cache::CachedPeer::to_addr),
+        );
+        if !cached.is_empty() {
+            info!(peers = cached.len(), "dialing peers met before");
+        }
+        let mut seeds = config.bootstrap.clone();
+        let fallback = if cached.is_empty() {
+            seeds.extend(config.default_bootstrap.iter().cloned());
+            Vec::new()
+        } else {
+            config.default_bootstrap.clone()
+        };
+        peers.extend(resolve_bootstrap(&seeds, endpoint.id()).await);
         for peer in &peers {
             lookup.add_endpoint_info(peer.clone());
         }
@@ -515,6 +567,32 @@ impl Node {
                     tokio::time::sleep(Duration::from_secs(STORAGE_MEASURE_SECS)).await;
                     let Some(node) = weak.upgrade() else { break };
                     node.measure_storage().await;
+                }
+            });
+        }
+        {
+            let weak = Arc::downgrade(&node);
+            tokio::spawn(async move {
+                loop {
+                    tokio::time::sleep(Duration::from_secs(PEER_CACHE_SAVE_SECS)).await;
+                    let Some(node) = weak.upgrade() else { break };
+                    node.save_peer_cache().await;
+                }
+            });
+        }
+        if !fallback.is_empty() {
+            let weak = Arc::downgrade(&node);
+            tokio::spawn(async move {
+                tokio::time::sleep(BOOTSTRAP_FALLBACK_AFTER).await;
+                let Some(node) = weak.upgrade() else { return };
+                if !node.neighbors().is_empty() {
+                    return;
+                }
+                info!("no peer met before answered: dialing the built-in bootstrap nodes");
+                for addr in resolve_bootstrap(&fallback, node.endpoint_id()).await {
+                    if let Err(e) = node.add_peer(addr).await {
+                        warn!("bootstrap peer: {e:#}");
+                    }
                 }
             });
         }
@@ -1392,7 +1470,41 @@ impl Node {
         }
     }
 
+    /// Persist the peers that answered `hello`, with the addresses the
+    /// endpoint knows for them now (B1).
+    pub async fn save_peer_cache(&self) {
+        let last_seen = self.peers.lock().map(|p| p.clone()).unwrap_or_default();
+        let met: Vec<EndpointId> = self
+            .peer_info
+            .lock()
+            .map(|p| p.keys().copied().collect())
+            .unwrap_or_default();
+        let mut fresh = Vec::new();
+        for id in met {
+            let Some(info) = self.endpoint().remote_info(id).await else {
+                continue;
+            };
+            let addr = EndpointAddr::from_parts(id, info.into_addrs().map(TransportAddr::from));
+            let seen = last_seen.get(&id).copied().unwrap_or_else(now_secs);
+            fresh.push(crate::peer_cache::CachedPeer::from_addr(&addr, seen));
+        }
+        if fresh.is_empty() {
+            return;
+        }
+        let (dir, me) = (self.config.data_dir.clone(), self.endpoint_id());
+        let saved = tokio::task::spawn_blocking(move || {
+            crate::peer_cache::save(&dir, me, now_secs(), fresh)
+        })
+        .await;
+        match saved {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => warn!("peer cache not saved: {e:#}"),
+            Err(e) => warn!("peer cache not saved: {e}"),
+        }
+    }
+
     pub async fn shutdown(&self) -> Result<()> {
+        self.save_peer_cache().await;
         self.gossip.shutdown().await.ok();
         self.router.shutdown().await?;
         // The router shuts the blob protocol down, which also closes the store.
