@@ -11,6 +11,14 @@
 //!
 //! Strings are hashed as received: no Unicode normalization.
 
+// Network input must never panic the node (security review, item D).
+#![deny(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::arithmetic_side_effects
+)]
+
 use std::collections::HashSet;
 use std::fmt;
 
@@ -45,8 +53,8 @@ pub fn from_slice<T: DeserializeOwned>(bytes: &[u8]) -> Result<T, StrictJsonErro
 /// Nesting depth of a value: 0 for scalars, 1 for a flat object or array.
 pub fn depth(value: &Value) -> usize {
     match value {
-        Value::Array(items) => 1 + items.iter().map(depth).max().unwrap_or(0),
-        Value::Object(map) => 1 + map.values().map(depth).max().unwrap_or(0),
+        Value::Array(items) => items.iter().map(depth).max().unwrap_or(0).saturating_add(1),
+        Value::Object(map) => map.values().map(depth).max().unwrap_or(0).saturating_add(1),
         _ => 0,
     }
 }
@@ -127,7 +135,7 @@ impl<'de> Visitor<'de> for Strict {
     }
 
     fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Value, A::Error> {
-        let depth = self.depth + 1;
+        let depth = self.depth.saturating_add(1);
         if depth > MAX_DEPTH {
             return Err(serde::de::Error::custom("JSON nested too deeply"));
         }
@@ -139,7 +147,7 @@ impl<'de> Visitor<'de> for Strict {
     }
 
     fn visit_map<A: MapAccess<'de>>(self, mut access: A) -> Result<Value, A::Error> {
-        let depth = self.depth + 1;
+        let depth = self.depth.saturating_add(1);
         if depth > MAX_DEPTH {
             return Err(serde::de::Error::custom("JSON nested too deeply"));
         }
@@ -157,6 +165,12 @@ impl<'de> Visitor<'de> for Strict {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::arithmetic_side_effects
+)]
 mod tests {
     use super::*;
 

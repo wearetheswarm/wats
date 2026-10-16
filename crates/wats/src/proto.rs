@@ -17,6 +17,14 @@
 //! Forward compatibility: unknown request types get `unsupported`, unknown
 //! fields are ignored, and every node serves each ALPN in [`ALPNS`].
 
+// Network input must never panic the node (security review, item D).
+#![deny(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::arithmetic_side_effects
+)]
+
 use std::sync::{Arc, OnceLock, Weak};
 
 use anyhow::{Context, Result, bail};
@@ -80,7 +88,7 @@ impl NodeInfo {
             protocols: PROTOCOL_VERSIONS.to_vec(),
             events_min: UNDERSTOOD_VERSIONS.0,
             events_max: UNDERSTOOD_VERSIONS.1,
-            relay_max: UNDERSTOOD_VERSIONS.1 + RELAY_VERSIONS_AHEAD,
+            relay_max: UNDERSTOOD_VERSIONS.1.saturating_add(RELAY_VERSIONS_AHEAD),
             features: FEATURES.iter().map(|f| f.to_string()).collect(),
         }
     }
@@ -235,8 +243,8 @@ impl ProtocolHandler for WatsProtocol {
 /// hash proximity" (SPEC §2.5). Smaller is closer.
 pub fn distance(hash: &[u8; 32], node: &EndpointId) -> [u8; 32] {
     let mut out = [0u8; 32];
-    for (i, (a, b)) in hash.iter().zip(node.as_bytes()).enumerate() {
-        out[i] = a ^ b;
+    for (o, (a, b)) in out.iter_mut().zip(hash.iter().zip(node.as_bytes())) {
+        *o = a ^ b;
     }
     out
 }
@@ -251,6 +259,12 @@ pub fn closest(hash: &[u8; 32], peers: &[EndpointId], k: usize) -> Vec<EndpointI
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::arithmetic_side_effects
+)]
 mod tests {
     use super::*;
     use iroh::SecretKey;

@@ -76,6 +76,23 @@ machine, and supply-chain attacks on dependencies beyond pinning and
   GREASE emitted on the wire, and a second independent verifier
   (`tools/verify-py`, in CI). The typed event a node stores and relays
   must re-serialize to exactly the object received.
+- **Robustness (no crash):** the modules that parse or handle network
+  input (`wire`, `proto`, `node`, `strict_json`, `event`) deny
+  `clippy::unwrap_used`, `expect_used`, `indexing_slicing` and
+  `arithmetic_side_effects` outside tests: arithmetic is checked or
+  saturating, lookups use `.get()`, failures are errors. A case kept on
+  purpose carries a narrow `#[allow]` with the reason it cannot panic. No
+  allocation is sized by a peer-supplied length: reads are capped, sync
+  pages are clamped to 256 events, refs to their maximum.
+- **Supervision:** the release profile unwinds (no `panic = "abort"`), so
+  a panic stays in its tokio task: per-connection and per-request tasks
+  are isolated. The long-lived loops whose silent death would disable a
+  feature (gossip receive loop per network, MCP socket accept loop, agent
+  runner, storage measuring, peer cache saver, relay fallback, the review
+  and report loop) run under `supervise`, which restarts them after a
+  panic with an error log line and a backoff of 1 s doubling to 10 s. The
+  crash-report hook (ADR 0013) still writes its report at the panic; the
+  log line says the node kept running.
 
 ### 2. MCP socket → node
 

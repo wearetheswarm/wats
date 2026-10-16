@@ -5,6 +5,14 @@
 //! hints (which nodes can serve the blobs). The envelope is not signed and
 //! not stored; only the event is.
 
+// Network input must never panic the node (security review, item D).
+#![deny(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::arithmetic_side_effects
+)]
+
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -33,6 +41,7 @@ use crate::event::{BlobRef, Draft, Event, is_safe_blob_name};
 use crate::identity::{DEFAULT_PROFILE, RootSecret, author_id};
 use crate::proto::{self, NodeInfo, Request, Response, WatsProtocol};
 use crate::store::{Inserted, Store};
+use crate::supervise::supervise;
 use crate::wire::{AnyEvent, RELAY_VERSIONS_AHEAD, UNDERSTOOD_VERSIONS};
 
 /// The public network id (ring zero, SPEC §2.4). Provisional, ADR 0004.
@@ -275,17 +284,19 @@ pub fn storage_state(used: u64, max: Option<u64>) -> StorageState {
 
 /// `1.2 GiB`.
 pub fn format_bytes(bytes: u64) -> String {
-    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
+    const UNITS: [&str; 4] = ["KiB", "MiB", "GiB", "TiB"];
     let mut value = bytes as f64;
-    let mut unit = 0;
-    while value >= 1024.0 && unit < UNITS.len() - 1 {
+    let mut unit = None;
+    for next in UNITS {
+        if value < 1024.0 {
+            break;
+        }
         value /= 1024.0;
-        unit += 1;
+        unit = Some(next);
     }
-    if unit == 0 {
-        format!("{bytes} B")
-    } else {
-        format!("{value:.1} {}", UNITS[unit])
+    match unit {
+        None => format!("{bytes} B"),
+        Some(unit) => format!("{value:.1} {unit}"),
     }
 }
 
@@ -326,20 +337,20 @@ fn revalidate_opaque(store: &Store) -> Result<()> {
                 if let Err(e) = store.insert(&event, now_secs()) {
                     warn!(%id, "stored opaque event not upgraded: {e:#}");
                     store.delete_opaque(&id)?;
-                    dropped += 1;
+                    dropped = dropped.saturating_add(1);
                 } else {
-                    upgraded += 1;
+                    upgraded = upgraded.saturating_add(1);
                 }
             }
             Ok(AnyEvent::Opaque(_)) => {}
             Err(e) => {
                 warn!(%id, "stored opaque event is invalid once understood, dropped: {e:#}");
                 store.delete_opaque(&id)?;
-                dropped += 1;
+                dropped = dropped.saturating_add(1);
             }
         }
     }
-    if upgraded + dropped > 0 {
+    if upgraded > 0 || dropped > 0 {
         info!(
             upgraded,
             dropped, "re-validated opaque events of versions now understood"
@@ -487,11 +498,12 @@ impl std::fmt::Debug for Node {
 /// Lock the data directory, waiting up to `wait` for another node to let
 /// go of it.
 fn lock_data_dir_waiting(dir: &Path, wait: Duration) -> Result<std::fs::File> {
-    let deadline = std::time::Instant::now() + wait;
+    // No deadline when `wait` does not fit in an `Instant`: wait forever.
+    let deadline = std::time::Instant::now().checked_add(wait);
     loop {
         match lock_data_dir(dir) {
             Ok(file) => return Ok(file),
-            Err(e) if std::time::Instant::now() >= deadline => return Err(e),
+            Err(e) if deadline.is_some_and(|d| std::time::Instant::now() >= d) => return Err(e),
             Err(_) => std::thread::sleep(Duration::from_millis(200)),
         }
     }
@@ -654,23 +666,29 @@ impl Node {
         node.measure_storage().await;
         if node.config.storage_max.is_some() {
             let weak = Arc::downgrade(&node);
-            tokio::spawn(async move {
-                loop {
-                    tokio::time::sleep(Duration::from_secs(STORAGE_MEASURE_SECS)).await;
-                    let Some(node) = weak.upgrade() else { break };
-                    node.measure_storage().await;
+            tokio::spawn(supervise("storage measure", move || {
+                let weak = weak.clone();
+                async move {
+                    loop {
+                        tokio::time::sleep(Duration::from_secs(STORAGE_MEASURE_SECS)).await;
+                        let Some(node) = weak.upgrade() else { break };
+                        node.measure_storage().await;
+                    }
                 }
-            });
+            }));
         }
         {
             let weak = Arc::downgrade(&node);
-            tokio::spawn(async move {
-                loop {
-                    tokio::time::sleep(Duration::from_secs(PEER_CACHE_SAVE_SECS)).await;
-                    let Some(node) = weak.upgrade() else { break };
-                    node.save_peer_cache().await;
+            tokio::spawn(supervise("peer cache saver", move || {
+                let weak = weak.clone();
+                async move {
+                    loop {
+                        tokio::time::sleep(Duration::from_secs(PEER_CACHE_SAVE_SECS)).await;
+                        let Some(node) = weak.upgrade() else { break };
+                        node.save_peer_cache().await;
+                    }
                 }
-            });
+            }));
         }
         if !fallback.is_empty() {
             let weak = Arc::downgrade(&node);
@@ -690,7 +708,17 @@ impl Node {
         }
         protocol.set_node(&node);
         for (net, receiver) in receivers {
-            tokio::spawn(Arc::clone(&node).receive_loop(net, receiver));
+            // The receiver outlives a panic of the loop: the restarted loop
+            // picks it up again (a tokio mutex is not poisoned by a panic).
+            let receiver = Arc::new(tokio::sync::Mutex::new(receiver));
+            let name = format!("gossip receive loop {net}");
+            let node = Arc::clone(&node);
+            tokio::spawn(async move {
+                supervise(&name, || {
+                    Arc::clone(&node).receive_loop(net.clone(), Arc::clone(&receiver))
+                })
+                .await;
+            });
         }
         info!(
             id = %node.endpoint_id(),
@@ -775,12 +803,13 @@ impl Node {
 
     /// Wait until at least one gossip neighbor is up on `net`.
     pub async fn wait_for_neighbor(&self, net: &str, timeout: Duration) -> Result<()> {
-        let deadline = tokio::time::Instant::now() + timeout;
+        // No deadline when `timeout` does not fit in an `Instant`.
+        let deadline = tokio::time::Instant::now().checked_add(timeout);
         loop {
             if self.neighbor_count(net) > 0 {
                 return Ok(());
             }
-            if tokio::time::Instant::now() >= deadline {
+            if deadline.is_some_and(|d| tokio::time::Instant::now() >= d) {
                 bail!("no peer joined network {net:?} within {timeout:?}");
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
@@ -1016,7 +1045,7 @@ impl Node {
     pub fn opaque_quota(&self) -> Option<u64> {
         self.config
             .storage_max
-            .map(|max| max / 100 * OPAQUE_SHARE_PERCENT)
+            .map(|max| (max / 100).saturating_mul(OPAQUE_SHARE_PERCENT))
     }
 
     pub fn storage_state(&self) -> StorageState {
@@ -1135,7 +1164,7 @@ impl Node {
             out.extend(proto::closest(
                 &hash,
                 &self.known_peers(),
-                self.config.replication * 2,
+                self.config.replication.saturating_mul(2),
             ));
         }
         out.extend(self.neighbors());
@@ -1222,7 +1251,12 @@ impl Node {
         Ok(Some(path))
     }
 
-    async fn receive_loop(self: Arc<Self>, net: String, mut receiver: GossipReceiver) {
+    async fn receive_loop(
+        self: Arc<Self>,
+        net: String,
+        receiver: Arc<tokio::sync::Mutex<GossipReceiver>>,
+    ) {
+        let mut receiver = receiver.lock().await;
         loop {
             match receiver.next().await {
                 Some(Ok(GossipEvent::Received(msg))) => {
@@ -1324,7 +1358,7 @@ impl Node {
         };
         if let AnyEvent::Opaque(r) = &event
             && unknown_version
-            && r.v > UNDERSTOOD_VERSIONS.1 + RELAY_VERSIONS_AHEAD
+            && r.v > UNDERSTOOD_VERSIONS.1.saturating_add(RELAY_VERSIONS_AHEAD)
         {
             bail!(
                 "event version {} is too far ahead of this node ({} understood): not relayed",
@@ -1342,7 +1376,7 @@ impl Node {
                 event.pow_bits()
             );
         }
-        if event.ts() > now_secs() + MAX_CLOCK_SKEW_SECS {
+        if event.ts() > now_secs().saturating_add(MAX_CLOCK_SKEW_SECS) {
             bail!("event timestamp is in the future");
         }
         if self.storage_state() == StorageState::OverCeiling {
@@ -1542,7 +1576,7 @@ impl Node {
         let watermark = self.store.sync_watermark(net)?;
         let (mut after_ts, mut after_id) =
             (watermark.saturating_sub(MAX_CLOCK_SKEW_SECS), String::new());
-        let mut new = 0;
+        let mut new: usize = 0;
         for _ in 0..10_000 {
             let request = Request::Sync {
                 net: net.to_string(),
@@ -1571,7 +1605,7 @@ impl Node {
                     bail!("peer sent an out-of-order sync page");
                 }
                 match self.accept_value(value) {
-                    Ok(Some((_, true))) => new += 1,
+                    Ok(Some((_, true))) => new = new.saturating_add(1),
                     Ok(_) => {}
                     Err(e) => debug!(%id, "sync: rejected event: {e:#}"),
                 }
@@ -1624,9 +1658,9 @@ impl Node {
         let request = GetRequest::builder()
             .root(ChunkRanges::chunks(..chunks))
             .build(hash);
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
+        let started = tokio::time::Instant::now();
         for provider in candidates {
-            let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+            let left = Duration::from_secs(120).saturating_sub(started.elapsed());
             if left.is_zero() {
                 warn!(hash = %blob.hash, "blob fetch timed out");
                 return false;
@@ -1713,8 +1747,10 @@ impl Node {
                 .get(&provider)
                 .map_or(0, |(n, _)| *n)
                 .saturating_add(1);
-            let until = std::time::Instant::now() + provider_backoff(failures);
-            backoff.insert(provider, (failures, until));
+            // `provider_backoff` is at most an hour: `checked_add` cannot fail.
+            if let Some(until) = std::time::Instant::now().checked_add(provider_backoff(failures)) {
+                backoff.insert(provider, (failures, until));
+            }
         }
     }
 
@@ -1773,6 +1809,12 @@ impl Node {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::arithmetic_side_effects
+)]
 mod storage_tests {
     use super::*;
 
@@ -1844,6 +1886,12 @@ mod storage_tests {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::arithmetic_side_effects
+)]
 mod tests {
     use super::*;
 

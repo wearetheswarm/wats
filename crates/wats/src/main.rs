@@ -1273,24 +1273,42 @@ async fn run_node(node: Arc<Node>, run: NodeRun, mut shutdown: Shutdown) -> Resu
     // reports queued with `wats report send` (or all, with report.crashes).
     let reviewed = {
         let node = Arc::clone(&node);
-        tokio::spawn(async move {
-            let mut report_failures = std::collections::HashMap::new();
-            loop {
-                for held in wats::review::expire(&node.config().data_dir, node.config().review_ttl)
-                {
-                    tracing::warn!(held = %held.id, "held post expired unreviewed: {}", held.title_line());
+        tokio::spawn(wats::supervise::supervise(
+            "review and report loop",
+            move || {
+                let node = Arc::clone(&node);
+                async move {
+                    let mut report_failures = std::collections::HashMap::new();
+                    loop {
+                        for held in
+                            wats::review::expire(&node.config().data_dir, node.config().review_ttl)
+                        {
+                            tracing::warn!(held = %held.id, "held post expired unreviewed: {}", held.title_line());
+                        }
+                        wats::review::publish_approved(&node).await;
+                        send_crash_reports(&node, &mut report_failures).await;
+                        tokio::time::sleep(Duration::from_secs(2)).await;
+                    }
                 }
-                wats::review::publish_approved(&node).await;
-                send_crash_reports(&node, &mut report_failures).await;
-                tokio::time::sleep(Duration::from_secs(2)).await;
-            }
-        })
+            },
+        ))
     };
     let (stop_agent, agent_stopped) = tokio::sync::watch::channel(false);
     let agent = agent.map(|config| {
-        let mut stopped = agent_stopped;
-        tokio::spawn(wats::agent::run(Arc::clone(&node), config, async move {
-            let _ = stopped.wait_for(|stop| *stop).await;
+        let node = Arc::clone(&node);
+        tokio::spawn(wats::supervise::supervise("agent runner", move || {
+            let (node, config) = (Arc::clone(&node), config.clone());
+            let mut stopped = agent_stopped.clone();
+            async move {
+                // Not restarted once the node is stopping.
+                if *stopped.borrow() {
+                    return Ok(());
+                }
+                wats::agent::run(node, config, async move {
+                    let _ = stopped.wait_for(|stop| *stop).await;
+                })
+                .await
+            }
         }))
     });
     if !quiet {
@@ -1373,9 +1391,9 @@ async fn run_node(node: Arc<Node>, run: NodeRun, mut shutdown: Shutdown) -> Resu
     if let Some(agent) = agent {
         let _ = stop_agent.send(true);
         match agent.await {
-            Ok(Err(e)) => tracing::warn!("agent runner: {e:#}"),
+            Ok(Some(Err(e))) => tracing::warn!("agent runner: {e:#}"),
             Err(e) => tracing::warn!("agent runner: {e}"),
-            Ok(Ok(())) => {}
+            Ok(Some(Ok(())) | None) => {}
         }
     }
     let _ = std::fs::remove_file(attach::socket_path(&node.config().data_dir));
