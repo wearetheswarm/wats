@@ -155,24 +155,40 @@ pub fn serve(_node: Arc<Node>) -> Result<Sessions> {
     Ok(Sessions::default())
 }
 
+/// Whether an MCP message from the client is part of its session setup
+/// (replayed to a new node after a reconnection).
+fn is_setup(line: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(line).is_ok_and(|v| {
+        matches!(
+            v["method"].as_str(),
+            Some("initialize") | Some("notifications/initialized")
+        )
+    })
+}
+
 /// Attach this process's stdio to the node owning `data_dir`, if one is
 /// running. Returns `Ok(false)` when no node is listening.
+///
+/// When the node goes away (e.g. a background node handing over to a
+/// daemon), the session waits up to 30 s for a node to listen again,
+/// replays the client's `initialize` and `initialized` to it, swallows the
+/// new `initialize` answer, and carries on: the MCP client sees nothing.
 #[cfg(unix)]
 pub async fn attach(
     data_dir: &Path,
     profile: Option<String>,
     file_roots: Vec<PathBuf>,
 ) -> Result<bool> {
+    use tokio::io::AsyncBufReadExt;
     if let Some(profile) = &profile
         && !is_valid_profile(profile)
     {
         bail!("profile name must be 1-64 chars of [a-z0-9_-]");
     }
     let path = socket_path(data_dir);
-    let Ok(stream) = tokio::net::UnixStream::connect(&path).await else {
+    let Ok(mut stream) = tokio::net::UnixStream::connect(&path).await else {
         return Ok(false);
     };
-    let (mut from_node, mut to_node) = stream.into_split();
     let mut handshake = serde_json::to_vec(&Handshake {
         wats_attach: 1,
         profile,
@@ -182,14 +198,61 @@ pub async fn attach(
             .filter(|t| !t.is_empty()),
     })?;
     handshake.push(b'\n');
-    to_node.write_all(&handshake).await?;
-    let mut stdin = tokio::io::stdin();
+    let mut stdin = BufReader::new(tokio::io::stdin()).lines();
     let mut stdout = tokio::io::stdout();
-    tokio::select! {
-        r = tokio::io::copy(&mut stdin, &mut to_node) => { r?; }
-        r = tokio::io::copy(&mut from_node, &mut stdout) => { r?; }
+    let mut setup: Vec<String> = Vec::new();
+    // The id of a replayed `initialize` whose answer the client must not see.
+    let mut swallow: Option<serde_json::Value> = None;
+    loop {
+        let (from_node, mut to_node) = stream.into_split();
+        to_node.write_all(&handshake).await?;
+        for line in &setup {
+            to_node.write_all(line.as_bytes()).await?;
+            to_node.write_all(b"\n").await?;
+        }
+        let mut from_node = BufReader::new(from_node).lines();
+        loop {
+            tokio::select! {
+                line = stdin.next_line() => {
+                    let Some(line) = line? else { return Ok(true) };
+                    if setup.len() < 2 && is_setup(&line) {
+                        setup.push(line.clone());
+                    }
+                    to_node.write_all(line.as_bytes()).await?;
+                    to_node.write_all(b"\n").await?;
+                }
+                line = from_node.next_line() => {
+                    let Some(line) = line? else { break };
+                    if let Some(id) = &swallow
+                        && serde_json::from_str::<serde_json::Value>(&line)
+                            .is_ok_and(|v| &v["id"] == id && v.get("method").is_none())
+                    {
+                        swallow = None;
+                        continue;
+                    }
+                    stdout.write_all(line.as_bytes()).await?;
+                    stdout.write_all(b"\n").await?;
+                    stdout.flush().await?;
+                }
+            }
+        }
+        // The node went away: wait for the next one.
+        let mut next = None;
+        for _ in 0..300 {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            if let Ok(s) = tokio::net::UnixStream::connect(&path).await {
+                next = Some(s);
+                break;
+            }
+        }
+        let Some(s) = next else { return Ok(true) };
+        stream = s;
+        swallow = setup
+            .iter()
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .find(|v| v["method"] == "initialize")
+            .map(|v| v["id"].clone());
     }
-    Ok(true)
 }
 
 #[cfg(not(unix))]

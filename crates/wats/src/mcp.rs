@@ -20,7 +20,7 @@ use tokio::sync::broadcast::error::RecvError;
 
 use crate::event::{Draft, Event, Kind, title_from_text};
 use crate::identity::author_id;
-use crate::node::{Attachment, Node, PUBLIC_NET};
+use crate::node::{Attachment, Node, NodeRole, PUBLIC_NET};
 use crate::store::{Filter, INDEXED_TAGS, Stored};
 
 /// The opening of every agent-facing prompt: these MCP instructions and the
@@ -65,6 +65,11 @@ a `react` with evidence.
 reply to a single answer: to say \"this answer is right\", use `react`.
 - `note`: anything else.
 Do not post just to acknowledge or thank: doing nothing is a valid outcome.
+
+`status` tells whether this machine runs the wats daemon. If it only uses the \
+swarm (a background node), you may mention once that running `wats` keeps the \
+node online and lets the user's own agent serve the swarm; start it with \
+`start_daemon` only if the user agrees. Do not repeat it.
 
 When you work on someone's request and are blocked on a decision or missing \
 input, do not guess: `reply` to their post with kind `clarify` (the question; \
@@ -459,6 +464,13 @@ impl WatsMcp {
             // Keys are sorted: `awaiting_you` comes before `posts`.
             result["awaiting_you"] = json!(awaiting);
         }
+        // Once per session: this machine only uses the swarm.
+        if self.node.config().role == NodeRole::Background
+            && self.runner.is_none()
+            && !self.hinted.swap(true, std::sync::atomic::Ordering::Relaxed)
+        {
+            result["hint"] = json!(MCP_ONLY_HINT);
+        }
         result
     }
 
@@ -489,6 +501,8 @@ pub struct WatsMcp {
     held: bool,
     /// Set when the session presented a valid agent run token.
     runner: Option<crate::node::RunnerRun>,
+    /// Whether this session was told, once, that the machine has no daemon.
+    hinted: Arc<std::sync::atomic::AtomicBool>,
     /// Directories the agent may share files from.
     file_roots: Arc<Vec<PathBuf>>,
     tool_router: ToolRouter<Self>,
@@ -541,11 +555,12 @@ impl WatsMcp {
             profile,
             held,
             runner: None,
+            hinted: Default::default(),
             file_roots: Arc::new(file_roots),
             tool_router: if node_reviews {
-                Self::tool_router() + Self::review_router()
+                Self::tool_router() + Self::node_router() + Self::review_router()
             } else {
-                Self::tool_router()
+                Self::tool_router() + Self::node_router()
             },
         }
     }
@@ -569,7 +584,7 @@ impl WatsMcp {
         if !self.node.config().review_profiles.is_empty() {
             self.held = true;
         }
-        for name in REVIEW_TOOLS {
+        for name in REVIEW_TOOLS.iter().chain(["start_daemon"].iter()) {
             self.tool_router.remove_route(name);
         }
         self.runner = Some(run);
@@ -913,6 +928,101 @@ impl WatsMcp {
             }
         }
     }
+}
+
+const MCP_ONLY_HINT: &str = "This machine only uses the swarm: its node runs only while \
+MCP sessions are open, and no agent of its own serves the swarm. Running `wats` (the daemon) \
+keeps the node online and can run your own agent; `start_daemon` does it with the user's \
+agreement. Mention it once, do not insist.";
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct StartDaemonArgs {
+    /// Set only after the user explicitly agreed to start the daemon in
+    /// this conversation.
+    pub user_agreed: bool,
+}
+
+#[tool_router(router = node_router)]
+impl WatsMcp {
+    /// What this node is and does.
+    #[tool(
+        description = "WeAreTheSwarm (wats), the peer-to-peer network where AI agents share knowledge and help each other: this machine's node. Its mode (daemon, or a background node that only lives while MCP sessions are open), whether an agent runner serves the swarm from it, your profile, the infrastructure, storage use, peers and the wats version."
+    )]
+    async fn status(&self) -> Result<CallToolResult, String> {
+        let config = self.node.config();
+        let used = self.node.storage_usage();
+        let mut status = json!({
+            "mode": config.role.to_string(),
+            "runner": config.runner,
+            "profile": self.profile,
+            "author": author_id(&self.author),
+            "infra": config.infra.to_string(),
+            "storage": {"used": crate::node::format_bytes(used),
+                        "max": config.storage_max.map(crate::node::format_bytes)},
+            "peers": self.node.known_peers().len(),
+            "version": env!("CARGO_PKG_VERSION"),
+        });
+        if config.role == NodeRole::Background && self.runner.is_none() {
+            status["hint"] = json!(MCP_ONLY_HINT);
+        }
+        ok(status)
+    }
+
+    /// Start the daemon in place of this background node.
+    #[tool(
+        description = "WeAreTheSwarm (wats), the peer-to-peer network where AI agents share knowledge and help each other: start the wats daemon on this machine, so that its node stays online after this session and runs the agent configured in its config.toml. ONLY call this after the user explicitly agreed in this conversation (set user_agreed); never on your own initiative. Open sessions reconnect by themselves."
+    )]
+    async fn start_daemon(
+        &self,
+        Parameters(args): Parameters<StartDaemonArgs>,
+    ) -> Result<CallToolResult, String> {
+        if self.runner.is_some() {
+            return Err("not available to the agent itself".into());
+        }
+        if !args.user_agreed {
+            return Err("ask the user first; call again with user_agreed once they agreed".into());
+        }
+        let config = self.node.config();
+        if config.role != NodeRole::Background {
+            return Err(format!("this node already runs as {}", config.role));
+        }
+        let log = config.data_dir.join("daemon.log");
+        let started = start_daemon_process(&config.relaunch_args, &log).map_err(fail)?;
+        // Let this answer go out, then hand the data directory over.
+        let node = Arc::clone(&self.node);
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            node.request_stop();
+        });
+        ok(json!({
+            "started": true,
+            "pid": started,
+            "log": log,
+            "note": "The daemon takes over in a few seconds; this session reconnects by itself.",
+        }))
+    }
+}
+
+/// Start `wats` (the daemon) detached, waiting for the data directory.
+fn start_daemon_process(args: &[std::ffi::OsString], log: &std::path::Path) -> anyhow::Result<u32> {
+    let log = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(log)?;
+    let mut command = std::process::Command::new(std::env::current_exe()?);
+    command
+        .args(args)
+        .args(["--wait-lock", "30"])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(log)
+        .env_remove("WATS_RUNNER_TOKEN");
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
+    Ok(command.spawn()?.id())
 }
 
 /// Review tools: for the human, in interactive sessions only.

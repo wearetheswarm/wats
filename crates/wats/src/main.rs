@@ -73,6 +73,10 @@ struct DaemonArgs {
     /// Exit after this many seconds without attached MCP sessions.
     #[arg(long)]
     idle_exit: Option<u64>,
+    /// Wait this many seconds for the data directory to be free (a daemon
+    /// taking over from a background node).
+    #[arg(long, hide = true)]
+    wait_lock: Option<u64>,
     #[command(flatten)]
     agent: AgentArgs,
 }
@@ -1309,6 +1313,10 @@ async fn run_node(node: Arc<Node>, run: NodeRun, mut shutdown: Shutdown) -> Resu
                 }
             },
             _ = &mut shutdown => break,
+            _ = node.stop_requested() => {
+                tracing::info!("handing the data directory over");
+                break;
+            }
         }
     }
     reviewed.abort();
@@ -1942,7 +1950,10 @@ async fn main() -> Result<()> {
             idle_exit,
             in_process: false,
         }) => return mcp_attached(&cli.node, &data_dir, idle_exit).await,
-        Some(Command::Mcp { .. }) => return run_mcp(Node::start(config).await?, shutdown).await,
+        Some(Command::Mcp { .. }) => {
+            config.role = wats::node::NodeRole::InProcess;
+            return run_mcp(Node::start(config).await?, shutdown).await;
+        }
         Some(Command::Id { host }) => return print_id(&config, &host),
         Some(Command::Config { .. } | Command::Agent { .. } | Command::Setup { .. }) => {
             unreachable!("handled above")
@@ -1980,6 +1991,18 @@ async fn main() -> Result<()> {
             Ok(false) => {}
             Err(e) => tracing::warn!("could not register wats in {name}: {e:#}"),
         }
+    }
+    // A node started by `wats mcp` (it exits when idle) is a background
+    // node; its sessions are told so, and can hand over to a daemon.
+    if daemon.idle_exit.is_some() {
+        config.role = wats::node::NodeRole::Background;
+    }
+    config.runner = agent
+        .as_ref()
+        .map(|a| format!("{} as {}", a.runtime, a.profile));
+    config.relaunch_args = cli.node.to_args(&data_dir);
+    if let Some(secs) = daemon.wait_lock {
+        config.lock_wait = Duration::from_secs(secs);
     }
     if !daemon.quiet {
         print_banner(&config, agent.as_ref());
