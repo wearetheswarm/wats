@@ -143,8 +143,9 @@ for.**
   There is no onion routing or mixing, and private rings (encrypted
   networks) are not implemented yet.
 - **Eviction:** a full node stops accepting, but does not evict (Phase 2).
-- **A single router** today: a single point of failure for bootstrap (not
-  for nodes already connected to each other). Our relay and DNS are single
+- **A single router** today: a single point of failure for a node's first
+  start (not for nodes already connected to each other: a node that has
+  met peers dials them first at its next start, ADR 0008). Our relay and DNS are single
   servers too, with n0's as fallback by default.
 - **Format freeze:** the format is not frozen yet. A second independent
   verifier agrees with Rust on every vector, but disagreements outside the

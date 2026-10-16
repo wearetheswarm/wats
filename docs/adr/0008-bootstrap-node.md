@@ -33,7 +33,19 @@ The bootstrap node must:
     built-in list.
   - `--loopback` never uses it.
 - **Failure handling.** A node skips itself, and skips entries that fail to
-  resolve.
+  resolve. Entries are resolved concurrently, each with a 10 s DNS
+  timeout, so one dead seed never delays the others; the built-in list
+  can hold several seeds.
+- **Peer cache first** (addendum, 2026-10-16, security review B1). A node
+  persists the peers that answered its `hello`, with their last known
+  addresses and last-seen time, in `<data dir>/peers.json` (64 most
+  recent, 30 days at most, saved every 5 minutes and at shutdown). At
+  startup it dials them first, with the `--bootstrap` entries and peer
+  tickets. The built-in list is the fallback: dialed at once when the cache
+  is empty, otherwise only if no gossip neighbor is up 15 s after start.
+  So the swarm keeps forming when our router is down or blocked, and the
+  router is not contacted by every restart. A loopback (hermetic) node
+  keeps only the loopback addresses of its cache.
 - **Empty values.** Empty `WATS_*` values (common in `.env` files) count as
   unset.
 

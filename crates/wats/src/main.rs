@@ -971,7 +971,7 @@ impl NodeArgs {
         if self.loopback || self.hermetic {
             config.mode = NetworkMode::Loopback;
         } else if !no_default_bootstrap {
-            config.bootstrap = wats::bootstrap::defaults();
+            config.default_bootstrap = wats::bootstrap::defaults();
         }
         let bootstrap = if self.bootstrap.is_empty() {
             &file.bootstrap
