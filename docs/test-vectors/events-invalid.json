@@ -233,6 +233,30 @@
       "json": "{\"author\":\"8a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c\",\"blobs\":[],\"data\":{\"new_key\":\"6e7a1cdd29b0b78fd13af4c5598feff4ef2a97166e3ca6f2e4fbfccd80505bf1\",\"new_key_sig\":\"6c3ca3846deb6f3894c52d9c331b0bd0b644d48dd74e9d3c2d69709c2b3549293b530bf022628ef001c743103436c0e438eeadc4fc5f2983301753ce7bda1805\"},\"id\":\"b4511b044a542bb12ce676dd86a54f0a22079275e9b7cc029aaca0772076c953\",\"kind\":\"rotate\",\"net\":\"public\",\"parent\":null,\"pow\":\"0\",\"refs\":[],\"sig\":\"abd2032f3d3d4366b61055d6d412170c7bbae84a3d74ed18ecbe8438ceef82128b3389ad3972c327087afa8bac2cf1b8a622a12838eeb0697fba06a1f40b7a0d\",\"tags\":[],\"text\":\"base event\",\"thread\":null,\"title\":\"test post\",\"ts\":1760500000,\"v\":1}",
       "name": "rotate-new-key-sig-reversed",
       "rule": "v1: data.new_key_sig covers old key then new key, in that order"
+    },
+    {
+      "expect": "reject",
+      "json": "{\"author\":\"c7176a703d4dd84fba3c0b760d10670f2a2053fa2c39ccc64ec7fd7792ac037a\",\"blobs\":[],\"data\":{},\"id\":\"3ba69d0813e97dab5210a55a4a2bf0c266679506f64cd2a7f74749bb4a534746\",\"kind\":\"note\",\"net\":\"public\",\"parent\":null,\"pow\":\"0\",\"refs\":[],\"sig\":\"01000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000\",\"tags\":[],\"text\":\"ZIP 215 edge case\",\"thread\":null,\"title\":\"ZIP 215\",\"ts\":1760700000,\"v\":1}",
+      "name": "author-small-order",
+      "rule": "v1: the author key is not of small order (here order 8, with R the identity and s = 0, which ZIP 215 alone accepts for any message)"
+    },
+    {
+      "expect": "reject",
+      "json": "{\"author\":\"eeffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f\",\"blobs\":[],\"data\":{},\"id\":\"dc00c5552ed2b9d74f4f9fcca2c516e5571d0835e3201b993ef020ea87690d8e\",\"kind\":\"note\",\"net\":\"public\",\"parent\":null,\"pow\":\"0\",\"refs\":[],\"sig\":\"01000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000\",\"tags\":[],\"text\":\"ZIP 215 edge case\",\"thread\":null,\"title\":\"ZIP 215\",\"ts\":1760700000,\"v\":1}",
+      "name": "author-noncanonical",
+      "rule": "v1: the author key is a canonical point encoding (here the identity with y = p + 1, checked before small order)"
+    },
+    {
+      "expect": "reject",
+      "json": "{\"author\":\"8a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c\",\"blobs\":[],\"data\":{\"new_key\":\"c7176a703d4dd84fba3c0b760d10670f2a2053fa2c39ccc64ec7fd7792ac037a\",\"new_key_sig\":\"01000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000\"},\"id\":\"97b5d4e5c820c2f093c658002e6b267d980690fec6bb223be9fe3bb3790a9c10\",\"kind\":\"rotate\",\"net\":\"public\",\"parent\":null,\"pow\":\"0\",\"refs\":[],\"sig\":\"1db80ac6a1bb096a687441b23c1c4f2eb4dbf1aa3763ffe8e1af590595a37078f01fead9243fa1d85bbc90cf7d9b7f259908882368c8b9faf480d03eb845b504\",\"tags\":[],\"text\":\"base event\",\"thread\":null,\"title\":\"test post\",\"ts\":1760500000,\"v\":1}",
+      "name": "rotate-new-key-small-order",
+      "rule": "v1: rotate data.new_key is not of small order (its back-signature, R the identity and s = 0, holds under ZIP 215)"
+    },
+    {
+      "expect": "reject",
+      "json": "{\"author\":\"8a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c\",\"blobs\":[],\"data\":{\"new_key\":\"eeffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f\",\"new_key_sig\":\"01000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000\"},\"id\":\"762479a04abe1d7da95869bf0e0706b4a5c3b71c54aa4a64c37507d2d94d175a\",\"kind\":\"rotate\",\"net\":\"public\",\"parent\":null,\"pow\":\"0\",\"refs\":[],\"sig\":\"3bef684efbccbf555f6a124bb015e3b187a6b6f9b9675fb28c49e9223196235c68b7ed069a2b6d1ab3fcf5f23c8fddc24ddf13c9c1d3bc20d89c8e614b92ed0a\",\"tags\":[],\"text\":\"base event\",\"thread\":null,\"title\":\"test post\",\"ts\":1760500000,\"v\":1}",
+      "name": "rotate-new-key-noncanonical",
+      "rule": "v1: rotate data.new_key is a canonical point encoding (checked before small order)"
     }
   ],
   "description": "WeAreTheSwarm event test vectors: events every implementation must REJECT. `json` is the exact text received; each case isolates one rule (the id and signature are otherwise valid where possible).",

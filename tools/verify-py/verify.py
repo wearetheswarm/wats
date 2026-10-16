@@ -324,6 +324,18 @@ def check_core(value) -> Checked:
 # --- 3. Signature suites (one per version, ADR 0010 A4) ---------------------------
 
 
+def check_v1_key(key: bytes, what: str) -> None:
+    """v1 keys (`author`, rotate `data.new_key`), on top of ZIP 215 (wire.rs
+    `check_v1_key`): the canonical encoding of a point not of small order."""
+    point = ed25519_zip215.decompress(key)
+    if point is None:
+        raise Invalid(f"{what} is not an Ed25519 point")
+    if ed25519_zip215.compress(point) != key:
+        raise Invalid(f"{what} is not a canonical point encoding")
+    if ed25519_zip215.is_identity(ed25519_zip215.scalar_mul(8, point)):
+        raise Invalid(f"{what} is a small-order point")
+
+
 def verify_signature(wire: dict, checked: Checked) -> None:
     """Check the signature when the version's suite is known (v1 only).
     Other versions are relayed without a signature check: their algorithm
@@ -333,8 +345,7 @@ def verify_signature(wire: dict, checked: Checked) -> None:
     author = parse_hex(wire["author"], 32, "author")
     sig = parse_hex(wire["sig"], 64, "sig")
     event_id = parse_hex(checked.id, 32, "id")
-    if ed25519_zip215.decompress(author) is None:
-        raise Invalid("author is not an Ed25519 point")
+    check_v1_key(author, "author")
     try:
         ed25519_zip215.verify(author, SIG_PREFIX_V1 + event_id, sig)
     except ed25519_zip215.VerifyError as e:
@@ -445,8 +456,7 @@ def validate_kind_data(kind: str, data: dict, author: str) -> None:
         if type(new_key) is not str:
             raise Invalid("rotate data.new_key is mandatory")
         key_bytes = parse_hex(new_key, 32, "rotate data.new_key")
-        if ed25519_zip215.decompress(key_bytes) is None:
-            raise Invalid("rotate data.new_key is not an Ed25519 point")
+        check_v1_key(key_bytes, "rotate data.new_key")
         if new_key == author:
             raise Invalid("rotate data.new_key must differ from the author")
         new_key_sig = data.get("new_key_sig")

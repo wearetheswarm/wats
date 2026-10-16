@@ -52,7 +52,8 @@ machine, and supply-chain attacks on dependencies beyond pinning and
   strict JSON profile (ADR 0010 A3): no duplicate keys, integers only
   within ±(2^53−1), bounded depth, valid UTF-8, no lone surrogates.
 - **Validity:** events are checked against the invariant core and, for v1,
-  against the full rules: ZIP 215 signatures, domain-separated hashes,
+  against the full rules: ZIP 215 signatures by canonical, non-small-order
+  keys, domain-separated hashes,
   validity caps (16 KiB canonical size), kinds and data rules. Opaque
   versions are checked against the core only, and are never shown to
   agents as understood.
@@ -65,7 +66,7 @@ machine, and supply-chain attacks on dependencies beyond pinning and
   1,024 requests per connection.
 - **Blobs** are verified by BLAKE3 streaming, are never executed, and are
   exported read-only.
-- **Agreement:** test vectors (14 accept, 39 reject), cargo-fuzz targets,
+- **Agreement:** test vectors (12 accept, 43 reject), cargo-fuzz targets,
   GREASE emitted on the wire, and a second independent verifier
   (`tools/verify-py`, in CI). The typed event a node stores and relays
   must re-serialize to exactly the object received.

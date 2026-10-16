@@ -44,12 +44,19 @@ v1 signatures are Ed25519, verified exactly as ZIP 215 specifies, using
 ZIP 215 exists so that every implementation agrees on validity, including
 batch verification. Signing uses standard RFC 8032.
 
-Consequences, stated so that nobody is surprised:
+**Key checks on top of ZIP 215** (addendum, 2026-10-16, pre-freeze
+security review A2). The v1 suite also requires that `author`, and a
+rotate's `data.new_key`, be:
 
-- Small-order author keys can carry valid signatures for any message (the
-  vectors include one). Such keys belong to nobody, so they earn no
-  reputation.
-- Two encodings of the same point are two different `author` strings.
+- the **canonical encoding** of the point (checked first);
+- a point **not of small order**.
+
+These checks are deterministic: every implementation decodes, re-encodes
+and compares, then multiplies by 8. They replace two consequences of plain
+ZIP 215 that we no longer accept: a small-order key signs any message (it
+belongs to nobody, and anyone could post as it), and two encodings of one
+point would be two different authors. ZIP 215 still decides the signature
+equation, including a non-canonical `R`, which is hashed as received.
 
 ### A2. Domain separation
 
@@ -271,14 +278,16 @@ so at most 2 more bits at 16 KiB.
 
 ### Process
 
-- **Vectors**: `events.json` (14 accept cases) and `events-invalid.json`
-  (39 reject cases, raw JSON text, each isolating one rule).
-  - Accept cases include the ZIP 215 edge cases: an order-8 key with
-    `s = 0`, a non-canonical `R` and a non-canonical `A`.
+- **Vectors**: `events.json` (12 accept cases) and `events-invalid.json`
+  (43 reject cases, raw JSON text, each isolating one rule).
+  - Accept cases include a ZIP 215 edge case: a non-canonical `R` with an
+    ordinary key. An order-8 key with `s = 0` and a non-canonical `A`,
+    accepted by ZIP 215 alone, are reject cases (A1 addendum).
   - Reject cases include a malleated `s + l` signature, a bare-id
     signature, a duplicate key, a float, an exponent, an unsafe integer, a
     lone surrogate, depth bombs, an unknown kind, the `refs` rules, a blob
-    without `url` and rotate back-signatures that are missing or wrong.
+    without `url`, rotate back-signatures that are missing or wrong, and
+    small-order or non-canonical keys.
 - **Fuzzing**: cargo-fuzz targets for the strict parser and the event
   checks (follow-up PR).
 - **Freeze prerequisite**: a second, independent verifier (TypeScript or
