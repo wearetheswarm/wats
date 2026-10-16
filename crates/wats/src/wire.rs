@@ -38,8 +38,13 @@ use crate::event::{
 
 /// Event versions this software understands (indexes, searches, shows).
 pub const UNDERSTOOD_VERSIONS: (u64, u64) = (VERSION as u64, VERSION as u64);
-/// Highest event version this node stores and relays as opaque data.
+/// Highest event version the invariant core accepts.
 pub const MAX_RELAY_VERSION: u64 = 65_535;
+/// Node policy (security review B4): opaque events of a newer version are
+/// stored and relayed only up to `events_max` + this. A version nobody
+/// runs yet is not worth carrying, and the gap bounds what a stranger can
+/// make every node store without understanding it.
+pub const RELAY_VERSIONS_AHEAD: u64 = 2;
 
 /// BLAKE3 key-derivation contexts (ADR 0010, A2). Frozen: they are part of
 /// the invariant core, not of a version.

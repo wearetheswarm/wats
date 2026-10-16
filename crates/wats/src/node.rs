@@ -31,7 +31,7 @@ use crate::event::{BlobRef, Draft, Event, is_safe_blob_name};
 use crate::identity::{DEFAULT_PROFILE, RootSecret, author_id};
 use crate::proto::{self, NodeInfo, Request, Response, WatsProtocol};
 use crate::store::{Inserted, Store};
-use crate::wire::AnyEvent;
+use crate::wire::{AnyEvent, RELAY_VERSIONS_AHEAD, UNDERSTOOD_VERSIONS};
 
 /// The public network id (ring zero, SPEC §2.4). Provisional, ADR 0004.
 pub const PUBLIC_NET: &str = "public";
@@ -303,6 +303,49 @@ pub fn dir_size(dir: &Path) -> u64 {
         .sum()
 }
 
+/// Share of `storage.max` that opaque events may take (B4).
+pub const OPAQUE_SHARE_PERCENT: u64 = 5;
+/// Extra proof of work required from events of a version this node does not
+/// understand (B4): carrying them costs every node, understanding nothing.
+pub const OPAQUE_EXTRA_POW_BITS: u32 = 2;
+
+fn understood(v: u64) -> bool {
+    (UNDERSTOOD_VERSIONS.0..=UNDERSTOOD_VERSIONS.1).contains(&v)
+}
+
+/// Re-validate the opaque events of versions this release understands,
+/// e.g. after an upgrade (B4): valid ones are stored as understood events,
+/// invalid ones dropped. Tombstones stay opaque.
+fn revalidate_opaque(store: &Store) -> Result<()> {
+    let (mut upgraded, mut dropped) = (0usize, 0usize);
+    for (id, wire) in store.opaque_in_versions(UNDERSTOOD_VERSIONS.0..=UNDERSTOOD_VERSIONS.1)? {
+        match AnyEvent::from_value(wire) {
+            Ok(AnyEvent::Known(event)) => {
+                if let Err(e) = store.insert(&event, now_secs()) {
+                    warn!(%id, "stored opaque event not upgraded: {e:#}");
+                    store.delete_opaque(&id)?;
+                    dropped += 1;
+                } else {
+                    upgraded += 1;
+                }
+            }
+            Ok(AnyEvent::Opaque(_)) => {}
+            Err(e) => {
+                warn!(%id, "stored opaque event is invalid once understood, dropped: {e:#}");
+                store.delete_opaque(&id)?;
+                dropped += 1;
+            }
+        }
+    }
+    if upgraded + dropped > 0 {
+        info!(
+            upgraded,
+            dropped, "re-validated opaque events of versions now understood"
+        );
+    }
+    Ok(())
+}
+
 /// How often the peer cache is saved (B1).
 const PEER_CACHE_SAVE_SECS: u64 = 300;
 /// How long peers from the cache have to answer before the built-in
@@ -508,6 +551,7 @@ impl Node {
 
         let blobs = FsStore::load(config.data_dir.join("blobs")).await?;
         let store = Arc::new(Store::open(&config.data_dir.join("events.sqlite"))?);
+        revalidate_opaque(&store)?;
         let gossip = Gossip::builder()
             .max_message_size(GOSSIP_MAX_MESSAGE_BYTES)
             .spawn(endpoint.clone());
@@ -920,6 +964,13 @@ impl Node {
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 
+    /// Bytes opaque events may take: a share of `storage_max` (B4).
+    pub fn opaque_quota(&self) -> Option<u64> {
+        self.config
+            .storage_max
+            .map(|max| max / 100 * OPAQUE_SHARE_PERCENT)
+    }
+
     pub fn storage_state(&self) -> StorageState {
         storage_state(self.storage_usage(), self.config.storage_max)
     }
@@ -1184,7 +1235,27 @@ impl Node {
         if size > crate::event::MAX_EVENT_BYTES {
             bail!("event is {size} bytes canonicalized, above the relay limit");
         }
-        let required = crate::event::required_pow_bits(self.config.min_pow_bits, size);
+        // Opaque events of a version this node does not understand (B4):
+        // relayed only a little ahead of what we understand, with more
+        // proof of work, and within a share of storage.max.
+        let unknown_version = match &event {
+            AnyEvent::Opaque(r) => !understood(r.v),
+            AnyEvent::Known(_) => false,
+        };
+        if let AnyEvent::Opaque(r) = &event
+            && unknown_version
+            && r.v > UNDERSTOOD_VERSIONS.1 + RELAY_VERSIONS_AHEAD
+        {
+            bail!(
+                "event version {} is too far ahead of this node ({} understood): not relayed",
+                r.v,
+                UNDERSTOOD_VERSIONS.1
+            );
+        }
+        let mut required = crate::event::required_pow_bits(self.config.min_pow_bits, size);
+        if unknown_version {
+            required = required.saturating_add(OPAQUE_EXTRA_POW_BITS);
+        }
         if event.pow_bits() < required {
             bail!(
                 "insufficient proof of work: {} bits for {size} bytes, {required} required",
@@ -1197,6 +1268,14 @@ impl Node {
         if self.storage_state() == StorageState::OverCeiling {
             self.log_storage("refusing events from others too");
             bail!("storage full");
+        }
+        if matches!(event, AnyEvent::Opaque(_))
+            && let Some(quota) = self.opaque_quota()
+            && self.store.opaque_bytes().saturating_add(size as u64) > quota
+            && self.store.get_raw(event.id())?.is_none()
+        {
+            self.log_storage("refusing opaque events (their quota is full)");
+            bail!("opaque event quota reached");
         }
         let inserted = match &event {
             AnyEvent::Known(e) => self.store.insert(e, now_secs())?,
@@ -1521,6 +1600,51 @@ impl Node {
 #[cfg(test)]
 mod storage_tests {
     use super::*;
+
+    #[test]
+    fn opaque_events_of_understood_versions_are_revalidated() {
+        use ed25519_dalek::SigningKey;
+        let store = Store::open_in_memory().unwrap();
+        let key = SigningKey::from_bytes(&[3; 32]);
+        // A valid v1 event a previous release stored opaque.
+        let event = crate::event::Draft {
+            net: "public".into(),
+            kind: Some(crate::event::Kind::Note),
+            title: Some("t".into()),
+            text: "now understood".into(),
+            ..Default::default()
+        }
+        .sign(&key, 1, 0)
+        .unwrap();
+        let raw = crate::wire::RawEvent::from_value(serde_json::to_value(&event).unwrap()).unwrap();
+        store.insert_raw(&raw, 1).unwrap();
+        // And one that breaks the v1 rules (an unknown kind).
+        let header = serde_json::json!({"v": 1, "ts": 1, "net": "public", "thread": null,
+            "parent": null, "kind": "poll"});
+        let body = serde_json::json!({"text": "x", "tags": [], "data": {}, "blobs": [],
+            "refs": [], "title": "t"});
+        let bad = crate::wire::sign_value(
+            header.as_object().unwrap().clone(),
+            body.as_object().unwrap().clone(),
+            &key,
+            0,
+        )
+        .unwrap();
+        let bad_raw = crate::wire::RawEvent::from_value(bad).unwrap();
+        store.insert_raw(&bad_raw, 1).unwrap();
+        assert!(store.opaque_bytes() > 0);
+
+        revalidate_opaque(&store).unwrap();
+        assert_eq!(
+            store.get(&event.id).unwrap().unwrap().event.text,
+            "now understood"
+        );
+        assert!(
+            store.get_raw(&bad_raw.id).unwrap().is_none(),
+            "invalid: dropped"
+        );
+        assert_eq!(store.opaque_bytes(), 0);
+    }
 
     #[test]
     fn states_and_formats() {

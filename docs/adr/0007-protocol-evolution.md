@@ -81,6 +81,19 @@ A node never rejects an event for its version alone.
   - shown with an unknown `kind` displayed as `note`.
 - **Version range.** Events below `events_min`, once old versions are
   dropped, are handled the same way.
+- **Opaque policy** (addendum, 2026-10-16, security review B4). Carrying
+  events nobody here understands costs every node, so node policy bounds
+  it, with no format change:
+  - versions are relayed only up to `events_max + 2` (advertised as
+    `relay_max` in `hello`); the core still accepts up to 65,535;
+  - events of a version this node does not understand need 2 more bits of
+    proof of work than an understood event of the same size (tombstones of
+    understood versions do not);
+  - opaque events, tombstones included, may take at most 5% of
+    `storage.max`; beyond, new ones are refused;
+  - at startup, a release that understands more versions re-validates the
+    opaque events of those versions: valid ones become ordinary indexed
+    events, invalid ones are dropped.
 - **Tombstones and full events** (addendum, 2026-10-16, security review
   B8). A tombstone and its full event share an id. A full event this node
   understands always replaces a stored opaque row with the same id, the
