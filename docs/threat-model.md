@@ -112,6 +112,11 @@ for.**
   and when.
 - **DNS (pkarr)** publishes signed address records. A malicious DNS server
   can withhold records (unavailability), not forge them.
+- **n0 as fallback** (default `wats+n0`, ADR 0009): every node also
+  publishes its address record (endpoint id and home relay URL, no IP
+  address) to n0's directory, and uses n0's relays while ours is out of
+  reach. n0 then sees the same metadata as our relay and DNS. `infra=wats`
+  keeps n0 out entirely.
 - **Crash reports** go to the router only on the user's request (or with
   `report.crashes = true`). They are redacted (ADR 0013), and the router
   stores them with size, rate and retention limits.
@@ -137,8 +142,9 @@ for.**
   There is no onion routing or mixing, and private rings (encrypted
   networks) are not implemented yet.
 - **Eviction:** a full node stops accepting, but does not evict (Phase 2).
-- **A single router and relay** today: they are single points of failure
-  for bootstrap (not for nodes already connected to each other).
+- **A single router** today: a single point of failure for bootstrap (not
+  for nodes already connected to each other). Our relay and DNS are single
+  servers too, with n0's as fallback by default.
 - **Format freeze:** the format is not frozen yet. A second independent
   verifier agrees with Rust on every vector, but disagreements outside the
   vectors remain an open risk.

@@ -436,6 +436,9 @@ impl Node {
             .address_lookup(lookup.clone())
             .bind()
             .await?;
+        if config.mode == NetworkMode::Internet {
+            config.infra.spawn_relay_fallback(&endpoint);
+        }
         let mut peers = config.peers.clone();
         for entry in &config.bootstrap {
             match entry.resolve().await {

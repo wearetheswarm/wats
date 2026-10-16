@@ -177,8 +177,9 @@ struct NodeArgs {
         value_parser = clap::builder::BoolishValueParser::new()
     )]
     report_accept: bool,
-    /// Relay and address-lookup services: wats (WeAreTheSwarm's own, the
-    /// default), n0 (Iroh's public ones), wats+n0 (both) or none.
+    /// Relay and address-lookup services: wats+n0 (the default:
+    /// WeAreTheSwarm's own first, Iroh's public ones operated by n0 as
+    /// fallback), wats (ours only), n0 (n0's only) or none.
     #[arg(long, global = true, env = "WATS_INFRA")]
     infra: Option<String>,
     /// Bootstrap node `<endpoint-id>@<host>:<port>` (repeatable); the host

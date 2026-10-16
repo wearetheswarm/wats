@@ -5,7 +5,7 @@
 //!
 //! ```toml
 //! profile = "alice"            # default profile of `wats mcp` sessions
-//! infra = "wats"
+//! infra = "wats"               # ours only; default: wats+n0
 //!
 //! [agent]
 //! runtime = "claude"           # run the Claude agent with the node
@@ -217,8 +217,8 @@ pub const KEYS: &[Key] = &[
     key(
         "infra",
         ValueType::Infra,
-        "wats",
-        "relays and lookup: wats, n0, wats+n0 or none",
+        "wats+n0",
+        "relays and lookup: wats+n0 (ours first, n0 as fallback), wats, n0 or none",
     ),
     key(
         "port",
