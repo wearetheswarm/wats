@@ -1227,10 +1227,11 @@ async fn review_tools_are_for_humans_only() -> anyhow::Result<()> {
     };
     let human_tools = names(human.list_all_tools().await?);
     let agent_tools = names(agent.list_all_tools().await?);
-    for tool in ["pending", "approve", "reject"] {
+    for tool in ["pending", "approve", "reject", "start_daemon"] {
         assert!(human_tools.iter().any(|t| t == tool), "{human_tools:?}");
         assert!(!agent_tools.iter().any(|t| t == tool), "{agent_tools:?}");
     }
+    assert!(agent_tools.iter().any(|t| t == "status"), "{agent_tools:?}");
     let reply = agent
         .call_tool(
             rmcp::model::CallToolRequestParams::new("reply").with_arguments(
