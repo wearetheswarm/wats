@@ -251,6 +251,24 @@ fn valid_vectors() -> Value {
     }
     .sign(&key(1), 1_760_600_600, 0)
     .unwrap();
+    let other_scheme = Draft {
+        net: "public".into(),
+        kind: Some(Kind::Note),
+        title: Some("test post".into()),
+        text: "a blob behind a non-https URL".into(),
+        blobs: vec![BlobRef {
+            hash: blake3::hash(b"dataset").to_hex().to_string(),
+            name: "dataset.csv".into(),
+            size: 7,
+            url: Some(
+                "ipfs://bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi/dataset.csv"
+                    .into(),
+            ),
+        }],
+        ..Draft::default()
+    }
+    .sign(&key(1), 1_760_600_700, 0)
+    .unwrap();
     let greased = Draft {
         net: "public".into(),
         kind: Some(Kind::Note),
@@ -298,6 +316,7 @@ fn valid_vectors() -> Value {
             accept("v2-opaque-other-suite", "The same, with a signature of another suite and size: v1 nodes do not check signatures of versions they do not know.", None, v2_other_suite),
             accept("v1-tombstone", "v1-react-reply with its body dropped: body_hash replaces the body fields; id and sig unchanged, signature still checked.", Some(2), tombstone(&reply)),
             accept("zip215-noncanonical-R", "ZIP 215: an ordinary author key (seed 07); R is a non-canonical encoding of the identity (y = p + 1) and s = k * a, so the cofactored equation holds. R is hashed as received: accepted.", Some(7), with_noncanonical_r(7)),
+            accept("v1-blob-url-other-scheme", "A blob URL with a scheme other than https: valid (nodes only follow https, by policy).", Some(1), serde_json::to_value(&other_scheme).unwrap()),
         ],
     })
 }
@@ -456,6 +475,18 @@ fn invalid_vectors() -> Value {
             reject("grease-too-large", "v1: the GREASE body keys, as one JCS object (keys included), are at most 64 bytes", modified(&|w| {
                 // {"_grease_big":"…"} is 65 bytes.
                 w.insert("_grease_big".into(), json!("g".repeat(47)));
+            })),
+            reject("blob-url-userinfo", "v1: a blob url has no userinfo (no @ in the authority)", modified(&|w| {
+                w.insert("blobs".into(), json!([{"hash": "ab".repeat(32), "name": "f", "size": 1, "url": "https://user@example.com/f"}]));
+            })),
+            reject("blob-url-not-ascii", "v1: a blob url is printable ASCII", modified(&|w| {
+                w.insert("blobs".into(), json!([{"hash": "ab".repeat(32), "name": "f", "size": 1, "url": "https://ex\u{e4}mple.com/f"}]));
+            })),
+            reject("blob-url-no-authority", "v1: a blob url is scheme://authority[path], with a lowercase scheme", modified(&|w| {
+                w.insert("blobs".into(), json!([{"hash": "ab".repeat(32), "name": "f", "size": 1, "url": "urn:sha256:abab"}]));
+            })),
+            reject("blob-url-empty-host", "v1: a blob url has a non-empty host", modified(&|w| {
+                w.insert("blobs".into(), json!([{"hash": "ab".repeat(32), "name": "f", "size": 1, "url": "https:///f"}]));
             })),
         ],
     })

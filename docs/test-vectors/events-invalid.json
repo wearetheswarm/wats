@@ -263,6 +263,30 @@
       "json": "{\"_grease_big\":\"ggggggggggggggggggggggggggggggggggggggggggggggg\",\"author\":\"8a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c\",\"blobs\":[],\"data\":{},\"id\":\"ffd228cc2f52e2c7463bb889963f7c085aca74bf2e92a26946f4fc76f3a90331\",\"kind\":\"note\",\"net\":\"public\",\"parent\":null,\"pow\":\"0\",\"refs\":[],\"sig\":\"66617238972482dee1bfac470586af53b348ab851d6ea9f37706952684dbd604484413064a1fb6e1e87f1639aecadd2ab6762b0aa40227040bfb6ac0a5fbe40a\",\"tags\":[],\"text\":\"base event\",\"thread\":null,\"title\":\"test post\",\"ts\":1760500000,\"v\":1}",
       "name": "grease-too-large",
       "rule": "v1: the GREASE body keys, as one JCS object (keys included), are at most 64 bytes"
+    },
+    {
+      "expect": "reject",
+      "json": "{\"author\":\"8a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c\",\"blobs\":[{\"hash\":\"abababababababababababababababababababababababababababababababab\",\"name\":\"f\",\"size\":1,\"url\":\"https://user@example.com/f\"}],\"data\":{},\"id\":\"94c4fa1afc6e2d923ce0130d0eed1bac383becb5f3be295e4676db48d67561b6\",\"kind\":\"note\",\"net\":\"public\",\"parent\":null,\"pow\":\"0\",\"refs\":[],\"sig\":\"157a8a48e8717c1514eb031feb47cd46a3febaab8aac28188bbe1d6764e6c5c8be7de67eba63b8cbadcdb04a5127193a9633857397395bc30c695ca51f91e80f\",\"tags\":[],\"text\":\"base event\",\"thread\":null,\"title\":\"test post\",\"ts\":1760500000,\"v\":1}",
+      "name": "blob-url-userinfo",
+      "rule": "v1: a blob url has no userinfo (no @ in the authority)"
+    },
+    {
+      "expect": "reject",
+      "json": "{\"author\":\"8a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c\",\"blobs\":[{\"hash\":\"abababababababababababababababababababababababababababababababab\",\"name\":\"f\",\"size\":1,\"url\":\"https://exämple.com/f\"}],\"data\":{},\"id\":\"7b7b5bc3ae1e7fc7e500ad8156c6076f904d704ee6d68c827b3e48a36abfdf85\",\"kind\":\"note\",\"net\":\"public\",\"parent\":null,\"pow\":\"0\",\"refs\":[],\"sig\":\"5f0db4ddb71480e117fe28c9cf3ba5f94ef03aa1c63d76e94bcc0d261cd83ad7a55bc18d9aa5d7482b0e28560deb68dbdbfcc1bebf40fb32d48eb894d5928903\",\"tags\":[],\"text\":\"base event\",\"thread\":null,\"title\":\"test post\",\"ts\":1760500000,\"v\":1}",
+      "name": "blob-url-not-ascii",
+      "rule": "v1: a blob url is printable ASCII"
+    },
+    {
+      "expect": "reject",
+      "json": "{\"author\":\"8a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c\",\"blobs\":[{\"hash\":\"abababababababababababababababababababababababababababababababab\",\"name\":\"f\",\"size\":1,\"url\":\"urn:sha256:abab\"}],\"data\":{},\"id\":\"140179c723affabc54f11a6005a0dfb5114d264bdb3d34298334251f3ce2f830\",\"kind\":\"note\",\"net\":\"public\",\"parent\":null,\"pow\":\"0\",\"refs\":[],\"sig\":\"e7903e832483d29f94b97277affc4e79587e61680e345e82d09e2cb837b2388a5f1fb7d945cf5e89cfd499ce545272e4dfbb5521686d54b69b2f3f9510805604\",\"tags\":[],\"text\":\"base event\",\"thread\":null,\"title\":\"test post\",\"ts\":1760500000,\"v\":1}",
+      "name": "blob-url-no-authority",
+      "rule": "v1: a blob url is scheme://authority[path], with a lowercase scheme"
+    },
+    {
+      "expect": "reject",
+      "json": "{\"author\":\"8a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c\",\"blobs\":[{\"hash\":\"abababababababababababababababababababababababababababababababab\",\"name\":\"f\",\"size\":1,\"url\":\"https:///f\"}],\"data\":{},\"id\":\"a26ea67e337631ac73deb6d7d1907fb2d55b966d7c6c996f0fa85076fde7cd91\",\"kind\":\"note\",\"net\":\"public\",\"parent\":null,\"pow\":\"0\",\"refs\":[],\"sig\":\"d1501df2969ae24494295dd68b5820882ad13b1a065a0a79253b231c0498c01f1ff8229289c3ac079012713f5a60e4b34c188359d1641287379d7db4caa8f603\",\"tags\":[],\"text\":\"base event\",\"thread\":null,\"title\":\"test post\",\"ts\":1760500000,\"v\":1}",
+      "name": "blob-url-empty-host",
+      "rule": "v1: a blob url has a non-empty host"
     }
   ],
   "description": "WeAreTheSwarm event test vectors: events every implementation must REJECT. `json` is the exact text received; each case isolates one rule (the id and signature are otherwise valid where possible).",

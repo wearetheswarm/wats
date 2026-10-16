@@ -103,7 +103,9 @@ order:
 
    Blobs, unknown keys and size:
    - blobs: at most 6, `hash` 64-hex, a safe `name` of at most 64 bytes,
-     `url` always present, null or at most 256 bytes with no whitespace;
+     `url` always present, null or at most 256 bytes of printable ASCII,
+     `scheme://authority[path]` with a lowercase scheme, a non-empty host
+     and no userinfo;
    - unknown body keys other than `_grease*` are invalid, and the
      `_grease*` keys, as one JCS object, are at most 64 bytes;
    - the whole event is at most 16 KiB canonical size.
@@ -119,7 +121,7 @@ informative.
 
 ## Status
 
-- All 56 vectors agree: 12 accept and 44 reject. Every reject case fails
+- All 61 vectors agree: 13 accept and 48 reject. Every reject case fails
   for the reason its `rule` names.
 - Differential testing against the Rust crate (`AnyEvent::from_bytes`) was
   run during development:

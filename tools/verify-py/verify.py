@@ -417,6 +417,29 @@ def check_v1_shape(wire: dict) -> None:
             raise Invalid("blob url must be null or a string")
 
 
+def is_valid_blob_url(url: str) -> bool:
+    """event.rs `is_valid_blob_url`: printable ASCII, `scheme://authority...`,
+    scheme `[a-z][a-z0-9+.-]{0,31}`, a non-empty host, no userinfo."""
+    if not all("\x21" <= c <= "\x7e" for c in url):
+        return False
+    if "://" not in url:
+        return False
+    scheme, rest = url.split("://", 1)
+    scheme_ok = (
+        1 <= len(scheme) <= 32
+        and "a" <= scheme[0] <= "z"
+        and all(c.islower() and c.isascii() or c.isdigit() or c in "+.-" for c in scheme[1:])
+    )
+    ends = [i for i in (rest.find(c) for c in "/?#") if i >= 0]
+    authority = rest[: min(ends)] if ends else rest
+    if authority.startswith("["):
+        end = authority.find("]")
+        host = authority[: end + 1] if end >= 0 else ""
+    else:
+        host = authority.split(":", 1)[0]
+    return scheme_ok and "@" not in authority and host != "" and host != "[]"
+
+
 def is_clean_token(s: str) -> bool:
     return s != "" and not any(c in WHITE_SPACE or is_control(c) for c in s)
 
@@ -553,6 +576,8 @@ def validate_content(wire: dict) -> None:
         url = blob["url"]
         if url is not None and (not is_clean_token(url) or utf8_len(url) > MAX_URL_BYTES):
             raise Invalid(f"blob url must be 1-{MAX_URL_BYTES} bytes with no whitespace")
+        if url is not None and not is_valid_blob_url(url):
+            raise Invalid("blob url must be printable ASCII `scheme://host...` with no userinfo")
     for key in wire:
         if key not in V1_FIELDS and not is_grease(key):
             raise Invalid(f"unknown field {key!r}")

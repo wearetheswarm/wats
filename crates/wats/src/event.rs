@@ -406,6 +406,38 @@ pub fn is_safe_blob_name(name: &str) -> bool {
             .any(|c| c.is_control() || matches!(c, '/' | '\\' | ':' | '\0'))
 }
 
+/// The syntax of a blob URL (pre-freeze security review, A4): printable
+/// ASCII, `scheme "://" authority [path...]`, the scheme
+/// `[a-z][a-z0-9+.-]{0,31}`, a non-empty host and no userinfo (no `@` in
+/// the authority). Any scheme is valid; following only `https` is node
+/// policy, so new schemes need no format change.
+pub fn is_valid_blob_url(url: &str) -> bool {
+    if !url.bytes().all(|b| b.is_ascii_graphic()) {
+        return false;
+    }
+    let Some((scheme, rest)) = url.split_once("://") else {
+        return false;
+    };
+    let mut chars = scheme.bytes();
+    let scheme_ok = chars.next().is_some_and(|b| b.is_ascii_lowercase())
+        && scheme.len() <= 32
+        && chars.all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b"+.-".contains(&b));
+    // The authority ends at the first `/`, `?` or `#`.
+    let authority = rest
+        .find(['/', '?', '#'])
+        .map_or(rest, |end| rest.get(..end).unwrap_or(rest));
+    // The host is a bracketed IP literal, or what precedes an optional
+    // `:port`.
+    let host = if authority.starts_with('[') {
+        authority
+            .find(']')
+            .map_or("", |end| authority.get(..=end).unwrap_or(""))
+    } else {
+        authority.split(':').next().unwrap_or("")
+    };
+    scheme_ok && !authority.contains('@') && !host.is_empty() && host != "[]"
+}
+
 /// Network ids: 1..=64 chars of `[a-z0-9._:-]`.
 pub fn is_valid_net(net: &str) -> bool {
     !net.is_empty()
@@ -617,6 +649,15 @@ fn validate_content(draft: &Draft, kind: &Kind, author: &str) -> Result<(), Even
             return Err(invalid(format!(
                 "blob url must be 1-{MAX_URL_BYTES} bytes with no whitespace"
             )));
+        }
+        if blob
+            .url
+            .as_deref()
+            .is_some_and(|url| !is_valid_blob_url(url))
+        {
+            return Err(invalid(
+                "blob url must be printable ASCII `scheme://host...` with no userinfo",
+            ));
         }
     }
     if let Some(key) = grease.keys().find(|k| !wire::is_grease(k)) {
@@ -1259,6 +1300,34 @@ mod tests {
             estimate >= real && estimate < real + 64,
             "{estimate} vs {real}"
         );
+    }
+
+    #[test]
+    fn blob_url_syntax() {
+        for url in [
+            "https://example.com/report.pdf",
+            "https://a",
+            "ipfs://bafy/x",
+            "https://[::1]:8/x",
+            "s3+x.y-z://bucket/k",
+            "https://x.com?q=@a",
+        ] {
+            assert!(is_valid_blob_url(url), "{url}");
+        }
+        for url in [
+            "https://user@x.com/",
+            "https://:80/",
+            "https:/x",
+            "HTTPS://x",
+            "https://x y",
+            "https://\u{e9}.com",
+            "https://[]/",
+            "https://[::1/x",
+            "urn:sha256:ab",
+            "1https://x",
+        ] {
+            assert!(!is_valid_blob_url(url), "{url}");
+        }
     }
 
     #[test]
