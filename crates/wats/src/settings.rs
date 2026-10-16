@@ -43,7 +43,17 @@ pub struct Settings {
     #[serde(default)]
     pub storage: StorageSettings,
     #[serde(default)]
+    pub report: ReportSettings,
+    #[serde(default)]
     pub agent: AgentSettings,
+}
+
+#[derive(Debug, Default, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReportSettings {
+    pub crashes: Option<bool>,
+    pub collector: Option<String>,
+    pub accept: Option<bool>,
 }
 
 #[derive(Debug, Default, Clone, Deserialize)]
@@ -216,6 +226,24 @@ pub const KEYS: &[Key] = &[
         ValueType::Size,
         "10G",
         "disk budget of the data dir: no blob fetches beyond, no events beyond +10%",
+    ),
+    key(
+        "report.crashes",
+        ValueType::Bool,
+        "false",
+        "send crash reports without asking (wats report send otherwise)",
+    ),
+    key(
+        "report.collector",
+        ValueType::Text,
+        "our router",
+        "node id that collects crash reports",
+    ),
+    key(
+        "report.accept",
+        ValueType::Bool,
+        "false",
+        "collect crash reports from other nodes (our router only)",
     ),
     key(
         "agent.runtime",

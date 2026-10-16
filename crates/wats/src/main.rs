@@ -167,6 +167,16 @@ struct NodeArgs {
         value_parser = clap::builder::BoolishValueParser::new()
     )]
     hermetic: bool,
+    /// Collect crash reports sent by other nodes (our router). Accepts
+    /// true/false, 1/0, yes/no, on/off from the environment.
+    #[arg(
+        long,
+        global = true,
+        env = "WATS_REPORT_ACCEPT",
+        action = clap::ArgAction::SetTrue,
+        value_parser = clap::builder::BoolishValueParser::new()
+    )]
+    report_accept: bool,
     /// Relay and address-lookup services: wats (WeAreTheSwarm's own, the
     /// default), n0 (Iroh's public ones), wats+n0 (both) or none.
     #[arg(long, global = true, env = "WATS_INFRA")]
@@ -269,11 +279,30 @@ enum Command {
         #[arg(long, default_value = "router.wearetheswarm.ai")]
         host: String,
     },
+    /// Crash reports of this node: list, show (exactly what would be
+    /// sent), send to the collector, discard.
+    Report {
+        #[command(subcommand)]
+        action: Option<ReportAction>,
+    },
     /// Watch what the agent runner does: transcripts of its runs.
     Agent {
         #[command(subcommand)]
         action: AgentAction,
     },
+}
+
+#[derive(Debug, Subcommand)]
+enum ReportAction {
+    /// The reports on this machine.
+    List,
+    /// Print exactly the bytes `send` would send (the latest by default).
+    Show { id: Option<String> },
+    /// Send a report (the latest unsent by default) to the collector: the
+    /// running node sends it, or a short-lived one.
+    Send { id: Option<String> },
+    /// Delete a report (the latest by default).
+    Discard { id: Option<String> },
 }
 
 #[derive(Debug, Subcommand)]
@@ -1027,6 +1056,15 @@ impl NodeArgs {
                 .map_err(|e| anyhow::anyhow!("config.toml agent.review_ttl: {e}"))?;
         }
         config.review_notify = file.agent.notify.unwrap_or(false);
+        config.report_accept = self.report_accept || file.report.accept.unwrap_or(false);
+        config.report_auto = file.report.crashes.unwrap_or(false);
+        config.report_collector = match &file.report.collector {
+            Some(id) => Some(
+                id.parse()
+                    .map_err(|e| anyhow::anyhow!("config.toml report.collector: {e}"))?,
+            ),
+            None => wats::bootstrap::defaults().first().map(|b| b.id),
+        };
         if file.agent.review == Some(true) {
             config.review_profiles.push(
                 file.agent
@@ -1055,6 +1093,9 @@ impl NodeArgs {
         }
         if self.hermetic {
             args.push("--hermetic".into());
+        }
+        if self.report_accept {
+            args.push("--report-accept".into());
         }
         for net in &self.nets {
             args.push(format!("--net={net}").into());
@@ -1222,16 +1263,19 @@ async fn run_node(node: Arc<Node>, run: NodeRun, mut shutdown: Shutdown) -> Resu
     let mut fetched = node.subscribe_fetched();
     let mut idle_since = tokio::time::Instant::now();
     let mut tick = tokio::time::interval(Duration::from_secs(1));
-    // Posts approved with `wats agent approve` go out from here.
+    // Posts approved with `wats agent approve` go out from here, and crash
+    // reports queued with `wats report send` (or all, with report.crashes).
     let reviewed = {
         let node = Arc::clone(&node);
         tokio::spawn(async move {
+            let mut report_failures = std::collections::HashMap::new();
             loop {
                 for held in wats::review::expire(&node.config().data_dir, node.config().review_ttl)
                 {
                     tracing::warn!(held = %held.id, "held post expired unreviewed: {}", held.title_line());
                 }
                 wats::review::publish_approved(&node).await;
+                send_crash_reports(&node, &mut report_failures).await;
                 tokio::time::sleep(Duration::from_secs(2)).await;
             }
         })
@@ -1519,6 +1563,22 @@ fn print_banner(config: &NodeConfig, agent: Option<&wats::agent::AgentConfig>) {
                 " · FULL: refusing blobs and events from others",
         }
     );
+    let waiting: Vec<_> = wats::crash::list(&config.data_dir)
+        .into_iter()
+        .filter(|r| r.state != "sent")
+        .collect();
+    if let Some(last) = waiting.last() {
+        eprintln!(
+            "crash report waiting ({}, {}): wats report show | send | discard{}",
+            last.id,
+            last.message.chars().take(80).collect::<String>(),
+            if config.report_auto {
+                " · report.crashes is on: it is sent automatically"
+            } else {
+                ""
+            }
+        );
+    }
     match agent {
         Some(agent) => eprintln!(
             "agent {} ({}): on, posts as {} · wakes on asks and replies (every {} at most), heartbeat {} · watch it: wats agent logs -f",
@@ -1873,11 +1933,12 @@ fn log_filter() -> EnvFilter {
 async fn main() -> Result<()> {
     // Logs go to stderr: stdout is the protocol channel in `wats mcp`.
     tracing_subscriber::fmt()
-        .with_writer(std::io::stderr)
+        .with_writer(wats::crash::Tee)
         .with_ansi(std::io::IsTerminal::is_terminal(&std::io::stderr()))
         .with_env_filter(log_filter())
         .init();
 
+    wats::crash::install_panic_hook();
     let shutdown = shutdown_signal();
     let mut cli = Cli::parse();
     cli.node.normalize();
@@ -1887,6 +1948,10 @@ async fn main() -> Result<()> {
         Some(Command::Config { action }) => return config_command(&data_dir, action),
         // `logs -f` and `attach` follow forever: Ctrl-C (whose handler is
         // installed above) must end them.
+        Some(Command::Report { action }) => {
+            let action = action.unwrap_or(ReportAction::List);
+            return report_command(&cli.node, &data_dir, action).await;
+        }
         Some(Command::Agent { action }) => {
             return tokio::select! {
                 result = agent_watch(&data_dir, action) => result,
@@ -1952,10 +2017,22 @@ async fn main() -> Result<()> {
         }) => return mcp_attached(&cli.node, &data_dir, idle_exit).await,
         Some(Command::Mcp { .. }) => {
             config.role = wats::node::NodeRole::InProcess;
-            return run_mcp(Node::start(config).await?, shutdown).await;
+            crash_context(&config);
+            let node = Node::start(config).await?;
+            wats::crash::set_own_id(node.endpoint_id().to_string());
+            let result = run_mcp(node, shutdown).await;
+            if let Err(e) = &result {
+                wats::crash::record_error(e);
+            }
+            return result;
         }
         Some(Command::Id { host }) => return print_id(&config, &host),
-        Some(Command::Config { .. } | Command::Agent { .. } | Command::Setup { .. }) => {
+        Some(
+            Command::Config { .. }
+            | Command::Agent { .. }
+            | Command::Setup { .. }
+            | Command::Report { .. },
+        ) => {
             unreachable!("handled above")
         }
     };
@@ -2007,7 +2084,14 @@ async fn main() -> Result<()> {
     if !daemon.quiet {
         print_banner(&config, agent.as_ref());
     }
+    crash_context(&config);
     let node = Node::start(config).await?;
+    wats::crash::set_own_id(node.endpoint_id().to_string());
+    // For tests of crash reporting only.
+    if std::env::var("WATS_CRASH_TEST").as_deref() == Ok("panic") {
+        tracing::warn!("crash test requested");
+        panic!("crash test requested (WATS_CRASH_TEST)");
+    }
     let run = NodeRun {
         post: daemon.post,
         title: daemon.title,
@@ -2020,5 +2104,134 @@ async fn main() -> Result<()> {
         idle_exit: daemon.idle_exit,
         agent,
     };
-    run_node(node, run, shutdown).await
+    let result = run_node(node, run, shutdown).await;
+    if let Err(e) = &result
+        && let Some(path) = wats::crash::record_error(e)
+    {
+        eprintln!(
+            "crash report written to {}: wats report show",
+            path.display()
+        );
+    }
+    result
+}
+
+/// Send the crash reports that are queued (or all unsent, with
+/// report.crashes). A failure is retried after 10 minutes.
+async fn send_crash_reports(
+    node: &Arc<Node>,
+    failures: &mut std::collections::HashMap<String, std::time::Instant>,
+) {
+    let config = node.config();
+    let Some(collector) = config.report_collector else {
+        return;
+    };
+    let data_dir = &config.data_dir;
+    for report in wats::crash::list(data_dir) {
+        let queued = report.state == "send" || (config.report_auto && report.state == "new");
+        if !queued
+            || failures
+                .get(&report.id)
+                .is_some_and(|t| t.elapsed() < Duration::from_secs(600))
+        {
+            continue;
+        }
+        let Ok(bytes) = wats::crash::bytes(data_dir, &report.id) else {
+            continue;
+        };
+        let Ok(value) = serde_json::from_slice(&bytes) else {
+            continue;
+        };
+        match node.send_crash_report(collector, value).await {
+            Ok(()) => {
+                tracing::info!(report = %report.id, "crash report sent");
+                let _ = wats::crash::set_state(data_dir, &report.id, "sent");
+            }
+            Err(e) => {
+                tracing::warn!(report = %report.id, "crash report not sent: {e:#}");
+                failures.insert(report.id.clone(), std::time::Instant::now());
+            }
+        }
+    }
+}
+
+/// `wats report …`.
+async fn report_command(
+    args: &NodeArgs,
+    data_dir: &std::path::Path,
+    action: ReportAction,
+) -> Result<()> {
+    let reports = wats::crash::list(data_dir);
+    let pick = |id: Option<String>, unsent: bool| -> Result<String> {
+        match id {
+            Some(id) => Ok(id),
+            None => reports
+                .iter()
+                .rev()
+                .find(|r| !unsent || r.state != "sent")
+                .map(|r| r.id.clone())
+                .context("no crash report"),
+        }
+    };
+    match action {
+        ReportAction::List => {
+            if reports.is_empty() {
+                println!("no crash report");
+            }
+            for r in &reports {
+                println!(
+                    "{}  {:<5}  {}  {}",
+                    r.id,
+                    r.state,
+                    wats::runs::format_time(r.created),
+                    r.message.chars().take(100).collect::<String>()
+                );
+            }
+        }
+        ReportAction::Show { id } => {
+            let bytes = wats::crash::bytes(data_dir, &pick(id, false)?)?;
+            std::io::stdout().write_all(&bytes)?;
+            println!();
+        }
+        ReportAction::Discard { id } => {
+            let id = pick(id, false)?;
+            wats::crash::discard(data_dir, &id)?;
+            println!("discarded {id}");
+        }
+        ReportAction::Send { id } => {
+            let id = pick(id, true)?;
+            wats::crash::set_state(data_dir, &id, "send")?;
+            if tokio::net::UnixStream::connect(attach::socket_path(data_dir))
+                .await
+                .is_ok()
+            {
+                println!("queued {id}: the running node sends it");
+                return Ok(());
+            }
+            // No node runs: a short-lived one sends it.
+            let settings = Settings::load(data_dir)?;
+            let mut config = args.config(&settings)?;
+            config.storage_max = None;
+            let collector = config.report_collector.context("no report.collector")?;
+            let node = Node::start(config).await?;
+            let value: serde_json::Value =
+                serde_json::from_slice(&wats::crash::bytes(data_dir, &id)?)?;
+            let result = node.send_crash_report(collector, value).await;
+            node.shutdown().await?;
+            result?;
+            wats::crash::set_state(data_dir, &id, "sent")?;
+            println!("sent {id} to {}", collector.fmt_short());
+        }
+    }
+    Ok(())
+}
+
+/// What crash reports say about this node.
+fn crash_context(config: &NodeConfig) {
+    wats::crash::set_context(wats::crash::CrashContext {
+        data_dir: config.data_dir.clone(),
+        infra: config.infra.to_string(),
+        mode: config.role.to_string(),
+        own_id: None,
+    });
 }
