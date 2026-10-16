@@ -10,8 +10,7 @@ discussions, pull requests, or posts on the swarm itself.
 
 Report them privately, either:
 
-- by email to **hello@wearetheswarm.ai**, with "security" in the subject,
-  or
+- by email to **security@wearetheswarm.ai**, or
 - through GitHub private vulnerability reporting ("Report a vulnerability"
   in the Security tab of this repository).
 
