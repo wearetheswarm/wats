@@ -70,6 +70,11 @@ pub const MAX_SAFE_INTEGER: u64 = (1 << 53) - 1;
 /// `announce` (`data.next_key_commitment`, ADR 0010, A5).
 pub const NEXT_KEY_CONTEXT: &str = "wats next key commitment v1";
 
+/// Domain prefix of the back-signature a `rotate` carries in
+/// `data.new_key_sig`: the new key signs
+/// `"wats/rotate/v1" || old key || new key` (raw 32-byte keys).
+pub const ROTATE_SIG_PREFIX: &[u8] = b"wats/rotate/v1";
+
 /// Why a post exists (SPEC §2.3, ADR 0010 A7). The core vocabulary is
 /// closed and frozen; extensions are namespaced `x.<domain>.<name>`.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -365,6 +370,23 @@ pub fn next_key_commitment(next_key: &[u8; 32]) -> String {
     hex::encode(blake3::derive_key(NEXT_KEY_CONTEXT, next_key))
 }
 
+/// The message the new key signs in a `rotate`: proof that its holder
+/// accepts the hand-over from `old_key`.
+pub fn rotate_message(old_key: &[u8; 32], new_key: &[u8; 32]) -> Vec<u8> {
+    let mut msg = Vec::with_capacity(ROTATE_SIG_PREFIX.len() + 64);
+    msg.extend_from_slice(ROTATE_SIG_PREFIX);
+    msg.extend_from_slice(old_key);
+    msg.extend_from_slice(new_key);
+    msg
+}
+
+/// `data.new_key_sig` of a `rotate` from `old_key` to `new_key` (hex).
+pub fn rotate_signature(new_key: &SigningKey, old_key: &[u8; 32]) -> String {
+    use ed25519_dalek::Signer;
+    let msg = rotate_message(old_key, new_key.verifying_key().as_bytes());
+    hex::encode(new_key.sign(&msg).to_bytes())
+}
+
 fn is_clean_token(s: &str) -> bool {
     !s.is_empty() && !s.chars().any(|c| c.is_whitespace() || c.is_control())
 }
@@ -428,11 +450,30 @@ fn validate_kind_data(
                 .and_then(Value::as_str)
                 .ok_or_else(|| invalid("rotate data.new_key is mandatory"))?;
             let bytes = parse_hex::<32>(new_key, "rotate data.new_key")?;
-            ed25519_zebra::VerificationKey::try_from(bytes)
+            let verifier = ed25519_zebra::VerificationKey::try_from(bytes)
                 .map_err(|_| invalid("rotate data.new_key is not an Ed25519 point"))?;
             if new_key == author {
                 return Err(invalid("rotate data.new_key must differ from the author"));
             }
+            // The new key's holder must agree to the hand-over, or anyone
+            // could rotate to a key they do not hold (ZIP 215, as events).
+            let sig = data
+                .get("new_key_sig")
+                .and_then(Value::as_str)
+                .ok_or_else(|| invalid("rotate data.new_key_sig is mandatory"))?;
+            let sig = parse_hex::<64>(sig, "rotate data.new_key_sig")?;
+            let old = parse_hex::<32>(author, "author")?;
+            verifier
+                .verify(
+                    &ed25519_zebra::Signature::from_bytes(&sig),
+                    &rotate_message(&old, &bytes),
+                )
+                .map_err(|_| {
+                    invalid(
+                        "rotate data.new_key_sig must be the new key's signature over \
+                         \"wats/rotate/v1\" || old key || new key",
+                    )
+                })?;
             optional_hex32(data, "next_key_commitment", kind)?;
         }
         Kind::Clarify => {
@@ -981,16 +1022,27 @@ mod tests {
         let rotate = Draft {
             kind: Some(Kind::Rotate),
             text: "Rotating to my next key.".into(),
-            data: obj(json!({"new_key": hex::encode(next.as_bytes())})),
+            data: obj(json!({
+                "new_key": hex::encode(next.as_bytes()),
+                "new_key_sig": rotate_signature(&key(2), key(1).verifying_key().as_bytes()),
+            })),
             ..draft()
         }
         .sign(&key(1), 1, 0)
         .unwrap();
         rotate.verify().unwrap();
+        let old = key(1).verifying_key();
         for data in [
             json!({}),
             json!({"new_key": "zz"}),
-            json!({"new_key": hex::encode(key(1).verifying_key().as_bytes())}),
+            json!({"new_key": hex::encode(old.as_bytes())}),
+            // No back-signature, one by the wrong key, one over the
+            // reversed hand-over.
+            json!({"new_key": hex::encode(next.as_bytes())}),
+            json!({"new_key": hex::encode(next.as_bytes()),
+                   "new_key_sig": rotate_signature(&key(3), old.as_bytes())}),
+            json!({"new_key": hex::encode(next.as_bytes()),
+                   "new_key_sig": rotate_signature(&key(1), next.as_bytes())}),
         ] {
             assert!(
                 Draft {

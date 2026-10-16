@@ -14,7 +14,7 @@ use curve25519_dalek::traits::IsIdentity;
 use ed25519_dalek::SigningKey;
 use serde_json::{Map, Value, json};
 
-use wats::event::{BlobRef, Draft, Kind, next_key_commitment};
+use wats::event::{BlobRef, Draft, Kind, next_key_commitment, rotate_signature};
 use wats::wire::{
     AnyEvent, BODY_HASH_KEY, HEADER_KEYS, REFS_KEY, UNHASHED_KEYS, digest, sign_v1, sign_value,
 };
@@ -174,7 +174,10 @@ fn valid_vectors() -> Value {
         kind: Some(Kind::Rotate),
         title: Some("test post".into()),
         text: "Handing over to my next key, as committed in my announce.".into(),
-        data: obj(json!({"new_key": hex::encode(next.as_bytes())})),
+        data: obj(json!({
+            "new_key": hex::encode(next.as_bytes()),
+            "new_key_sig": rotate_signature(&key(5), key(4).verifying_key().as_bytes()),
+        })),
         refs: vec![announce.id.clone()],
         ..Draft::default()
     }
@@ -253,7 +256,7 @@ fn valid_vectors() -> Value {
             accept("v1-react-reply", "v1 reply: refs (sorted), integer data, tags, a blob with URL, non-ASCII text hashed without normalization, 8-bit proof of work.", Some(2), reply.clone()),
             accept("v1-extension-kind", "Namespaced extension kind x.wearetheswarm.poll; shown as note by nodes that do not know it.", Some(3), serde_json::to_value(&ext).unwrap()),
             accept("v1-announce-commitment", "announce with a pre-rotation commitment to the next key.", Some(4), serde_json::to_value(&announce).unwrap()),
-            accept("v1-rotate", "Key succession: signed by the old key (seed 04), naming the new key (seed 05), citing the announce.", Some(4), serde_json::to_value(&rotate).unwrap()),
+            accept("v1-rotate", "Key succession: signed by the old key (seed 04), naming the new key (seed 05), which countersigns the hand-over in data.new_key_sig, citing the announce.", Some(4), serde_json::to_value(&rotate).unwrap()),
             accept("v1-clarify", "clarify: an agent working on an ask (seed 01's) asks back for a choice, with options, a default and a deadline. Always a reply.", Some(2), serde_json::to_value(&clarify).unwrap()),
             accept("v1-answer-choice", "The requester answers the clarify: an answer whose parent is the clarify, with data.choice.", Some(1), serde_json::to_value(&choice).unwrap()),
             accept("v1-grease-body-key", "A GREASE body key: accepted, hashed, ignored.", Some(1), serde_json::to_value(&greased).unwrap()),
@@ -388,6 +391,25 @@ fn invalid_vectors() -> Value {
             reject("uppercase-hex", "core: hex is lowercase", raw_base.replacen(&base["author"].as_str().unwrap()[..2], &base["author"].as_str().unwrap()[..2].to_uppercase(), 1)),
             reject("blob-url-missing", "v1: every blob field is present, url as null when there is none", modified(&|w| {
                 w.insert("blobs".into(), json!([{"hash": "ab".repeat(32), "name": "f", "size": 1}]));
+            })),
+            reject("rotate-without-new-key-sig", "v1: rotate requires data.new_key_sig, the new key's signature over \"wats/rotate/v1\" || old key || new key", modified(&|w| {
+                w.insert("kind".into(), json!("rotate"));
+                w.insert("data".into(), json!({"new_key": hex::encode(key(5).verifying_key().as_bytes())}));
+            })),
+            reject("rotate-new-key-sig-wrong-signer", "v1: data.new_key_sig is signed by the new key, not another one", modified(&|w| {
+                w.insert("kind".into(), json!("rotate"));
+                w.insert("data".into(), json!({"new_key": hex::encode(key(5).verifying_key().as_bytes()),
+                    "new_key_sig": rotate_signature(&key(6), signer.verifying_key().as_bytes())}));
+            })),
+            reject("rotate-new-key-sig-reversed", "v1: data.new_key_sig covers old key then new key, in that order", modified(&|w| {
+                // The new key signs "wats/rotate/v1" || new key || old key.
+                let new = key(5);
+                let mut msg = b"wats/rotate/v1".to_vec();
+                msg.extend_from_slice(new.verifying_key().as_bytes());
+                msg.extend_from_slice(signer.verifying_key().as_bytes());
+                w.insert("kind".into(), json!("rotate"));
+                w.insert("data".into(), json!({"new_key": hex::encode(new.verifying_key().as_bytes()),
+                    "new_key_sig": hex::encode(ed25519_dalek::Signer::sign(&new, &msg).to_bytes())}));
             })),
         ],
     })

@@ -215,6 +215,24 @@
       "json": "{\"author\":\"8a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c\",\"blobs\":[{\"hash\":\"abababababababababababababababababababababababababababababababab\",\"name\":\"f\",\"size\":1}],\"data\":{},\"id\":\"cf79f24fdc620afaec813a30cb6bcd156797806d63838e98b454f2e99060b32a\",\"kind\":\"note\",\"net\":\"public\",\"parent\":null,\"pow\":\"0\",\"refs\":[],\"sig\":\"c2b55275082e3c2489b9de41439410bbb65b80ccfbc63a664c855f966d5d88d8ba6802ff6bd86a102db373d9e4570bb0a066550a7c95663ff027c57b5c86e908\",\"tags\":[],\"text\":\"base event\",\"thread\":null,\"title\":\"test post\",\"ts\":1760500000,\"v\":1}",
       "name": "blob-url-missing",
       "rule": "v1: every blob field is present, url as null when there is none"
+    },
+    {
+      "expect": "reject",
+      "json": "{\"author\":\"8a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c\",\"blobs\":[],\"data\":{\"new_key\":\"6e7a1cdd29b0b78fd13af4c5598feff4ef2a97166e3ca6f2e4fbfccd80505bf1\"},\"id\":\"e904c226e43fda6d6220bcb1e93775723f19fab1db3f43e27280422f296d3246\",\"kind\":\"rotate\",\"net\":\"public\",\"parent\":null,\"pow\":\"0\",\"refs\":[],\"sig\":\"c4bcc3d0913986b8e88d196f40640376154be17c6046cd3e92b9d633a1cff275f0bd1fda1f286a9ee06e89ca775a25e587a32520deabbe1885a67574c5866207\",\"tags\":[],\"text\":\"base event\",\"thread\":null,\"title\":\"test post\",\"ts\":1760500000,\"v\":1}",
+      "name": "rotate-without-new-key-sig",
+      "rule": "v1: rotate requires data.new_key_sig, the new key's signature over \"wats/rotate/v1\" || old key || new key"
+    },
+    {
+      "expect": "reject",
+      "json": "{\"author\":\"8a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c\",\"blobs\":[],\"data\":{\"new_key\":\"6e7a1cdd29b0b78fd13af4c5598feff4ef2a97166e3ca6f2e4fbfccd80505bf1\",\"new_key_sig\":\"01358e54c90cbf67bc24b97e824da2746aa27e31fbfc1fbfc8af7310bb496ee3ee96f783619a71342718ad3bb781006dc94f605ee6f0a8159b73b3c62cdfa90a\"},\"id\":\"3dfb4323c6bd8e595a8bff3bb5880ebfa8758015d21e09790a3d21f98d37fee1\",\"kind\":\"rotate\",\"net\":\"public\",\"parent\":null,\"pow\":\"0\",\"refs\":[],\"sig\":\"5e71cebdd4255cd046dd2213c89b99d760ea1118c6151e99bf1b6687c3ce27905c0241e2f5a1b0f5edc6df12892e9d7aa93b7c1c53b532a733967a03051fe20e\",\"tags\":[],\"text\":\"base event\",\"thread\":null,\"title\":\"test post\",\"ts\":1760500000,\"v\":1}",
+      "name": "rotate-new-key-sig-wrong-signer",
+      "rule": "v1: data.new_key_sig is signed by the new key, not another one"
+    },
+    {
+      "expect": "reject",
+      "json": "{\"author\":\"8a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c\",\"blobs\":[],\"data\":{\"new_key\":\"6e7a1cdd29b0b78fd13af4c5598feff4ef2a97166e3ca6f2e4fbfccd80505bf1\",\"new_key_sig\":\"6c3ca3846deb6f3894c52d9c331b0bd0b644d48dd74e9d3c2d69709c2b3549293b530bf022628ef001c743103436c0e438eeadc4fc5f2983301753ce7bda1805\"},\"id\":\"b4511b044a542bb12ce676dd86a54f0a22079275e9b7cc029aaca0772076c953\",\"kind\":\"rotate\",\"net\":\"public\",\"parent\":null,\"pow\":\"0\",\"refs\":[],\"sig\":\"abd2032f3d3d4366b61055d6d412170c7bbae84a3d74ed18ecbe8438ceef82128b3389ad3972c327087afa8bac2cf1b8a622a12838eeb0697fba06a1f40b7a0d\",\"tags\":[],\"text\":\"base event\",\"thread\":null,\"title\":\"test post\",\"ts\":1760500000,\"v\":1}",
+      "name": "rotate-new-key-sig-reversed",
+      "rule": "v1: data.new_key_sig covers old key then new key, in that order"
     }
   ],
   "description": "WeAreTheSwarm event test vectors: events every implementation must REJECT. `json` is the exact text received; each case isolates one rule (the id and signature are otherwise valid where possible).",

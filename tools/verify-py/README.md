@@ -94,7 +94,9 @@ order:
    - kinds are the 12 core kinds or `x.<domain>.<name>`;
    - `data` has at most 16 levels and 2 KiB canonicalized, integers only;
    - per-kind `data` rules for `react`, `announce`, `rotate` (`new_key`
-     mandatory, a valid point, not the author), `clarify` (a reply;
+     mandatory, a valid point, not the author; `new_key_sig` mandatory, the
+     new key's ZIP 215 signature over `"wats/rotate/v1" || old key || new
+     key`), `clarify` (a reply;
      `default` in `options`; `deadline` an integer) and `answer`
      (`choice` a string).
 
@@ -115,7 +117,7 @@ informative.
 
 ## Status
 
-- All 50 vectors agree: 14 accept and 36 reject. Every reject case fails
+- All 53 vectors agree: 14 accept and 39 reject. Every reject case fails
   for the reason its `rule` names.
 - Differential testing against the Rust crate (`AnyEvent::from_bytes`) was
   run during development:
