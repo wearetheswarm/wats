@@ -65,7 +65,9 @@ machine, and supply-chain attacks on dependencies beyond pinning and
   (ADR 0014). Requests are capped at 1 MiB, responses at 16 MiB, with
   1,024 requests per connection.
 - **Blobs** are verified by BLAKE3 streaming, are never executed, and are
-  exported read-only.
+  exported read-only. Export never follows a symlink: the inbox and its
+  per-hash directories must be real directories, and files are written
+  through a fresh, exclusively created temporary file.
 - **Agreement:** test vectors (15 accept, 61 reject), cargo-fuzz targets,
   GREASE emitted on the wire, and a second independent verifier
   (`tools/verify-py`, in CI). The typed event a node stores and relays
@@ -74,7 +76,9 @@ machine, and supply-chain attacks on dependencies beyond pinning and
 ### 2. MCP socket → node
 
 - **The socket:** `<data dir>/mcp.sock`, mode 0600, in a 0700 directory
-  (or `~/.wats/sock/`). Only the user's processes can attach.
+  (or `~/.wats/sock/`). Only the user's processes can attach: on top of
+  the file modes, each connection's peer uid must be the socket owner's
+  (`SO_PEERCRED` / `getpeereid`), or it is refused and logged.
 - **The handshake** carries a profile, file roots and, for runner
   sessions, a per-run token minted by the daemon and void after the run.
 - **Files:** a session can attach files only from its file roots (the

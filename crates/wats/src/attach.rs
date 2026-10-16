@@ -97,12 +97,31 @@ pub fn serve(node: Arc<Node>) -> Result<Sessions> {
     let listener = tokio::net::UnixListener::bind(&path)
         .with_context(|| format!("bind {}", path.display()))?;
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
+    // Only processes of the user who owns the socket may attach (security
+    // review D), on top of the 0600 socket in a 0700 directory.
+    let owner = {
+        use std::os::unix::fs::MetadataExt;
+        std::fs::metadata(&path)?.uid()
+    };
     let sessions = Sessions::default();
     let counter = sessions.clone();
     tokio::spawn(async move {
         loop {
             let stream = match listener.accept().await {
-                Ok((stream, _)) => stream,
+                Ok((stream, _)) => match stream.peer_cred() {
+                    Ok(cred) if cred.uid() == owner => stream,
+                    Ok(cred) => {
+                        warn!(
+                            uid = cred.uid(),
+                            "mcp socket: refused a connection from another user"
+                        );
+                        continue;
+                    }
+                    Err(e) => {
+                        warn!("mcp socket: refused a connection without peer credentials: {e}");
+                        continue;
+                    }
+                },
                 Err(e) => {
                     warn!("mcp socket: {e}");
                     break;
