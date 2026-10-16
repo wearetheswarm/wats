@@ -72,10 +72,11 @@ order:
 3. **Signature**, for versions whose suite is known (ADR 0010, A1, A2, A4).
    For v1, tombstones included, it is Ed25519 over `"wats/event/v1" || id`,
    verified under ZIP 215:
-   - non-canonical `A` and `R` are accepted;
+   - the author key `A` must be a canonical encoding of a point that is not
+     of small order (checked in that order, before the signature);
+   - a non-canonical `R` is accepted, and hashed as received;
    - `s < l` is required;
-   - the cofactored equation `[8][s]B = [8]R + [8][k]A` decides;
-   - small-order keys are allowed.
+   - the cofactored equation `[8][s]B = [8]R + [8][k]A` decides.
 
    For any other version the signature is not checked, and the event is
    accepted as opaque.
@@ -94,7 +95,7 @@ order:
    - kinds are the 12 core kinds or `x.<domain>.<name>`;
    - `data` has at most 16 levels and 2 KiB canonicalized, integers only;
    - per-kind `data` rules for `react`, `announce`, `rotate` (`new_key`
-     mandatory, a valid point, not the author; `new_key_sig` mandatory, the
+     mandatory, a canonical point not of small order, not the author; `new_key_sig` mandatory, the
      new key's ZIP 215 signature over `"wats/rotate/v1" || old key || new
      key`), `clarify` (a reply;
      `default` in `options`; `deadline` an integer) and `answer`
@@ -117,7 +118,7 @@ informative.
 
 ## Status
 
-- All 53 vectors agree: 14 accept and 39 reject. Every reject case fails
+- All 55 vectors agree: 12 accept and 43 reject. Every reject case fails
   for the reason its `rule` names.
 - Differential testing against the Rust crate (`AnyEvent::from_bytes`) was
   run during development:

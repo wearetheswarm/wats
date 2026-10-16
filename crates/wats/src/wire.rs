@@ -369,11 +369,30 @@ impl RawEvent {
 /// accepted, `s` must be canonical (< l), and the cofactored equation
 /// `[8][s]B = [8]R + [8][k]A` decides.
 pub fn verify_v1(author: &[u8; 32], id: &[u8; 32], sig: &[u8; 64]) -> Result<(), EventError> {
+    check_v1_key(author, "author")?;
     let key = ed25519_zebra::VerificationKey::try_from(*author)
         .map_err(|_| invalid("author is not an Ed25519 point"))?;
     let signature = ed25519_zebra::Signature::from_bytes(sig);
     key.verify(&signature, &v1_message(id))
         .map_err(|_| EventError::BadSignature)
+}
+
+/// v1 keys (`author`, rotate `data.new_key`) are checked on top of ZIP 215
+/// (pre-freeze security review, A2): the canonical encoding of a point
+/// that is not of small order. A small-order key signs anything, and two
+/// encodings of one point would be two authors. ZIP 215 still decides the
+/// signature equation, non-canonical `R` included.
+pub fn check_v1_key(key: &[u8; 32], what: &str) -> Result<(), EventError> {
+    let point = curve25519_dalek::edwards::CompressedEdwardsY(*key)
+        .decompress()
+        .ok_or_else(|| invalid(format!("{what} is not an Ed25519 point")))?;
+    if point.compress().to_bytes() != *key {
+        return Err(invalid(format!("{what} is not a canonical point encoding")));
+    }
+    if point.is_small_order() {
+        return Err(invalid(format!("{what} is a small-order point")));
+    }
+    Ok(())
 }
 
 /// The message signed by v1 events.

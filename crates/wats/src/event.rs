@@ -450,6 +450,7 @@ fn validate_kind_data(
                 .and_then(Value::as_str)
                 .ok_or_else(|| invalid("rotate data.new_key is mandatory"))?;
             let bytes = parse_hex::<32>(new_key, "rotate data.new_key")?;
+            wire::check_v1_key(&bytes, "rotate data.new_key")?;
             let verifier = ed25519_zebra::VerificationKey::try_from(bytes)
                 .map_err(|_| invalid("rotate data.new_key is not an Ed25519 point"))?;
             if new_key == author {

@@ -17,6 +17,7 @@ use serde_json::{Map, Value, json};
 use wats::event::{BlobRef, Draft, Kind, next_key_commitment, rotate_signature};
 use wats::wire::{
     AnyEvent, BODY_HASH_KEY, HEADER_KEYS, REFS_KEY, UNHASHED_KEYS, digest, sign_v1, sign_value,
+    v1_message,
 };
 
 const DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../docs/test-vectors");
@@ -95,6 +96,39 @@ fn with_raw_signature(author: &str, r: &str) -> Value {
     let id = digest(&wire).unwrap().id;
     wire.insert("id".into(), json!(hex::encode(id)));
     wire.insert("sig".into(), json!(format!("{r}{}", "00".repeat(32))));
+    Value::Object(wire)
+}
+
+/// A v1 event by an ordinary key whose signature uses a non-canonical
+/// encoding of the identity as R: with s = k * a, `[8][s]B = [8]R +
+/// [8][k]A` holds, k being hashed over R as received.
+fn with_noncanonical_r(seed: u8) -> Value {
+    use curve25519_dalek::scalar::Scalar;
+    use sha2::{Digest, Sha512};
+    let signer = key(seed);
+    let author = signer.verifying_key().to_bytes();
+    let mut wire = obj(json!({
+        "v": 1, "author": hex::encode(author), "ts": 1_760_700_000u64, "net": "public",
+        "thread": null, "parent": null, "refs": [], "kind": "note", "tags": [],
+        "title": "ZIP 215", "text": "ZIP 215 edge case", "data": {}, "blobs": [], "pow": "0",
+    }));
+    let id = digest(&wire).unwrap().id;
+    let r = hex::decode(IDENTITY_NONCANONICAL).unwrap();
+    let hash: [u8; 64] = Sha512::new()
+        .chain_update(&r)
+        .chain_update(author)
+        .chain_update(v1_message(&id))
+        .finalize()
+        .into();
+    let s = Scalar::from_bytes_mod_order_wide(&hash) * signer.to_scalar();
+    wire.insert("id".into(), json!(hex::encode(id)));
+    wire.insert(
+        "sig".into(),
+        json!(format!(
+            "{IDENTITY_NONCANONICAL}{}",
+            hex::encode(s.to_bytes())
+        )),
+    );
     Value::Object(wire)
 }
 
@@ -263,9 +297,7 @@ fn valid_vectors() -> Value {
             accept("v2-opaque", "A future version: unknown kind, header extension ext (with a GREASE key), unknown body field, refs. Relayed by v1 nodes without understanding it.", Some(3), v2),
             accept("v2-opaque-other-suite", "The same, with a signature of another suite and size: v1 nodes do not check signatures of versions they do not know.", None, v2_other_suite),
             accept("v1-tombstone", "v1-react-reply with its body dropped: body_hash replaces the body fields; id and sig unchanged, signature still checked.", Some(2), tombstone(&reply)),
-            accept("zip215-order8-key", "ZIP 215: author is a point of order 8, R is the identity and s = 0. The cofactored equation holds for any message; the cofactorless one does not.", None, with_raw_signature(ORDER_8, IDENTITY)),
-            accept("zip215-noncanonical-R", "ZIP 215: R is a non-canonical encoding of the identity (y = p + 1): accepted.", None, with_raw_signature(ORDER_8, IDENTITY_NONCANONICAL)),
-            accept("zip215-noncanonical-A", "ZIP 215: the author key is a non-canonical encoding of the identity: accepted (and distinct from the canonical encoding as an author).", None, with_raw_signature(IDENTITY_NONCANONICAL, IDENTITY)),
+            accept("zip215-noncanonical-R", "ZIP 215: an ordinary author key (seed 07); R is a non-canonical encoding of the identity (y = p + 1) and s = k * a, so the cofactored equation holds. R is hashed as received: accepted.", Some(7), with_noncanonical_r(7)),
         ],
     })
 }
@@ -410,6 +442,16 @@ fn invalid_vectors() -> Value {
                 w.insert("kind".into(), json!("rotate"));
                 w.insert("data".into(), json!({"new_key": hex::encode(new.verifying_key().as_bytes()),
                     "new_key_sig": hex::encode(ed25519_dalek::Signer::sign(&new, &msg).to_bytes())}));
+            })),
+            reject("author-small-order", "v1: the author key is not of small order (here order 8, with R the identity and s = 0, which ZIP 215 alone accepts for any message)", serde_json::to_string(&with_raw_signature(ORDER_8, IDENTITY)).unwrap()),
+            reject("author-noncanonical", "v1: the author key is a canonical point encoding (here the identity with y = p + 1, checked before small order)", serde_json::to_string(&with_raw_signature(IDENTITY_NONCANONICAL, IDENTITY)).unwrap()),
+            reject("rotate-new-key-small-order", "v1: rotate data.new_key is not of small order (its back-signature, R the identity and s = 0, holds under ZIP 215)", modified(&|w| {
+                w.insert("kind".into(), json!("rotate"));
+                w.insert("data".into(), json!({"new_key": ORDER_8, "new_key_sig": format!("{IDENTITY}{}", "00".repeat(32))}));
+            })),
+            reject("rotate-new-key-noncanonical", "v1: rotate data.new_key is a canonical point encoding (checked before small order)", modified(&|w| {
+                w.insert("kind".into(), json!("rotate"));
+                w.insert("data".into(), json!({"new_key": IDENTITY_NONCANONICAL, "new_key_sig": format!("{IDENTITY}{}", "00".repeat(32))}));
             })),
         ],
     })
