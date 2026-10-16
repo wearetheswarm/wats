@@ -400,7 +400,7 @@ fn invalid_vectors() -> Value {
             reject("tags-too-many", "v1 validity cap: at most 32 tags", modified(&|w| {
                 w.insert("tags".into(), json!((0..33).map(|i| format!("t{i}")).collect::<Vec<_>>()));
             })),
-            reject("event-too-large", "v1 validity cap: 16 KiB canonical size (only unbounded GREASE body keys can exceed it once every field is within its cap)", modified(&|w| {
+            reject("event-too-large", "v1 validity cap: 16 KiB canonical size. Since GREASE body keys are capped too (see grease-too-large), no event within the field caps reaches it: this case is now rejected by the GREASE cap first, and the size cap is a backstop", modified(&|w| {
                 w.insert("text".into(), json!("x".repeat(6 * 1024)));
                 w.insert("_grease_big".into(), json!("g".repeat(11 * 1024)));
             })),
@@ -452,6 +452,10 @@ fn invalid_vectors() -> Value {
             reject("rotate-new-key-noncanonical", "v1: rotate data.new_key is a canonical point encoding (checked before small order)", modified(&|w| {
                 w.insert("kind".into(), json!("rotate"));
                 w.insert("data".into(), json!({"new_key": IDENTITY_NONCANONICAL, "new_key_sig": format!("{IDENTITY}{}", "00".repeat(32))}));
+            })),
+            reject("grease-too-large", "v1: the GREASE body keys, as one JCS object (keys included), are at most 64 bytes", modified(&|w| {
+                // {"_grease_big":"…"} is 65 bytes.
+                w.insert("_grease_big".into(), json!("g".repeat(47)));
             })),
         ],
     })

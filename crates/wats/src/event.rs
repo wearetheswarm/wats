@@ -55,6 +55,10 @@ pub const MAX_BLOB_NAME_BYTES: usize = 64;
 /// Maximum size of a blob URL, in bytes: permanent pointers only (no
 /// presigned URLs).
 pub const MAX_URL_BYTES: usize = 256;
+/// Maximum size of the GREASE body keys of an event (pre-freeze security
+/// review, A6): the length of JCS of the object they form, keys included,
+/// so that they cannot carry a hidden payload.
+pub const MAX_GREASE_BYTES: usize = 64;
 /// Maximum size of an event: a validity cap on its canonical size, the
 /// length of JCS(whole wire object).
 pub const MAX_EVENT_BYTES: usize = 16 * 1024;
@@ -617,6 +621,11 @@ fn validate_content(draft: &Draft, kind: &Kind, author: &str) -> Result<(), Even
     }
     if let Some(key) = grease.keys().find(|k| !wire::is_grease(k)) {
         return Err(invalid(format!("unknown field {key:?}")));
+    }
+    if !grease.is_empty() && jcs(grease)?.len() > MAX_GREASE_BYTES {
+        return Err(invalid(format!(
+            "GREASE body keys exceed {MAX_GREASE_BYTES} bytes canonicalized"
+        )));
     }
     Ok(())
 }
@@ -1229,13 +1238,19 @@ mod tests {
         let event = full.clone().sign(&key(1), MAX_SAFE_INTEGER, 0).unwrap();
         let size = event.canonical_size().unwrap();
         assert!(size <= MAX_EVENT_BYTES, "worst case {size} bytes");
-        // Only unbounded GREASE can push it over the total cap.
+        // GREASE at its cap too: nothing can reach the total cap any more.
+        let greased = Draft {
+            grease: obj(json!({"_grease_big": "g".repeat(MAX_GREASE_BYTES - 18)})),
+            ..full.clone()
+        };
+        let event = greased.sign(&key(1), MAX_SAFE_INTEGER, 0).unwrap();
+        assert!(event.canonical_size().unwrap() <= MAX_EVENT_BYTES);
         let over = Draft {
-            grease: obj(json!({"_grease_big": "g".repeat(2048)})),
+            grease: obj(json!({"_grease_big": "g".repeat(MAX_GREASE_BYTES - 17)})),
             ..full
         };
         let err = over.sign(&key(1), 1, 0).unwrap_err().to_string();
-        assert!(err.contains("canonicalized"), "{err}");
+        assert!(err.contains("GREASE"), "{err}");
         // The estimate bounds the real size.
         let small = draft();
         let estimate = small.estimated_size(&key(1)).unwrap();
