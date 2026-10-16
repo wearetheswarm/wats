@@ -798,7 +798,14 @@ impl WatsMcp {
                 None => Err(format!("post {} is not known to this node", args.id)),
             };
         };
-        let root = post.event.thread_root().to_string();
+        // A grafted reply (B9) is shown on its own, not in the thread it
+        // claims: its parent is in another thread or network.
+        let orphan = store.is_grafted(&post.event).map_err(fail)?;
+        let root = if orphan {
+            post.event.id.clone()
+        } else {
+            post.event.thread_root().to_string()
+        };
         let thread = store.thread(&root, 500).map_err(fail)?;
         let opaque = store.thread_opaque(&root, 100).map_err(fail)?;
         let mut view =
@@ -861,6 +868,12 @@ impl WatsMcp {
             "thread_total": thread_total,
             "thread": summaries,
         });
+        if orphan {
+            result["orphan"] = json!(
+                "this reply claims a thread its parent is not in: shown alone, \
+                 not part of that thread"
+            );
+        }
         if !opaque.is_empty() {
             result["unreadable"] = opaque
                 .into_iter()

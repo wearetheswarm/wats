@@ -60,6 +60,10 @@ machine, and supply-chain attacks on dependencies beyond pinning and
 - **Policy:** proof of work grows with size, there is a clock-skew limit,
   network membership is checked, and `storage.max` (ADR 0012) bounds the
   disk.
+- **Threads:** a reply cannot be grafted into another thread. It is
+  refused when its parent is known and sits in another thread or network;
+  if it arrived before its parent, readers show it alone, as an orphan,
+  never inside the thread it claims.
 - **Limits:** per-peer token buckets on `hello`, `sync`, `replicate` and
   `crash_report`, and a cap on concurrent blob fetches per peer
   (ADR 0014). Requests are capped at 1 MiB, responses at 16 MiB, with
