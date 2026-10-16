@@ -427,6 +427,65 @@
       "id": "a7c09b9dac93e36f03937316c48b73051a12d3ba8daec97834122006f4e61a0e",
       "name": "v1-blob-url-other-scheme",
       "secret_key": "0101010101010101010101010101010101010101010101010101010101010101"
+    },
+    {
+      "body_hash": "78f904c60626b2e8ea3bad0d5b5aaa3b90ce015199df49a1b72163867e52ca73",
+      "body_jcs": "{\"blobs\":[],\"data\":{},\"tags\":[\"lang:français\",\"topic:日本語のテキスト\"],\"text\":\"tags with non-ASCII labels\",\"title\":\"test post\"}",
+      "description": "Tags with non-ASCII labels: each label an IDNA2008 U-label in NFC, of one script (lang:français is Latin; the Japanese label mixes Han, Hiragana and Katakana, which UTS #39 highly restrictive allows).",
+      "event": {
+        "author": "8a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c",
+        "blobs": [],
+        "data": {},
+        "id": "862a252ca5175cbfd3a950fd01c0381fe31b379a5b66564d5ee7b2b802c668da",
+        "kind": "note",
+        "net": "public",
+        "parent": null,
+        "pow": "0",
+        "refs": [],
+        "sig": "ba896aac18892ae44478fc597a20a099c7e0e3a1270da164c0960e57a9c2fa99a0d6635dfa6ee97ba9b45cbb3cffaf30e4914b03d512fa5c0eae0cb7e83bd006",
+        "tags": [
+          "lang:français",
+          "topic:日本語のテキスト"
+        ],
+        "text": "tags with non-ASCII labels",
+        "thread": null,
+        "title": "test post",
+        "ts": 1760600800,
+        "v": 1
+      },
+      "expect": "accept",
+      "header_jcs": "{\"author\":\"8a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c\",\"body\":\"78f904c60626b2e8ea3bad0d5b5aaa3b90ce015199df49a1b72163867e52ca73\",\"kind\":\"note\",\"net\":\"public\",\"parent\":null,\"pow\":\"0\",\"refs\":[],\"thread\":null,\"ts\":1760600800,\"v\":1}",
+      "id": "862a252ca5175cbfd3a950fd01c0381fe31b379a5b66564d5ee7b2b802c668da",
+      "name": "v1-tags-non-ascii",
+      "secret_key": "0101010101010101010101010101010101010101010101010101010101010101"
+    },
+    {
+      "body_hash": "4500e924e7d796b8dcb3875ebe272a744d20a2823694a5451da6910fcb683afe",
+      "body_jcs": "{\"blobs\":[],\"data\":{},\"tags\":[],\"text\":\"U+A7DB LATIN SMALL LETTER LAMBDA is new in Unicode 16.0\",\"title\":\"Lambda ꟛ\"}",
+      "description": "A title with U+A7DB LATIN SMALL LETTER LAMBDA, assigned in Unicode 16.0 (unassigned in 15.1): v1 pins Unicode 16.0.0.",
+      "event": {
+        "author": "8a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c",
+        "blobs": [],
+        "data": {},
+        "id": "576d20d65eef602a15676dd70d5952d5d8f98649ca1d3ad5dfe42fa9381950cb",
+        "kind": "note",
+        "net": "public",
+        "parent": null,
+        "pow": "0",
+        "refs": [],
+        "sig": "e927a12e5dcfb4524f8b6792bdfda8dea902112b3af82c09e114d6ba78254c822c589213a2afdae57db4a0be67c913b9fdab071d0f6bc7d19a7accbc02ea1901",
+        "tags": [],
+        "text": "U+A7DB LATIN SMALL LETTER LAMBDA is new in Unicode 16.0",
+        "thread": null,
+        "title": "Lambda ꟛ",
+        "ts": 1760600900,
+        "v": 1
+      },
+      "expect": "accept",
+      "header_jcs": "{\"author\":\"8a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c\",\"body\":\"4500e924e7d796b8dcb3875ebe272a744d20a2823694a5451da6910fcb683afe\",\"kind\":\"note\",\"net\":\"public\",\"parent\":null,\"pow\":\"0\",\"refs\":[],\"thread\":null,\"ts\":1760600900,\"v\":1}",
+      "id": "576d20d65eef602a15676dd70d5952d5d8f98649ca1d3ad5dfe42fa9381950cb",
+      "name": "v1-title-unicode-16",
+      "secret_key": "0101010101010101010101010101010101010101010101010101010101010101"
     }
   ],
   "description": "WeAreTheSwarm event test vectors: events every implementation must ACCEPT. Rules: ADR 0007 and ADR 0010 (strict JSON input, header/body split, body = BLAKE3-derive_key(\"wats event body v1\", JCS(body)), id = BLAKE3-derive_key(\"wats event id v1\", JCS(header)), v1 signature = Ed25519 over \"wats/event/v1\" || id verified under ZIP 215). secret_key is the 32-byte Ed25519 seed, when there is one.",

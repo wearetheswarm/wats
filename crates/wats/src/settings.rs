@@ -156,6 +156,10 @@ impl Settings {
                 .parse::<crate::access::Access>()
                 .with_context(|| format!("{}: agent.access", path.display()))?;
         }
+        for cap in &settings.agent.caps {
+            crate::agent::check_cap(cap)
+                .map_err(|why| anyhow::anyhow!("{}: agent.caps: {why}", path.display()))?;
+        }
         if let Some(dir) = &settings.agent.workdir {
             settings.agent.workdir = Some(data_dir.join(dir));
         }
@@ -553,12 +557,19 @@ fn toml_value(key: &Key, raw: &str) -> Result<toml_edit::Value> {
             "false" | "0" | "no" | "off" => false.into(),
             _ => return Err(invalid(format!("{raw:?} is not true or false"))),
         },
-        ValueType::List => raw
-            .split(',')
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .collect::<toml_edit::Array>()
-            .into(),
+        ValueType::List => {
+            let items: Vec<&str> = raw
+                .split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .collect();
+            if key.name == "agent.caps" {
+                for cap in &items {
+                    crate::agent::check_cap(cap).map_err(invalid)?;
+                }
+            }
+            items.into_iter().collect::<toml_edit::Array>().into()
+        }
     })
 }
 
@@ -750,6 +761,19 @@ mod tests {
         assert!(file.set("profile", "Bad Name").is_err());
         assert!(file.set("agent.colour", "x").is_err());
         assert!(file.set("port", "70000").is_err());
+        // Capabilities become announce tags: checked when set.
+        file.set("agent.caps", "pdf, Code-Review, lang:fran\u{e7}ais")
+            .unwrap();
+        for bad in [
+            "rust lang",
+            "pdf,c++",
+            "lang:franc\u{327}ais",
+            "p\u{430}ypal",
+            "a::b",
+        ] {
+            let err = file.set("agent.caps", bad).unwrap_err().to_string();
+            assert!(err.contains("not a valid capability"), "{bad}: {err}");
+        }
         file.save().unwrap();
         let text = std::fs::read_to_string(dir.path().join(FILE_NAME)).unwrap();
         assert!(text.contains("# mine") && text.contains("# keep"), "{text}");

@@ -66,7 +66,7 @@ machine, and supply-chain attacks on dependencies beyond pinning and
   1,024 requests per connection.
 - **Blobs** are verified by BLAKE3 streaming, are never executed, and are
   exported read-only.
-- **Agreement:** test vectors (13 accept, 48 reject), cargo-fuzz targets,
+- **Agreement:** test vectors (15 accept, 61 reject), cargo-fuzz targets,
   GREASE emitted on the wire, and a second independent verifier
   (`tools/verify-py`, in CI). The typed event a node stores and relays
   must re-serialize to exactly the object received.

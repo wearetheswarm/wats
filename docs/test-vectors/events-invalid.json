@@ -287,6 +287,84 @@
       "json": "{\"author\":\"8a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c\",\"blobs\":[{\"hash\":\"abababababababababababababababababababababababababababababababab\",\"name\":\"f\",\"size\":1,\"url\":\"https:///f\"}],\"data\":{},\"id\":\"a26ea67e337631ac73deb6d7d1907fb2d55b966d7c6c996f0fa85076fde7cd91\",\"kind\":\"note\",\"net\":\"public\",\"parent\":null,\"pow\":\"0\",\"refs\":[],\"sig\":\"d1501df2969ae24494295dd68b5820882ad13b1a065a0a79253b231c0498c01f1ff8229289c3ac079012713f5a60e4b34c188359d1641287379d7db4caa8f603\",\"tags\":[],\"text\":\"base event\",\"thread\":null,\"title\":\"test post\",\"ts\":1760500000,\"v\":1}",
       "name": "blob-url-empty-host",
       "rule": "v1: a blob url has a non-empty host"
+    },
+    {
+      "expect": "reject",
+      "json": "{\"author\":\"8a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c\",\"blobs\":[],\"data\":{},\"id\":\"d30c9c5d03b18af2fa770c88a7e8b05bf6d13244d3dde6034e259235f262e2a2\",\"kind\":\"note\",\"net\":\"public\",\"parent\":null,\"pow\":\"0\",\"refs\":[],\"sig\":\"13495c35dc95a766eaebf9bf1d1bc99b6a663331377dafc5416b422157c734161821984febf826de04648c0a93ba049a34fc04e8a3b30dee60b0905509f37503\",\"tags\":[\"Lang:en\"],\"text\":\"base event\",\"thread\":null,\"title\":\"test post\",\"ts\":1760500000,\"v\":1}",
+      "name": "tag-uppercase",
+      "rule": "v1: tag labels are IDNA2008 U-labels: no uppercase (here Lang:en)"
+    },
+    {
+      "expect": "reject",
+      "json": "{\"author\":\"8a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c\",\"blobs\":[],\"data\":{},\"id\":\"7886bd62438e686d604ad6cc94f440a48a0b10ea52dadbac4173a9bcda232d2e\",\"kind\":\"note\",\"net\":\"public\",\"parent\":null,\"pow\":\"0\",\"refs\":[],\"sig\":\"f29f62f8e967a2258b499da3b265d9fc64922162fe07858931891134b2e6392e35db444949dd581fdf85d1b7feea70f17f99e968623b88c8eb98a5234c7b3405\",\"tags\":[\"lang:français\"],\"text\":\"base event\",\"thread\":null,\"title\":\"test post\",\"ts\":1760500000,\"v\":1}",
+      "name": "tag-not-nfc",
+      "rule": "v1: tag labels are already in NFC, never normalized (here c + U+0327 instead of U+00E7)"
+    },
+    {
+      "expect": "reject",
+      "json": "{\"author\":\"8a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c\",\"blobs\":[],\"data\":{},\"id\":\"c48598159a9ded26d9caeacc227f7d854d1f7b3c21f86e4d6c2bc0acca72f0dc\",\"kind\":\"note\",\"net\":\"public\",\"parent\":null,\"pow\":\"0\",\"refs\":[],\"sig\":\"3815aafb413cb8d5b4a8f0b78ecde10aec18ca737faf80da96074101fa4a922f587f8672b9b123be7d44b9a67e2e49fed727b8819506611c868f4e257cb0f702\",\"tags\":[\"topic:pаypal\"],\"text\":\"base event\",\"thread\":null,\"title\":\"test post\",\"ts\":1760500000,\"v\":1}",
+      "name": "tag-mixed-scripts",
+      "rule": "v1: one script per tag label, UTS #39 highly restrictive (here Latin with a Cyrillic U+0430)"
+    },
+    {
+      "expect": "reject",
+      "json": "{\"author\":\"8a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c\",\"blobs\":[],\"data\":{},\"id\":\"60b7b53c6ae0fc668e2f26041ccd12c1eef81a192d3a8eb4678b6b84b5be2995\",\"kind\":\"note\",\"net\":\"public\",\"parent\":null,\"pow\":\"0\",\"refs\":[],\"sig\":\"f4b503a9baaddee4dc1b73283bc95bee0323b0d87f69afad7bbfa4ba1a103edee5f3079c65a3f387f22d66c7fdc7d1981b9063cdfeaaa196e78de7441a07b601\",\"tags\":[\"a::b\"],\"text\":\"base event\",\"thread\":null,\"title\":\"test post\",\"ts\":1760500000,\"v\":1}",
+      "name": "tag-empty-label",
+      "rule": "v1: tag labels (separated by . / :) are not empty"
+    },
+    {
+      "expect": "reject",
+      "json": "{\"author\":\"8a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c\",\"blobs\":[],\"data\":{},\"id\":\"93713661f36cea0c4d0522f7c52e230e64461d251f758a533f6d53c1f230ee80\",\"kind\":\"note\",\"net\":\"public\",\"parent\":null,\"pow\":\"0\",\"refs\":[],\"sig\":\"577ef9f766c5288c63dc511e61611eca98fd8dd467ec2a8a97383d01c7353f55fa86d03c22de890fa608bcc4bb127b6ecd9d670b383e731ad114b7ef6723ff03\",\"tags\":[\"topic:-rust\"],\"text\":\"base event\",\"thread\":null,\"title\":\"test post\",\"ts\":1760500000,\"v\":1}",
+      "name": "tag-leading-hyphen",
+      "rule": "v1: a tag label does not start or end with a hyphen"
+    },
+    {
+      "expect": "reject",
+      "json": "{\"author\":\"8a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c\",\"blobs\":[],\"data\":{},\"id\":\"762f78c06ce96bfdd7323f7d98a3710a0dd087dcc9fe76f790ba57728e298b45\",\"kind\":\"note\",\"net\":\"public\",\"parent\":null,\"pow\":\"0\",\"refs\":[],\"sig\":\"948734eab423bdc70c8459ee8304e96de6d10702dcdc07cf6a82f2c1b3721b2b7a6f73e7d8813058ed0937aab741be9daa977e0d563e5bd3ee55b118d3d8410b\",\"tags\":[\"topic:a‍b\"],\"text\":\"base event\",\"thread\":null,\"title\":\"test post\",\"ts\":1760500000,\"v\":1}",
+      "name": "tag-contextj",
+      "rule": "v1: ZWJ in a tag label only after a virama (RFC 5892 CONTEXTJ; here in a Latin label)"
+    },
+    {
+      "expect": "reject",
+      "json": "{\"author\":\"8a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c\",\"blobs\":[],\"data\":{},\"id\":\"6a576a664eadcad2baa9e3ba3ce19e778c4b1068d5625e0bb594dbe685590d17\",\"kind\":\"note\",\"net\":\"public\",\"parent\":null,\"pow\":\"0\",\"refs\":[],\"sig\":\"8bc46d8eecd7bc8fdd02cba55fc6b07fec3246aa7952c2a4804e3949a9613b70a3aa58c2863a809c4da74bb7aba3a1da5d5e61ce202586b3ec53aae703cda70a\",\"tags\":[\"topic:1שלום\"],\"text\":\"base event\",\"thread\":null,\"title\":\"test post\",\"ts\":1760500000,\"v\":1}",
+      "name": "tag-bidi",
+      "rule": "v1: a tag with right-to-left characters follows the RFC 5893 bidi rule (here a label starting with a digit, then Hebrew)"
+    },
+    {
+      "expect": "reject",
+      "json": "{\"author\":\"8a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c\",\"blobs\":[],\"data\":{},\"id\":\"ae822e93535d4c9615db3fd2a8a8e0e0dce28ef8c84da70017c507c71b3d948c\",\"kind\":\"note\",\"net\":\"public\",\"parent\":null,\"pow\":\"0\",\"refs\":[],\"sig\":\"e49fa4f60020862882ce3b61792e5db81d736848e3e40e4fd3f3581f66e6fa2056aacdff62e5dc8e1163d1a4a720d5b6b91234bfa52ffd3d2a592d4b0d212904\",\"tags\":[],\"text\":\"base event\",\"thread\":null,\"title\":\"invoice‮fdp.exe\",\"ts\":1760500000,\"v\":1}",
+      "name": "title-bidi-override",
+      "rule": "v1: no format characters in a title other than ZWJ and ZWNJ (here U+202E RIGHT-TO-LEFT OVERRIDE)"
+    },
+    {
+      "expect": "reject",
+      "json": "{\"author\":\"8a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c\",\"blobs\":[],\"data\":{},\"id\":\"22dc3bc0f18dcb353d68d78660e27b1602660b8fa10ccd95cc58b4828d9fa60f\",\"kind\":\"note\",\"net\":\"public\",\"parent\":null,\"pow\":\"0\",\"refs\":[],\"sig\":\"47d04c3dbda015d7e836f0d11c0bd57d8d12518ef81d35d40a997db7dfd3db4b2dea3f16230daa80deed3ab60fb22c46b6bccf8e69af31b291d6eecfed2f4701\",\"tags\":[],\"text\":\"base event\",\"thread\":null,\"title\":\"logo \",\"ts\":1760500000,\"v\":1}",
+      "name": "title-private-use",
+      "rule": "v1: no private-use characters in a title (here U+E000)"
+    },
+    {
+      "expect": "reject",
+      "json": "{\"author\":\"8a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c\",\"blobs\":[],\"data\":{},\"id\":\"99e964cc84fd962807b220a5ca9ce4f7ce5da1e6b17059e825fc3377024c3838\",\"kind\":\"note\",\"net\":\"public\",\"parent\":null,\"pow\":\"0\",\"refs\":[],\"sig\":\"aae9606c53cdd9c435f9cd1a8a4774d99c01f3c2c64e614f2db65938d89a494df09ca0ef9b5699d11fd53e0b007de3469c1ec0dc1dc3792af546a896df808400\",\"tags\":[],\"text\":\"base event\",\"thread\":null,\"title\":\"new letter ꟏\",\"ts\":1760500000,\"v\":1}",
+      "name": "title-unassigned",
+      "rule": "v1: no code point unassigned in Unicode 16.0.0 in a title (here U+A7CF, assigned only in Unicode 17.0)"
+    },
+    {
+      "expect": "reject",
+      "json": "{\"author\":\"8a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c\",\"blobs\":[{\"hash\":\"abababababababababababababababababababababababababababababababab\",\"name\":\"CON\",\"size\":1,\"url\":null}],\"data\":{},\"id\":\"762fc824ecb2cdc1279dd55187c39fd66293ccf37f3bfc986112410f88358cb3\",\"kind\":\"note\",\"net\":\"public\",\"parent\":null,\"pow\":\"0\",\"refs\":[],\"sig\":\"bdd10b451789a3bdb950c5475ca5ba91323733e28f56bf1e57ef545b6b0bbd9452e6ee8f2f55b72759de1ccc019ffd81f189c6b66a2f1493d1840da82dbfab0b\",\"tags\":[],\"text\":\"base event\",\"thread\":null,\"title\":\"test post\",\"ts\":1760500000,\"v\":1}",
+      "name": "blob-name-windows-reserved",
+      "rule": "v1: a blob name is not a Windows device name (here CON)"
+    },
+    {
+      "expect": "reject",
+      "json": "{\"author\":\"8a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c\",\"blobs\":[{\"hash\":\"abababababababababababababababababababababababababababababababab\",\"name\":\"nul.txt\",\"size\":1,\"url\":null}],\"data\":{},\"id\":\"79a452fc7ec8e4b38acffbc2275ec2c61d52e2fe84c92a5f538a4bd3e3fd6e82\",\"kind\":\"note\",\"net\":\"public\",\"parent\":null,\"pow\":\"0\",\"refs\":[],\"sig\":\"02d13bd9b4eef9770fcabea4ea67b2b3719bac9a44027d5bfe6446721c4ee31497117b032f6e64cf9ef7278f3d7fc054ae612b179b3106a7abb2125fea45d80a\",\"tags\":[],\"text\":\"base event\",\"thread\":null,\"title\":\"test post\",\"ts\":1760500000,\"v\":1}",
+      "name": "blob-name-windows-reserved-ext",
+      "rule": "v1: a blob name is not a Windows device name, with or without an extension (here nul.txt)"
+    },
+    {
+      "expect": "reject",
+      "json": "{\"author\":\"8a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c\",\"blobs\":[{\"hash\":\"abababababababababababababababababababababababababababababababab\",\"name\":\"report.\",\"size\":1,\"url\":null}],\"data\":{},\"id\":\"88c7f499959fe7e9f9320421c646de47953adb362f4baa7e1146439b05bff9be\",\"kind\":\"note\",\"net\":\"public\",\"parent\":null,\"pow\":\"0\",\"refs\":[],\"sig\":\"8f3e7cc90a4d4b419a6127d559d22a156d930b9ff370ad6d064b56c00715c5c5286dff9c412db58f5b141aa5d0732593c112e2c98743ad6f56a28b4497f7830e\",\"tags\":[],\"text\":\"base event\",\"thread\":null,\"title\":\"test post\",\"ts\":1760500000,\"v\":1}",
+      "name": "blob-name-trailing-dot",
+      "rule": "v1: a blob name does not end with a dot or a space"
     }
   ],
   "description": "WeAreTheSwarm event test vectors: events every implementation must REJECT. `json` is the exact text received; each case isolates one rule (the id and signature are otherwise valid where possible).",

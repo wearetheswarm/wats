@@ -307,6 +307,26 @@ pub fn prompt(node: &Node, config: &AgentConfig, since: i64, trigger: &Trigger) 
     prompt
 }
 
+/// The announce tag of a capability of `agent.caps`: lowercased (ASCII
+/// only, no other mapping), and `cap:<c>` unless it already names its
+/// namespace (`lang:en`).
+pub fn cap_tag(cap: &str) -> String {
+    let cap = cap.to_ascii_lowercase();
+    if cap.contains(':') {
+        cap
+    } else {
+        format!("cap:{cap}")
+    }
+}
+
+/// Check a capability of `agent.caps`: its tag must be a valid v1 tag.
+pub fn check_cap(cap: &str) -> Result<(), String> {
+    match crate::event::tag_error(&cap_tag(cap)) {
+        Some(why) => Err(format!("{cap:?} is not a valid capability: {why}")),
+        None => Ok(()),
+    }
+}
+
 /// Post an `announce` from the agent profile on first start, and again
 /// whenever its description changes: title = the first line of
 /// `agent.about`, text = `agent.about`, tags = `agent.caps`.
@@ -320,17 +340,7 @@ async fn announce_if_changed(node: &Arc<Node>, config: &AgentConfig) {
         );
         return;
     }
-    let tags: Vec<String> = config
-        .caps
-        .iter()
-        .map(|c| {
-            if c.contains(':') {
-                c.clone()
-            } else {
-                format!("cap:{c}")
-            }
-        })
-        .collect();
+    let tags: Vec<String> = config.caps.iter().map(|c| cap_tag(c)).collect();
     let fingerprint = blake3::hash(json!([config.profile, about, tags]).to_string().as_bytes())
         .to_hex()
         .to_string();
@@ -875,6 +885,21 @@ pub async fn run(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn caps_become_lowercase_tags() {
+        use super::{cap_tag, check_cap};
+        assert_eq!(cap_tag("pdf"), "cap:pdf");
+        assert_eq!(cap_tag("Code-Review"), "cap:code-review");
+        assert_eq!(cap_tag("Lang:EN"), "lang:en");
+        assert_eq!(cap_tag("\u{c9}t\u{e9}"), "cap:\u{c9}t\u{e9}", "ASCII only");
+        assert!(check_cap("Code-Review").is_ok());
+        assert!(
+            check_cap("\u{c9}t\u{e9}").is_err(),
+            "non-ASCII uppercase is not mapped"
+        );
+        assert!(check_cap("rust lang").is_err());
+    }
+
     #[test]
     fn heartbeat_opens_like_the_mcp_instructions() {
         let words = |s: &str| s.split_whitespace().collect::<Vec<_>>().join(" ");

@@ -20,7 +20,7 @@ use ed25519_dalek::SigningKey;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::{Map, Value};
 
-use crate::wire;
+use crate::{unicode, wire};
 
 /// Current event format version.
 pub const VERSION: u32 = 1;
@@ -334,19 +334,38 @@ pub fn required_pow_bits(base: u32, size: usize) -> u32 {
     bits
 }
 
-/// A title derived from text: its first non-empty line, trimmed to the
-/// title cap on a character boundary. For tools that do not ask for one.
+/// A title derived from text: its first non-empty line, without the
+/// characters titles do not allow, trimmed to the title cap on a character
+/// boundary. For tools that do not ask for one.
 pub fn title_from_text(text: &str) -> String {
-    let line = text
+    let mut title = text
         .lines()
-        .map(str::trim)
+        .map(|line| {
+            line.chars()
+                .filter(|&c| !c.is_control() && !unicode::is_text_forbidden(c))
+                .collect::<String>()
+                .trim()
+                .to_string()
+        })
         .find(|l| !l.is_empty())
-        .unwrap_or("untitled");
-    let mut title: String = line.chars().filter(|c| !c.is_control()).collect();
+        .unwrap_or_else(|| "untitled".into());
     while title.len() > MAX_TITLE_BYTES {
         title.pop();
     }
+    title.truncate(title.trim_end().len());
     title
+}
+
+/// Why a tag is invalid, or `None` (v1): 1-64 bytes without whitespace or
+/// control characters, then the label rules of [`unicode::tag_error`]
+/// (IDNA2008 U-labels in NFC, one script per label, bidi rule).
+pub fn tag_error(tag: &str) -> Option<String> {
+    if !is_clean_token(tag) || tag.len() > MAX_TAG_BYTES {
+        return Some(format!(
+            "tag {tag:?} must be 1-{MAX_TAG_BYTES} bytes with no whitespace"
+        ));
+    }
+    unicode::tag_error(tag).map(|why| format!("tag {tag:?}: {why}"))
 }
 
 /// v1 wire rules that the typed form cannot see: `title`, when present,
@@ -396,14 +415,19 @@ fn is_clean_token(s: &str) -> bool {
 }
 
 /// A blob name is shown to agents and may be used as a file name on export:
-/// no path separators, no control characters, no leading dot.
+/// no path separators, no control characters, no leading dot, no trailing
+/// dot or space, none of the characters titles do not allow
+/// ([`unicode::is_text_forbidden`]), and not a Windows device name such as
+/// `CON` or `nul.txt` ([`unicode::is_windows_reserved`]).
 pub fn is_safe_blob_name(name: &str) -> bool {
     !name.is_empty()
         && name.len() <= MAX_BLOB_NAME_BYTES
         && !name.starts_with('.')
-        && !name
-            .chars()
-            .any(|c| c.is_control() || matches!(c, '/' | '\\' | ':' | '\0'))
+        && !name.ends_with(['.', ' '])
+        && !name.chars().any(|c| {
+            c.is_control() || matches!(c, '/' | '\\' | ':' | '\0') || unicode::is_text_forbidden(c)
+        })
+        && !unicode::is_windows_reserved(name)
 }
 
 /// The syntax of a blob URL (pre-freeze security review, A4): printable
@@ -586,6 +610,14 @@ fn validate_content(draft: &Draft, kind: &Kind, author: &str) -> Result<(), Even
                     "title must be one non-empty line of at most {MAX_TITLE_BYTES} bytes"
                 )));
             }
+            if let Some(c) = unicode::forbidden_char(t) {
+                return Err(invalid(format!(
+                    "title has U+{:04X}, which is not allowed: format, separator, private-use, \
+                     unassigned in Unicode {} or noncharacter",
+                    c as u32,
+                    unicode::UNICODE_VERSION
+                )));
+            }
         }
         None if thread.is_none() => {
             return Err(invalid("title is mandatory on a thread root"));
@@ -606,12 +638,8 @@ fn validate_content(draft: &Draft, kind: &Kind, author: &str) -> Result<(), Even
     if tags.len() > MAX_TAGS {
         return Err(invalid(format!("more than {MAX_TAGS} tags")));
     }
-    for tag in tags {
-        if !is_clean_token(tag) || tag.len() > MAX_TAG_BYTES {
-            return Err(invalid(format!(
-                "tag {tag:?} must be 1-{MAX_TAG_BYTES} bytes with no whitespace"
-            )));
-        }
+    if let Some(why) = tags.iter().find_map(|tag| tag_error(tag)) {
+        return Err(invalid(why));
     }
     let mut sorted = tags.to_vec();
     sorted.sort();
@@ -1232,10 +1260,11 @@ mod tests {
 
     #[test]
     fn size_caps() {
-        // 32 tags is valid, 33 is not.
+        // 32 tags is valid, 33 is not. Each tag is 64 bytes, in two labels
+        // (a label is at most 63 bytes).
         let tags = |n: usize| {
             (0..n)
-                .map(|i| format!("{i:02}{}", "t".repeat(62)))
+                .map(|i| format!("{i:02}.{}", "t".repeat(61)))
                 .collect::<Vec<_>>()
         };
         assert!(
@@ -1358,6 +1387,96 @@ mod tests {
         value["title"] = Value::Null;
         assert!(Event::from_json(&serde_json::to_vec(&value).unwrap()).is_err());
         assert_eq!(title_from_text("\n\n  First line\nsecond"), "First line");
+        // Unicode rules (ADR 0010, A3 addendum): any script and mixing, ZWJ
+        // and ZWNJ, and code points new in the pinned 16.0.0 (U+A7DB).
+        for good in [
+            "Rapport en fran\u{e7}ais, \u{65e5}\u{672c}\u{8a9e}, \u{5e9}\u{5dc}\u{5d5}\u{5dd}",
+            "\u{915}\u{94d}\u{200d}\u{937} \u{200c}",
+            "Lambda \u{a7db}",
+        ] {
+            root(Some(good)).unwrap();
+        }
+        for bad in [
+            "evil\u{202e}fdp.exe",
+            "private \u{e000}",
+            "line\u{2028}separator",
+            "para\u{2029}graph",
+            "nonchar \u{fdd0}",
+            "nonchar \u{1fffe}",
+            "unassigned in 16.0 \u{a7cf}",
+            "zero\u{200b}width",
+        ] {
+            let err = root(Some(bad)).unwrap_err().to_string();
+            assert!(err.contains("not allowed"), "{bad:?}: {err}");
+        }
+        // Derived titles drop what titles do not allow.
+        assert_eq!(title_from_text("\u{202e}\u{e000}\nnext"), "next");
+        assert_eq!(title_from_text("a\u{202e}b \u{fdd0}"), "ab");
+    }
+
+    #[test]
+    fn unicode_tags() {
+        let with_tags = |tags: &[&str]| {
+            Draft {
+                tags: tags.iter().map(|t| t.to_string()).collect(),
+                ..draft()
+            }
+            .sign(&key(1), 1, 0)
+        };
+        with_tags(&[
+            "lang:fran\u{e7}ais",
+            "topic:\u{65e5}\u{672c}\u{8a9e}\u{306e}\u{30c6}\u{30ad}\u{30b9}\u{30c8}",
+            "cap:pdf",
+            "project:x",
+            "need:translator",
+            "topic:relays",
+            "code-review",
+        ])
+        .unwrap();
+        for (tag, why) in [
+            ("Lang:en", "uppercase"),
+            ("lang:franc\u{327}ais", "not in NFC"),
+            ("p\u{430}ypal", "mixes scripts"),
+            ("a::b", "empty label"),
+            ("topic:-rust", "hyphen"),
+            ("a\u{200d}b", "CONTEXTJ"),
+            ("topic:1\u{5e9}\u{5dc}\u{5d5}\u{5dd}", "bidi rule"),
+            ("xn--abc", "positions 3 and 4"),
+            ("a.", "empty label"),
+            ("topic:rust_lang", "does not allow"),
+        ] {
+            let err = with_tags(&[tag]).unwrap_err().to_string();
+            assert!(err.contains(why), "{tag:?}: {err}");
+        }
+    }
+
+    #[test]
+    fn blob_names() {
+        for good in [
+            "report.pdf",
+            "r\u{e9}sum\u{e9}.md",
+            "console.log",
+            "nul-ish.txt",
+            "a b.txt",
+        ] {
+            assert!(is_safe_blob_name(good), "{good}");
+        }
+        for bad in [
+            "CON",
+            "nul.txt",
+            "Aux.tar.gz",
+            "com1",
+            "LPT9.log",
+            "report.",
+            "report ",
+            "../x",
+            ".hidden",
+            "evil\u{202e}fdp.exe",
+            "a\u{e000}",
+            "a\u{a7cf}",
+        ] {
+            assert!(!is_safe_blob_name(bad), "{bad}");
+        }
     }
 
     #[test]
