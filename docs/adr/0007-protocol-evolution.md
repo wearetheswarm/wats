@@ -81,6 +81,14 @@ A node never rejects an event for its version alone.
   - shown with an unknown `kind` displayed as `note`.
 - **Version range.** Events below `events_min`, once old versions are
   dropped, are handled the same way.
+- **Tombstones and full events** (addendum, 2026-10-16, security review
+  B8). A tombstone and its full event share an id. A full event this node
+  understands always replaces a stored opaque row with the same id, the
+  tombstone included: the body is restored, indexed, and gets a new local
+  sequence number, so peers that sync from this node receive it again. A
+  tombstone never replaces a stored full event: whoever relays a tombstone
+  cannot make another node forget a body. Dropping a body on purpose is a
+  local decision of the node, not something a peer can trigger.
 
 ### 3. Peer negotiation
 

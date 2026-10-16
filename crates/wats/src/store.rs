@@ -228,12 +228,29 @@ impl Store {
         let stored = {
             let mut conn = self.conn();
             let tx = conn.transaction()?;
-            if tx
-                .query_row("SELECT 1 FROM events WHERE id = ?", [&event.id], |_| Ok(()))
-                .optional()?
-                .is_some()
-            {
-                return Ok(Inserted::Duplicate);
+            let existing: Option<(i64, bool)> = tx
+                .query_row(
+                    "SELECT seq, opaque FROM events WHERE id = ?",
+                    [&event.id],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .optional()?;
+            match existing {
+                Some((_, false)) => return Ok(Inserted::Duplicate),
+                // Same id, stored opaque: its tombstone (the id covers the
+                // body through its hash), or the event itself before this
+                // release understood its version. The full, understood
+                // event always replaces it (security review B8); it gets a
+                // new seq, so peers syncing from us receive it again.
+                Some((seq, true)) => {
+                    // Opaque rows are indexed with empty text and tags.
+                    tx.execute(
+                        "INSERT INTO events_fts (events_fts, rowid, text, tags) VALUES ('delete', ?, '', '')",
+                        [seq],
+                    )?;
+                    tx.execute("DELETE FROM events WHERE seq = ?", [seq])?;
+                }
+                None => {}
             }
             if let Some(parent) = &event.parent {
                 let found: Option<(String, Option<String>)> = tx
@@ -317,7 +334,9 @@ impl Store {
     }
 
     /// Store an event this node does not understand (ADR 0007). It is
-    /// served to peers (sync) and to `read`, never indexed.
+    /// served to peers (sync) and to `read`, never indexed. Never replaces
+    /// a stored event: in particular, a tombstone never downgrades the
+    /// full event with the same id (security review B8).
     pub fn insert_raw(&self, raw: &RawEvent, received_at: u64) -> Result<Inserted> {
         let conn = self.conn();
         let changed = conn.execute(
@@ -811,5 +830,70 @@ mod tests {
         let e = post(1, 10, Kind::Note, &[], "hello");
         store.insert(&e, 10).unwrap();
         assert_eq!(rx.try_recv().unwrap().event.id, e.id);
+    }
+
+    /// The tombstone of a full event: header, refs and signature, with
+    /// `body_hash` instead of the body.
+    fn tombstone_of(event: &Event) -> RawEvent {
+        use crate::wire::{BODY_HASH_KEY, HEADER_KEYS, REFS_KEY, UNHASHED_KEYS, digest};
+        let full = match serde_json::to_value(event).unwrap() {
+            Value::Object(map) => map,
+            _ => unreachable!(),
+        };
+        let mut t: serde_json::Map<String, Value> = full
+            .iter()
+            .filter(|(k, _)| {
+                HEADER_KEYS.contains(&k.as_str())
+                    || k.as_str() == REFS_KEY
+                    || UNHASHED_KEYS.contains(&k.as_str())
+            })
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        t.insert(
+            BODY_HASH_KEY.into(),
+            serde_json::json!(digest(&full).unwrap().body_hash),
+        );
+        let raw = RawEvent::from_value(Value::Object(t)).unwrap();
+        assert!(raw.tombstoned);
+        raw
+    }
+
+    #[test]
+    fn a_tombstone_never_downgrades_a_full_event() {
+        let store = Store::open_in_memory().unwrap();
+        let event = post(1, 10, Kind::Note, &["cap:pdf"], "keep my body");
+        store.insert(&event, 10).unwrap();
+        assert_eq!(
+            store.insert_raw(&tombstone_of(&event), 11).unwrap(),
+            Inserted::Duplicate
+        );
+        let stored = store.get(&event.id).unwrap().expect("still full");
+        assert_eq!(stored.event.text, "keep my body");
+    }
+
+    #[test]
+    fn a_full_event_replaces_its_tombstone() {
+        let store = Store::open_in_memory().unwrap();
+        let event = post(1, 10, Kind::Note, &["cap:pdf"], "the body came later");
+        assert!(matches!(
+            store.insert_raw(&tombstone_of(&event), 10).unwrap(),
+            Inserted::New(_)
+        ));
+        assert!(
+            store.get(&event.id).unwrap().is_none(),
+            "tombstones are opaque"
+        );
+        assert!(matches!(
+            store.insert(&event, 11).unwrap(),
+            Inserted::New(_)
+        ));
+        let stored = store.get(&event.id).unwrap().expect("now full");
+        assert_eq!(stored.event.text, "the body came later");
+        assert_eq!(store.insert(&event, 12).unwrap(), Inserted::Duplicate);
+        let (_, opaque, raw) = store.get_raw(&event.id).unwrap().unwrap();
+        assert!(!opaque && raw.get("text").is_some());
+        // Indexed like any event.
+        let found = store.search(Some("body"), &Filter::default(), 10).unwrap();
+        assert_eq!(found.len(), 1);
     }
 }
