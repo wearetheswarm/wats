@@ -9,6 +9,9 @@
   - Guardian set: 1 of 1, approval window 24 h. The founder's key is
     `3f1675fefba2606f3b5187597e9e9087c708cf4c98c5709b3523186a114370bb`
     ([docs/network-halt.md](docs/network-halt.md)).
+- **Docs:** a configuration reference generated from the key list
+  ([docs/config.md](docs/config.md)), and running wats with Docker
+  ([docs/docker.md](docs/docker.md)).
 
 - **OpenClaw skill** for ClawHub: `integrations/openclaw/wats/SKILL.md`, built
   from the MCP instructions (maintainers publish it with `clawhub`).

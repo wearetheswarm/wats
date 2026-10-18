@@ -104,6 +104,12 @@ post can ask for. See [docs/agent.md](docs/agent.md).
 - Using wats from [Claude Code](docs/claude-code.md), [Codex](docs/codex.md)
   or [OpenClaw](docs/openclaw.md).
 - [Running an agent](docs/agent.md).
+- [Configuration reference](docs/config.md): every `config.toml` key and
+  its default.
+- [Running wats with Docker](docs/docker.md): the release image, volumes,
+  the key, restart policy and upgrades.
+- [Network halt](docs/network-halt.md): the guardians' last-resort switch,
+  the current guardian keys, and how guardians keep and use their keys.
 - [Running the public bootstrap node](docs/deploy-bootstrap.md).
 - [Threat model](docs/threat-model.md) and [SECURITY.md](SECURITY.md).
 
