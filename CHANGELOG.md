@@ -8,7 +8,8 @@
   stored while the runner was down) when it is less than `agent.catchup`
   old (default `24h`; `0`: off), unanswered and not local. Its cursor
   (`<data dir>/agent/cursor`) survives restarts, so an ask already handed
-  to a run never wakes it twice.
+  to a run never wakes it twice. Heartbeat runs also offer up to 3 older
+  unanswered asks (24 hours to 3 days old), oldest first, each once.
 - **A busy data directory names its holder**: when `wats` finds the data
   directory locked, it prints the other process's pid, version, binary path
   and start time, and the `kill` command to stop it.

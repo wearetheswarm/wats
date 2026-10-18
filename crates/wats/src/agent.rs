@@ -163,6 +163,77 @@ fn unanswered(node: &Node, me: &str, event: &Event) -> bool {
     })
 }
 
+/// Older unanswered asks offered per heartbeat run (ADR 0018 §6).
+pub const OLDER_ASKS_PER_HEARTBEAT: usize = 3;
+/// Asks older than this are not offered at all.
+pub const OLDER_ASKS_MAX_AGE: Duration = Duration::from_secs(3 * 86_400);
+/// The older asks already offered, one id per line in `work_dir`.
+const OFFERED_FILE: &str = "offered";
+/// How many offered ids are remembered.
+const OFFERED_KEEP: usize = 2000;
+
+fn read_offered(work_dir: &std::path::Path) -> Vec<String> {
+    std::fs::read_to_string(work_dir.join(OFFERED_FILE))
+        .map(|t| t.lines().map(str::to_string).collect())
+        .unwrap_or_default()
+}
+
+fn save_offered(work_dir: &std::path::Path, mut offered: Vec<String>, new: &[String]) {
+    offered.extend(new.iter().cloned());
+    let skip = offered.len().saturating_sub(OFFERED_KEEP);
+    let text: String = offered
+        .iter()
+        .skip(skip)
+        .map(|id| format!("{id}\n"))
+        .collect();
+    let path = work_dir.join(OFFERED_FILE);
+    let tmp = work_dir.join(format!("{OFFERED_FILE}.tmp"));
+    if let Err(e) = std::fs::write(&tmp, text).and_then(|()| std::fs::rename(&tmp, &path)) {
+        debug!("cannot save the offered asks to {}: {e}", path.display());
+    }
+}
+
+/// Up to [`OLDER_ASKS_PER_HEARTBEAT`] asks for a heartbeat run, oldest
+/// first: between `window` (`agent.catchup`) and [`OLDER_ASKS_MAX_AGE`]
+/// old, of interest to the agent, unanswered, and never offered before
+/// (ADR 0018 §6). An old question still has value; they only fill a
+/// heartbeat that runs anyway.
+pub fn older_asks(
+    node: &Node,
+    me: &str,
+    config: &AgentConfig,
+    window: Duration,
+    offered: &[String],
+    now: u64,
+) -> Vec<Arc<Event>> {
+    let (newest, oldest) = (
+        now.saturating_sub(window.as_secs()),
+        now.saturating_sub(OLDER_ASKS_MAX_AGE.as_secs()),
+    );
+    let asks = Filter {
+        kinds: vec![Kind::Ask],
+        ..Filter::default()
+    };
+    let Ok(found) = node.store().search(None, &asks, 1000) else {
+        return Vec::new();
+    };
+    let mut older: Vec<Arc<Event>> = found
+        .into_iter()
+        .map(|s| s.event)
+        .filter(|e| e.ts < newest && e.ts >= oldest && e.thread.is_none())
+        .filter(|e| !offered.contains(&e.id))
+        .filter(|e| {
+            matches!(
+                interest(node, me, &config.allow, config.ignore_local, e),
+                Interest::Wake(_)
+            ) && unanswered(node, me, e)
+        })
+        .collect();
+    older.sort_by_key(|e| e.ts);
+    older.truncate(OLDER_ASKS_PER_HEARTBEAT);
+    older
+}
+
 /// Events stored after `after` and up to `upto` (store sequence numbers)
 /// that should still wake the agent: of interest to it (see [`interest`];
 /// local authors left out per `agent.ignore_local`), posted less than
@@ -1301,6 +1372,22 @@ pub async fn run(
                     }
                 };
                 let mut text = prompt(&node, &config, since, &trigger);
+                // A heartbeat also offers a few older unanswered asks.
+                if let (Trigger::Heartbeat, Some(window)) = (&trigger, config.catchup) {
+                    let offered = read_offered(&config.work_dir);
+                    let older = older_asks(&node, &me, &config, window, &offered, unix_now);
+                    if !older.is_empty() {
+                        let ids: Vec<String> = older.iter().map(|e| e.id.clone()).collect();
+                        info!("heartbeat: offering {} nobody answered", count(ids.len(), "older ask", "older asks"));
+                        text.push_str(&format!(
+                            "\n\nOlder asks nobody answered (more than {} old; optional: help \
+                             only where you can add real value, otherwise skip them):\n{}\n",
+                            window_text(window),
+                            event_lines(&node, &ids).join("\n")
+                        ));
+                        save_offered(&config.work_dir, offered, &ids);
+                    }
+                }
                 let taken = std::mem::take(&mut feedback);
                 text.push_str(&feedback_section(&node, &taken));
                 // What the human said about the posts they rejected.
