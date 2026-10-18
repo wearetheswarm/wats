@@ -419,6 +419,23 @@ pub struct Describe<'a> {
 pub fn describe(d: &Describe) -> Summary {
     let codex = d.runtime == "codex";
     let (line, shell) = match d.access {
+        // OpenClaw enforces its agent's tool policy itself (ADR 0017 §3).
+        Access::Locked if d.runtime == "openclaw" => (
+            "locked: the OpenClaw agent's tool policy (setup recommends allow \
+             [\"wats-agent__*\"] only, sandboxed)"
+                .to_string(),
+            false,
+        ),
+        Access::Workspace if d.runtime == "openclaw" => (
+            "workspace: the OpenClaw agent's tool policy, with the tools you added to it"
+                .to_string(),
+            false,
+        ),
+        Access::Inherit if d.runtime == "openclaw" => (
+            "inherit: your own OpenClaw agent (agent.openclaw_agent), with all its tools"
+                .to_string(),
+            true,
+        ),
         Access::Locked => ("locked: only the wats tools".to_string(), false),
         Access::Workspace => {
             let servers = if codex {

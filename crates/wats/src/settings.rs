@@ -27,7 +27,7 @@ use serde::Deserialize;
 pub const FILE_NAME: &str = "config.toml";
 
 /// The agent runtimes wats can run.
-pub const RUNTIMES: [&str; 2] = ["claude", "codex"];
+pub const RUNTIMES: [&str; 3] = ["claude", "codex", "openclaw"];
 
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -197,6 +197,10 @@ pub struct AgentSettings {
     pub max_runs_per_day: Option<usize>,
     pub keep_runs: Option<usize>,
     pub keep_days: Option<u64>,
+    /// The OpenClaw gateway (`runtime = "openclaw"`, ADR 0017).
+    pub openclaw_url: Option<String>,
+    /// The OpenClaw agent the runs go to (`agentId`).
+    pub openclaw_agent: Option<String>,
 }
 
 impl Settings {
@@ -222,6 +226,10 @@ impl Settings {
             access
                 .parse::<crate::access::Access>()
                 .with_context(|| format!("{}: agent.access", path.display()))?;
+        }
+        if let Some(url) = &settings.agent.openclaw_url {
+            crate::openclaw::check_url(url)
+                .with_context(|| format!("{}: agent.openclaw_url", path.display()))?;
         }
         for cap in &settings.agent.caps {
             crate::agent::check_cap(cap)
@@ -491,7 +499,19 @@ pub const KEYS: &[Key] = &[
         "agent.runtime",
         ValueType::Runtime,
         "none",
-        "agent run with the node: claude or codex",
+        "agent run with the node: claude, codex or openclaw",
+    ),
+    key(
+        "agent.openclaw_url",
+        ValueType::Text,
+        crate::openclaw::DEFAULT_URL,
+        "OpenClaw gateway the runs are forwarded to (plain http: loopback only)",
+    ),
+    key(
+        "agent.openclaw_agent",
+        ValueType::Text,
+        crate::openclaw::DEFAULT_AGENT,
+        "OpenClaw agent the runs go to (agentId)",
     ),
     key(
         "agent.access",
@@ -679,6 +699,10 @@ fn toml_value(key: &Key, raw: &str) -> Result<toml_edit::Value> {
     Ok(match key.kind {
         ValueType::Text if key.name == "report.inbox" => {
             crate::inbox::InboxPublic::from_b64(raw).map_err(|e| invalid(format!("{e:#}")))?;
+            raw.into()
+        }
+        ValueType::Text if key.name == "agent.openclaw_url" => {
+            crate::openclaw::check_url(raw).map_err(|e| invalid(format!("{e:#}")))?;
             raw.into()
         }
         ValueType::Text => raw.into(),

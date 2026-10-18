@@ -241,10 +241,8 @@ fn setup_detects_agent_clis_on_path() {
     let data = dir.path().join("d");
     let said = setup(&data, &bin);
     assert!(said.contains("1) codex"), "{said}");
-    assert!(
-        said.contains("openclaw") && said.contains("(agent: not supported yet;"),
-        "{said}"
-    );
+    assert!(said.contains("2) openclaw"), "{said}");
+    assert!(!said.contains("not supported yet"), "{said}");
     assert!(said.contains("wats setup openclaw --mcp"), "{said}");
     assert!(!said.contains("claude "), "{said}");
     assert!(
@@ -365,16 +363,15 @@ fn setup_openclaw_mcp_through_its_cli() {
     assert_eq!(calls().last().unwrap(), &["mcp", "unset", "wats"]);
     assert!(!entry.exists());
 
-    // No flag: the agent half is not there yet; OpenClaw is not run.
+    // No flag means both halves: without a terminal, the agent half wants
+    // --yes for the spend caps, and nothing is run before.
     let before = calls().len();
     let out = setup(&path_with, &[]);
     let err = String::from_utf8_lossy(&out.stderr);
     assert!(!out.status.success());
-    assert!(
-        err.contains("later version") && err.contains("wats setup openclaw --mcp"),
-        "{err}"
-    );
+    assert!(err.contains("--yes"), "{err}");
     assert_eq!(calls().len(), before);
+    assert!(!data.join("openclaw").exists());
 
     // Not on PATH.
     let out = setup("/bin:/usr/bin", &["--mcp"]);
@@ -395,4 +392,157 @@ fn setup_openclaw_mcp_through_its_cli() {
     assert!(err.contains("Error: invalid MCP server config"), "{err}");
     let after = calls();
     assert_eq!(after.len(), before + 1, "{after:?}");
+}
+
+/// `wats setup openclaw --agent --yes`: the hook and runner tokens (0600,
+/// kept on a second run), the `wats` and `wats-agent` MCP entries through
+/// a fake `openclaw` (the agent's with the runner token in its env), the
+/// JSON5 block with the token as an environment reference, the token
+/// printed once on its `export` line, `openclaw config validate`, and
+/// config.toml. A non-loopback http URL and `inherit` without allow and
+/// review are refused before anything runs. `wats status` then says the
+/// budget is OpenClaw's.
+#[test]
+fn setup_openclaw_agent_tokens_entries_and_block() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let bin = dir.path().join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let log = dir.path().join("calls.log");
+    let fake = bin.join("openclaw");
+    std::fs::write(
+        &fake,
+        format!(
+            "#!/bin/sh\n\
+             printf '%s\\n' \"$@\" >> {log}\necho --- >> {log}\n\
+             case \"$2\" in\n\
+             set) printf '%s\\n' \"$4\" > {dir}/entry-$3.json;;\n\
+             show) cat {dir}/entry-$3.json;;\n\
+             esac\n",
+            log = log.display(),
+            dir = dir.path().display(),
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let data = dir.path().join("data");
+    let path = format!("{}:/bin:/usr/bin", bin.display());
+    let run = |args: &[&str]| {
+        std::process::Command::new(env!("CARGO_BIN_EXE_wats"))
+            .env("WATS_HERMETIC", "1")
+            .env("HOME", dir.path())
+            .env("PATH", &path)
+            .env("USER", "alice")
+            .env_remove("WATS_PROFILE")
+            .env_remove("WATS_OPENCLAW")
+            .arg("--dir")
+            .arg(&data)
+            .args(args)
+            .output()
+            .unwrap()
+    };
+    let calls = || -> Vec<Vec<String>> {
+        std::fs::read_to_string(&log)
+            .unwrap_or_default()
+            .split("---\n")
+            .filter(|c| !c.is_empty())
+            .map(|c| c.lines().map(str::to_string).collect())
+            .collect()
+    };
+
+    // Refused before anything runs.
+    let out = run(&[
+        "setup",
+        "openclaw",
+        "--agent",
+        "--yes",
+        "--url",
+        "http://192.168.1.2:18789",
+    ]);
+    assert!(!out.status.success());
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("loopback"),
+        "{out:?}"
+    );
+    assert!(calls().is_empty() && !data.join("openclaw").exists());
+
+    let out = run(&["setup", "openclaw", "--agent", "--yes"]);
+    let said = String::from_utf8_lossy(&out.stdout).into_owned();
+    assert!(out.status.success(), "{out:?}");
+    let token = |name: &str| {
+        let file = data.join("openclaw").join(name);
+        let mode = std::fs::metadata(&file).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600, "{name}");
+        let token = std::fs::read_to_string(&file).unwrap().trim().to_string();
+        assert_eq!(token.len(), 64, "{name}");
+        token
+    };
+    let (hooks, runner) = (token("hooks.token"), token("runner.token"));
+    let exe = std::fs::canonicalize(env!("CARGO_BIN_EXE_wats")).unwrap();
+    let all = calls();
+    assert_eq!(all.len(), 5, "{all:?}");
+    assert_eq!(all[0][..3], ["mcp", "set", "wats"]);
+    assert_eq!(all[1], ["mcp", "show", "wats"]);
+    assert_eq!(all[2][..3], ["mcp", "set", "wats-agent"]);
+    let agent: serde_json::Value = serde_json::from_str(&all[2][3]).unwrap();
+    assert_eq!(
+        agent,
+        serde_json::json!({
+            "command": exe,
+            "args": ["--dir", data, "mcp", "--profile", "alice-agent"],
+            "env": {"WATS_RUNNER_TOKEN": runner},
+        })
+    );
+    assert_eq!(all[3], ["mcp", "show", "wats-agent"]);
+    assert_eq!(all[4], ["config", "validate"]);
+    assert!(
+        said.contains("token: \"${WATS_OPENCLAW_HOOKS_TOKEN}\""),
+        "{said}"
+    );
+    assert!(said.contains("allowedAgentIds: [\"wats\"]"), "{said}");
+    assert!(said.contains("allowRequestSessionKey: true"), "{said}");
+    assert!(
+        said.contains("allowedSessionKeyPrefixes: [\"wats:\"]"),
+        "{said}"
+    );
+    assert!(said.contains("allow: [\"wats-agent__*\"]"), "{said}");
+    assert!(said.contains("\"exec\", \"process\", \"write\""), "{said}");
+    assert!(said.contains("Spend caps belong"), "{said}");
+    assert_eq!(said.matches(&hooks).count(), 1, "{said}");
+    assert!(
+        said.contains(&format!("\nexport WATS_OPENCLAW_HOOKS_TOKEN={hooks}\n")),
+        "{said}"
+    );
+    assert!(!said.contains(&runner), "{said}");
+    let config = std::fs::read_to_string(data.join("config.toml")).unwrap();
+    assert!(config.contains("runtime = \"openclaw\""), "{config}");
+    assert!(
+        config.contains("openclaw_url = \"http://127.0.0.1:18789\""),
+        "{config}"
+    );
+
+    // Again: the same tokens.
+    let out = run(&["setup", "openclaw", "--agent", "--yes"]);
+    assert!(out.status.success(), "{out:?}");
+    assert_eq!(
+        (token("hooks.token"), token("runner.token")),
+        (hooks, runner)
+    );
+
+    // Not running: `wats status` shows who manages the budget.
+    let status = String::from_utf8_lossy(&run(&["status"]).stdout).into_owned();
+    assert!(status.contains("budget: managed by OpenClaw"), "{status}");
+
+    // inherit hands the swarm to the user's own agent: allow and review
+    // first.
+    let set = run(&["config", "set", "agent.access", "inherit"]);
+    assert!(set.status.success(), "{set:?}");
+    let before = calls().len();
+    let out = run(&["setup", "openclaw", "--agent", "--yes"]);
+    assert!(!out.status.success());
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("agent.review"),
+        "{out:?}"
+    );
+    assert_eq!(calls().len(), before);
 }

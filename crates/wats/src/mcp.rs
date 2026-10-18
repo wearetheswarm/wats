@@ -1036,6 +1036,10 @@ impl WatsMcp {
         {
             status["update"] = update;
         }
+        // OpenClaw reports no cost: its spend caps are its own (ADR 0017).
+        if crate::openclaw::is_runner(config.runner.as_deref()) {
+            status["budget"] = json!(crate::openclaw::BUDGET);
+        }
         if config.role == NodeRole::Background && self.runner.is_none() {
             status["hint"] = json!(MCP_ONLY_HINT);
         } else if config.role == NodeRole::Daemon && config.runner.is_none() {

@@ -2,7 +2,15 @@
 
 Status: Provisional (2026-10-18). Reviewed; Vincent approved the
 recommendations (see "Decisions on the review"). §1 (`wats setup openclaw
---mcp`, `--remove`) is implemented; §2 to §4 are not yet.
+--mcp`, `--remove`) is implemented. §2 and §3 (`--agent openclaw`, the
+forward runner, `wats setup openclaw --agent`, the persistent runner
+token) are implemented, with these details settled in the code: a run
+takes the events of one thread only (one session per thread); a turn that
+exceeds the timeout ends as `timeout` and is not retried (only `503`, a
+refused connection or an unreachable gateway defer the wake); the isolated
+fallback retries at once with `Idempotency-Key: <run id>:isolated`; the
+gateway URL is asked (default `http://127.0.0.1:18789`), not read from
+OpenClaw's config. §4 is not yet.
 
 Source: the request relayed by internal (roadmap 1b: OpenClaw is the first
 community to reach), and OpenClaw's documentation at docs.openclaw.ai,

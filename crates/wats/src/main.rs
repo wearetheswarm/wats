@@ -88,6 +88,8 @@ struct AgentArgs {
     /// Run an agent with the node for this run, woken on asks, on replies in
     /// its threads and once per heartbeat; its only tools are this node's
     /// MCP tools. `claude` also registers wats in Claude Code if needed.
+    /// `openclaw` forwards each run to the OpenClaw gateway instead of
+    /// spawning a CLI (set up with `wats setup openclaw --agent`).
     #[arg(long = "agent", value_name = "RUNTIME", value_parser = wats::settings::RUNTIMES)]
     agents: Vec<String>,
     /// Do not run the agents enabled in config.toml.
@@ -565,8 +567,8 @@ enum SetupTool {
         #[arg(long, env = "WATS_CLAUDE", default_value = "claude")]
         claude: PathBuf,
     },
-    /// OpenClaw: register wats as its MCP server (--mcp) or remove it
-    /// (--remove). The OpenClaw agent runner comes in a later version.
+    /// OpenClaw. With neither --mcp nor --agent, does both. Never edits
+    /// openclaw.json.
     Openclaw {
         /// Register wats as an MCP server of OpenClaw: `openclaw mcp set
         /// wats '{"command": <this wats>, "args": ["mcp", "--profile",
@@ -574,14 +576,26 @@ enum SetupTool {
         /// --profile, else config.toml's, else your OS user name.
         #[arg(long, conflicts_with = "remove")]
         mcp: bool,
-        /// Remove the wats MCP server from OpenClaw: `openclaw mcp unset
-        /// wats`.
+        /// Remove the wats MCP servers from OpenClaw: `openclaw mcp unset
+        /// wats` (and wats-agent).
         #[arg(long)]
         remove: bool,
-        /// Not available yet: OpenClaw as the node's agent (`--agent
-        /// openclaw`) comes in a later version.
-        #[arg(long, conflicts_with_all = ["mcp", "remove"])]
+        /// OpenClaw as the node's agent: the `wats` entry, the hook and
+        /// runner tokens (<data dir>/openclaw/), the `wats-agent` MCP
+        /// entry, the config block to paste into openclaw.json, and
+        /// agent.runtime = "openclaw" in config.toml.
+        #[arg(long, conflicts_with = "remove")]
         agent: bool,
+        /// Confirm that spend caps are set on the OpenClaw side (wats
+        /// cannot enforce its USD budgets there); needed without a
+        /// terminal.
+        #[arg(long, short = 'y')]
+        yes: bool,
+        /// The OpenClaw gateway (agent.openclaw_url); default
+        /// http://127.0.0.1:18789, asked on a terminal. Plain http is for
+        /// loopback only.
+        #[arg(long)]
+        url: Option<String>,
         /// The OpenClaw CLI.
         #[arg(long, env = "WATS_OPENCLAW", default_value = "openclaw")]
         openclaw: PathBuf,
@@ -764,46 +778,219 @@ fn openclaw_ok(output: &std::process::Output, what: &str) -> Result<()> {
     anyhow::bail!("`openclaw {what}` failed ({}):\n{stderr}", output.status)
 }
 
-/// `wats setup openclaw`: register wats as OpenClaw's `wats` MCP server
-/// (`--mcp`) or remove it (`--remove`), through OpenClaw's CLI only: its
-/// config (`openclaw.json`) is never edited here. `openclaw mcp set`
-/// replaces an entry of the same name, so running it again is harmless.
+/// What `wats setup openclaw` was asked.
+struct OpenclawSetup {
+    mcp: bool,
+    agent: bool,
+    remove: bool,
+    yes: bool,
+    url: Option<String>,
+}
+
+/// `openclaw mcp set <name> <entry>`, then `openclaw mcp show <name>` to
+/// check that it runs `command`. `secret` never appears in what is printed.
+fn openclaw_mcp_set(
+    openclaw: &std::path::Path,
+    name: &str,
+    entry: &serde_json::Value,
+    command: &str,
+    secret: Option<&str>,
+) -> Result<()> {
+    let scrub = |e: anyhow::Error| match secret {
+        Some(secret) => anyhow::anyhow!("{}", format!("{e:#}").replace(secret, "<token>")),
+        None => e,
+    };
+    let output = run_openclaw(openclaw, &["mcp", "set", name, &entry.to_string()])?;
+    openclaw_ok(&output, &format!("mcp set {name}")).map_err(scrub)?;
+    let shown = run_openclaw(openclaw, &["mcp", "show", name])?;
+    openclaw_ok(&shown, &format!("mcp show {name}")).map_err(scrub)?;
+    if String::from_utf8_lossy(&shown.stdout).contains(command) {
+        println!("  checked: `openclaw mcp show {name}` runs {command}");
+    } else {
+        eprintln!("warning: `openclaw mcp show {name}` does not show {command}; check it there");
+    }
+    Ok(())
+}
+
+/// One line from the terminal, trimmed.
+fn ask_line(question: &str) -> Result<String> {
+    use std::io::Write;
+    print!("{question}");
+    std::io::stdout().flush()?;
+    let mut line = String::new();
+    std::io::stdin().read_line(&mut line)?;
+    Ok(line.trim().to_string())
+}
+
+/// `wats setup openclaw`, through OpenClaw's CLI only: its config
+/// (`openclaw.json`) is never edited here.
+/// - `--mcp`: the `wats` MCP server, with the user's profile.
+/// - `--agent` (ADR 0017 §2–§3): also `wats`, then the hook and runner
+///   tokens, the `wats-agent` MCP server (the agent profile, with the
+///   persistent runner token), the JSON5 block to paste, and
+///   `agent.runtime = "openclaw"` with the gateway URL in config.toml.
+/// - neither: both. `--remove`: unset the entries.
+///
+/// `openclaw mcp set` replaces an entry of the same name, so running it
+/// again is harmless; existing tokens are kept.
 fn setup_openclaw(
     args: &NodeArgs,
     data_dir: &std::path::Path,
-    (mcp, remove): (bool, bool),
+    asked: OpenclawSetup,
     openclaw: &std::path::Path,
 ) -> Result<()> {
-    if remove {
+    use std::io::IsTerminal;
+    use wats::openclaw as oc;
+    if asked.remove {
+        if oc::runner_token_path(data_dir).exists() {
+            let output = run_openclaw(openclaw, &["mcp", "unset", oc::AGENT_SERVER])?;
+            if output.status.success() {
+                println!("OpenClaw: {} MCP server removed", oc::AGENT_SERVER);
+            }
+        }
         let output = run_openclaw(openclaw, &["mcp", "unset", "wats"])?;
         openclaw_ok(&output, "mcp unset wats")?;
         println!("OpenClaw: wats MCP server removed");
         return Ok(());
     }
-    anyhow::ensure!(
-        mcp,
-        "OpenClaw as the node's agent (`--agent openclaw`) comes in a later version. \
-         For now, `wats setup openclaw --mcp` gives your OpenClaw agents the wats tools \
-         (see docs/openclaw.md)"
-    );
+    // The `wats` entry is always set; neither flag means both.
+    let agent = asked.agent || !asked.mcp;
     let settings = Settings::load(data_dir)?;
+    let interactive = std::io::stdin().is_terminal();
+    // The agent half: everything is checked and confirmed before anything
+    // is written.
+    let gateway = if agent {
+        let access: wats::access::Access = settings
+            .agent
+            .access
+            .as_deref()
+            .unwrap_or("locked")
+            .parse()?;
+        oc::check_access(
+            access,
+            &settings.agent.allow,
+            settings.agent.review == Some(true),
+        )?;
+        println!("Budget: {}", oc::SPEND_CAPS);
+        if !asked.yes {
+            anyhow::ensure!(
+                interactive,
+                "spend caps for OpenClaw are not wats's: pass --yes to confirm that they are \
+                 set on the OpenClaw side (no terminal to ask)"
+            );
+            let answer = ask_line(
+                "Are spend caps set on the OpenClaw side (or with your model provider)? [y/N]: ",
+            )?;
+            anyhow::ensure!(
+                matches!(answer.to_lowercase().as_str(), "y" | "yes"),
+                "cancelled: nothing was changed"
+            );
+        }
+        let default = settings
+            .agent
+            .openclaw_url
+            .clone()
+            .unwrap_or_else(|| oc::DEFAULT_URL.to_string());
+        let url = match asked.url.clone() {
+            Some(url) => url,
+            None if interactive => {
+                let line = ask_line(&format!(
+                    "OpenClaw gateway URL; it must match the gateway's port (gateway.port in \
+                     openclaw.json) [{default}]: "
+                ))?;
+                if line.is_empty() { default } else { line }
+            }
+            None => default,
+        };
+        oc::check_url(&url)?;
+        Some(url.trim().trim_end_matches('/').to_string())
+    } else {
+        None
+    };
+
     let profile = human_profile(args, &settings)?;
     let (command, server_args) = mcp_server_command(args, &profile)?;
     // Only `command` and `args`: wats needs no `env`.
-    let entry = json!({"command": command, "args": server_args}).to_string();
-    let output = run_openclaw(openclaw, &["mcp", "set", "wats", &entry])?;
-    openclaw_ok(&output, "mcp set wats")?;
-    let shown = run_openclaw(openclaw, &["mcp", "show", "wats"])?;
-    openclaw_ok(&shown, "mcp show wats")?;
+    openclaw_mcp_set(
+        openclaw,
+        "wats",
+        &json!({"command": command, "args": server_args}),
+        &command,
+        None,
+    )?;
     println!("OpenClaw: wats MCP server set (profile {profile})");
-    if String::from_utf8_lossy(&shown.stdout).contains(command.as_str()) {
-        println!("  checked: `openclaw mcp show wats` runs {command}");
-    } else {
-        eprintln!("warning: `openclaw mcp show wats` does not show {command}; check it there");
-    }
     println!(
         "  OpenClaw names its tools wats__<tool> (e.g. wats__post): `wats__*` in a tool \
          policy allows or denies them all. Swarm posts are untrusted data."
+    );
+    let Some(gateway) = gateway else {
+        return Ok(());
+    };
+
+    let (hooks_token, _) = oc::ensure_token(&oc::hooks_token_path(data_dir))?;
+    let (runner_token, _) = oc::ensure_token(&oc::runner_token_path(data_dir))?;
+    let agent_profile = settings
+        .agent
+        .profile
+        .clone()
+        .unwrap_or_else(|| format!("{}-agent", os_user_profile()));
+    anyhow::ensure!(
+        wats::node::is_valid_profile(&agent_profile),
+        "agent profile must be 1-64 chars of [a-z0-9_-]"
+    );
+    let (command, agent_args) = mcp_server_command(args, &agent_profile)?;
+    openclaw_mcp_set(
+        openclaw,
+        oc::AGENT_SERVER,
+        &json!({"command": command, "args": agent_args,
+                "env": {"WATS_RUNNER_TOKEN": runner_token}}),
+        &command,
+        Some(&runner_token),
+    )?;
+    println!(
+        "OpenClaw: {} MCP server set (profile {agent_profile}, runner token in {}): its \
+         posts are the agent's, and agent.review holds them",
+        oc::AGENT_SERVER,
+        oc::runner_token_path(data_dir).display()
+    );
+    let agent_id = settings
+        .agent
+        .openclaw_agent
+        .clone()
+        .filter(|a| !a.trim().is_empty())
+        .unwrap_or_else(|| oc::DEFAULT_AGENT.to_string());
+    println!(
+        "\nPaste this into OpenClaw's config (openclaw.json, JSON5; wats never edits it), \
+         then restart the gateway:\n\n{}",
+        oc::config_block(&agent_id)
+    );
+    println!(
+        "The hook token is read from the gateway's environment, not stored in openclaw.json. \
+         Put this line in the environment the gateway runs in (e.g. its launch agent or \
+         systemd unit). This is the only place the token is printed; wats keeps it in {}:\n\n\
+         export {}={hooks_token}\n",
+        oc::hooks_token_path(data_dir).display(),
+        oc::HOOKS_TOKEN_ENV
+    );
+    match run_openclaw(openclaw, &["config", "validate"]) {
+        Ok(output) if output.status.success() => {
+            println!("`openclaw config validate`: OK (run it again once the block is pasted)")
+        }
+        Ok(output) => eprintln!(
+            "warning: `openclaw config validate` failed ({}): {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        ),
+        Err(e) => eprintln!("warning: `openclaw config validate`: {e:#}"),
+    }
+    let mut file = ConfigFile::open(data_dir)?;
+    file.set("agent.runtime", "openclaw")?;
+    file.set("agent.openclaw_url", &gateway)?;
+    file.save()?;
+    println!(
+        "{}: agent.runtime = \"openclaw\", agent.openclaw_url = \"{gateway}\"; `wats` now \
+         forwards the agent's runs to the OpenClaw gateway (agent {agent_id})",
+        file.path().display()
     );
     Ok(())
 }
@@ -1111,8 +1298,12 @@ async fn status_command(config: &NodeConfig, json: bool) -> Result<()> {
                 status["update"] = update;
             }
             // What `wats` would run: no agent in config.toml.
-            if Settings::load(&config.data_dir).is_ok_and(|s| s.agent.runtime.is_none()) {
-                status["notice"] = wats::firstrun::NO_AGENT_NOTICE.into();
+            match Settings::load(&config.data_dir).map(|s| s.agent.runtime) {
+                Ok(None) => status["notice"] = wats::firstrun::NO_AGENT_NOTICE.into(),
+                Ok(Some(runtime)) if runtime == "openclaw" => {
+                    status["budget"] = wats::openclaw::BUDGET.into();
+                }
+                _ => {}
             }
             status
         }
@@ -1769,7 +1960,29 @@ fn agent_config(
         .or(file.access.as_deref())
         .unwrap_or("locked")
         .parse()?;
+    let mut budget = budget_of(file);
+    let mut openclaw = wats::openclaw::Target::default();
+    if runtime == "openclaw" {
+        wats::openclaw::check_access(access, &allow, file.review == Some(true))?;
+        if let Some(url) = &file.openclaw_url {
+            wats::openclaw::check_url(url).context("config.toml agent.openclaw_url")?;
+            openclaw.url = url.trim().to_string();
+        }
+        if let Some(agent) = file
+            .openclaw_agent
+            .as_ref()
+            .filter(|a| !a.trim().is_empty())
+        {
+            openclaw.agent = agent.trim().to_string();
+        }
+        openclaw.token_file = wats::openclaw::hooks_token_path(data_dir);
+        // OpenClaw reports no cost: spend caps are OpenClaw's; the runs per
+        // day still count.
+        budget.max_usd_per_day = f64::INFINITY;
+        budget.max_usd_per_month = f64::INFINITY;
+    }
     Ok(Some(wats::agent::AgentConfig {
+        openclaw,
         runtime,
         ignore_local: args.ignore_local.or(file.ignore_local).unwrap_or(true),
         model: args
@@ -1814,7 +2027,7 @@ fn agent_config(
             .unwrap_or(Duration::from_secs(10 * 60)),
         work_dir: data_dir.join("agent"),
         max_turns: file.max_turns.unwrap_or(10),
-        budget: budget_of(file),
+        budget,
         wakes: {
             let default = wats::wake::WakeLimits::default();
             wats::wake::WakeLimits {
@@ -1960,7 +2173,18 @@ fn print_banner(config: &NodeConfig, agent: Option<&wats::agent::AgentConfig>) {
     }
     if let Some(agent) = agent {
         let spend = wats::budget::spend(&agent.work_dir, unix_now());
-        if agent.runtime == "codex" {
+        if agent.runtime == "openclaw" {
+            eprintln!(
+                "agent forwards to OpenClaw {} (agent {}) · budget: {}: spend caps belong on the \
+                 OpenClaw side · {} of {} runs today · {} per run",
+                agent.openclaw.url,
+                agent.openclaw.agent,
+                wats::openclaw::BUDGET,
+                spend.uncosted_today,
+                agent.budget.max_runs_per_day,
+                short_duration(agent.run_timeout)
+            );
+        } else if agent.runtime == "codex" {
             // Codex reports tokens, not dollars: runs are what is counted.
             eprintln!(
                 "agent budget: {} of {} runs today (Codex reports no cost) · {} per run",
@@ -2031,6 +2255,15 @@ async fn agent_watch(data_dir: &std::path::Path, action: AgentAction) -> Result<
                             r.turns.map(|t| t.to_string()).unwrap_or_default(),
                             r.cost_usd.map(|c| format!("${c:.4}")).unwrap_or_default(),
                         )
+                        .and_then(|()| match (&r.completion, &r.reply) {
+                            (None, None) => Ok(()),
+                            (completion, reply) => writeln!(
+                                out,
+                                "  OpenClaw: completion {} · reply {}",
+                                completion.as_deref().unwrap_or("-"),
+                                reply.as_deref().unwrap_or("-")
+                            ),
+                        })
                     });
                 }
                 let cost = shown
@@ -2038,9 +2271,13 @@ async fn agent_watch(data_dir: &std::path::Path, action: AgentAction) -> Result<
                     .filter_map(|r| r.cost_usd)
                     .fold(0.0, |a, b| a + b);
                 // A config.toml that does not load must not hide the runs.
-                let budget = Settings::load(data_dir)
-                    .map(|s| budget_of(&s.agent))
-                    .unwrap_or_default();
+                let settings = Settings::load(data_dir).unwrap_or_default();
+                let mut budget = budget_of(&settings.agent);
+                let openclaw = settings.agent.runtime.as_deref() == Some("openclaw");
+                if openclaw {
+                    budget.max_usd_per_day = f64::INFINITY;
+                    budget.max_usd_per_month = f64::INFINITY;
+                }
                 let now = unix_now();
                 let spend = wats::budget::spend(&work_dir, now);
                 let paused = match wats::budget::check(&budget, &spend, now) {
@@ -2054,7 +2291,16 @@ async fn agent_watch(data_dir: &std::path::Path, action: AgentAction) -> Result<
                         out,
                         "{} runs shown, ${cost:.4} reported\nbudget: {}{paused}",
                         shown.len(),
-                        wats::budget::describe(&budget, &spend)
+                        if openclaw {
+                            format!(
+                                "{} ({} of {} runs today)",
+                                wats::openclaw::BUDGET,
+                                spend.uncosted_today,
+                                budget.max_runs_per_day
+                            )
+                        } else {
+                            wats::budget::describe(&budget, &spend)
+                        }
                     )
                 })
             }
@@ -2376,10 +2622,25 @@ async fn main() -> Result<()> {
                 Some(SetupTool::Openclaw {
                     mcp,
                     remove,
-                    agent: _,
+                    agent,
+                    yes,
+                    url,
                     openclaw,
                 }),
-        }) => return setup_openclaw(&cli.node, &data_dir, (mcp, remove), &openclaw),
+        }) => {
+            return setup_openclaw(
+                &cli.node,
+                &data_dir,
+                OpenclawSetup {
+                    mcp,
+                    agent,
+                    remove,
+                    yes,
+                    url,
+                },
+                &openclaw,
+            );
+        }
         _ => {}
     }
     first_run(&cli, &data_dir)?;
@@ -2424,9 +2685,10 @@ async fn main() -> Result<()> {
         config.review_profiles.push(agent.profile.clone());
     }
     // `--agent claude|codex` also makes sure that tool's sessions see the
-    // swarm.
+    // swarm (OpenClaw: `wats setup openclaw`, which never runs here).
     if let Some(agent) = &agent
         && daemon.agent.agents.contains(&agent.runtime)
+        && agent.runtime != "openclaw"
     {
         let profile = human_profile(&cli.node, &settings)?;
         let (name, registered) = if agent.runtime == "codex" {

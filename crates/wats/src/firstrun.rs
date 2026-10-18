@@ -34,10 +34,24 @@ pub const NO_AGENT_FOUND: &str = "No agent CLI found: install Claude Code \
 (https://claude.com/claude-code) or Codex (https://github.com/openai/codex), then run \
 `wats setup` again.";
 
-/// Shown by setup when OpenClaw is on `PATH`: it cannot be the node's
-/// agent yet, but its agents can use the wats tools.
+/// Shown by setup when OpenClaw is on `PATH` and not the node's agent: its
+/// agents can use the wats tools.
 pub const OPENCLAW_MCP_HINT: &str = "OpenClaw found: to reach the swarm from your OpenClaw \
 agents, register wats as its MCP server: wats setup openclaw --mcp";
+
+/// Shown by setup when OpenClaw is the node's agent: the gateway side is
+/// set up apart (tokens, MCP entries, the config block to paste).
+pub const OPENCLAW_AGENT_NEXT: &str = "`wats` now forwards the agent's runs to OpenClaw's \
+gateway. Finish with: wats setup openclaw --agent (the hook token, the restricted `wats` \
+OpenClaw agent and its MCP entry)";
+
+/// Keys OpenClaw does not use: it reports no cost and counts its own
+/// turns (ADR 0017 §2).
+const NOT_FOR_OPENCLAW: [&str; 3] = [
+    "agent.max_turns",
+    "agent.max_usd_per_day",
+    "agent.max_usd_per_month",
+];
 
 /// The questions after the agent runtime, in order: storage, the agent's
 /// limits (only asked when it runs an agent), networks.
@@ -259,9 +273,13 @@ pub fn prompt(
         "wats setup: the node's main choices. Enter accepts the [default]."
     )?;
     let runtime = ask_runtime(input, out, found, settings.agent.runtime.as_deref())?;
+    let openclaw = runtime.as_deref() == Some("openclaw");
+    if openclaw {
+        writeln!(out, "{}", crate::openclaw::SPEND_CAPS)?;
+    }
     let mut values = Vec::new();
     for (key, label, agent_only) in QUESTIONS {
-        if agent_only && runtime.is_none() {
+        if (agent_only && runtime.is_none()) || (openclaw && NOT_FOR_OPENCLAW.contains(&key)) {
             continue;
         }
         let default = current(settings, key).unwrap_or_else(|| {
@@ -313,7 +331,9 @@ pub fn render(choices: &Choices) -> Result<String> {
     line(&mut text, "nets")?;
     text.push_str("\n[storage]\n");
     line(&mut text, "storage.max")?;
-    text.push_str("\n[agent]\n# agent run with the node: claude or codex (default: none)\n");
+    text.push_str(
+        "\n[agent]\n# agent run with the node: claude, codex or openclaw (default: none)\n",
+    );
     match &choices.runtime {
         Some(runtime) => text.push_str(&format!(
             "runtime = {}\n",
@@ -396,6 +416,7 @@ pub fn setup(
     let file = apply(data_dir, &choices)?;
     writeln!(out, "Wrote {}", file.display())?;
     match &choices.runtime {
+        Some(runtime) if runtime == "openclaw" => writeln!(out, "{OPENCLAW_AGENT_NEXT}")?,
         Some(runtime) => {
             let name = if runtime == "codex" {
                 "Codex"
@@ -410,7 +431,8 @@ pub fn setup(
         }
         None => writeln!(out, "{NO_AGENT_NOTICE}")?,
     }
-    if found.iter().any(|f| f.name == "openclaw") {
+    if found.iter().any(|f| f.name == "openclaw") && choices.runtime.as_deref() != Some("openclaw")
+    {
         writeln!(out, "{OPENCLAW_MCP_HINT}")?;
     }
     Ok(choices)
@@ -453,7 +475,7 @@ mod tests {
                 }
             ]
         );
-        assert!(found[0].supported() && !found[1].supported());
+        assert!(found.iter().all(Found::supported));
         assert!(detect_agents(None).is_empty());
     }
 
@@ -473,6 +495,14 @@ mod tests {
         assert_eq!(choices.runtime.as_deref(), Some("codex"));
         assert!(said.contains("wats setup codex --mcp"), "{said}");
         assert!(said.contains(OPENCLAW_MCP_HINT), "{said}");
+        // OpenClaw as the agent: the next step is its own setup.
+        let other = tempfile::tempdir().unwrap();
+        let mut out = Vec::new();
+        let choices = setup(other.path(), &mut "2\n".as_bytes(), &mut out, Some(&path)).unwrap();
+        let said = String::from_utf8(out).unwrap();
+        assert_eq!(choices.runtime.as_deref(), Some("openclaw"));
+        assert!(said.contains(OPENCLAW_AGENT_NEXT), "{said}");
+        assert!(!said.contains(OPENCLAW_MCP_HINT), "{said}");
         // Without OpenClaw, no hint.
         std::fs::remove_file(bin.path().join("openclaw")).unwrap();
         let mut out = Vec::new();
@@ -553,21 +583,29 @@ mod tests {
         assert_eq!(settings.nets, ["public", "acme"]);
     }
 
+    /// OpenClaw is offered as an agent; its spend caps are its own, so the
+    /// USD budgets and turns are not asked.
+    #[test]
+    fn openclaw_is_offered_as_an_agent() {
+        let (choices, said) = run(&found(&["openclaw"]), &Settings::default(), "");
+        assert!(said.contains("1) openclaw"), "{said}");
+        assert!(!said.contains("not supported yet"), "{said}");
+        assert!(said.contains(crate::openclaw::SPEND_CAPS), "{said}");
+        assert_eq!(choices.runtime.as_deref(), Some("openclaw"));
+        let keys: Vec<_> = choices.values.iter().map(|(k, _)| *k).collect();
+        assert_eq!(keys, ["storage.max", "agent.timeout", "nets"]);
+        let text = render(&choices).unwrap();
+        assert!(text.contains("\nruntime = \"openclaw\"\n"), "{text}");
+    }
+
     #[test]
     fn no_supported_agent_found() {
-        let (choices, said) = run(&found(&["openclaw"]), &Settings::default(), "");
-        assert!(said.contains("openclaw"), "{said}");
-        assert!(
-            said.contains("(agent: not supported yet; MCP: wats setup openclaw --mcp)"),
-            "{said}"
-        );
+        let (choices, said) = run(&[], &Settings::default(), "");
         assert!(said.contains(NO_AGENT_FOUND), "{said}");
         assert_eq!(choices.runtime, None);
         // No agent: no agent limits asked.
         let keys: Vec<_> = choices.values.iter().map(|(k, _)| *k).collect();
         assert_eq!(keys, ["storage.max", "nets"]);
-        let (_, said) = run(&[], &Settings::default(), "");
-        assert!(said.contains(NO_AGENT_FOUND), "{said}");
     }
 
     #[test]
