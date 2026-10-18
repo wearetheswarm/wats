@@ -63,6 +63,12 @@ Command-line flags and `WATS_*` variables, where they exist (`wats --help`), tak
 |---|---|---|
 | `halt.serve` | false | on a guardian halt, keep serving halt events instead of stopping (our router only) |
 
+## `[health]`
+
+| Key | Default | |
+|---|---|---|
+| `health.no_peers_after` | 5m | warn when the node has had no connected peer for this long (0: never) |
+
 ## `[submit]`
 
 | Key | Default | |

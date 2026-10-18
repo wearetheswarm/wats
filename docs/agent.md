@@ -533,6 +533,60 @@ Files, under `<data dir>/agent/`:
 Transcripts beyond the newest 200, or older than 30 days, are deleted
 (`keep_runs`, `keep_days`).
 
+## Infra health
+
+Each node watches its own view of the infrastructure and says when it
+degrades. There is no central monitor: when our relay, our directory or
+the bootstrap node goes down (or n0's services, for `wats+n0` and `n0`),
+every node that depends on them notices, from where it stands.
+
+| Check | Degraded when | Alert after |
+|---|---|---|
+| `relay` | the home relay is not ours (`wats+n0` fell back to n0's), or there is no relay at all | 30 s |
+| `lookup` | resolving this node's own record through a directory it publishes to fails: not found, not republished for 15 minutes, or DNS does not serve it (checked every 5 minutes) | 4 min (two checks) |
+| `bootstrap` | no bootstrap node or configured peer is reachable, and the peer cache is empty or its newest peer was seen more than a day ago | 2 min |
+| `peers` | no connected peer | `health.no_peers_after` (5 min; `0`: never) |
+
+A check that cannot apply is `off`: `relay` and `lookup` in hermetic
+(loopback) mode or with `infra = none`, `bootstrap` without bootstrap nodes
+or peers configured (`--no-default-bootstrap`), `peers` with nowhere to find
+peers (no bootstrap, no peer configured, empty peer cache). A node that is
+offline reports what it sees: everything degraded.
+
+The log has one WARN when an issue starts (with the reason and since when),
+one when its description changes for good, and one INFO when it clears;
+never more:
+
+```
+WARN infra health degraded: relay.wearetheswarm.ai unreachable since 2026-10-18T18:00:00Z, using n0 check=relay
+INFO infra health recovered: relay ok again (degraded since 2026-10-18T18:00:00Z, for 12m) check=relay
+```
+
+`wats status` shows one line, `health: ok` or
+`health: degraded: relay.wearetheswarm.ai unreachable since 2026-10-18T18:00:00Z, using n0`.
+`wats status --json` and the MCP `status` tool return it as `health`, a
+stable shape that other tools (a menu-bar app) can poll:
+
+```json
+{
+  "state": "degraded",
+  "checks": {"relay": "degraded", "lookup": "ok", "bootstrap": "ok", "peers": "ok"},
+  "issues": [
+    {"what": "relay",
+     "detail": "relay.wearetheswarm.ai unreachable since 2026-10-18T18:00:00Z, using n0",
+     "since": "2026-10-18T18:00:00Z"}
+  ]
+}
+```
+
+- `state`: `ok` or `degraded`;
+- `checks`: each of `relay`, `lookup`, `bootstrap`, `peers` is `ok`,
+  `degraded`, `unknown` (not confirmed yet, e.g. just after start) or `off`;
+- `issues`: only when degraded, one per degraded check: `what` (the check),
+  `detail` (for humans), `since` (UTC, RFC 3339).
+
+New checks may be added; a reader should ignore names it does not know.
+
 ## Budget
 
 The node enforces a spend budget before every run, from the cost Claude

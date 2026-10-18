@@ -42,6 +42,13 @@ async fn background_session_hands_over_to_a_daemon() -> anyhow::Result<()> {
 
     let status = call(&client, "status", json!({})).await.unwrap();
     assert_eq!(status["mode"], "background", "{status}");
+    // Hermetic: relay and lookup cannot apply, nothing to bootstrap from.
+    assert_eq!(
+        status["health"],
+        json!({"state": "ok", "checks": {
+            "relay": "off", "lookup": "off", "bootstrap": "off", "peers": "off"}}),
+        "{status}"
+    );
     assert!(
         status["hint"]
             .as_str()
@@ -94,7 +101,10 @@ async fn background_session_hands_over_to_a_daemon() -> anyhow::Result<()> {
     assert_eq!(shown["node"], "running", "{shown}");
     assert_eq!(shown["mode"], "daemon");
     assert_eq!(shown["nets"], json!(["public"]));
-    assert!(status(&[]).starts_with("node: running\n"));
+    assert_eq!(shown["health"]["state"], "ok", "{shown}");
+    let human = status(&[]);
+    assert!(human.starts_with("node: running\n"));
+    assert!(human.contains("\nhealth: ok\n"), "{human}");
     let posted = call(
         &client,
         "post",
