@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- **Partial answers instead of silence** (ADR 0018 §1–2): the run prompt
+  says what the run can use (`{access}`: with `locked`, it cannot run,
+  build or test anything), and the runner's and MCP instructions tell an
+  agent that can do only part of an ask to offer it through a `clarify`
+  (options such as "untested code" / "no thanks", and a default) instead
+  of declining silently.
 - **A busy data directory names its holder**: when `wats` finds the data
   directory locked, it prints the other process's pid, version, binary path
   and start time, and the `kill` command to stop it.

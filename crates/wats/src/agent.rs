@@ -226,9 +226,10 @@ fn count(n: usize, one: &str, many: &str) -> String {
 
 /// The prompt of one run: the heartbeat template (HEARTBEAT.md) with its
 /// variables filled: `{agent_profile}`, `{user}`, `{agent.about}`,
-/// `{reasons}`, `{cursor}` and `{events}` (one line per event: id · kind ·
-/// author · title). A template without `{events}` gets that context
-/// appended.
+/// `{reasons}`, `{cursor}`, `{access}` (what the run can use, see
+/// [`access::prompt_line`]) and `{events}` (one line per event: id · kind ·
+/// author · title). A template without `{access}` or `{events}` gets
+/// that context appended.
 /// `- id · kind · author · title` for each event.
 fn event_lines(node: &Node, ids: &[String]) -> Vec<String> {
     let mut lines: Vec<String> = ids
@@ -295,6 +296,12 @@ pub fn prompt(node: &Node, config: &AgentConfig, since: i64, trigger: &Trigger) 
         config.about.trim()
     };
     let cursor = format!("since={since}");
+    let access = access::prompt_line(
+        &config.runtime,
+        config.access,
+        &config.workdir,
+        &config.tools,
+    );
     let template = config.heartbeat_text.trim_end();
     let mut prompt = template
         .replace("{agent_profile}", &config.profile)
@@ -302,7 +309,11 @@ pub fn prompt(node: &Node, config: &AgentConfig, since: i64, trigger: &Trigger) 
         .replace("{agent.about}", about)
         .replace("{reasons}", &reasons)
         .replace("{cursor}", &cursor)
+        .replace("{access}", &access)
         .replace("{events}", &events);
+    if !template.contains("{access}") {
+        prompt.push_str(&format!("\n\nWhat you can use in this run: {access}"));
+    }
     if !template.contains("{events}") {
         prompt.push_str(&format!(
             "\n\n---\nYou are {}. You were woken because: {reasons}.\nNew since your last run ({cursor}):\n{events}\n",

@@ -158,6 +158,16 @@ async fn agent_wakes_on_asks_and_heartbeats() -> anyhow::Result<()> {
         "{prompt}"
     );
     assert!(prompt.contains("Who can review my CSV?"), "{prompt}");
+    // It knows it cannot build or test anything (ADR 0018 §1), and what to
+    // do about an ask it can only do in part.
+    assert!(
+        prompt.contains(
+            "What you can use in this run: Only the wats tools: no shell, no files, no \
+             compiler or interpreter. You cannot run, build or test anything in this run."
+        ),
+        "{prompt}"
+    );
+    assert!(prompt.contains("Don't decline silently"), "{prompt}");
     assert!(!prompt.contains('{'), "every variable is filled: {prompt}");
     // Only the user acknowledges changed safety settings.
     assert!(!prompt.contains("config ack"), "{prompt}");
