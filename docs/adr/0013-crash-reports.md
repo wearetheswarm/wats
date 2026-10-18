@@ -88,6 +88,7 @@ Code: `crates/wats/src/inbox.rs`, `wats inbox`. Design: ADR 0015 §5.
   different authors never merge.
 - **Fallback.** While `MAINTAINERS_INBOX` is unset and no `report.inbox` is
   configured, the `crash_report` request to `report.collector` stays as
-  above, unchanged. The router's collector is removed once the key ships
+  above, unchanged. (2026-10-18: the key is set. Reports go to the inbox
+  unless `report.collector` or `report.inbox` is set explicitly.) The router's collector is removed once the key ships
   and the nodes that only know the collector are gone; this ADR is then
   superseded by ADR 0015 §5.

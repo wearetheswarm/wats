@@ -1631,12 +1631,15 @@ impl NodeArgs {
             ),
             None => wats::bootstrap::defaults().first().map(|b| b.id),
         };
-        config.report_inbox = match file
-            .report
-            .inbox
-            .as_deref()
-            .or(wats::inbox::MAINTAINERS_INBOX)
-        {
+        // Where reports go: an explicit `report.inbox`, else an explicit
+        // `report.collector` (the compiled-in inbox is only a default), else
+        // the maintainers' inbox, else the default collector.
+        let compiled_inbox = if file.report.collector.is_some() {
+            None
+        } else {
+            wats::inbox::MAINTAINERS_INBOX
+        };
+        config.report_inbox = match file.report.inbox.as_deref().or(compiled_inbox) {
             Some(key) => Some(
                 wats::inbox::InboxPublic::from_b64(key)
                     .map_err(|e| anyhow::anyhow!("config.toml report.inbox: {e:#}"))?,

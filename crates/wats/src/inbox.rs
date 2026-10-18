@@ -44,10 +44,15 @@ type PublicKey = <Kem as hpke::Kem>::PublicKey;
 type EncappedKey = <Kem as hpke::Kem>::EncappedKey;
 
 /// The maintainers' inbox public key (base64url), compiled in like the
-/// bootstrap list. `None` until it is generated (`wats inbox keygen`, see
-/// docs/release-signing.md, "Inbox key"): crash reports then go to
-/// `report.collector` instead.
-pub const MAINTAINERS_INBOX: Option<&str> = None;
+/// bootstrap list, generated with `wats inbox keygen` (docs/release-signing.md,
+/// "Inbox key"; the secret is kept in sops). Its id is
+/// [`MAINTAINERS_INBOX_ID`]. `report.inbox` overrides it; with `None`,
+/// crash reports would go to `report.collector` instead.
+pub const MAINTAINERS_INBOX: Option<&str> = Some(
+    "zbjHcnmWczc99LWhiOwnrkdKVhxue6MHa2YO87ak11oVCJpTPLUkm1Yx-5FhhXd6i8QwNqZlOEmRCDFQvFobFFFiD5QHcrhpzwoW7BKKShcDdjFtvmqshwa3UHB6U7LEKYLEVYeZmASBO1qIybGNzkpy-0lEO4mxvoh27Kl_zcGEaXp_Zkw1TBghXRKKR2Bv2gG7uxKclcgK4mOgQlEC_1Y9ytjDxHG2qafFlqyGe9ZnqBqAtda8Y4c3HhcCYiAoi5y7cEXKdtevLPEuiNBa64CsvIwlybt4W9QOs7pbl2zLxiYw0BAC6bkc-lGnTaJTtbJ0cfFzYsp8Jmp0oZIzcNMZR8WwClF14OdSjUOiUnhbrBu7zwi3_BTGECtUl3tw7ZRXd5VNtSJrgkwaySGoE3jKaCAm6aQGpwVgl_iXmjcFZqeIHIWpFtRrFiHHgtiWP3yKXDhAb1yOmJiYZ9s8lnCoupsV80iLZvBIWUMh0NZYX1SHpTuaVzYNYFQw4_LOBlIHN0LMPMlp8-ZOYoBm5mFITzlckICD_9WRnoIr3MJD9Vu4JEJWjgNVktOKBkKLxAkU51RLxyA5sRgVQyEPZGCRVCG5cZEEzjup-UTI9GZkhshQG1ZKM6w7jKls0_xsfMhVh9F1jHuNgMosNKuFcPRILLRZGME4C-yo5YmkOKaODZFi_tugEQeeKHI9SjE9k4JfVGQuVbJTKvYA-fly99y5ZTc9wilHVtqKASMwFBRKvDeaQmZ_oWE7N3vHnKZp78utU0C3ALqrFTNVvkmpdDgpn2pLuUwANTx6VUIYh-p3eBVprVYc87ZKMZWulkwz9UwSiUdgDBydVzm9xyLGIpOb4nmyf0Mqp4Rj4MkGIGjCcpIPbBCFECNYhzt-wLQ0fleqSWGsp6IJB4FLWnLE44cP8HuVShGa5Yg0eaxX5fIwDIcpKjpIJkaq5mU9D4kGyUlsewF6_DbDTUlnChpMRHxtaHVsSEt56Gl9Y8onXjqq6OQqb0qoAPZXXlQm01FaNmQXb6UQUKaBqwjLHPWpd2kUgQImpYW6_csHNOIbw_RIE0oiUXNCQPXE98CwuNBMfFFA2fBygwm84Fw0GnNRrFVpr1wxXwMXb1kMowJA4Lt-SwOofQMv_OG0C5R7gYBzwaCB9cJV4yMroUJhqjdJBHTBR0tcOeE3zHV6wdscr8y5hBA6kSanpRNe1rqw90y1G4aRmxFT8wZqS6VqqyMFiDeWV-vDZItzSGXIxvUjo6VeiEU7SapPkyelEygm9SQblmFio4hrwdVrI7ukJeZKJdxWElVNu7NIh1Gx4ltUQFsPJ6kn1lUk40RX2UysX3JOdIBZfWFDbWEeOYgUX0mbeGkb5ZwOfFR3rdZapjYn81BKICmgF8A1-pKYZ8K3XHdqywFbX1WrHvjKWsuQJTSLmhZ2rXVEA7OpwwJnm2mF9hqQBnI-RpEDnpRE5rWWniEFyAUXXkpRp5BBElt6q8SmaWDEN8GvdyE3sOtWPHu9cfwe99qcsiRwVHNhwdm1adTFhDmtV8kbfGpsLK0AsCCV1e0i8nizT74Apchr4fuEF3sNr1q9AMi1HXdE5rPUVPIf-tyaWAmPsCl1UyZzqTWzEw",
+);
+/// The inbox id of [`MAINTAINERS_INBOX`], as published with it.
+pub const MAINTAINERS_INBOX_ID: &str = "inbox:6579c82d9bda63d4eea8adeeff05e383";
 
 /// Size of an X-Wing public key.
 pub const PUBLIC_KEY_BYTES: usize = 1216;
@@ -675,7 +680,8 @@ mod tests {
         assert!(InboxKey::from_secret_str("abcd").is_err());
         // The compiled-in key, once set, must parse.
         if let Some(maintainers) = MAINTAINERS_INBOX {
-            InboxPublic::from_b64(maintainers).unwrap();
+            let public = InboxPublic::from_b64(maintainers).unwrap();
+            assert_eq!(public.id(), MAINTAINERS_INBOX_ID, "the published inbox id");
         }
     }
 

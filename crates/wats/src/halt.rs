@@ -37,9 +37,12 @@ use crate::event::{Draft, Event, Kind};
 use crate::node::PUBLIC_NET;
 
 /// The guardians' public keys (64 hex), compiled in and changed only by a
-/// release (ADR 0016 §1). Empty until the founder's key is sent: an empty
-/// set disables the halt entirely.
-pub const GUARDIANS: &[&str] = &[];
+/// release (ADR 0016 §1), announced in its notes and listed in
+/// docs/network-halt.md. An empty set disables the halt entirely.
+pub const GUARDIANS: &[&str] = &[
+    // Vincent Carluer, founder (2026-10-18).
+    "3f1675fefba2606f3b5187597e9e9087c708cf4c98c5709b3523186a114370bb",
+];
 /// How many distinct guardians a halt or an unhalt needs.
 pub const HALT_THRESHOLD: usize = 1;
 /// How long after a halt (or unhalt) its approvals count. It changes with
@@ -773,6 +776,21 @@ mod tests {
         g = set(&[1], 2);
         assert!(!g.enabled(), "a threshold above the set");
         assert!(!Guardians::compiled().enabled() || !GUARDIANS.is_empty());
+    }
+
+    /// The compiled set: valid v1 keys (canonical, not of small order),
+    /// distinct, and a threshold they can meet.
+    #[test]
+    fn compiled_guardians_are_valid_keys() {
+        for key in GUARDIANS {
+            let bytes = crate::event::parse_hex::<32>(key, "guardian").unwrap();
+            crate::wire::check_v1_key(&bytes, "guardian").unwrap();
+        }
+        let mut sorted = GUARDIANS.to_vec();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(sorted.len(), GUARDIANS.len(), "no duplicate guardian");
+        assert!(Guardians::compiled().enabled());
     }
 
     #[test]

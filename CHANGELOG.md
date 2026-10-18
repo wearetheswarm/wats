@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- **Keys in the binary.**
+  - Maintainers' inbox, the default destination of crash reports:
+    `MAINTAINERS_INBOX`, id `inbox:6579c82d9bda63d4eea8adeeff05e383`.
+    An explicit `report.collector` or `report.inbox` takes precedence.
+  - Guardian set: 1 of 1, approval window 24 h. The founder's key is
+    `3f1675fefba2606f3b5187597e9e9087c708cf4c98c5709b3523186a114370bb`
+    ([docs/network-halt.md](docs/network-halt.md)).
 - **`install.sh`**: installs a signed release (macOS arm64, Linux x86_64)
   after the same checks as `wats upgrade` (both minisign signatures, the
   signed file names, the SHA-256), into `~/.local/bin` or `--prefix`,
