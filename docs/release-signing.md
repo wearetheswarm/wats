@@ -8,15 +8,12 @@ Each release asset `wats-X.Y.Z-<target>.tar.gz` comes with:
 - `wats-X.Y.Z-<target>.tar.gz.sha256.minisig`: the signature of the checksum
   file.
 
-> **Status: preparation.** The release workflow is ready to sign, but the
-> signing key does not exist yet. Until it does, releases carry no `.minisig`
-> files and the public key below is a placeholder. Do not trust a key that is
-> not published in this repository.
+Do not trust a key that is not published in this repository.
 
 ## Public key
 
 ```text
-MINISIGN_PUBLIC_KEY_PLACEHOLDER
+RWRq1jSm2cLFXa7MknbYgKFMYbgbyNEF5fkIpkEGGZzkQZ3i5rIYabci
 ```
 
 The same key is quoted in the README Quickstart. The release workflow
@@ -30,7 +27,7 @@ release from https://github.com/jedisct1/minisign/releases), then:
 
 ```sh
 gh release download vX.Y.Z -R wearetheswarm/wats -p '*linux-musl*'   # or '*apple-darwin*'
-minisign -Vm wats-X.Y.Z-x86_64-unknown-linux-musl.tar.gz -P MINISIGN_PUBLIC_KEY_PLACEHOLDER
+minisign -Vm wats-X.Y.Z-x86_64-unknown-linux-musl.tar.gz -P RWRq1jSm2cLFXa7MknbYgKFMYbgbyNEF5fkIpkEGGZzkQZ3i5rIYabci
 shasum -a 256 -c wats-X.Y.Z-x86_64-unknown-linux-musl.tar.gz.sha256
 ```
 
@@ -46,7 +43,7 @@ to the project's key. If you only use the checksum (for instance in a
 script that pins it), verify the checksum file's own signature first:
 
 ```sh
-minisign -Vm wats-X.Y.Z-<target>.tar.gz.sha256 -P MINISIGN_PUBLIC_KEY_PLACEHOLDER
+minisign -Vm wats-X.Y.Z-<target>.tar.gz.sha256 -P RWRq1jSm2cLFXa7MknbYgKFMYbgbyNEF5fkIpkEGGZzkQZ3i5rIYabci
 ```
 
 ## How releases are signed
@@ -63,10 +60,10 @@ attaching them to the GitHub release:
   the same workflows, so it would add no protection in CI; the offline
   backup is encrypted anyway (see below);
 - the workflow derives the public key from the secret key, verifies every
-  signature it makes, and fails if README.md and this file publish another
-  key (a warning only while they still hold the placeholder);
-- if `MINISIGN_SECRET_KEY` is not set, the signing steps are skipped with a
-  warning in the run, and the release is published unsigned.
+  signature it makes, and fails if README.md and this file do not publish
+  that key;
+- if `MINISIGN_SECRET_KEY` is not set, the workflow fails: no release is
+  published unsigned.
 
 A backup of the secret key is kept outside GitHub, encrypted with the rest
 of the project's operational secrets (sops). GitHub secrets cannot be read

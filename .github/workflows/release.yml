@@ -12,8 +12,8 @@ name: release
 #   aarch64-apple-darwin       Apple silicon (macOS minutes cost ~10x; once
 #                              per release)
 # Each binary is attached to the release as wats-X.Y.Z-<target>.tar.gz plus
-# a .sha256, each signed with minisign (.minisig) when the MINISIGN_SECRET_KEY
-# secret is set; without it the signing steps are skipped with a warning
+# a .sha256, each signed with minisign (.minisig) with the key held in the
+# MINISIGN_SECRET_KEY secret; without it the run fails
 # (docs/release-signing.md). Download: gh release download vX.Y.Z -R wearetheswarm/wats
 # Windows native and the cargo-dist installers come with the public launch
 # (installers need public releases).
@@ -107,18 +107,15 @@ jobs:
 
       # Signing (docs/release-signing.md): the archive and its .sha256 get a
       # minisign .minisig each. The key is a password-less minisign secret
-      # key held only in the MINISIGN_SECRET_KEY repo secret. Until it is
-      # set, signing is skipped with a warning so that releases keep working.
+      # key held only in the MINISIGN_SECRET_KEY repo secret. Without it the
+      # run fails: no release goes out unsigned.
       - name: Signing key
-        id: signing
         env:
           MINISIGN_SECRET_KEY: ${{ secrets.MINISIGN_SECRET_KEY }}
         run: |
-          if [ -n "$MINISIGN_SECRET_KEY" ]; then
-            echo "enabled=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "::warning::MINISIGN_SECRET_KEY is not set: this release is NOT signed (see docs/release-signing.md)"
-            echo "enabled=false" >> "$GITHUB_OUTPUT"
+          if [ -z "$MINISIGN_SECRET_KEY" ]; then
+            echo "::error::MINISIGN_SECRET_KEY is not set: refusing to build an unsigned release (see docs/release-signing.md)"
+            exit 1
           fi
 
       # A pinned upstream release, checked against a hard-coded SHA-256. The
@@ -126,7 +123,6 @@ jobs:
       # upstream key RWQf6LRCGA9i53mlYecO4IzT51TGPpvWucNSCh1CBM0QTaLn73Y7GFO3
       # (https://jedisct1.github.io/minisign/). Recheck both when bumping.
       - name: Install minisign
-        if: steps.signing.outputs.enabled == 'true'
         env:
           MINISIGN_VERSION: "0.12"
           MINISIGN_LINUX_SHA256: 9a599b48ba6eb7b1e80f12f36b94ceca7c00b7a5173c95c3efc88d9822957e73
@@ -153,11 +149,9 @@ jobs:
 
       # Signs, verifies each signature with the public key derived from the
       # secret key, and checks that this public key is the one published in
-      # README.md and docs/release-signing.md (a warning while they still hold
-      # the placeholder, an error if they hold another key). A key with a
-      # password fails here: stdin is closed, so minisign cannot prompt.
+      # README.md and docs/release-signing.md (an error otherwise). A key with
+      # a password fails here: stdin is closed, so minisign cannot prompt.
       - name: Sign
-        if: steps.signing.outputs.enabled == 'true'
         env:
           MINISIGN_SECRET_KEY: ${{ secrets.MINISIGN_SECRET_KEY }}
           NAME: ${{ steps.package.outputs.name }}
@@ -177,11 +171,7 @@ jobs:
             cat "$f.minisig"
           done
           for doc in README.md docs/release-signing.md; do
-            if grep -qF "$pub" "$doc"; then
-              continue
-            elif grep -qF MINISIGN_PUBLIC_KEY_PLACEHOLDER "$doc"; then
-              echo "::warning::$doc still holds the public key placeholder; publish $pub there"
-            else
+            if ! grep -qF "$pub" "$doc"; then
               echo "::error::$doc does not publish the signing public key $pub"
               exit 1
             fi

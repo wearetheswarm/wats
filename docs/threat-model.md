@@ -182,5 +182,6 @@ for.**
   vectors remain an open risk.
 - **Supply chain:** dependencies are pinned and checked by `cargo deny`
   (licenses, advisories, sources). The release workflow signs archives with
-  minisign ([release-signing.md](release-signing.md)), but the key is not
-  set yet, so releases are still unsigned. There are no reproducible builds.
+  minisign ([release-signing.md](release-signing.md)); the secret key sits
+  in a repository secret, so whoever controls the repository's workflows
+  can sign. There are no reproducible builds.

@@ -43,11 +43,9 @@ the public key published in [docs/release-signing.md](docs/release-signing.md)
 in this repository, and check that the signed file name in the trusted
 comment matches the version you downloaded.
 
-Signing is being set up: the public key is still a placeholder there, and
-releases are unsigned until it is replaced by the real key. The secret key
-lives only in a repository secret and an encrypted offline backup. If you
-find a signature that verifies with the published key on a file we did not
-release, report it as a vulnerability.
+The secret key lives only in a repository secret and an encrypted offline
+backup. If you find a signature that verifies with the published key on a
+file we did not release, report it as a vulnerability.
 
 ## Scope
 
