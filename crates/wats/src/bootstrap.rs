@@ -1,11 +1,16 @@
 //! Bootstrap peers (ADR 0008).
 //!
 //! An entry is `<endpoint-id>@<host>:<port>`. The host is resolved with DNS
-//! at startup, so the IP can move; the endpoint id is pinned, because Iroh
+//! at startup and again at every reconnection attempt (see
+//! [`crate::reconnect`]), so the IP can move and a DNS failure is never
+//! final; the endpoint id is pinned, because Iroh
 //! authenticates every connection against the dialed id: a host answering
 //! with another key is simply not connected to.
 
+use std::future::Future;
 use std::net::SocketAddr;
+use std::pin::Pin;
+use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
 use iroh::{EndpointAddr, EndpointId, TransportAddr};
@@ -82,6 +87,42 @@ impl BootstrapEntry {
             self.id,
             addrs.into_iter().map(TransportAddr::Ip),
         ))
+    }
+}
+
+type ResolveFn = dyn Fn(BootstrapEntry) -> Pin<Box<dyn Future<Output = Result<EndpointAddr>> + Send>>
+    + Send
+    + Sync;
+
+/// How bootstrap entries are resolved: DNS, or a function (tests that make
+/// DNS fail, then come back).
+#[derive(Clone, Default)]
+pub struct Resolver(Option<Arc<ResolveFn>>);
+
+impl Resolver {
+    pub fn custom<F, Fut>(resolve: F) -> Self
+    where
+        F: Fn(BootstrapEntry) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<EndpointAddr>> + Send + 'static,
+    {
+        Resolver(Some(Arc::new(move |entry| Box::pin(resolve(entry)))))
+    }
+
+    pub async fn resolve(&self, entry: &BootstrapEntry) -> Result<EndpointAddr> {
+        match &self.0 {
+            None => entry.resolve().await,
+            Some(resolve) => resolve(entry.clone()).await,
+        }
+    }
+}
+
+impl std::fmt::Debug for Resolver {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(if self.0.is_some() {
+            "Resolver(custom)"
+        } else {
+            "Resolver(dns)"
+        })
     }
 }
 
