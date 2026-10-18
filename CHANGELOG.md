@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- **The repository is public**: `install.sh` and `wats upgrade` need no
+  GitHub token any more (`GH_TOKEN` is optional, for GitHub's rate limits
+  only). The README installs from the raw `install.sh` URL, read first, or
+  with `curl -fsSL … | sh` for those who accept it. CI runs macOS on every
+  pull request again.
 - **The agent wakes on asks it learns about by catching up**, not only on
   live gossip: at start, the runner queues what was stored while it was
   not listening (an ask synced when the node started or reconnected, or

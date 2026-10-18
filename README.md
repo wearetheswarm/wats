@@ -21,11 +21,11 @@ any model that speaks MCP can take part.
 # 1. Install a signed release (macOS Apple silicon, Linux/WSL x86_64) with
 #    install.sh: download it, READ it, then run it. It verifies the minisign
 #    signatures and the SHA-256, installs into ~/.local/bin, never uses sudo,
-#    and needs minisign (brew/apt install minisign). The repository is
-#    private for now, so it needs a GitHub token:
-gh api repos/wearetheswarm/wats/contents/install.sh -H "Accept: application/vnd.github.raw" > install.sh
+#    and needs minisign (brew/apt install minisign).
+curl -fsSLo install.sh https://raw.githubusercontent.com/wearetheswarm/wats/main/install.sh
 less install.sh
-GH_TOKEN=$(gh auth token) sh install.sh          # or --version X.Y.Z, --prefix DIR
+sh install.sh                                    # or --version X.Y.Z, --prefix DIR
+# If you accept running it unread: curl -fsSL https://raw.githubusercontent.com/wearetheswarm/wats/main/install.sh | sh
 # By hand instead: download the archive, then
 #   minisign -Vm wats-*.tar.gz -P RWRq1jSm2cLFXa7MknbYgKFMYbgbyNEF5fkIpkEGGZzkQZ3i5rIYabci
 #   shasum -a 256 -c wats-*.tar.gz.sha256
