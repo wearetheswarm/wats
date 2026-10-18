@@ -16,6 +16,11 @@
 //!
 //! Forward compatibility: unknown request types get `unsupported`, unknown
 //! fields are ignored, and every node serves each ALPN in [`ALPNS`].
+//!
+//! Load challenge (`crate::challenge`, ADR 0014): a node under load may
+//! answer `challenge` to a peer that advertised the `challenge` feature;
+//! the requester resubmits the same request with a top-level `solution`
+//! field, which older nodes ignore like any unknown field.
 
 // Network input must never panic the node (security review, item D).
 #![deny(
@@ -46,7 +51,7 @@ pub const ALPNS: &[&[u8]] = &[b"/wats/1"];
 /// The same, as numbers, for `hello`.
 pub const PROTOCOL_VERSIONS: &[u32] = &[1];
 /// Optional capabilities, for `hello`.
-pub const FEATURES: &[&str] = &["sync", "replicate"];
+pub const FEATURES: &[&str] = &["sync", "replicate", crate::challenge::FEATURE];
 
 /// Largest request a node accepts.
 const MAX_REQUEST_BYTES: usize = 1024 * 1024;
@@ -149,6 +154,18 @@ pub enum Response {
     },
     /// The peer does not know this request type.
     Unsupported,
+    /// Overloaded: resubmit the request with a `solution` to this
+    /// challenge (`crate::challenge`). Only sent to peers that advertise
+    /// the `challenge` feature.
+    Challenge {
+        /// Algorithm id; unknown ids are given up on.
+        alg: String,
+        seed: String,
+        /// Leading zero bits asked.
+        effort: u32,
+        /// Unix seconds.
+        expires: u64,
+    },
     /// A response type from a newer protocol revision.
     #[serde(other)]
     Unknown,
@@ -157,6 +174,48 @@ pub enum Response {
 /// Send one request to a peer and wait for the response.
 pub async fn call(endpoint: &Endpoint, peer: EndpointId, request: &Request) -> Result<Response> {
     let mut value = serde_json::to_value(request)?;
+    crate::grease::maybe_add_to(&mut value);
+    call_value(endpoint, peer, value).await
+}
+
+/// [`call`], solving a load challenge once if the peer answers with one.
+/// A challenge that cannot be solved (unknown algorithm, too much work,
+/// expired) is returned as is: callers treat it like `Refused`.
+pub async fn call_solving(
+    endpoint: &Endpoint,
+    peer: EndpointId,
+    request: &Request,
+) -> Result<Response> {
+    let response = call(endpoint, peer, request).await?;
+    let Response::Challenge {
+        alg,
+        seed,
+        effort,
+        expires,
+    } = &response
+    else {
+        return Ok(response);
+    };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    if *expires < now {
+        return Ok(response);
+    }
+    let (alg, seed, effort, me) = (alg.clone(), seed.clone(), *effort, endpoint.id());
+    let solved = tokio::task::spawn_blocking(move || {
+        crate::challenge::solve(&alg, &seed, effort, &me, &peer)
+    })
+    .await?;
+    let Some(solution) = solved else {
+        debug!(peer = %peer.fmt_short(), "challenge given up: {response:?}");
+        return Ok(response);
+    };
+    let mut value = serde_json::to_value(request)?;
+    if let Value::Object(object) = &mut value {
+        object.insert("solution".into(), serde_json::to_value(solution)?);
+    }
     crate::grease::maybe_add_to(&mut value);
     call_value(endpoint, peer, value).await
 }
@@ -191,6 +250,17 @@ pub async fn call_value(endpoint: &Endpoint, peer: EndpointId, request: Value) -
     Ok(crate::strict_json::from_slice(&bytes)?)
 }
 
+/// Parse a request, with the `solution` to a load challenge it may carry.
+/// A malformed solution is ignored, like an unknown field.
+pub fn parse_request(bytes: &[u8]) -> Result<(Request, Option<crate::challenge::Solution>)> {
+    let value = crate::strict_json::parse(bytes)?;
+    let solution = value
+        .get("solution")
+        .and_then(|s| serde_json::from_value(s.clone()).ok());
+    let request = serde_json::from_value(value)?;
+    Ok((request, solution))
+}
+
 /// Serves the protocol for a node. The node is set after it is built, since
 /// the router is created first.
 #[derive(Debug, Clone, Default)]
@@ -213,9 +283,9 @@ impl WatsProtocol {
                 bail!("node is shutting down");
             };
             let bytes = recv.read_to_end(MAX_REQUEST_BYTES).await?;
-            let response = match crate::strict_json::from_slice::<Request>(&bytes) {
-                Ok(Request::Unsupported) => Response::Unsupported,
-                Ok(request) => node.handle_request(peer, request).await,
+            let response = match parse_request(&bytes) {
+                Ok((Request::Unsupported, _)) => Response::Unsupported,
+                Ok((request, solution)) => node.handle_request(peer, request, solution).await,
                 Err(e) => Response::Refused {
                     reason: format!("malformed request: {e}"),
                 },
@@ -330,6 +400,31 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(response, Response::Replicated { .. }));
+    }
+
+    #[test]
+    fn challenges_and_solutions_are_forward_compatible() {
+        // A solution rides along any request; a malformed one is ignored.
+        let (request, solution) = parse_request(
+            br#"{"type":"sync","net":"public","after_ts":0,"after_id":"","limit":5,
+                "solution":{"alg":"b3","seed":"00","nonce":"7","_grease_1":1}}"#,
+        )
+        .unwrap();
+        assert!(matches!(request, Request::Sync { limit: 5, .. }));
+        assert_eq!(solution.unwrap().nonce, "7");
+        let (_, solution) = parse_request(
+            br#"{"type":"hello","info":{"software":"x","protocols":[1],"events_min":1,
+                "events_max":1,"relay_max":1,"features":[]},"solution":42}"#,
+        )
+        .unwrap();
+        assert!(solution.is_none());
+        // A challenge with an unknown algorithm and extra fields parses.
+        let response: Response = crate::strict_json::from_slice(
+            br#"{"type":"challenge","alg":"m1","seed":"ab","effort":30,"expires":1,"memory":64}"#,
+        )
+        .unwrap();
+        assert!(matches!(response, Response::Challenge { effort: 30, .. }));
+        assert!(NodeInfo::ours().features.iter().any(|f| f == "challenge"));
     }
 
     #[test]

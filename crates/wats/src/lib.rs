@@ -9,6 +9,7 @@ pub mod agent;
 pub mod attach;
 pub mod bootstrap;
 pub mod budget;
+pub mod challenge;
 pub mod crash;
 pub mod event;
 pub mod grease;

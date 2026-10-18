@@ -68,6 +68,11 @@ machine, and supply-chain attacks on dependencies beyond pinning and
   `crash_report`, and a cap on concurrent blob fetches per peer
   (ADR 0014). Requests are capped at 1 MiB, responses at 16 MiB, with
   1,024 requests per connection.
+- **Load challenge:** a node over its in-flight threshold, or facing a
+  peer over its rate limit, answers with a BLAKE3 proof-of-work challenge
+  (bound to both node ids, single use, 60 s, effort adapting from 8 to 24
+  bits) to peers that advertise `challenge`; older peers are refused as
+  before. Solved requests stay under a global ceiling (ADR 0014 addendum).
 - **Blobs** are verified by BLAKE3 streaming, are never executed, and are
   exported read-only. Export never follows a symlink: the inbox and its
   per-hash directories must be real directories, and files are written

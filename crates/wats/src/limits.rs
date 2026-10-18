@@ -21,6 +21,20 @@ pub struct Limits {
     pub report_per_min: u32,
     /// Blobs one peer can make us fetch at the same time (replication).
     pub blob_fetches_per_peer: usize,
+    /// Answer with a proof-of-work challenge (`crate::challenge`) instead
+    /// of refusing a peer over its rate limit, and challenge peers without
+    /// a reputation while overloaded. Only peers that advertise the
+    /// `challenge` feature are ever challenged.
+    pub challenge: bool,
+    /// Effort asked when the load starts (leading zero bits).
+    pub challenge_base_bits: u32,
+    /// Highest effort asked while the overload lasts.
+    pub challenge_max_bits: u32,
+    /// The node is overloaded above this many `/wats` requests in flight.
+    pub overload_in_flight: usize,
+    /// Requests let through on a solved challenge, all peers together, per
+    /// minute: solving puzzles never exceeds this ceiling (0: unlimited).
+    pub solved_per_min: u32,
 }
 
 impl Default for Limits {
@@ -31,6 +45,11 @@ impl Default for Limits {
             replicate_per_min: 120,
             report_per_min: 10,
             blob_fetches_per_peer: 4,
+            challenge: true,
+            challenge_base_bits: 8,
+            challenge_max_bits: 24,
+            overload_in_flight: 64,
+            solved_per_min: 1200,
         }
     }
 }
@@ -60,12 +79,30 @@ struct Bucket {
     last: Instant,
 }
 
+/// Refill `bucket` at `per_min / 60` tokens a second, up to a burst of a
+/// quarter of a minute's worth, and take one token if there is one.
+fn take(bucket: &mut Bucket, per_min: u32, now: Instant) -> bool {
+    let burst = f64::from((per_min / 4).max(1));
+    let rate = f64::from(per_min) / 60.0;
+    bucket.tokens =
+        (bucket.tokens + now.duration_since(bucket.last).as_secs_f64() * rate).min(burst);
+    bucket.last = now;
+    if bucket.tokens >= 1.0 {
+        bucket.tokens -= 1.0;
+        true
+    } else {
+        false
+    }
+}
+
 /// Buckets, refilled continuously: `per_min / 60` tokens a second, up to a
 /// burst of a quarter of a minute's worth (at least one).
 pub struct RateLimiter {
     limits: Limits,
     buckets: Mutex<HashMap<(EndpointId, Kind), Bucket>>,
     logged: Mutex<HashMap<(EndpointId, Kind), Instant>>,
+    /// Requests let through on a solved challenge, all peers together.
+    solved: Mutex<Option<Bucket>>,
     fetches: Mutex<HashMap<EndpointId, Arc<Semaphore>>>,
 }
 
@@ -75,6 +112,7 @@ impl RateLimiter {
             limits,
             buckets: Default::default(),
             logged: Default::default(),
+            solved: Default::default(),
             fetches: Default::default(),
         }
     }
@@ -96,7 +134,6 @@ impl RateLimiter {
             return true; // 0 means unlimited
         }
         let burst = f64::from((per_min / 4).max(1));
-        let rate = f64::from(per_min) / 60.0;
         let now = Instant::now();
         let allowed = {
             let Ok(mut buckets) = self.buckets.lock() else {
@@ -110,15 +147,7 @@ impl RateLimiter {
                 tokens: burst,
                 last: now,
             });
-            bucket.tokens =
-                (bucket.tokens + now.duration_since(bucket.last).as_secs_f64() * rate).min(burst);
-            bucket.last = now;
-            if bucket.tokens >= 1.0 {
-                bucket.tokens -= 1.0;
-                true
-            } else {
-                false
-            }
+            take(bucket, per_min, now)
         };
         if !allowed && let Ok(mut logged) = self.logged.lock() {
             let last = logged.get(&(peer, kind)).copied();
@@ -132,6 +161,31 @@ impl RateLimiter {
             }
         }
         allowed
+    }
+
+    /// The limits in force.
+    pub fn limits(&self) -> &Limits {
+        &self.limits
+    }
+
+    /// Whether one more request may go through on a solved challenge,
+    /// under the global `solved_per_min` ceiling.
+    pub fn allow_solved(&self) -> bool {
+        let per_min = self.limits.solved_per_min;
+        if per_min == 0 {
+            return true;
+        }
+        let Ok(mut bucket) = self.solved.lock() else {
+            return false;
+        };
+        take(
+            bucket.get_or_insert(Bucket {
+                tokens: f64::from((per_min / 4).max(1)),
+                last: Instant::now(),
+            }),
+            per_min,
+            Instant::now(),
+        )
     }
 
     /// A permit to fetch one blob for `peer`, if it has fewer than
@@ -185,6 +239,17 @@ mod tests {
             ..Limits::default()
         });
         assert!((0..1000).all(|_| unlimited.allow(a, Kind::Sync)));
+    }
+
+    #[test]
+    fn solved_requests_have_a_global_ceiling() {
+        let limiter = RateLimiter::new(Limits {
+            solved_per_min: 8, // burst 2
+            ..Limits::default()
+        });
+        assert!(limiter.allow_solved());
+        assert!(limiter.allow_solved());
+        assert!(!limiter.allow_solved(), "ceiling reached");
     }
 
     #[tokio::test]
