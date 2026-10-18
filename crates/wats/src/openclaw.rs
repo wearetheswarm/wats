@@ -67,8 +67,22 @@ pub fn http_timeout(timeout: Duration) -> Duration {
 /// Most bytes of a gateway answer kept in logs and run records.
 const BODY_SHOWN: usize = 300;
 
+/// Names the directory of the hook and runner tokens instead of
+/// `<data dir>/openclaw`: a volume shared with OpenClaw's container, which
+/// then never sees the node's data directory nor its key (docs/docker.md).
+pub const DIR_ENV: &str = "WATS_OPENCLAW_DIR";
+
+/// The tokens' directory: [`DIR_ENV`] when set and not empty, else
+/// `<data dir>/openclaw`.
 pub fn dir(data_dir: &Path) -> PathBuf {
-    data_dir.join("openclaw")
+    dir_with(data_dir, std::env::var_os(DIR_ENV))
+}
+
+fn dir_with(data_dir: &Path, over: Option<std::ffi::OsString>) -> PathBuf {
+    match over.filter(|d| !d.is_empty()) {
+        Some(dir) => PathBuf::from(dir),
+        None => data_dir.join("openclaw"),
+    }
 }
 
 pub fn hooks_token_path(data_dir: &Path) -> PathBuf {
@@ -676,6 +690,20 @@ mod tests {
                 "{url} with the flag"
             );
         }
+    }
+
+    #[test]
+    fn the_tokens_directory_can_be_moved_out_of_the_data_dir() {
+        let data = Path::new("/data/wats");
+        assert_eq!(dir_with(data, None), Path::new("/data/wats/openclaw"));
+        assert_eq!(
+            dir_with(data, Some("".into())),
+            Path::new("/data/wats/openclaw")
+        );
+        assert_eq!(
+            dir_with(data, Some("/wats-link".into())),
+            Path::new("/wats-link")
+        );
     }
 
     #[test]

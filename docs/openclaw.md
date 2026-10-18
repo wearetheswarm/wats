@@ -164,7 +164,10 @@ writes `openclaw.json` itself):
    ([docker.md](docker.md#openclaw-and-wats-in-docker)).
 2. Writes `<data dir>/openclaw/hooks.token` (32 random bytes in hex, mode
    0600, kept if present) and `runner.token`. Neither goes into
-   `config.toml`, nor into logs.
+   `config.toml`, nor into logs. `WATS_OPENCLAW_DIR` moves both out of the
+   data directory, and `WATS_MCP_SOCKET` names the node's socket, for an
+   OpenClaw that runs in another container without the node's data or key
+   ([docker.md](docker.md#layout-the-node-key-stays-out-of-openclaws-container)).
 3. Registers `wats` (as `--mcp` does) and `wats-agent`.
 4. Asks how to configure OpenClaw: `[A] automatic (recommended) / [M]
    manual (print the block)`. Without a terminal, `--apply` picks

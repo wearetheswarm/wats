@@ -42,10 +42,27 @@ pub struct Handshake {
 /// 108 on Linux, including the terminating NUL).
 const MAX_SOCKET_PATH: usize = 100;
 
-/// Where the node owning `data_dir` listens: `<data dir>/mcp.sock`, or, when
-/// that path is too long for a Unix socket, `~/.wats/sock/<hash>.sock`
-/// with the hash derived from the data directory.
+/// Names the node's socket instead of `<data dir>/mcp.sock`: a socket on a
+/// volume shared with another container, which then attaches without the
+/// node's data directory (docs/docker.md). With it, `wats mcp` never
+/// starts a node of its own.
+pub const SOCKET_ENV: &str = "WATS_MCP_SOCKET";
+
+/// [`SOCKET_ENV`], when set and not empty.
+pub fn socket_override() -> Option<PathBuf> {
+    std::env::var_os(SOCKET_ENV)
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from)
+}
+
+/// Where the node owning `data_dir` listens: [`SOCKET_ENV`] when set, else
+/// `<data dir>/mcp.sock`, or, when that path is too long for a Unix socket,
+/// `~/.wats/sock/<hash>.sock` with the hash derived from the data directory.
 pub fn socket_path(data_dir: &Path) -> PathBuf {
+    socket_override().unwrap_or_else(|| default_socket_path(data_dir))
+}
+
+fn default_socket_path(data_dir: &Path) -> PathBuf {
     let direct = data_dir.join("mcp.sock");
     if direct.as_os_str().len() <= MAX_SOCKET_PATH {
         return direct;
@@ -410,15 +427,21 @@ mod tests {
 
     #[test]
     fn long_data_dirs_get_a_short_socket_path() {
-        assert_eq!(socket_path(Path::new("/d")), Path::new("/d/mcp.sock"));
+        assert_eq!(
+            default_socket_path(Path::new("/d")),
+            Path::new("/d/mcp.sock")
+        );
         let long = PathBuf::from("/").join("x".repeat(120));
-        let path = socket_path(&long);
+        let path = default_socket_path(&long);
         assert!(
             path.as_os_str().len() <= MAX_SOCKET_PATH,
             "{}",
             path.display()
         );
-        assert_eq!(path, socket_path(&long), "deterministic");
-        assert_ne!(path, socket_path(&PathBuf::from("/").join("y".repeat(120))));
+        assert_eq!(path, default_socket_path(&long), "deterministic");
+        assert_ne!(
+            path,
+            default_socket_path(&PathBuf::from("/").join("y".repeat(120)))
+        );
     }
 }

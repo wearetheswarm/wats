@@ -2,38 +2,50 @@
 # (ADR 0017; docs/docker.md, "OpenClaw and wats in Docker").
 #
 # The wats node forwards each agent run to the gateway over plain http on
-# the internal network `swarm` (http://openclaw:18789, allowed by
+# the network `swarm` (http://openclaw:18789, allowed by
 # agent.openclaw_insecure_ok); OpenClaw's restricted `wats` agent answers
-# through `wats mcp`, which attaches to the node via the shared volume.
-# The gateway port is never published: keep it that way.
+# through `wats mcp`. The gateway port is never published: keep it that way.
+#
+# The node's key never enters the openclaw container: it is a secret of the
+# `wats` service only (WATS_SECRET_FILE), and the node's data volume is
+# mounted there only. The two containers share one small volume, wats-link:
+# the node's socket (WATS_MCP_SOCKET) and the hook and runner tokens
+# (WATS_OPENCLAW_DIR).
 #
 # Placeholders: OPENCLAW_IMAGE (no default: the image OpenClaw's docs give,
 # pinned) and the gateway's own settings (listening beyond loopback, its
 # auth), which are OpenClaw's: see docs.openclaw.ai.
 #
 # Setup, from this directory:
-#   1. export OPENCLAW_IMAGE=<OpenClaw's gateway image, pinned>
+#   1. The node key, outside the repository's history (*.key is ignored):
+#        (umask 077; openssl rand -hex 32 > secret.key)   # or an existing key
+#        sudo chown 65532:65532 secret.key                # Linux hosts
+#   2. export OPENCLAW_IMAGE=<OpenClaw's gateway image, pinned>
 #      docker compose up -d --build
-#      Both start; agent runs fail until step 4 (no hook token yet).
-#   2. Let the node use plain http on this network, and name the agent:
+#      Agent runs fail until step 5 (no hook token yet).
+#   3. The node's settings (in the wats container), then restart it:
+#        docker compose exec wats wats config set agent.openclaw_insecure_ok true
+#        docker compose exec wats wats config set agent.openclaw_url http://openclaw:18789
+#        docker compose exec wats wats config set agent.profile helper
+#        docker compose restart wats
+#   4. Set wats up in OpenClaw, inside the openclaw container (where the
+#      `openclaw` CLI is): MCP entries, tokens (into wats-link) and
+#      OpenClaw's config. Same agent.profile as the node. --print instead
+#      of --apply prints the block to paste into openclaw.json yourself.
 #        docker compose exec openclaw wats config set agent.openclaw_insecure_ok true
 #        docker compose exec openclaw wats config set agent.profile helper
-#   3. Set wats up in OpenClaw (inside the openclaw container, where the
-#      `openclaw` CLI is): MCP entries, tokens, OpenClaw's config, and
-#      agent.openclaw_url in config.toml. --print instead of --apply prints
-#      the block to paste into openclaw.json yourself.
 #        docker compose exec openclaw wats setup openclaw --agent --apply --yes \
 #          --url http://openclaw:18789
-#   4. It prints `export WATS_OPENCLAW_HOOKS_TOKEN=<token>`. Put
+#   5. It prints `export WATS_OPENCLAW_HOOKS_TOKEN=<token>`. Put
 #      `WATS_OPENCLAW_HOOKS_TOKEN=<token>` in ./openclaw.env (mode 0600,
 #      git-ignored, never in an image), make the gateway listen on the
 #      container's network (OpenClaw's gateway bind setting), set spend
 #      caps on the OpenClaw side, then:
 #        docker compose up -d --force-recreate
-#   5. Acknowledge the safety settings changed in steps 2-3, as the user:
-#        docker compose exec openclaw wats config ack
+#   6. Acknowledge the safety settings changed in step 3, as the user:
+#        docker compose exec wats wats config ack
 # Logs: docker compose logs -f wats   (one line per forwarded run)
-# Runs: docker compose exec openclaw wats agent runs
+# Runs: docker compose exec wats wats agent runs
 
 name: wats-openclaw
 
@@ -46,7 +58,7 @@ services:
         WATS_IMAGE: ghcr.io/wearetheswarm/wats:${WATS_VERSION:-0.3.0}
     image: wats-openclaw
     restart: on-failure
-    # The hook token, from `wats setup openclaw`; absent before step 4.
+    # The hook token, from `wats setup openclaw`; absent before step 5.
     env_file:
       - path: ./openclaw.env
         required: false
@@ -54,13 +66,12 @@ services:
       # The profile of the `wats` MCP entry (your own OpenClaw agents).
       WATS_PROFILE: ${WATS_PROFILE:-me}
     # Model provider keys and channel accounts stay in this container (its
-    # environment or its home volume): the wats node never sees them.
+    # environment or its home volume): the wats node never sees them, and
+    # this container never sees the node's key.
     volumes:
       - openclaw-home:/home/openclaw
-      # The node's data directory: `wats mcp` attaches to its socket.
-      - wats-data:/data
-    # The node must own the data directory before OpenClaw starts `wats mcp`.
-    depends_on: [wats]
+      # The node's socket and the OpenClaw tokens, nothing else of the node.
+      - wats-link:/wats-link
     # `swarm` is shared with the node; `egress` reaches the model provider.
     networks: [swarm, egress]
     # No `ports:`: the gateway is for the wats node only. Drop read_only if
@@ -76,14 +87,27 @@ services:
     # 0 and must stay down (ADR 0016); crashes are still restarted.
     restart: on-failure
     command: ["node", "--quiet", "--agent", "openclaw"]
+    # openclaw first: its image gives wats-link its owner (uid 65532).
+    depends_on: [openclaw]
+    environment:
+      WATS_SECRET_FILE: /run/secrets/wats_key
+      WATS_MCP_SOCKET: /wats-link/mcp.sock
+      WATS_OPENCLAW_DIR: /wats-link
+    secrets: [wats_key]
     volumes:
       - wats-data:/data
+      - wats-link:/wats-link
     # `swarm` reaches the gateway; `egress` reaches the other nodes.
     networks: [swarm, egress]
     read_only: true
     tmpfs: ["/tmp"]
     cap_drop: [ALL]
     security_opt: ["no-new-privileges:true"]
+
+secrets:
+  # Mounted read-only into the wats service only.
+  wats_key:
+    file: ./secret.key
 
 networks:
   # Both are bridges on this host: the forwards (and the hook token in
@@ -95,3 +119,4 @@ networks:
 volumes:
   openclaw-home:
   wats-data:
+  wats-link:

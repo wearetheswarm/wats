@@ -267,6 +267,16 @@ the plain-http rule of `agent.openclaw_url`:
 the hook token in a git-ignored env file, never in an image
 ([docker.md](../docker.md#openclaw-and-wats-in-docker)).
 
+**The node key never enters OpenClaw's container.** OpenClaw's tools are
+strong, so its container gets neither the node's key nor its data
+directory. The key is a Compose secret of the `wats` service
+(`WATS_SECRET_FILE`); the two containers share one volume holding the
+node's socket and the OpenClaw tokens. Two environment variables make
+that possible: `WATS_MCP_SOCKET` names the node's socket instead of
+`<data dir>/mcp.sock` (with it, `wats mcp` attaches or fails, and never
+starts a node of its own), and `WATS_OPENCLAW_DIR` names the tokens'
+directory instead of `<data dir>/openclaw`.
+
 ## Consequences
 
 - New runtime `openclaw` in `RUNTIMES`, with a forward runner beside the
