@@ -120,7 +120,7 @@ struct AgentArgs {
     #[arg(long)]
     max_runs_per_hour: Option<usize>,
     /// Runs that one author's posts can trigger per hour; 0: unlimited
-    /// [default: 3].
+    /// [default: 0].
     #[arg(long)]
     wakes_per_author_per_hour: Option<usize>,
     /// Only wake for events by these authors (64-hex author ids, from
