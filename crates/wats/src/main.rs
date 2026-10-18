@@ -284,6 +284,13 @@ enum Command {
         #[arg(long)]
         in_process: bool,
     },
+    /// Show the node: running or not, networks, peers, storage, version
+    /// and the update notice (what the MCP `status` tool returns).
+    Status {
+        /// Print JSON instead of `key: value` lines.
+        #[arg(long)]
+        json: bool,
+    },
     /// Print this node's endpoint id and author id, and its bootstrap entry.
     /// Creates the node secret if the data directory has none; does not need
     /// the node to be stopped.
@@ -946,6 +953,68 @@ fn config_command(data_dir: &std::path::Path, action: ConfigAction) -> Result<()
 }
 
 use wats::settings::{ConfigFile, Settings, parse_duration, parse_size};
+
+/// `wats status`: the running node's MCP `status`, or what is known
+/// without a node.
+async fn status_command(config: &NodeConfig, json: bool) -> Result<()> {
+    let status = match attach::call_tool(&config.data_dir, "status", serde_json::json!({})).await? {
+        Some(mut status) => {
+            status["node"] = "running".into();
+            status
+        }
+        None => {
+            let mut status = serde_json::json!({
+                "node": "not running",
+                "nets": config.nets,
+                "version": env!("CARGO_PKG_VERSION"),
+            });
+            if let Some(update) = wats::update::status_json(&config.data_dir) {
+                status["update"] = update;
+            }
+            status
+        }
+    };
+    if json {
+        println!("{}", serde_json::to_string_pretty(&status)?);
+    } else {
+        for line in status_lines("", &status) {
+            println!("{line}");
+        }
+    }
+    Ok(())
+}
+
+/// `key: value` lines, nested keys joined with dots, `node` first.
+fn status_lines(prefix: &str, value: &serde_json::Value) -> Vec<String> {
+    use serde_json::Value;
+    match value {
+        Value::Object(map) => {
+            let mut keys: Vec<&String> = map.keys().collect();
+            keys.sort_by_key(|k| (k.as_str() != "node", k.as_str()));
+            keys.into_iter()
+                .flat_map(|k| {
+                    let key = if prefix.is_empty() {
+                        k.clone()
+                    } else {
+                        format!("{prefix}.{k}")
+                    };
+                    status_lines(&key, &map[k])
+                })
+                .collect()
+        }
+        Value::Null => vec![format!("{prefix}: -")],
+        Value::String(s) => vec![format!("{prefix}: {s}")],
+        Value::Array(items) => vec![format!(
+            "{prefix}: {}",
+            items
+                .iter()
+                .map(|v| v.as_str().map_or_else(|| v.to_string(), str::to_string))
+                .collect::<Vec<_>>()
+                .join(", ")
+        )],
+        other => vec![format!("{prefix}: {other}")],
+    }
+}
 
 fn print_id(config: &NodeConfig, host: &str) -> Result<()> {
     let (root, path, existed) = match &config.secret_file {
@@ -2173,6 +2242,7 @@ async fn main() -> Result<()> {
             return result;
         }
         Some(Command::Id { host }) => return print_id(&config, &host),
+        Some(Command::Status { json }) => return status_command(&config, json).await,
         Some(
             Command::Config { .. }
             | Command::Upgrade { .. }

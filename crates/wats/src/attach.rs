@@ -298,6 +298,90 @@ pub async fn attach(_: &Path, _: Option<String>, _: Vec<PathBuf>) -> Result<bool
     Ok(false)
 }
 
+/// Call one MCP tool of the node running in `data_dir`, as a short MCP
+/// session over its socket (e.g. `wats status`). `None` when no node runs
+/// there. Returns the tool's structured result.
+#[cfg(unix)]
+pub async fn call_tool(
+    data_dir: &Path,
+    tool: &str,
+    arguments: serde_json::Value,
+) -> Result<Option<serde_json::Value>> {
+    use serde_json::json;
+    let Ok(stream) = tokio::net::UnixStream::connect(socket_path(data_dir)).await else {
+        return Ok(None);
+    };
+    let (from_node, mut to_node) = stream.into_split();
+    let mut from_node = BufReader::new(from_node).lines();
+    let handshake = Handshake {
+        wats_attach: 1,
+        profile: None,
+        file_roots: Vec::new(),
+        runner_token: None,
+    };
+    let initialize = json!({"jsonrpc": "2.0", "id": 1, "method": "initialize",
+        "params": {"protocolVersion": "2025-06-18", "capabilities": {},
+                   "clientInfo": {"name": "wats-cli", "version": env!("CARGO_PKG_VERSION")}}});
+    let initialized = json!({"jsonrpc": "2.0", "method": "notifications/initialized"});
+    let call = json!({"jsonrpc": "2.0", "id": 2, "method": "tools/call",
+        "params": {"name": tool, "arguments": arguments}});
+    let exchange = async {
+        for message in [serde_json::to_value(&handshake)?, initialize] {
+            to_node.write_all(&serde_json::to_vec(&message)?).await?;
+            to_node.write_all(b"\n").await?;
+        }
+        let response = |id: u64| {
+            move |line: &str| {
+                serde_json::from_str::<serde_json::Value>(line)
+                    .ok()
+                    .filter(|v| v["id"] == id && v.get("method").is_none())
+            }
+        };
+        loop {
+            let line = from_node
+                .next_line()
+                .await?
+                .context("the node closed the session")?;
+            if response(1)(&line).is_some() {
+                break;
+            }
+        }
+        for message in [initialized, call] {
+            to_node.write_all(&serde_json::to_vec(&message)?).await?;
+            to_node.write_all(b"\n").await?;
+        }
+        loop {
+            let line = from_node
+                .next_line()
+                .await?
+                .context("the node closed the session")?;
+            if let Some(reply) = response(2)(&line) {
+                if let Some(error) = reply.get("error") {
+                    bail!("{tool}: {}", error["message"]);
+                }
+                let result = &reply["result"];
+                if result["isError"] == true {
+                    bail!("{tool}: {}", result["content"][0]["text"]);
+                }
+                return Ok(result["structuredContent"].clone());
+            }
+        }
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(10), exchange)
+        .await
+        .context("the node did not answer within 10 s")?
+        .map(Some)
+}
+
+#[cfg(not(unix))]
+pub async fn call_tool(
+    _: &Path,
+    _: &str,
+    _: serde_json::Value,
+) -> Result<Option<serde_json::Value>> {
+    Ok(None)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

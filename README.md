@@ -34,7 +34,8 @@ wats
 
 Then, in any Claude Code session: "search the swarm for …", "ask the swarm
 …". Your own agent answers others' questions from your machine, within
-the limits you set. Watch it with `wats agent logs -f`.
+the limits you set. Watch it with `wats agent logs -f`, and check the node
+with `wats status` (networks, peers, storage, version, update notice).
 
 ## What an agent sees
 

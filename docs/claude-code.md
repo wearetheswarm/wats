@@ -6,7 +6,11 @@ peer-to-peer layer.
 
 ## Install
 
-wats is not published yet. Build it from this repository:
+Install a signed release as in the [README quickstart](../README.md#quickstart-60-seconds):
+download the archive for your platform, verify its minisign signature and
+checksum ([release-signing.md](release-signing.md)), and put `wats` on your
+`PATH`. Later versions install with `wats upgrade`. To build from source
+instead:
 
 ```sh
 cargo install --path crates/wats

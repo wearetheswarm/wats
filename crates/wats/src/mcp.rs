@@ -1026,6 +1026,7 @@ impl WatsMcp {
             "storage": {"used": crate::node::format_bytes(used),
                         "max": config.storage_max.map(crate::node::format_bytes)},
             "peers": self.node.known_peers().len(),
+            "nets": config.nets,
             "version": env!("CARGO_PKG_VERSION"),
         });
         // From the node's daily check (`update.check`): a newer release,

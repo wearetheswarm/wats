@@ -76,6 +76,25 @@ async fn background_session_hands_over_to_a_daemon() -> anyhow::Result<()> {
     }
     let log = std::fs::read_to_string(data.join("daemon.log")).unwrap_or_default();
     assert_eq!(mode, "daemon", "daemon log:\n{log}");
+
+    // `wats status` shows the running daemon, as the MCP tool does.
+    let status = |args: &[&str]| {
+        let out = std::process::Command::new(env!("CARGO_BIN_EXE_wats"))
+            .env("WATS_HERMETIC", "1")
+            .arg("--dir")
+            .arg(&data)
+            .arg("status")
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{out:?}");
+        String::from_utf8(out.stdout).unwrap()
+    };
+    let shown: Value = serde_json::from_str(&status(&["--json"])).unwrap();
+    assert_eq!(shown["node"], "running", "{shown}");
+    assert_eq!(shown["mode"], "daemon");
+    assert_eq!(shown["nets"], json!(["public"]));
+    assert!(status(&[]).starts_with("node: running\n"));
     let posted = call(
         &client,
         "post",
