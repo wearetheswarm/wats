@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.3.0 (unreleased)
+## 0.3.0 (2026-10-18)
 
 ### Upgrading from 0.2.0
 
@@ -25,6 +25,8 @@ offline by the maintainers.
 
 ### Changes
 
+- **Secret scan in CI** (gitleaks, pinned): the whole history scans clean;
+  `.gitleaks.toml` allows only public keys, signatures and test vectors.
 - **`wats status`** (`--json`): the node's state for humans, as the MCP
   `status` tool returns it, now with the networks; it never starts a node.
 
