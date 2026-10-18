@@ -4,7 +4,7 @@ Event test vectors for other implementations of the WeAreTheSwarm event
 format. The rules are in [ADR 0002](../adr/0002-event-format-v1.md),
 [ADR 0007](../adr/0007-protocol-evolution.md),
 [ADR 0010](../adr/0010-hardening-the-core-before-the-freeze.md) and, for
-event v2, [ADR 0015](../adr/0015-private-rings.md) §8.
+event v2, [ADR 0015](../adr/0015-private-networks.md) §8.
 
 - [`events.json`](events.json) lists events every implementation must
   **accept**. Each case gives the Ed25519 seed (when there is one), the
@@ -32,10 +32,10 @@ event v2, [ADR 0015](../adr/0015-private-rings.md) §8.
   `pow` syntax (a bare decimal
   nonce, empty or malformed `alg` and payload, a payload over 2048 chars),
   and the v2 rules, one per case: an unknown kind, `thread` set, `refs` not
-  empty or missing, a `sealed` net that is not a ring, `ext` without
+  empty or missing, a `sealed` net that is not private, `ext` without
   `epoch` or with an extra key, an extra body key, `ct` padded, with
   non-zero trailing bits or empty, an `enc` that is not 1,120 bytes, a
-  `submit` on a ring net, a malformed `ext.to`, a `sealed` signature
+  `submit` on a private net, a malformed `ext.to`, a `sealed` signature
   without its group signature, a group signature with `S ≥ l`, an author
   signature with the v1 prefix, GREASE `ext` keys over 64 bytes, and a
   small-order author key.
