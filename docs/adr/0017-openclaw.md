@@ -10,7 +10,10 @@ exceeds the timeout ends as `timeout` and is not retried (only `503`, a
 refused connection or an unreachable gateway defer the wake); the isolated
 fallback retries at once with `Idempotency-Key: <run id>:isolated`; the
 gateway URL is asked (default `http://127.0.0.1:18789`), not read from
-OpenClaw's config. §4 (the ClawHub skill) is implemented too.
+OpenClaw's config. §4 (the ClawHub skill) is implemented too. Amended
+on 2026-10-18 (decision 2 below): on consent, setup applies OpenClaw's
+config through `openclaw config patch`, with a backup and validation; the
+printed block stays as the manual mode.
 
 Source: the request relayed by internal (roadmap 1b: OpenClaw is the first
 community to reach), and OpenClaw's documentation at docs.openclaw.ai,
@@ -74,10 +77,22 @@ radius than our `locked` runs.
   1. It generates a 32-byte hook token and writes it to
      `<data dir>/openclaw/hooks.token` with mode 0600. The token never
      goes into `config.toml` and is never logged.
-  2. It prints the JSON5 block that enables hooks with that token (and
-     the dedicated agent below) for the user to paste into OpenClaw's
-     config, then runs `openclaw config validate`. It never edits
-     `openclaw.json` itself.
+  2. It configures OpenClaw's hooks with that token (and the dedicated
+     agent below). wats never writes `openclaw.json` itself. It asks
+     `[A] automatic (recommended) / [M] manual` (`--apply` and `--print`
+     without a terminal; with neither flag and no terminal, it prints):
+     - **Automatic**: `openclaw config file`, a copy of that file to
+       `<file>.bak-<UTC timestamp>` (printed); `openclaw config get` of
+       `hooks.allowedAgentIds` and `hooks.allowedSessionKeyPrefixes`,
+       merged with ours, since `config patch` replaces arrays; when
+       `openclaw config set` supports SecretRefs, `openclaw config set
+       hooks.token --ref-source env --ref-id WATS_OPENCLAW_HOOKS_TOKEN`;
+       then the patch (the same content as the block) is printed and sent
+       to `openclaw config patch --stdin --dry-run`, then `openclaw config
+       patch --stdin`, then `openclaw config validate`. Any failure from
+       the first write on copies the backup back and fails.
+     - **Manual**: it prints the JSON5 block for the user to paste, then
+       runs `openclaw config validate`.
      - We recommend that OpenClaw reads the token from an environment
        variable rather than storing it in clear in `openclaw.json`; its
        hooks config supports environment references.
@@ -211,8 +226,14 @@ radius than our `locked` runs.
 
 1. **Per-thread sessions** with the `wats:` prefix, falling back to
    isolated sessions when the gateway setting is off.
-2. **Setup only prints the JSON5 block** to paste. It never edits
-   `openclaw.json`.
+2. **wats never edits `openclaw.json` itself.** Setup first only printed
+   the JSON5 block to paste. Amended the same day: on the user's consent
+   (`[A]`, or `--apply`), it applies the config through OpenClaw's own
+   CLI (`openclaw config patch`, dry run first), after a backup of the
+   file, and validates; any failure restores the backup. The hook token
+   is a SecretRef to the environment when OpenClaw supports it, so it
+   never sits in `openclaw.json`. The printed block stays as the manual
+   mode, and the default without a terminal.
 3. **No USD budget for v1.** Setup warns once that spend caps belong on
    the OpenClaw side, and the user confirms. `status` shows
    `budget: managed by OpenClaw`.
