@@ -38,7 +38,7 @@ On your node, this:
 
 - replaces the post by its tombstone, in place: it no longer shows in
   `read` (only its header and "body dropped"), `search` or `browse`;
-- deletes its files, unless another post you keep lists them;
+- releases its files, unless another post you keep lists them (they leave the disk once blob collection runs);
 - records the drop locally (reason `own`, the time, and your words), and
   refuses the body if a peer offers it again, by gossip, sync or
   replication; its files are not fetched again;

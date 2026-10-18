@@ -464,65 +464,9 @@ const MAX_PROVIDER_ATTEMPTS: usize = 4;
 const PROVIDER_BACKOFF: Duration = Duration::from_secs(30);
 const PROVIDER_BACKOFF_MAX: Duration = Duration::from_secs(3600);
 
-/// How often the blob store collects the blobs nothing keeps: no tag
-/// (`wats/blob/<hash>`) and listed by no kept event, e.g. the blobs of a
-/// dropped body (ADR 0020 §2), or a fetch that failed half-way.
-const BLOB_GC_SECS: u64 = 3600;
-
-/// Keep every blob a kept full event lists: covers a fetched blob between
-/// its download and its tag. A store error skips the collection.
-fn protect_referenced<'a>(
-    store: &Store,
-    live: &'a mut HashSet<Hash>,
-) -> std::pin::Pin<
-    Box<dyn std::future::Future<Output = iroh_blobs::store::ProtectOutcome> + Send + Sync + 'a>,
-> {
-    let outcome = match store.referenced_blobs() {
-        Ok(hashes) => {
-            live.extend(hashes.iter().filter_map(|h| h.parse::<Hash>().ok()));
-            iroh_blobs::store::ProtectOutcome::Continue
-        }
-        Err(e) => {
-            warn!("blob collection skipped: {e:#}");
-            iroh_blobs::store::ProtectOutcome::Abort
-        }
-    };
-    Box::pin(std::future::ready(outcome))
-}
-
-/// Constrain a closure to the signature of a collection callback.
-fn gc_callback<F>(f: F) -> iroh_blobs::store::ProtectCb
-where
-    F: for<'a> Fn(
-            &'a mut HashSet<Hash>,
-        ) -> std::pin::Pin<
-            Box<
-                dyn std::future::Future<Output = iroh_blobs::store::ProtectOutcome>
-                    + Send
-                    + Sync
-                    + 'a,
-            >,
-        > + Send
-        + Sync
-        + 'static,
-{
-    Arc::new(f)
-}
-
-/// Open the blob store of `dir`, collecting what nothing keeps every
-/// [`BLOB_GC_SECS`].
-async fn load_blobs(dir: &Path, store: Arc<Store>) -> Result<FsStore> {
-    let mut options = iroh_blobs::store::fs::options::Options::new(dir);
-    options.gc = Some(iroh_blobs::store::GcConfig {
-        interval: Duration::from_secs(BLOB_GC_SECS),
-        add_protected: Some(gc_callback(move |live| protect_referenced(&store, live))),
-    });
-    Ok(FsStore::load_with_opts(dir.join("blobs.db"), options).await?)
-}
-
 /// Delete every tag of blob `hash` (`wats/blob/<hash>`, and the automatic
-/// tag of an import by an older release): the next collection removes it,
-/// unless a kept event lists it.
+/// tag of an import by an older release). Nothing deletes the file yet:
+/// the blob store's collection comes in its own change.
 async fn unpin_blob(blobs: &FsStore, hash: Hash) -> Result<()> {
     let mut names = Vec::new();
     let mut tags = blobs.tags().list().await?;
@@ -1050,7 +994,7 @@ impl Node {
 
         let store = Arc::new(Store::open(&config.data_dir.join("events.sqlite"))?);
         revalidate_opaque(&store)?;
-        let blobs = load_blobs(&config.data_dir.join("blobs"), Arc::clone(&store)).await?;
+        let blobs = FsStore::load(config.data_dir.join("blobs")).await?;
         let gossip = Gossip::builder()
             .max_message_size(GOSSIP_MAX_MESSAGE_BYTES)
             .spawn(endpoint.clone());
