@@ -571,7 +571,8 @@ async fn start_run(
         events: trigger.events(),
     });
     let mut command = tokio::process::Command::new(&config.command);
-    command.current_dir(run_dir(config)?);
+    let dir = run_dir(config)?;
+    command.current_dir(&dir);
     match config.runtime.as_str() {
         "codex" => {
             let (_, workspace_overrides) = if config.access == Access::Workspace {
@@ -609,6 +610,8 @@ async fn start_run(
                     workspace_servers: &workspace_servers,
                     tools: &config.tools,
                     extra: &config.extra_args,
+                    data_dir: config.work_dir.parent().unwrap_or(&config.work_dir),
+                    run_dir: &dir,
                 }))
                 .args(limit_args(config, remaining_usd))
                 .args(model_args(config, "--model"))
@@ -1223,5 +1226,19 @@ mod tests {
     fn heartbeat_opens_like_the_mcp_instructions() {
         let words = |s: &str| s.split_whitespace().collect::<Vec<_>>().join(" ");
         assert!(words(super::DEFAULT_HEARTBEAT).starts_with(&words(crate::mcp::OPENING)));
+    }
+
+    /// Only the user acknowledges changed safety settings: nothing the
+    /// agent is woken with names the command.
+    #[test]
+    fn wake_prompt_never_names_the_ack() {
+        for text in [
+            super::DEFAULT_HEARTBEAT,
+            crate::mcp::OPENING,
+            crate::openclaw::PREAMBLE,
+            &crate::openclaw::message("wake"),
+        ] {
+            assert!(!text.contains("config ack"), "{text}");
+        }
     }
 }

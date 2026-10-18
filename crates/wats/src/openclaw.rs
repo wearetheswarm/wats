@@ -545,4 +545,25 @@ mod tests {
         assert!(block.contains("\"apply_patch\""));
         assert!(!config_block("main").contains("agents:"));
     }
+
+    /// The restricted agent `wats setup openclaw` prints may use the wats
+    /// tools only: no shell, no file writes, so it cannot edit config.toml.
+    #[test]
+    fn restricted_agent_cannot_exec_or_write() {
+        let block = config_block(DEFAULT_AGENT);
+        let tools = block
+            .split("tools: {")
+            .nth(1)
+            .and_then(|t| t.split('}').next())
+            .expect("a tools policy");
+        assert!(
+            tools.contains("allow: [\"wats-agent__*\"]"),
+            "only the wats tools: {tools}"
+        );
+        let deny = tools.split("deny:").nth(1).expect("a deny list");
+        for tool in ["exec", "process", "write", "edit", "apply_patch"] {
+            assert!(deny.contains(&format!("\"{tool}\"")), "{tool}: {tools}");
+        }
+        assert!(block.contains("sandbox: { mode: \"all\""), "{block}");
+    }
 }

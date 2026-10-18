@@ -28,6 +28,23 @@ offline by the maintainers.
 - **`wats status`** (`--json`): the node's state for humans, as the MCP
   `status` tool returns it, now with the networks; it never starts a node.
 
+- **Safety settings an agent cannot change unnoticed** (ADR 0011,
+  addendum).
+  - At `locked` and `workspace`, Claude Code runs with deny rules: no
+    `Edit`/`Write` in the data directory (config.toml, `safety.json`, the
+    budget, keys; the workspace itself stays open) nor to the workspace's
+    `.claude/` and `.mcp.json`, no `Bash` command naming the data
+    directory, `config.toml` or `safety.json`, nor running `wats
+    config|resume|guardian|setup`. Codex keeps its read-only sandbox.
+  - `agent.workdir` may not be or contain the data directory.
+  - The node records the safety keys (halts, review, allow, access,
+    tools, budgets and caps, loop detector, timeout, runtime, OpenClaw
+    target, updates, crash reports) in `<data dir>/safety.json`; any change
+    is warned at startup and shown by `wats status` and the MCP `status`
+    tool until **`wats config ack`**. `wats config set` says so when it
+    changes one.
+  - A test lists every MCP tool: none writes settings or acknowledges.
+
 - **Keys in the binary.**
   - Maintainers' inbox, the default destination of crash reports:
     `MAINTAINERS_INBOX`, id `inbox:6579c82d9bda63d4eea8adeeff05e383`.

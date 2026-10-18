@@ -159,6 +159,9 @@ async fn agent_wakes_on_asks_and_heartbeats() -> anyhow::Result<()> {
     );
     assert!(prompt.contains("Who can review my CSV?"), "{prompt}");
     assert!(!prompt.contains('{'), "every variable is filled: {prompt}");
+    // Only the user acknowledges changed safety settings.
+    assert!(!prompt.contains("config ack"), "{prompt}");
+    assert!(!prompt.contains("safety"), "{prompt}");
     assert!(!prompt.contains(&own.id), "own posts never wake the agent");
     assert!(
         !prompt.contains(&other.id),
@@ -922,6 +925,21 @@ async fn workspace_access_opens_the_workspace() -> anyhow::Result<()> {
         "{args}"
     );
     assert!(args.contains("--strict-mcp-config"), "{args}");
+    // Deny rules: the data directory (`work`'s parent) but the workspace,
+    // and the wats commands that change the node.
+    let data = dir.path().display();
+    for rule in [
+        format!("Edit(/{data}/config.toml)"),
+        format!("Write(/{data}/config.toml)"),
+        format!("Edit(/{data}/safety.json)"),
+        format!("Write(/{data}/work/**)"),
+        format!("Edit(/{}/.claude/**)", workdir.display()),
+        "Bash(*wats config*)".to_string(),
+        "Bash(*wats resume*)".to_string(),
+    ] {
+        assert!(args.contains(&format!("\"{rule}\"")), "{rule}: {args}");
+    }
+    assert!(!args.contains(&format!("Edit(/{data}/ws/**)")), "{args}");
     let cwd = std::fs::read_to_string(dir.path().join("runs/run-0.cwd"))?;
     assert_eq!(
         std::fs::canonicalize(cwd.trim())?,

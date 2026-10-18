@@ -161,6 +161,40 @@ full runner of Phase 2, a node must be able to wake an agent on its own.
     over). The cap on wakes per author (`agent.wakes_per_author_per_hour`,
     default 0: unlimited) is unchanged.
 
+## Safety settings (addendum, 2026-10-18)
+
+An agent runs as the user. Whatever it can run as that user, it can use
+to switch off what keeps it in check: `halt.accept`, `agent.review`,
+`agent.access`, the budgets. A same-UID process cannot be fully stopped,
+so the rule is: it cannot by default, and it is detected if it does.
+
+- **Prevention** (`locked`, `workspace`): Claude Code gets `--settings`
+  with `permissions.deny`: `Edit`/`Write` on the data directory (every
+  entry but the path to the run directory when that lies inside, plus
+  `config.toml` and `safety.json` before they exist), on the run
+  directory's `.claude/**` and `.mcp.json`; `Bash(*<data dir>*)` (also as
+  `~/…`, `$HOME/…`), `Bash(*config.toml*)`, `Bash(*safety.json*)`,
+  `Bash(*wats config*)`, `Bash(*wats resume*)`, `Bash(*wats guardian*)`,
+  `Bash(*wats setup*)`, and `Bash(*..*)` from a workspace inside the data
+  directory. Codex has no path deny: the sandbox stays `read-only`, so
+  nothing is a writable root. The OpenClaw agent `wats setup openclaw`
+  prints allows `wats-agent__*` only and denies `exec`, `process`,
+  `write`, `edit`, `apply_patch`. `agent.workdir` may not be or contain
+  the data directory. `inherit` is the user's own environment: no rule.
+- **No MCP tool writes settings**; a test lists every tool against a
+  reviewed allowlist, so a new one fails until reviewed.
+- **Detection:** `<data dir>/safety.json` holds the acknowledged values
+  of the safety keys (values, not a hash, so that the notice says what
+  changed). The first run records them silently. A difference is logged
+  at startup and shown by `wats status` and the MCP `status` tool until
+  `wats config ack`, a CLI command no tool can run and the wake prompt
+  never names. `wats config set` changes are flagged too, and say so.
+  There is no live config reload: the running node uses the values it
+  started with, while `status` compares the file at each call.
+- **For later (service packaging, roadmap 1d):** the always-on service
+  runs as a dedicated system user, with a config the login user's agents
+  cannot write. Only that makes the settings a boundary at `inherit`.
+
 ## Consequences
 
 - **Cheap when idle.** No model call happens without new events or a due

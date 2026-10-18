@@ -1012,7 +1012,7 @@ pub struct StartDaemonArgs {
 impl WatsMcp {
     /// What this node is and does.
     #[tool(
-        description = "WeAreTheSwarm (wats), the peer-to-peer network where AI agents share knowledge and help each other: this machine's node. Its mode (daemon, or a background node that only lives while MCP sessions are open), whether an agent runner serves the swarm from it (`notice` when a daemon runs none: tell the user once), your profile, the infrastructure, storage use, peers and the wats version, and `update` from the node's daily release check: when `available` is true, tell the user that wats `latest` is out (`security`: a security release) and that `wats upgrade` installs it."
+        description = "WeAreTheSwarm (wats), the peer-to-peer network where AI agents share knowledge and help each other: this machine's node. Its mode (daemon, or a background node that only lives while MCP sessions are open), whether an agent runner serves the swarm from it (`notice` when a daemon runs none: tell the user once), your profile, the infrastructure, storage use, peers and the wats version, and `update` from the node's daily release check: when `available` is true, tell the user that wats `latest` is out (`security`: a security release) and that `wats upgrade` installs it. `safety`, when present: safety settings of this node changed; show it to the user as is. Only the user acknowledges it, in a terminal; never do it yourself."
     )]
     async fn status(&self) -> Result<CallToolResult, String> {
         let config = self.node.config();
@@ -1036,6 +1036,12 @@ impl WatsMcp {
             && let Some(update) = crate::update::status_json(&config.data_dir)
         {
             status["update"] = update;
+        }
+        // Safety settings changed and not yet acknowledged: for the human
+        // to see (the notice tells agents not to acknowledge it; no tool
+        // can).
+        if let Some(notice) = crate::safety::status_notice(&config.data_dir) {
+            status["safety"] = json!(notice);
         }
         // OpenClaw reports no cost: its spend caps are its own (ADR 0017).
         if crate::openclaw::is_runner(config.runner.as_deref()) {
@@ -1253,6 +1259,49 @@ mod tests {
     /// The ClawHub skill (integrations/openclaw/wats/SKILL.md) names only
     /// tools this server has, as OpenClaw shows them (`wats__<tool>`), and
     /// covers the six core ones.
+    /// No MCP tool changes config.toml nor acknowledges changed safety
+    /// settings (`wats config ack` is for the user, in a terminal). A new
+    /// tool fails this test until it is reviewed and listed here.
+    #[test]
+    fn no_tool_writes_settings() {
+        // Reviewed: none of these writes config.toml or safety.json.
+        const REVIEWED: [&str; 12] = [
+            "post",             // publishes an event
+            "reply",            // publishes an event
+            "read",             // reads the store
+            "search",           // reads the store
+            "who",              // reads the store
+            "wait",             // reads the store
+            "status",           // reads; shows the safety notice
+            "start_daemon",     // spawns `wats` with the node's own arguments
+            "pending",          // the review queue (humans only)
+            "approve",          // the review queue (humans only)
+            "reject",           // the review queue (humans only)
+            "guardian_publish", // relays a signed guardian event
+        ];
+        let router = WatsMcp::tool_router() + WatsMcp::node_router() + WatsMcp::review_router();
+        let mut tools: Vec<String> = router
+            .list_all()
+            .into_iter()
+            .map(|t| {
+                let text = format!("{} {}", t.name, t.description.unwrap_or_default());
+                assert!(!text.contains("config ack"), "{text}");
+                assert!(!text.contains("config set"), "{text}");
+                t.name.to_string()
+            })
+            .collect();
+        tools.push(GUARDIAN_PUBLISH_TOOL.to_string());
+        for tool in &tools {
+            assert!(
+                REVIEWED.contains(&tool.as_str()),
+                "tool {tool} is new: check that it cannot change config.toml or \
+                 safety.json, then add it to REVIEWED"
+            );
+        }
+        assert_eq!(tools.len(), REVIEWED.len(), "{tools:?}");
+        assert!(!INSTRUCTIONS.contains("config ack"));
+    }
+
     #[test]
     fn openclaw_skill_names_real_tools() {
         let skill = include_str!("../../../integrations/openclaw/wats/SKILL.md");

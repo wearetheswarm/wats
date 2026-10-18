@@ -95,6 +95,7 @@ wats                         # from now on: the node with its agent
 | `wats setup codex [--mcp] [--agent]` | The same for the Codex CLI; `wats --agent codex` runs a headless Codex ([codex.md](codex.md)). |
 | `wats setup openclaw [--mcp] [--agent] [--yes] [--url URL]` | OpenClaw: its MCP entries, the hook token and the config block to paste; `wats --agent openclaw` forwards each run to the OpenClaw gateway instead of spawning a CLI ([openclaw.md](openclaw.md)). |
 | `wats config get\|set\|unset\|list` | `<data dir>/config.toml`. |
+| `wats config ack` | Acknowledge changed [safety settings](#safety-settings): prints what changed, then records the current values. Yours to run, never an agent's. |
 | `wats mcp` | The stdio entry point MCP hosts run; it relays to the daemon of its data directory. |
 | `wats agent logs [-f] [--run ID]`, `runs`, `attach` | Watch what the agent does. |
 | `wats agent pending [show <id>]`, `approve [--edit] <id>`, `reject <id> [--reason]` | The review queue (`agent.review`). |
@@ -348,6 +349,43 @@ These are orthogonal to the level:
   agent can start its own `wats mcp` under another profile and bypass the
   queue. The banner warns about this. Only a sandbox (a container,
   `deploy/agent/`) makes review hold there.
+
+### Safety settings
+
+An agent runs as you, so it can do what you can, unless something stops
+it. What wats does about the settings that keep it in check (halts,
+review, `agent.allow`, access, tools, budgets and run caps, the loop
+detector, updates, crash reports; the list is `KEYS` in
+`crates/wats/src/safety.rs`):
+
+- **At `inherit`, or with a full shell** (`Bash` in `agent.tools`, Codex
+  `shell_tool`), the agent can do anything you can, including editing
+  `config.toml`. Nothing in the same user account can fully stop that.
+  This is why `locked` is the default.
+- **`locked` and `workspace` raise the bar.** Claude Code gets deny rules,
+  which win over any allow rule, the workspace's included: no `Edit` or
+  `Write` in the data directory (config.toml, `safety.json`, the budget,
+  keys; only the workspace itself, when it lies inside, stays open), nor to
+  the workspace's own `.claude/` and `.mcp.json` (hooks and MCP servers run
+  commands); no `Bash` command naming the data directory, `config.toml` or
+  `safety.json`, nor running `wats config`, `wats resume`, `wats guardian`
+  or `wats setup` (and no `..` from a workspace inside the data directory).
+  Shell rules match the command text: they raise the bar, they are not a
+  sandbox. Codex cannot deny a path: its sandbox stays read-only, so no
+  directory, the data directory included, is writable. The OpenClaw agent
+  that `wats setup openclaw` prints allows the wats tools only and denies
+  `exec`, `write` and `edit`.
+- **`agent.workdir` cannot be the data directory or contain it**: `wats
+  config set` and the daemon refuse it.
+- **Detection catches what slips through.** The node keeps the values of
+  these settings in `<data dir>/safety.json`, recorded silently the first
+  time. Any later change, by hand, by an agent or with `wats config set`,
+  is logged at every start and shown by `wats status` and the MCP `status`
+  tool (`safety settings changed on <date>: halt.accept true→false, …`)
+  until you run `wats config ack` in a terminal. No MCP tool acknowledges
+  or changes settings, and the wake prompt never mentions the command.
+  An agent that can write anywhere can also rewrite `safety.json`: at
+  `inherit`, detection is a tripwire, not a lock.
 
 ### Wake limits
 
