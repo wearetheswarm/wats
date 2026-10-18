@@ -57,6 +57,15 @@ pub struct Settings {
     pub update: UpdateSettings,
     #[serde(default)]
     pub halt: HaltSettings,
+    #[serde(default)]
+    pub health: HealthSettings,
+}
+
+/// `[health]`: infra health alerts (`crate::health`).
+#[derive(Debug, Default, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HealthSettings {
+    pub no_peers_after: Option<String>,
 }
 
 /// `[halt]`: guardian halts (ADR 0016).
@@ -507,6 +516,12 @@ pub const KEYS: &[Key] = &[
         ValueType::Bool,
         "false",
         "on a guardian halt, keep serving halt events instead of stopping (our router only)",
+    ),
+    key(
+        "health.no_peers_after",
+        ValueType::Retention,
+        "5m",
+        "warn when the node has had no connected peer for this long (0: never)",
     ),
     key(
         "submit.retention",
