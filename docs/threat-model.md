@@ -165,9 +165,18 @@ for.**
   tells GitHub this node's IP address and wats version (user agent). It
   never runs with `--hermetic` or `--loopback`; `update.check = false`
   turns it off.
-- **Crash reports** go to the router only on the user's request (or with
-  `report.crashes = true`). They are redacted (ADR 0013), and the router
-  stores them with size, rate and retention limits.
+- **Crash reports** leave the machine only on the user's request (or with
+  `report.crashes = true`), redacted (ADR 0013). With the maintainers'
+  inbox key compiled in (or `report.inbox`), they are **end-to-end
+  encrypted** to it (HPKE with X-Wing, ADR 0015 §5) and carried as v2
+  `submit` events on the public network: every node stores and relays them
+  but cannot read them. What stays visible is the metadata of the outer
+  event: a one-off author key drawn for each report (so it does not name
+  the node), the timestamp, the size and number of parts, and the inbox id.
+  Peers that relay them also see which node first pushed them. Until the
+  key is compiled in, reports go to the router as a `crash_report`
+  request, and the router stores them with size, rate and retention
+  limits.
 
 ## Known gaps
 

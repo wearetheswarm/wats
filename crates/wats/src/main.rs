@@ -297,6 +297,12 @@ enum Command {
         #[command(subcommand)]
         action: Option<ReportAction>,
     },
+    /// The sealed inbox (ADR 0015 §5): crash reports end-to-end encrypted
+    /// to the maintainers' key.
+    Inbox {
+        #[command(subcommand)]
+        action: InboxAction,
+    },
     /// Watch what the agent runner does: transcripts of its runs.
     Agent {
         #[command(subcommand)]
@@ -325,11 +331,35 @@ enum ReportAction {
     List,
     /// Print exactly the bytes `send` would send (the latest by default).
     Show { id: Option<String> },
-    /// Send a report (the latest unsent by default) to the collector: the
-    /// running node sends it, or a short-lived one.
+    /// Send a report (the latest unsent by default), sealed to the
+    /// maintainers' inbox when its key is known, to the collector
+    /// otherwise: the running node sends it, or a short-lived one.
     Send { id: Option<String> },
     /// Delete a report (the latest by default).
     Discard { id: Option<String> },
+}
+
+#[derive(Debug, Subcommand)]
+enum InboxAction {
+    /// Generate an inbox key pair: the secret goes to a new file (mode
+    /// 0600, never overwritten; back it up in sops), the public key and
+    /// the inbox id are printed.
+    Keygen {
+        /// Where to write the secret [default: <data dir>/inbox.key].
+        #[arg(long)]
+        out: Option<PathBuf>,
+    },
+    /// Decrypt the submissions to this inbox held by the local store, and
+    /// write each complete crash report to `<out>/<report id>.json`
+    /// (existing files are left alone).
+    Read {
+        /// The inbox secret file.
+        #[arg(long)]
+        key: PathBuf,
+        /// Output directory [default: <data dir>/inbox].
+        #[arg(long)]
+        out: Option<PathBuf>,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -1102,6 +1132,18 @@ impl NodeArgs {
                     .map_err(|e| anyhow::anyhow!("config.toml report.collector: {e}"))?,
             ),
             None => wats::bootstrap::defaults().first().map(|b| b.id),
+        };
+        config.report_inbox = match file
+            .report
+            .inbox
+            .as_deref()
+            .or(wats::inbox::MAINTAINERS_INBOX)
+        {
+            Some(key) => Some(
+                wats::inbox::InboxPublic::from_b64(key)
+                    .map_err(|e| anyhow::anyhow!("config.toml report.inbox: {e:#}"))?,
+            ),
+            None => None,
         };
         if file.agent.review == Some(true) {
             config.review_profiles.push(
@@ -2044,6 +2086,7 @@ async fn main() -> Result<()> {
             let action = action.unwrap_or(ReportAction::List);
             return report_command(&cli.node, &data_dir, action).await;
         }
+        Some(Command::Inbox { action }) => return inbox_command(&data_dir, action),
         Some(Command::Agent { action }) => {
             return tokio::select! {
                 result = agent_watch(&data_dir, action) => result,
@@ -2124,7 +2167,8 @@ async fn main() -> Result<()> {
             | Command::Upgrade { .. }
             | Command::Agent { .. }
             | Command::Setup { .. }
-            | Command::Report { .. },
+            | Command::Report { .. }
+            | Command::Inbox { .. },
         ) => {
             unreachable!("handled above")
         }
@@ -2216,9 +2260,9 @@ async fn send_crash_reports(
     failures: &mut std::collections::HashMap<String, std::time::Instant>,
 ) {
     let config = node.config();
-    let Some(collector) = config.report_collector else {
+    if config.report_inbox.is_none() && config.report_collector.is_none() {
         return;
-    };
+    }
     let data_dir = &config.data_dir;
     for report in wats::crash::list(data_dir) {
         let queued = report.state == "send" || (config.report_auto && report.state == "new");
@@ -2232,12 +2276,9 @@ async fn send_crash_reports(
         let Ok(bytes) = wats::crash::bytes(data_dir, &report.id) else {
             continue;
         };
-        let Ok(value) = serde_json::from_slice(&bytes) else {
-            continue;
-        };
-        match node.send_crash_report(collector, value).await {
-            Ok(()) => {
-                tracing::info!(report = %report.id, "crash report sent");
+        match send_crash_report(node, bytes).await {
+            Ok(how) => {
+                tracing::info!(report = %report.id, "crash report sent {how}");
                 let _ = wats::crash::set_state(data_dir, &report.id, "sent");
             }
             Err(e) => {
@@ -2246,6 +2287,27 @@ async fn send_crash_reports(
             }
         }
     }
+}
+
+/// Send one crash report: sealed to the inbox when a key is known (ADR
+/// 0015 §5), else to the collector (ADR 0013). Says which path was used.
+async fn send_crash_report(node: &Arc<Node>, bytes: Vec<u8>) -> Result<String> {
+    let config = node.config();
+    if let Some(inbox) = &config.report_inbox {
+        let sealed = node.send_to_inbox(inbox, "crash", bytes).await?;
+        let bits = sealed.bits.iter().max().copied().unwrap_or(0);
+        return Ok(format!(
+            "sealed to {} ({} part(s), {bits} bits of proof of work)",
+            inbox.id(),
+            sealed.events.len()
+        ));
+    }
+    let collector = config
+        .report_collector
+        .context("no report.inbox nor report.collector")?;
+    let value: serde_json::Value = serde_json::from_slice(&bytes)?;
+    node.send_crash_report(collector, value).await?;
+    Ok(format!("to collector {}", collector.fmt_short()))
 }
 
 /// `wats report …`.
@@ -2305,15 +2367,71 @@ async fn report_command(
             let settings = Settings::load(data_dir)?;
             let mut config = args.config(&settings)?;
             config.storage_max = None;
-            let collector = config.report_collector.context("no report.collector")?;
+            if config.report_inbox.is_none() && config.report_collector.is_none() {
+                anyhow::bail!("no report.inbox nor report.collector");
+            }
+            let inbox = config.report_inbox.is_some();
             let node = Node::start(config).await?;
-            let value: serde_json::Value =
-                serde_json::from_slice(&wats::crash::bytes(data_dir, &id)?)?;
-            let result = node.send_crash_report(collector, value).await;
+            let bytes = wats::crash::bytes(data_dir, &id)?;
+            if inbox
+                && let Err(e) = node
+                    .wait_for_neighbor(wats::node::PUBLIC_NET, Duration::from_secs(15))
+                    .await
+            {
+                eprintln!("{e:#}: the report is kept here and relayed when the node next runs");
+            }
+            let result = send_crash_report(&node, bytes).await;
+            if inbox && result.is_ok() {
+                // Let gossip carry the parts before this node stops.
+                tokio::time::sleep(Duration::from_secs(2)).await;
+            }
             node.shutdown().await?;
-            result?;
+            let how = result?;
             wats::crash::set_state(data_dir, &id, "sent")?;
-            println!("sent {id} to {}", collector.fmt_short());
+            println!("sent {id} {how}");
+        }
+    }
+    Ok(())
+}
+
+/// `wats inbox …` (ADR 0015 §5).
+fn inbox_command(data_dir: &std::path::Path, action: InboxAction) -> Result<()> {
+    match action {
+        InboxAction::Keygen { out } => {
+            let out = out.unwrap_or_else(|| data_dir.join("inbox.key"));
+            if let Some(parent) = out.parent().filter(|p| !p.as_os_str().is_empty()) {
+                std::fs::create_dir_all(parent)?;
+            }
+            let key = wats::inbox::keygen(&out)?;
+            println!("secret written to {} (mode 0600)", out.display());
+            println!("public key: {}", key.public().to_b64());
+            println!("inbox id: {}", key.public().id());
+            println!(
+                "Back the secret up in sops, then set MAINTAINERS_INBOX \
+                 (or report.inbox) to the public key."
+            );
+        }
+        InboxAction::Read { key, out } => {
+            let key = wats::inbox::InboxKey::load(&key)?;
+            let out = out.unwrap_or_else(|| data_dir.join("inbox"));
+            let store = wats::store::Store::open_read_only(&data_dir.join("events.sqlite"))?;
+            let events = store.submits_to(key.public().id())?;
+            let summary = wats::inbox::read_submissions(&key, &events, &out)?;
+            for path in &summary.written {
+                println!("{}", path.display());
+            }
+            println!(
+                "{} submission(s) to {}: {} new report(s), {} already read, {} incomplete, \
+                 {} failed to decrypt, {} rejected, {} of another type",
+                events.len(),
+                key.public().id(),
+                summary.written.len(),
+                summary.existing,
+                summary.incomplete,
+                summary.undecryptable,
+                summary.rejected,
+                summary.skipped,
+            );
         }
     }
     Ok(())

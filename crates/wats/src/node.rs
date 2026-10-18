@@ -139,6 +139,10 @@ pub struct NodeConfig {
     pub limits: crate::limits::Limits,
     /// Where this node sends its crash reports (`report.collector`).
     pub report_collector: Option<EndpointId>,
+    /// The inbox crash reports are sealed to (`report.inbox`, else the
+    /// compiled-in maintainers' key). When set, reports go there instead of
+    /// to `report_collector` (ADR 0015 §5).
+    pub report_inbox: Option<crate::inbox::InboxPublic>,
     /// Send them without asking (`report.crashes`).
     pub report_auto: bool,
     /// Network arguments that start the same node again (`start_daemon`).
@@ -179,6 +183,7 @@ impl NodeConfig {
             report_accept: false,
             limits: Default::default(),
             report_collector: None,
+            report_inbox: None,
             report_auto: false,
             replication: 3,
             submit_retention: Some(DEFAULT_SUBMIT_RETENTION),
@@ -1100,6 +1105,36 @@ impl Node {
             proto::Response::Refused { reason } => bail!("refused: {reason}"),
             other => bail!("unexpected answer {other:?}"),
         }
+    }
+
+    /// Seal a payload to `inbox` and publish it on the public network as v2
+    /// `submit` events, one per part, under a fresh one-off author (ADR
+    /// 0015 §5). Each part is mined to what v2 receivers require of a
+    /// submission: the public schedule (or `pow_bits`), the size bits and
+    /// [`SUBMIT_EXTRA_POW_BITS`], no new-author bits. Returns the sealed
+    /// parts.
+    pub async fn send_to_inbox(
+        &self,
+        inbox: &crate::inbox::InboxPublic,
+        kind: &str,
+        payload: Vec<u8>,
+    ) -> Result<crate::inbox::Sealed> {
+        let ts = now_secs();
+        let base = self
+            .config
+            .pow_bits
+            .unwrap_or_else(|| crate::event::scheduled_pow_bits(&self.config.pow_schedule, ts));
+        let (inbox, kind) = (inbox.clone(), kind.to_string());
+        let sealed = tokio::task::spawn_blocking(move || {
+            crate::inbox::seal_payload(&inbox, &kind, &payload, ts, |size| {
+                crate::event::required_pow_bits(base, size).saturating_add(SUBMIT_EXTRA_POW_BITS)
+            })
+        })
+        .await??;
+        for event in &sealed.events {
+            self.publish_signed(event.clone()).await?;
+        }
+        Ok(sealed)
     }
 
     /// Ask the process running this node to stop (it releases the data

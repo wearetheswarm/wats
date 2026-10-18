@@ -134,6 +134,7 @@ impl LimitsSettings {
 pub struct ReportSettings {
     pub crashes: Option<bool>,
     pub collector: Option<String>,
+    pub inbox: Option<String>,
     pub accept: Option<bool>,
 }
 
@@ -457,7 +458,13 @@ pub const KEYS: &[Key] = &[
         "report.collector",
         ValueType::Text,
         "our router",
-        "node id that collects crash reports",
+        "node id that collects crash reports (when no inbox key is known)",
+    ),
+    key(
+        "report.inbox",
+        ValueType::Text,
+        "the maintainers' key, once compiled in",
+        "inbox public key (base64url) crash reports are sealed to",
     ),
     key(
         "report.accept",
@@ -655,6 +662,10 @@ pub fn find_key(name: &str) -> Result<&'static Key> {
 fn toml_value(key: &Key, raw: &str) -> Result<toml_edit::Value> {
     let invalid = |why: String| anyhow::anyhow!("{}: {why}", key.name);
     Ok(match key.kind {
+        ValueType::Text if key.name == "report.inbox" => {
+            crate::inbox::InboxPublic::from_b64(raw).map_err(|e| invalid(format!("{e:#}")))?;
+            raw.into()
+        }
         ValueType::Text => raw.into(),
         ValueType::Profile => {
             if !crate::node::is_valid_profile(raw) {

@@ -292,7 +292,7 @@ invalid. Everything else a ring needs is an *inner* kind, hidden in `ct`.
   - `type` is `crash`, `security`, `join` or `request`.
   - `reply` is optional. With it, the ring can answer with a submission
     to the inbox of that one-off key.
-  - Payloads over about 11 KiB are split into parts. Parts are grouped
+  - Payloads over about 10 KiB (compressed) are split into parts. Parts are grouped
     by their (shared) one-off author and by a report id inside `ct`,
     since v2 `refs` is always `[]`. A 64 KiB crash report (ADR 0013) is at
     most 6 parts.
@@ -437,7 +437,24 @@ of them and never shows it.
 
 ### 9. Phases
 
-- **(a) Sealed inbox and crash reports.**
+- **(a) Sealed inbox and crash reports.** Implemented: (a1) validity and
+  policy, (a2) the inbox (`crates/wats/src/inbox.rs`, `wats inbox`, ADR
+  0013 addendum). The compiled-in key is still to generate
+  (`MAINTAINERS_INBOX` is `None`, so reports keep going to the collector
+  until it is set). What (a2) settled:
+  - The secret is the 32-byte X-Wing seed, stored as hex on one line.
+  - The plaintext of a part is a JSON header line, `\n`, then raw bytes:
+    `{"type": …, "report": "<16 hex>", "part": k, "parts": n,
+    "z": "deflate"}` followed by one chunk of the raw-deflate-compressed
+    payload, instead of a JSON `body`. The `reply` key waits for join
+    requests (c).
+  - Chunks are balanced and at most 10,514 bytes, computed from the
+    encodings with a 256-byte margin under the 16 KiB cap, and checked
+    against the real canonical size before mining. Payloads are capped at
+    1 MiB inflated and 128 parts.
+  - Each part has its own HPKE encapsulation; all parts of a payload share
+    the one-off author.
+  - A typical crash report is one or two parts, mined at 23 to 25 bits.
   - v2 `submit` validity in Rust and Python, with vectors. Done in (a1),
     with `sealed` validity too (§8), and the `submit` node policy.
   - The `hpke` dependency.

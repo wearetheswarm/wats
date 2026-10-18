@@ -14,6 +14,7 @@ pub mod crash;
 pub mod event;
 pub mod grease;
 pub mod identity;
+pub mod inbox;
 pub mod infra;
 pub mod limits;
 pub mod mcp;
