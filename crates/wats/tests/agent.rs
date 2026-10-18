@@ -120,6 +120,7 @@ async fn agent_wakes_on_asks_and_heartbeats() -> anyhow::Result<()> {
         work_dir: dir.path().join("work"),
         keep_runs: 2,
         keep_days: 30,
+        openclaw: Default::default(),
     };
     let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
     let runner = tokio::spawn(wats::agent::run(Arc::clone(&a), config.clone(), async {
@@ -644,6 +645,7 @@ async fn budget_pauses_the_agent() -> anyhow::Result<()> {
         work_dir: dir.path().join("work"),
         keep_runs: 100,
         keep_days: 30,
+        openclaw: Default::default(),
     };
     let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
     let runner = tokio::spawn(wats::agent::run(Arc::clone(&a), config, async {
@@ -803,6 +805,7 @@ echo '{{"type":"turn.completed","usage":{{"input_tokens":10,"output_tokens":2}}}
         work_dir: work.clone(),
         keep_runs: 100,
         keep_days: 30,
+        openclaw: Default::default(),
     };
     let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
     let runner = tokio::spawn(wats::agent::run(Arc::clone(&a), config, async {
@@ -903,6 +906,7 @@ async fn workspace_access_opens_the_workspace() -> anyhow::Result<()> {
         work_dir: work.clone(),
         keep_runs: 100,
         keep_days: 30,
+        openclaw: Default::default(),
     };
     let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
     let runner = tokio::spawn(wats::agent::run(Arc::clone(&a), config, async {
@@ -1029,7 +1033,9 @@ async fn call_post(
 
 /// The runner token travels through the socket: a `wats mcp` process with
 /// a valid `WATS_RUNNER_TOKEN` is a runner session (held, whatever its
-/// profile); without it, or with a made-up one, it is not.
+/// profile); without it, or with a made-up one, it is not. OpenClaw's
+/// persistent token (`openclaw/runner.token`) counts too, and the `status`
+/// of an OpenClaw runner says its budget is OpenClaw's.
 #[tokio::test(flavor = "multi_thread")]
 async fn runner_token_marks_the_session_over_the_socket() -> anyhow::Result<()> {
     use rmcp::ServiceExt;
@@ -1041,9 +1047,20 @@ async fn runner_token_marks_the_session_over_the_socket() -> anyhow::Result<()> 
     config.pow_bits = Some(0);
     config.min_pow_bits = Some(0);
     config.review_profiles = vec!["agent".into()];
+    config.runner = Some("openclaw as agent".into());
     let node = Node::start(config).await?;
     let _sessions = wats::attach::serve(Arc::clone(&node))?;
+    // An OpenClaw runner: its budget is OpenClaw's.
+    let status = wats::attach::call_tool(&data, "status", serde_json::json!({}))
+        .await?
+        .unwrap();
+    assert_eq!(status["budget"], "managed by OpenClaw", "{status}");
     let token = node.new_runner_token(wats::node::RunnerRun::default());
+    // The persistent token of OpenClaw's `wats-agent` entry.
+    let persistent = "cd".repeat(32);
+    let persistent_file = wats::openclaw::runner_token_path(&data);
+    std::fs::create_dir_all(persistent_file.parent().unwrap())?;
+    std::fs::write(&persistent_file, format!("{persistent}\n"))?;
     let session = |token: Option<&str>| {
         let mut cmd = tokio::process::Command::new(env!("CARGO_BIN_EXE_wats"));
         cmd.args(["--loopback", "--profile", "human", "--dir"])
@@ -1057,6 +1074,7 @@ async fn runner_token_marks_the_session_over_the_socket() -> anyhow::Result<()> 
     };
     for (token, held) in [
         (Some(token.as_str()), true),
+        (Some(persistent.as_str()), true),
         (Some("00ff"), false),
         (None, false),
     ] {
@@ -1373,6 +1391,7 @@ async fn wakes_only_on_what_is_addressed_to_it() -> anyhow::Result<()> {
         work_dir: dir.path().join("work"),
         keep_runs: 100,
         keep_days: 30,
+        openclaw: Default::default(),
     };
     let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
     let runner = tokio::spawn(wats::agent::run(Arc::clone(&a), config, async {
@@ -1476,6 +1495,7 @@ async fn wake_limits_defer_and_survive_a_restart() -> anyhow::Result<()> {
         work_dir: dir.path().join("work"),
         keep_runs: 100,
         keep_days: 30,
+        openclaw: Default::default(),
     };
     let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
     let runner = tokio::spawn(wats::agent::run(Arc::clone(&a), config.clone(), async {
@@ -1584,6 +1604,7 @@ async fn loop_detector_pauses_a_thread_until_a_third_party_posts() -> anyhow::Re
         work_dir: dir.path().join("work"),
         keep_runs: 100,
         keep_days: 30,
+        openclaw: Default::default(),
     };
     let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
     let runner = tokio::spawn(wats::agent::run(Arc::clone(&a), config, async {
@@ -1743,4 +1764,235 @@ fn setup_instructions_block_and_codex_approval() {
         config.contains("default_tools_approval_mode = \"approve\""),
         "{config}"
     );
+}
+
+/// One request the OpenClaw gateway stub received.
+#[derive(Debug, Clone)]
+struct HookRequest {
+    line: String,
+    headers: Vec<(String, String)>,
+    body: serde_json::Value,
+}
+
+impl HookRequest {
+    fn header(&self, name: &str) -> Option<&str> {
+        self.headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case(name))
+            .map(|(_, v)| v.as_str())
+    }
+}
+
+/// A stub of the OpenClaw gateway on 127.0.0.1: it records each request
+/// and answers with the next scripted `(status, body, delay)`.
+fn gateway_stub(
+    script: Vec<(u16, &'static str, Duration)>,
+) -> (String, Arc<std::sync::Mutex<Vec<HookRequest>>>) {
+    use std::io::{BufRead, BufReader, Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let log = Arc::clone(&seen);
+    std::thread::spawn(move || {
+        let mut script = script.into_iter();
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { continue };
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            let mut headers = Vec::new();
+            loop {
+                let mut header = String::new();
+                reader.read_line(&mut header).unwrap();
+                let header = header.trim_end();
+                if header.is_empty() {
+                    break;
+                }
+                let (k, v) = header.split_once(':').unwrap();
+                headers.push((k.trim().to_string(), v.trim().to_string()));
+            }
+            let length: usize = headers
+                .iter()
+                .find(|(k, _)| k.eq_ignore_ascii_case("content-length"))
+                .map_or(0, |(_, v)| v.parse().unwrap());
+            let mut body = vec![0; length];
+            reader.read_exact(&mut body).unwrap();
+            log.lock().unwrap().push(HookRequest {
+                line: line.trim_end().to_string(),
+                headers,
+                body: serde_json::from_slice(&body).unwrap_or_default(),
+            });
+            let (status, answer, delay) = script.next().unwrap_or((500, "{}", Duration::ZERO));
+            std::thread::sleep(delay);
+            let _ = write!(
+                stream,
+                "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{answer}",
+                answer.len()
+            );
+        }
+    });
+    (url, seen)
+}
+
+/// `--agent openclaw`: each run is a POST to the gateway's /hooks/agent
+/// with the hook token, the run id as idempotency key, and the wake in the
+/// thread's session. 200 records the completion; a 400 on the session
+/// policy falls back to isolated sessions for good; 401 fails the run; 503
+/// defers the wake to the next run; a slow gateway times the run out.
+#[tokio::test(flavor = "multi_thread")]
+async fn openclaw_forwards_wakes_to_the_gateway() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let a = node(&dir.path().join("a"), &[]).await?;
+    let ok = r#"{"ok":true,"completion":{"status":"ok"},"replyDisposition":"visible"}"#;
+    let (url, seen) = gateway_stub(vec![
+        (200, ok, Duration::ZERO),
+        (
+            400,
+            r#"{"error":"sessionKey is not allowed by the hooks session policy"}"#,
+            Duration::ZERO,
+        ),
+        (
+            200,
+            r#"{"completion":{"status":"ok"},"replyDisposition":"silent"}"#,
+            Duration::ZERO,
+        ),
+        (401, r#"{"error":"unauthorized"}"#, Duration::ZERO),
+        (503, r#"{"error":"starting"}"#, Duration::ZERO),
+        (200, ok, Duration::ZERO),
+        (200, ok, Duration::from_secs(6)),
+    ]);
+    let token = "ab".repeat(32);
+    let token_file = dir.path().join("hooks.token");
+    std::fs::write(&token_file, format!("{token}\n"))?;
+    let work = dir.path().join("work");
+    let config = AgentConfig {
+        runtime: "openclaw".into(),
+        profile: "agent".into(),
+        user: "alice".into(),
+        about: String::new(),
+        caps: vec![],
+        every: Duration::from_secs(1),
+        heartbeat: Duration::from_secs(3600),
+        max_runs_per_hour: 100,
+        allow: vec![],
+        ignore_local: false,
+        heartbeat_text: DEFAULT_HEARTBEAT.into(),
+        command: "/nonexistent/openclaw".into(),
+        mcp_command: "/usr/bin/true".into(),
+        mcp_args: vec![],
+        extra_args: vec![],
+        run_timeout: Duration::from_secs(1),
+        max_turns: 10,
+        budget: wats::budget::Budget::default(),
+        wakes: wats::wake::WakeLimits::unlimited(),
+        codex_disable: vec![],
+        access: wats::access::Access::Locked,
+        workdir: std::path::PathBuf::from("/nonexistent"),
+        tools: vec![],
+        model: Some("cheap-model".into()),
+        work_dir: work.clone(),
+        keep_runs: 50,
+        keep_days: 30,
+        openclaw: wats::openclaw::Target {
+            url: url.clone(),
+            agent: "wats".into(),
+            token_file,
+        },
+    };
+    let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+    let runner = tokio::spawn(wats::agent::run(Arc::clone(&a), config, async {
+        let _ = stopped.await;
+    }));
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let human = a.author_key("human")?;
+    let requests = || seen.lock().unwrap().clone();
+    let records = || -> Vec<wats::runs::RunRecord> {
+        wats::runs::list(&work)
+            .into_iter()
+            .filter(|r| r.status != "running")
+            .collect()
+    };
+
+    // 200: the forward, and its completion in the run index.
+    let first = a.publish_as(&human, ask("first question"), &[]).await?;
+    eventually("an indexed run", || records().len() == 1).await;
+    let sent = requests().remove(0);
+    let run = records().remove(0);
+    assert_eq!(sent.line, "POST /hooks/agent HTTP/1.1");
+    assert_eq!(
+        sent.header("authorization"),
+        Some(format!("Bearer {token}").as_str())
+    );
+    assert_eq!(sent.header("idempotency-key"), Some(run.id.as_str()));
+    let body = &sent.body;
+    assert_eq!(body["name"], "wats");
+    assert_eq!(body["agentId"], "wats");
+    assert_eq!(body["sessionMode"], "persistent");
+    assert_eq!(body["sessionKey"], format!("wats:{}", first.id));
+    assert_eq!(body["deliver"], false);
+    assert_eq!(body["waitForCompletion"], true);
+    assert_eq!(body["timeoutSeconds"], 1);
+    assert_eq!(body["model"], "cheap-model");
+    let message = body["message"].as_str().unwrap();
+    assert!(message.starts_with(wats::openclaw::PREAMBLE), "{message}");
+    assert!(message.contains(&first.id), "{message}");
+    assert_eq!(
+        (run.runtime.as_str(), run.status.as_str()),
+        ("openclaw", "ok")
+    );
+    assert_eq!(run.completion.as_deref(), Some("ok"));
+    assert_eq!(run.reply.as_deref(), Some("visible"));
+    assert_eq!(run.events, std::slice::from_ref(&first.id));
+    let transcript = std::fs::read_to_string(wats::runs::transcript_path(&work, &run.id))?;
+    assert!(transcript.contains("openclaw_forward"), "{transcript}");
+    assert!(!transcript.contains(&token), "the token is never written");
+    assert!(!transcript.contains("first question"), "nor the message");
+
+    // 400 on the session policy: the same run retries without a session
+    // key, and so do the later ones.
+    let second = a.publish_as(&human, ask("second question"), &[]).await?;
+    eventually("the isolated retry", || records().len() == 2).await;
+    let all = requests();
+    assert_eq!(all[1].body["sessionKey"], format!("wats:{}", second.id));
+    assert_eq!(all[2].body["sessionMode"], "isolated");
+    assert!(all[2].body.get("sessionKey").is_none(), "{}", all[2].body);
+    let run = records().remove(1);
+    assert_eq!(
+        all[2].header("idempotency-key"),
+        Some(format!("{}:isolated", run.id).as_str())
+    );
+    assert_eq!(run.status, "ok");
+    assert_eq!(run.reply.as_deref(), Some("silent"));
+
+    // 401: the run fails, pointing to the token.
+    a.publish_as(&human, ask("third question"), &[]).await?;
+    eventually("a failed run", || records().len() == 3).await;
+    let run = records().remove(2);
+    assert_eq!(run.status, "failed");
+    assert!(
+        run.error.as_deref().unwrap().contains("hook token"),
+        "{run:?}"
+    );
+    assert_eq!(requests()[3].body["sessionMode"], "isolated");
+
+    // 503: deferred, no record; the next run forwards the same wake.
+    let fourth = a.publish_as(&human, ask("fourth question"), &[]).await?;
+    eventually("the retried run", || records().len() == 4).await;
+    let all = requests();
+    assert_eq!(all.len(), 6);
+    let message = |n: usize| all[n].body["message"].as_str().unwrap().to_string();
+    assert!(message(4).contains(&fourth.id) && message(5).contains(&fourth.id));
+    let run = records().remove(3);
+    assert_eq!(run.status, "ok");
+    assert_eq!(run.events, std::slice::from_ref(&fourth.id));
+
+    // Slower than the timeout: the run times out.
+    a.publish_as(&human, ask("fifth question"), &[]).await?;
+    eventually("a timed-out run", || records().len() == 5).await;
+    assert_eq!(records().remove(4).status, "timeout");
+
+    let _ = stop.send(());
+    runner.await??;
+    a.shutdown().await?;
+    Ok(())
 }
