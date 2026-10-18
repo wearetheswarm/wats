@@ -1408,40 +1408,46 @@ use wats::settings::{ConfigFile, Settings, parse_duration, parse_size};
 /// `wats status`: the running node's MCP `status`, or what is known
 /// without a node.
 async fn status_command(config: &NodeConfig, json: bool) -> Result<()> {
-    let status = match attach::call_tool(&config.data_dir, "status", serde_json::json!({})).await? {
-        Some(mut status) => {
-            status["node"] = "running".into();
-            status
-        }
-        None => {
-            let mut status = serde_json::json!({
-                "node": "not running",
-                "nets": config.nets,
-                "version": env!("CARGO_PKG_VERSION"),
-            });
-            if let Some(update) = wats::update::status_json(&config.data_dir) {
-                status["update"] = update;
+    let mut status =
+        match attach::call_tool(&config.data_dir, "status", serde_json::json!({})).await? {
+            Some(mut status) => {
+                status["node"] = "running".into();
+                status
             }
-            status["halt"] = wats::halt::offline_status(&config.data_dir, config.halt.accept);
-            if config.data_dir.is_dir()
-                && let Some(notice) = wats::safety::status_notice(&config.data_dir)
-            {
-                status["safety"] = notice.into();
-            }
-            // What `wats` would run: no agent in config.toml.
-            match Settings::load(&config.data_dir).map(|s| s.agent.runtime) {
-                Ok(None) => status["notice"] = wats::firstrun::NO_AGENT_NOTICE.into(),
-                Ok(Some(runtime)) if runtime == "openclaw" => {
-                    status["budget"] = wats::openclaw::BUDGET.into();
+            None => {
+                let mut status = serde_json::json!({
+                    "node": "not running",
+                    "nets": config.nets,
+                    "version": env!("CARGO_PKG_VERSION"),
+                });
+                if let Some(update) = wats::update::status_json(&config.data_dir) {
+                    status["update"] = update;
                 }
-                _ => {}
+                status["halt"] = wats::halt::offline_status(&config.data_dir, config.halt.accept);
+                if config.data_dir.is_dir()
+                    && let Some(notice) = wats::safety::status_notice(&config.data_dir)
+                {
+                    status["safety"] = notice.into();
+                }
+                // What `wats` would run: no agent in config.toml.
+                match Settings::load(&config.data_dir).map(|s| s.agent.runtime) {
+                    Ok(None) => status["notice"] = wats::firstrun::NO_AGENT_NOTICE.into(),
+                    Ok(Some(runtime)) if runtime == "openclaw" => {
+                        status["budget"] = wats::openclaw::BUDGET.into();
+                    }
+                    _ => {}
+                }
+                status
             }
-            status
-        }
-    };
+        };
     if json {
         println!("{}", serde_json::to_string_pretty(&status)?);
     } else {
+        // One line: "health: degraded: relay.wearetheswarm.ai unreachable
+        // since …, using n0".
+        if let Some(health) = status.get_mut("health") {
+            *health = wats::health::summary(health).into();
+        }
         for line in status_lines("", &status) {
             println!("{line}");
         }
@@ -1656,6 +1662,10 @@ impl NodeArgs {
         if let Some(ttl) = &file.agent.review_ttl {
             config.review_ttl = parse_duration(ttl)
                 .map_err(|e| anyhow::anyhow!("config.toml agent.review_ttl: {e}"))?;
+        }
+        if let Some(after) = &file.health.no_peers_after {
+            config.no_peers_after = wats::settings::parse_retention(after)
+                .map_err(|e| anyhow::anyhow!("config.toml health.no_peers_after: {e}"))?;
         }
         if let Some(retention) = &file.submit.retention {
             config.submit_retention = wats::settings::parse_retention(retention)

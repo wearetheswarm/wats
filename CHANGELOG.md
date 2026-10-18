@@ -1,5 +1,21 @@
 # Changelog
 
+## Unreleased
+
+### Changes
+
+- **Infra health alerts**: each node watches its own view of the
+  infrastructure, with no central monitor: the home relay (ours
+  unreachable, fallen back to n0, or none), the address directories (its
+  own record, resolved through each one every 5 minutes), the bootstrap
+  nodes (none reachable and the peer cache empty or stale) and its peers
+  (none connected for `health.no_peers_after`, 5 minutes). One WARN when an
+  issue starts, one INFO when it clears. `wats status` shows a `health`
+  line; `wats status --json` and the MCP `status` tool a stable `health`
+  object (`state`, `checks`, `issues`). Hermetic and `--infra none` nodes
+  report the checks that cannot apply as `off`
+  ([docs/agent.md](docs/agent.md#infra-health), ADR 0009 addendum).
+
 ## 0.3.0 (2026-10-18)
 
 ### Upgrading from 0.2.0

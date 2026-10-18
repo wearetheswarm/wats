@@ -15,6 +15,7 @@ pub mod event;
 pub mod firstrun;
 pub mod grease;
 pub mod halt;
+pub mod health;
 pub mod identity;
 pub mod inbox;
 pub mod infra;
