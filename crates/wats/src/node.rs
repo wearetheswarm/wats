@@ -182,6 +182,10 @@ pub struct NodeConfig {
     /// Warn when the node has had no connected peer for this long
     /// (`health.no_peers_after`); `None` never does.
     pub no_peers_after: Option<Duration>,
+    /// An ask with no answer after this long (or past its `data.deadline`)
+    /// is listed as unanswered for its author (`ask.unanswered_after`,
+    /// ADR 0018 §4); `None` never.
+    pub unanswered_after: Option<Duration>,
 }
 
 impl NodeConfig {
@@ -216,6 +220,7 @@ impl NodeConfig {
             update: Default::default(),
             halt: Default::default(),
             no_peers_after: Some(crate::health::DEFAULT_NO_PEERS_AFTER),
+            unanswered_after: Some(crate::unanswered::DEFAULT_AFTER),
             bootstrap: Vec::new(),
             default_bootstrap: Vec::new(),
             resolver: Default::default(),

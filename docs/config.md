@@ -69,6 +69,12 @@ Command-line flags and `WATS_*` variables, where they exist (`wats --help`), tak
 |---|---|---|
 | `health.no_peers_after` | 5m | warn when the node has had no connected peer for this long (0: never) |
 
+## `[ask]`
+
+| Key | Default | |
+|---|---|---|
+| `ask.unanswered_after` | 30m | an ask of yours with no answer after this long (or past its data.deadline) shows up as unanswered in status, wait and search (0: never) |
+
 ## `[submit]`
 
 | Key | Default | |
