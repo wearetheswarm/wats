@@ -66,6 +66,23 @@ jobs:
       - name: cargo deny
         if: runner.os == 'Linux'
         run: cargo deny check
+      # Secret scan: gitleaks, pinned by SHA-256, with .gitleaks.toml (the
+      # default rules minus public keys and signatures). The checkout is
+      # shallow, so this scans the whole tree of the commit under test.
+      - name: Secret scan (gitleaks)
+        if: runner.os == 'Linux'
+        env:
+          GITLEAKS_VERSION: "8.21.2"
+          GITLEAKS_SHA256: 5bc41815076e6ed6ef8fbecc9d9b75bcae31f39029ceb55da08086315316e3ba
+        run: |
+          dir="$RUNNER_TEMP/gitleaks"
+          mkdir -p "$dir"
+          asset="gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          curl -fsSL --proto '=https' --tlsv1.2 -o "$dir/$asset" \
+            "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/$asset"
+          echo "$GITLEAKS_SHA256  $dir/$asset" | sha256sum -c -
+          tar -xzf "$dir/$asset" -C "$dir" gitleaks
+          "$dir/gitleaks" detect --source . --config .gitleaks.toml --redact --no-banner
       # install.sh: shellcheck, and its verification against signed fixtures
       # (a tampered archive or a wrong signature must be refused).
       - name: install.sh
