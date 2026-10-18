@@ -200,6 +200,7 @@ pub struct AgentSettings {
     pub max_runs_per_hour: Option<usize>,
     pub wakes_per_author_per_hour: Option<usize>,
     pub loop_max_exchanges: Option<usize>,
+    pub catchup: Option<String>,
     /// Removed keys ([`REMOVED_KEYS`]): still accepted, ignored, with a
     /// warning.
     #[serde(default)]
@@ -663,6 +664,14 @@ pub const KEYS: &[Key] = &[
         "30",
         "turns the agent and one other author may take in a row in a thread \
          before it stops waking the agent, until a third party posts (0: off)",
+    ),
+    key(
+        "agent.catchup",
+        ValueType::Retention,
+        "24h",
+        "at start, asks and replies stored while the runner was not listening \
+         (synced at startup or on a reconnection) still wake the agent when \
+         this recent and unanswered (0: off)",
     ),
     key(
         "agent.allow",

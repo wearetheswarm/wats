@@ -102,6 +102,192 @@ pub struct AgentConfig {
     pub keep_days: u64,
     /// With the `openclaw` runtime: the gateway the runs are forwarded to.
     pub openclaw: crate::openclaw::Target,
+    /// At start, events stored while the runner was not listening (synced
+    /// at startup or on a reconnection, or before a restart) still wake
+    /// the agent when this recent, unanswered and not local
+    /// (`agent.catchup`; `None`: off). See [`catch_up`].
+    pub catchup: Option<Duration>,
+}
+
+/// Default of `agent.catchup`.
+pub const DEFAULT_CATCHUP: Duration = Duration::from_secs(24 * 3600);
+
+/// The runner's cursor in `work_dir`: the store sequence number up to
+/// which events were handed to a run (or found of no interest).
+const CURSOR_FILE: &str = "cursor";
+
+fn read_cursor(work_dir: &std::path::Path) -> Option<i64> {
+    std::fs::read_to_string(work_dir.join(CURSOR_FILE))
+        .ok()?
+        .trim()
+        .parse()
+        .ok()
+}
+
+fn write_cursor(work_dir: &std::path::Path, seq: i64) {
+    let path = work_dir.join(CURSOR_FILE);
+    let tmp = work_dir.join(format!("{CURSOR_FILE}.tmp"));
+    let written = std::fs::create_dir_all(work_dir)
+        .and_then(|()| std::fs::write(&tmp, format!("{seq}\n")))
+        .and_then(|()| std::fs::rename(&tmp, &path));
+    if let Err(e) = written {
+        debug!("cannot save the agent cursor to {}: {e}", path.display());
+    }
+}
+
+/// "24h", "90m", "45s".
+fn window_text(window: Duration) -> String {
+    let secs = window.as_secs();
+    if secs >= 3600 && secs.is_multiple_of(3600) {
+        format!("{}h", secs / 3600)
+    } else if secs >= 60 && secs.is_multiple_of(60) {
+        format!("{}m", secs / 60)
+    } else {
+        format!("{secs}s")
+    }
+}
+
+/// Whether `event` is still waiting for the agent `me`: the agent has not
+/// posted in its thread since, and, for an ask, nobody answered it.
+fn unanswered(node: &Node, me: &str, event: &Event) -> bool {
+    let Ok(thread) = node.store().thread(event.thread_root(), 1000) else {
+        return true;
+    };
+    !thread.iter().any(|stored| {
+        let post = &stored.event;
+        post.id != event.id
+            && ((post.author == me && post.ts >= event.ts)
+                || (event.kind == Kind::Ask
+                    && post.kind == Kind::Answer
+                    && post.author != event.author))
+    })
+}
+
+/// Older unanswered asks offered per heartbeat run (ADR 0018 §6).
+pub const OLDER_ASKS_PER_HEARTBEAT: usize = 3;
+/// Asks older than this are not offered at all.
+pub const OLDER_ASKS_MAX_AGE: Duration = Duration::from_secs(3 * 86_400);
+/// The older asks already offered, one id per line in `work_dir`.
+const OFFERED_FILE: &str = "offered";
+/// How many offered ids are remembered.
+const OFFERED_KEEP: usize = 2000;
+
+fn read_offered(work_dir: &std::path::Path) -> Vec<String> {
+    std::fs::read_to_string(work_dir.join(OFFERED_FILE))
+        .map(|t| t.lines().map(str::to_string).collect())
+        .unwrap_or_default()
+}
+
+fn save_offered(work_dir: &std::path::Path, mut offered: Vec<String>, new: &[String]) {
+    offered.extend(new.iter().cloned());
+    let skip = offered.len().saturating_sub(OFFERED_KEEP);
+    let text: String = offered
+        .iter()
+        .skip(skip)
+        .map(|id| format!("{id}\n"))
+        .collect();
+    let path = work_dir.join(OFFERED_FILE);
+    let tmp = work_dir.join(format!("{OFFERED_FILE}.tmp"));
+    if let Err(e) = std::fs::write(&tmp, text).and_then(|()| std::fs::rename(&tmp, &path)) {
+        debug!("cannot save the offered asks to {}: {e}", path.display());
+    }
+}
+
+/// Up to [`OLDER_ASKS_PER_HEARTBEAT`] asks for a heartbeat run, oldest
+/// first: between `window` (`agent.catchup`) and [`OLDER_ASKS_MAX_AGE`]
+/// old, of interest to the agent, unanswered, and never offered before
+/// (ADR 0018 §6). An old question still has value; they only fill a
+/// heartbeat that runs anyway.
+pub fn older_asks(
+    node: &Node,
+    me: &str,
+    config: &AgentConfig,
+    window: Duration,
+    offered: &[String],
+    now: u64,
+) -> Vec<Arc<Event>> {
+    let (newest, oldest) = (
+        now.saturating_sub(window.as_secs()),
+        now.saturating_sub(OLDER_ASKS_MAX_AGE.as_secs()),
+    );
+    let asks = Filter {
+        kinds: vec![Kind::Ask],
+        ..Filter::default()
+    };
+    let Ok(found) = node.store().search(None, &asks, 1000) else {
+        return Vec::new();
+    };
+    let mut older: Vec<Arc<Event>> = found
+        .into_iter()
+        .map(|s| s.event)
+        .filter(|e| e.ts < newest && e.ts >= oldest && e.thread.is_none())
+        .filter(|e| !offered.contains(&e.id))
+        .filter(|e| {
+            matches!(
+                interest(node, me, &config.allow, config.ignore_local, e),
+                Interest::Wake(_)
+            ) && unanswered(node, me, e)
+        })
+        .collect();
+    older.sort_by_key(|e| e.ts);
+    older.truncate(OLDER_ASKS_PER_HEARTBEAT);
+    older
+}
+
+/// Events stored after `after` and up to `upto` (store sequence numbers)
+/// that should still wake the agent: of interest to it (see [`interest`];
+/// local authors left out per `agent.ignore_local`), posted less than
+/// `window` before `now`, and unanswered (see [`unanswered`]). Live
+/// gossip is not the only way in: an ask synced when the node starts or
+/// reconnects, or stored while the runner was down, wakes the agent too.
+pub fn catch_up(
+    node: &Node,
+    me: &str,
+    config: &AgentConfig,
+    window: Duration,
+    after: i64,
+    upto: i64,
+    now: u64,
+) -> Vec<(Arc<Event>, &'static str)> {
+    let oldest = now.saturating_sub(window.as_secs());
+    let filter = Filter {
+        kinds: vec![
+            Kind::Ask,
+            Kind::Answer,
+            Kind::Clarify,
+            Kind::Offer,
+            Kind::Claim,
+            Kind::Release,
+        ],
+        ..Filter::default()
+    };
+    let mut found = Vec::new();
+    let mut cursor = after;
+    loop {
+        let Ok(page) = node.store().since(cursor, &filter, 500) else {
+            break;
+        };
+        let Some(last) = page.last().map(|s| s.seq) else {
+            break;
+        };
+        for stored in page {
+            if stored.seq > upto {
+                return found;
+            }
+            let event = stored.event;
+            if event.ts < oldest {
+                continue;
+            }
+            if let Interest::Wake(why) =
+                interest(node, me, &config.allow, config.ignore_local, &event)
+                && unanswered(node, me, &event)
+            {
+                found.push((event, why));
+            }
+        }
+        cursor = last;
+    }
+    found
 }
 
 /// Why a run happened.
@@ -1067,6 +1253,34 @@ pub async fn run(
     let mut wakes = wake_history(&node, &config, unix_now());
     let mut feedback: Vec<String> = Vec::new();
     let mut since = node.store().last_seq()?;
+    // What arrived while the runner was not listening: since its cursor,
+    // or everything recent on a first start.
+    if let Some(window) = config.catchup {
+        let after = read_cursor(&config.work_dir).unwrap_or(0).min(since);
+        let missed = catch_up(&node, &me, &config, window, after, since, unix_now());
+        if !missed.is_empty() {
+            info!(
+                "agent catch-up: {} queued from before the runner listened (less than {} old, unanswered)",
+                count(missed.len(), "event", "events"),
+                window_text(window)
+            );
+        }
+        for (event, why) in missed {
+            info!(
+                event = short(&event.id),
+                kind = event.kind.as_str(),
+                "queued for the agent (catch-up): {why}"
+            );
+            pending.push(Queued {
+                id: event.id.clone(),
+                why,
+                author: event.author.clone(),
+                thread: event.thread_root().to_string(),
+                held: None,
+            });
+        }
+    }
+    write_cursor(&config.work_dir, since);
     // Clarifies past their deadline already queued (ADR 0018 §3).
     let mut deadline_checked: Option<Instant> = None;
     let mut next_deadline: Option<u64> = None;
@@ -1270,6 +1484,22 @@ pub async fn run(
                     }
                 };
                 let mut text = prompt(&node, &config, since, &trigger);
+                // A heartbeat also offers a few older unanswered asks.
+                if let (Trigger::Heartbeat, Some(window)) = (&trigger, config.catchup) {
+                    let offered = read_offered(&config.work_dir);
+                    let older = older_asks(&node, &me, &config, window, &offered, unix_now);
+                    if !older.is_empty() {
+                        let ids: Vec<String> = older.iter().map(|e| e.id.clone()).collect();
+                        info!("heartbeat: offering {} nobody answered", count(ids.len(), "older ask", "older asks"));
+                        text.push_str(&format!(
+                            "\n\nOlder asks nobody answered (more than {} old; optional: help \
+                             only where you can add real value, otherwise skip them):\n{}\n",
+                            window_text(window),
+                            event_lines(&node, &ids).join("\n")
+                        ));
+                        save_offered(&config.work_dir, offered, &ids);
+                    }
+                }
                 let taken = std::mem::take(&mut feedback);
                 text.push_str(&feedback_section(&node, &taken));
                 // What the human said about the posts they rejected.
@@ -1283,6 +1513,7 @@ pub async fn run(
                 }
                 // Everything up to now is covered by this run.
                 since = node.store().last_seq()?;
+                write_cursor(&config.work_dir, since);
                 let mut woke = Vec::new();
                 if let Trigger::Events(ids) = &trigger {
                     let ids: std::collections::HashSet<&str> =

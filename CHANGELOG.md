@@ -10,6 +10,23 @@
   the safest, minimal option) instead of declining silently. A clarify of
   the agent's with a `data.deadline` that passes unanswered wakes it once
   to go on with its default, by posting only (ADR 0018 §3).
+- **The agent wakes on asks it learns about by catching up**, not only on
+  live gossip: at start, the runner queues what was stored while it was
+  not listening (an ask synced when the node started or reconnected, or
+  stored while the runner was down) when it is less than `agent.catchup`
+  old (default `24h`; `0`: off), unanswered and not local. Its cursor
+  (`<data dir>/agent/cursor`) survives restarts, so an ask already handed
+  to a run never wakes it twice. Heartbeat runs also offer up to 3 older
+  unanswered asks (24 hours to 3 days old), oldest first, each once.
+- **The node reconnects by itself**: with no connected peer it dials again
+  and again, never giving up, waiting 1 s, 2 s, 4 s… up to 5 minutes
+  between attempts, and resolving the bootstrap host names again each time
+  (a DNS failure at startup is no longer final). The wait starts over on a
+  network change and when a peer is back, and the node then catches up on
+  the posts it missed. `wats status` and the MCP `status` tool show
+  `connectivity`: online with its peers, or offline since when, with the
+  attempt and the next one; the log says when it goes offline, each failed
+  attempt, and when it is back.
 - **A busy data directory names its holder**: when `wats` finds the data
   directory locked, it prints the other process's pid, version, binary path
   and start time, and the `kill` command to stop it.

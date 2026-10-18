@@ -77,12 +77,18 @@ pub struct NodeConfig {
     pub nets: Vec<String>,
     /// Bootstrap peers.
     pub peers: Vec<EndpointAddr>,
-    /// Bootstrap entries resolved by DNS at startup, ids pinned (ADR 0008).
+    /// Bootstrap entries resolved by DNS at startup and at every
+    /// reconnection attempt, ids pinned (ADR 0008).
     pub bootstrap: Vec<BootstrapEntry>,
     /// The bootstrap nodes compiled into the binary: dialed at startup only
-    /// when the peer cache is empty, or later when none of its peers
-    /// answered (security review B1).
+    /// when the peer cache is empty, or later when no peer answered
+    /// (security review B1).
     pub default_bootstrap: Vec<BootstrapEntry>,
+    /// How bootstrap entries are resolved: DNS (tests inject failures).
+    pub resolver: crate::bootstrap::Resolver,
+    /// How fast the node dials again with no connected peer
+    /// ([`crate::reconnect`]).
+    pub reconnect: crate::reconnect::Backoff,
     /// Fixed UDP port for IPv4 (0.0.0.0), e.g. behind a load balancer.
     /// Random when unset.
     pub port: Option<u16>,
@@ -198,6 +204,8 @@ impl NodeConfig {
             no_peers_after: Some(crate::health::DEFAULT_NO_PEERS_AFTER),
             bootstrap: Vec::new(),
             default_bootstrap: Vec::new(),
+            resolver: Default::default(),
+            reconnect: Default::default(),
             port: None,
             external_addrs: Vec::new(),
             secret_file: None,
@@ -473,17 +481,25 @@ pub fn provider_backoff(failures: u32) -> Duration {
 
 /// How often the peer cache is saved (B1).
 const PEER_CACHE_SAVE_SECS: u64 = 300;
-/// How long peers from the cache have to answer before the built-in
-/// bootstrap nodes are dialed (B1).
-const BOOTSTRAP_FALLBACK_AFTER: Duration = Duration::from_secs(15);
+/// How often the reconnect loop looks at the peers while online.
+const RECONNECT_WATCH_EVERY: Duration = Duration::from_secs(1);
+/// At most one catch-up with every neighbor per this long, on network
+/// changes while online.
+const CATCH_UP_EVERY: Duration = Duration::from_secs(30);
 
 /// Resolve bootstrap entries concurrently; an entry that does not resolve
 /// is logged and skipped, so one dead seed never blocks the others.
-async fn resolve_bootstrap(entries: &[BootstrapEntry], me: EndpointId) -> Vec<EndpointAddr> {
+async fn resolve_bootstrap(
+    entries: &[BootstrapEntry],
+    me: EndpointId,
+    resolver: &crate::bootstrap::Resolver,
+) -> Vec<EndpointAddr> {
     let mut tasks = tokio::task::JoinSet::new();
     for entry in entries.iter().cloned() {
+        let resolver = resolver.clone();
         tasks.spawn(async move {
-            let resolved = tokio::time::timeout(Duration::from_secs(10), entry.resolve()).await;
+            let resolved =
+                tokio::time::timeout(Duration::from_secs(10), resolver.resolve(&entry)).await;
             (entry, resolved)
         });
     }
@@ -503,6 +519,93 @@ async fn resolve_bootstrap(entries: &[BootstrapEntry], me: EndpointId) -> Vec<En
         }
     }
     out
+}
+
+/// The reconnect loop ([`crate::reconnect`]): while the node has no
+/// gossip neighbor, dial everything it knows again, with backoff; never
+/// give up. Holds the node only while it works, so a stopped node ends it.
+async fn reconnect_loop(weak: std::sync::Weak<Node>) {
+    use crate::reconnect::jitter;
+    use tokio::time::Instant;
+    let Some(node) = weak.upgrade() else { return };
+    let backoff = node.config.reconnect;
+    drop(node);
+    // The dials of `start` get `start_grace` to answer before the first
+    // attempt; the connectivity stays `connecting` meanwhile.
+    let mut starting = true;
+    let mut attempt: u32 = 1;
+    let mut next: Option<Instant> = Instant::now().checked_add(backoff.start_grace);
+    // The attempt whose wait was last reported.
+    let mut reported: u32 = 0;
+    let mut last_catch_up: Option<Instant> = None;
+    let mut last_redial: Option<Instant> = None;
+    loop {
+        let Some(node) = weak.upgrade() else { return };
+        if node.endpoint().is_closed() {
+            return;
+        }
+        let changed = node
+            .network_changed
+            .swap(false, std::sync::atomic::Ordering::SeqCst);
+        let peers = node.neighbors().len();
+        let now = Instant::now();
+        if peers > 0 {
+            let transition = node
+                .connectivity
+                .lock()
+                .ok()
+                .and_then(|mut c| c.online(peers, now_secs()));
+            if let Some(transition) = transition {
+                transition.log();
+            }
+            (starting, attempt, next, reported) = (false, 1, None, 0);
+            if changed && last_catch_up.is_none_or(|t| t.elapsed() >= CATCH_UP_EVERY) {
+                last_catch_up = Some(now);
+                node.catch_up_all();
+            }
+            let kick = Arc::clone(&node.reconnect_kick);
+            drop(node);
+            let _ = tokio::time::timeout(RECONNECT_WATCH_EVERY, kick.notified()).await;
+            continue;
+        }
+        if changed {
+            // A new network: dial at once (but not twice within `first`
+            // when the network flaps), the backoff starts over.
+            let soonest = last_redial
+                .and_then(|t| t.checked_add(backoff.first))
+                .map_or(now, |t| t.max(now));
+            (attempt, next, reported) = (1, Some(soonest), 0);
+        }
+        // Just went offline: the first, short wait.
+        let at = *next.get_or_insert_with(|| {
+            now.checked_add(backoff.delay(attempt, jitter()))
+                .unwrap_or(now)
+        });
+        if !starting && reported != attempt {
+            reported = attempt;
+            let dialable = node.has_dial_targets();
+            let wait = at.saturating_duration_since(now);
+            let transition = node
+                .connectivity
+                .lock()
+                .ok()
+                .and_then(|mut c| c.offline(attempt, wait, dialable, now_secs()));
+            if let Some(transition) = transition {
+                transition.log();
+            }
+        }
+        if now >= at {
+            last_redial = Some(now);
+            node.redial().await;
+            starting = false;
+            attempt = attempt.saturating_add(1);
+            next = Instant::now().checked_add(backoff.delay(attempt, jitter()));
+            continue;
+        }
+        let kick = Arc::clone(&node.reconnect_kick);
+        drop(node);
+        let _ = tokio::time::timeout(at.saturating_duration_since(now), kick.notified()).await;
+    }
 }
 
 pub fn now_secs() -> u64 {
@@ -553,6 +656,12 @@ pub struct Node {
     peer_info: std::sync::Mutex<HashMap<EndpointId, NodeInfo>>,
     /// Cached blob store size: (when measured, bytes).
     usage: std::sync::Mutex<Option<(std::time::Instant, u64)>>,
+    /// What the reconnect loop sees ([`crate::reconnect`]).
+    connectivity: std::sync::Mutex<crate::reconnect::Connectivity>,
+    /// Wakes the reconnect loop: a neighbor up, a network change.
+    reconnect_kick: Arc<tokio::sync::Notify>,
+    /// A network change since the reconnect loop last looked.
+    network_changed: std::sync::atomic::AtomicBool,
     /// Size of the whole data directory, measured every 30 s.
     storage_bytes: std::sync::atomic::AtomicU64,
     /// When we last logged that storage is full (rate limit).
@@ -785,13 +894,10 @@ impl Node {
             config.no_peers_after,
         ));
         let mut seeds = config.bootstrap.clone();
-        let fallback = if cached.is_empty() {
+        if cached.is_empty() {
             seeds.extend(config.default_bootstrap.iter().cloned());
-            Vec::new()
-        } else {
-            config.default_bootstrap.clone()
-        };
-        peers.extend(resolve_bootstrap(&seeds, endpoint.id()).await);
+        }
+        peers.extend(resolve_bootstrap(&seeds, endpoint.id(), &config.resolver).await);
         for peer in &peers {
             lookup.add_endpoint_info(peer.clone());
         }
@@ -864,6 +970,9 @@ impl Node {
             lock: std::sync::Mutex::new(Some(lock)),
             health: std::sync::Mutex::new(health),
             seed_ids,
+            connectivity: std::sync::Mutex::new(crate::reconnect::Connectivity::new(now_secs())),
+            reconnect_kick: Default::default(),
+            network_changed: Default::default(),
         });
         node.measure_storage().await;
         if node.config.storage_max.is_some() {
@@ -934,22 +1043,7 @@ impl Node {
                 }
             }));
         }
-        if !fallback.is_empty() {
-            let weak = Arc::downgrade(&node);
-            tokio::spawn(async move {
-                tokio::time::sleep(BOOTSTRAP_FALLBACK_AFTER).await;
-                let Some(node) = weak.upgrade() else { return };
-                if !node.neighbors().is_empty() {
-                    return;
-                }
-                info!("no peer met before answered: dialing the built-in bootstrap nodes");
-                for addr in resolve_bootstrap(&fallback, node.endpoint_id()).await {
-                    if let Err(e) = node.add_peer(addr).await {
-                        warn!("bootstrap peer: {e:#}");
-                    }
-                }
-            });
-        }
+        node.spawn_reconnect();
         node.spawn_health_checks();
         if !node.config.halt.accept {
             warn!("this node ignores guardian halts (halt.accept = false)");
@@ -989,10 +1083,152 @@ impl Node {
     /// The `health` value of `status`: this node's view of the
     /// infrastructure (see [`crate::health`]).
     pub fn health_json(&self) -> serde_json::Value {
-        self.health
+        let mut health = self
+            .health
             .lock()
             .map(|h| h.json())
+            .unwrap_or_else(|_| serde_json::json!({"state": "unknown"}));
+        if let Some(map) = health.as_object_mut() {
+            map.insert("connectivity".into(), self.connectivity_json());
+        }
+        health
+    }
+
+    /// The `connectivity` value of `health` (see [`crate::reconnect`]).
+    pub fn connectivity_json(&self) -> serde_json::Value {
+        self.connectivity
+            .lock()
+            .map(|c| c.json(now_secs()))
             .unwrap_or_else(|_| serde_json::json!({"state": "unknown"}))
+    }
+
+    /// Something changed the network (new addresses, the home relay
+    /// back): the reconnect loop starts its backoff over.
+    pub fn network_changed(&self) {
+        self.network_changed
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        self.reconnect_kick.notify_one();
+    }
+
+    /// The peer cache, as this node may dial it.
+    fn cached_peers(&self) -> Vec<crate::peer_cache::CachedPeer> {
+        let cached = crate::peer_cache::load(&self.config.data_dir, self.endpoint_id(), now_secs());
+        if self.config.mode == NetworkMode::Loopback {
+            crate::peer_cache::loopback_only(cached)
+        } else {
+            cached
+        }
+    }
+
+    /// Whether the node knows anywhere to dial.
+    fn has_dial_targets(&self) -> bool {
+        !self.config.peers.is_empty()
+            || !self.config.bootstrap.is_empty()
+            || !self.config.default_bootstrap.is_empty()
+            || !self.cached_peers().is_empty()
+    }
+
+    /// Where the node can dial: the configured peers, the peer cache, and
+    /// the bootstrap entries, the built-in ones included, resolved now
+    /// (every attempt resolves again). Only used with no connected peer,
+    /// so the built-in nodes are dialed only when no peer answered (B1).
+    async fn dial_targets(&self) -> Vec<EndpointAddr> {
+        let me = self.endpoint_id();
+        let cached = self.cached_peers();
+        let mut seeds = self.config.bootstrap.clone();
+        seeds.extend(self.config.default_bootstrap.iter().cloned());
+        let mut targets: Vec<EndpointAddr> = self.config.peers.clone();
+        targets.extend(
+            cached
+                .iter()
+                .filter_map(crate::peer_cache::CachedPeer::to_addr),
+        );
+        targets.extend(resolve_bootstrap(&seeds, me, &self.config.resolver).await);
+        targets.retain(|t| t.id != me);
+        targets
+    }
+
+    /// One reconnection attempt: dial every target on every network.
+    /// Returns whether there was anything to dial.
+    async fn redial(&self) -> bool {
+        let targets = self.dial_targets().await;
+        if targets.is_empty() {
+            return false;
+        }
+        debug!(targets = targets.len(), "dialing peers again");
+        for addr in targets {
+            let id = addr.id;
+            if let Err(e) = self.add_peer(addr).await {
+                debug!(peer = %id.fmt_short(), "redial: {e:#}");
+            }
+        }
+        true
+    }
+
+    /// Catch up with every neighbor (after a network change while online:
+    /// gossip may have lost messages without losing its neighbors).
+    fn catch_up_all(self: &Arc<Self>) {
+        let nets: Vec<(String, Vec<EndpointId>)> = self
+            .neighbors
+            .lock()
+            .map(|n| {
+                n.iter()
+                    .map(|(net, peers)| (net.clone(), peers.iter().copied().collect()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        for (net, peers) in nets {
+            for peer in peers {
+                let node = Arc::clone(self);
+                let net = net.clone();
+                tokio::spawn(async move {
+                    match node.sync_from(peer, &net).await {
+                        Ok(n) => debug!(%net, peer = %peer.fmt_short(), new = n, "caught up"),
+                        Err(e) => debug!(%net, peer = %peer.fmt_short(), "catch-up failed: {e:#}"),
+                    }
+                });
+            }
+        }
+    }
+
+    /// The reconnect loop ([`crate::reconnect`]) and the network watchers
+    /// that start its backoff over.
+    fn spawn_reconnect(self: &Arc<Self>) {
+        let weak = Arc::downgrade(self);
+        tokio::spawn(supervise("reconnect", move || {
+            let weak = weak.clone();
+            async move { reconnect_loop(weak).await }
+        }));
+        if self.config.mode != NetworkMode::Internet {
+            return;
+        }
+        let weak = Arc::downgrade(self);
+        let mut addr = self.endpoint().watch_addr();
+        tokio::spawn(async move {
+            use iroh::Watcher as _;
+            while addr.updated().await.is_ok() {
+                let Some(node) = weak.upgrade() else { break };
+                debug!("our addresses changed");
+                node.network_changed();
+            }
+        });
+        let weak = Arc::downgrade(self);
+        let mut relays = self.endpoint().home_relay_status();
+        tokio::spawn(async move {
+            use iroh::Watcher as _;
+            let connected =
+                |s: &Vec<iroh::endpoint::RelayStatus>| s.iter().any(|r| r.is_connected());
+            let mut was = connected(&relays.get());
+            while let Ok(status) = relays.updated().await {
+                let Some(node) = weak.upgrade() else { break };
+                let now = connected(&status);
+                if now && !was {
+                    debug!("home relay connected again");
+                    node.network_changed();
+                }
+                was = now;
+            }
+        });
     }
 
     fn health_applies(&self, what: crate::health::What) -> bool {
@@ -1712,6 +1948,7 @@ impl Node {
                     if let Ok(mut n) = self.neighbors.lock() {
                         n.entry(net.clone()).or_default().insert(id);
                     }
+                    self.reconnect_kick.notify_one();
                     self.seen(id);
                     let node = Arc::clone(&self);
                     let net = net.clone();

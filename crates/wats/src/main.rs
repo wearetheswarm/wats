@@ -1777,8 +1777,15 @@ async fn status_command(config: &NodeConfig, json: bool) -> Result<()> {
     } else {
         // One line: "health: degraded: relay.wearetheswarm.ai unreachable
         // since …, using n0".
+        // And one for connectivity: "online (3 peers)", or "offline since
+        // …, reconnecting (attempt 3, next in 8s)".
+        let mut connectivity = None;
         if let Some(health) = status.get_mut("health") {
+            connectivity = health.get("connectivity").map(wats::reconnect::summary);
             *health = wats::health::summary(health).into();
+        }
+        if let (Some(connectivity), Some(map)) = (connectivity, status.as_object_mut()) {
+            map.insert("connectivity".into(), connectivity.into());
         }
         for line in status_lines("", &status) {
             println!("{line}");
@@ -2532,7 +2539,13 @@ fn agent_config(
         budget.max_usd_per_day = f64::INFINITY;
         budget.max_usd_per_month = f64::INFINITY;
     }
+    let catchup = match &file.catchup {
+        Some(value) => wats::settings::parse_retention(value)
+            .map_err(|e| anyhow::anyhow!("config.toml agent.catchup: {e}"))?,
+        None => Some(wats::agent::DEFAULT_CATCHUP),
+    };
     Ok(Some(wats::agent::AgentConfig {
+        catchup,
         openclaw,
         runtime,
         ignore_local: args.ignore_local.or(file.ignore_local).unwrap_or(true),
