@@ -43,12 +43,18 @@ async fn background_session_hands_over_to_a_daemon() -> anyhow::Result<()> {
     let status = call(&client, "status", json!({})).await.unwrap();
     assert_eq!(status["mode"], "background", "{status}");
     // Hermetic: relay and lookup cannot apply, nothing to bootstrap from.
+    let mut health = status["health"].clone();
+    let connectivity = health.as_object_mut().unwrap().remove("connectivity");
     assert_eq!(
-        status["health"],
+        health,
         json!({"state": "ok", "checks": {
             "relay": "off", "lookup": "off", "bootstrap": "off", "peers": "off"}}),
         "{status}"
     );
+    // Nowhere to dial: never "reconnecting".
+    let connectivity = connectivity.unwrap();
+    assert_eq!(connectivity["peers"], 0, "{status}");
+    assert!(connectivity.get("attempt").is_none(), "{status}");
     assert!(
         status["hint"]
             .as_str()
