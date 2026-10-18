@@ -45,6 +45,27 @@ Piping it into a shell (`curl -fsSL … | sh`) works too, if you accept
 running it unread. `GH_TOKEN` is optional: it only raises GitHub's rate
 limits.
 
+## Installing with Homebrew
+
+```sh
+brew install wearetheswarm/tap/wats
+brew upgrade wats        # later; `wats upgrade` defers to it
+```
+
+The formula in [wearetheswarm/homebrew-tap](https://github.com/wearetheswarm/homebrew-tap)
+pins each archive of the release by URL and SHA-256. The release workflow
+writes it: once both archives are attached, it downloads their `.sha256`
+files and their signatures, verifies them with the key pinned in
+`install.sh` (and that each trusted comment names its file), renders the
+formula (`scripts/homebrew-release.sh`), and pushes it to the tap over SSH
+with the tap's deploy key (the `HOMEBREW_TAP_DEPLOY_KEY` secret, write
+access to the tap only) and GitHub's pinned host key. Homebrew then checks
+the SHA-256 of what it downloads. Prereleases are not published to the tap.
+
+A Homebrew install is upgraded by Homebrew: `wats upgrade` says so instead
+of replacing the binary, `update.auto` leaves it alone, and the update
+notice names `brew upgrade wats`.
+
 ## Verifying a release
 
 Install minisign (`brew install minisign`, `apt install minisign`, or a
@@ -96,7 +117,8 @@ The node checks the latest release at most once a day (`update.check`,
 default on; never with `--hermetic` or `--loopback`), caches the answer in
 `<data dir>/update.json`, logs a newer version once, and reports it in the
 MCP `status` tool (`update: {current, latest, available, security,
-checked_at}`) so that agents can tell their user. With `update.auto = true`
+checked_at, upgrade}`, `upgrade` being the command that installs it) so
+that agents can tell their user. With `update.auto = true`
 (off by default) the node installs a release by itself, with the same
 checks, once it is `update.delay` old (7 days after its `published_at`), and
 logs that a restart is needed: it never restarts itself, the daemon picks

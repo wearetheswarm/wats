@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- **Homebrew**: `brew install wearetheswarm/tap/wats` (macOS Apple
+  silicon, Linux x86_64). Each release updates the tap's formula from its
+  minisign-verified checksums. A Homebrew install is upgraded with `brew
+  upgrade wats`: `wats upgrade` says so, `update.auto` leaves it alone, and
+  the update notice and `status` name the right command.
 - **install.sh comes with each release**, signed with minisign like the
   archives: `https://github.com/wearetheswarm/wats/releases/latest/download/install.sh` is always the latest release's installer,
   and `install.sh.minisig` verifies it.

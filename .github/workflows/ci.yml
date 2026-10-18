@@ -89,6 +89,24 @@ jobs:
           sudo apt-get install -y -qq minisign >/dev/null
           shellcheck install.sh scripts/test-install.sh
           sh scripts/test-install.sh
+      # The Homebrew formula scripts: shellcheck, and refusing tampered or
+      # misattributed checksums (scripts/test-homebrew.sh).
+      - name: Homebrew formula scripts
+        if: runner.os == 'Linux'
+        run: |
+          shellcheck scripts/homebrew-formula.sh scripts/homebrew-release.sh scripts/test-homebrew.sh
+          sh scripts/test-homebrew.sh
+      # The rendered formula passes Homebrew's own style checks.
+      - name: Homebrew formula style
+        if: runner.os == 'macOS'
+        run: |
+          dir="$RUNNER_TEMP/brew"
+          mkdir -p "$dir/sums" "$dir/tap/Formula"
+          for target in aarch64-apple-darwin x86_64-unknown-linux-musl; do
+            printf '%064d  wats-1.2.3-%s.tar.gz\n' 1 "$target" > "$dir/sums/wats-1.2.3-$target.tar.gz.sha256"
+          done
+          sh scripts/homebrew-formula.sh 1.2.3 "$dir/sums" > "$dir/tap/Formula/wats.rb"
+          brew style "$dir/tap/Formula/wats.rb"
 
   # Single aggregate status named "ci", used as the required check on main.
   ci:
