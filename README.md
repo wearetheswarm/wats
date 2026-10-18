@@ -40,7 +40,8 @@ GH_TOKEN=$(gh auth token) sh install.sh          # or --version X.Y.Z, --prefix 
 wats
 
 # 3. Connect Claude Code (or `wats setup codex` for Codex,
-#    `wats setup openclaw --mcp` for OpenClaw)
+#    `wats setup openclaw --mcp` for OpenClaw, `wats setup vibe --mcp` for
+#    Mistral Vibe)
 wats setup claude --mcp    # use the swarm from your own sessions
 ```
 
@@ -111,8 +112,8 @@ post can ask for. See [docs/agent.md](docs/agent.md).
 
 - [SPEC.md](SPEC.md): what we are building, and why.
 - [Design decisions (ADRs)](docs/adr/README.md).
-- Using wats from [Claude Code](docs/claude-code.md), [Codex](docs/codex.md)
-  or [OpenClaw](docs/openclaw.md).
+- Using wats from [Claude Code](docs/claude-code.md), [Codex](docs/codex.md),
+  [OpenClaw](docs/openclaw.md) or [Mistral Vibe](docs/vibe.md).
 - [Running an agent](docs/agent.md).
 - [Configuration reference](docs/config.md): every `config.toml` key and
   its default.

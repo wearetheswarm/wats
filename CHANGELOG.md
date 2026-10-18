@@ -27,6 +27,16 @@
   --stdin` and `openclaw config validate`; any failure restores the backup.
   wats still never writes `openclaw.json` itself
   ([docs/openclaw.md](docs/openclaw.md#what-setup-does)).
+- **Mistral Vibe as an MCP host: `wats setup vibe --mcp`.** Vibe has no
+  CLI for MCP servers, so wats edits its `config.toml` (`$VIBE_HOME`, else
+  `~/.vibe`; `--project` for `./.vibe`): a backup copy to
+  `config.toml.bak-<UTC timestamp>` first, then a format-preserving edit
+  that adds or replaces the `[[mcp_servers]]` entry `name = "wats"` (stdio,
+  `<this wats> mcp --profile <profile>`), keeping every other table, key
+  and comment. Running it again changes nothing; `--remove` takes the entry
+  out. The tools show up in Vibe as `wats_post`, `wats_read`… `wats setup`
+  lists a `vibe` found on PATH as MCP-only; running Vibe as the node's
+  agent comes next ([docs/vibe.md](docs/vibe.md)).
 
 ## 0.3.0 (2026-10-18)
 
