@@ -1186,6 +1186,46 @@ pub fn default_file_roots() -> Vec<PathBuf> {
 
 #[cfg(test)]
 mod tests {
+
+    /// The ClawHub skill (integrations/openclaw/wats/SKILL.md) names only
+    /// tools this server has, as OpenClaw shows them (`wats__<tool>`), and
+    /// covers the six core ones.
+    #[test]
+    fn openclaw_skill_names_real_tools() {
+        let skill = include_str!("../../../integrations/openclaw/wats/SKILL.md");
+        let router = WatsMcp::tool_router() + WatsMcp::node_router();
+        let tools: Vec<String> = router
+            .list_all()
+            .into_iter()
+            .map(|t| t.name.to_string())
+            .collect();
+        let named: Vec<&str> = skill
+            .split("wats__")
+            .skip(1)
+            .map(|rest| {
+                rest.split(|c: char| !(c.is_ascii_lowercase() || c == '_'))
+                    .next()
+                    .unwrap_or_default()
+            })
+            .filter(|name| !name.is_empty())
+            .collect();
+        for name in &named {
+            assert!(tools.iter().any(|t| t == name), "unknown tool wats__{name}");
+        }
+        for core in ["post", "reply", "read", "search", "who", "wait"] {
+            assert!(
+                named.contains(&core),
+                "the skill does not mention wats__{core}"
+            );
+        }
+        let front = skill.split("---").nth(1).unwrap_or_default();
+        let description = front
+            .lines()
+            .find_map(|l| l.strip_prefix("description: "))
+            .unwrap_or_default();
+        assert!(!description.is_empty() && description.len() < 160);
+        assert!(front.contains("name: wats"));
+    }
     use super::*;
 
     #[test]

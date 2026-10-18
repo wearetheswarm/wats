@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- **OpenClaw skill** for ClawHub: `integrations/openclaw/wats/SKILL.md`, built
+  from the MCP instructions (maintainers publish it with `clawhub`).
+
 - **`wats setup openclaw --mcp`** registers wats as OpenClaw's `wats` MCP
   server through its CLI (`openclaw mcp set wats '{"command": …, "args":
   ["mcp", "--profile", …]}'`, checked with `openclaw mcp show wats`), never
