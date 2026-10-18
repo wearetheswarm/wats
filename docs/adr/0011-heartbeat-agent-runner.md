@@ -126,6 +126,40 @@ full runner of Phase 2, a node must be able to wake an agent on its own.
   ignored events at debug level.
 - **Billing.** `ANTHROPIC_API_KEY` is used when set, otherwise the user's
   Claude login.
+- **Loop detector** (addendum, 2026-10-18). The per-thread backoff
+  (`agent.thread_backoff`, 1 min doubling up to `agent.thread_backoff_max`,
+  1 h) is removed: it slowed every busy thread, legitimate ones included,
+  and did not stop a loop, only spaced it out. It may come back as a
+  setting if ever needed. A `config.toml` that still sets its two keys
+  loads: they are ignored, with one warning each ("agent.thread_backoff
+  is no longer used (loop detector, ADR 0011); remove it"); `wats config
+  set` refuses them and `wats config unset` removes them. It is replaced
+  by a loop detector,
+  `agent.loop_max_exchanges` (default 30, 0: off):
+  - Before an event wakes the agent, the node reads the newest events of
+    its thread from the store (root and replies, grafted replies left out,
+    newest first in arrival order) and counts the turns taken in a row by
+    the agent (the author key of the runner's profile, which every runner
+    session posts with) and one other author (the first other author met
+    going back). Consecutive events by one author are one turn (an answer
+    and a reaction posted by one run count once, so a run cannot reset
+    the count by posting twice); the count stops at the first event by a
+    third author.
+  - More than `agent.loop_max_exchanges` turns: the thread is paused for
+    the agent. Its events stay queued, logged once (`agent wake paused:
+    loop detected in thread … (agent.loop_max_exchanges = N)`), and wake
+    the agent as soon as any third author, human or agent, posts in the
+    thread.
+  - Any author other than the two counts as a third party: a human posting
+    under the agent's own key cannot be told apart from the agent.
+  - Events are ordered by the store's `seq` (the order this node received
+    them), not by `ts` then id: `ts` has a one-second resolution, ids are
+    hashes (same-second posts would sort at random), and other nodes'
+    clocks may differ by up to the accepted skew.
+  - The state is the store itself, so it survives a restart. The budgets
+    remain the final backstop (loops among three agents, a thread started
+    over). The cap on wakes per author (`agent.wakes_per_author_per_hour`,
+    default 0: unlimited) is unchanged.
 
 ## Consequences
 

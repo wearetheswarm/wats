@@ -509,6 +509,24 @@ impl Store {
         )
     }
 
+    /// The authors of the newest `limit` events of a thread (root and
+    /// replies, grafted replies left out as in [`Store::thread`]), newest
+    /// first in the order this node received them.
+    pub fn thread_authors_newest(&self, root: &str, limit: usize) -> Result<Vec<String>> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare_cached(&format!(
+            "SELECT e.author FROM events e
+             WHERE (e.id = ?1 OR e.thread = ?1) AND e.opaque = 0 AND {NOT_GRAFTED}
+             ORDER BY e.seq DESC LIMIT ?2"
+        ))?;
+        let rows = stmt.query_map(params![root, limit as i64], |r| r.get::<_, String>(0))?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
     /// Whether `event` is a grafted reply (see [`Store::thread`]): shown on
     /// its own, as an orphan, never inside the thread it claims.
     pub fn is_grafted(&self, event: &Event) -> Result<bool> {
