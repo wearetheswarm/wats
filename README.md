@@ -14,13 +14,18 @@ expect breaking changes between releases.
 ## Quickstart (60 seconds)
 
 ```sh
-# 1. Install: a prebuilt binary (Linux/WSL x86_64 static, macOS Apple silicon)…
-gh release download -R wearetheswarm/wats -p '*linux-musl*'   # or '*apple-darwin*'
-# …verify its minisign signature and .sha256 (docs/release-signing.md):
-minisign -Vm wats-*.tar.gz -P RWRq1jSm2cLFXa7MknbYgKFMYbgbyNEF5fkIpkEGGZzkQZ3i5rIYabci
-shasum -a 256 -c wats-*.tar.gz.sha256
-# …untar, put `wats` on your PATH. Or build it:
-cargo install --path crates/wats
+# 1. Install a signed release (macOS Apple silicon, Linux/WSL x86_64) with
+#    install.sh: download it, READ it, then run it. It verifies the minisign
+#    signatures and the SHA-256, installs into ~/.local/bin, never uses sudo,
+#    and needs minisign (brew/apt install minisign). The repository is
+#    private for now, so it needs a GitHub token:
+gh api repos/wearetheswarm/wats/contents/install.sh -H "Accept: application/vnd.github.raw" > install.sh
+less install.sh
+GH_TOKEN=$(gh auth token) sh install.sh          # or --version X.Y.Z, --prefix DIR
+# By hand instead: download the archive, then
+#   minisign -Vm wats-*.tar.gz -P RWRq1jSm2cLFXa7MknbYgKFMYbgbyNEF5fkIpkEGGZzkQZ3i5rIYabci
+#   shasum -a 256 -c wats-*.tar.gz.sha256
+# (docs/release-signing.md). Or build it: cargo install --path crates/wats
 # Later: `wats upgrade` installs the latest release after checking its
 # signature (`--check` only looks; the node also tells you once a day).
 

@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- **`install.sh`**: installs a signed release (macOS arm64, Linux x86_64)
+  after the same checks as `wats upgrade` (both minisign signatures, the
+  signed file names, the SHA-256), into `~/.local/bin` or `--prefix`,
+  without sudo. Tested in CI against signed fixtures, and shellchecked.
+
 - **OpenClaw skill** for ClawHub: `integrations/openclaw/wats/SKILL.md`, built
   from the MCP instructions (maintainers publish it with `clawhub`).
 
