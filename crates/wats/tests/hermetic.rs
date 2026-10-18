@@ -909,14 +909,39 @@ fn resume_clears_the_halt_marker_and_status_shows_it() {
         .stdout(std::process::Stdio::null())
         .spawn()
         .unwrap();
-    std::thread::sleep(Duration::from_secs(2));
+    let wanted = "this node ignores guardian halts (halt.accept = false)";
+    let err = stderr_until(&mut child, wanted, Duration::from_secs(20));
+    assert!(err.contains(wanted), "{err}");
+}
+
+/// The stderr of `child` up to the first line containing `wanted`, or all
+/// of it when `deadline` passes first; then `child` is killed. Polling for
+/// the line, not sleeping a fixed time, keeps slow CI runners green.
+fn stderr_until(child: &mut std::process::Child, wanted: &str, deadline: Duration) -> String {
+    use std::io::BufRead;
+    let stderr = child.stderr.take().unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let wanted = wanted.to_string();
+    std::thread::spawn(move || {
+        let mut seen = String::new();
+        for line in std::io::BufReader::new(stderr)
+            .lines()
+            .map_while(Result::ok)
+        {
+            seen.push_str(&line);
+            seen.push('\n');
+            if line.contains(&wanted) {
+                break;
+            }
+        }
+        let _ = tx.send(seen);
+    });
+    let seen = rx.recv_timeout(deadline);
     child.kill().unwrap();
-    let out = child.wait_with_output().unwrap();
-    let err = String::from_utf8_lossy(&out.stderr);
-    assert!(
-        err.contains("this node ignores guardian halts (halt.accept = false)"),
-        "{err}"
-    );
+    child.wait().unwrap();
+    // After the kill, the reader sees the end of the pipe and sends.
+    seen.or_else(|_| rx.recv_timeout(Duration::from_secs(5)))
+        .unwrap_or_default()
 }
 
 /// Safety settings: recorded silently the first time, any change (an
