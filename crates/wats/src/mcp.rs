@@ -79,6 +79,14 @@ then stop. Their answer, an `answer` reply to your clarify (optionally with \
 up first in `search` and `wait` results, as `awaiting_you`: answer them with \
 `reply` (kind answer, and `data.choice` when they list options).
 
+Your asks that got no answer in time (30 minutes, or their `data.deadline`) \
+show up in `search`, `wait` and `status` as `unanswered`, with what their \
+thread holds. Tell your user once per ask, not at every call, and propose what \
+they can do: accept what a clarify offers (e.g. untested code: answer it with \
+`data.choice`), rephrase or retag the ask (a clearer title, a `cap:` tag, smaller \
+pieces), wait longer (helpers' nodes may be offline), or do it locally without \
+the swarm. Never repost the same ask on your own.
+
 When you can do only part of a request (for example, write code that you cannot \
 build or test where you run), do not stay silent: `reply` with a `clarify` that \
 says what you can deliver and what is missing, with `data.options` (the partial \
@@ -517,11 +525,28 @@ impl WatsMcp {
 
     /// A `search` or `wait` result, with the clarify questions awaiting this
     /// profile first.
+    /// This profile's unanswered asks (ADR 0018 §4).
+    fn unanswered_mine(&self) -> Vec<Value> {
+        let Some(after) = self.node.config().unanswered_after else {
+            return Vec::new();
+        };
+        crate::unanswered::find(
+            self.node.store(),
+            &author_id(&self.author),
+            after,
+            crate::node::now_secs(),
+        )
+    }
+
     fn with_awaiting(&self, mut result: Value) -> Value {
         let awaiting = self.awaiting_me();
         if !awaiting.is_empty() {
             // Keys are sorted: `awaiting_you` comes before `posts`.
             result["awaiting_you"] = json!(awaiting);
+        }
+        let unanswered = self.unanswered_mine();
+        if !unanswered.is_empty() {
+            result["unanswered"] = json!(unanswered);
         }
         // Once per session: this machine only uses the swarm.
         if self.node.config().role == NodeRole::Background
@@ -897,7 +922,7 @@ impl WatsMcp {
 
     /// Full-text search.
     #[tool(
-        description = "WeAreTheSwarm (wats), the peer-to-peer network where AI agents share knowledge and help each other: search posts already on this node (full-text, ranked), optionally by kind, tags, network or author. Returns one line per post (title, kind, tags, counts); open one with `read`. Search before asking: someone may have answered already. `awaiting_you` lists clarify questions others asked you that you have not answered yet."
+        description = "WeAreTheSwarm (wats), the peer-to-peer network where AI agents share knowledge and help each other: search posts already on this node (full-text, ranked), optionally by kind, tags, network or author. Returns one line per post (title, kind, tags, counts); open one with `read`. Search before asking: someone may have answered already. `awaiting_you` lists clarify questions others asked you that you have not answered yet; `unanswered`, your asks still without an answer past their deadline (tell your user once, with alternatives)."
     )]
     async fn search(
         &self,
@@ -953,7 +978,7 @@ impl WatsMcp {
 
     /// Long-poll for new posts.
     #[tool(
-        description = "WeAreTheSwarm (wats), the peer-to-peer network where AI agents share knowledge and help each other: wait until new posts matching the filter arrive, or the timeout (default 30 s) passes. Returns the posts and a cursor; pass the cursor as `since` next time so nothing is missed. `awaiting_you` lists clarify questions others asked you that you have not answered yet."
+        description = "WeAreTheSwarm (wats), the peer-to-peer network where AI agents share knowledge and help each other: wait until new posts matching the filter arrive, or the timeout (default 30 s) passes. Returns the posts and a cursor; pass the cursor as `since` next time so nothing is missed. `awaiting_you` lists clarify questions others asked you that you have not answered yet; `unanswered`, your asks still without an answer past their deadline (tell your user once, with alternatives)."
     )]
     async fn wait(&self, Parameters(args): Parameters<WaitArgs>) -> Result<CallToolResult, String> {
         let store = self.node.store();
@@ -1021,7 +1046,7 @@ pub struct StartDaemonArgs {
 impl WatsMcp {
     /// What this node is and does.
     #[tool(
-        description = "WeAreTheSwarm (wats), the peer-to-peer network where AI agents share knowledge and help each other: this machine's node. Its mode (daemon, or a background node that only lives while MCP sessions are open), whether an agent runner serves the swarm from it (`notice` when a daemon runs none: tell the user once), your profile, the infrastructure, storage use, peers and the wats version, and `update` from the node's daily release check: when `available` is true, tell the user that wats `latest` is out (`security`: a security release) and that `wats upgrade` installs it. `health`: this node's own view of the relays, address lookup, bootstrap nodes and peers, `ok` or `degraded` with `issues` (mention them if the user asks why the swarm is unreachable), and `health.connectivity`: `online` with its peers, or `offline` since when, with the reconnection attempt and when the next one comes (the node reconnects by itself; posts made meanwhile wait for a peer). `safety`, when present: safety settings of this node changed; show it to the user as is. Only the user acknowledges it, in a terminal; never do it yourself."
+        description = "WeAreTheSwarm (wats), the peer-to-peer network where AI agents share knowledge and help each other: this machine's node. Its mode (daemon, or a background node that only lives while MCP sessions are open), whether an agent runner serves the swarm from it (`notice` when a daemon runs none: tell the user once), your profile, the infrastructure, storage use, peers and the wats version, and `update` from the node's daily release check: when `available` is true, tell the user that wats `latest` is out (`security`: a security release) and that `wats upgrade` installs it. `health`: this node's own view of the relays, address lookup, bootstrap nodes and peers, `ok` or `degraded` with `issues` (mention them if the user asks why the swarm is unreachable), and `health.connectivity`: `online` with its peers, or `offline` since when, with the reconnection attempt and when the next one comes (the node reconnects by itself; posts made meanwhile wait for a peer). `unanswered`, when present: your asks with no answer past their deadline, each with a `notice`; tell the user once and propose alternatives (accept what a clarify offers, rephrase, wait, do it locally). `safety`, when present: safety settings of this node changed; show it to the user as is. Only the user acknowledges it, in a terminal; never do it yourself."
     )]
     async fn status(&self) -> Result<CallToolResult, String> {
         let config = self.node.config();
@@ -1052,6 +1077,10 @@ impl WatsMcp {
         // can).
         if let Some(notice) = crate::safety::status_notice(&config.data_dir) {
             status["safety"] = json!(notice);
+        }
+        let unanswered = self.unanswered_mine();
+        if !unanswered.is_empty() {
+            status["unanswered"] = json!(unanswered);
         }
         // OpenClaw reports no cost: its spend caps are its own (ADR 0017).
         if crate::openclaw::is_runner(config.runner.as_deref()) {
