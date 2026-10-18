@@ -8,6 +8,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 
+use iroh::Watcher as _;
 use wats::bootstrap::{BootstrapEntry, Resolver};
 use wats::event::{Draft, Event, Kind};
 use wats::node::{NetworkMode, Node, NodeConfig, PUBLIC_NET};
@@ -306,8 +307,10 @@ fn free_tcp_port() -> u16 {
 
 /// Two nodes that reach each other only through a relay on this machine
 /// (no IP transport, no address lookup). The relay stops: both see they
-/// are offline. A post lands on one side meanwhile. The relay comes back
-/// on the same URL: the other node reconnects by itself and catches up.
+/// are offline. A post lands on one side meanwhile. The relay stays down
+/// for more than a minute, then comes back on the same URL: the other
+/// node reconnects by itself and catches up, soon after both home relays
+/// are back.
 #[tokio::test(flavor = "multi_thread")]
 async fn reconnects_when_the_relay_comes_back() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
@@ -370,19 +373,51 @@ async fn reconnects_when_the_relay_comes_back() -> anyhow::Result<()> {
     let missed = missed.id;
     assert!(a.store().get(&missed)?.is_none());
 
+    // The relay stays down longer than a QUIC handshake waits (30 s): the
+    // dials A made while offline have failed by now. Gossip never dials a
+    // peer again after its dial failed (see `Node::redial`); A must still
+    // reconnect.
+    tokio::time::sleep(Duration::from_secs(31)).await;
+
     // Back on the same port: the relay URL is unchanged. Each endpoint
-    // dials the relay again on its own backoff (Iroh: up to 16 s, with
-    // jitter), then A's pending dial to B gets through on a QUIC
-    // retransmit: 10 to 30 s in practice, hence the longer limit.
+    // dials the relay again on Iroh's own backoff (up to 16 s, doubled by
+    // jitter): that part is not ours.
     let relay = relay_on(port).await;
     let up = tokio::time::Instant::now();
+    eventually_within("both home relays back", Duration::from_secs(45), || {
+        [&a, &b]
+            .iter()
+            .all(|node| {
+                node.endpoint()
+                    .home_relay_status()
+                    .get()
+                    .iter()
+                    .any(|r| r.is_connected())
+            })
+            .then_some(())
+    })
+    .await;
+    let relays_back = tokio::time::Instant::now();
+    eprintln!(
+        "both home relays back {:?} after the relay came back",
+        up.elapsed()
+    );
+    // Ours: from there, A's dial in flight (10 s at most) gets through, or
+    // the next attempt of its reconnect loop (at most 1 s apart here)
+    // dials B afresh, and A catches up. It used to wait on the dial made
+    // while the relay was down: a handshake retransmit up to 10 s later,
+    // or never once that dial had failed.
     eventually_within(
         "the post made while the relay was down",
-        Duration::from_secs(120),
+        Duration::from_secs(15),
         || a.store().get(&missed).ok().flatten(),
     )
     .await;
-    eprintln!("caught up {:?} after the relay came back", up.elapsed());
+    eprintln!(
+        "caught up {:?} after the relay came back, {:?} after both home relays",
+        up.elapsed(),
+        relays_back.elapsed()
+    );
     for node in [&a, &b] {
         eventually("online again", || {
             (connectivity(node)["state"] == "online").then_some(())

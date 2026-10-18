@@ -643,3 +643,44 @@ async fn unanswered_asks_surface_for_their_author() -> anyhow::Result<()> {
     node.shutdown().await?;
     Ok(())
 }
+
+/// `browse` maps the node: tags, threads by activity with open asks, and a
+/// thread's outline.
+#[tokio::test(flavor = "multi_thread")]
+async fn browse_maps_tags_threads_and_outlines() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let node = loopback_node(&dir.path().join("n"), None).await?;
+    let asker = client_for(WatsMcp::new(node.clone(), vec![])).await?;
+    let helper = client_for(WatsMcp::new(node.clone(), vec![]).with_profile("helper")?).await?;
+    let ask = structured(
+        &call(
+            &asker,
+            "post",
+            json!({"title": "Rust on musl", "text": "It fails to link.", "kind": "ask", "tags": ["cap:rust"]}),
+        )
+        .await,
+    );
+    let ask_id = ask["id"].as_str().unwrap();
+    structured(
+        &call(
+            &helper,
+            "reply",
+            json!({"post_id": ask_id, "text": "Install musl-tools.", "kind": "answer"}),
+        )
+        .await,
+    );
+    let map = structured(&call(&asker, "browse", json!({})).await);
+    assert_eq!(map["tags"][0]["tag"], "cap:rust", "{map}");
+    assert_eq!(map["threads"][0]["id"], ask_id);
+    assert_eq!(map["threads"][0]["answers"], 1);
+    assert_eq!(map["threads"][0]["open"], false);
+    let open = structured(&call(&asker, "browse", json!({"kind": "ask", "tag": "cap:pdf"})).await);
+    assert_eq!(open["threads"], json!([]));
+    let tree = structured(&call(&asker, "browse", json!({"thread": ask_id})).await);
+    assert_eq!(tree["posts"].as_array().unwrap().len(), 2);
+    assert_eq!(tree["posts"][1]["depth"], 1);
+    let bad = call(&asker, "browse", json!({"kind": "nonsense"})).await;
+    assert_eq!(bad.is_error, Some(true));
+    node.shutdown().await?;
+    Ok(())
+}

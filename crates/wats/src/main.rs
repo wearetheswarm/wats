@@ -307,6 +307,32 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// A map of what this node knows: the busiest tags, the threads by latest
+    /// activity (with reply and answer counts, and open asks), or one
+    /// thread's outline (what the MCP `browse` tool returns).
+    Browse {
+        /// Only threads carrying this exact tag (e.g. cap:pdf).
+        #[arg(long)]
+        tag: Option<String>,
+        /// Only tags starting with this in the tag list (e.g. cap:).
+        #[arg(long)]
+        prefix: Option<String>,
+        /// Only threads whose root is of this kind (e.g. ask).
+        #[arg(long)]
+        kind: Option<String>,
+        /// One thread's outline instead (id of its root post).
+        #[arg(long)]
+        thread: Option<String>,
+        /// Skip this many threads.
+        #[arg(long, default_value_t = 0)]
+        offset: usize,
+        /// Threads per page (default 30, at most 100).
+        #[arg(long)]
+        limit: Option<usize>,
+        /// Print JSON instead of lines.
+        #[arg(long)]
+        json: bool,
+    },
     /// Print this node's endpoint id and author id, and its bootstrap entry.
     /// Creates the node secret if the data directory has none; does not need
     /// the node to be stopped.
@@ -1739,6 +1765,71 @@ use wats::settings::{ConfigFile, Settings, parse_duration, parse_size};
 
 /// `wats status`: the running node's MCP `status`, or what is known
 /// without a node.
+/// `wats browse`: reads the store directly (read-only, so a running node
+/// is fine).
+fn browse_command(config: &NodeConfig, query: &wats::browse::Query, json: bool) -> Result<()> {
+    let path = config.data_dir.join("events.sqlite");
+    anyhow::ensure!(
+        path.exists(),
+        "no events yet in {}: start the node once",
+        config.data_dir.display()
+    );
+    let store = wats::store::Store::open_read_only(&path)?;
+    let map = wats::browse::browse(&store, query)?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&map)?);
+        return Ok(());
+    }
+    let s = |v: &serde_json::Value| v.as_str().unwrap_or("").to_string();
+    if let Some(posts) = map["posts"].as_array() {
+        for p in posts {
+            let depth = p["depth"].as_u64().unwrap_or(0) as usize;
+            println!(
+                "{}{} {} {} · {}",
+                "  ".repeat(depth),
+                s(&p["id"]).get(..12).unwrap_or(""),
+                s(&p["kind"]),
+                s(&p["title"]),
+                s(&p["author"]),
+            );
+        }
+        return Ok(());
+    }
+    if let Some(tags) = map["tags"].as_array().filter(|t| !t.is_empty()) {
+        println!("tags:");
+        for t in tags {
+            println!(
+                "  {}  {} threads · {} posts · last {}",
+                s(&t["tag"]),
+                t["threads"],
+                t["posts"],
+                s(&t["last"])
+            );
+        }
+    }
+    println!("threads:");
+    for t in map["threads"].as_array().into_iter().flatten() {
+        let open = match t["open"].as_bool() {
+            Some(true) => " OPEN",
+            _ => "",
+        };
+        println!(
+            "  {} {}{} {}  {} replies · {} answers · last {}",
+            s(&t["id"]).get(..12).unwrap_or(""),
+            s(&t["kind"]),
+            open,
+            s(&t["title"]),
+            t["replies"],
+            t["answers"],
+            s(&t["last"])
+        );
+    }
+    if let Some(next) = map["next_offset"].as_u64() {
+        println!("more: wats browse --offset {next}");
+    }
+    Ok(())
+}
+
 async fn status_command(config: &NodeConfig, json: bool) -> Result<()> {
     let mut status =
         match attach::call_tool(&config.data_dir, "status", serde_json::json!({})).await? {
@@ -3288,6 +3379,30 @@ async fn main() -> Result<()> {
         }
         Some(Command::Id { host }) => return print_id(&config, &host),
         Some(Command::Status { json }) => return status_command(&config, json).await,
+        Some(Command::Browse {
+            tag,
+            prefix,
+            kind,
+            thread,
+            offset,
+            limit,
+            json,
+        }) => {
+            let query = wats::browse::Query {
+                net: None,
+                tag,
+                prefix,
+                kind: kind
+                    .as_deref()
+                    .map(str::parse)
+                    .transpose()
+                    .map_err(|_| anyhow::anyhow!("--kind: not a kind"))?,
+                thread,
+                offset,
+                limit,
+            };
+            return browse_command(&config, &query, json);
+        }
         Some(
             Command::Config { .. }
             | Command::Upgrade { .. }

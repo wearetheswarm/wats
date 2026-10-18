@@ -505,6 +505,12 @@ const RECONNECT_WATCH_EVERY: Duration = Duration::from_secs(1);
 /// At most one catch-up with every neighbor per this long, on network
 /// changes while online.
 const CATCH_UP_EVERY: Duration = Duration::from_secs(30);
+/// How long a reconnection attempt waits for its connection to a peer
+/// ([`Node::redial`]). A handshake, even through a relay, takes well
+/// under a second; this leaves room for the QUIC retransmits (1, 3 and
+/// 7 s after the first packet) on a bad link. The next attempt dials
+/// afresh.
+const REDIAL_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Resolve bootstrap entries concurrently; an entry that does not resolve
 /// is logged and skipped, so one dead seed never blocks the others.
@@ -681,6 +687,9 @@ pub struct Node {
     reconnect_kick: Arc<tokio::sync::Notify>,
     /// A network change since the reconnect loop last looked.
     network_changed: std::sync::atomic::AtomicBool,
+    /// Peers the reconnect loop is dialing ([`Node::redial`]): one dial
+    /// per peer at a time.
+    redialing: std::sync::Mutex<HashSet<EndpointId>>,
     /// Size of the whole data directory, measured every 30 s.
     storage_bytes: std::sync::atomic::AtomicU64,
     /// When we last logged that storage is full (rate limit).
@@ -998,6 +1007,7 @@ impl Node {
             connectivity: std::sync::Mutex::new(crate::reconnect::Connectivity::new(now_secs())),
             reconnect_kick: Default::default(),
             network_changed: Default::default(),
+            redialing: Default::default(),
         });
         node.measure_storage().await;
         if node.config.storage_max.is_some() {
@@ -1170,9 +1180,29 @@ impl Node {
         targets
     }
 
-    /// One reconnection attempt: dial every target on every network.
-    /// Returns whether there was anything to dial.
-    async fn redial(&self) -> bool {
+    /// One reconnection attempt: a fresh gossip connection to every
+    /// target, handed to gossip; the target is then joined on every
+    /// network over it. Returns whether there was anything to dial.
+    ///
+    /// The node dials by itself, not through `join_peers` alone, because
+    /// iroh-gossip (0.101) dials a peer only when nothing is queued for
+    /// it. While its dial is pending, `join_peers` only queues a `Join`;
+    /// once that dial failed (a QUIC handshake gives up after 30 s), the
+    /// queue stays and gossip never dials that peer again: only a
+    /// connection clears it. A relay down for more than half a minute
+    /// left a node cut off from its peers for good. And a dial still
+    /// pending gets through only on its next handshake retransmit, up to
+    /// 10 s after the path is back. A fresh connection, handed to gossip
+    /// like an incoming one, clears that state and flushes the queue.
+    ///
+    /// The dials run in the background, so the reconnect loop keeps its
+    /// backoff: at most one dial per target per attempt, and none while
+    /// the previous one to that target, bounded by
+    /// [`REDIAL_CONNECT_TIMEOUT`], is still waiting. A target that does
+    /// not answer is not joined (that would only queue one more `Join`,
+    /// or start a dial gossip may never retry); the next attempt dials it
+    /// again.
+    async fn redial(self: &Arc<Self>) -> bool {
         let targets = self.dial_targets().await;
         if targets.is_empty() {
             return false;
@@ -1180,9 +1210,51 @@ impl Node {
         debug!(targets = targets.len(), "dialing peers again");
         for addr in targets {
             let id = addr.id;
-            if let Err(e) = self.add_peer(addr).await {
-                debug!(peer = %id.fmt_short(), "redial: {e:#}");
+            self.lookup.add_endpoint_info(addr.clone());
+            let idle = self
+                .redialing
+                .lock()
+                .map(|mut r| r.insert(id))
+                .unwrap_or(false);
+            if !idle {
+                debug!(peer = %id.fmt_short(), "redial: still dialing");
+                continue;
             }
+            let endpoint = self.endpoint().clone();
+            let weak = Arc::downgrade(self);
+            tokio::spawn(async move {
+                let dialed = tokio::time::timeout(
+                    REDIAL_CONNECT_TIMEOUT,
+                    endpoint.connect(addr.clone(), iroh_gossip::ALPN),
+                )
+                .await;
+                let Some(node) = weak.upgrade() else { return };
+                if let Ok(mut r) = node.redialing.lock() {
+                    r.remove(&id);
+                }
+                let conn = match dialed {
+                    Ok(Ok(conn)) => conn,
+                    Ok(Err(e)) => {
+                        debug!(peer = %id.fmt_short(), "redial: {e:#}");
+                        return;
+                    }
+                    Err(_) => {
+                        debug!(
+                            peer = %id.fmt_short(),
+                            "redial: no answer within {REDIAL_CONNECT_TIMEOUT:?}"
+                        );
+                        return;
+                    }
+                };
+                debug!(peer = %id.fmt_short(), "redial: connected");
+                if let Err(e) = node.gossip.handle_connection(conn).await {
+                    debug!(peer = %id.fmt_short(), "redial: {e:#}");
+                    return;
+                }
+                if let Err(e) = node.add_peer(addr).await {
+                    debug!(peer = %id.fmt_short(), "redial: {e:#}");
+                }
+            });
         }
         true
     }
