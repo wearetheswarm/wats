@@ -165,6 +165,119 @@ pub struct ClaudeRun<'a> {
     pub workspace_servers: &'a [String],
     pub tools: &'a [String],
     pub extra: &'a [String],
+    /// The node's data directory, which the agent may not change.
+    pub data_dir: &'a Path,
+    /// Where the run starts (the workspace, or the locked directory).
+    pub run_dir: &'a Path,
+}
+
+/// The `wats` commands an agent's shell may not run: they change what the
+/// node does, or acknowledge such a change.
+pub const DENIED_WATS_COMMANDS: [&str; 4] = ["config", "resume", "guardian", "setup"];
+
+/// A path as a Claude Code permission rule path: `//` starts an absolute
+/// path (a single `/` is relative to the settings file).
+fn rule_path(path: &Path) -> String {
+    format!("/{}", path.display())
+}
+
+/// The path, and its canonical form when it differs (symlinks such as
+/// macOS's /var → /private/var).
+fn spellings(path: &Path) -> Vec<PathBuf> {
+    let mut out = vec![path.to_path_buf()];
+    if let Ok(canonical) = std::fs::canonicalize(path)
+        && canonical != path
+    {
+        out.push(canonical);
+    }
+    out
+}
+
+/// What the agent may not write: the data directory, except the run
+/// directory when it lies inside (the default workspace is
+/// `<data dir>/agent/workspace`). Then every entry along the way, but the
+/// one leading to the run directory, is listed, with config.toml and
+/// safety.json even before they exist.
+fn protected_paths(data_dir: &Path, run_dir: &Path) -> Vec<String> {
+    let Ok(inside) = run_dir.strip_prefix(data_dir) else {
+        return vec![format!("{}/**", rule_path(data_dir))];
+    };
+    let mut out = Vec::new();
+    let mut level = data_dir.to_path_buf();
+    for next in inside.components() {
+        let mut names: Vec<std::ffi::OsString> = std::fs::read_dir(&level)
+            .map(|entries| {
+                entries
+                    .filter_map(|e| e.ok().map(|e| e.file_name()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        if level == data_dir {
+            for name in [crate::settings::FILE_NAME, crate::safety::FILE_NAME] {
+                if !names.iter().any(|n| n == name) {
+                    names.push(name.into());
+                }
+            }
+        }
+        names.sort();
+        for name in names.iter().filter(|n| n.as_os_str() != next.as_os_str()) {
+            let path = rule_path(&level.join(name));
+            out.push(path.clone());
+            out.push(format!("{path}/**"));
+        }
+        level.push(next);
+    }
+    out
+}
+
+/// Claude Code deny rules of a locked or workspace run: no edit nor write
+/// in the data directory (config.toml, safety.json, the budget, keys), nor
+/// to the workspace's own settings and MCP servers (hooks and servers run
+/// commands); no shell command naming the data directory, config.toml or
+/// safety.json, nor running `wats config|resume|guardian|setup`. Deny
+/// rules win over any allow rule, the workspace's included.
+pub fn claude_deny_rules(data_dir: &Path, run_dir: &Path) -> Vec<String> {
+    let mut paths = Vec::new();
+    for data in spellings(data_dir) {
+        for run in spellings(run_dir) {
+            paths.extend(protected_paths(&data, &run));
+        }
+    }
+    for run in spellings(run_dir) {
+        paths.push(format!("{}/.claude/**", rule_path(&run)));
+        paths.push(rule_path(&run.join(".mcp.json")));
+    }
+    let mut seen = std::collections::HashSet::new();
+    paths.retain(|p| seen.insert(p.clone()));
+    let mut rules: Vec<String> = Vec::new();
+    for tool in ["Edit", "Write"] {
+        rules.extend(paths.iter().map(|p| format!("{tool}({p})")));
+    }
+    let mut mentions: Vec<String> = spellings(data_dir)
+        .iter()
+        .map(|d| d.display().to_string())
+        .collect();
+    if let Some(home) = std::env::home_dir()
+        && let Ok(rel) = data_dir.strip_prefix(&home)
+    {
+        let rel = rel.display();
+        mentions.extend([
+            format!("~/{rel}"),
+            format!("$HOME/{rel}"),
+            format!("${{HOME}}/{rel}"),
+        ]);
+    }
+    mentions.extend([
+        crate::settings::FILE_NAME.to_string(),
+        crate::safety::FILE_NAME.to_string(),
+    ]);
+    mentions.extend(DENIED_WATS_COMMANDS.iter().map(|c| format!("wats {c}")));
+    rules.extend(mentions.iter().map(|m| format!("Bash(*{m}*)")));
+    // From a workspace inside the data directory, `..` leads to it.
+    if run_dir.starts_with(data_dir) {
+        rules.push("Bash(*..*)".into());
+    }
+    rules
 }
 
 /// `claude -p` arguments for one run, before the per-run limits and the
@@ -186,6 +299,7 @@ pub fn claude_args(run: &ClaudeRun) -> Vec<String> {
                     ("--setting-sources", "project".into()),
                 ],
             ));
+            out.extend(deny_settings(run));
         }
         Access::Workspace => {
             out.push("--strict-mcp-config".into());
@@ -206,12 +320,41 @@ pub fn claude_args(run: &ClaudeRun) -> Vec<String> {
                     ("--setting-sources", "project".into()),
                 ],
             ));
+            out.extend(deny_settings(run));
         }
         // The user's MCP servers, settings and permission mode apply.
         Access::Inherit => {}
     }
     out.extend(["--allowedTools".into(), allowed.join(",")]);
     out
+}
+
+/// `--settings` with the deny rules ([`claude_deny_rules`]): flag
+/// settings load whatever `--setting-sources` says.
+fn deny_settings(run: &ClaudeRun) -> [String; 2] {
+    let settings = json!({
+        "permissions": {"deny": claude_deny_rules(run.data_dir, run.run_dir)},
+    });
+    ["--settings".into(), settings.to_string()]
+}
+
+/// Refuse a workspace that is the data directory or contains it: the
+/// agent's tools are scoped to its workspace, which would then include
+/// config.toml.
+pub fn check_workdir(workdir: &Path, data_dir: &Path) -> Result<()> {
+    for work in spellings(workdir) {
+        for data in spellings(data_dir) {
+            anyhow::ensure!(
+                !data.starts_with(&work),
+                "agent.workdir {} is or contains the data directory {}: choose a \
+                 directory of its own (the default is {})",
+                workdir.display(),
+                data_dir.display(),
+                data_dir.join("agent").join("workspace").display()
+            );
+        }
+    }
+    Ok(())
 }
 
 /// Write the MCP config of one Claude Code run: the wats server (with the
@@ -508,11 +651,14 @@ mod tests {
                 workspace_servers: servers,
                 tools,
                 extra: &[],
+                data_dir: Path::new("/d"),
+                run_dir: Path::new("/d/agent/workspace"),
             })
             .join(" ")
         };
         let locked = base(Access::Locked, &[], &[]);
-        assert!(locked.contains("--strict-mcp-config --tools  --permission-mode dontAsk --setting-sources project --allowedTools mcp__wats__*"), "{locked}");
+        assert!(locked.contains("--strict-mcp-config --tools  --permission-mode dontAsk --setting-sources project --settings {\"permissions\":{\"deny\":[\"Edit(//d/config.toml)\""), "{locked}");
+        assert!(locked.ends_with("--allowedTools mcp__wats__*"), "{locked}");
         let ws = base(
             Access::Workspace,
             &[
@@ -533,6 +679,113 @@ mod tests {
         assert!(!inherit.contains("--strict-mcp-config"), "{inherit}");
         assert!(!inherit.contains("--tools"), "{inherit}");
         assert!(!inherit.contains("--permission-mode"), "{inherit}");
+        assert!(!inherit.contains("--settings"), "{inherit}");
+    }
+
+    /// The deny rules of the generated settings, for one run.
+    fn deny_of(access: Access, data: &Path, run: &Path) -> Vec<String> {
+        let args = claude_args(&ClaudeRun {
+            access,
+            mcp_config: Path::new("/w/mcp.json"),
+            workspace_servers: &[],
+            tools: &["Edit".into(), "Bash".into()],
+            extra: &[],
+            data_dir: data,
+            run_dir: run,
+        });
+        let at = args
+            .iter()
+            .position(|a| a == "--settings")
+            .expect("--settings");
+        let settings: Value = serde_json::from_str(&args[at + 1]).unwrap();
+        settings["permissions"]["deny"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r.as_str().unwrap().to_string())
+            .collect()
+    }
+
+    #[test]
+    fn claude_denies_the_data_dir_and_wats_commands() {
+        let dir = tempfile::tempdir().unwrap();
+        let data = std::fs::canonicalize(dir.path()).unwrap().join("d");
+        let workspace = data.join("agent").join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(data.join("blobs")).unwrap();
+        std::fs::write(data.join("secret.key"), "").unwrap();
+        std::fs::write(data.join("agent").join("spend.jsonl"), "").unwrap();
+        let d = data.display();
+        for (access, run) in [
+            (Access::Locked, data.join("agent").join("locked")),
+            (Access::Workspace, workspace.clone()),
+        ] {
+            let deny = deny_of(access, &data, &run);
+            let has = |rule: String| assert!(deny.contains(&rule), "{rule} not in {deny:?}");
+            for tool in ["Edit", "Write"] {
+                // config.toml and safety.json, even before they exist.
+                has(format!("{tool}(/{d}/config.toml)"));
+                has(format!("{tool}(/{d}/safety.json)"));
+                has(format!("{tool}(/{d}/secret.key)"));
+                has(format!("{tool}(/{d}/blobs/**)"));
+                // The budget, next to the run directory.
+                has(format!("{tool}(/{d}/agent/spend.jsonl)"));
+                has(format!("{tool}(/{}/.claude/**)", run.display()));
+                has(format!("{tool}(/{}/.mcp.json)", run.display()));
+                // The way to the run directory stays open.
+                assert!(
+                    !deny.contains(&format!("{tool}(/{d}/agent/**)")),
+                    "{deny:?}"
+                );
+                assert!(!deny.contains(&format!("{tool}(/{d}/**)")), "{deny:?}");
+            }
+            for command in ["config", "resume", "guardian", "setup"] {
+                has(format!("Bash(*wats {command}*)"));
+            }
+            has(format!("Bash(*{d}*)"));
+            has("Bash(*config.toml*)".into());
+            has("Bash(*..*)".into());
+        }
+        // A workspace of its own: the whole data directory.
+        let elsewhere = dir.path().join("work");
+        let deny = deny_of(Access::Workspace, &data, &elsewhere);
+        assert!(deny.contains(&format!("Edit(/{d}/**)")), "{deny:?}");
+        assert!(deny.contains(&format!("Write(/{d}/**)")), "{deny:?}");
+        assert!(!deny.contains(&"Bash(*..*)".to_string()), "{deny:?}");
+    }
+
+    #[test]
+    fn workdir_never_holds_the_data_dir() {
+        let data = Path::new("/home/a/.wats");
+        assert!(check_workdir(data, data).is_err());
+        assert!(check_workdir(Path::new("/home/a"), data).is_err());
+        assert!(check_workdir(Path::new("/"), data).is_err());
+        check_workdir(&data.join("agent/workspace"), data).unwrap();
+        check_workdir(Path::new("/home/a/agent"), data).unwrap();
+    }
+
+    /// Codex cannot deny a path: locked and workspace keep the sandbox
+    /// read-only, so no directory, the data directory included, is
+    /// writable.
+    #[test]
+    fn codex_data_dir_is_never_writable() {
+        for access in [Access::Locked, Access::Workspace] {
+            let args = codex_args(&CodexRun {
+                access,
+                wats_command: Path::new("/bin/wats"),
+                wats_args: &["--dir".into(), "/d".into(), "mcp".into()],
+                runner_token: "t",
+                disable: &["shell_tool".into()],
+                workspace_overrides: &[],
+                extra: &[],
+            })
+            .join(" ");
+            assert!(args.contains("--sandbox read-only"), "{args}");
+            assert!(args.contains("--ignore-user-config"), "{args}");
+            assert!(!args.contains("workspace-write"), "{args}");
+            assert!(!args.contains("danger-full-access"), "{args}");
+            assert!(!args.contains("writable_roots"), "{args}");
+        }
     }
 
     #[test]

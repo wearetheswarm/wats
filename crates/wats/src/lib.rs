@@ -26,6 +26,7 @@ pub mod peer_cache;
 pub mod proto;
 pub mod review;
 pub mod runs;
+pub mod safety;
 pub mod settings;
 pub mod store;
 pub mod strict_json;
