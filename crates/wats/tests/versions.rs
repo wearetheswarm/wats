@@ -24,10 +24,10 @@ async fn node(dir: &std::path::Path, peers: &[&Arc<Node>]) -> anyhow::Result<Arc
     Node::start(config).await
 }
 
-/// What a v2 node would publish: a new kind, a header extension and a body
-/// field v1 does not know.
-fn v2_event(text: &str, ts: u64) -> Value {
-    event_of_version(2, text, ts, wats::node::OPAQUE_EXTRA_POW_BITS)
+/// What a v3 node would publish: a new kind, a header extension and a body
+/// field this node does not know (v2 is a validated version, ADR 0015).
+fn v3_event(text: &str, ts: u64) -> Value {
+    event_of_version(3, text, ts, wats::node::OPAQUE_EXTRA_POW_BITS)
 }
 
 /// The same shape at any version, mined to `bits`.
@@ -64,17 +64,17 @@ async fn opaque_events_policy() -> anyhow::Result<()> {
     let bits = wats::node::OPAQUE_EXTRA_POW_BITS;
 
     // Up to events_max + 2 is relayed; further ahead is not.
-    node.publish_signed(event_of_version(3, "v3", now, bits))
+    node.publish_signed(event_of_version(4, "v4", now, bits))
         .await?;
     let err = node
-        .publish_signed(event_of_version(4, "v4", now, bits))
+        .publish_signed(event_of_version(5, "v5", now, bits))
         .await
         .unwrap_err();
     assert!(err.to_string().contains("too far ahead"), "{err:#}");
 
     // Two more bits of proof of work than a v1 event of the same size.
     let weak = loop {
-        let candidate = event_of_version(2, &format!("weak {}", rand_text()), now, 0);
+        let candidate = event_of_version(3, &format!("weak {}", rand_text()), now, 0);
         let id = candidate["id"].as_str().unwrap();
         if id.starts_with(['8', '9', 'a', 'b', 'c', 'd', 'e', 'f']) {
             break candidate; // 0 leading zero bits
@@ -88,7 +88,7 @@ async fn opaque_events_policy() -> anyhow::Result<()> {
     let mut refused = None;
     for i in 0..20 {
         // Proof of work also grows with size: mine a little more.
-        let event = event_of_version(2, &format!("{i} {big}"), now, bits + 3);
+        let event = event_of_version(3, &format!("{i} {big}"), now, bits + 3);
         if let Err(e) = node.publish_signed(event).await {
             refused = Some((i, e));
             break;
@@ -117,9 +117,10 @@ async fn eventually(what: &str, mut check: impl AsyncFnMut() -> bool) {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn v1_node_relays_v2_events() -> anyhow::Result<()> {
+async fn node_relays_events_of_a_future_version() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
-    // "a" plays the v2 publisher, "b" is the v1 node in the middle.
+    // "a" plays the v3 publisher, "b" is the node in the middle, which
+    // does not understand v3.
     let b = node(&dir.path().join("b"), &[]).await?;
     let a = node(&dir.path().join("a"), &[&b]).await?;
     a.wait_for_neighbor(PUBLIC_NET, Duration::from_secs(10))
@@ -128,15 +129,15 @@ async fn v1_node_relays_v2_events() -> anyhow::Result<()> {
         .await?;
 
     // Live, over gossip.
-    let live = v2_event("Where should the next relay go?", wats::node::now_secs());
+    let live = v3_event("Where should the next relay go?", wats::node::now_secs());
     let live_id = live["id"].as_str().unwrap().to_string();
     a.publish_signed(live.clone()).await?;
-    eventually("b stores the v2 event", async || {
+    eventually("b stores the v3 event", async || {
         b.store().get_raw(&live_id).unwrap().is_some()
     })
     .await;
     let (v, opaque, stored) = b.store().get_raw(&live_id)?.unwrap();
-    assert_eq!((v, opaque), (2, true));
+    assert_eq!((v, opaque), (3, true));
     assert_eq!(stored, live, "stored byte-for-byte as received");
     // Not indexed: invisible to search and wait.
     assert!(
@@ -175,30 +176,30 @@ async fn v1_node_relays_v2_events() -> anyhow::Result<()> {
     .await;
     assert_eq!(b.peer_info(&a.endpoint_id()).unwrap(), NodeInfo::ours());
 
-    // A second v2 event while "a" is the only one holding it, then "a" leaves.
-    let offline = v2_event(
+    // A second v3 event while "a" is the only one holding it, then "a" leaves.
+    let offline = v3_event(
         "Second poll, published before c existed.",
         wats::node::now_secs(),
     );
     let offline_id = offline["id"].as_str().unwrap().to_string();
     a.publish_signed(offline).await?;
-    eventually("b stores the second v2 event", async || {
+    eventually("b stores the second v3 event", async || {
         b.store().get_raw(&offline_id).unwrap().is_some()
     })
     .await;
     a.shutdown().await?;
 
-    // "c" (another v2 node) only knows "b": it gets both events from the
-    // v1 node, intact and verifiable.
+    // "c" (another v3 node) only knows "b": it gets both events from the
+    // node that does not understand them, intact and verifiable.
     let c = node(&dir.path().join("c"), &[&b]).await?;
     for id in [&live_id, &offline_id] {
-        eventually("c receives the v2 event through b", async || {
+        eventually("c receives the v3 event through b", async || {
             c.store().get_raw(id).unwrap().is_some()
         })
         .await;
         let (_, _, value) = c.store().get_raw(id)?.unwrap();
         let raw = RawEvent::from_value(value)?;
-        assert_eq!(raw.v, 2);
+        assert_eq!(raw.v, 3);
         assert_eq!(&raw.id, id);
     }
 

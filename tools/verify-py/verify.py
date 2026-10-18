@@ -6,10 +6,11 @@ library only), checked against the published test vectors.
         docs/test-vectors/events-invalid.json
 
 It ports the rules of ADR 0002 (event format v1), ADR 0007 (invariant core,
-opaque events) and ADR 0010 (hardening: ZIP 215, domain separation, strict
+opaque events), ADR 0010 (hardening: ZIP 215, domain separation, strict
 JSON, one suite per version, rotate, refs, extension kinds, GREASE, caps,
-titles, clarify, Unicode rules in unicode_rules.py), following the Rust implementation in
-`crates/wats/src/{strict_json,wire,event}.rs`: `check_event` below is the
+titles, clarify, Unicode rules in unicode_rules.py) and ADR 0015 §8 (event
+v2 validity: `sealed` and `submit`), following the Rust implementation in
+`crates/wats/src/{strict_json,wire,event,v2}.rs`: `check_event` below is the
 counterpart of `wire::AnyEvent::from_bytes`.
 
 Pipeline for one event (raw bytes as received):
@@ -17,11 +18,16 @@ Pipeline for one event (raw bytes as received):
 1. Strict JSON parse (strict_json.py).
 2. Invariant core, for every version: shape, nesting, header/body split,
    body hash and id with BLAKE3-derive_key and JCS (`check_core`).
-3. Signature, only for versions whose suite is known (v1: Ed25519 over
-   "wats/event/v1" || id, ZIP 215), tombstones included (`verify_signature`).
-4. v1 rules, only for v1 events that are not tombstoned and whose proof of
+3. v2 rules, for every v2 event (`check_v2`): kind, header, ext, body
+   (unless tombstoned) and size. v2 events are then accepted as opaque:
+   their content is encrypted.
+4. Signature, only for versions whose suite is known, tombstones included
+   (`verify_signature`): v1, Ed25519 over "wats/event/v1" || id (ZIP 215);
+   v2, the same over "wats/event/v2" || id, followed for `sealed` by the
+   group signature, checked as shape only (S < l).
+5. v1 rules, only for v1 events that are not tombstoned and whose proof of
    work uses an algorithm this verifier knows (`b3`) (`check_v1`).
-   Everything else is accepted as opaque after steps 1-3.
+   Everything else is accepted as opaque after steps 1-4.
 """
 
 from __future__ import annotations
@@ -70,6 +76,25 @@ POW_PAYLOAD_CHARS = frozenset(
     "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
 )
 MAX_SAFE_INTEGER = 2**53 - 1
+
+# --- v2 (v2.rs, ADR 0015) ------------------------------------------------------
+
+V2 = 2
+SIG_PREFIX_V2 = b"wats/event/v2"
+RING_SIG_PREFIX = b"wats/ring/v2"  # the group signature's message; shape only here
+KIND_SEALED = "sealed"
+KIND_SUBMIT = "submit"
+RING_NET_PREFIX = "ring:"
+INBOX_PREFIX = "inbox:"
+MAX_CT_BYTES = 12_288
+MIN_SUBMIT_CT_BYTES = 16
+ENC_BYTES = 1120
+SEALED_SIG_HEX = 256
+SUBMIT_SIG_HEX = 128
+# The order l of the prime subgroup of edwards25519.
+GROUP_ORDER = 2**252 + 27742317777372353535851937790883648493
+B64URL = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
+B64URL_VALUES = {c: i for i, c in enumerate(B64URL)}
 
 # --- v1 rules (event.rs) -----------------------------------------------------
 
@@ -361,9 +386,13 @@ def check_v1_key(key: bytes, what: str) -> None:
 
 
 def verify_signature(wire: dict, checked: Checked) -> None:
-    """Check the signature when the version's suite is known (v1 only).
+    """Check the signature when the version's suite is known (v1, v2).
     Other versions are relayed without a signature check: their algorithm
     is unknown to this verifier."""
+    if checked.v == V2:
+        verify_v2_signature(wire, checked)
+        checked.signature_checked = True
+        return
     if checked.v != 1:
         return
     author = parse_hex(wire["author"], 32, "author")
@@ -377,7 +406,133 @@ def verify_signature(wire: dict, checked: Checked) -> None:
     checked.signature_checked = True
 
 
-# --- 4. v1 rules ---------------------------------------------------------------
+# --- 3. v2 rules (v2.rs) ------------------------------------------------------------
+
+
+def b64url_decode(s: str) -> bytes | None:
+    """Canonical base64url without padding (v2.rs `b64url_decode`):
+    alphabet A-Z a-z 0-9 - _, no '=', a length that is not 1 modulo 4, no
+    non-zero bit after the last whole byte. None when it does not
+    round-trip."""
+    if len(s) % 4 == 1:
+        return None
+    out = bytearray()
+    acc = nbits = 0
+    for c in s:
+        value = B64URL_VALUES.get(c)
+        if value is None:
+            return None
+        acc = (acc << 6) | value
+        nbits += 6
+        if nbits >= 8:
+            nbits -= 8
+            out.append((acc >> nbits) & 0xFF)
+            acc &= (1 << nbits) - 1
+    return bytes(out) if acc == 0 else None
+
+
+def is_lower_hex_of(s: str, length: int) -> bool:
+    return len(s) == length and is_lower_hex(s)
+
+
+def check_v2_keys(obj: dict, required: tuple, what: str) -> None:
+    """Exactly `required`, plus _grease* keys whose JCS (as one object,
+    keys included) is at most 64 bytes."""
+    for key in required:
+        if key not in obj:
+            raise Invalid(f"{what} must carry {key}")
+    grease = {}
+    for key, value in obj.items():
+        if key in required:
+            continue
+        if not is_grease(key):
+            raise Invalid(f"unknown {what} key {key!r}")
+        grease[key] = value
+    if grease and len(jcs.canonicalize(grease)) > MAX_GREASE_BYTES:
+        raise Invalid(f"GREASE {what} keys exceed {MAX_GREASE_BYTES} bytes canonicalized")
+
+
+def check_v2_binary(body: dict, key: str, low: int, high: int) -> None:
+    text = body[key]
+    if type(text) is not str:
+        raise Invalid(f"{key} must be a string")
+    data = b64url_decode(text)
+    if data is None:
+        raise Invalid(f"{key} is not canonical base64url without padding")
+    if not low <= len(data) <= high:
+        raise Invalid(f"{key} must decode to {low}-{high} bytes, not {len(data)}")
+
+
+def check_v2(wire: dict, checked: Checked) -> None:
+    """The v2 rules of an event that passed the core (v2.rs `check_rules`,
+    ADR 0015 §8): kind, header, ext, body unless tombstoned, size."""
+    kind = wire["kind"]
+    if kind not in (KIND_SEALED, KIND_SUBMIT):
+        raise Invalid(f"v2 kind {kind!r} is not sealed or submit")
+    sealed = kind == KIND_SEALED
+    if wire["thread"] is not None or wire["parent"] is not None:
+        raise Invalid("v2 thread and parent must be null")
+    if REFS_KEY not in wire:
+        raise Invalid("v2 refs must be present, as []")
+    if wire[REFS_KEY] != []:
+        raise Invalid("v2 refs must be []")
+    check_v1_key(parse_hex(wire["author"], 32, "author"), "author")
+    ext = wire.get(EXT_KEY)
+    if type(ext) is not dict:
+        raise Invalid("v2 ext is required")
+    net = wire["net"]
+    if sealed:
+        if not (net.startswith(RING_NET_PREFIX) and is_lower_hex_of(net[len(RING_NET_PREFIX):], 32)):
+            raise Invalid("sealed net must be ring:<32 hex>")
+        check_v2_keys(ext, ("epoch",), "ext")
+        epoch = as_u64(ext["epoch"])
+        if epoch is None or epoch > MAX_SAFE_INTEGER:
+            raise Invalid("ext.epoch must be an integer from 0 to 2^53 - 1")
+    else:
+        if net.startswith(RING_NET_PREFIX):
+            raise Invalid("submit net must not be a ring")
+        check_v2_keys(ext, ("to",), "ext")
+        to = ext["to"]
+        if not (type(to) is str and to.startswith(INBOX_PREFIX)
+                and is_lower_hex_of(to[len(INBOX_PREFIX):], 32)):
+            raise Invalid("ext.to must be inbox:<32 hex>")
+    if not checked.tombstoned:
+        structural = set(HEADER_KEYS) | {REFS_KEY, EXT_KEY, BODY_HASH_KEY, *UNHASHED_KEYS}
+        body = {k: v for k, v in wire.items() if k not in structural}
+        if sealed:
+            check_v2_keys(body, ("ct",), "body")
+            check_v2_binary(body, "ct", 1, MAX_CT_BYTES)
+        else:
+            check_v2_keys(body, ("enc", "ct"), "body")
+            check_v2_binary(body, "enc", ENC_BYTES, ENC_BYTES)
+            check_v2_binary(body, "ct", MIN_SUBMIT_CT_BYTES, MAX_CT_BYTES)
+    size = canonical_size(wire)
+    if size > MAX_EVENT_BYTES:
+        raise Invalid(f"event is {size} bytes canonicalized, above {MAX_EVENT_BYTES}")
+
+
+def verify_v2_signature(wire: dict, checked: Checked) -> None:
+    """The v2 suite (v2.rs `verify_signature`): the author's signature over
+    "wats/event/v2" || id, then for sealed the group signature, whose
+    scalar S must be < l (shape only: no group key is needed)."""
+    sig = wire["sig"]
+    expected = SEALED_SIG_HEX if wire["kind"] == KIND_SEALED else SUBMIT_SIG_HEX
+    if len(sig) != expected:
+        raise Invalid(f"{wire['kind']} sig must be {expected} hex characters")
+    author = parse_hex(wire["author"], 32, "author")
+    event_id = parse_hex(checked.id, 32, "id")
+    check_v1_key(author, "author")
+    try:
+        ed25519_zip215.verify(author, SIG_PREFIX_V2 + event_id, parse_hex(sig[:128], 64, "sig"))
+    except ed25519_zip215.VerifyError as e:
+        raise Invalid(f"invalid signature ({e})") from None
+    if len(sig) == SEALED_SIG_HEX:
+        group = parse_hex(sig[128:], 64, "group signature")
+        if int.from_bytes(group[32:], "little") >= GROUP_ORDER:
+            raise Invalid("group signature scalar is not canonical (S >= l)")
+
+
+# --- 5. v1 rules ---------------------------------------------------------------
 
 # The fields of the Rust `Event` struct; `title` is optional, every other
 # one is required. Any other key is collected as a would-be GREASE key.
@@ -654,7 +809,11 @@ def check_event(raw: bytes) -> Checked:
     except strict_json.StrictJsonError as e:
         raise Invalid(f"strict JSON: {e}") from None
     checked = check_core(value)
+    if checked.v == V2:
+        check_v2(value, checked)
     verify_signature(value, checked)
+    if checked.v == V2:
+        return checked  # validated, opaque: its content is encrypted
     if checked.tombstoned or checked.v != VERSION:
         return checked  # opaque: core (and known-suite signature) only
     if value["pow"].partition(":")[0] != POW_ALG_B3:
@@ -697,7 +856,12 @@ def run_accept(case: dict) -> tuple:
     how = "opaque" if got.opaque else "v1"
     if got.tombstoned:
         how += ", tombstoned"
-    how += ", signature checked" if got.signature_checked else ", signature not checked (unknown suite)"
+    if got.v == V2:
+        how += ", v2, signature checked"
+        if case["event"]["kind"] == KIND_SEALED:
+            how += " (group signature: shape only)"
+    else:
+        how += ", signature checked" if got.signature_checked else ", signature not checked (unknown suite)"
     return True, f"accepted ({how})"
 
 

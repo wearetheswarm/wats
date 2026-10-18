@@ -2,8 +2,9 @@
 
 Event test vectors for other implementations of the WeAreTheSwarm event
 format. The rules are in [ADR 0002](../adr/0002-event-format-v1.md),
-[ADR 0007](../adr/0007-protocol-evolution.md) and
-[ADR 0010](../adr/0010-hardening-the-core-before-the-freeze.md).
+[ADR 0007](../adr/0007-protocol-evolution.md),
+[ADR 0010](../adr/0010-hardening-the-core-before-the-freeze.md) and, for
+event v2, [ADR 0015](../adr/0015-private-rings.md) §8.
 
 - [`events.json`](events.json) lists events every implementation must
   **accept**. Each case gives the Ed25519 seed (when there is one), the
@@ -11,8 +12,12 @@ format. The rules are in [ADR 0002](../adr/0002-event-format-v1.md),
   profile), the body hash, the event id and the wire event. The cases are:
   - v1 posts: a reply with `refs`, an extension kind, an announce with a
     pre-rotation commitment, a `rotate`, and a GREASE body key;
-  - future-version events that v1 nodes relay without understanding them,
-    including one with a signature of another suite;
+  - future-version (v3) events that nodes relay without understanding
+    them, including one with a signature of another suite;
+  - v2 events: a `submit`, a `sealed` (its group signature made with a
+    fixed test group key, seed `0a` repeated, and checked as shape only),
+    a `submit` tombstone, and a `sealed` with capped GREASE keys in `ext`
+    and in the body;
   - a tombstone;
   - proofs of work: an unknown algorithm (valid, opaque) and a `b3` payload
     that is not a decimal nonce (valid, no work);
@@ -22,8 +27,16 @@ format. The rules are in [ADR 0002](../adr/0002-event-format-v1.md),
   names the rule it breaks: signature, malleated `s`, bare-id signature, id
   mismatch, duplicate key, float, exponent, unsafe integer, lone surrogate,
   depth bombs, unknown kind, unknown field, `ext` in v1, the `refs` rules,
-  `rotate` without a new key, uppercase hex, and `pow` syntax (a bare decimal
-  nonce, empty or malformed `alg` and payload, a payload over 2048 chars).
+  `rotate` without a new key, uppercase hex, `pow` syntax (a bare decimal
+  nonce, empty or malformed `alg` and payload, a payload over 2048 chars),
+  and the v2 rules, one per case: an unknown kind, `thread` set, `refs` not
+  empty or missing, a `sealed` net that is not a ring, `ext` without
+  `epoch` or with an extra key, an extra body key, `ct` padded, with
+  non-zero trailing bits or empty, an `enc` that is not 1,120 bytes, a
+  `submit` on a ring net, a malformed `ext.to`, a `sealed` signature
+  without its group signature, a group signature with `S ≥ l`, an author
+  signature with the v1 prefix, GREASE `ext` keys over 64 bytes, and a
+  small-order author key.
 
 Both files are generated and checked by `crates/wats/tests/test_vectors.rs`.
 While the format is provisional, regenerate them with:

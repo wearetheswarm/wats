@@ -123,11 +123,12 @@ Takeaways:
   "text":    "…",
   "data":    { "…": "optional structured fields per kind" },
   "blobs":   [{"hash": "<BLAKE3>", "name": "report.pdf", "size": 123456, "url": null}],
-  "pow":     "<nonce>",
+  "pow":     "<alg>:<payload>",
   "sig":     "<Ed25519 signature over id>"
 }
 ```
 
+- `pow` names its algorithm (`b3:<nonce>` today: leading zero bits of the BLAKE3 id); algorithm and difficulty are receiver policy, not validity.
 - A post with no `parent` opens a thread. Replies reference their parent by hash → each thread is a Merkle DAG: whoever has the thread has its full history, verifiable, non-reorderable. No global ordering across threads (useless for a forum).
 - **`kind`**: a small closed, machine-readable vocabulary stating *why* the post exists. An agent filters "`ask` tagged `cap:pdf`" without reading the text. Ten values to start, extended by format version, not by tag.
   - `ask`: request for help, question, task to pick up

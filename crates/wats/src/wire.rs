@@ -49,8 +49,10 @@ use crate::event::{
     Event, EventError, MAX_SAFE_INTEGER, VERSION, is_valid_net, leading_zero_bits, parse_hex,
 };
 
-/// Event versions this software understands (indexes, searches, shows).
-pub const UNDERSTOOD_VERSIONS: (u64, u64) = (VERSION as u64, VERSION as u64);
+/// Event versions whose rules this software checks: v1, indexed, searched
+/// and shown, and v2 (ADR 0015), validated but still stored as opaque rows
+/// and never indexed or shown, because its content is encrypted.
+pub const UNDERSTOOD_VERSIONS: (u64, u64) = (VERSION as u64, crate::v2::VERSION);
 /// Highest event version the invariant core accepts.
 pub const MAX_RELAY_VERSION: u64 = 65_535;
 /// Node policy (security review B4): opaque events of a newer version are
@@ -194,17 +196,7 @@ pub fn header_object(wire: &Map<String, Value>) -> Result<Split, EventError> {
         }
         header.insert(EXT_KEY.to_string(), ext.clone());
     }
-    let mut body = Map::new();
-    for (key, value) in wire {
-        let structural = HEADER_KEYS.contains(&key.as_str())
-            || key == REFS_KEY
-            || key == EXT_KEY
-            || UNHASHED_KEYS.contains(&key.as_str())
-            || key == BODY_HASH_KEY;
-        if !structural {
-            body.insert(key.clone(), value.clone());
-        }
-    }
+    let body = body_object(wire);
     let (body_jcs, body_hash) = match wire.get(BODY_HASH_KEY) {
         Some(hash) => {
             if !body.is_empty() {
@@ -224,6 +216,24 @@ pub fn header_object(wire: &Map<String, Value>) -> Result<Split, EventError> {
     };
     header.insert("body".to_string(), Value::String(body_hash.clone()));
     Ok((header, body_jcs, body_hash))
+}
+
+/// Whether a wire key is not a body key: a header key, `id`, `sig` or
+/// `body_hash`.
+pub fn is_structural_key(key: &str) -> bool {
+    HEADER_KEYS.contains(&key)
+        || key == REFS_KEY
+        || key == EXT_KEY
+        || UNHASHED_KEYS.contains(&key)
+        || key == BODY_HASH_KEY
+}
+
+/// The body keys of a wire object (empty for a tombstone).
+pub fn body_object(wire: &Map<String, Value>) -> Map<String, Value> {
+    wire.iter()
+        .filter(|(key, _)| !is_structural_key(key))
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect()
 }
 
 /// Hash a wire object. Checks the split rules, not the signature.
@@ -407,6 +417,11 @@ impl RawEvent {
                 self.signature_checked = true;
                 Ok(true)
             }
+            crate::v2::VERSION => {
+                crate::v2::verify_signature(self)?;
+                self.signature_checked = true;
+                Ok(true)
+            }
             _ => Ok(false),
         }
     }
@@ -447,12 +462,32 @@ impl RawEvent {
 /// accepted, `s` must be canonical (< l), and the cofactored equation
 /// `[8][s]B = [8]R + [8][k]A` decides.
 pub fn verify_v1(author: &[u8; 32], id: &[u8; 32], sig: &[u8; 64]) -> Result<(), EventError> {
+    verify_prefixed(SIG_PREFIX_V1, author, id, sig)
+}
+
+/// An Ed25519 author signature over `prefix || id`, under the v1 rules:
+/// the key checks of [`check_v1_key`], then ZIP 215. v1 and v2 differ only
+/// by the prefix.
+pub fn verify_prefixed(
+    prefix: &[u8],
+    author: &[u8; 32],
+    id: &[u8; 32],
+    sig: &[u8; 64],
+) -> Result<(), EventError> {
     check_v1_key(author, "author")?;
     let key = ed25519_zebra::VerificationKey::try_from(*author)
         .map_err(|_| invalid("author is not an Ed25519 point"))?;
     let signature = ed25519_zebra::Signature::from_bytes(sig);
-    key.verify(&signature, &v1_message(id))
+    key.verify(&signature, &prefixed_message(prefix, id))
         .map_err(|_| EventError::BadSignature)
+}
+
+/// `prefix || id`, the message of a prefixed signature.
+pub fn prefixed_message(prefix: &[u8], id: &[u8; 32]) -> Vec<u8> {
+    let mut msg = Vec::with_capacity(prefix.len().saturating_add(32));
+    msg.extend_from_slice(prefix);
+    msg.extend_from_slice(id);
+    msg
 }
 
 /// v1 keys (`author`, rotate `data.new_key`) are checked on top of ZIP 215
@@ -475,10 +510,7 @@ pub fn check_v1_key(key: &[u8; 32], what: &str) -> Result<(), EventError> {
 
 /// The message signed by v1 events.
 pub fn v1_message(id: &[u8; 32]) -> Vec<u8> {
-    let mut msg = Vec::with_capacity(SIG_PREFIX_V1.len().saturating_add(32));
-    msg.extend_from_slice(SIG_PREFIX_V1);
-    msg.extend_from_slice(id);
-    msg
+    prefixed_message(SIG_PREFIX_V1, id)
 }
 
 /// Sign an id with the v1 suite.
@@ -502,10 +534,18 @@ impl AnyEvent {
 
     /// Check an event that was parsed under the strict profile. Versions
     /// with a known suite get their signature checked; understood versions
-    /// get their full rules; everything else only the invariant core.
+    /// get their full rules; everything else only the invariant core. v2
+    /// events (ADR 0015), tombstoned or not, get their rules and signature
+    /// checked and are returned opaque: their content is encrypted.
     pub fn from_value(value: Value) -> Result<AnyEvent, EventError> {
         let mut raw = RawEvent::from_value(value)?;
+        if raw.v == crate::v2::VERSION {
+            crate::v2::check_rules(&raw)?;
+        }
         raw.verify_signature()?;
+        if raw.v == crate::v2::VERSION {
+            return Ok(AnyEvent::Opaque(raw));
+        }
         let (min, max) = UNDERSTOOD_VERSIONS;
         // An event whose proof of work this node cannot measure is opaque
         // too, whatever its version: never shown, never taken as no work.
@@ -582,20 +622,26 @@ pub fn sign_value(
     for (k, v) in header {
         wire.insert(k, v);
     }
+    let id = mine(&mut wire, pow_bits)?;
+    wire.insert("id".into(), Value::String(hex::encode(id)));
+    wire.insert("sig".into(), Value::String(hex::encode(sign_v1(key, &id))));
+    Ok(Value::Object(wire))
+}
+
+/// Mine a `b3` proof of work of `pow_bits` into `wire` (`pow` is set) and
+/// return the id. `id` and `sig` are left to the caller.
+pub fn mine(wire: &mut Map<String, Value>, pow_bits: u32) -> Result<[u8; 32], EventError> {
     let mut nonce: u64 = 0;
-    let id = loop {
+    loop {
         wire.insert("pow".into(), Value::String(format!("{POW_ALG_B3}:{nonce}")));
-        let digest = digest(&wire)?;
+        let digest = digest(wire)?;
         if leading_zero_bits(&digest.id) >= pow_bits {
-            break digest.id;
+            return Ok(digest.id);
         }
         nonce = nonce
             .checked_add(1)
             .ok_or_else(|| invalid("pow nonce space exhausted"))?;
-    };
-    wire.insert("id".into(), Value::String(hex::encode(id)));
-    wire.insert("sig".into(), Value::String(hex::encode(sign_v1(key, &id))));
-    Ok(Value::Object(wire))
+    }
 }
 
 #[cfg(test)]
@@ -614,9 +660,9 @@ mod tests {
         SigningKey::from_bytes(&[9; 32])
     }
 
-    fn v2_event() -> Value {
+    fn v3_event() -> Value {
         sign_value(
-            json!({"v": 2, "ts": 1_760_600_000u64, "net": "public", "thread": null,
+            json!({"v": 3, "ts": 1_760_600_000u64, "net": "public", "thread": null,
                    "parent": null, "kind": "poll", "ext": {"lang": "en"}})
             .as_object()
             .unwrap()
@@ -698,11 +744,11 @@ mod tests {
 
     #[test]
     fn future_versions_are_checked_and_kept_opaque() {
-        let value = v2_event();
+        let value = v3_event();
         let AnyEvent::Opaque(raw) = AnyEvent::from_value(value.clone()).unwrap() else {
-            panic!("v2 must be opaque to a v1 node");
+            panic!("v3 must be opaque to this node");
         };
-        assert_eq!(raw.v, 2);
+        assert_eq!(raw.v, 3);
         assert!(!raw.signature_checked, "unknown suite: not checked");
         assert_eq!(raw.display_kind(), Kind::Note);
         assert!(raw.pow_work().unwrap() >= 4);
@@ -778,7 +824,7 @@ mod tests {
 
     #[test]
     fn domain_separation_is_in_effect() {
-        let value = v2_event();
+        let value = v3_event();
         let wire = value.as_object().unwrap();
         let d = digest(wire).unwrap();
         assert_ne!(d.id, *blake3::hash(&d.header_jcs).as_bytes());
