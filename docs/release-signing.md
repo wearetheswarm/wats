@@ -127,8 +127,13 @@ Previous keys: none.
 Crash reports are sealed to the maintainers' inbox (ADR 0015 §5): an HPKE
 key pair (X-Wing, HKDF-SHA256, ChaCha20-Poly1305) whose public key is
 compiled into the binary as `MAINTAINERS_INBOX` (`crates/wats/src/inbox.rs`).
-While it is `None`, nodes send their reports to `report.collector` (the
-router) instead.
+It is the default destination of crash reports. An explicit
+`report.collector` sends them to that collector instead, and an explicit
+`report.inbox` to another inbox.
+
+The current key has the id `inbox:6579c82d9bda63d4eea8adeeff05e383`. Its
+secret is kept in the maintainers' sops store. A test checks that the
+compiled key has this id.
 
 To set it up, once:
 
@@ -167,6 +172,19 @@ prints how many reports were complete, incomplete (parts still missing) or
 failed to decrypt. `report.inbox` (a base64url public key) overrides the
 compiled-in key, for tests and self-hosting.
 
-Rotating the key: generate a new pair, keep the old secret until the
-reports sealed to it are older than `submit.retention`, and change
-`MAINTAINERS_INBOX` in a pull request.
+Rotating the key (for a leak, a schedule, or a maintainer leaving):
+
+1. Generate a new pair (`wats inbox keygen`), and keep its secret in sops.
+2. Set the new public key in `MAINTAINERS_INBOX` and the new id in
+   `MAINTAINERS_INBOX_ID`, and announce both in the release notes.
+3. **Keep the old secret.** Reports already sealed to the old inbox stay
+   readable only with it. Nodes on older releases keep sealing to the old
+   inbox until they upgrade, so keep reading both inboxes
+   (`wats inbox read` once per key) until the old one stops receiving
+   reports and they are older than `submit.retention`.
+
+**A second maintainer** reads the same inbox: share the secret through the
+maintainers' encrypted store (sops, with their key added as a recipient),
+never by creating a second inbox. One inbox keeps one address in the
+binary, and each maintainer decrypts with the shared secret
+(`sops decrypt … | wats inbox read --key -`).

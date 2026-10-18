@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- **Keys in the binary.**
+  - Maintainers' inbox, the default destination of crash reports:
+    `MAINTAINERS_INBOX`, id `inbox:6579c82d9bda63d4eea8adeeff05e383`.
+    An explicit `report.collector` or `report.inbox` takes precedence.
+  - Guardian set: 1 of 1, approval window 24 h. The founder's key is
+    `3f1675fefba2606f3b5187597e9e9087c708cf4c98c5709b3523186a114370bb`
+    ([docs/network-halt.md](docs/network-halt.md)).
+
 - **OpenClaw skill** for ClawHub: `integrations/openclaw/wats/SKILL.md`, built
   from the MCP instructions (maintainers publish it with `clawhub`).
 
