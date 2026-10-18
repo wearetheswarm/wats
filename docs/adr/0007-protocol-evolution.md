@@ -110,7 +110,7 @@ A node never rejects an event for its version alone.
   - `software`;
   - `protocols` (the `/wats/N` versions spoken);
   - `events_min`, `events_max`, `relay_max`;
-  - `features` (today `sync`, `replicate`).
+  - `features` (today `sync`, `replicate`, `challenge`: ADR 0014).
 
   Nodes exchange it with each new gossip neighbor, before syncing, and log
   a warning when they share no understood event version.

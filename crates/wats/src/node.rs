@@ -478,6 +478,10 @@ pub struct Node {
     stop: tokio::sync::Notify,
     /// Per-peer request limits.
     limiter: crate::limits::RateLimiter,
+    /// Load challenges (ADR 0014 addendum).
+    challenger: crate::challenge::Challenger,
+    /// `/wats` requests being served.
+    in_flight: std::sync::atomic::AtomicUsize,
     /// Tokens of the agent runs in progress: an MCP session presenting one
     /// is a runner session.
     runner_tokens: std::sync::Mutex<HashMap<String, RunnerRun>>,
@@ -492,6 +496,22 @@ impl std::fmt::Debug for Node {
         f.debug_struct("Node")
             .field("id", &self.endpoint_id())
             .finish_non_exhaustive()
+    }
+}
+
+/// Counts a `/wats` request in flight while it lives.
+struct InFlight<'a>(&'a std::sync::atomic::AtomicUsize);
+
+impl<'a> InFlight<'a> {
+    fn enter(count: &'a std::sync::atomic::AtomicUsize) -> Self {
+        count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        InFlight(count)
+    }
+}
+
+impl Drop for InFlight<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
     }
 }
 
@@ -587,6 +607,9 @@ impl Node {
             // Hermetic: never dial what is not on this machine.
             cached = crate::peer_cache::loopback_only(cached);
         }
+        // Peers met before have a reputation: no load challenge for them.
+        let reputable: HashSet<EndpointId> =
+            cached.iter().filter_map(|p| p.id.parse().ok()).collect();
         let mut peers = config.peers.clone();
         peers.extend(
             cached
@@ -659,6 +682,12 @@ impl Node {
             storage_logged: Default::default(),
             stop: Default::default(),
             limiter: crate::limits::RateLimiter::new(limits),
+            challenger: crate::challenge::Challenger::new(
+                limits.challenge_base_bits,
+                limits.challenge_max_bits,
+                reputable,
+            ),
+            in_flight: Default::default(),
             runner_tokens: Default::default(),
             local_authors: Default::default(),
             lock: std::sync::Mutex::new(Some(lock)),
@@ -940,7 +969,7 @@ impl Node {
             async move {
                 let result = tokio::time::timeout(
                     Duration::from_secs(150),
-                    proto::call(self.endpoint(), peer, &request),
+                    proto::call_solving(self.endpoint(), peer, &request),
                 )
                 .await;
                 (peer, result)
@@ -969,7 +998,7 @@ impl Node {
         report: serde_json::Value,
     ) -> Result<()> {
         let request = proto::Request::CrashReport { report };
-        match proto::call(self.endpoint(), collector, &request).await? {
+        match proto::call_solving(self.endpoint(), collector, &request).await? {
             proto::Response::Accepted => Ok(()),
             proto::Response::Unsupported => {
                 bail!("{} does not collect crash reports", collector.fmt_short())
@@ -1432,10 +1461,11 @@ impl Node {
         let request = Request::Hello {
             info: NodeInfo::ours_greased(),
         };
-        let mut info = match proto::call(self.endpoint(), peer, &request).await? {
+        let mut info = match proto::call_solving(self.endpoint(), peer, &request).await? {
             Response::Hello { info } => info,
             other => bail!("unexpected hello response: {other:?}"),
         };
+        self.challenger.met(peer);
         crate::grease::strip(&mut info.features);
         if !NodeInfo::ours().shares_event_version(&info) {
             warn!(
@@ -1461,8 +1491,19 @@ impl Node {
         self.peer_info.lock().ok()?.get(peer).cloned()
     }
 
-    /// Serve a `/wats/1` request from `peer`.
-    pub(crate) async fn handle_request(&self, peer: EndpointId, request: Request) -> Response {
+    /// Load challenges issued and solutions accepted by this node so far.
+    pub fn challenge_stats(&self) -> (u64, u64) {
+        self.challenger.stats()
+    }
+
+    /// Serve a `/wats/1` request from `peer`, with the solution to a load
+    /// challenge it may carry.
+    pub(crate) async fn handle_request(
+        &self,
+        peer: EndpointId,
+        request: Request,
+        solution: Option<crate::challenge::Solution>,
+    ) -> Response {
         self.seen(peer);
         let kind = match &request {
             Request::Hello { .. } => Some(crate::limits::Kind::Hello),
@@ -1471,12 +1512,11 @@ impl Node {
             Request::CrashReport { .. } => Some(crate::limits::Kind::Report),
             Request::Unsupported => None,
         };
+        let _in_flight = InFlight::enter(&self.in_flight);
         if let Some(kind) = kind
-            && !self.limiter.allow(peer, kind)
+            && let Some(response) = self.admit(peer, kind, &request, solution)
         {
-            return Response::Refused {
-                reason: format!("rate limited ({}): retry later", kind.as_str()),
-            };
+            return response;
         }
         match request {
             Request::Hello { mut info } => {
@@ -1484,6 +1524,7 @@ impl Node {
                 if let Ok(mut infos) = self.peer_info.lock() {
                     infos.insert(peer, info);
                 }
+                self.challenger.met(peer);
                 Response::Hello {
                     info: NodeInfo::ours_greased(),
                 }
@@ -1569,6 +1610,63 @@ impl Node {
         }
     }
 
+    /// Rate limits and load challenge: `None` lets the request through,
+    /// otherwise the response to send instead.
+    fn admit(
+        &self,
+        peer: EndpointId,
+        kind: crate::limits::Kind,
+        request: &Request,
+        solution: Option<crate::challenge::Solution>,
+    ) -> Option<Response> {
+        let limits = self.limiter.limits();
+        let in_flight = self.in_flight.load(std::sync::atomic::Ordering::Relaxed);
+        let overloaded = in_flight > limits.overload_in_flight;
+        // Only peers that said they can solve one are challenged; a hello
+        // says it itself.
+        let solves = limits.challenge
+            && match request {
+                Request::Hello { info } => {
+                    info.features.iter().any(|f| f == crate::challenge::FEATURE)
+                }
+                _ => self
+                    .peer_info(&peer)
+                    .is_some_and(|i| i.features.iter().any(|f| f == crate::challenge::FEATURE)),
+            };
+        // A valid solution passes the per-peer limit and the overload, but
+        // not the global ceiling on solved requests.
+        if solves && let Some(solution) = solution {
+            match self
+                .challenger
+                .verify(&solution, &peer, &self.endpoint_id(), now_secs())
+            {
+                Ok(()) if self.limiter.allow_solved() => {
+                    self.challenger.note(overloaded);
+                    return None;
+                }
+                Ok(()) => debug!(peer = %peer.fmt_short(), "solved requests over the ceiling"),
+                Err(why) => debug!(peer = %peer.fmt_short(), ?why, "challenge solution rejected"),
+            }
+        }
+        let limited = !self.limiter.allow(peer, kind);
+        let effort = self.challenger.note(overloaded || (limited && solves));
+        if solves && (limited || (overloaded && !self.challenger.reputable(&peer))) {
+            let issued = self.challenger.issue(&peer, effort, now_secs());
+            return Some(Response::Challenge {
+                alg: issued.alg,
+                seed: issued.seed,
+                effort: issued.effort,
+                expires: issued.expires,
+            });
+        }
+        if limited {
+            return Some(Response::Refused {
+                reason: format!("rate limited ({}): retry later", kind.as_str()),
+            });
+        }
+        None
+    }
+
     /// Catch up on a network from a peer: page through its events after our
     /// sync watermark. Returns how many new events were stored.
     pub async fn sync_from(&self, peer: EndpointId, net: &str) -> Result<usize> {
@@ -1584,7 +1682,7 @@ impl Node {
                 after_id: after_id.clone(),
                 limit: proto::MAX_SYNC_PAGE,
             };
-            let (events, more) = match proto::call(self.endpoint(), peer, &request).await? {
+            let (events, more) = match proto::call_solving(self.endpoint(), peer, &request).await? {
                 Response::SyncPage { events, more } => (events, more),
                 other => bail!("unexpected sync response: {other:?}"),
             };

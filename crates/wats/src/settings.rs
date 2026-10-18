@@ -58,6 +58,9 @@ pub struct LimitsSettings {
     pub replicate_per_min: Option<u32>,
     pub report_per_min: Option<u32>,
     pub blob_fetches_per_peer: Option<usize>,
+    pub challenge: Option<bool>,
+    pub challenge_base_bits: Option<u32>,
+    pub challenge_max_bits: Option<u32>,
 }
 
 impl LimitsSettings {
@@ -73,6 +76,16 @@ impl LimitsSettings {
                 .blob_fetches_per_peer
                 .unwrap_or(d.blob_fetches_per_peer)
                 .max(1),
+            challenge: self.challenge.unwrap_or(d.challenge),
+            challenge_base_bits: self
+                .challenge_base_bits
+                .unwrap_or(d.challenge_base_bits)
+                .clamp(1, crate::challenge::MAX_BITS),
+            challenge_max_bits: self
+                .challenge_max_bits
+                .unwrap_or(d.challenge_max_bits)
+                .clamp(1, crate::challenge::MAX_BITS),
+            ..d
         }
     }
 }
@@ -292,6 +305,24 @@ pub const KEYS: &[Key] = &[
         ValueType::Integer,
         "4",
         "blobs one peer can make this node fetch at once",
+    ),
+    key(
+        "limits.challenge",
+        ValueType::Bool,
+        "true",
+        "under load, challenge peers that can solve it with proof of work instead of refusing them",
+    ),
+    key(
+        "limits.challenge_base_bits",
+        ValueType::Integer,
+        "8",
+        "effort of a load challenge when the load starts (leading zero bits)",
+    ),
+    key(
+        "limits.challenge_max_bits",
+        ValueType::Integer,
+        "24",
+        "highest effort of a load challenge, reached one bit per 10 s of overload",
     ),
     key(
         "report.crashes",

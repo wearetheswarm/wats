@@ -236,6 +236,8 @@ async fn sync_requests_are_rate_limited() -> anyhow::Result<()> {
     config.pow_bits = 0;
     config.min_pow_bits = 0;
     config.limits.sync_per_min = 8; // a burst of 2
+    // Refusals only: challenges instead are in tests/challenge.rs.
+    config.limits.challenge = false;
     let server = Node::start(config).await?;
     let a = node(&dir.path().join("a"), &[&server], 1).await?;
     let b = node(&dir.path().join("b"), &[&server], 1).await?;
