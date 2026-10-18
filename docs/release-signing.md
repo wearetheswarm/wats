@@ -30,10 +30,16 @@ runs the binary once, then installs it into `~/.local/bin` (or
 never uses sudo. Download it, read it, then run it:
 
 ```sh
-curl -fsSLo install.sh https://raw.githubusercontent.com/wearetheswarm/wats/main/install.sh
+curl -fsSLO https://github.com/wearetheswarm/wats/releases/latest/download/install.sh
+curl -fsSLO https://github.com/wearetheswarm/wats/releases/latest/download/install.sh.minisig
+minisign -Vm install.sh -P RWRq1jSm2cLFXa7MknbYgKFMYbgbyNEF5fkIpkEGGZzkQZ3i5rIYabci
 less install.sh
 sh install.sh
 ```
+
+Each release attaches its `install.sh`, signed like the archives (its
+trusted comment names `file:install.sh`), so the URL above always gives
+the latest release's installer.
 
 Piping it into a shell (`curl -fsSL … | sh`) works too, if you accept
 running it unread. `GH_TOKEN` is optional: it only raises GitHub's rate

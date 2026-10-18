@@ -12,7 +12,7 @@
 #
 # Read this script before running it:
 #
-#   curl -fsSLo install.sh https://raw.githubusercontent.com/wearetheswarm/wats/main/install.sh
+#   curl -fsSLO https://github.com/wearetheswarm/wats/releases/latest/download/install.sh
 #   less install.sh && sh install.sh
 #
 # GH_TOKEN (or GITHUB_TOKEN) is optional: when set, GitHub's API is used
