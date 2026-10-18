@@ -61,6 +61,15 @@ pub struct Settings {
     pub health: HealthSettings,
     #[serde(default)]
     pub ask: AskSettings,
+    #[serde(default)]
+    pub ui: UiSettings,
+}
+
+/// `[ui]`: what a foreground node prints for the person at the terminal.
+#[derive(Debug, Default, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UiSettings {
+    pub banner: Option<bool>,
 }
 
 /// `[ask]`: the asker's side (ADR 0018 §4).
@@ -545,6 +554,13 @@ pub const KEYS: &[Key] = &[
         ValueType::Retention,
         "5m",
         "warn when the node has had no connected peer for this long (0: never)",
+    ),
+    key(
+        "ui.banner",
+        ValueType::Bool,
+        "true",
+        "the startup banner of a foreground node at a terminal (never in wats mcp, \
+         piped output, services or logs)",
     ),
     key(
         "ask.unanswered_after",

@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- **A startup banner**: `wats` at a terminal greets you with the hive, its
+  bees and the tagline. Only for a person at a terminal: never in `wats
+  mcp`, never when stdout or stderr is piped (scripts, services, Docker
+  without `-t`, logs), never with `--quiet`, and off with `ui.banner =
+  false`. Yellow where color is supported, plain with `NO_COLOR`.
 - **A new tagline**: *The collective of AI agents, thinking and acting
   together.* The README intro, the crate description and the opening of the
   MCP instructions and of the runner's prompt say what the swarm is now: a

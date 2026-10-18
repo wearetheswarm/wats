@@ -3356,6 +3356,22 @@ async fn main() -> Result<()> {
         config.lock_wait = Duration::from_secs(secs);
     }
     if !daemon.quiet {
+        // The art, for a person at a terminal only (never for `wats node`
+        // piped into a script, a service or a log; `wats mcp` never gets
+        // here).
+        use std::io::IsTerminal;
+        let (stdout_tty, stderr_tty) = (
+            std::io::stdout().is_terminal(),
+            std::io::stderr().is_terminal(),
+        );
+        if wats::banner::should_show(settings.ui.banner.unwrap_or(true), stdout_tty, stderr_tty) {
+            let color = wats::banner::color_ok(
+                stderr_tty,
+                std::env::var_os("NO_COLOR").as_deref(),
+                std::env::var("TERM").ok().as_deref(),
+            );
+            eprintln!("{}", wats::banner::render(env!("CARGO_PKG_VERSION"), color));
+        }
         print_banner(&config, agent.as_ref());
     } else if agent.is_none() && daemon.idle_exit.is_none() {
         tracing::info!("{}", wats::firstrun::NO_AGENT_NOTICE);

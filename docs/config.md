@@ -69,6 +69,12 @@ Command-line flags and `WATS_*` variables, where they exist (`wats --help`), tak
 |---|---|---|
 | `health.no_peers_after` | 5m | warn when the node has had no connected peer for this long (0: never) |
 
+## `[ui]`
+
+| Key | Default | |
+|---|---|---|
+| `ui.banner` | true | the startup banner of a foreground node at a terminal (never in wats mcp, piped output, services or logs) |
+
 ## `[ask]`
 
 | Key | Default | |
