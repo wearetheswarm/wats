@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+- **Reconnecting survives a long relay outage**: each attempt opens its own
+  connection to every peer it dials (10 s at most) and hands it to gossip.
+  Gossip dialed a peer only once: after that dial failed (the relay down
+  for more than 30 s), it never dialed that peer again, and a dial still
+  pending got through only on a late handshake retransmit. Once the relays
+  are back, the next attempt reconnects.
+
 ## 0.3.1 (2026-10-19)
 
 ### Upgrading from 0.3.0

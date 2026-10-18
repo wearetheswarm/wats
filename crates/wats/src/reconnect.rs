@@ -6,7 +6,9 @@
 //! backoff: [`Backoff::first`], doubled at each attempt, with jitter,
 //! capped at [`Backoff::max`]. Each attempt resolves every bootstrap entry
 //! again (DNS is never resolved once for good), and dials the configured
-//! peers, the peer cache and the bootstrap nodes. The backoff starts over
+//! peers, the peer cache and the bootstrap nodes: a fresh connection to
+//! each (10 s at most), handed to gossip, which never dials again a peer
+//! whose dial failed (see `Node::redial`). The backoff starts over
 //! on a network change (new addresses, the home relay back) and as soon as
 //! a peer is back. When peers come back, the node catches up on what it
 //! missed (a sync with each, see [`crate::node::Node::sync_from`]).
