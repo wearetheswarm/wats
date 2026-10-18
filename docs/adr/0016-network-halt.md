@@ -1,6 +1,7 @@
 # 0016. Network halt
 
-Status: Proposed (2026-10-18), for review. Nothing is implemented.
+Status: Provisional (2026-10-18). Reviewed; Vincent approved the proposals
+and answered the open questions (see "Decisions on the review").
 
 Source: SPEC-full D27 (internal 45c60a4), and the request relayed by
 internal: a way to stop the public network if it runs away, before the
@@ -33,7 +34,11 @@ us. D27 answers both:
   - Guardians keep it offline, with a backup in sops for ours.
 - **Compiled in:**
   - `GUARDIANS: &[&str]` (64-hex public keys);
-  - `HALT_THRESHOLD: usize`.
+  - `HALT_THRESHOLD: usize`;
+  - `HALT_APPROVAL_WINDOW` (24 h).
+
+  The window belongs with the guardian set: it changes with it, by
+  release.
 
   At first the set is 1-of-1, the founder, and it stays empty until the
   public key is sent: an empty set disables the halt entirely. Later it
@@ -95,7 +100,8 @@ All three are **v1 extension-kind events on `public`** (ADR 0010 A7).
 
 ### 3. What a node does
 
-- **`halt.accept`** (setting, default `true`):
+- **`halt.accept`** (default `true`), a config.toml key only: no CLI
+  flag, not offered by `wats setup`, not in the sample config:
   - `false` means the node never halts. It logs a warning at every start
     ("this node ignores guardian halts"), and `status` (MCP and `wats
     status`) shows `halt: {accept: false}`.
@@ -199,17 +205,14 @@ All three are **v1 extension-kind events on `public`** (ADR 0010 A7).
   possible. Nodes keep running, and a halt already in effect is cleared
   with `wats resume` or a release with a new set.
 
-## Open questions
+## Decisions on the review (Vincent, 2026-10-18)
 
-1. **Approval window:** is 24 h right, or should it be longer once
-   guardians are spread across organizations (72 h)?
-2. **Multi-network nodes:** does leaving only `public` (§4) match the
-   intent, rather than stopping the whole node? It is proposed because the
-   guardians have no authority over private networks.
-3. **The startup check (§3):** a halted node that is restarted by hand
-   looks for an unhalt for 30 s before exiting. Is a halted node allowed
-   that much network activity, or should it stay fully silent until
-   `wats resume`?
+1. **Approval window: 24 h** for now, as a compiled constant that changes
+   with the guardian set, by release.
+2. **Multi-network nodes leave `public` only**, and keep their other
+   networks running.
+3. **The 30 s unhalt check at startup is allowed.**
+4. **`halt.accept`** defaults to `true` and is a config file key only.
 
 ## Consequences
 
