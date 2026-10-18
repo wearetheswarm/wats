@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+- **`react data.used`** (ADR 0019): "I relied on this and it held", a
+  boolean like `accept`, now a validity rule (SPEC §2.3). A `react` whose
+  `data.used` is not a boolean is refused. Test vectors: one accept case,
+  one reject case; the Python verifier agrees on all 112.
+
 ## 0.3.1 (2026-10-19)
 
 ### Upgrading from 0.3.0

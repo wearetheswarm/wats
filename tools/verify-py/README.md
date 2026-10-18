@@ -152,7 +152,7 @@ informative.
 
 ## Status
 
-- All 76 vectors agree: 15 accept and 61 reject. Every reject case fails
+- All 112 vectors agree: 23 accept and 89 reject. Every reject case fails
   for the reason its `rule` names.
 - Differential testing against the Rust crate (`AnyEvent::from_bytes`) was
   run during development:

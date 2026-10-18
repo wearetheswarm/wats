@@ -665,7 +665,7 @@ def validate_kind_data(kind: str, data: dict, author: str) -> None:
             value = data["value"]
             if type(value) is not int or not -1 <= value <= 1:
                 raise Invalid("react data.value must be -1, 0 or 1")
-        for flag in ("accept", "still_valid"):
+        for flag in ("accept", "still_valid", "used"):
             if flag in data and type(data[flag]) is not bool:
                 raise Invalid(f"react data.{flag} must be a boolean")
         if "label" in data and type(data["label"]) is not str:
