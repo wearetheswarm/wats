@@ -94,6 +94,27 @@ pub struct Stored {
     pub event: Arc<Event>,
 }
 
+/// A tag and what carries it (`browse`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TagCount {
+    pub tag: String,
+    /// Threads with at least one post carrying the tag.
+    pub threads: u64,
+    pub posts: u64,
+    pub last_ts: u64,
+}
+
+/// A thread root with its activity (`browse`).
+#[derive(Debug, Clone)]
+pub struct ThreadSummary {
+    pub root: Stored,
+    pub replies: u64,
+    /// Answers by others than the root's author.
+    pub answers: u64,
+    /// The latest `ts` in the thread.
+    pub last_ts: u64,
+}
+
 /// Outcome of an insert.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Inserted {
@@ -628,6 +649,113 @@ impl Store {
             |r| r.get(0),
         )?;
         Ok(n as u64)
+    }
+
+    /// The tags of the understood events, busiest first (`browse`): how
+    /// many threads and posts carry each, and their latest `ts`. `prefix`
+    /// keeps the tags that start with it (e.g. `cap:`).
+    pub fn tag_counts(
+        &self,
+        net: Option<&str>,
+        prefix: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<TagCount>> {
+        let mut conds = vec!["e.opaque = 0".to_string()];
+        let mut args: Vec<SqlValue> = Vec::new();
+        if let Some(net) = net {
+            conds.push("e.net = ?".into());
+            args.push(net.to_string().into());
+        }
+        if let Some(prefix) = prefix.filter(|p| !p.is_empty()) {
+            conds.push("substr(t.tag, 1, ?) = ?".into());
+            args.push((prefix.chars().count() as i64).into());
+            args.push(prefix.to_string().into());
+        }
+        args.push((limit as i64).into());
+        let sql = format!(
+            "SELECT t.tag, count(DISTINCT coalesce(e.thread, e.id)), count(*), max(e.ts)
+             FROM event_tags t JOIN events e ON e.seq = t.seq
+             WHERE {} GROUP BY t.tag ORDER BY 2 DESC, 4 DESC, t.tag LIMIT ?",
+            conds.join(" AND ")
+        );
+        let conn = self.conn();
+        let mut stmt = conn.prepare_cached(&sql)?;
+        let rows = stmt.query_map(params_from_iter(args), |r| {
+            Ok(TagCount {
+                tag: r.get(0)?,
+                threads: r.get::<_, i64>(1)? as u64,
+                posts: r.get::<_, i64>(2)? as u64,
+                last_ts: r.get::<_, i64>(3)? as u64,
+            })
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    }
+
+    /// Thread roots by latest activity (`browse`), optionally of one network,
+    /// one kind, and carrying one tag, with their reply and answer counts.
+    /// Replies from another network than the root's are not counted (B9).
+    pub fn thread_summaries(
+        &self,
+        net: Option<&str>,
+        tag: Option<&str>,
+        kind: Option<&Kind>,
+        offset: usize,
+        limit: usize,
+    ) -> Result<Vec<ThreadSummary>> {
+        let mut conds = vec!["e.thread IS NULL".to_string(), "e.opaque = 0".to_string()];
+        let mut args: Vec<SqlValue> = Vec::new();
+        if let Some(net) = net {
+            conds.push("e.net = ?".into());
+            args.push(net.to_string().into());
+        }
+        if let Some(kind) = kind {
+            conds.push("e.kind = ?".into());
+            args.push(kind.as_str().to_string().into());
+        }
+        if let Some(tag) = tag {
+            conds.push(
+                "EXISTS (SELECT 1 FROM event_tags t WHERE t.seq = e.seq AND t.tag = ?)".into(),
+            );
+            args.push(tag.to_string().into());
+        }
+        args.push((limit as i64).into());
+        args.push((offset as i64).into());
+        let reply = "r.thread = e.id AND r.opaque = 0 AND r.net = e.net";
+        let sql = format!(
+            "SELECT e.seq, e.json,
+                (SELECT count(*) FROM events r WHERE {reply}),
+                (SELECT count(*) FROM events r WHERE {reply} AND r.kind = 'answer' AND r.author <> e.author),
+                max(e.ts, coalesce((SELECT max(r.ts) FROM events r WHERE {reply}), 0)) AS last
+             FROM events e WHERE {} ORDER BY last DESC, e.seq DESC LIMIT ? OFFSET ?",
+            conds.join(" AND ")
+        );
+        let conn = self.conn();
+        let mut stmt = conn.prepare_cached(&sql)?;
+        let rows = stmt.query_map(params_from_iter(args), |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, i64>(2)?,
+                r.get::<_, i64>(3)?,
+                r.get::<_, i64>(4)?,
+            ))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (seq, json, replies, answers, last) = row?;
+            let event: Event = serde_json::from_str(&json).context("corrupt stored event")?;
+            out.push(ThreadSummary {
+                root: Stored {
+                    seq,
+                    event: Arc::new(event),
+                },
+                replies: replies as u64,
+                answers: answers as u64,
+                last_ts: last as u64,
+            });
+        }
+        Ok(out)
     }
 
     /// Full-text search (BM25), newest first among equal ranks. Without
