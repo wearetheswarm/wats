@@ -3746,3 +3746,199 @@ fn crash_context(config: &NodeConfig) {
         own_id: None,
     });
 }
+
+/// `docs/cli.md`, generated from the clap definitions above; a test keeps
+/// the published page in step (`WATS_UPDATE_DOCS=1 cargo test -p wats --bin
+/// wats cli_reference` rewrites it).
+#[cfg(test)]
+mod cli_reference {
+    use clap::CommandFactory;
+
+    /// One line for a table cell.
+    fn cell(text: &str) -> String {
+        text.split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+            .replace('|', "\\|")
+    }
+
+    fn option(arg: &clap::Arg) -> String {
+        let value = || {
+            arg.get_value_names()
+                .map(|names| {
+                    names
+                        .iter()
+                        .map(|n| format!("<{n}>"))
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                })
+                .unwrap_or_else(|| format!("<{}>", arg.get_id().as_str().to_uppercase()))
+        };
+        let takes_value = arg.get_num_args().is_none_or(|n| n.takes_values())
+            && !matches!(
+                arg.get_action(),
+                clap::ArgAction::SetTrue
+                    | clap::ArgAction::SetFalse
+                    | clap::ArgAction::Count
+                    | clap::ArgAction::Help
+                    | clap::ArgAction::Version
+            );
+        if arg.is_positional() {
+            return format!("`{}`", value());
+        }
+        let mut names = Vec::new();
+        if let Some(short) = arg.get_short() {
+            names.push(format!("-{short}"));
+        }
+        if let Some(long) = arg.get_long() {
+            names.push(format!("--{long}"));
+        }
+        let mut text = names.join(", ");
+        if takes_value {
+            text.push(' ');
+            text.push_str(&value());
+        }
+        format!("`{text}`")
+    }
+
+    fn table(out: &mut String, args: &[&clap::Arg]) {
+        out.push_str("| Option | Env | Default | Description |\n|---|---|---|---|\n");
+        for arg in args {
+            let env = arg
+                .get_env()
+                .map(|e| format!("`{}`", e.to_string_lossy()))
+                .unwrap_or_default();
+            let default = arg
+                .get_default_values()
+                .iter()
+                .map(|v| format!("`{}`", v.to_string_lossy()))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let mut help = cell(
+                &arg.get_long_help()
+                    .or(arg.get_help())
+                    .map(ToString::to_string)
+                    .unwrap_or_default(),
+            );
+            let values: Vec<String> = arg
+                .get_possible_values()
+                .iter()
+                .filter(|v| !v.is_hide_set())
+                .map(|v| format!("`{}`", v.get_name()))
+                .collect();
+            let is_bool =
+                values.len() == 2 && values.iter().all(|v| v == "`true`" || v == "`false`");
+            if !values.is_empty() && !is_bool {
+                if !help.is_empty() && !help.ends_with(['.', ')', ']']) {
+                    help.push('.');
+                }
+                if !help.is_empty() {
+                    help.push(' ');
+                }
+                help.push_str(&format!("One of: {}.", values.join(", ")));
+            }
+            out.push_str(&format!(
+                "| {} | {env} | {default} | {help} |\n",
+                option(arg)
+            ));
+        }
+        out.push('\n');
+    }
+
+    fn section(out: &mut String, cmd: &clap::Command, path: &[String], top: bool) {
+        let name = path.join(" ");
+        out.push_str(&format!(
+            "<a id=\"{}\"></a>\n\n## `{name}`\n\n",
+            path.join("-")
+        ));
+        if let Some(about) = cmd.get_long_about().or(cmd.get_about()) {
+            out.push_str(about.to_string().trim());
+            out.push_str("\n\n");
+        }
+        let usage = cmd.clone().bin_name(&name).render_usage().to_string();
+        let usage = usage.trim_start_matches("Usage: ").trim();
+        out.push_str(&format!("```\n{usage}\n```\n\n"));
+        let args: Vec<&clap::Arg> = cmd
+            .get_arguments()
+            .filter(|a| !a.is_hide_set())
+            .filter(|a| !matches!(a.get_id().as_str(), "help" | "version"))
+            // Global options are listed once, under `wats`.
+            .filter(|a| top || !a.is_global_set())
+            .collect();
+        let mut headings: Vec<Option<&str>> = Vec::new();
+        for arg in &args {
+            if !headings.contains(&arg.get_help_heading()) {
+                headings.push(arg.get_help_heading());
+            }
+        }
+        for heading in headings {
+            let group: Vec<&clap::Arg> = args
+                .iter()
+                .copied()
+                .filter(|a| a.get_help_heading() == heading)
+                .collect();
+            if let Some(heading) = heading {
+                out.push_str(&format!("**{heading}**\n\n"));
+            }
+            table(out, &group);
+        }
+        let subs: Vec<&clap::Command> = cmd
+            .get_subcommands()
+            .filter(|s| !s.is_hide_set() && s.get_name() != "help")
+            .collect();
+        if !subs.is_empty() {
+            out.push_str("| Command | |\n|---|---|\n");
+            for sub in &subs {
+                let mut sub_path = path.to_vec();
+                sub_path.push(sub.get_name().to_string());
+                out.push_str(&format!(
+                    "| [`{}`](#{}) | {} |\n",
+                    sub_path.join(" "),
+                    sub_path.join("-"),
+                    cell(&sub.get_about().map(ToString::to_string).unwrap_or_default())
+                ));
+            }
+            out.push('\n');
+        }
+        for sub in subs {
+            let mut sub_path = path.to_vec();
+            sub_path.push(sub.get_name().to_string());
+            section(out, sub, &sub_path, false);
+        }
+    }
+
+    pub fn markdown() -> String {
+        let mut cmd = super::Cli::command();
+        cmd.build();
+        let mut out = String::from(
+            "# Command-line reference\n\n\
+             <!-- Generated from the clap definitions in crates/wats/src/main.rs: \
+             WATS_UPDATE_DOCS=1 cargo test -p wats --bin wats cli_reference. \
+             Do not edit by hand. -->\n\n\
+             Every command and option of `wats`, as `wats --help` shows them. \
+             The options listed under `wats` apply to every command. Most of them \
+             can also be set in `<data dir>/config.toml`, see the \
+             [configuration reference](config.md); a flag or an environment \
+             variable wins over the file.\n\n",
+        );
+        section(&mut out, &cmd, &["wats".to_string()], true);
+        while out.ends_with("\n\n") {
+            out.pop();
+        }
+        out
+    }
+
+    #[test]
+    fn cli_reference_is_up_to_date() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/cli.md");
+        let generated = markdown();
+        if std::env::var_os("WATS_UPDATE_DOCS").is_some() {
+            std::fs::write(&path, &generated).unwrap();
+        }
+        let published = std::fs::read_to_string(&path).unwrap_or_default();
+        assert_eq!(
+            published, generated,
+            "docs/cli.md drifted: WATS_UPDATE_DOCS=1 cargo test -p wats --bin wats cli_reference"
+        );
+    }
+}
