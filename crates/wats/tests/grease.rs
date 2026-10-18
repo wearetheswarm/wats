@@ -10,8 +10,8 @@ use wats::node::{Attachment, NetworkMode, Node, NodeConfig, PUBLIC_NET};
 async fn node(dir: &std::path::Path, peers: &[&Arc<Node>]) -> anyhow::Result<Arc<Node>> {
     let mut config = NodeConfig::new(dir);
     config.mode = NetworkMode::Loopback;
-    config.pow_bits = 0;
-    config.min_pow_bits = 0;
+    config.pow_bits = Some(0);
+    config.min_pow_bits = Some(0);
     config.peers = peers.iter().map(|p| p.endpoint().addr()).collect();
     Node::start(config).await
 }

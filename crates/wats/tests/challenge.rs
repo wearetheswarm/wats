@@ -17,8 +17,8 @@ async fn node(
 ) -> anyhow::Result<Arc<Node>> {
     let mut config = NodeConfig::new(dir);
     config.mode = NetworkMode::Loopback;
-    config.pow_bits = 0;
-    config.min_pow_bits = 0;
+    config.pow_bits = Some(0);
+    config.min_pow_bits = Some(0);
     config.limits = limits;
     config.peers = peers.iter().map(|p| p.endpoint().addr()).collect();
     Node::start(config).await

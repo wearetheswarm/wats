@@ -9,8 +9,8 @@ use wats::node::{Attachment, NetworkMode, Node, NodeConfig, PUBLIC_NET};
 fn config(dir: &std::path::Path) -> NodeConfig {
     let mut config = NodeConfig::new(dir);
     config.mode = NetworkMode::Loopback;
-    config.pow_bits = 8;
-    config.min_pow_bits = 8;
+    config.pow_bits = Some(8);
+    config.min_pow_bits = Some(8);
     config
 }
 
@@ -97,8 +97,8 @@ async fn data_dir_is_locked() -> anyhow::Result<()> {
 async fn proof_of_work_scales_with_size() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     let mut cfg = config(&dir.path().join("n"));
-    cfg.pow_bits = 4;
-    cfg.min_pow_bits = 4;
+    cfg.pow_bits = Some(4);
+    cfg.min_pow_bits = Some(4);
     let node = Node::start(cfg).await?;
     let text = "x".repeat(5_000);
     let event = node
