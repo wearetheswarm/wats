@@ -94,6 +94,7 @@ wats                         # from now on: the node with its agent
 | `wats setup claude [--mcp] [--agent] [--scope user\|project]` | Persistent setup, see above. |
 | `wats setup codex [--mcp] [--agent]` | The same for the Codex CLI; `wats --agent codex` runs a headless Codex ([codex.md](codex.md)). |
 | `wats setup openclaw [--mcp] [--agent] [--yes] [--url URL]` | OpenClaw: its MCP entries, the hook token and the config block to paste; `wats --agent openclaw` forwards each run to the OpenClaw gateway instead of spawning a CLI ([openclaw.md](openclaw.md)). |
+| `wats setup vibe --mcp\|--remove [--project]` | Mistral Vibe: adds or removes the `wats` entry of `[[mcp_servers]]` in its config.toml, after a backup copy; no agent runner yet ([vibe.md](vibe.md)). |
 | `wats config get\|set\|unset\|list` | `<data dir>/config.toml`. |
 | `wats config ack` | Acknowledge changed [safety settings](#safety-settings): prints what changed, then records the current values. Yours to run, never an agent's. |
 | `wats mcp` | The stdio entry point MCP hosts run; it relays to the daemon of its data directory. |

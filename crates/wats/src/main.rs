@@ -690,6 +690,24 @@ enum SetupTool {
         #[arg(long, env = "WATS_OPENCLAW", default_value = "openclaw")]
         openclaw: PathBuf,
     },
+    /// Mistral Vibe, as an MCP host (its agent runner comes later). Vibe
+    /// has no CLI for MCP servers: wats edits its config.toml, after a
+    /// backup copy, and touches nothing but its own entry.
+    Vibe {
+        /// Add, or replace, the `[[mcp_servers]]` entry `name = "wats"` in
+        /// Vibe's config.toml ($VIBE_HOME/config.toml, else
+        /// ~/.vibe/config.toml): transport "stdio", command <this wats>,
+        /// args ["mcp", "--profile", <profile>]. The profile is --profile,
+        /// else config.toml's, else your OS user name.
+        #[arg(long, conflicts_with = "remove")]
+        mcp: bool,
+        /// Remove that entry (with a backup copy too).
+        #[arg(long)]
+        remove: bool,
+        /// Edit ./.vibe/config.toml, this project's, instead.
+        #[arg(long)]
+        project: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -1075,6 +1093,90 @@ fn apply_openclaw_config(
             )
         ))),
     }
+}
+
+/// `wats setup vibe`: add (`--mcp`) or remove (`--remove`) the `wats`
+/// entry of Vibe's `[[mcp_servers]]`, editing its config.toml after a
+/// backup copy ([`wats::vibe`]).
+fn setup_vibe(
+    args: &NodeArgs,
+    data_dir: &std::path::Path,
+    (mcp, remove, project): (bool, bool, bool),
+) -> Result<()> {
+    use wats::vibe;
+    if !mcp && !remove {
+        println!(
+            "Mistral Vibe: wats cannot run it as the node's agent yet (coming next). To reach \
+             the swarm from your Vibe sessions, add wats as its MCP server:\n  \
+             wats setup vibe --mcp"
+        );
+        return Ok(());
+    }
+    let path = if project {
+        std::path::absolute(".vibe")?
+    } else {
+        vibe::home(std::env::var_os("VIBE_HOME"), std::env::home_dir())
+            .context("no home directory: set VIBE_HOME")?
+    }
+    .join("config.toml");
+    let text = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => return Err(e).with_context(|| format!("read {}", path.display())),
+    };
+    let invalid = || format!("{}: left as it is", path.display());
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let backed_up = |backup: Option<PathBuf>| match backup {
+        Some(backup) => println!("  backup: {}", backup.display()),
+        None => println!("  (new file)"),
+    };
+    if remove {
+        let Some(new) = vibe::remove_server(&text).with_context(invalid)? else {
+            println!(
+                "Mistral Vibe: no wats MCP server in {}, nothing to remove",
+                path.display()
+            );
+            return Ok(());
+        };
+        let backup = vibe::write_with_backup(&path, &new, now)?;
+        println!(
+            "Mistral Vibe: wats MCP server removed from {}",
+            path.display()
+        );
+        backed_up(backup);
+        return Ok(());
+    }
+    let profile = human_profile(args, &Settings::load(data_dir)?)?;
+    let (command, server_args) = mcp_server_command(args, &profile)?;
+    let Some(new) = vibe::upsert_server(&text, &command, &server_args).with_context(invalid)?
+    else {
+        println!(
+            "Mistral Vibe: wats MCP server already in {} (profile {profile})",
+            path.display()
+        );
+        return Ok(());
+    };
+    let backup = vibe::write_with_backup(&path, &new, now)?;
+    println!(
+        "Mistral Vibe: wats MCP server {} {} (profile {profile})",
+        if vibe::remove_server(&text).is_ok_and(|r| r.is_some()) {
+            "updated in"
+        } else {
+            "added to"
+        },
+        path.display()
+    );
+    backed_up(backup);
+    println!(
+        "  [[mcp_servers]] name = \"wats\", transport = \"stdio\", command = {command:?}, \
+         args = {server_args:?}\n\
+         Its tools are wats_post, wats_reply, wats_read, wats_search, wats_who and wats_wait \
+         (check with /mcp in Vibe)."
+    );
+    Ok(())
 }
 
 /// One line from the terminal, trimmed.
@@ -3089,6 +3191,14 @@ async fn main() -> Result<()> {
                 &openclaw,
             );
         }
+        Some(Command::Setup {
+            tool:
+                Some(SetupTool::Vibe {
+                    mcp,
+                    remove,
+                    project,
+                }),
+        }) => return setup_vibe(&cli.node, &data_dir, (mcp, remove, project)),
         _ => {}
     }
     first_run(&cli, &data_dir)?;
