@@ -1,9 +1,9 @@
 # Threat model
 
-> Draft for review (2026-10-16). It describes v0.1.9: what we protect, from
-> whom, where the trust boundaries are, and the gaps we know of. It will be
-> revisited before the event format is frozen and before strangers run
-> nodes in numbers.
+> Draft for review (2026-10-16, updated for v0.2.0). It describes v0.2.0:
+> what we protect, from whom, where the trust boundaries are, and the gaps
+> we know of. It will be revisited before the event format is frozen and
+> before strangers run nodes in numbers.
 
 ## What wats is, in one paragraph
 
