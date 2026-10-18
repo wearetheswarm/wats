@@ -1,12 +1,14 @@
 //! Crash reports: a panicking node writes a redacted report; `wats report
 //! show` prints it; `wats report send` delivers it to a collector that
-//! accepts reports, and only to one.
+//! accepts reports, and only to one. With an inbox key, reports are sealed
+//! to the inbox instead (ADR 0015 §5) and travel by gossip.
 
 #![cfg(unix)]
 
 use std::time::Duration;
 
-use wats::node::{NetworkMode, Node, NodeConfig};
+use wats::inbox::{InboxKey, read_submissions};
+use wats::node::{NetworkMode, Node, NodeConfig, PUBLIC_NET};
 
 async fn collector(dir: &std::path::Path, accept: bool) -> anyhow::Result<std::sync::Arc<Node>> {
     let mut config = NodeConfig::new(dir);
@@ -101,9 +103,165 @@ async fn panic_report_show_and_send() -> anyhow::Result<()> {
     assert_eq!(stored.len(), 1, "{stored:?}");
     let list = String::from_utf8(wats(&data, &ticket, &["report", "list"]).stdout)?;
     assert!(list.contains("sent"), "{list}");
+    let id = list.split_whitespace().next().unwrap().to_string();
 
+    // With an inbox key, the report is sealed to the inbox instead and
+    // reaches the inbox node by gossip, as v2 `submit` events.
+    let inbox_dir = dir.path().join("inbox-node");
+    let inbox_node = receiver(&inbox_dir).await?;
+    let key_file = dir.path().join("inbox.key");
+    let keygen = wats(
+        &data,
+        &ticket,
+        &["inbox", "keygen", "--out", key_file.to_str().unwrap()],
+    );
+    assert!(keygen.status.success());
+    let printed = String::from_utf8(keygen.stdout)?;
+    let public = printed
+        .lines()
+        .find_map(|l| l.strip_prefix("public key: "))
+        .unwrap();
+    let key = InboxKey::load(&key_file)?;
+    assert_eq!(public, key.public().to_b64());
+    assert!(printed.contains(key.public().id()), "{printed}");
+    // Never over an existing secret.
+    let again = wats(
+        &data,
+        &ticket,
+        &["inbox", "keygen", "--out", key_file.to_str().unwrap()],
+    );
+    assert!(!again.status.success());
+
+    std::fs::write(
+        data.join("config.toml"),
+        format!("[report]\ninbox = \"{public}\"\n"),
+    )?;
+    let sent = wats(
+        &data,
+        &inbox_node.ticket().await.to_string(),
+        &[
+            "--pow-bits",
+            "0",
+            "--min-pow-bits",
+            "0",
+            "report",
+            "send",
+            &id,
+        ],
+    );
+    let stdout = String::from_utf8_lossy(&sent.stdout);
+    assert!(
+        sent.status.success() && stdout.contains(key.public().id()),
+        "{stdout} {}",
+        String::from_utf8_lossy(&sent.stderr)
+    );
+    eventually("the inbox node stores the submission", async || {
+        !inbox_node
+            .store()
+            .submits_to(key.public().id())
+            .unwrap()
+            .is_empty()
+    })
+    .await;
+    // `wats inbox read` next to the running node: the exact report bytes.
+    let out = dir.path().join("read");
+    let read = std::process::Command::new(env!("CARGO_BIN_EXE_wats"))
+        .env("WATS_HERMETIC", "1")
+        .arg("--dir")
+        .arg(&inbox_dir)
+        .args(["inbox", "read", "--key"])
+        .arg(&key_file)
+        .arg("--out")
+        .arg(&out)
+        .output()?;
+    let stdout = String::from_utf8_lossy(&read.stdout);
+    assert!(
+        read.status.success(),
+        "{stdout} {}",
+        String::from_utf8_lossy(&read.stderr)
+    );
+    assert!(stdout.contains("1 new report"), "{stdout}");
+    let files = walk(&out);
+    assert_eq!(files.len(), 1, "{files:?}");
+    assert_eq!(std::fs::read(&files[0])?, wats::crash::bytes(&data, &id)?);
+
+    let _ = tokio::time::timeout(Duration::from_secs(5), inbox_node.shutdown()).await;
     let _ = tokio::time::timeout(Duration::from_secs(5), collector_node.shutdown()).await;
     let _ = tokio::time::timeout(Duration::from_secs(5), refuser.shutdown()).await;
+    Ok(())
+}
+
+/// A node that accepts submissions mined at the size and submit bits only.
+async fn receiver(dir: &std::path::Path) -> anyhow::Result<std::sync::Arc<Node>> {
+    let mut config = NodeConfig::new(dir);
+    config.mode = NetworkMode::Loopback;
+    config.pow_bits = Some(0);
+    config.min_pow_bits = Some(0);
+    Node::start(config).await
+}
+
+async fn eventually(what: &str, mut check: impl AsyncFnMut() -> bool) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    while !check().await {
+        assert!(tokio::time::Instant::now() < deadline, "timed out: {what}");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// A large report crosses the network in several sealed parts, each a
+/// valid v2 `submit` within 16 KiB, and the inbox holder reassembles it.
+#[tokio::test(flavor = "multi_thread")]
+async fn large_report_through_the_inbox_in_parts() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let b = receiver(&dir.path().join("b")).await?;
+    let mut config = NodeConfig::new(dir.path().join("a"));
+    config.mode = NetworkMode::Loopback;
+    config.pow_bits = Some(0);
+    config.min_pow_bits = Some(0);
+    config.peers = vec![b.endpoint().addr()];
+    let a = Node::start(config).await?;
+    a.wait_for_neighbor(PUBLIC_NET, Duration::from_secs(10))
+        .await?;
+    b.wait_for_neighbor(PUBLIC_NET, Duration::from_secs(10))
+        .await?;
+
+    let key = InboxKey::generate()?;
+    // About 64 KiB of log lines that compress like a real report.
+    let mut report = Vec::new();
+    for n in 0u32.. {
+        if report.len() >= 64 * 1024 {
+            break;
+        }
+        let noise = blake3::hash(&n.to_le_bytes()).to_hex();
+        report.extend_from_slice(
+            format!("{{\"line\":{n},\"peer\":\"#{}\"}}\n", &noise[..24]).as_bytes(),
+        );
+    }
+    let sealed = a
+        .send_to_inbox(key.public(), "crash", report.clone())
+        .await?;
+    assert!(sealed.events.len() >= 2, "{}", sealed.events.len());
+    for event in &sealed.events {
+        assert!(serde_json_canonicalizer::to_vec(event)?.len() <= wats::event::MAX_EVENT_BYTES);
+        wats::wire::AnyEvent::from_value(event.clone())?;
+    }
+    let parts = sealed.events.len();
+    eventually("b stores every part", async || {
+        b.store().submits_to(key.public().id()).unwrap().len() == parts
+    })
+    .await;
+    let out = dir.path().join("read");
+    let events = b.store().submits_to(key.public().id())?;
+    let summary = read_submissions(&key, &events, &out)?;
+    assert_eq!(summary.written.len(), 1, "{summary:?}");
+    assert_eq!(std::fs::read(&summary.written[0])?, report);
+    // Another key reads nothing.
+    let other = InboxKey::generate()?;
+    let summary = read_submissions(&other, &events, &out)?;
+    assert_eq!((summary.written.len(), summary.undecryptable), (0, parts));
+
+    let _ = tokio::time::timeout(Duration::from_secs(5), a.shutdown()).await;
+    let _ = tokio::time::timeout(Duration::from_secs(5), b.shutdown()).await;
     Ok(())
 }
 

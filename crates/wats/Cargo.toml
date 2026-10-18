@@ -48,6 +48,9 @@ minisign-verify = "=0.3.0"
 sha2 = "=0.11.1"
 flate2 = { version = "=1.1.10", default-features = false, features = ["rust_backend"] }
 tar = { version = "=0.4.46", default-features = false }
+# The sealed inbox (src/inbox.rs, ADR 0015 §5): HPKE with X-Wing,
+# HKDF-SHA256 and ChaCha20-Poly1305.
+hpke = { version = "=0.14.1", default-features = false, features = ["alloc", "getrandom", "x25519", "mlkem", "chacha"] }
 
 [dev-dependencies]
 rmcp = { version = "=3.5.1", features = ["client", "transport-child-process"] }

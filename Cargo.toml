@@ -12,3 +12,9 @@ repository = "https://github.com/wearetheswarm/wats"
 [profile.release]
 # Smaller binaries and images at no build-time cost. LTO stays off.
 strip = true
+
+[profile.test]
+# Each integration test is its own binary, and on Linux each one embeds the
+# full debug info of every dependency: CI runners ran out of disk. Line
+# tables keep file:line in backtraces at a fraction of the size.
+debug = "line-tables-only"

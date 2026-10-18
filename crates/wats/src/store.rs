@@ -449,6 +449,48 @@ impl Store {
         Ok(())
     }
 
+    /// The stored v2 `submit` events addressed to `inbox` (`ext.to`), as
+    /// wire JSON, oldest first. Tombstones are left out.
+    pub fn submits_to(&self, inbox: &str) -> Result<Vec<Value>> {
+        let rows = self.query_raw(
+            "SELECT seq, json FROM events
+             WHERE opaque = 1 AND v = 2 AND kind = 'submit'
+               AND json_extract(json, '$.ext.to') = ?
+             ORDER BY seq",
+            vec![inbox.to_string().into()],
+        )?;
+        Ok(rows
+            .into_iter()
+            .filter(|e| {
+                e.get("ext")
+                    .and_then(|x| x.get("to"))
+                    .and_then(Value::as_str)
+                    == Some(inbox)
+                    && e.get("ct").is_some()
+            })
+            .collect())
+    }
+
+    /// Open the store of a data directory read-only, next to a running
+    /// node (WAL), e.g. for `wats inbox read`.
+    pub fn open_read_only(path: &Path) -> Result<Self> {
+        let conn = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .with_context(|| format!("open {}", path.display()))?;
+        conn.busy_timeout(std::time::Duration::from_secs(5))?;
+        let version: i64 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
+        if version != SCHEMA_VERSION {
+            bail!(
+                "store schema version {version}, this wats reads {SCHEMA_VERSION}: start the node once"
+            );
+        }
+        let (new_events, _) = broadcast::channel(1);
+        Ok(Self {
+            conn: Mutex::new(conn),
+            new_events,
+            opaque_bytes: AtomicU64::new(0),
+        })
+    }
+
     /// Drop the stored v2 `submit` events (opaque rows, tombstones
     /// included) whose `ts` is before `before`: the retention of
     /// submissions (ADR 0015 §5). Returns how many were dropped.

@@ -59,3 +59,35 @@ must not leak what the node holds or where it is.
 - The router learns the sender's node id, which it already knows as a
   peer. Pulling and reading the reports is a devops task (`make reports`).
 - Private rings could carry reports later; not before they exist.
+
+## Transport through the sealed inbox (addendum, 2026-10-18)
+
+Code: `crates/wats/src/inbox.rs`, `wats inbox`. Design: ADR 0015 §5.
+
+- **When an inbox key is known**, reports no longer go to the collector:
+  `wats report send` and automatic sending (`report.crashes = true`) seal
+  them to the maintainers' inbox and publish them on the public network as
+  v2 `submit` events. The key is compiled in (`MAINTAINERS_INBOX`), and
+  `report.inbox` (a base64url public key) overrides it, for tests and
+  self-hosting. The log and `wats report send` say which path was used.
+- **One-off key.** Each report is signed by a fresh Ed25519 key, shared by
+  its parts and then dropped: the visible header names neither the node
+  nor its author, and two reports cannot be linked by their author.
+- **Compression and parts.** The stored report bytes are deflate-compressed
+  (raw deflate, best level), then split into balanced chunks of at most
+  10,514 bytes, so that each part stays within the 16 KiB canonical cap.
+  Each part's plaintext is a JSON header line,
+  `{"type":"crash","report":"<16 hex>","part":k,"parts":n,"z":"deflate"}`,
+  then `\n` and the chunk. Parts are grouped by their one-off author and
+  the `report` id. A typical report (a few KiB to a few tens of KiB) is one
+  or two parts.
+- **Reading.** `wats inbox read --key <secret>` on the maintainers' node
+  decrypts the submissions in its store, reassembles complete reports and
+  writes `<data dir>/inbox/<report id>.json`. Inflated payloads are capped
+  at 1 MiB, duplicate or out-of-range parts are rejected, and parts of
+  different authors never merge.
+- **Fallback.** While `MAINTAINERS_INBOX` is unset and no `report.inbox` is
+  configured, the `crash_report` request to `report.collector` stays as
+  above, unchanged. The router's collector is removed once the key ships
+  and the nodes that only know the collector are gone; this ADR is then
+  superseded by ADR 0015 §5.

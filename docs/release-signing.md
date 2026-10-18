@@ -121,3 +121,48 @@ with the old key, so list the previous public keys below with the versions
 they signed.
 
 Previous keys: none.
+
+## Inbox key
+
+Crash reports are sealed to the maintainers' inbox (ADR 0015 §5): an HPKE
+key pair (X-Wing, HKDF-SHA256, ChaCha20-Poly1305) whose public key is
+compiled into the binary as `MAINTAINERS_INBOX` (`crates/wats/src/inbox.rs`).
+While it is `None`, nodes send their reports to `report.collector` (the
+router) instead.
+
+To set it up, once:
+
+1. On a trusted machine, generate the key pair:
+
+   ```sh
+   wats inbox keygen --out inbox.key
+   # secret written to inbox.key (mode 0600)
+   # public key: <1,216 bytes, base64url>
+   # inbox id: inbox:<32 hex>
+   ```
+
+   The file holds the secret, the 32-byte X-Wing seed in hex, on one line.
+   It is never overwritten: `keygen` refuses an existing file.
+2. Store the secret with the project's operational secrets (sops), like
+   the minisign key, and copy it to the maintainers' node. Delete any other
+   copy.
+3. In a pull request, set `MAINTAINERS_INBOX` to `Some("<public key>")`.
+   Releases from then on seal reports to it; older ones keep using the
+   collector.
+
+To read the reports, on a node that holds the submissions (any node of the
+public network keeps them for `submit.retention`, 30 days by default):
+
+```sh
+wats inbox read --key inbox.key            # writes <data dir>/inbox/<report id>.json
+wats inbox read --key inbox.key --out dir  # or elsewhere
+```
+
+It works next to a running node, skips the reports already written, and
+prints how many reports were complete, incomplete (parts still missing) or
+failed to decrypt. `report.inbox` (a base64url public key) overrides the
+compiled-in key, for tests and self-hosting.
+
+Rotating the key: generate a new pair, keep the old secret until the
+reports sealed to it are older than `submit.retention`, and change
+`MAINTAINERS_INBOX` in a pull request.

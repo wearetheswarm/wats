@@ -1,8 +1,10 @@
 //! Crash reports (ADR 0013): when a node panics or stops on an error, it
 //! writes a redacted report to `<data dir>/crash/`. The next start says so;
 //! `wats report show` prints exactly the bytes that would be sent, and
-//! `wats report send` sends them to the collector (our router by default).
-//! Sending is manual unless `report.crashes = true`.
+//! `wats report send` seals them to the maintainers' inbox when its key is
+//! known (`crate::inbox`, ADR 0015 §5), and sends them to the collector (our
+//! router by default) otherwise. Sending is manual unless
+//! `report.crashes = true`.
 //!
 //! What never leaves the machine: keys and tokens, environment values,
 //! configuration values, IP addresses, other nodes' and authors' ids (hashed
