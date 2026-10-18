@@ -66,6 +66,14 @@ jobs:
       - name: cargo deny
         if: runner.os == 'Linux'
         run: cargo deny check
+      # install.sh: shellcheck, and its verification against signed fixtures
+      # (a tampered archive or a wrong signature must be refused).
+      - name: install.sh
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get install -y -qq minisign >/dev/null
+          shellcheck install.sh scripts/test-install.sh
+          sh scripts/test-install.sh
 
   # Single aggregate status named "ci", used as the required check on main.
   ci:
