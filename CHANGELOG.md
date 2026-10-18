@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- **A busy data directory names its holder**: when `wats` finds the data
+  directory locked, it prints the other process's pid, version, binary path
+  and start time, and the `kill` command to stop it.
+
 ### Changes
 
 - **Infra health alerts**: each node watches its own view of the

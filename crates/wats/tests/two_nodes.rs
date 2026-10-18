@@ -86,7 +86,14 @@ async fn data_dir_is_locked() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     let a = Node::start(config(dir.path())).await?;
     let err = Node::start(config(dir.path())).await.unwrap_err();
-    assert!(err.to_string().contains("another wats node"), "{err:#}");
+    let msg = err.to_string();
+    assert!(msg.contains("another wats node"), "{err:#}");
+    // The holder is named, so that the user knows what to stop.
+    assert!(
+        msg.contains(&format!("pid {}", std::process::id())),
+        "{msg}"
+    );
+    assert!(msg.contains(env!("CARGO_PKG_VERSION")), "{msg}");
     a.shutdown().await?;
     Ok(())
 }
