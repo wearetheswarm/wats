@@ -38,7 +38,8 @@ pub struct RunRecord {
     /// Unix seconds.
     pub started: u64,
     /// `ok`, `error` (non-zero exit), `timeout`, `stopped` (node shut down)
-    /// or `failed` (could not start); empty while running.
+    /// or `failed` (could not start, or refused by the OpenClaw gateway);
+    /// empty while running.
     #[serde(default)]
     pub status: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -52,6 +53,12 @@ pub struct RunRecord {
     pub cost_usd: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// OpenClaw: the turn's `completion.status`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completion: Option<String>,
+    /// OpenClaw: its `replyDisposition` (`visible`, `silent` or `empty`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reply: Option<String>,
 }
 
 fn unix_now() -> u64 {
@@ -451,9 +458,31 @@ pub fn render(line: &str, style: Style) -> Vec<String> {
             if let Some(cost) = value["cost_usd"].as_f64() {
                 parts.push(format!("${cost:.4}"));
             }
+            if let Some(completion) = value["completion"].as_str() {
+                parts.push(format!("completion {completion}"));
+            }
+            if let Some(reply) = value["reply"].as_str() {
+                parts.push(format!("reply {reply}"));
+            }
+            if value["runtime"] == "openclaw"
+                && let Some(error) = value["error"].as_str()
+            {
+                parts.push(error.to_string());
+            }
             out.push(format!("■ {}", parts.join(" · ")));
             out.push(String::new());
         }
+        "openclaw_forward" => out.push(style.dim(&format!(
+            "→ forwarded to OpenClaw {} · agent {} · session {} · {} bytes",
+            value["url"].as_str().unwrap_or("?"),
+            value["agentId"].as_str().unwrap_or("?"),
+            value["sessionKey"].as_str().unwrap_or("?"),
+            value["bytes"].as_u64().unwrap_or(0),
+        ))),
+        "openclaw_reply" => out.push(style.dim(&format!(
+            "← OpenClaw: {}",
+            value["outcome"].as_str().unwrap_or("?")
+        ))),
         "system" if value["subtype"] == "init" => {
             let servers: Vec<String> = value["mcp_servers"]
                 .as_array()

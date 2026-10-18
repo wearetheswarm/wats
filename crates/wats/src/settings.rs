@@ -27,7 +27,7 @@ use serde::Deserialize;
 pub const FILE_NAME: &str = "config.toml";
 
 /// The agent runtimes wats can run.
-pub const RUNTIMES: [&str; 2] = ["claude", "codex"];
+pub const RUNTIMES: [&str; 3] = ["claude", "codex", "openclaw"];
 
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -210,6 +210,10 @@ pub struct AgentSettings {
     pub max_runs_per_day: Option<usize>,
     pub keep_runs: Option<usize>,
     pub keep_days: Option<u64>,
+    /// The OpenClaw gateway (`runtime = "openclaw"`, ADR 0017).
+    pub openclaw_url: Option<String>,
+    /// The OpenClaw agent the runs go to (`agentId`).
+    pub openclaw_agent: Option<String>,
 }
 
 impl Settings {
@@ -235,6 +239,10 @@ impl Settings {
             access
                 .parse::<crate::access::Access>()
                 .with_context(|| format!("{}: agent.access", path.display()))?;
+        }
+        if let Some(url) = &settings.agent.openclaw_url {
+            crate::openclaw::check_url(url)
+                .with_context(|| format!("{}: agent.openclaw_url", path.display()))?;
         }
         for cap in &settings.agent.caps {
             crate::agent::check_cap(cap)
@@ -510,7 +518,19 @@ pub const KEYS: &[Key] = &[
         "agent.runtime",
         ValueType::Runtime,
         "none",
-        "agent run with the node: claude or codex",
+        "agent run with the node: claude, codex or openclaw",
+    ),
+    key(
+        "agent.openclaw_url",
+        ValueType::Text,
+        crate::openclaw::DEFAULT_URL,
+        "OpenClaw gateway the runs are forwarded to (plain http: loopback only)",
+    ),
+    key(
+        "agent.openclaw_agent",
+        ValueType::Text,
+        crate::openclaw::DEFAULT_AGENT,
+        "OpenClaw agent the runs go to (agentId)",
     ),
     key(
         "agent.access",
@@ -711,6 +731,10 @@ fn toml_value(key: &Key, raw: &str) -> Result<toml_edit::Value> {
     Ok(match key.kind {
         ValueType::Text if key.name == "report.inbox" => {
             crate::inbox::InboxPublic::from_b64(raw).map_err(|e| invalid(format!("{e:#}")))?;
+            raw.into()
+        }
+        ValueType::Text if key.name == "agent.openclaw_url" => {
+            crate::openclaw::check_url(raw).map_err(|e| invalid(format!("{e:#}")))?;
             raw.into()
         }
         ValueType::Text => raw.into(),
@@ -957,8 +981,64 @@ pub fn parse_size(s: &str) -> Result<u64, String> {
         .ok_or_else(|| format!("size {s:?} is too large"))
 }
 
+/// `docs/config.md`: every key of [`KEYS`] with its default, grouped by
+/// section ([`HIDDEN_KEYS`] stay out). Generated, and checked by a test.
+pub fn reference_markdown() -> String {
+    let mut out = String::from(
+        "# Configuration reference\n\n\
+         <!-- Generated from crates/wats/src/settings.rs (KEYS); \
+         regenerate with `WATS_UPDATE_DOCS=1 cargo test -p wats --lib settings`. -->\n\n\
+         Settings live in `config.toml` in the data directory (`~/.wats` by default).\n\
+         Edit them with `wats config set <key> <value>`, `wats config get <key>`, \
+         `wats config unset <key>` or `wats config edit`.\n\
+         Command-line flags and `WATS_*` variables, where they exist (`wats --help`), \
+         take precedence over the file.\n",
+    );
+    let mut section = None;
+    for key in KEYS {
+        let this = key.name.split_once('.').map_or("node", |(s, _)| s);
+        if section != Some(this) {
+            section = Some(this);
+            let title = match this {
+                "node" => "Node (top level)".to_string(),
+                s => format!("`[{s}]`"),
+            };
+            out.push_str(&format!(
+                "\n## {title}\n\n| Key | Default | |\n|---|---|---|\n"
+            ));
+        }
+        // Markdown table cells: no `|`, and `<…>` must not read as HTML.
+        let cell = |s: &str| {
+            s.replace('|', "\\|")
+                .replace('<', "&lt;")
+                .replace('>', "&gt;")
+        };
+        out.push_str(&format!(
+            "| `{}` | {} | {} |\n",
+            key.name,
+            cell(key.default),
+            cell(key.help)
+        ));
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn reference_page_is_up_to_date() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/config.md");
+        let generated = super::reference_markdown();
+        if std::env::var_os("WATS_UPDATE_DOCS").is_some() {
+            std::fs::write(&path, &generated).unwrap();
+        }
+        let published = std::fs::read_to_string(&path).unwrap_or_default();
+        assert_eq!(
+            published, generated,
+            "docs/config.md drifted: WATS_UPDATE_DOCS=1 cargo test -p wats --lib settings"
+        );
+    }
+
     use super::*;
 
     #[test]
