@@ -565,6 +565,27 @@ enum SetupTool {
         #[arg(long, env = "WATS_CLAUDE", default_value = "claude")]
         claude: PathBuf,
     },
+    /// OpenClaw: register wats as its MCP server (--mcp) or remove it
+    /// (--remove). The OpenClaw agent runner comes in a later version.
+    Openclaw {
+        /// Register wats as an MCP server of OpenClaw: `openclaw mcp set
+        /// wats '{"command": <this wats>, "args": ["mcp", "--profile",
+        /// <profile>]}'`, replacing any entry of that name. The profile is
+        /// --profile, else config.toml's, else your OS user name.
+        #[arg(long, conflicts_with = "remove")]
+        mcp: bool,
+        /// Remove the wats MCP server from OpenClaw: `openclaw mcp unset
+        /// wats`.
+        #[arg(long)]
+        remove: bool,
+        /// Not available yet: OpenClaw as the node's agent (`--agent
+        /// openclaw`) comes in a later version.
+        #[arg(long, conflicts_with_all = ["mcp", "remove"])]
+        agent: bool,
+        /// The OpenClaw CLI.
+        #[arg(long, env = "WATS_OPENCLAW", default_value = "openclaw")]
+        openclaw: PathBuf,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -708,6 +729,83 @@ fn register_in_codex(args: &NodeArgs, profile: &str, codex: &std::path::Path) ->
         .with_context(|| format!("run {}", codex.display()))?;
     anyhow::ensure!(status.success(), "`codex mcp add` failed ({status})");
     Ok(true)
+}
+
+/// Run the OpenClaw CLI with `args`, stdin closed, and return its output.
+/// A missing CLI gets the install hint.
+fn run_openclaw(openclaw: &std::path::Path, args: &[&str]) -> Result<std::process::Output> {
+    std::process::Command::new(openclaw)
+        .args(args)
+        .stdin(std::process::Stdio::null())
+        .output()
+        .map_err(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                anyhow::anyhow!(
+                    "OpenClaw CLI not found: `{}` is not on your PATH. Install OpenClaw \
+                     (https://docs.openclaw.ai), or pass --openclaw <path>",
+                    openclaw.display()
+                )
+            } else {
+                anyhow::Error::new(e).context(format!("run {}", openclaw.display()))
+            }
+        })
+}
+
+/// Fail with the stderr of a failed OpenClaw command.
+fn openclaw_ok(output: &std::process::Output, what: &str) -> Result<()> {
+    if output.status.success() {
+        return Ok(());
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stderr = stderr.trim();
+    if stderr.is_empty() {
+        anyhow::bail!("`openclaw {what}` failed ({})", output.status);
+    }
+    anyhow::bail!("`openclaw {what}` failed ({}):\n{stderr}", output.status)
+}
+
+/// `wats setup openclaw`: register wats as OpenClaw's `wats` MCP server
+/// (`--mcp`) or remove it (`--remove`), through OpenClaw's CLI only: its
+/// config (`openclaw.json`) is never edited here. `openclaw mcp set`
+/// replaces an entry of the same name, so running it again is harmless.
+fn setup_openclaw(
+    args: &NodeArgs,
+    data_dir: &std::path::Path,
+    (mcp, remove): (bool, bool),
+    openclaw: &std::path::Path,
+) -> Result<()> {
+    if remove {
+        let output = run_openclaw(openclaw, &["mcp", "unset", "wats"])?;
+        openclaw_ok(&output, "mcp unset wats")?;
+        println!("OpenClaw: wats MCP server removed");
+        return Ok(());
+    }
+    anyhow::ensure!(
+        mcp,
+        "OpenClaw as the node's agent (`--agent openclaw`) comes in a later version. \
+         For now, `wats setup openclaw --mcp` gives your OpenClaw agents the wats tools \
+         (see docs/openclaw.md)"
+    );
+    let settings = Settings::load(data_dir)?;
+    let profile = human_profile(args, &settings)?;
+    let (command, server_args) = mcp_server_command(args, &profile)?;
+    // Only `command` and `args`: wats needs no `env`.
+    let entry = json!({"command": command, "args": server_args}).to_string();
+    let output = run_openclaw(openclaw, &["mcp", "set", "wats", &entry])?;
+    openclaw_ok(&output, "mcp set wats")?;
+    let shown = run_openclaw(openclaw, &["mcp", "show", "wats"])?;
+    openclaw_ok(&shown, "mcp show wats")?;
+    println!("OpenClaw: wats MCP server set (profile {profile})");
+    if String::from_utf8_lossy(&shown.stdout).contains(command.as_str()) {
+        println!("  checked: `openclaw mcp show wats` runs {command}");
+    } else {
+        eprintln!("warning: `openclaw mcp show wats` does not show {command}; check it there");
+    }
+    println!(
+        "  OpenClaw names its tools wats__<tool> (e.g. wats__post): `wats__*` in a tool \
+         policy allows or denies them all. Swarm posts are untrusted data."
+    );
+    Ok(())
 }
 
 const AGENTS_MD_BEGIN: &str = "<!-- wats:begin -->";
@@ -2273,6 +2371,15 @@ async fn main() -> Result<()> {
                 },
             );
         }
+        Some(Command::Setup {
+            tool:
+                Some(SetupTool::Openclaw {
+                    mcp,
+                    remove,
+                    agent: _,
+                    openclaw,
+                }),
+        }) => return setup_openclaw(&cli.node, &data_dir, (mcp, remove), &openclaw),
         _ => {}
     }
     first_run(&cli, &data_dir)?;
