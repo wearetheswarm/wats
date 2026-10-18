@@ -270,3 +270,86 @@ jobs:
             echo ""
             echo "Deploy it by setting WATS_VERSION=${VERSION} in the router .env (docs/deploy-bootstrap.md)."
           } >> "$GITHUB_STEP_SUMMARY"
+
+  # The Homebrew tap (brew install wearetheswarm/tap/wats): once both
+  # archives are attached, render the formula from the release's signed
+  # checksums (scripts/homebrew-release.sh verifies them with the key pinned
+  # in install.sh) and push it to wearetheswarm/homebrew-tap over SSH, with
+  # the tap's deploy key (HOMEBREW_TAP_DEPLOY_KEY) and GitHub's pinned host
+  # key. Prereleases are left out. Without the secret, the tap is not
+  # updated and the run says so; the release itself is done by then.
+  homebrew:
+    name: homebrew tap
+    needs: build
+    if: github.event_name == 'release' && !github.event.release.prerelease
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install minisign
+        env:
+          MINISIGN_VERSION: "0.12"
+          MINISIGN_LINUX_SHA256: 9a599b48ba6eb7b1e80f12f36b94ceca7c00b7a5173c95c3efc88d9822957e73
+          MINISIGN_MACOS_SHA256: 89000b19535765f9cffc65a65d64a820f433ef6db8020667f7570e06bf6aac63
+        run: |
+          case "$RUNNER_OS-$RUNNER_ARCH" in
+            Linux-X64)   asset="minisign-$MINISIGN_VERSION-linux.tar.gz"; sha="$MINISIGN_LINUX_SHA256" ;;
+            macOS-ARM64) asset="minisign-$MINISIGN_VERSION-macos.zip";    sha="$MINISIGN_MACOS_SHA256" ;;
+            *) echo "::error::no pinned minisign for $RUNNER_OS-$RUNNER_ARCH"; exit 1 ;;
+          esac
+          dir="$RUNNER_TEMP/minisign"
+          mkdir -p "$dir/bin"
+          curl -fsSL --proto '=https' --tlsv1.2 -o "$dir/$asset" \
+            "https://github.com/jedisct1/minisign/releases/download/$MINISIGN_VERSION/$asset"
+          echo "$sha  $dir/$asset" | shasum -a 256 -c -
+          case "$asset" in
+            *.tar.gz) tar -xzf "$dir/$asset" -C "$dir"
+                      cp "$dir/minisign-linux/x86_64/minisign" "$dir/bin/minisign" ;;
+            *.zip)    unzip -q "$dir/$asset" minisign -d "$dir/bin" ;;
+          esac
+          chmod +x "$dir/bin/minisign"
+          "$dir/bin/minisign" -v
+          echo "$dir/bin" >> "$GITHUB_PATH"
+
+      - name: Formula
+        env:
+          TAG: ${{ github.event.release.tag_name }}
+        run: |
+          sh scripts/homebrew-release.sh "${TAG#v}" tap-out
+          cat tap-out/Formula/wats.rb
+
+      - name: Push to wearetheswarm/homebrew-tap
+        env:
+          DEPLOY_KEY: ${{ secrets.HOMEBREW_TAP_DEPLOY_KEY }}
+          TAG: ${{ github.event.release.tag_name }}
+          # GitHub's published ed25519 host key (api.github.com/meta,
+          # SHA256:+DiY3wvvV6TuJJhbpZisF/zLDA0zPMSvHdkr4UvCOqU).
+          GITHUB_HOST_KEY: "github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl"
+        run: |
+          if [ -z "$DEPLOY_KEY" ]; then
+            echo "::warning::HOMEBREW_TAP_DEPLOY_KEY is not set: the Homebrew tap is not updated"
+            exit 0
+          fi
+          ssh_dir="$RUNNER_TEMP/ssh"
+          mkdir -p "$ssh_dir" && chmod 700 "$ssh_dir"
+          trap 'rm -rf "$ssh_dir"' EXIT
+          (umask 077 && printf '%s\n' "$DEPLOY_KEY" > "$ssh_dir/key")
+          printf '%s\n' "$GITHUB_HOST_KEY" > "$ssh_dir/known_hosts"
+          export GIT_SSH_COMMAND="ssh -i $ssh_dir/key -o IdentitiesOnly=yes -o UserKnownHostsFile=$ssh_dir/known_hosts -o StrictHostKeyChecking=yes"
+          git clone --depth 1 git@github.com:wearetheswarm/homebrew-tap.git tap
+          mkdir -p tap/Formula
+          cp tap-out/Formula/wats.rb tap/Formula/wats.rb
+          cd tap
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Formula/wats.rb
+          if git diff --cached --quiet; then
+            echo "Formula/wats.rb is already up to date"
+            exit 0
+          fi
+          git commit -q -m "wats ${TAG#v}"
+          git push origin HEAD:main
+          echo "### Homebrew tap: wats ${TAG#v}" >> "$GITHUB_STEP_SUMMARY"

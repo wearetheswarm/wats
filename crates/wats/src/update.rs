@@ -359,6 +359,24 @@ pub fn current_exe() -> Result<PathBuf> {
     Ok(exe.canonicalize().unwrap_or(exe))
 }
 
+/// Whether Homebrew installed this binary (`…/Cellar/wats/<version>/…`):
+/// then Homebrew upgrades it (`brew upgrade wats`), not `wats upgrade`, so
+/// that it keeps track of the installed version.
+pub fn homebrew_managed(exe: &Path) -> bool {
+    let parts: Vec<_> = exe.components().map(|c| c.as_os_str()).collect();
+    parts.windows(2).any(|w| w[0] == "Cellar" && w[1] == "wats")
+}
+
+/// The command that upgrades this binary: `brew upgrade wats` for a
+/// Homebrew install, `wats upgrade` otherwise.
+pub fn upgrade_hint() -> &'static str {
+    if current_exe().is_ok_and(|exe| homebrew_managed(&exe)) {
+        "brew upgrade wats"
+    } else {
+        "wats upgrade"
+    }
+}
+
 /// `<exe>.old`: the previous binary, kept for `wats upgrade --rollback`.
 pub fn old_path(exe: &Path) -> PathBuf {
     let mut name = exe.file_name().unwrap_or_default().to_os_string();
@@ -654,6 +672,11 @@ pub async fn upgrade_command(opts: UpgradeOptions) -> Result<()> {
             );
         }
     };
+    let brew = current_exe().is_ok_and(|exe| homebrew_managed(&exe));
+    ensure!(
+        !brew || opts.check,
+        "this wats was installed by Homebrew: upgrade it with `brew upgrade wats`"
+    );
     if opts.rollback {
         let exe = current_exe()?;
         let old = rollback(&exe)?;
@@ -705,7 +728,12 @@ pub async fn upgrade_command(opts: UpgradeOptions) -> Result<()> {
     println!("this is wats {current}; release {version}{security}{published}");
     if opts.check {
         if version > current {
-            println!("wats {version} is available: `wats upgrade` installs it");
+            let how = if brew {
+                "brew upgrade wats"
+            } else {
+                "wats upgrade"
+            };
+            println!("wats {version} is available: `{how}` installs it");
         } else {
             println!("wats is up to date");
         }
@@ -903,6 +931,7 @@ pub fn status_json(data_dir: &Path) -> Option<serde_json::Value> {
         "available": latest > current,
         "security": latest > current && cache.security,
         "checked_at": format_timestamp(cache.checked_at),
+        "upgrade": upgrade_hint(),
     }))
 }
 
@@ -927,12 +956,14 @@ pub async fn run(policy: UpdatePolicy, data_dir: PathBuf) {
                         ""
                     };
                     tracing::warn!(
-                        "wats {latest} is available{security}, this is {current}: `wats upgrade` installs it"
+                        "wats {latest} is available{security}, this is {current}: `{}` installs it",
+                        upgrade_hint()
                     );
                     cache.notified = Some(latest.to_string());
                     let _ = cache.save(&data_dir);
                 }
                 if let Some(version) = auto_target(&policy, &cache, current, now)
+                    && upgrade_hint() == "wats upgrade"
                     && failed_auto
                         .is_none_or(|(v, at)| v != version || now >= at + CHECK_EVERY_SECS)
                 {
@@ -1396,6 +1427,20 @@ mod tests {
         };
         assert!(!may_check(&on, true));
         assert!(!may_check(&off, false));
+    }
+
+    #[test]
+    fn homebrew_installs_are_left_to_homebrew() {
+        assert!(homebrew_managed(Path::new(
+            "/opt/homebrew/Cellar/wats/0.3.1/bin/wats"
+        )));
+        assert!(homebrew_managed(Path::new(
+            "/home/linuxbrew/.linuxbrew/Cellar/wats/0.3.1/bin/wats"
+        )));
+        assert!(!homebrew_managed(Path::new("/Users/me/.local/bin/wats")));
+        assert!(!homebrew_managed(Path::new(
+            "/opt/homebrew/Cellar/other/1/bin/wats"
+        )));
     }
 
     #[test]

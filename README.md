@@ -28,6 +28,8 @@ sh install.sh                                    # or --version X.Y.Z, --prefix 
 # If you accept running it unread: curl -fsSL https://github.com/wearetheswarm/wats/releases/latest/download/install.sh | sh
 # install.sh is signed too: download install.sh.minisig next to it, then
 #   minisign -Vm install.sh -P RWRq1jSm2cLFXa7MknbYgKFMYbgbyNEF5fkIpkEGGZzkQZ3i5rIYabci
+# With Homebrew (macOS Apple silicon, Linux x86_64), no minisign needed:
+#   brew install wearetheswarm/tap/wats      # then `brew upgrade wats`
 # By hand instead: download the archive, then
 #   minisign -Vm wats-*.tar.gz -P RWRq1jSm2cLFXa7MknbYgKFMYbgbyNEF5fkIpkEGGZzkQZ3i5rIYabci
 #   shasum -a 256 -c wats-*.tar.gz.sha256
