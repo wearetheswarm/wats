@@ -1,7 +1,8 @@
 //! Chaos tests of reconnection (src/reconnect.rs): a node that loses its
 //! peers, or never resolves its bootstrap node, dials again until it
 //! succeeds, then catches up on what was posted meanwhile. Hermetic:
-//! loopback only, DNS failures injected.
+//! loopback only (direct, or through a relay server on 127.0.0.1), DNS
+//! failures injected.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -34,11 +35,18 @@ fn config(dir: &std::path::Path) -> NodeConfig {
     config
 }
 
-async fn eventually<F, T>(what: &str, mut f: F) -> T
+async fn eventually<F, T>(what: &str, f: F) -> T
 where
     F: FnMut() -> Option<T>,
 {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    eventually_within(what, Duration::from_secs(60), f).await
+}
+
+async fn eventually_within<F, T>(what: &str, limit: Duration, mut f: F) -> T
+where
+    F: FnMut() -> Option<T>,
+{
+    let deadline = tokio::time::Instant::now() + limit;
     loop {
         if let Some(value) = f() {
             return value;
@@ -263,5 +271,128 @@ async fn resolves_the_bootstrap_host_again_until_dns_answers() -> anyhow::Result
     for n in [router, node] {
         n.shutdown().await?;
     }
+    Ok(())
+}
+
+/// A relay server on 127.0.0.1:`port`, plain HTTP, no QUIC address
+/// discovery. Binding may briefly fail right after the previous server on
+/// the same port stopped: retried.
+async fn relay_on(port: u16) -> iroh_relay::server::Server {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let mut config = iroh_relay::server::ServerConfig::default();
+        config.relay = Some(iroh_relay::server::RelayConfig::new((
+            std::net::Ipv4Addr::LOCALHOST,
+            port,
+        )));
+        match iroh_relay::server::Server::spawn(config).await {
+            Ok(server) => return server,
+            Err(e) if tokio::time::Instant::now() < deadline => {
+                eprintln!("relay on port {port}: {e:#}; retrying");
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            Err(e) => panic!("relay on port {port}: {e:#}"),
+        }
+    }
+}
+
+fn free_tcp_port() -> u16 {
+    std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port()
+}
+
+/// Two nodes that reach each other only through a relay on this machine
+/// (no IP transport, no address lookup). The relay stops: both see they
+/// are offline. A post lands on one side meanwhile. The relay comes back
+/// on the same URL: the other node reconnects by itself and catches up.
+#[tokio::test(flavor = "multi_thread")]
+async fn reconnects_when_the_relay_comes_back() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let port = free_tcp_port();
+    let relay = relay_on(port).await;
+    let relay_url: iroh::RelayUrl = format!("http://127.0.0.1:{port}").parse()?;
+    let mode = NetworkMode::LocalRelay { port };
+
+    let mut b_config = config(&dir.path().join("b"));
+    b_config.mode = mode;
+    let b = Node::start(b_config).await?;
+    let mut a_config = config(&dir.path().join("a"));
+    a_config.mode = mode;
+    a_config.peers.push(iroh::EndpointAddr::from_parts(
+        b.endpoint_id(),
+        [iroh::TransportAddr::Relay(relay_url.clone())],
+    ));
+    let a = Node::start(a_config).await?;
+    for node in [&a, &b] {
+        // No direct path is possible: the relay carries everything.
+        assert!(node.endpoint().bound_sockets().is_empty());
+    }
+    a.wait_for_neighbor(PUBLIC_NET, Duration::from_secs(30))
+        .await?;
+    for node in [&a, &b] {
+        eventually("online through the relay", || {
+            (connectivity(node)["state"] == "online").then_some(())
+        })
+        .await;
+    }
+
+    // Iroh notices only when the relay path goes idle: 30 s, plus up to
+    // one 5 s heartbeat.
+    relay.shutdown().await?;
+    let down = tokio::time::Instant::now();
+    for node in [&a, &b] {
+        eventually("offline once the relay is gone", || {
+            let c = connectivity(node);
+            (node.neighbor_count(PUBLIC_NET) == 0 && c["state"] == "offline").then_some(())
+        })
+        .await;
+    }
+    eprintln!("both offline {:?} after the relay stopped", down.elapsed());
+
+    // While the relay is down, a post lands in B's store (as if it got it
+    // from someone else): A can only get it by catching up.
+    let missed = Draft {
+        net: PUBLIC_NET.into(),
+        kind: Some(Kind::Ask),
+        title: Some("missed while the relay was down".into()),
+        text: "Posted while the relay was down.".into(),
+        ..Draft::default()
+    }
+    .sign(
+        &ed25519_dalek::SigningKey::from_bytes(&[9; 32]),
+        wats::node::now_secs(),
+        0,
+    )?;
+    b.store().insert(&missed, wats::node::now_secs())?;
+    let missed = missed.id;
+    assert!(a.store().get(&missed)?.is_none());
+
+    // Back on the same port: the relay URL is unchanged. Each endpoint
+    // dials the relay again on its own backoff (Iroh: up to 16 s, with
+    // jitter), then A's pending dial to B gets through on a QUIC
+    // retransmit: 10 to 30 s in practice, hence the longer limit.
+    let relay = relay_on(port).await;
+    let up = tokio::time::Instant::now();
+    eventually_within(
+        "the post made while the relay was down",
+        Duration::from_secs(120),
+        || a.store().get(&missed).ok().flatten(),
+    )
+    .await;
+    eprintln!("caught up {:?} after the relay came back", up.elapsed());
+    for node in [&a, &b] {
+        eventually("online again", || {
+            (connectivity(node)["state"] == "online").then_some(())
+        })
+        .await;
+    }
+
+    for node in [a, b] {
+        node.shutdown().await?;
+    }
+    relay.shutdown().await?;
     Ok(())
 }
