@@ -259,11 +259,14 @@ enum Command {
         #[command(flatten)]
         daemon: Box<DaemonArgs>,
     },
-    /// Set up an agent tool once: register wats as its MCP server and/or
-    /// enable its agent runner in config.toml.
+    /// With no tool, ask the node's main choices (agent among the CLIs
+    /// found on PATH, storage, the agent's limits, networks) and write them
+    /// to config.toml; a first `wats` on a terminal does it. With a tool,
+    /// set it up once: register wats as its MCP server and/or enable its
+    /// agent runner in config.toml.
     Setup {
         #[command(subcommand)]
-        tool: SetupTool,
+        tool: Option<SetupTool>,
     },
     /// Read or change `<data dir>/config.toml`, what a bare `wats` runs
     /// with. Flags and WATS_* variables override it.
@@ -913,6 +916,44 @@ fn setup_tool(
     Ok(())
 }
 
+/// The first run of a foreground node (`wats`, `wats node`) without
+/// config.toml: `wats setup` on a terminal, else the defaults written,
+/// commented. Never for `wats mcp` or the background node it starts
+/// (`--idle-exit`), nor with `--hermetic` (tests) or an `--agent` /
+/// `--no-agent` flag, which write the defaults without asking.
+fn first_run(cli: &Cli, data_dir: &std::path::Path) -> Result<()> {
+    use std::io::IsTerminal;
+    let daemon = match &cli.command {
+        None => &cli.daemon,
+        Some(Command::Node { daemon }) => daemon,
+        _ => return Ok(()),
+    };
+    if daemon.idle_exit.is_some() || data_dir.join(wats::settings::FILE_NAME).exists() {
+        return Ok(());
+    }
+    let flags = !daemon.agent.agents.is_empty() || daemon.agent.no_agent;
+    if std::io::stdin().is_terminal()
+        && std::io::stdout().is_terminal()
+        && !cli.node.hermetic
+        && !flags
+    {
+        println!("No config.toml yet in {}: first run.", data_dir.display());
+        wats::firstrun::setup(
+            data_dir,
+            &mut std::io::stdin().lock(),
+            &mut std::io::stdout(),
+            std::env::var_os("PATH").as_deref(),
+        )?;
+        println!();
+    } else if let Some(path) = wats::firstrun::write_default(data_dir)? {
+        tracing::info!(
+            "first run: wrote the default config to {} (edit it, or run `wats setup`)",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
 /// `wats config get | set | unset | list`.
 fn config_command(data_dir: &std::path::Path, action: ConfigAction) -> Result<()> {
     let mut file = ConfigFile::open(data_dir)?;
@@ -970,6 +1011,10 @@ async fn status_command(config: &NodeConfig, json: bool) -> Result<()> {
             });
             if let Some(update) = wats::update::status_json(&config.data_dir) {
                 status["update"] = update;
+            }
+            // What `wats` would run: no agent in config.toml.
+            if Settings::load(&config.data_dir).is_ok_and(|s| s.agent.runtime.is_none()) {
+                status["notice"] = wats::firstrun::NO_AGENT_NOTICE.into();
             }
             status
         }
@@ -1779,7 +1824,7 @@ fn print_banner(config: &NodeConfig, agent: Option<&wats::agent::AgentConfig>) {
             short_duration(agent.every),
             short_duration(agent.heartbeat),
         ),
-        None => eprintln!("agent: off (wats --agent claude, or wats setup claude)"),
+        None => eprintln!("agent: off · {}", wats::firstrun::NO_AGENT_NOTICE),
     }
     if let Some(agent) = agent {
         let summary = wats::access::describe(&wats::access::Describe {
@@ -2173,15 +2218,24 @@ async fn main() -> Result<()> {
                 _ = shutdown => Ok(()),
             };
         }
+        Some(Command::Setup { tool: None }) => {
+            wats::firstrun::setup(
+                &data_dir,
+                &mut std::io::stdin().lock(),
+                &mut std::io::stdout(),
+                std::env::var_os("PATH").as_deref(),
+            )?;
+            return Ok(());
+        }
         Some(Command::Setup {
             tool:
-                SetupTool::Claude {
+                Some(SetupTool::Claude {
                     mcp,
                     agent,
                     keys,
                     scope,
                     claude,
-                },
+                }),
         }) => {
             return setup_tool(
                 &cli.node,
@@ -2194,13 +2248,13 @@ async fn main() -> Result<()> {
         }
         Some(Command::Setup {
             tool:
-                SetupTool::Codex {
+                Some(SetupTool::Codex {
                     mcp,
                     agent,
                     keys,
                     no_approval,
                     codex,
-                },
+                }),
         }) => {
             return setup_tool(
                 &cli.node,
@@ -2221,6 +2275,7 @@ async fn main() -> Result<()> {
         }
         _ => {}
     }
+    first_run(&cli, &data_dir)?;
     let settings = Settings::load(&data_dir)?;
     let mut config = cli.node.config(&settings)?;
     let (daemon, json_lines) = match cli.command {
@@ -2301,6 +2356,8 @@ async fn main() -> Result<()> {
     }
     if !daemon.quiet {
         print_banner(&config, agent.as_ref());
+    } else if agent.is_none() && daemon.idle_exit.is_none() {
+        tracing::info!("{}", wats::firstrun::NO_AGENT_NOTICE);
     }
     crash_context(&config);
     let node = Node::start(config).await?;

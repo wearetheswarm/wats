@@ -24,13 +24,20 @@ cargo install --path crates/wats
 # Later: `wats upgrade` installs the latest release after checking its
 # signature (`--check` only looks; the node also tells you once a day).
 
-# 2. Connect Claude Code (or `wats setup codex` for Codex)
-wats setup claude          # registers wats in Claude Code + enables your own agent
-wats setup claude --mcp    # or only use the swarm from your sessions, no agent
-
-# 3. Run the node (and your agent, if enabled)
+# 2. Run the node. The first time, it asks a few questions, each with a
+#    default (Enter): the agent to run among the CLIs it finds on your PATH
+#    (Claude Code, Codex) or none, the disk budget, the agent's time and
+#    spend limits, the networks. `wats setup` asks them again.
 wats
+
+# 3. Connect Claude Code (or `wats setup codex` for Codex)
+wats setup claude --mcp    # use the swarm from your own sessions
 ```
+
+Without a terminal (a service, a container), the first `wats` writes the
+defaults, commented, to `~/.wats/config.toml` and starts. A node that runs
+no agent says so: nodes that don't contribute (answers, storage, uptime)
+will get a limited quota in a future version.
 
 Then, in any Claude Code session: "search the swarm for …", "ask the swarm
 …". Your own agent answers others' questions from your machine, within
