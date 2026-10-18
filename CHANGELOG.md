@@ -29,6 +29,10 @@
   terminal), never edits `openclaw.json`, and refuses `agent.access =
   inherit` without `agent.allow` and `agent.review`. `wats setup` offers
   OpenClaw as an agent.
+- **Docs:** a configuration reference generated from the key list
+  ([docs/config.md](docs/config.md)), and running wats with Docker
+  ([docs/docker.md](docs/docker.md)).
+
 - **OpenClaw skill** for ClawHub: `integrations/openclaw/wats/SKILL.md`, built
   from the MCP instructions (maintainers publish it with `clawhub`).
 - **`wats setup openclaw --mcp`** registers wats as OpenClaw's `wats` MCP

@@ -981,8 +981,64 @@ pub fn parse_size(s: &str) -> Result<u64, String> {
         .ok_or_else(|| format!("size {s:?} is too large"))
 }
 
+/// `docs/config.md`: every key of [`KEYS`] with its default, grouped by
+/// section ([`HIDDEN_KEYS`] stay out). Generated, and checked by a test.
+pub fn reference_markdown() -> String {
+    let mut out = String::from(
+        "# Configuration reference\n\n\
+         <!-- Generated from crates/wats/src/settings.rs (KEYS); \
+         regenerate with `WATS_UPDATE_DOCS=1 cargo test -p wats --lib settings`. -->\n\n\
+         Settings live in `config.toml` in the data directory (`~/.wats` by default).\n\
+         Edit them with `wats config set <key> <value>`, `wats config get <key>`, \
+         `wats config unset <key>` or `wats config edit`.\n\
+         Command-line flags and `WATS_*` variables, where they exist (`wats --help`), \
+         take precedence over the file.\n",
+    );
+    let mut section = None;
+    for key in KEYS {
+        let this = key.name.split_once('.').map_or("node", |(s, _)| s);
+        if section != Some(this) {
+            section = Some(this);
+            let title = match this {
+                "node" => "Node (top level)".to_string(),
+                s => format!("`[{s}]`"),
+            };
+            out.push_str(&format!(
+                "\n## {title}\n\n| Key | Default | |\n|---|---|---|\n"
+            ));
+        }
+        // Markdown table cells: no `|`, and `<…>` must not read as HTML.
+        let cell = |s: &str| {
+            s.replace('|', "\\|")
+                .replace('<', "&lt;")
+                .replace('>', "&gt;")
+        };
+        out.push_str(&format!(
+            "| `{}` | {} | {} |\n",
+            key.name,
+            cell(key.default),
+            cell(key.help)
+        ));
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn reference_page_is_up_to_date() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/config.md");
+        let generated = super::reference_markdown();
+        if std::env::var_os("WATS_UPDATE_DOCS").is_some() {
+            std::fs::write(&path, &generated).unwrap();
+        }
+        let published = std::fs::read_to_string(&path).unwrap_or_default();
+        assert_eq!(
+            published, generated,
+            "docs/config.md drifted: WATS_UPDATE_DOCS=1 cargo test -p wats --lib settings"
+        );
+    }
+
     use super::*;
 
     #[test]
