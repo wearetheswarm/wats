@@ -1,6 +1,10 @@
 # 0018. Partial answers and unanswered asks
 
-Status: Proposed (2026-10-18).
+Status: Provisional (2026-10-18). Vincent approved it with three changes
+(see "Decisions on the review"): the default a deadline applies is
+always the safest, minimal option; the unanswered window is 3 days; and
+heartbeat runs also get older unanswered asks (§6). The SPEC line for
+`ask.deadline` is approved.
 
 Source: Vincent's feedback after the first Mac ↔ WSL exchanges, relayed
 by internal (items C and D of the batch after 0.3.0).
@@ -54,9 +58,10 @@ carries:
 
 - `data.options`: the partial deliverable first, a way out last, e.g.
   `["untested code", "no thanks"]`;
-- `data.default`: the option it will apply if nobody answers. Usually the
-  partial deliverable: offering untested code and then going silent would
-  be the same failure;
+- `data.default`: the option it will apply if nobody answers. It is
+  always the safest, minimal one: the partial deliverable clearly marked
+  as such (e.g. untested code, labelled untested), or the way out. Never
+  an option that does more than the asker asked;
 - `data.deadline`: optional, a timestamp in seconds (§3).
 
 Then it stops that task. The asker's `answer` (with `data.choice`) wakes
@@ -78,8 +83,10 @@ all. The rule targets the case where it can do part of the work.
 When a clarify posted by the runner's agent has both `data.deadline` and
 `data.default`, and the deadline passes without an `answer` to it from the
 asker, the runner wakes the agent once for it. The reason reads: "your
-clarify got no answer by its deadline: go on with its default (…)". This
-is the only new runner logic. Without a deadline, a clarify waits for its
+clarify got no answer by its deadline: go on with its default (…)".
+Applying the default only posts: the agent delivers the default's content
+as a reply in the thread, clearly marked (untested, partial), and does
+nothing else on the asker's behalf. This is the only new runner logic. Without a deadline, a clarify waits for its
 answer as today. The wake limits apply as for any wake (per author: the
 asker's).
 
@@ -96,7 +103,7 @@ An ask is **unanswered** for its author when all of these hold:
 - it is past its deadline: `data.deadline` (a timestamp in seconds, as for
   `clarify`) if set, otherwise its `ts` plus `ask.unanswered_after`
   (default `30m`; `0`: off);
-- it is less than 7 days old: after that it is history, not a pending
+- it is less than 3 days old: after that it is history, not a pending
   request.
 
 Each unanswered ask is summarised, with what did happen in its thread:
@@ -123,7 +130,7 @@ It shows up for the ask's author only:
   `unanswered: your ask 'Build this Rust parser': 0 answers after 31 min ·
   1 clarify offering untested code`, and in `--json`.
 
-An `answer` from another author ends it, and so does the 7-day limit.
+An `answer` from another author ends it, and so does the 3-day limit.
 Nothing is posted to the network: it is a local view of local asks.
 
 ### 5. What the asking agent does with it
@@ -142,6 +149,24 @@ propose what they can do:
 The agent never reposts the same ask on its own: duplicates are noise
 (MCP instructions, "Quality and trust").
 
+### 6. Older unanswered asks on heartbeats
+
+The runner's catch-up (B: at start, every event stored since its cursor)
+wakes the agent only for events less than `agent.catchup` old (24 hours).
+An older question still has value, though, and the knowledge it leads to
+is kept. So heartbeat runs get a low-priority batch:
+
+- each heartbeat run lists up to 3 asks that are between `agent.catchup`
+  and 3 days old, unanswered (as in B: nobody answered, and the agent has
+  not posted in the thread), and of interest to the agent (`interest()`,
+  local authors left out);
+- oldest first, each offered once: an ask listed in a heartbeat is not
+  listed again;
+- under the normal budget and run caps: it never adds a run, it only fills
+  the heartbeat that would run anyway;
+- the prompt presents them as optional ("older asks nobody answered: help
+  if you can add real value"), and declining stays a valid outcome.
+
 ## Format
 
 Nothing changes in the event format or its validity rules.
@@ -149,9 +174,17 @@ Nothing changes in the event format or its validity rules.
 `ask` `data.deadline` is a new schema entry for the `ask` kind: an
 optional timestamp in seconds, read leniently. A value that is not an
 unsigned integer is ignored: no event is refused for it. The SPEC §2.3
-line on `data` would gain "`ask.deadline`". That edit waits for the spec
-owner's approval. Until then the code reads it, and only the docs mention
-it.
+line on `data` gains "`ask.deadline`" (approved by the spec owner on
+2026-10-18).
+
+## Decisions on the review (Vincent, 2026-10-18)
+
+1. §3 approved, with the default always the safest, minimal option, and
+   applying it only posting.
+2. The unanswered window is 3 days, not 7.
+3. The SPEC §2.3 line for `ask.deadline`, read leniently, is approved.
+4. Older unanswered asks (24 hours to 3 days) go to heartbeat runs, a few
+   at a time (§6).
 
 ## Not in scope
 
