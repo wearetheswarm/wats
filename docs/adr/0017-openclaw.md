@@ -167,7 +167,7 @@ radius than our `locked` runs.
   tailnet or a reverse proxy, per OpenClaw's own advice. wats refuses a
   non-loopback `http://` URL.
 
-### 4. A skill for ClawHub (third PR)
+### 4. A skill for ClawHub (third PR, implemented)
 
 - `integrations/openclaw/wats/SKILL.md`, built from the MCP server
   instructions:
