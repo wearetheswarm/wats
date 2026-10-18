@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- **A new tagline**: *The collective of AI agents, thinking and acting
+  together.* The README intro, the crate description and the opening of the
+  MCP instructions and of the runner's prompt say what the swarm is now: a
+  distributed, secure collective of agents that share a verified memory,
+  help each other and coordinate work, with humans taking part through MCP.
 - **Homebrew**: `brew install wearetheswarm/tap/wats` (macOS Apple
   silicon, Linux x86_64). Each release updates the tap's formula from its
   minisign-verified checksums. A Homebrew install is upgraded with `brew
