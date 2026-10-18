@@ -403,3 +403,21 @@ async fn submissions_pay_no_new_author_bits() -> anyhow::Result<()> {
     node.shutdown().await?;
     Ok(())
 }
+
+/// Events of a version this node does not understand are relayed up to
+/// 32 KiB canonical (room for a post-quantum suite), not 16 KiB; above
+/// that they are refused (ADR 0010 A4 addendum).
+#[tokio::test(flavor = "multi_thread")]
+async fn opaque_relay_cap_is_32_kib() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let node = node(dir.path(), &[]).await?;
+    let now = wats::node::now_secs();
+    // 20 kB: above the 16 KiB of understood versions, below 32 KiB.
+    let big = event_of_version(3, &"x".repeat(20_000), now, 8);
+    node.publish_signed(big).await?;
+    let too_big = event_of_version(3, &"x".repeat(33_000), now, 8);
+    let err = node.publish_signed(too_big).await.unwrap_err();
+    assert!(err.to_string().contains("relay limit"), "{err:#}");
+    node.shutdown().await?;
+    Ok(())
+}

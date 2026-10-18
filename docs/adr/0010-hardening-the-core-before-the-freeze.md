@@ -99,12 +99,32 @@ hashing.
 
 - `author` and `sig` are core-shaped as lowercase hex of any even length
   (up to 8 KiB and 64 KiB of hex), so a post-quantum suite fits.
+  (Widened before the freeze, see "base64url keys" below.)
 - For a version whose suite it knows, a node checks the signature, even on
   a tombstone.
 - For any other version, a relaying node checks shape, id, proof of work,
   size and policy, but **not** the signature: it cannot know the
   algorithm. Such events stay opaque (not indexed, not shown), so an
   unverified author never reaches an agent.
+- **Base64url keys and signatures** (addendum, 2026-10-18, decided by
+  Vincent). The core shape of `author` and `sig` becomes a non-empty
+  string over the base64url alphabet `[A-Za-z0-9_-]`, a superset of
+  lowercase hex, with the same bounds: 8,192 and 65,536 characters.
+  - The version still decides the exact encoding. v1 and v2 keep requiring
+    lowercase hex of 64 and 128 (v2 `sealed`: 256) characters.
+  - Why: a post-quantum version can use base64url and save about 2.5 KB
+    per event. An ML-DSA-44 public key is 1,312 bytes (2,624 hex chars,
+    1,750 in base64url), and its signature 2,420 bytes (4,840 hex chars,
+    3,227 in base64url).
+  - **Relay policy:** a node stores and relays events of versions it does
+    not understand up to **32 KiB** canonical, instead of 16 KiB
+    (`node.rs` `OPAQUE_RELAY_MAX_BYTES`). Nodes deployed from 0.2.0 on will
+    then carry a future post-quantum version with larger events. The 5%
+    opaque quota still bounds them. Understood versions keep their own
+    validity caps (16 KiB for v1 and v2).
+  - Vectors: an opaque v3 event with a base64url author and signature at
+    ML-DSA-44 sizes (accept), and a v1 event with a non-hex author
+    (reject).
 
 ### A5. Key succession hook
 
@@ -440,8 +460,8 @@ another core change.
 
 ### Process
 
-- **Vectors**: `events.json` (21 accept cases) and `events-invalid.json`
-  (87 reject cases, raw JSON text, each isolating one rule), event v2
+- **Vectors**: `events.json` (22 accept cases) and `events-invalid.json`
+  (88 reject cases, raw JSON text, each isolating one rule), event v2
   (ADR 0015 §8) included.
   - Accept cases include a ZIP 215 edge case: a non-canonical `R` with an
     ordinary key. An order-8 key with `s = 0` and a non-canonical `A`,

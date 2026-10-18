@@ -392,6 +392,23 @@ fn valid_vectors() -> Value {
     // A future suite: other key and signature formats, not checked by
     // nodes that do not know it (ADR 0010, A4). The id does not cover `sig`.
     v3_other_suite["sig"] = json!("5a".repeat(2420));
+    // A post-quantum-sized suite in base64url (ADR 0010 A4 addendum): an
+    // ML-DSA-44 public key (1,312 bytes, 1,750 chars) and signature (2,420
+    // bytes, 3,227 chars). `author` is in the header, so the id changes.
+    let mut v3_b64url_suite = v3.as_object().unwrap().clone();
+    v3_b64url_suite.insert(
+        "author".into(),
+        json!(
+            format!("{}-_", "Ab9".repeat(583))
+                .chars()
+                .take(1750)
+                .collect::<String>()
+        ),
+    );
+    v3_b64url_suite.insert("sig".into(), json!("q_Z-".repeat(807)[..3227].to_string()));
+    let d = digest(&v3_b64url_suite).unwrap();
+    v3_b64url_suite.insert("id".into(), json!(hex::encode(d.id)));
+    let v3_b64url_suite = Value::Object(v3_b64url_suite);
     let v2_submit = v2_signed(false, &|_, _| {});
     let v2_sealed = v2_signed(true, &|_, _| {});
     let v2_sealed_grease = v2_signed(true, &|h, b| {
@@ -424,6 +441,7 @@ fn valid_vectors() -> Value {
             accept("v1-answer-choice", "The requester answers the clarify: an answer whose parent is the clarify, with data.choice.", Some(1), serde_json::to_value(&choice).unwrap()),
             accept("v1-grease-body-key", "A GREASE body key: accepted, hashed, ignored.", Some(1), serde_json::to_value(&greased).unwrap()),
             accept("v3-opaque", "A future version: unknown kind, header extension ext (with a GREASE key), unknown body field, refs. Relayed by nodes that do not understand it (here v3, signed with the v1 suite for the record).", Some(3), v3),
+            accept("v3-opaque-base64url-suite", "A future version whose suite encodes author and sig in base64url, at post-quantum sizes (ML-DSA-44: 1,750 and 3,227 chars): the core accepts any string over [A-Za-z0-9_-] within 8 KiB and 64 KiB; the version decides the exact encoding. Proof of work below the relay policy: valid, not necessarily relayed.", None, v3_b64url_suite),
             accept("v3-opaque-other-suite", "The same, with a signature of another suite and size: nodes do not check signatures of versions they do not know.", None, v3_other_suite),
             accept("v1-tombstone", "v1-react-reply with its body dropped: body_hash replaces the body fields; id and sig unchanged, signature still checked.", Some(2), tombstone(&reply)),
             accept("zip215-noncanonical-R", "ZIP 215: an ordinary author key (seed 07); R is a non-canonical encoding of the identity (y = p + 1) and s = k * a, so the cofactored equation holds. R is hashed as received: accepted.", Some(7), with_noncanonical_r(7)),
@@ -560,7 +578,8 @@ fn invalid_vectors() -> Value {
             reject("blob-url-too-long", "v1: blob url at most 256 bytes (permanent pointers only)", modified(&|w| {
                 w.insert("blobs".into(), json!([{"hash": "ab".repeat(32), "name": "f", "size": 1, "url": format!("https://example.com/{}", "u".repeat(240))}]));
             })),
-            reject("uppercase-hex", "core: hex is lowercase", raw_base.replacen(&base["author"].as_str().unwrap()[..2], &base["author"].as_str().unwrap()[..2].to_uppercase(), 1)),
+            reject("v1-author-not-hex", "v1: author is 64 lowercase hex chars (the core allows base64url for later versions)", modified(&|w| { w.insert("author".into(), json!("A".repeat(43))); })),
+            reject("uppercase-hex", "v1: author is lowercase hex (here two uppercase chars, which also breaks the id)", raw_base.replacen(&base["author"].as_str().unwrap()[..2], &base["author"].as_str().unwrap()[..2].to_uppercase(), 1)),
             reject("blob-url-missing", "v1: every blob field is present, url as null when there is none", modified(&|w| {
                 w.insert("blobs".into(), json!([{"hash": "ab".repeat(32), "name": "f", "size": 1}]));
             })),
