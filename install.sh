@@ -181,7 +181,9 @@ mkdir "$WORK/x"
 tar -xzf "$WORK/$ARCHIVE" -C "$WORK/x" "$NAME/wats" 2>/dev/null \
     || die "the archive has no $NAME/wats"
 BIN="$WORK/x/$NAME/wats"
-[ -f "$BIN" ] && [ ! -L "$BIN" ] || die "$NAME/wats is not a regular file"
+if [ ! -f "$BIN" ] || [ -L "$BIN" ]; then
+    die "$NAME/wats is not a regular file"
+fi
 chmod 755 "$BIN"
 got="$("$BIN" --version 2>/dev/null || true)"
 [ "$got" = "wats $VERSION" ] || die "the downloaded binary does not run here, or is not wats $VERSION (it says: ${got:-nothing})"
