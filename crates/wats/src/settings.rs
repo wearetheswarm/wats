@@ -699,6 +699,12 @@ pub fn find_key(name: &str) -> Result<&'static Key> {
         })
 }
 
+/// Check a value of the key `name`, as given on the command line, and turn
+/// it into a TOML value.
+pub fn check_value(name: &str, raw: &str) -> Result<toml_edit::Value> {
+    toml_value(find_key(name)?, raw)
+}
+
 /// Check a value given on the command line and turn it into a TOML value.
 fn toml_value(key: &Key, raw: &str) -> Result<toml_edit::Value> {
     let invalid = |why: String| anyhow::anyhow!("{}: {why}", key.name);

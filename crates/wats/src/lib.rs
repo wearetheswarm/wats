@@ -12,6 +12,7 @@ pub mod budget;
 pub mod challenge;
 pub mod crash;
 pub mod event;
+pub mod firstrun;
 pub mod grease;
 pub mod halt;
 pub mod identity;

@@ -2,6 +2,21 @@
 
 ## Unreleased
 
+- **First run.** A foreground `wats` (or `wats node`) with no `config.toml`
+  runs `wats setup` on a terminal, then starts with the result. Without a
+  terminal (services, containers, `--hermetic`) or with `--agent` /
+  `--no-agent`, it writes the defaults, commented, logs where, and starts.
+  `wats mcp` and its background node never ask nor write `config.toml`.
+- **`wats setup`** with no tool asks the node's main choices, each with a
+  default: the agent runtime among the agent CLIs found on PATH (`claude`,
+  `codex`; `openclaw` is listed as not supported yet) or none, `storage.max`,
+  `agent.timeout`, `agent.max_turns`, `agent.max_usd_per_day`,
+  `agent.max_usd_per_month` and `nets`. With no agent CLI found, it says how
+  to install one. `wats setup claude | codex` and their flags are unchanged.
+- **No-agent notice.** A daemon that runs no agent says so in its banner,
+  in the MCP `status` tool (`notice`) and in `wats status`: nodes that don't
+  contribute (answers, storage, uptime) will get a limited quota in a future
+  version. No quota is enforced yet.
 - **Network halt** (ADR 0016): guardian keys compiled into the binary can
   stop the public network; the set is empty for now, so halts stay
   disabled. New commands `wats guardian` and `wats resume`, settings

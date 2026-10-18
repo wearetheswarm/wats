@@ -1,0 +1,555 @@
+//! The first run of `wats`, and `wats setup` with no tool: the node's main
+//! choices, each with a default.
+//!
+//! A foreground node (`wats`, `wats node`) that finds no `config.toml` in
+//! its data directory asks them on a terminal ([`setup`]), or writes the
+//! defaults, commented, without one ([`write_default`]: daemons,
+//! containers, services). `wats mcp` and the background node it starts
+//! never do either: an MCP-only user keeps a data directory without
+//! `config.toml`.
+//!
+//! The choices are existing keys only ([`crate::settings::KEYS`]): the
+//! agent runtime among the agent CLIs found on `PATH`, `storage.max`, the
+//! agent's run time, turn and spend limits, and `nets`.
+
+use std::ffi::OsStr;
+use std::io::{BufRead, Write};
+use std::path::{Path, PathBuf};
+
+use anyhow::{Context, Result};
+
+use crate::settings::{self, ConfigFile, FILE_NAME, RUNTIMES, Settings};
+
+/// The agent CLIs looked for on `PATH`. Only [`RUNTIMES`] can run.
+pub const AGENT_CLIS: [&str; 3] = ["claude", "codex", "openclaw"];
+
+/// Shown when the node runs no agent (startup, `status`). A future
+/// policy: no quota is enforced today.
+pub const NO_AGENT_NOTICE: &str = "This node runs no agent: nodes that don't contribute \
+(answers, storage, uptime) will get a limited quota in a future version. `wats setup` \
+enables one.";
+
+/// Shown by setup when no supported agent CLI is on `PATH`.
+pub const NO_AGENT_FOUND: &str = "No agent CLI found: install Claude Code \
+(https://claude.com/claude-code) or Codex (https://github.com/openai/codex), then run \
+`wats setup` again.";
+
+/// The questions after the agent runtime, in order: storage, the agent's
+/// limits (only asked when it runs an agent), networks.
+const QUESTIONS: [(&str, &str, bool); 6] = [
+    ("storage.max", "Disk budget of the data directory", false),
+    ("agent.timeout", "Time limit of one agent run", true),
+    ("agent.max_turns", "Turns per agent run", true),
+    (
+        "agent.max_usd_per_day",
+        "Agent spend budget per UTC day, in USD",
+        true,
+    ),
+    (
+        "agent.max_usd_per_month",
+        "Agent spend budget per UTC month, in USD",
+        true,
+    ),
+    ("nets", "Networks to join, comma-separated", false),
+];
+
+/// An agent CLI found on `PATH`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Found {
+    pub name: &'static str,
+    pub path: PathBuf,
+}
+
+impl Found {
+    /// Whether wats can run it (an agent runtime).
+    pub fn supported(&self) -> bool {
+        RUNTIMES.contains(&self.name)
+    }
+}
+
+/// The [`AGENT_CLIS`] found in the directories of `path` (a `PATH` value),
+/// in the order of [`AGENT_CLIS`].
+pub fn detect_agents(path: Option<&OsStr>) -> Vec<Found> {
+    let dirs: Vec<PathBuf> = path
+        .map(|p| std::env::split_paths(p).collect())
+        .unwrap_or_default();
+    AGENT_CLIS
+        .iter()
+        .filter_map(|&name| {
+            dirs.iter()
+                .flat_map(|dir| candidates(dir, name))
+                .find(|p| is_executable(p))
+                .map(|path| Found { name, path })
+        })
+        .collect()
+}
+
+fn candidates(dir: &Path, name: &str) -> Vec<PathBuf> {
+    if cfg!(windows) {
+        ["exe", "cmd", "bat"]
+            .iter()
+            .map(|ext| dir.join(format!("{name}.{ext}")))
+            .collect()
+    } else {
+        vec![dir.join(name)]
+    }
+}
+
+fn is_executable(path: &Path) -> bool {
+    let Ok(meta) = std::fs::metadata(path) else {
+        return false;
+    };
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        meta.is_file() && meta.permissions().mode() & 0o111 != 0
+    }
+    #[cfg(not(unix))]
+    {
+        meta.is_file()
+    }
+}
+
+/// What setup chose. `values` holds the answered keys only, as typed (e.g.
+/// `10G`, `public,acme`).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Choices {
+    pub runtime: Option<String>,
+    pub values: Vec<(&'static str, String)>,
+}
+
+/// The value of `key` in `settings`, as `wats config set` takes it.
+fn current(settings: &Settings, key: &str) -> Option<String> {
+    let agent = &settings.agent;
+    match key {
+        "storage.max" => settings.storage.max.clone(),
+        "agent.timeout" => agent.timeout.clone(),
+        "agent.max_turns" => agent.max_turns.map(|n| n.to_string()),
+        "agent.max_usd_per_day" => agent.max_usd_per_day.map(|n| n.to_string()),
+        "agent.max_usd_per_month" => agent.max_usd_per_month.map(|n| n.to_string()),
+        "nets" => (!settings.nets.is_empty()).then(|| settings.nets.join(",")),
+        _ => None,
+    }
+}
+
+/// Whether `raw` is the key's default value.
+fn is_default(key: &str, raw: &str) -> bool {
+    let Ok(default) = settings::find_key(key) else {
+        return false;
+    };
+    match (
+        settings::check_value(key, raw),
+        settings::check_value(key, default.default),
+    ) {
+        (Ok(a), Ok(b)) => a.to_string().trim() == b.to_string().trim(),
+        _ => false,
+    }
+}
+
+/// One line of input: `None` at the end of the input.
+fn read_answer(input: &mut impl BufRead, out: &mut impl Write) -> Result<Option<String>> {
+    out.flush()?;
+    let mut line = String::new();
+    if input.read_line(&mut line)? == 0 {
+        writeln!(out)?;
+        return Ok(None);
+    }
+    Ok(Some(line.trim().to_string()))
+}
+
+/// Ask the agent runtime among the CLIs found. `None`: no agent.
+fn ask_runtime(
+    input: &mut impl BufRead,
+    out: &mut impl Write,
+    found: &[Found],
+    current: Option<&str>,
+) -> Result<Option<String>> {
+    let supported: Vec<&Found> = found.iter().filter(|f| f.supported()).collect();
+    if !found.is_empty() {
+        writeln!(out, "Agent CLIs found on your PATH:")?;
+        let mut n = 0;
+        for f in found {
+            if f.supported() {
+                n += 1;
+                writeln!(out, "  {n}) {:<9} {}", f.name, f.path.display())?;
+            } else {
+                writeln!(
+                    out,
+                    "  -  {:<9} {} (not supported yet)",
+                    f.name,
+                    f.path.display()
+                )?;
+            }
+        }
+    }
+    if supported.is_empty() {
+        writeln!(out, "{NO_AGENT_FOUND}")?;
+        return Ok(current.map(str::to_string));
+    }
+    writeln!(out, "  0) none: the node runs no agent")?;
+    let default = current
+        .map(str::to_string)
+        .unwrap_or_else(|| supported[0].name.to_string());
+    loop {
+        write!(out, "Agent the node runs (agent.runtime) [{default}]: ")?;
+        let Some(answer) = read_answer(input, out)? else {
+            return Ok(Some(default).filter(|r| r != "none"));
+        };
+        let answer = if answer.is_empty() {
+            default.clone()
+        } else {
+            answer.to_lowercase()
+        };
+        let pick = match answer.parse::<usize>() {
+            Ok(0) => Some("none"),
+            Ok(i) => supported.get(i - 1).map(|f| f.name),
+            Err(_) if answer == "none" => Some("none"),
+            Err(_) => RUNTIMES.iter().copied().find(|r| *r == answer),
+        };
+        match pick {
+            Some("none") => return Ok(None),
+            Some(runtime) => return Ok(Some(runtime.to_string())),
+            None => writeln!(
+                out,
+                "  answer a number above, {} or none",
+                RUNTIMES.join(", ")
+            )?,
+        }
+    }
+}
+
+/// Ask one key, checked like `wats config set`; Enter (or the end of the
+/// input) keeps `default`.
+fn ask(
+    input: &mut impl BufRead,
+    out: &mut impl Write,
+    key: &str,
+    label: &str,
+    default: &str,
+) -> Result<String> {
+    loop {
+        write!(out, "{label} ({key}) [{default}]: ")?;
+        let answer = match read_answer(input, out)? {
+            Some(answer) if !answer.is_empty() => answer,
+            _ => return Ok(default.to_string()),
+        };
+        match settings::check_value(key, &answer) {
+            Ok(_) => return Ok(answer),
+            Err(e) => writeln!(out, "  {e:#}")?,
+        }
+    }
+}
+
+/// Ask the main choices, with the current settings (or the defaults) as
+/// defaults. `found`: [`detect_agents`].
+pub fn prompt(
+    input: &mut impl BufRead,
+    out: &mut impl Write,
+    found: &[Found],
+    settings: &Settings,
+) -> Result<Choices> {
+    writeln!(
+        out,
+        "wats setup: the node's main choices. Enter accepts the [default]."
+    )?;
+    let runtime = ask_runtime(input, out, found, settings.agent.runtime.as_deref())?;
+    let mut values = Vec::new();
+    for (key, label, agent_only) in QUESTIONS {
+        if agent_only && runtime.is_none() {
+            continue;
+        }
+        let default = current(settings, key).unwrap_or_else(|| {
+            settings::find_key(key)
+                .map_or("", |k| k.default)
+                .to_string()
+        });
+        values.push((key, ask(input, out, key, label, &default)?));
+    }
+    Ok(Choices { runtime, values })
+}
+
+const HEADER: &str = "\
+# wats node configuration: what a bare `wats` runs with. Flags and WATS_*
+# variables override it.
+# Commented lines show the defaults: uncomment one to change it, or use
+# `wats config set <key> <value>`. `wats config list` shows every key;
+# `wats setup` asks the main choices again.
+";
+
+/// The text of a new config.toml with these choices: chosen values that
+/// are not the default are set, the others are commented.
+pub fn render(choices: &Choices) -> Result<String> {
+    let chosen = |key: &str| {
+        choices
+            .values
+            .iter()
+            .find(|(k, _)| *k == key)
+            .map(|(_, v)| v.as_str())
+    };
+    let mut text = HEADER.to_string();
+    let line = |text: &mut String, key: &str| -> Result<()> {
+        let help = settings::find_key(key)?.help;
+        let leaf = key.rsplit('.').next().unwrap_or(key);
+        text.push_str(&format!("# {help}\n"));
+        match chosen(key).filter(|v| !is_default(key, v)) {
+            Some(v) => text.push_str(&format!("{leaf} = {}\n", settings::check_value(key, v)?)),
+            None => {
+                let default = settings::find_key(key)?.default;
+                text.push_str(&format!(
+                    "# {leaf} = {}\n",
+                    settings::check_value(key, default)?
+                ));
+            }
+        }
+        Ok(())
+    };
+    text.push('\n');
+    line(&mut text, "nets")?;
+    text.push_str("\n[storage]\n");
+    line(&mut text, "storage.max")?;
+    text.push_str("\n[agent]\n# agent run with the node: claude or codex (default: none)\n");
+    match &choices.runtime {
+        Some(runtime) => text.push_str(&format!(
+            "runtime = {}\n",
+            settings::check_value("agent.runtime", runtime)?
+        )),
+        None => text.push_str("# runtime = \"claude\"\n"),
+    }
+    for (key, _, agent_only) in QUESTIONS {
+        if agent_only {
+            text.push('\n');
+            line(&mut text, key)?;
+        }
+    }
+    toml::from_str::<Settings>(&text).context("the generated config.toml does not load")?;
+    Ok(text)
+}
+
+/// Write the choices to `<data dir>/config.toml`: a new file from
+/// [`render`], or the answered keys of an existing one (a default value
+/// unsets its key), keeping its comments. Returns the file's path.
+pub fn apply(data_dir: &Path, choices: &Choices) -> Result<PathBuf> {
+    let path = data_dir.join(FILE_NAME);
+    if !path.exists() {
+        std::fs::create_dir_all(data_dir)
+            .with_context(|| format!("create {}", data_dir.display()))?;
+        std::fs::write(&path, render(choices)?)
+            .with_context(|| format!("write {}", path.display()))?;
+        return Ok(path);
+    }
+    let mut file = ConfigFile::open(data_dir)?;
+    match &choices.runtime {
+        Some(runtime) => file.set("agent.runtime", runtime)?,
+        None => {
+            file.unset("agent.runtime")?;
+        }
+    }
+    for (key, value) in &choices.values {
+        if is_default(key, value) {
+            file.unset(key)?;
+        } else {
+            file.set(key, value)?;
+        }
+    }
+    file.save()?;
+    Ok(path)
+}
+
+/// Write the default config.toml (every key commented) if there is none.
+/// Returns its path when it wrote it.
+pub fn write_default(data_dir: &Path) -> Result<Option<PathBuf>> {
+    let path = data_dir.join(FILE_NAME);
+    std::fs::create_dir_all(data_dir).with_context(|| format!("create {}", data_dir.display()))?;
+    let text = render(&Choices::default())?;
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)
+    {
+        Ok(mut file) => {
+            file.write_all(text.as_bytes())
+                .with_context(|| format!("write {}", path.display()))?;
+            Ok(Some(path))
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(None),
+        Err(e) => Err(e).with_context(|| format!("write {}", path.display())),
+    }
+}
+
+/// `wats setup` with no tool: detect the agent CLIs on `path`, ask the
+/// main choices on `input`/`out`, write them. Returns the choices.
+pub fn setup(
+    data_dir: &Path,
+    input: &mut impl BufRead,
+    out: &mut impl Write,
+    path: Option<&OsStr>,
+) -> Result<Choices> {
+    let settings = Settings::load(data_dir)?;
+    let found = detect_agents(path);
+    let choices = prompt(input, out, &found, &settings)?;
+    let file = apply(data_dir, &choices)?;
+    writeln!(out, "Wrote {}", file.display())?;
+    match &choices.runtime {
+        Some(runtime) => {
+            let name = if runtime == "codex" {
+                "Codex"
+            } else {
+                "Claude Code"
+            };
+            writeln!(
+                out,
+                "`wats` now runs the node with a {name} agent. To reach the swarm from \
+                 your own {name} sessions too: wats setup {runtime} --mcp"
+            )?;
+        }
+        None => writeln!(out, "{NO_AGENT_NOTICE}")?,
+    }
+    Ok(choices)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[cfg(unix)]
+    fn fake_cli(dir: &Path, name: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let path = dir.join(name);
+        std::fs::write(&path, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn detects_executables_on_path() {
+        let a = tempfile::tempdir().unwrap();
+        let b = tempfile::tempdir().unwrap();
+        let codex = fake_cli(a.path(), "codex");
+        let openclaw = fake_cli(b.path(), "openclaw");
+        // Not executable: not found.
+        std::fs::write(a.path().join("claude"), "").unwrap();
+        let path = std::env::join_paths([a.path(), b.path()]).unwrap();
+        let found = detect_agents(Some(&path));
+        assert_eq!(
+            found,
+            [
+                Found {
+                    name: "codex",
+                    path: codex
+                },
+                Found {
+                    name: "openclaw",
+                    path: openclaw
+                }
+            ]
+        );
+        assert!(found[0].supported() && !found[1].supported());
+        assert!(detect_agents(None).is_empty());
+    }
+
+    fn run(found: &[Found], settings: &Settings, input: &str) -> (Choices, String) {
+        let mut out = Vec::new();
+        let choices = prompt(&mut input.as_bytes(), &mut out, found, settings).unwrap();
+        (choices, String::from_utf8(out).unwrap())
+    }
+
+    fn found(names: &[&'static str]) -> Vec<Found> {
+        names
+            .iter()
+            .map(|&name| Found {
+                name,
+                path: PathBuf::from(format!("/bin/{name}")),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn enter_accepts_every_default() {
+        let (choices, said) = run(&found(&["claude", "codex"]), &Settings::default(), "");
+        assert_eq!(choices.runtime.as_deref(), Some("claude"));
+        let keys: Vec<_> = choices.values.iter().map(|(k, _)| *k).collect();
+        assert_eq!(keys, QUESTIONS.map(|q| q.0));
+        assert!(said.contains("1) claude"), "{said}");
+        assert!(
+            said.contains("[10G]") && said.contains("[public]"),
+            "{said}"
+        );
+        // Defaults only: nothing is set.
+        let text = render(&choices).unwrap();
+        assert!(text.contains("\nruntime = \"claude\"\n"), "{text}");
+        assert!(text.contains("# max = \"10G\""), "{text}");
+        assert!(text.contains("# max_usd_per_day = 2.0"), "{text}");
+    }
+
+    #[test]
+    fn scripted_answers_are_checked() {
+        let input = "7\n2\n20G\n1h\nmany\n5\n1.5\n10\npublic,acme\n";
+        let (choices, said) = run(&found(&["claude", "codex"]), &Settings::default(), input);
+        assert_eq!(choices.runtime.as_deref(), Some("codex"));
+        assert!(said.contains("answer a number above"), "{said}");
+        assert!(said.contains("not an integer"), "{said}");
+        assert_eq!(
+            choices.values,
+            [
+                ("storage.max", "20G".to_string()),
+                ("agent.timeout", "1h".into()),
+                ("agent.max_turns", "5".into()),
+                ("agent.max_usd_per_day", "1.5".into()),
+                ("agent.max_usd_per_month", "10".into()),
+                ("nets", "public,acme".into()),
+            ]
+        );
+        let dir = tempfile::tempdir().unwrap();
+        apply(dir.path(), &choices).unwrap();
+        let settings = Settings::load(dir.path()).unwrap();
+        assert_eq!(settings.agent.runtime.as_deref(), Some("codex"));
+        assert_eq!(settings.storage.max.as_deref(), Some("20G"));
+        assert_eq!(settings.agent.max_turns, Some(5));
+        assert_eq!(settings.agent.max_usd_per_month, Some(10.0));
+        assert_eq!(settings.nets, ["public", "acme"]);
+        // Again on the same file: the current values are the defaults, and
+        // choosing no agent unsets it, keeping the rest.
+        let (again, said) = run(&found(&["claude", "codex"]), &settings, "0\n\n\n");
+        assert!(said.contains("[codex]") && said.contains("[20G]"), "{said}");
+        assert_eq!(again.runtime, None);
+        apply(dir.path(), &again).unwrap();
+        let settings = Settings::load(dir.path()).unwrap();
+        assert_eq!(settings.agent.runtime, None);
+        assert_eq!(settings.agent.max_turns, Some(5));
+        assert_eq!(settings.nets, ["public", "acme"]);
+    }
+
+    #[test]
+    fn no_supported_agent_found() {
+        let (choices, said) = run(&found(&["openclaw"]), &Settings::default(), "");
+        assert!(said.contains("openclaw"), "{said}");
+        assert!(said.contains("(not supported yet)"), "{said}");
+        assert!(said.contains(NO_AGENT_FOUND), "{said}");
+        assert_eq!(choices.runtime, None);
+        // No agent: no agent limits asked.
+        let keys: Vec<_> = choices.values.iter().map(|(k, _)| *k).collect();
+        assert_eq!(keys, ["storage.max", "nets"]);
+        let (_, said) = run(&[], &Settings::default(), "");
+        assert!(said.contains(NO_AGENT_FOUND), "{said}");
+    }
+
+    #[test]
+    fn default_config_is_commented_defaults() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_default(dir.path()).unwrap().unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            text.lines()
+                .all(|l| l.is_empty() || l.starts_with('#') || l.starts_with('[')),
+            "{text}"
+        );
+        assert!(text.contains("# nets = [\"public\"]"), "{text}");
+        let settings = Settings::load(dir.path()).unwrap();
+        assert!(settings.agent.runtime.is_none() && settings.nets.is_empty());
+        // Never overwritten.
+        std::fs::write(&path, "profile = \"alice\"\n").unwrap();
+        assert_eq!(write_default(dir.path()).unwrap(), None);
+        assert!(std::fs::read_to_string(&path).unwrap().contains("alice"));
+    }
+}
