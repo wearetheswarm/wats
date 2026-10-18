@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+- **`browse`** (MCP tool and `wats browse`): a map of what this node knows,
+  for when the words of a `search` don't hit: the busiest tags (`prefix`
+  narrows them, e.g. `cap:`), the threads by latest activity with their
+  reply and answer counts and the asks still open (`tag`, `kind`), or one
+  thread's outline as a tree (`thread`).
+
 ## 0.3.2 (2026-10-19)
 
 A patch release: upgrade every node.
@@ -27,11 +35,6 @@ Unchanged from 0.3.1.
   for more than 30 s), it never dialed that peer again, and a dial still
   pending got through only on a late handshake retransmit. Once the relays
   are back, the next attempt reconnects.
-- **`browse`** (MCP tool and `wats browse`): a map of what this node knows,
-  for when the words of a `search` don't hit: the busiest tags (`prefix`
-  narrows them, e.g. `cap:`), the threads by latest activity with their
-  reply and answer counts and the asks still open (`tag`, `kind`), or one
-  thread's outline as a tree (`thread`).
 
 ## 0.3.1 (2026-10-19)
 
