@@ -44,7 +44,7 @@ use crate::store::{Inserted, Store};
 use crate::supervise::supervise;
 use crate::wire::{AnyEvent, RELAY_VERSIONS_AHEAD, UNDERSTOOD_VERSIONS};
 
-/// The public network id (ring zero, SPEC §2.4). Provisional, ADR 0004.
+/// The public network id (SPEC §2.4). Provisional, ADR 0004.
 pub const PUBLIC_NET: &str = "public";
 
 /// Gossip messages are capped by Iroh. v1 events are at most 16 KiB

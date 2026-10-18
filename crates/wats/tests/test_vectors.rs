@@ -155,13 +155,13 @@ fn tombstone(event: &Value) -> Value {
 }
 
 /// v2 test keys: the author of the submissions, the author of the sealed
-/// events, and the test group key of their ring's epoch (ADR 0015 §8:
+/// events, and the test group key of their private network's epoch (ADR 0015 §8:
 /// the vectors document the group signature; verifiers check its shape
 /// only).
 const SUBMIT_SEED: u8 = 8;
 const SEALED_SEED: u8 = 9;
 const GROUP_SEED: u8 = 10;
-const RING_NET: &str = "ring:0f1e2d3c4b5a69788796a5b4c3d2e1f0";
+const PRIVATE_NET: &str = "private:0f1e2d3c4b5a69788796a5b4c3d2e1f0";
 const INBOX: &str = "inbox:00112233445566778899aabbccddeeff";
 
 /// The header and body of the v2 `submit` vector: `enc` is 1,120 fixed
@@ -182,7 +182,7 @@ fn submit_parts() -> (Map<String, Value>, Map<String, Value>) {
 fn sealed_parts() -> (Map<String, Value>, Map<String, Value>) {
     (
         obj(
-            json!({"v": 2, "ts": 1_760_800_100u64, "net": RING_NET, "thread": null,
+            json!({"v": 2, "ts": 1_760_800_100u64, "net": PRIVATE_NET, "thread": null,
                    "parent": null, "refs": [], "kind": "sealed", "ext": {"epoch": 3}}),
         ),
         obj(json!({"ct": b64url_encode(b"an MLS PrivateMessage, test vector")})),
@@ -450,7 +450,7 @@ fn valid_vectors() -> Value {
             accept("v1-pow-unknown-alg", "A proof of work of an algorithm this node does not know (eqx): valid, since validity checks only the syntax \"<alg>:<payload>\". A node stores and relays it as an opaque event, under the opaque quota, and never shows it nor takes it as no work.", Some(1), pow_variant("eqx:AAECAwQFBgcICQoLDA0ODw")),
             accept("v1-pow-b3-not-decimal", "pow b3 with a payload that is not a decimal nonce: valid syntax; a node that knows b3 counts it as no work, so it passes only where no proof of work is required.", Some(1), pow_variant("b3:abc_DEF-9")),
             accept("v2-submit", "v2 submit (ADR 0015 §5, §8): a sealed-inbox submission on the public net, ext.to the inbox id, enc 1,120 fixed bytes and a small ct, both canonical base64url; sig is the author's Ed25519 signature over \"wats/event/v2\" || id. Validated, then stored opaque: its content is encrypted.", Some(SUBMIT_SEED), v2_submit.clone()),
-            accept("v2-sealed", "v2 sealed (ADR 0015 §3, §8): a ring event, net ring:<32 hex>, ext.epoch, body exactly ct. sig is the author's signature over \"wats/event/v2\" || id, then the epoch's group signature over \"wats/ring/v2\" || id made with the test group key (Ed25519 seed 0a repeated 32 times); verifiers check the group signature as shape only (S < l).", Some(SEALED_SEED), v2_sealed),
+            accept("v2-sealed", "v2 sealed (ADR 0015 §3, §8): an event of a private network, net private:<32 hex>, ext.epoch, body exactly ct. sig is the author's signature over \"wats/event/v2\" || id, then the epoch's group signature over \"wats/private/v2\" || id made with the test group key (Ed25519 seed 0a repeated 32 times); verifiers check the group signature as shape only (S < l).", Some(SEALED_SEED), v2_sealed),
             accept("v2-submit-tombstone", "v2-submit with its body dropped: body_hash replaces enc and ct; the header (ext included) and the signature rules stay.", Some(SUBMIT_SEED), tombstone(&v2_submit)),
             accept("v2-sealed-grease", "v2 sealed with GREASE keys in ext and in the body, each set within 64 bytes of JCS: accepted, hashed, ignored.", Some(SEALED_SEED), v2_sealed_grease),
             accept("v1-title-unicode-16", "A title with U+A7DB LATIN SMALL LETTER LAMBDA, assigned in Unicode 16.0 (unassigned in 15.1): v1 pins Unicode 16.0.0.", Some(1), serde_json::to_value(&unicode_16_title).unwrap()),
@@ -658,7 +658,7 @@ fn invalid_vectors() -> Value {
             })),
             reject("v2-refs-not-empty", "v2: refs is []", v2_case(false, &|h, _| { h["refs"] = json!(["aa".repeat(32)]); })),
             reject("v2-refs-missing", "v2: refs is present, as []", v2_case(false, &|h, _| { h.remove("refs"); })),
-            reject("v2-sealed-net-not-ring", "v2 sealed: net matches ^ring:[0-9a-f]{32}$", v2_case(true, &|h, _| { h["net"] = json!("public"); })),
+            reject("v2-sealed-net-not-private", "v2 sealed: net matches ^private:[0-9a-f]{32}$", v2_case(true, &|h, _| { h["net"] = json!("public"); })),
             reject("v2-sealed-ext-no-epoch", "v2 sealed: ext is exactly {\"epoch\": n} plus capped _grease* keys (here {})", v2_case(true, &|h, _| { h["ext"] = json!({}); })),
             reject("v2-sealed-ext-extra-key", "v2 sealed: no ext key other than epoch and _grease* (here lang)", v2_case(true, &|h, _| { h["ext"]["lang"] = json!("en"); })),
             reject("v2-sealed-body-extra-key", "v2 sealed: the body is exactly ct plus capped _grease* keys (here a text in clear)", v2_case(true, &|_, b| { b.insert("text".into(), json!("in clear")); })),
@@ -666,11 +666,11 @@ fn invalid_vectors() -> Value {
             reject("v2-ct-trailing-bits", "v2: binary values are canonical base64url, no non-zero bit after the last whole byte (here YWJjZB, whose canonical form is YWJjZA)", v2_case(true, &|_, b| { b["ct"] = json!("YWJjZB"); })),
             reject("v2-ct-empty", "v2 sealed: ct decodes to 1-12,288 bytes (here empty)", v2_case(true, &|_, b| { b["ct"] = json!(""); })),
             reject("v2-submit-enc-length", "v2 submit: enc decodes to exactly 1,120 bytes (here 1,119)", v2_case(false, &|_, b| { b["enc"] = json!(b64url_encode(&[7; 1119])); })),
-            reject("v2-submit-net-ring", "v2 submit: net is not a ring: net", v2_case(false, &|h, _| { h["net"] = json!(RING_NET); })),
+            reject("v2-submit-net-private", "v2 submit: net is not a private: net", v2_case(false, &|h, _| { h["net"] = json!(PRIVATE_NET); })),
             reject("v2-submit-to-malformed", "v2 submit: ext.to is inbox:<32 lowercase hex> (here uppercase hex)", v2_case(false, &|h, _| { h["ext"] = json!({"to": format!("inbox:{}", INBOX["inbox:".len()..].to_uppercase())}); })),
             reject("v2-sealed-sig-author-only", "v2 sealed: sig is 256 hex chars, the author signature then the group signature (here the author signature alone, 128 hex)", v2_with_sig(true, &|id| hex::encode(sign_v2(&key(SEALED_SEED), id)))),
             reject("v2-sealed-group-s-not-canonical", "v2 sealed: the group signature's scalar S (its last 32 bytes, little-endian) is < l (here S + l)", v2_with_sig(true, &|id| {
-                let mut group = wats::v2::sign_ring(&key(GROUP_SEED), id);
+                let mut group = wats::v2::sign_group(&key(GROUP_SEED), id);
                 let mut carry = 0u16;
                 for (i, l) in L.iter().enumerate() {
                     let sum = group[32 + i] as u16 + *l as u16 + carry;

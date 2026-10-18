@@ -180,10 +180,10 @@ then accepted as opaque, since their content is encrypted:
 
 - `kind` is `sealed` or `submit`; `thread` and `parent` are null; `refs`
   is present and `[]`; `author` passes the v1 key checks.
-- `sealed`: `net` is `ring:<32 lowercase hex>`; `ext` is exactly
+- `sealed`: `net` is `private:<32 lowercase hex>`; `ext` is exactly
   `{"epoch": n}` (0 to 2^53 − 1); the body is exactly `ct`, decoding to
   1-12,288 bytes; `sig` is 256 hex characters.
-- `submit`: `net` does not start with `ring:`; `ext` is exactly
+- `submit`: `net` does not start with `private:`; `ext` is exactly
   `{"to": "inbox:<32 lowercase hex>"}`; the body is exactly `enc` (1,120
   bytes) and `ct` (16-12,288 bytes); `sig` is 128 hex characters.
 - `ext` and the body may add `_grease*` keys, at most 64 bytes of JCS each

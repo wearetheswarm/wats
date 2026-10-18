@@ -28,4 +28,4 @@ wrong, the ADR says so and the question goes back to the spec owners.
 | [0012](0012-storage-budget.md) | A disk budget for the data directory | Provisional |
 | [0013](0013-crash-reports.md) | Crash reports | Provisional |
 | [0014](0014-rate-limits.md) | Per-peer rate limits | Provisional |
-| [0015](0015-private-rings.md) | Private rings (event v2) | Provisional |
+| [0015](0015-private-networks.md) | Private networks (event v2) | Provisional |

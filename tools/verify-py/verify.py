@@ -81,10 +81,10 @@ MAX_SAFE_INTEGER = 2**53 - 1
 
 V2 = 2
 SIG_PREFIX_V2 = b"wats/event/v2"
-RING_SIG_PREFIX = b"wats/ring/v2"  # the group signature's message; shape only here
+GROUP_SIG_PREFIX = b"wats/private/v2"  # the group signature's message; shape only here
 KIND_SEALED = "sealed"
 KIND_SUBMIT = "submit"
-RING_NET_PREFIX = "ring:"
+PRIVATE_NET_PREFIX = "private:"
 INBOX_PREFIX = "inbox:"
 MAX_CT_BYTES = 12_288
 MIN_SUBMIT_CT_BYTES = 16
@@ -488,15 +488,15 @@ def check_v2(wire: dict, checked: Checked) -> None:
         raise Invalid("v2 ext is required")
     net = wire["net"]
     if sealed:
-        if not (net.startswith(RING_NET_PREFIX) and is_lower_hex_of(net[len(RING_NET_PREFIX):], 32)):
-            raise Invalid("sealed net must be ring:<32 hex>")
+        if not (net.startswith(PRIVATE_NET_PREFIX) and is_lower_hex_of(net[len(PRIVATE_NET_PREFIX):], 32)):
+            raise Invalid("sealed net must be private:<32 hex>")
         check_v2_keys(ext, ("epoch",), "ext")
         epoch = as_u64(ext["epoch"])
         if epoch is None or epoch > MAX_SAFE_INTEGER:
             raise Invalid("ext.epoch must be an integer from 0 to 2^53 - 1")
     else:
-        if net.startswith(RING_NET_PREFIX):
-            raise Invalid("submit net must not be a ring")
+        if net.startswith(PRIVATE_NET_PREFIX):
+            raise Invalid("submit net must not be a private network")
         check_v2_keys(ext, ("to",), "ext")
         to = ext["to"]
         if not (type(to) is str and to.startswith(INBOX_PREFIX)

@@ -58,7 +58,7 @@ must not leak what the node holds or where it is.
   collect.
 - The router learns the sender's node id, which it already knows as a
   peer. Pulling and reading the reports is a devops task (`make reports`).
-- Private rings could carry reports later; not before they exist.
+- Private networks could carry reports later; not before they exist.
 
 ## Transport through the sealed inbox (addendum, 2026-10-18)
 

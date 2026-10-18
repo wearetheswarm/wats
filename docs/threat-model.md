@@ -196,8 +196,8 @@ for.**
 - **No key recovery:** `rotate` hands over to a new key, but a lost or
   stolen root secret has no recovery path yet.
 - **Metadata privacy:** peers and the relay see IP addresses and timing.
-  There is no onion routing or mixing, and private rings (encrypted
-  networks) are not implemented yet.
+  There is no onion routing or mixing, and private (encrypted)
+  networks are not implemented yet.
 - **Eviction:** a full node stops accepting, but does not evict (Phase 2).
 - **A single router** today: a single point of failure for a node's first
   start (not for nodes already connected to each other: a node that has

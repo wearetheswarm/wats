@@ -1,8 +1,8 @@
 //! Event v2 validity (ADR 0015, §2 and §8): the rules every node, member of
-//! a ring or not, checks without decrypting anything.
+//! a private network or not, checks without decrypting anything.
 //!
 //! v2 has two kinds in clear: `sealed` (an MLS message inside a private
-//! ring) and `submit` (a sealed-inbox submission on a public net). The real
+//! network) and `submit` (a sealed-inbox submission on a public net). The real
 //! content sits in `ct`, so a v2 event is stored as an opaque row and never
 //! indexed or shown. Group signatures, MLS and HPKE are member-side policy,
 //! not validity: only the shape of the group signature is checked here.
@@ -24,18 +24,18 @@ use crate::wire::{
     verify_prefixed,
 };
 
-/// The event version of private rings.
+/// The event version of private networks.
 pub const VERSION: u64 = 2;
 /// The author signature covers `"wats/event/v2" || id`.
 pub const SIG_PREFIX_V2: &[u8] = b"wats/event/v2";
-/// The epoch's group signature (`sealed` only) covers `"wats/ring/v2" || id`.
-pub const RING_SIG_PREFIX: &[u8] = b"wats/ring/v2";
-/// A message inside a private ring.
+/// The epoch's group signature (`sealed` only) covers `"wats/private/v2" || id`.
+pub const GROUP_SIG_PREFIX: &[u8] = b"wats/private/v2";
+/// A message inside a private network.
 pub const KIND_SEALED: &str = "sealed";
 /// A submission to a sealed inbox, on a public net.
 pub const KIND_SUBMIT: &str = "submit";
-/// `net` of a ring: this prefix and 32 lowercase hex characters.
-pub const RING_NET_PREFIX: &str = "ring:";
+/// `net` of a private network: this prefix and 32 lowercase hex characters.
+pub const PRIVATE_NET_PREFIX: &str = "private:";
 /// `ext.to` of a submission: this prefix and 32 lowercase hex characters.
 pub const INBOX_PREFIX: &str = "inbox:";
 /// Largest decoded `ct`.
@@ -113,9 +113,9 @@ fn is_lower_hex(s: &str, len: usize) -> bool {
             .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
-/// Whether `net` names a ring: `ring:` and 32 lowercase hex characters.
-pub fn is_ring_net(net: &str) -> bool {
-    net.strip_prefix(RING_NET_PREFIX)
+/// Whether `net` names a private network: `private:` and 32 lowercase hex characters.
+pub fn is_private_net(net: &str) -> bool {
+    net.strip_prefix(PRIVATE_NET_PREFIX)
         .is_some_and(|rest| is_lower_hex(rest, 32))
 }
 
@@ -205,8 +205,8 @@ pub fn check_rules(raw: &RawEvent) -> Result<(), EventError> {
         _ => return Err(invalid("v2 ext is required")),
     };
     if sealed {
-        if !is_ring_net(&raw.net) {
-            return Err(invalid("sealed net must be ring:<32 hex>"));
+        if !is_private_net(&raw.net) {
+            return Err(invalid("sealed net must be private:<32 hex>"));
         }
         check_keys(ext, &["epoch"], "ext")?;
         if !ext
@@ -217,8 +217,8 @@ pub fn check_rules(raw: &RawEvent) -> Result<(), EventError> {
             return Err(invalid("ext.epoch must be an integer from 0 to 2^53 - 1"));
         }
     } else {
-        if raw.net.starts_with(RING_NET_PREFIX) {
-            return Err(invalid("submit net must not be a ring"));
+        if raw.net.starts_with(PRIVATE_NET_PREFIX) {
+            return Err(invalid("submit net must not be a private network"));
         }
         check_keys(ext, &["to"], "ext")?;
         if !ext
@@ -302,9 +302,9 @@ pub fn sign_v2(key: &SigningKey, id: &[u8; 32]) -> [u8; 64] {
 }
 
 /// The group signature of a `sealed` event, with the epoch's group key.
-pub fn sign_ring(group: &SigningKey, id: &[u8; 32]) -> [u8; 64] {
+pub fn sign_group(group: &SigningKey, id: &[u8; 32]) -> [u8; 64] {
     group
-        .sign(&prefixed_message(RING_SIG_PREFIX, id))
+        .sign(&prefixed_message(GROUP_SIG_PREFIX, id))
         .to_bytes()
 }
 
@@ -313,7 +313,7 @@ pub fn sign_ring(group: &SigningKey, id: &[u8; 32]) -> [u8; 64] {
 pub fn v2_sig(author: &SigningKey, group: Option<&SigningKey>, id: &[u8; 32]) -> String {
     let mut sig = hex::encode(sign_v2(author, id));
     if let Some(group) = group {
-        sig.push_str(&hex::encode(sign_ring(group, id)));
+        sig.push_str(&hex::encode(sign_group(group, id)));
     }
     sig
 }
@@ -382,7 +382,7 @@ mod tests {
     fn sealed_parts() -> (Map<String, Value>, Map<String, Value>) {
         (
             obj(
-                json!({"v": 2, "ts": 1_760_800_000u64, "net": format!("ring:{}", "cd".repeat(16)),
+                json!({"v": 2, "ts": 1_760_800_000u64, "net": format!("private:{}", "cd".repeat(16)),
                        "thread": null, "parent": null, "refs": [], "kind": "sealed",
                        "ext": {"epoch": 3}}),
             ),
@@ -508,20 +508,20 @@ mod tests {
         }
         rejected(true, |h, _| h["net"] = json!("public"));
         rejected(true, |h, _| {
-            h["net"] = json!(format!("ring:{}", "cd".repeat(15)))
+            h["net"] = json!(format!("private:{}", "cd".repeat(15)))
         });
         rejected(true, |h, _| h["ext"] = json!({}));
         rejected(true, |h, _| h["ext"] = json!({"epoch": -1}));
         rejected(true, |h, _| h["ext"] = json!({"epoch": "3"}));
         rejected(false, |h, _| {
-            h["net"] = json!(format!("ring:{}", "cd".repeat(16)))
+            h["net"] = json!(format!("private:{}", "cd".repeat(16)))
         });
         rejected(false, |h, _| h["ext"] = json!({"to": "inbox:ABAB"}));
         rejected(false, |h, _| {
             h["ext"] = json!({"to": format!("inbox:{}", "AB".repeat(16))})
         });
         rejected(false, |h, _| {
-            h["ext"] = json!({"to": format!("ring:{}", "ab".repeat(16))})
+            h["ext"] = json!({"to": format!("private:{}", "ab".repeat(16))})
         });
         // epoch at its bounds.
         assert!(with(true, |h, _| h["ext"] = json!({"epoch": 0})).is_ok());
@@ -573,7 +573,7 @@ mod tests {
         // The author signature alone is not enough for sealed.
         assert!(check(&s, hex::encode(sign_v2(&author(), &id))).is_err());
         // The group signature is shape only: any key, any message, S < l.
-        let other = hex::encode(sign_ring(&author(), &[0; 32]));
+        let other = hex::encode(sign_group(&author(), &[0; 32]));
         assert!(
             check(
                 &s,

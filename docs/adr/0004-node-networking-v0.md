@@ -7,7 +7,7 @@ Code: `crates/wats/src/node.rs`.
 
 ## Decision
 
-- **Public network id**: `"public"` (ring zero, SPEC §2.4).
+- **Public network id**: `"public"` (SPEC §2.4).
 - **Gossip topics**: one Iroh gossip topic per network,
   `TopicId = BLAKE3 derive_key("wearetheswarm 2026-10-15 gossip topic v1", net)`.
   Every node joins the whole public network (SPEC §2.6 "full replication").

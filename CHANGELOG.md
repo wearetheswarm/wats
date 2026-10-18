@@ -32,7 +32,7 @@ nodes.
   events, plus 4 bits for authors a node has known for less than a day (one
   fewer per day), on live events only. `--pow-bits` and `--min-pow-bits` set a
   flat difficulty.
-- **Event v2** (ADR 0015): kinds `sealed` (private rings, later) and `submit`
+- **Event v2** (ADR 0015): kinds `sealed` (private networks, later) and `submit`
   (sealed inbox) are validated without decrypting. v2 events are stored and
   relayed, never shown.
 - **Hardened v1 format** (ADR 0010 addenda): mandatory back-signature on
