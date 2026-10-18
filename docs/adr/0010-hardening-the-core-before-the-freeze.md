@@ -405,6 +405,34 @@ another core change.
   header with everything but the payload. Its work is then the puzzle's,
   not the leading zero bits of `id`. `b3` needs no challenge: its nonce is
   hashed into `id` directly.
+- **Policy** (`event.rs` `POW_SCHEDULE`, `node.rs` `policy_pow_bits`).
+  Like all of this section's policy, it is not validity:
+  - **Base difficulty: 21 bits** for `b3`, about 1 s of mining on a
+    mid-range laptop. Measured on 2026-10-18 at 3.4 million attempts a
+    second on one core of an Apple M4 Pro, for a short post and a 6 KiB
+    one alike (mining hashes the header, whose size does not depend on
+    the body). That is 0.6 s for 21 bits there, and about 1 s on a laptop
+    half as fast. Size still adds one bit per doubling above 4 KiB.
+  - **Keyed to the event's `ts`.** The base comes from a schedule of
+    `(from ts, bits)` entries. A raise appends an entry with a future
+    `ts`, so events published before it keep the requirement of their
+    time and are never rejected afterwards, by any node, during sync. A
+    publisher who backdates `ts` pays at most the price of the previous
+    entry; a raise therefore protects from its date on, not
+    retroactively.
+  - **New authors: +4 bits**, one bit fewer per day the receiving node has
+    known the author, i.e. since it first stored one of the author's
+    events. The bits apply to events pushed to the node (gossip, replicate
+    requests, local publishes), not to the history it pulls with sync,
+    which keeps the price of its time.
+    - Publishers mine for how long their own node has known their author.
+    - A node that is itself new requires the extra bits from established
+      authors for a few days. It may then refuse some of their live posts,
+      which it gets back by sync.
+    - A reputation-based rule can replace the age-based one later without
+      a format change.
+  - `--pow-bits` and `--min-pow-bits` replace the schedule and the
+    new-author bits with a flat difficulty, for tests and private networks.
 - **Vectors**: accept an unknown algorithm (opaque) and a `b3` with a
   non-decimal payload. Reject a bare decimal nonce, an empty `alg` or
   payload, an uppercase or 17-char `alg`, a payload with `+`, `/` or `=`,

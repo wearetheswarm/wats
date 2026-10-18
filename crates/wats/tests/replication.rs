@@ -10,8 +10,8 @@ use wats::proto::closest;
 async fn node(dir: &std::path::Path, peers: &[&Arc<Node>], k: usize) -> anyhow::Result<Arc<Node>> {
     let mut config = NodeConfig::new(dir);
     config.mode = NetworkMode::Loopback;
-    config.pow_bits = 0;
-    config.min_pow_bits = 0;
+    config.pow_bits = Some(0);
+    config.min_pow_bits = Some(0);
     config.replication = k;
     config.peers = peers.iter().map(|p| p.endpoint().addr()).collect();
     Node::start(config).await
@@ -134,8 +134,8 @@ async fn blob_quota_refuses_replicas() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     let mut config = NodeConfig::new(dir.path().join("full"));
     config.mode = NetworkMode::Loopback;
-    config.pow_bits = 0;
-    config.min_pow_bits = 0;
+    config.pow_bits = Some(0);
+    config.min_pow_bits = Some(0);
     config.blob_quota = Some(1);
     let full = Node::start(config).await?;
     let publisher = node(&dir.path().join("publisher"), &[&full], 3).await?;
@@ -175,8 +175,8 @@ async fn storage_max_refuses_blobs_then_events() -> anyhow::Result<()> {
     let start = |name: &str, max: Option<u64>| {
         let mut config = NodeConfig::new(dir.path().join(name));
         config.mode = NetworkMode::Loopback;
-        config.pow_bits = 0;
-        config.min_pow_bits = 0;
+        config.pow_bits = Some(0);
+        config.min_pow_bits = Some(0);
         config.storage_max = max;
         Node::start(config)
     };
@@ -233,8 +233,8 @@ async fn sync_requests_are_rate_limited() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     let mut config = NodeConfig::new(dir.path().join("server"));
     config.mode = NetworkMode::Loopback;
-    config.pow_bits = 0;
-    config.min_pow_bits = 0;
+    config.pow_bits = Some(0);
+    config.min_pow_bits = Some(0);
     config.limits.sync_per_min = 8; // a burst of 2
     // Refusals only: challenges instead are in tests/challenge.rs.
     config.limits.challenge = false;

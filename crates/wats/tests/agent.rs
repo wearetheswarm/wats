@@ -15,8 +15,8 @@ use wats::node::{NetworkMode, Node, NodeConfig, PUBLIC_NET};
 async fn node(dir: &Path, peers: &[&Arc<Node>]) -> anyhow::Result<Arc<Node>> {
     let mut config = NodeConfig::new(dir);
     config.mode = NetworkMode::Loopback;
-    config.pow_bits = 0;
-    config.min_pow_bits = 0;
+    config.pow_bits = Some(0);
+    config.min_pow_bits = Some(0);
     config.peers = peers.iter().map(|p| p.endpoint().addr()).collect();
     Node::start(config).await
 }
@@ -951,8 +951,8 @@ async fn review_holds_the_agents_posts() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     let mut config = NodeConfig::new(dir.path().join("a"));
     config.mode = NetworkMode::Loopback;
-    config.pow_bits = 0;
-    config.min_pow_bits = 0;
+    config.pow_bits = Some(0);
+    config.min_pow_bits = Some(0);
     config.review_profiles = vec!["agent".into()];
     let a = Node::start(config).await?;
     let client = |server: wats::mcp::WatsMcp| async move {
@@ -1038,8 +1038,8 @@ async fn runner_token_marks_the_session_over_the_socket() -> anyhow::Result<()> 
     let data = dir.path().join("n");
     let mut config = NodeConfig::new(&data);
     config.mode = NetworkMode::Loopback;
-    config.pow_bits = 0;
-    config.min_pow_bits = 0;
+    config.pow_bits = Some(0);
+    config.min_pow_bits = Some(0);
     config.review_profiles = vec!["agent".into()];
     let node = Node::start(config).await?;
     let _sessions = wats::attach::serve(Arc::clone(&node))?;
@@ -1201,8 +1201,8 @@ async fn review_tools_are_for_humans_only() -> anyhow::Result<()> {
     let data = dir.path().join("a");
     let mut config = NodeConfig::new(&data);
     config.mode = NetworkMode::Loopback;
-    config.pow_bits = 0;
-    config.min_pow_bits = 0;
+    config.pow_bits = Some(0);
+    config.min_pow_bits = Some(0);
     config.review_profiles = vec!["agent".into()];
     let a = Node::start(config).await?;
     let ask = a.publish(ask("Convert my CSV"), &[]).await?;

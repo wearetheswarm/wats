@@ -329,6 +329,36 @@ pub fn parse_hex<const N: usize>(s: &str, what: &str) -> Result<[u8; N], EventEr
     Ok(out)
 }
 
+/// The network's base difficulty for `b3`, keyed to the event's `ts`
+/// (ADR 0010, PoW policy): `(from ts, bits)`, ascending. A raise appends an
+/// entry with a future `ts`, so events published before it keep the
+/// requirement of their time and are never rejected afterwards. 21 bits is
+/// about 1 s of mining on a mid-range laptop (measured: 3.4 million
+/// attempts a second on one core of an Apple M4 Pro, about 0.6 s).
+pub const POW_SCHEDULE: &[(u64, u32)] = &[(0, 21)];
+/// Extra bits required on live events from authors a node has known for
+/// less than a day, one bit fewer per day known.
+pub const NEW_AUTHOR_EXTRA_BITS: u32 = 4;
+const NEW_AUTHOR_DECAY_SECS: u64 = 24 * 3600;
+
+/// The base difficulty of `schedule` (e.g. [`POW_SCHEDULE`]) for an event
+/// of time `ts`.
+pub fn scheduled_pow_bits(schedule: &[(u64, u32)], ts: u64) -> u32 {
+    schedule
+        .iter()
+        .rev()
+        .find(|(from, _)| *from <= ts)
+        .map_or(0, |(_, bits)| *bits)
+}
+
+/// Extra bits for an author this node has known for `known_for` seconds
+/// (`None`: never seen): [`NEW_AUTHOR_EXTRA_BITS`], minus one per day.
+pub fn new_author_extra_bits(known_for: Option<u64>) -> u32 {
+    let days = known_for.map_or(0, |s| s / NEW_AUTHOR_DECAY_SECS);
+    let days = u32::try_from(days).unwrap_or(u32::MAX);
+    NEW_AUTHOR_EXTRA_BITS.saturating_sub(days)
+}
+
 /// Proof of work a receiver requires for an event of `size` canonical
 /// bytes: `base` bits, plus one bit per doubling above 4 KiB, i.e.
 /// `base + max(0, ceil(log2(size / 4096)))` (ADR 0010, limits). Node
@@ -1265,6 +1295,31 @@ mod tests {
             ..draft()
         })
         .unwrap();
+    }
+
+    #[test]
+    fn pow_schedule_and_new_authors() {
+        assert_eq!(scheduled_pow_bits(POW_SCHEDULE, 0), 21);
+        assert_eq!(scheduled_pow_bits(POW_SCHEDULE, 1_800_000_000), 21);
+        let raised = [(0, 21), (1_900_000_000, 23)];
+        assert_eq!(
+            scheduled_pow_bits(&raised, 1_899_999_999),
+            21,
+            "older events keep their price"
+        );
+        assert_eq!(scheduled_pow_bits(&raised, 1_900_000_000), 23);
+        assert_eq!(scheduled_pow_bits(&[], 5), 0);
+        assert_eq!(new_author_extra_bits(None), 4);
+        assert_eq!(new_author_extra_bits(Some(0)), 4);
+        assert_eq!(new_author_extra_bits(Some(86_399)), 4);
+        assert_eq!(new_author_extra_bits(Some(86_400)), 3);
+        assert_eq!(new_author_extra_bits(Some(3 * 86_400)), 1);
+        assert_eq!(new_author_extra_bits(Some(4 * 86_400)), 0);
+        assert_eq!(new_author_extra_bits(Some(u64::MAX)), 0);
+        assert!(
+            POW_SCHEDULE.windows(2).all(|w| w[0].0 < w[1].0),
+            "ascending"
+        );
     }
 
     #[test]
