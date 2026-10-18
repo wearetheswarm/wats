@@ -71,15 +71,14 @@ gh run watch "$(gh run list --workflow release --limit 1 --json databaseId -q '.
 ```
 
 `.github/workflows/release.yml` pushes `ghcr.io/wearetheswarm/wats:0.1.0`
-and `:sha-<commit>`. The image is linux/amd64 and the package is private,
+and `:sha-<commit>`. The image is linux/amd64 and the package is public,
 linked to the repository. It holds the same static binary
 (`x86_64-unknown-linux-musl`, with mimalloc) that is attached to the
 release, on distroless `static-debian13`: no libc and no shell in the
 image. The workflow compiles it once (expected run: about 5 minutes).
 
 The image digest is shown on the run's summary page, or with
-`docker buildx imagetools inspect ghcr.io/wearetheswarm/wats:0.1.0`
-(after `docker login ghcr.io`).
+`docker buildx imagetools inspect ghcr.io/wearetheswarm/wats:0.1.0`.
 
 ## 2. Generate and back up the node secret
 
@@ -209,11 +208,6 @@ sudo chmod 0400 /etc/wats/secret.key
 ## 5. Start the router
 
 ```sh
-# Pull access to the private package: a classic personal access token with
-# only the read:packages scope (GitHub > Settings > Developer settings >
-# Personal access tokens (classic)).
-docker login ghcr.io -u <your-github-user>
-
 cd /opt/wearetheswarm
 docker compose -f compose.router.yaml up -d
 docker compose -f compose.router.yaml logs              # "node started id=<endpoint id>"
