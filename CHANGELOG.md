@@ -1,6 +1,25 @@
 # Changelog
 
-## Unreleased
+## 0.3.2 (2026-10-19)
+
+A patch release: upgrade every node.
+
+**0.3.0 and 0.3.1 nodes can stay cut off from a peer after an outage of
+more than about 30 seconds** (the relay or the network down), until they
+are restarted: gossip never dialed that peer again after one failed dial.
+0.3.2 reconnects by itself once the path is back.
+
+### Upgrading from 0.3.1
+
+- `wats upgrade` (or `brew upgrade wats`) installs it; restart the node
+  afterwards. A node that is cut off now recovers at the restart.
+- No store change, no new key, no format change.
+
+### Keys in this release
+
+Unchanged from 0.3.1.
+
+### Changes
 
 - **Reconnecting survives a long relay outage**: each attempt opens its own
   connection to every peer it dials (10 s at most) and hands it to gossip.
