@@ -65,6 +65,20 @@ pub enum NetworkMode {
     Internet,
     /// Loopback only, no relays, no DNS: for tests and local demos.
     Loopback,
+    /// Test only: no IP transport and no address lookup; peers are reached
+    /// only through the relay at `http://127.0.0.1:<port>` (plain HTTP:
+    /// the relayed QUIC traffic is end-to-end encrypted anyway). For
+    /// hermetic chaos tests where the relay is load-bearing. Never set
+    /// from the command line.
+    LocalRelay { port: u16 },
+}
+
+impl NetworkMode {
+    /// Whether the node stays on this machine (loopback or a local relay):
+    /// no infrastructure services, no peer reached through the Internet.
+    pub fn is_local(self) -> bool {
+        matches!(self, NetworkMode::Loopback | NetworkMode::LocalRelay { .. })
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -847,6 +861,12 @@ impl Node {
             NetworkMode::Loopback => Endpoint::builder(presets::Minimal)
                 .clear_ip_transports()
                 .bind_addr((std::net::Ipv4Addr::LOCALHOST, port))?,
+            NetworkMode::LocalRelay { port: relay_port } => {
+                let url: iroh::RelayUrl = format!("http://127.0.0.1:{relay_port}").parse()?;
+                Endpoint::builder(presets::Minimal)
+                    .clear_ip_transports()
+                    .relay_mode(iroh::RelayMode::Custom(url.into()))
+            }
         };
         for addr in &config.external_addrs {
             builder = builder.external_addr(*addr);
@@ -862,7 +882,7 @@ impl Node {
         // Peers met before come first (B1); the built-in bootstrap nodes
         // are dialed now only when there are none.
         let mut cached = crate::peer_cache::load(&config.data_dir, endpoint.id(), now_secs());
-        if config.mode == NetworkMode::Loopback {
+        if config.mode.is_local() {
             // Hermetic: never dial what is not on this machine.
             cached = crate::peer_cache::loopback_only(cached);
         }
@@ -887,7 +907,7 @@ impl Node {
             .filter(|id| *id != endpoint.id())
             .collect();
         let health = crate::health::Health::new(crate::health::Plan::new(
-            config.mode == NetworkMode::Loopback,
+            config.mode.is_local(),
             config.infra,
             seed_ids.len(),
             cached.len(),
@@ -1020,10 +1040,7 @@ impl Node {
                 }
             }));
         }
-        if crate::update::may_check(
-            &node.config.update,
-            node.config.mode == NetworkMode::Loopback,
-        ) {
+        if crate::update::may_check(&node.config.update, node.config.mode.is_local()) {
             let (policy, dir) = (node.config.update.clone(), node.config.data_dir.clone());
             let weak = Arc::downgrade(&node);
             tokio::spawn(supervise("update check", move || {
@@ -1113,7 +1130,7 @@ impl Node {
     /// The peer cache, as this node may dial it.
     fn cached_peers(&self) -> Vec<crate::peer_cache::CachedPeer> {
         let cached = crate::peer_cache::load(&self.config.data_dir, self.endpoint_id(), now_secs());
-        if self.config.mode == NetworkMode::Loopback {
+        if self.config.mode.is_local() {
             crate::peer_cache::loopback_only(cached)
         } else {
             cached
@@ -1199,7 +1216,8 @@ impl Node {
             let weak = weak.clone();
             async move { reconnect_loop(weak).await }
         }));
-        if self.config.mode != NetworkMode::Internet {
+        // Loopback: fixed addresses and no relay, nothing to watch.
+        if self.config.mode == NetworkMode::Loopback {
             return;
         }
         let weak = Arc::downgrade(self);
@@ -1332,7 +1350,7 @@ impl Node {
             } else {
                 let mut cached =
                     crate::peer_cache::load(&self.config.data_dir, self.endpoint_id(), now_secs());
-                if self.config.mode == NetworkMode::Loopback {
+                if self.config.mode.is_local() {
                     cached = crate::peer_cache::loopback_only(cached);
                 }
                 cached.iter().map(|p| p.last_seen).max()

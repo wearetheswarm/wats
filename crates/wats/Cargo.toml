@@ -53,6 +53,9 @@ tar = { version = "=0.4.46", default-features = false }
 hpke = { version = "=0.14.1", default-features = false, features = ["alloc", "getrandom", "x25519", "mlkem", "chacha"] }
 
 [dev-dependencies]
+# A local relay server for the relay chaos test (tests/reconnect.rs). Never
+# a normal dependency: the shipped binary has no relay server.
+iroh-relay = { version = "=1.3.0", default-features = false, features = ["server"] }
 rmcp = { version = "=3.5.1", features = ["client", "transport-child-process"] }
 tempfile = "=3.27.0"
 
