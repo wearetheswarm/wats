@@ -1,9 +1,7 @@
 name: ci
 
-# Budget mode while the repo is private (GitHub Free: 2,000 min/month,
-# macOS billed 10x): Linux runs on pull requests and pushes to main
-# (docs-only pushes skipped); macOS runs only on manual dispatch and on a
-# weekly schedule. Restore macOS on pull requests once the repo is public.
+# Linux and macOS on pull requests and pushes to main (docs-only pushes
+# skipped), plus a weekly run that catches toolchain and dependency drift.
 
 on:
   push:
@@ -16,7 +14,7 @@ on:
   pull_request:
   workflow_dispatch:
   schedule:
-    # Weekly macOS run, Monday 06:00 UTC.
+    # Weekly run, Monday 06:00 UTC.
     - cron: "0 6 * * 1"
 
 permissions:
@@ -35,9 +33,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: ${{ fromJSON((github.event_name == 'workflow_dispatch' || github.event_name == 'schedule') && '["ubuntu-latest", "macos-latest"]' || '["ubuntu-latest"]') }}
+        os: [ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 15
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - name: Install toolchain (from rust-toolchain.toml)

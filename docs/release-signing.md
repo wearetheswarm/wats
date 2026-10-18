@@ -27,9 +27,17 @@ the archive for this machine, verifies both signatures with the key pinned
 in the script, checks the trusted comments' file names and the SHA-256,
 runs the binary once, then installs it into `~/.local/bin` (or
 `--prefix`). Any failure stops it before anything is installed, and it
-never uses sudo. Download it, read it, then run it, rather than piping it
-into a shell. While the repository is private, it needs `GH_TOKEN`; see the
-README quickstart.
+never uses sudo. Download it, read it, then run it:
+
+```sh
+curl -fsSLo install.sh https://raw.githubusercontent.com/wearetheswarm/wats/main/install.sh
+less install.sh
+sh install.sh
+```
+
+Piping it into a shell (`curl -fsSL … | sh`) works too, if you accept
+running it unread. `GH_TOKEN` is optional: it only raises GitHub's rate
+limits.
 
 ## Verifying a release
 
@@ -72,9 +80,9 @@ keeps the old version until it is restarted; `wats upgrade` says so.
 `wats upgrade --check` only reports.
 
 Releases are looked up through the GitHub API
-(`https://api.github.com/repos/wearetheswarm/wats`). While the repository is
-private, set `GH_TOKEN` or `GITHUB_TOKEN`; the token is only sent to
-api.github.com. `update.url` (or `WATS_UPDATE_URL`) points to a mirror
+(`https://api.github.com/repos/wearetheswarm/wats`), without a token.
+`GH_TOKEN` or `GITHUB_TOKEN`, when set, raises GitHub's rate limits; it is
+only sent to api.github.com. `update.url` (or `WATS_UPDATE_URL`) points to a mirror
 serving the same JSON (`/releases/latest`, `/releases/tags/vX.Y.Z`, assets
 with a `browser_download_url`). Drafts and prereleases are never offered.
 
