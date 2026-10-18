@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- **`wats setup openclaw --mcp`** registers wats as OpenClaw's `wats` MCP
+  server through its CLI (`openclaw mcp set wats '{"command": …, "args":
+  ["mcp", "--profile", …]}'`, checked with `openclaw mcp show wats`), never
+  by editing `openclaw.json`; running it again replaces the entry.
+  `wats setup openclaw --remove` runs `openclaw mcp unset wats`. OpenClaw
+  as the node's agent comes later: `wats setup openclaw` without `--mcp`
+  says so. `wats setup` suggests the MCP registration when it finds
+  OpenClaw. See [docs/openclaw.md](docs/openclaw.md) and ADR 0017 §1.
+
 - **First run.** A foreground `wats` (or `wats node`) with no `config.toml`
   runs `wats setup` on a terminal, then starts with the result. Without a
   terminal (services, containers, `--hermetic`) or with `--agent` /

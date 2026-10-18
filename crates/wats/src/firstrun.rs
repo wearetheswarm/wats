@@ -34,6 +34,11 @@ pub const NO_AGENT_FOUND: &str = "No agent CLI found: install Claude Code \
 (https://claude.com/claude-code) or Codex (https://github.com/openai/codex), then run \
 `wats setup` again.";
 
+/// Shown by setup when OpenClaw is on `PATH`: it cannot be the node's
+/// agent yet, but its agents can use the wats tools.
+pub const OPENCLAW_MCP_HINT: &str = "OpenClaw found: to reach the swarm from your OpenClaw \
+agents, register wats as its MCP server: wats setup openclaw --mcp";
+
 /// The questions after the agent runtime, in order: storage, the agent's
 /// limits (only asked when it runs an agent), networks.
 const QUESTIONS: [(&str, &str, bool); 6] = [
@@ -175,9 +180,10 @@ fn ask_runtime(
             } else {
                 writeln!(
                     out,
-                    "  -  {:<9} {} (not supported yet)",
+                    "  -  {:<9} {} (agent: not supported yet; MCP: wats setup {} --mcp)",
                     f.name,
-                    f.path.display()
+                    f.path.display(),
+                    f.name
                 )?;
             }
         }
@@ -404,6 +410,9 @@ pub fn setup(
         }
         None => writeln!(out, "{NO_AGENT_NOTICE}")?,
     }
+    if found.iter().any(|f| f.name == "openclaw") {
+        writeln!(out, "{OPENCLAW_MCP_HINT}")?;
+    }
     Ok(choices)
 }
 
@@ -446,6 +455,30 @@ mod tests {
         );
         assert!(found[0].supported() && !found[1].supported());
         assert!(detect_agents(None).is_empty());
+    }
+
+    /// OpenClaw on PATH: setup offers its MCP registration, whatever agent
+    /// the node runs.
+    #[cfg(unix)]
+    #[test]
+    fn setup_offers_openclaw_mcp() {
+        let bin = tempfile::tempdir().unwrap();
+        fake_cli(bin.path(), "codex");
+        fake_cli(bin.path(), "openclaw");
+        let path = std::env::join_paths([bin.path()]).unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let mut out = Vec::new();
+        let choices = setup(data.path(), &mut "".as_bytes(), &mut out, Some(&path)).unwrap();
+        let said = String::from_utf8(out).unwrap();
+        assert_eq!(choices.runtime.as_deref(), Some("codex"));
+        assert!(said.contains("wats setup codex --mcp"), "{said}");
+        assert!(said.contains(OPENCLAW_MCP_HINT), "{said}");
+        // Without OpenClaw, no hint.
+        std::fs::remove_file(bin.path().join("openclaw")).unwrap();
+        let mut out = Vec::new();
+        setup(data.path(), &mut "".as_bytes(), &mut out, Some(&path)).unwrap();
+        let said = String::from_utf8(out).unwrap();
+        assert!(!said.contains("openclaw"), "{said}");
     }
 
     fn run(found: &[Found], settings: &Settings, input: &str) -> (Choices, String) {
@@ -524,7 +557,10 @@ mod tests {
     fn no_supported_agent_found() {
         let (choices, said) = run(&found(&["openclaw"]), &Settings::default(), "");
         assert!(said.contains("openclaw"), "{said}");
-        assert!(said.contains("(not supported yet)"), "{said}");
+        assert!(
+            said.contains("(agent: not supported yet; MCP: wats setup openclaw --mcp)"),
+            "{said}"
+        );
         assert!(said.contains(NO_AGENT_FOUND), "{said}");
         assert_eq!(choices.runtime, None);
         // No agent: no agent limits asked.

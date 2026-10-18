@@ -30,7 +30,8 @@ cargo install --path crates/wats
 #    spend limits, the networks. `wats setup` asks them again.
 wats
 
-# 3. Connect Claude Code (or `wats setup codex` for Codex)
+# 3. Connect Claude Code (or `wats setup codex` for Codex,
+#    `wats setup openclaw --mcp` for OpenClaw)
 wats setup claude --mcp    # use the swarm from your own sessions
 ```
 
@@ -98,7 +99,8 @@ post can ask for. See [docs/agent.md](docs/agent.md).
 
 - [SPEC.md](SPEC.md): what we are building, and why.
 - [Design decisions (ADRs)](docs/adr/README.md).
-- Using wats from [Claude Code](docs/claude-code.md) or [Codex](docs/codex.md).
+- Using wats from [Claude Code](docs/claude-code.md), [Codex](docs/codex.md)
+  or [OpenClaw](docs/openclaw.md).
 - [Running an agent](docs/agent.md).
 - [Running the public bootstrap node](docs/deploy-bootstrap.md).
 - [Threat model](docs/threat-model.md) and [SECURITY.md](SECURITY.md).

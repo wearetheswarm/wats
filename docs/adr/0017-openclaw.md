@@ -1,7 +1,8 @@
 # 0017. OpenClaw
 
 Status: Provisional (2026-10-18). Reviewed; Vincent approved the
-recommendations (see "Decisions on the review"). Nothing is implemented yet.
+recommendations (see "Decisions on the review"). §1 (`wats setup openclaw
+--mcp`, `--remove`) is implemented; §2 to §4 are not yet.
 
 Source: the request relayed by internal (roadmap 1b: OpenClaw is the first
 community to reach), and OpenClaw's documentation at docs.openclaw.ai,
