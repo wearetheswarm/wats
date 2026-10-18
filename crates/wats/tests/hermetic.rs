@@ -242,9 +242,10 @@ fn setup_detects_agent_clis_on_path() {
     let said = setup(&data, &bin);
     assert!(said.contains("1) codex"), "{said}");
     assert!(
-        said.contains("openclaw") && said.contains("(not supported yet)"),
+        said.contains("openclaw") && said.contains("(agent: not supported yet;"),
         "{said}"
     );
+    assert!(said.contains("wats setup openclaw --mcp"), "{said}");
     assert!(!said.contains("claude "), "{said}");
     assert!(
         said.contains("Agent the node runs (agent.runtime) [codex]"),
@@ -264,6 +265,138 @@ fn setup_detects_agent_clis_on_path() {
     );
     assert!(said.contains("This node runs no agent"), "{said}");
 }
+
+/// `wats setup openclaw`: through OpenClaw's CLI only (a fake `openclaw`
+/// on PATH that records its arguments and keeps the entry in a file).
+/// `--mcp` sends `mcp set wats <json>` then `mcp show wats`, again on a
+/// second run; `--remove` sends `mcp unset wats`; no flag points to
+/// `--mcp`; a missing CLI gets the install hint; a failing `mcp set`
+/// gives its stderr and a non-zero exit.
+#[test]
+fn setup_openclaw_mcp_through_its_cli() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let bin = dir.path().join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let log = dir.path().join("calls.log");
+    let entry = dir.path().join("entry.json");
+    let fail = dir.path().join("fail");
+    let fake = bin.join("openclaw");
+    std::fs::write(
+        &fake,
+        format!(
+            "#!/bin/sh\n\
+             printf '%s\\n' \"$@\" >> {log}\necho --- >> {log}\n\
+             case \"$2\" in\n\
+             set) if [ -f {fail} ]; then echo 'Error: invalid MCP server config' >&2; exit 3; fi\n\
+                  printf '%s\\n' \"$4\" > {entry};;\n\
+             show) [ -f {entry} ] || {{ echo 'No MCP server named wats' >&2; exit 1; }}; cat {entry};;\n\
+             unset) rm -f {entry};;\n\
+             esac\n",
+            log = log.display(),
+            entry = entry.display(),
+            fail = fail.display(),
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let data = dir.path().join("data");
+    let path_with = format!("{}:/bin:/usr/bin", bin.display());
+    let setup = |path: &str, args: &[&str]| {
+        std::process::Command::new(env!("CARGO_BIN_EXE_wats"))
+            .env("WATS_HERMETIC", "1")
+            .env("HOME", dir.path())
+            .env("PATH", path)
+            .env("USER", "alice")
+            .env_remove("WATS_PROFILE")
+            .env_remove("WATS_OPENCLAW")
+            .arg("--dir")
+            .arg(&data)
+            .arg("setup")
+            .arg("openclaw")
+            .args(args)
+            .output()
+            .unwrap()
+    };
+    let calls = || -> Vec<Vec<String>> {
+        std::fs::read_to_string(&log)
+            .unwrap_or_default()
+            .split("---\n")
+            .filter(|c| !c.is_empty())
+            .map(|c| c.lines().map(str::to_string).collect())
+            .collect()
+    };
+    let exe = std::fs::canonicalize(env!("CARGO_BIN_EXE_wats")).unwrap();
+    let expected = serde_json::json!({
+        "command": exe,
+        "args": ["--dir", data, "mcp", "--profile", "alice"],
+    });
+
+    let out = setup(&path_with, &["--mcp"]);
+    let said = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "{out:?}");
+    assert!(
+        said.contains("OpenClaw: wats MCP server set (profile alice)"),
+        "{said}"
+    );
+    assert!(said.contains("checked: `openclaw mcp show wats`"), "{said}");
+    let first = calls();
+    assert_eq!(first.len(), 2, "{first:?}");
+    assert_eq!(first[0][..3], ["mcp", "set", "wats"], "{first:?}");
+    assert_eq!(first[0].len(), 4, "{first:?}");
+    let sent: serde_json::Value = serde_json::from_str(&first[0][3]).unwrap();
+    assert_eq!(sent, expected);
+    assert_eq!(first[1], ["mcp", "show", "wats"]);
+
+    // Again: the entry is set again (OpenClaw replaces it).
+    let out = setup(&path_with, &["--mcp"]);
+    assert!(out.status.success(), "{out:?}");
+    let again = calls();
+    assert_eq!(again.len(), 4, "{again:?}");
+    assert_eq!(again[2], first[0]);
+    let kept: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&entry).unwrap()).unwrap();
+    assert_eq!(kept, expected);
+
+    // --remove.
+    let out = setup(&path_with, &["--remove"]);
+    assert!(out.status.success(), "{out:?}");
+    assert!(String::from_utf8_lossy(&out.stdout).contains("removed"));
+    assert_eq!(calls().last().unwrap(), &["mcp", "unset", "wats"]);
+    assert!(!entry.exists());
+
+    // No flag: the agent half is not there yet; OpenClaw is not run.
+    let before = calls().len();
+    let out = setup(&path_with, &[]);
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success());
+    assert!(
+        err.contains("later version") && err.contains("wats setup openclaw --mcp"),
+        "{err}"
+    );
+    assert_eq!(calls().len(), before);
+
+    // Not on PATH.
+    let out = setup("/bin:/usr/bin", &["--mcp"]);
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success());
+    assert!(
+        err.contains("OpenClaw CLI not found") && err.contains("https://docs.openclaw.ai"),
+        "{err}"
+    );
+
+    // `mcp set` fails: its stderr, a non-zero exit, no `mcp show`.
+    std::fs::write(&fail, "").unwrap();
+    let before = calls().len();
+    let out = setup(&path_with, &["--mcp"]);
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success());
+    assert!(err.contains("`openclaw mcp set wats` failed"), "{err}");
+    assert!(err.contains("Error: invalid MCP server config"), "{err}");
+    let after = calls();
+    assert_eq!(after.len(), before + 1, "{after:?}");
+}
+
 /// `wats` with `stdin` written to its standard input.
 fn wats_stdin(data: &std::path::Path, args: &[&str], stdin: &[u8]) -> std::process::Output {
     use std::io::Write;
