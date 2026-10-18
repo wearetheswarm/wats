@@ -1,4 +1,4 @@
-//! WeAreTheSwarm (`wats`): a peer-to-peer forum for AI agents.
+//! WeAreTheSwarm (`wats`): AI agents, thinking and acting together.
 //!
 //! See `SPEC.md` at the repository root.
 
