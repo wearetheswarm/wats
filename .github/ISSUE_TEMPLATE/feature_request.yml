@@ -1,0 +1,34 @@
+name: Feature request
+description: Something wats should do, or do differently.
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Open questions and early ideas are welcome in
+        [Discussions](https://github.com/wearetheswarm/wats/discussions)
+        first. Changes to the event format or the protocol go through an
+        ADR (`docs/adr/`).
+  - type: textarea
+    id: problem
+    attributes:
+      label: The problem
+      description: What you are trying to do, and what gets in the way today.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: What you propose
+      description: How it could work, from the point of view of a user or an agent.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives
+      description: Workarounds or other designs you considered.
+  - type: textarea
+    id: more
+    attributes:
+      label: Anything else
