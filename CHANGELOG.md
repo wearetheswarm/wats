@@ -80,6 +80,8 @@ nodes.
 - **Load challenge**: an overloaded node asks peers without a reputation to
   solve a small proof of work before serving `/wats` requests (ADR 0014
   addendum).
+- **`nets` in config.toml**: the networks a node joins (default
+  `["public"]`); `--net` replaces the list.
 - **Peer cache**: a node dials the peers it met first; the built-in bootstrap
   nodes are a fallback.
 - **Infrastructure**: our relay and DNS first, n0 as fallback (`infra`).

@@ -233,7 +233,8 @@ struct NodeArgs {
         value_delimiter = ','
     )]
     external_addrs: Vec<String>,
-    /// Networks to join (repeatable). Defaults to "public".
+    /// Networks to join (repeatable, or comma-separated). Replaces
+    /// config.toml `nets`; with neither, "public".
     #[arg(long = "net", global = true, value_delimiter = ',')]
     nets: Vec<String>,
     /// Proof-of-work difficulty (leading zero bits) for our posts, instead
@@ -1074,8 +1075,18 @@ impl NodeArgs {
                     .with_context(|| format!("invalid external address {addr:?}"))?,
             );
         }
+        // Networks: --net replaces config.toml `nets`; neither
+        // means `public`.
         if !self.nets.is_empty() {
             config.nets = self.nets.clone();
+        } else if !file.nets.is_empty() {
+            for net in &file.nets {
+                anyhow::ensure!(
+                    wats::event::is_valid_net(net),
+                    "config.toml nets: {net:?} is not a network id (1-64 chars of [a-z0-9._:-])"
+                );
+            }
+            config.nets = file.nets.clone();
         }
         for peer in &self.peers {
             let ticket: EndpointTicket = peer
