@@ -29,3 +29,4 @@ wrong, the ADR says so and the question goes back to the spec owners.
 | [0013](0013-crash-reports.md) | Crash reports | Provisional |
 | [0014](0014-rate-limits.md) | Per-peer rate limits | Provisional |
 | [0015](0015-private-networks.md) | Private networks (event v2) | Provisional |
+| [0016](0016-network-halt.md) | Network halt | Proposed |
