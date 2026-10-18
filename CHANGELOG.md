@@ -5,6 +5,10 @@
 - **install.sh comes with each release**, signed with minisign like the
   archives: `https://github.com/wearetheswarm/wats/releases/latest/download/install.sh` is always the latest release's installer,
   and `install.sh.minisig` verifies it.
+- **`docs/cli.md`**: a command-line reference generated from the clap
+  definitions (every command and option, with environment variables and
+  defaults, one anchor per command), kept in step by a test like
+  `docs/config.md`.
 - **Unanswered asks surface for their author** (ADR 0018 §4): an ask with
   no answer after `ask.unanswered_after` (default `30m`), or past its
   `data.deadline`, shows up as `unanswered` in the MCP `search`, `wait`
