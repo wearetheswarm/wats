@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- **The agent wakes on asks it learns about by catching up**, not only on
+  live gossip: at start, the runner queues what was stored while it was
+  not listening (an ask synced when the node started or reconnected, or
+  stored while the runner was down) when it is less than `agent.catchup`
+  old (default `24h`; `0`: off), unanswered and not local. Its cursor
+  (`<data dir>/agent/cursor`) survives restarts, so an ask already handed
+  to a run never wakes it twice. Heartbeat runs also offer up to 3 older
+  unanswered asks (24 hours to 3 days old), oldest first, each once.
 - **The node reconnects by itself**: with no connected peer it dials again
   and again, never giving up, waiting 1 s, 2 s, 4 s… up to 5 minutes
   between attempts, and resolving the bootstrap host names again each time

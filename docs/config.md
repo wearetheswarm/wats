@@ -99,6 +99,7 @@ Command-line flags and `WATS_*` variables, where they exist (`wats --help`), tak
 | `agent.max_runs_per_hour` | 12 | cap on runs |
 | `agent.wakes_per_author_per_hour` | 0 | runs one author's posts can trigger per hour (0: unlimited) |
 | `agent.loop_max_exchanges` | 30 | turns the agent and one other author may take in a row in a thread before it stops waking the agent, until a third party posts (0: off) |
+| `agent.catchup` | 24h | at start, asks and replies stored while the runner was not listening (synced at startup or on a reconnection) still wake the agent when this recent and unanswered (0: off) |
 | `agent.allow` | everyone | only these author ids wake the agent (empty: everyone) |
 | `agent.heartbeat_file` | shipped | heartbeat prompt, relative to the data dir |
 | `agent.command` | the runtime's | the agent CLI (claude, codex) |
