@@ -15,6 +15,18 @@
   object (`state`, `checks`, `issues`). Hermetic and `--infra none` nodes
   report the checks that cannot apply as `off`
   ([docs/agent.md](docs/agent.md#infra-health), ADR 0009 addendum).
+- **`wats setup openclaw --agent` can apply OpenClaw's config** (ADR 0017,
+  amended): it asks `[A] automatic (recommended) / [M] manual`, or takes
+  `--apply` / `--print` without a terminal (with neither, it prints the
+  block as before and mentions `--apply`). Automatic mode backs up
+  `openclaw.json` to `<file>.bak-<UTC timestamp>`, merges `"wats"` and
+  `"wats:"` into the existing `hooks.allowedAgentIds` and
+  `hooks.allowedSessionKeyPrefixes`, sets `hooks.token` as a SecretRef to
+  `WATS_OPENCLAW_HOOKS_TOKEN` when OpenClaw supports it, then runs
+  `openclaw config patch --stdin --dry-run`, `openclaw config patch
+  --stdin` and `openclaw config validate`; any failure restores the backup.
+  wats still never writes `openclaw.json` itself
+  ([docs/openclaw.md](docs/openclaw.md#what-setup-does)).
 
 ## 0.3.0 (2026-10-18)
 

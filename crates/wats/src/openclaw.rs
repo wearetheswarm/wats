@@ -467,6 +467,117 @@ pub fn config_block(agent: &str) -> String {
     block
 }
 
+/// The session key prefix of wats's forwards (`wats:<root>`).
+pub const SESSION_PREFIX: &str = "wats:";
+
+/// The patch `wats setup openclaw --apply` sends to `openclaw config patch`:
+/// the content of [`config_block`] as JSON. `patch` replaces arrays, so
+/// `agent_ids` and `prefixes` are the merged lists (see [`merge_list`]).
+/// With `token_ref`, `hooks.token` is left out: it is set apart as a
+/// SecretRef to [`HOOKS_TOKEN_ENV`].
+pub fn config_patch(
+    agent: &str,
+    agent_ids: &[String],
+    prefixes: &[String],
+    token_ref: bool,
+) -> Value {
+    let mut hooks = json!({
+        "enabled": true,
+        "path": "/hooks",
+        "allowedAgentIds": agent_ids,
+        "allowRequestSessionKey": true,
+        "allowedSessionKeyPrefixes": prefixes,
+    });
+    if !token_ref {
+        hooks["token"] = format!("${{{HOOKS_TOKEN_ENV}}}").into();
+    }
+    let mut patch = json!({ "hooks": hooks });
+    if agent == DEFAULT_AGENT {
+        patch["agents"] = json!({ "entries": { DEFAULT_AGENT: {
+            "name": "wats (swarm)",
+            "workspace": "~/.openclaw/workspace-wats",
+            "sandbox": { "mode": "all", "scope": "agent" },
+            "tools": { "allow": [format!("{AGENT_SERVER}__*")], "deny": DENIED_TOOLS },
+        } } });
+    }
+    patch
+}
+
+/// The strings of what `openclaw config get <path>` printed for a list: a
+/// JSON array, else a bracketed or one-per-line list of (maybe quoted)
+/// values. Nothing, `undefined` or `null`: an empty list.
+pub fn parse_config_list(output: &str) -> Vec<String> {
+    let output = output.trim();
+    if matches!(output, "" | "undefined" | "null") {
+        return Vec::new();
+    }
+    match serde_json::from_str::<Value>(output) {
+        Ok(Value::Array(items)) => {
+            return items
+                .into_iter()
+                .map(|v| match v {
+                    Value::String(s) => s,
+                    other => other.to_string(),
+                })
+                .collect();
+        }
+        Ok(Value::String(s)) => return vec![s],
+        _ => {}
+    }
+    let inner = output.strip_prefix('[').unwrap_or(output);
+    let inner = inner.trim_end().strip_suffix(']').unwrap_or(inner);
+    inner
+        .split([',', '\n'])
+        .map(|s| s.trim().trim_matches(|c| c == '"' || c == '\'').trim())
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+/// `existing`, then each of `ours` it lacks, without duplicates.
+pub fn merge_list(existing: &[String], ours: &[&str]) -> Vec<String> {
+    let mut merged: Vec<String> = Vec::new();
+    for item in existing
+        .iter()
+        .map(String::as_str)
+        .chain(ours.iter().copied())
+    {
+        if !merged.iter().any(|m| m == item) {
+            merged.push(item.to_string());
+        }
+    }
+    merged
+}
+
+/// The path `openclaw config file` printed: its last non-empty line,
+/// unquoted, with a leading `~/` expanded to `home`.
+pub fn parse_config_file(output: &str, home: Option<&Path>) -> Option<PathBuf> {
+    let line = output.lines().map(str::trim).rfind(|l| !l.is_empty())?;
+    let line = line.trim_matches(|c| c == '"' || c == '\'');
+    match (line.strip_prefix("~/"), home) {
+        (Some(rest), Some(home)) => Some(home.join(rest)),
+        _ => Some(PathBuf::from(line)),
+    }
+}
+
+/// `<file>.bak-<UTC timestamp>` (e.g. `openclaw.json.bak-20261018T091500Z`)
+/// for the time `now` (seconds since the epoch), with `-2`, `-3`… when
+/// that name is taken.
+pub fn backup_path(file: &Path, now: u64) -> PathBuf {
+    let (y, mo, d, h, mi, s) = crate::runs::civil(now);
+    let base = format!(
+        "{}.bak-{y:04}{mo:02}{d:02}T{h:02}{mi:02}{s:02}Z",
+        file.display()
+    );
+    let mut path = PathBuf::from(&base);
+    let mut n = 2;
+    while path.exists() {
+        path = PathBuf::from(format!("{base}-{n}"));
+        n += 1;
+    }
+    path
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -565,5 +676,76 @@ mod tests {
             assert!(deny.contains(&format!("\"{tool}\"")), "{tool}: {tools}");
         }
         assert!(block.contains("sandbox: { mode: \"all\""), "{block}");
+    }
+
+    /// The patch is the printed block, as JSON, with the merged lists; the
+    /// token is an environment reference unless a SecretRef sets it.
+    #[test]
+    fn patch_matches_the_block() {
+        let ids = merge_list(&["main".into(), "wats".into()], &["wats"]);
+        assert_eq!(ids, ["main", "wats"]);
+        let prefixes = merge_list(&[], &[SESSION_PREFIX]);
+        let patch = config_patch(DEFAULT_AGENT, &ids, &prefixes, false);
+        assert_eq!(patch["hooks"]["token"], "${WATS_OPENCLAW_HOOKS_TOKEN}");
+        assert_eq!(patch["hooks"]["allowedAgentIds"], json!(["main", "wats"]));
+        assert_eq!(
+            patch["hooks"]["allowedSessionKeyPrefixes"],
+            json!(["wats:"])
+        );
+        assert_eq!(patch["hooks"]["allowRequestSessionKey"], true);
+        let tools = &patch["agents"]["entries"]["wats"]["tools"];
+        assert_eq!(tools["allow"], json!(["wats-agent__*"]));
+        assert_eq!(tools["deny"], json!(DENIED_TOOLS));
+        let block = config_block(DEFAULT_AGENT);
+        for value in ["/hooks", "wats (swarm)", "~/.openclaw/workspace-wats"] {
+            assert!(block.contains(value) && patch.to_string().contains(value));
+        }
+        let with_ref = config_patch(DEFAULT_AGENT, &ids, &prefixes, true);
+        assert!(with_ref["hooks"].get("token").is_none());
+        assert!(
+            config_patch("main", &ids, &prefixes, true)
+                .get("agents")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn config_outputs() {
+        for (out, want) in [
+            ("[\"main\", \"x\"]\n", vec!["main", "x"]),
+            ("[\n  \"main\"\n]", vec!["main"]),
+            ("['main', 'x',]", vec!["main", "x"]),
+            ("main\nx\n", vec!["main", "x"]),
+            ("\"main\"", vec!["main"]),
+            ("", vec![]),
+            ("undefined\n", vec![]),
+            ("[]", vec![]),
+        ] {
+            assert_eq!(parse_config_list(out), want, "{out:?}");
+        }
+        let home = Path::new("/home/a");
+        assert_eq!(
+            parse_config_file("~/.openclaw/openclaw.json\n", Some(home)),
+            Some(home.join(".openclaw/openclaw.json"))
+        );
+        assert_eq!(
+            parse_config_file("Config:\n\"/x/openclaw.json\"\n\n", None),
+            Some(PathBuf::from("/x/openclaw.json"))
+        );
+        assert_eq!(parse_config_file(" \n", None), None);
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("openclaw.json");
+        let backup = backup_path(&file, 1_792_281_600);
+        assert_eq!(
+            backup.file_name().unwrap(),
+            "openclaw.json.bak-20261018T000000Z"
+        );
+        std::fs::write(&backup, "").unwrap();
+        assert!(
+            backup_path(&file, 1_792_281_600)
+                .display()
+                .to_string()
+                .ends_with("Z-2")
+        );
     }
 }

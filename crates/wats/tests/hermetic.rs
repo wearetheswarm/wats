@@ -514,6 +514,9 @@ fn setup_openclaw_agent_tokens_entries_and_block() {
         "{said}"
     );
     assert!(!said.contains(&runner), "{said}");
+    // No terminal and neither --apply nor --print: the block is printed,
+    // and --apply is pointed to.
+    assert!(said.contains("`--apply` applies this block"), "{said}");
     let config = std::fs::read_to_string(data.join("config.toml")).unwrap();
     assert!(config.contains("runtime = \"openclaw\""), "{config}");
     assert!(
@@ -545,6 +548,208 @@ fn setup_openclaw_agent_tokens_entries_and_block() {
         "{out:?}"
     );
     assert_eq!(calls().len(), before);
+}
+
+/// `wats setup openclaw --agent --apply`, against a fake `openclaw` that
+/// keeps a fake openclaw.json: a backup of that file, the existing hooks
+/// lists merged with ours, the SecretRef `config set` for the hook token,
+/// the same patch on stdin to the dry run then the real `config patch`,
+/// then `config validate` (with the token in its environment). A failing
+/// validate restores the file byte for byte and fails. Without SecretRefs,
+/// the patch carries the `${VAR}` reference. `--print` patches nothing.
+#[test]
+fn setup_openclaw_agent_applies_through_config_patch() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    let bin = d.join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    std::fs::create_dir_all(d.join("oc")).unwrap();
+    let log = d.join("calls.log");
+    let cfg = d.join("oc").join("openclaw.json");
+    let fake = bin.join("openclaw");
+    let script = r#"#!/bin/sh
+printf '%s\n' "$@" >> {d}/calls.log
+echo --- >> {d}/calls.log
+case "$1 $2" in
+'mcp set') printf '%s\n' "$4" > {d}/entry-$3.json;;
+'mcp show') cat {d}/entry-$3.json;;
+'config file') echo '~/oc/openclaw.json';;
+'config get') if [ -f "{d}/get-$3" ]; then cat "{d}/get-$3"; else echo "Config path not found: $3" >&2; exit 1; fi;;
+'config set') if [ "$3" = --help ]; then [ -f {d}/norefs ] || echo '  --ref-source <source>  SecretRef source'; else echo "// set $3" >> {d}/oc/openclaw.json; fi;;
+'config patch') if [ "$4" = --dry-run ]; then cat > {d}/dry.json; else cat > {d}/real.json; echo '// patched' >> {d}/oc/openclaw.json; fi;;
+'config validate') if [ -f {d}/invalid ]; then echo 'Invalid config: hooks.token' >&2; exit 1; fi; [ -n "$WATS_OPENCLAW_HOOKS_TOKEN" ] || exit 2;;
+esac
+"#;
+    std::fs::write(&fake, script.replace("{d}", &d.display().to_string())).unwrap();
+    std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let original = "{\n  // the user's\n  hooks: { allowedAgentIds: [\"main\"] },\n}\n";
+    std::fs::write(&cfg, original).unwrap();
+    std::fs::write(d.join("get-hooks.allowedAgentIds"), "[\n  \"main\"\n]\n").unwrap();
+    let data = d.join("data");
+    let path = format!("{}:/bin:/usr/bin", bin.display());
+    let run = |args: &[&str]| {
+        std::process::Command::new(env!("CARGO_BIN_EXE_wats"))
+            .env("WATS_HERMETIC", "1")
+            .env("HOME", d)
+            .env("PATH", &path)
+            .env("USER", "alice")
+            .env_remove("WATS_PROFILE")
+            .env_remove("WATS_OPENCLAW")
+            .env_remove("WATS_OPENCLAW_HOOKS_TOKEN")
+            .arg("--dir")
+            .arg(&data)
+            .args(["setup", "openclaw", "--agent", "--yes"])
+            .args(args)
+            .output()
+            .unwrap()
+    };
+    let calls = || -> Vec<Vec<String>> {
+        std::fs::read_to_string(&log)
+            .unwrap_or_default()
+            .split("---\n")
+            .filter(|c| !c.is_empty())
+            .map(|c| c.lines().map(str::to_string).collect())
+            .collect()
+    };
+    let json = |name: &str| -> serde_json::Value {
+        serde_json::from_str(&std::fs::read_to_string(d.join(name)).unwrap()).unwrap()
+    };
+    let backups = || -> Vec<std::path::PathBuf> {
+        let mut found: Vec<_> = std::fs::read_dir(d.join("oc"))
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .filter(|p| p.to_string_lossy().contains("openclaw.json.bak-"))
+            .collect();
+        found.sort();
+        found
+    };
+
+    let out = run(&["--apply"]);
+    let said = String::from_utf8_lossy(&out.stdout).into_owned();
+    assert!(out.status.success(), "{out:?}");
+    let all = calls();
+    let config: Vec<&[String]> = all[4..].iter().map(Vec::as_slice).collect();
+    assert_eq!(
+        config,
+        [
+            &["config", "file"][..],
+            &["config", "get", "hooks.allowedAgentIds"],
+            &["config", "get", "hooks.allowedSessionKeyPrefixes"],
+            &["config", "set", "--help"],
+            &[
+                "config",
+                "set",
+                "hooks.token",
+                "--ref-source",
+                "env",
+                "--ref-id",
+                "WATS_OPENCLAW_HOOKS_TOKEN"
+            ],
+            &["config", "patch", "--stdin", "--dry-run"],
+            &["config", "patch", "--stdin"],
+            &["config", "validate"],
+        ],
+        "{all:?}"
+    );
+    // The backup: the file as it was, and said.
+    let backup = backups();
+    assert_eq!(backup.len(), 1, "{backup:?}");
+    assert_eq!(std::fs::read_to_string(&backup[0]).unwrap(), original);
+    assert!(said.contains(&backup[0].display().to_string()), "{said}");
+    // The same patch to the dry run and the real one, shown first.
+    let patch = json("real.json");
+    assert_eq!(json("dry.json"), patch);
+    assert_eq!(
+        patch["hooks"]["allowedAgentIds"],
+        serde_json::json!(["main", "wats"])
+    );
+    assert_eq!(
+        patch["hooks"]["allowedSessionKeyPrefixes"],
+        serde_json::json!(["wats:"])
+    );
+    assert_eq!(patch["hooks"]["enabled"], true);
+    assert!(patch["hooks"].get("token").is_none(), "{patch}");
+    assert_eq!(
+        patch["agents"]["entries"]["wats"]["tools"]["allow"],
+        serde_json::json!(["wats-agent__*"])
+    );
+    assert!(said.contains("\"allowedAgentIds\": ["), "{said}");
+    assert!(said.contains("applied"), "{said}");
+    let hooks = std::fs::read_to_string(data.join("openclaw/hooks.token")).unwrap();
+    assert!(
+        said.contains(&format!(
+            "export WATS_OPENCLAW_HOOKS_TOKEN={}",
+            hooks.trim()
+        )),
+        "{said}"
+    );
+    assert!(
+        !std::fs::read_to_string(&cfg)
+            .unwrap()
+            .contains(hooks.trim())
+    );
+    let toml = std::fs::read_to_string(data.join("config.toml")).unwrap();
+    assert!(toml.contains("runtime = \"openclaw\""), "{toml}");
+
+    // validate fails: the file is restored byte for byte, non-zero exit.
+    std::fs::write(d.join("invalid"), "").unwrap();
+    let before = std::fs::read(&cfg).unwrap();
+    let out = run(&["--apply"]);
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success(), "{out:?}");
+    assert!(err.contains("restored from"), "{err}");
+    assert!(err.contains("Invalid config: hooks.token"), "{err}");
+    assert_eq!(std::fs::read(&cfg).unwrap(), before);
+    assert_eq!(backups().len(), 2);
+    std::fs::remove_file(d.join("invalid")).unwrap();
+
+    // No SecretRefs: the token is the `${VAR}` reference in the patch.
+    std::fs::write(d.join("norefs"), "").unwrap();
+    let start = calls().len();
+    let out = run(&["--apply"]);
+    assert!(out.status.success(), "{out:?}");
+    assert!(
+        !calls()[start..]
+            .iter()
+            .any(|c| c.contains(&"hooks.token".into())),
+        "{:?}",
+        calls()
+    );
+    assert_eq!(
+        json("real.json")["hooks"]["token"],
+        "${WATS_OPENCLAW_HOOKS_TOKEN}"
+    );
+
+    // --print: the block, and no `config patch`.
+    let start = calls().len();
+    let out = run(&["--print"]);
+    let said = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "{out:?}");
+    assert!(
+        said.contains("token: \"${WATS_OPENCLAW_HOOKS_TOKEN}\""),
+        "{said}"
+    );
+    assert!(!said.contains("`--apply` applies"), "{said}");
+    let later = calls();
+    assert!(
+        !later[start..]
+            .iter()
+            .any(|c| c.get(1).is_some_and(|a| a == "patch")),
+        "{later:?}"
+    );
+    assert_eq!(later.last().unwrap(), &["config", "validate"]);
+
+    // --apply belongs to the agent half.
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_wats"))
+        .env("WATS_HERMETIC", "1")
+        .env("PATH", &path)
+        .arg("--dir")
+        .arg(&data)
+        .args(["setup", "openclaw", "--mcp", "--apply"])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
 }
 
 /// `wats` with `stdin` written to its standard input.
