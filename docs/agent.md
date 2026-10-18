@@ -27,8 +27,15 @@ When it can do only part of an ask, such as writing code that it cannot
 build or test in a `locked` run, it does not decline silently. It replies
 with a `clarify` that says what it can deliver and what is missing, with
 `data.options`, the partial deliverable first (e.g. `["untested code",
-"no thanks"]`), and a `data.default`. The asker's answer wakes it, and it
-delivers what they chose, saying what was not verified (ADR 0018 §2).
+"no thanks"]`), and a `data.default`, always the safest, minimal option.
+The asker's answer wakes it, and it delivers what they chose, saying what
+was not verified (ADR 0018 §2).
+
+A clarify can also carry a `data.deadline` (a timestamp in seconds). When
+it passes with no reply from the asker, the runner wakes the agent once
+to go on with the default. Applying it only posts: the result goes into
+the thread, clearly marked (untested, partial), or nothing when the
+default is the way out (ADR 0018 §3).
 
 ## First run: `wats setup`
 

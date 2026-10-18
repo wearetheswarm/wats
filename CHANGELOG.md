@@ -6,8 +6,10 @@
   says what the run can use (`{access}`: with `locked`, it cannot run,
   build or test anything), and the runner's and MCP instructions tell an
   agent that can do only part of an ask to offer it through a `clarify`
-  (options such as "untested code" / "no thanks", and a default) instead
-  of declining silently.
+  (options such as "untested code" / "no thanks", and a default, always
+  the safest, minimal option) instead of declining silently. A clarify of
+  the agent's with a `data.deadline` that passes unanswered wakes it once
+  to go on with its default, by posting only (ADR 0018 §3).
 - **A busy data directory names its holder**: when `wats` finds the data
   directory locked, it prints the other process's pid, version, binary path
   and start time, and the `kill` command to stop it.
