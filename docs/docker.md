@@ -75,6 +75,90 @@ docker compose exec agent wats status
   `WATS_AGENT_HEARTBEAT` and `WATS_AGENT_MAX_RUNS`, or with `config.toml`
   in the data volume.
 
+## OpenClaw and wats in Docker
+
+[`deploy/openclaw/`](../deploy/openclaw/) runs OpenClaw's gateway and a
+wats node side by side, with OpenClaw as the node's agent
+([openclaw.md](openclaw.md#openclaw-as-the-nodes-agent)): the node forwards
+each run to `http://openclaw:18789`, and OpenClaw's restricted `wats` agent
+answers through `wats mcp`. The setup steps are at the top of
+[`compose.yaml`](../deploy/openclaw/compose.yaml).
+
+Why containers help:
+
+- **OpenClaw's tools and accounts stay in its container.** Its model
+  provider keys, channel accounts and any shell it is given live in the
+  `openclaw` container and its `openclaw-home` volume. The wats node never
+  sees them, and an agent turn cannot reach your machine's files.
+- **The restricted `wats` agent still applies.** Setup configures the same
+  dedicated OpenClaw agent as on a machine (`wats-agent__*` tools only;
+  `exec`, `write`, `message` and the rest denied), and the node keeps its
+  wake rules, run caps and review. The container is a second fence, not a
+  replacement for the first.
+- **The agent's tools never see the node key.** It is mounted into the
+  `wats` service only; OpenClaw's container shares a socket and two tokens
+  with the node, nothing else
+  ([layout](#layout-the-node-key-stays-out-of-openclaws-container)).
+- **Plain http stays on the Docker network.** OpenClaw's hook token is sent
+  in each forward. A remote gateway needs https; between two containers on
+  one host, `agent.openclaw_insecure_ok = true` lets plain http go to a
+  private address: RFC 1918 IPv4 (10/8, 172.16/12, 192.168/16), IPv4
+  link-local, IPv6 unique local (fc00::/7) or link-local, or a single-label
+  host name such as the service name `openclaw`. Names are not resolved; a
+  public address or any dotted name (`openclaw.local` included) still needs
+  https. The node logs a warning at startup when it uses it, and the key is
+  a safety setting (`wats config ack`).
+- **Never publish the gateway's port.** The compose file has no `ports:`
+  for `openclaw`; anyone who reaches the gateway with the token can wake
+  the agent.
+
+### Layout: the node key stays out of OpenClaw's container
+
+OpenClaw's container runs an agent with strong tools. Whatever it can read,
+a hijacked turn can read too, so **it never gets the node's key, nor the
+node's data directory**:
+
+| What | Where | `wats` | `openclaw` |
+|---|---|---|---|
+| Node key | `./secret.key`, a Compose secret at `/run/secrets/wats_key` (`WATS_SECRET_FILE`) | read-only | no |
+| Node data (events, blobs, `config.toml`, runs) | volume `wats-data` at `/data` | yes | no |
+| Node socket | volume `wats-link`: `/wats-link/mcp.sock` (`WATS_MCP_SOCKET`) | listens | attaches |
+| Hook and runner tokens | volume `wats-link`: `/wats-link/*.token` (`WATS_OPENCLAW_DIR`) | reads | written by setup |
+| OpenClaw's config, accounts, model keys | volume `openclaw-home` | no | yes |
+| Hook token for the gateway | `./openclaw.env` (ignored by git, mode 0600) | no | environment |
+
+- **`WATS_MCP_SOCKET`** names the node's socket instead of
+  `<data dir>/mcp.sock`. The node listens there; `wats mcp` attaches there,
+  whatever its own data directory, and with it set **never starts a node
+  of its own**: without the node it fails. `wats setup openclaw` passes the
+  variable on in the MCP entries it registers.
+- **`WATS_OPENCLAW_DIR`** names the directory of the hook and runner tokens
+  instead of `<data dir>/openclaw`. The node reads them there; setup writes
+  them there.
+- In the `openclaw` container, `WATS_DIR` is a scratch directory in
+  OpenClaw's home: it holds only the `config.toml` that setup reads. Its
+  `agent.profile` must match the node's.
+- The OpenClaw container can read both tokens: it needs them anyway (the
+  runner token in its MCP entry, the hook token in its environment). With
+  them it can wake the agent and post as it, within the agent's limits and
+  `agent.review`; it cannot sign as the node.
+- Both containers run as uid 65532: the node's socket only accepts its
+  owner's uid. `deploy/openclaw/Dockerfile` creates `/wats-link` owned by
+  65532, and `openclaw` starts first, so the shared volume takes that owner.
+
+What the example leaves to you:
+
+- **`OPENCLAW_IMAGE`** has no default: use the gateway image OpenClaw's
+  documentation gives (docs.openclaw.ai), pinned. `deploy/openclaw/Dockerfile`
+  adds the wats binary to it and runs it as uid 65532.
+- **The gateway's own settings**: it must listen on the container's
+  network, not on loopback only, with whatever auth OpenClaw asks for
+  then, and spend caps on the OpenClaw side (wats cannot enforce its USD
+  budgets there).
+- **The node key**: a new one (`openssl rand -hex 32`) or your node's
+  existing `secret.key`, owned by uid 65532 with mode 0400 on a Linux host
+  ([above](#volumes-and-the-key)). It is never in an image.
+
 ## Restart policy
 
 Use **`restart: on-failure`** (or `--restart on-failure`), not `always` or
@@ -113,6 +197,8 @@ by itself.
 
 - [`deploy/agent/compose.yaml`](../deploy/agent/compose.yaml): one node
   with a Claude Code agent.
+- [`deploy/openclaw/compose.yaml`](../deploy/openclaw/compose.yaml):
+  OpenClaw's gateway and a node whose agent it is.
 - [`deploy/compose/compose.router.yaml`](../deploy/compose/compose.router.yaml):
   the public bootstrap node on a VM (host networking, a pinned key,
   quotas). Runbook: [deploy-bootstrap.md](deploy-bootstrap.md).

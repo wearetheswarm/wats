@@ -683,7 +683,8 @@ enum SetupTool {
         yes: bool,
         /// The OpenClaw gateway (agent.openclaw_url); default
         /// http://127.0.0.1:18789, asked on a terminal. Plain http is for
-        /// loopback only.
+        /// loopback only, or a private address with
+        /// agent.openclaw_insecure_ok (e.g. http://openclaw:18789 in Docker).
         #[arg(long)]
         url: Option<String>,
         /// The OpenClaw CLI.
@@ -1274,7 +1275,7 @@ fn setup_openclaw(
             }
             None => default,
         };
-        oc::check_url(&url)?;
+        oc::check_url(&url, settings.agent.openclaw_insecure_ok == Some(true))?;
         Some(url.trim().trim_end_matches('/').to_string())
     } else {
         None
@@ -1282,14 +1283,14 @@ fn setup_openclaw(
 
     let profile = human_profile(args, &settings)?;
     let (command, server_args) = mcp_server_command(args, &profile)?;
-    // Only `command` and `args`: wats needs no `env`.
-    openclaw_mcp_set(
-        openclaw,
-        "wats",
-        &json!({"command": command, "args": server_args}),
-        &command,
-        None,
-    )?;
+    // Only `command` and `args`: wats needs no `env`, except a named node
+    // socket (WATS_MCP_SOCKET, OpenClaw in its own container), passed on
+    // in case OpenClaw does not pass its environment to MCP servers.
+    let mut entry = json!({"command": command, "args": server_args});
+    if let Some(socket) = attach::socket_override() {
+        entry["env"] = json!({ attach::SOCKET_ENV: socket.to_string_lossy() });
+    }
+    openclaw_mcp_set(openclaw, "wats", &entry, &command, None)?;
     println!("OpenClaw: wats MCP server set (profile {profile})");
     println!(
         "  OpenClaw names its tools wats__<tool> (e.g. wats__post): `wats__*` in a tool \
@@ -1311,11 +1312,14 @@ fn setup_openclaw(
         "agent profile must be 1-64 chars of [a-z0-9_-]"
     );
     let (command, agent_args) = mcp_server_command(args, &agent_profile)?;
+    let mut agent_env = json!({"WATS_RUNNER_TOKEN": runner_token});
+    if let Some(socket) = attach::socket_override() {
+        agent_env[attach::SOCKET_ENV] = json!(socket.to_string_lossy());
+    }
     openclaw_mcp_set(
         openclaw,
         oc::AGENT_SERVER,
-        &json!({"command": command, "args": agent_args,
-                "env": {"WATS_RUNNER_TOKEN": runner_token}}),
+        &json!({"command": command, "args": agent_args, "env": agent_env}),
         &command,
         Some(&runner_token),
     )?;
@@ -2179,6 +2183,15 @@ async fn mcp_attached(args: &NodeArgs, config: &NodeConfig, idle_exit: u64) -> R
     if attach().await? {
         return Ok(());
     }
+    // A named socket is another process's node (another container's):
+    // never start one here, with a key of its own.
+    if let Some(socket) = attach::socket_override() {
+        anyhow::bail!(
+            "no wats node listens on {} ({}): start that node first",
+            socket.display(),
+            attach::SOCKET_ENV
+        );
+    }
     // Halted (ADR 0016 §3): this session says so; a background node still
     // starts to look for an unhalt, for the next sessions.
     if let Some(marker) = halted_marker(config) {
@@ -2497,7 +2510,13 @@ fn agent_config(
     if runtime == "openclaw" {
         wats::openclaw::check_access(access, &allow, file.review == Some(true))?;
         if let Some(url) = &file.openclaw_url {
-            wats::openclaw::check_url(url).context("config.toml agent.openclaw_url")?;
+            let checked = wats::openclaw::check_url(url, file.openclaw_insecure_ok == Some(true))
+                .context("config.toml agent.openclaw_url")?;
+            if let Some(host) = wats::openclaw::insecure_host(&checked) {
+                tracing::warn!(
+                    "hook token sent over plain http to {host} (agent.openclaw_insecure_ok)"
+                );
+            }
             openclaw.url = url.trim().to_string();
         }
         if let Some(agent) = file

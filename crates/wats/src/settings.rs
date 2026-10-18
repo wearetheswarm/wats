@@ -221,8 +221,21 @@ pub struct AgentSettings {
     pub keep_days: Option<u64>,
     /// The OpenClaw gateway (`runtime = "openclaw"`, ADR 0017).
     pub openclaw_url: Option<String>,
+    /// Plain http to a private gateway address too (a Docker network),
+    /// not only loopback.
+    pub openclaw_insecure_ok: Option<bool>,
     /// The OpenClaw agent the runs go to (`agentId`).
     pub openclaw_agent: Option<String>,
+}
+
+impl AgentSettings {
+    /// Check `openclaw_url` against `openclaw_insecure_ok`.
+    pub fn check_openclaw_url(&self) -> Result<()> {
+        if let Some(url) = &self.openclaw_url {
+            crate::openclaw::check_url(url, self.openclaw_insecure_ok == Some(true))?;
+        }
+        Ok(())
+    }
 }
 
 impl Settings {
@@ -249,10 +262,10 @@ impl Settings {
                 .parse::<crate::access::Access>()
                 .with_context(|| format!("{}: agent.access", path.display()))?;
         }
-        if let Some(url) = &settings.agent.openclaw_url {
-            crate::openclaw::check_url(url)
-                .with_context(|| format!("{}: agent.openclaw_url", path.display()))?;
-        }
+        settings
+            .agent
+            .check_openclaw_url()
+            .with_context(|| format!("{}: agent.openclaw_url", path.display()))?;
         for cap in &settings.agent.caps {
             crate::agent::check_cap(cap)
                 .map_err(|why| anyhow::anyhow!("{}: agent.caps: {why}", path.display()))?;
@@ -539,7 +552,14 @@ pub const KEYS: &[Key] = &[
         "agent.openclaw_url",
         ValueType::Text,
         crate::openclaw::DEFAULT_URL,
-        "OpenClaw gateway the runs are forwarded to (plain http: loopback only)",
+        "OpenClaw gateway the runs are forwarded to (plain http: loopback only, unless agent.openclaw_insecure_ok)",
+    ),
+    key(
+        "agent.openclaw_insecure_ok",
+        ValueType::Bool,
+        "false",
+        "allow plain http to a private gateway (10/8, 172.16/12, 192.168/16, fc00::/7, \
+         link-local, a single-label name like a Compose service)",
     ),
     key(
         "agent.openclaw_agent",
@@ -748,8 +768,10 @@ fn toml_value(key: &Key, raw: &str) -> Result<toml_edit::Value> {
             crate::inbox::InboxPublic::from_b64(raw).map_err(|e| invalid(format!("{e:#}")))?;
             raw.into()
         }
+        // The lenient form here; `ConfigFile::save` and `Settings::load`
+        // check it against `agent.openclaw_insecure_ok`.
         ValueType::Text if key.name == "agent.openclaw_url" => {
-            crate::openclaw::check_url(raw).map_err(|e| invalid(format!("{e:#}")))?;
+            crate::openclaw::check_url(raw, true).map_err(|e| invalid(format!("{e:#}")))?;
             raw.into()
         }
         ValueType::Text => raw.into(),
@@ -924,8 +946,14 @@ impl ConfigFile {
     /// Write the file, after checking that it still loads.
     pub fn save(&self) -> Result<()> {
         let text = self.doc.to_string();
-        toml::from_str::<Settings>(&text)
+        let settings = toml::from_str::<Settings>(&text)
             .with_context(|| format!("refusing to write an invalid {}", self.path.display()))?;
+        settings.agent.check_openclaw_url().with_context(|| {
+            format!(
+                "refusing to write {}: agent.openclaw_url",
+                self.path.display()
+            )
+        })?;
         if let Some(dir) = self.path.parent() {
             std::fs::create_dir_all(dir)?;
         }
@@ -1091,6 +1119,49 @@ mod tests {
         let mut file = ConfigFile::open(dir.path()).unwrap();
         file.set("nets", "public, acme.dev").unwrap();
         assert!(file.set("nets", "public,Acme").is_err(), "not a network id");
+    }
+
+    /// Plain http to a Compose service needs `agent.openclaw_insecure_ok`,
+    /// in the file and through `wats config set` / `unset`.
+    #[test]
+    fn openclaw_insecure_ok_allows_private_http_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(FILE_NAME);
+        std::fs::write(&path, "[agent]\nopenclaw_url = \"http://openclaw:18789\"\n").unwrap();
+        assert!(Settings::load(dir.path()).is_err(), "no flag");
+        std::fs::write(
+            &path,
+            "[agent]\nopenclaw_url = \"http://openclaw:18789\"\nopenclaw_insecure_ok = true\n",
+        )
+        .unwrap();
+        let settings = Settings::load(dir.path()).unwrap();
+        assert_eq!(settings.agent.openclaw_insecure_ok, Some(true));
+        std::fs::write(
+            &path,
+            "[agent]\nopenclaw_url = \"http://gw.example.com\"\nopenclaw_insecure_ok = true\n",
+        )
+        .unwrap();
+        assert!(Settings::load(dir.path()).is_err(), "dotted name");
+
+        std::fs::remove_file(&path).unwrap();
+        let mut file = ConfigFile::open(dir.path()).unwrap();
+        assert!(
+            file.set("agent.openclaw_url", "http://8.8.8.8:18789")
+                .is_err()
+        );
+        file.set("agent.openclaw_url", "http://openclaw:18789")
+            .unwrap();
+        assert!(file.save().is_err(), "saved without the flag");
+        file.set("agent.openclaw_insecure_ok", "true").unwrap();
+        file.save().unwrap();
+        assert!(file.unset("agent.openclaw_insecure_ok").unwrap());
+        assert!(
+            file.save().is_err(),
+            "flag removed under a private http URL"
+        );
+        file.set("agent.openclaw_url", "http://127.0.0.1:18789")
+            .unwrap();
+        file.save().unwrap();
     }
 
     /// The per-thread backoff keys were removed (ADR 0011, loop detector):

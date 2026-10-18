@@ -67,8 +67,22 @@ pub fn http_timeout(timeout: Duration) -> Duration {
 /// Most bytes of a gateway answer kept in logs and run records.
 const BODY_SHOWN: usize = 300;
 
+/// Names the directory of the hook and runner tokens instead of
+/// `<data dir>/openclaw`: a volume shared with OpenClaw's container, which
+/// then never sees the node's data directory nor its key (docs/docker.md).
+pub const DIR_ENV: &str = "WATS_OPENCLAW_DIR";
+
+/// The tokens' directory: [`DIR_ENV`] when set and not empty, else
+/// `<data dir>/openclaw`.
 pub fn dir(data_dir: &Path) -> PathBuf {
-    data_dir.join("openclaw")
+    dir_with(data_dir, std::env::var_os(DIR_ENV))
+}
+
+fn dir_with(data_dir: &Path, over: Option<std::ffi::OsString>) -> PathBuf {
+    match over.filter(|d| !d.is_empty()) {
+        Some(dir) => PathBuf::from(dir),
+        None => data_dir.join("openclaw"),
+    }
 }
 
 pub fn hooks_token_path(data_dir: &Path) -> PathBuf {
@@ -85,26 +99,67 @@ pub fn is_runner(runner: Option<&str>) -> bool {
     runner.is_some_and(|r| r.starts_with("openclaw "))
 }
 
+/// Whether `host` is loopback (127.0.0.0/8, ::1, `localhost`).
+fn is_loopback(host: &url::Host<&str>) -> bool {
+    match host {
+        url::Host::Domain(d) => d.eq_ignore_ascii_case("localhost"),
+        url::Host::Ipv4(ip) => ip.is_loopback(),
+        url::Host::Ipv6(ip) => ip.is_loopback(),
+    }
+}
+
+/// Whether `host` is private, for `agent.openclaw_insecure_ok`: RFC 1918
+/// IPv4 (10/8, 172.16/12, 192.168/16), IPv4 link-local (169.254/16), IPv6
+/// unique local (fc00::/7) and link-local (fe80::/10), or a single-label
+/// host name (no dot: a Docker Compose service name such as `openclaw`).
+/// Names are never resolved; a dotted name (`openclaw.local` included) is
+/// not private, to keep the rule simple.
+fn is_private(host: &url::Host<&str>) -> bool {
+    match host {
+        url::Host::Domain(d) => !d.is_empty() && !d.contains('.'),
+        url::Host::Ipv4(ip) => ip.is_private() || ip.is_link_local(),
+        url::Host::Ipv6(ip) => {
+            let first = ip.segments()[0];
+            first & 0xfe00 == 0xfc00 || first & 0xffc0 == 0xfe80
+        }
+    }
+}
+
 /// Check the gateway URL: http or https, and plain http only to a loopback
-/// address (a remote gateway needs HTTPS, per OpenClaw's own advice).
-pub fn check_url(raw: &str) -> Result<url::Url> {
+/// address (a remote gateway needs HTTPS, per OpenClaw's own advice). With
+/// `insecure_ok` (`agent.openclaw_insecure_ok`), plain http may also go to
+/// a private address ([`is_private`]), e.g. `http://openclaw:18789` on a
+/// Docker network; never to a public address or a dotted host name.
+pub fn check_url(raw: &str, insecure_ok: bool) -> Result<url::Url> {
     let url = url::Url::parse(raw.trim()).with_context(|| format!("{raw:?} is not a URL"))?;
-    let loopback = match url.host() {
-        Some(url::Host::Domain(d)) => d.eq_ignore_ascii_case("localhost"),
-        Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
-        Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
-        None => false,
-    };
+    let host = url.host();
+    let loopback = host.as_ref().is_some_and(is_loopback);
+    let private = host.as_ref().is_some_and(is_private);
     match url.scheme() {
-        "https" if url.host().is_some() => {}
+        "https" if host.is_some() => {}
         "http" if loopback => {}
+        "http" if insecure_ok && private => {}
+        "http" if insecure_ok => bail!(
+            "{raw:?}: with agent.openclaw_insecure_ok, plain http is only for loopback or a \
+             private address (10/8, 172.16/12, 192.168/16, 169.254/16, fc00::/7, fe80::/10, \
+             or a single-label host name such as the Compose service `openclaw`); a public \
+             address or a dotted host name needs https"
+        ),
         "http" => bail!(
             "{raw:?}: plain http is only for a gateway on loopback (127.0.0.1, ::1, \
-             localhost); a remote gateway needs https (a tailnet or a reverse proxy)"
+             localhost); a remote gateway needs https (a tailnet or a reverse proxy), or, on \
+             a private network such as Docker's, agent.openclaw_insecure_ok = true"
         ),
         _ => bail!("{raw:?}: the gateway URL must be http://127.0.0.1:<port> or https://…"),
     }
     Ok(url)
+}
+
+/// The host the hook token goes to over plain http beyond loopback
+/// (allowed by `agent.openclaw_insecure_ok`), to warn about at startup.
+pub fn insecure_host(url: &url::Url) -> Option<String> {
+    let host = url.host()?;
+    (url.scheme() == "http" && !is_loopback(&host)).then(|| host.to_string())
 }
 
 /// Read a token file: its first line, trimmed, not empty.
@@ -584,22 +639,82 @@ mod tests {
 
     #[test]
     fn urls() {
-        for ok in [
-            "http://127.0.0.1:18789",
-            "http://localhost:18789/",
-            "http://[::1]:18789",
-            "https://gw.example.ts.net",
-        ] {
-            assert!(check_url(ok).is_ok(), "{ok}");
+        // (url, accepted without agent.openclaw_insecure_ok, accepted with it)
+        let table = [
+            // Loopback: plain http always.
+            ("http://127.0.0.1:18789", true, true),
+            ("http://127.1.2.3:18789", true, true),
+            ("http://localhost:18789/", true, true),
+            ("http://[::1]:18789", true, true),
+            // https: always.
+            ("https://gw.example.ts.net", true, true),
+            ("https://203.0.113.7", true, true),
+            ("https://openclaw:18789", true, true),
+            // Private addresses: plain http with the flag only.
+            ("http://10.0.0.5:18789", false, true),
+            ("http://172.16.0.2:18789", false, true),
+            ("http://172.31.255.254:18789", false, true),
+            ("http://192.168.1.10:18789", false, true),
+            ("http://169.254.1.1:18789", false, true),
+            ("http://[fd00::2]:18789", false, true),
+            ("http://[fc00::1]:18789", false, true),
+            ("http://[fe80::1]:18789", false, true),
+            // Single-label names (a Compose service): with the flag only.
+            ("http://openclaw:18789", false, true),
+            ("http://OpenClaw-gw:18789/", false, true),
+            // Public addresses and dotted names: never over plain http.
+            ("http://172.32.0.1:18789", false, false),
+            ("http://8.8.8.8:18789", false, false),
+            ("http://203.0.113.7:18789", false, false),
+            ("http://[2001:db8::1]:18789", false, false),
+            ("http://[::ffff:10.0.0.5]:18789", false, false),
+            ("http://example.com", false, false),
+            ("http://gw.example.com", false, false),
+            ("http://openclaw.local:18789", false, false),
+            ("http://openclaw.:18789", false, false),
+            // Not a gateway URL at all.
+            ("ftp://127.0.0.1", false, false),
+            ("ftp://openclaw", false, false),
+            ("127.0.0.1:18789", false, false),
+            ("openclaw:18789", false, false),
+        ];
+        for (url, plain, insecure_ok) in table {
+            assert_eq!(
+                check_url(url, false).is_ok(),
+                plain,
+                "{url} without the flag"
+            );
+            assert_eq!(
+                check_url(url, true).is_ok(),
+                insecure_ok,
+                "{url} with the flag"
+            );
         }
-        for bad in [
-            "http://192.168.1.10:18789",
-            "http://gw.example.com",
-            "ftp://127.0.0.1",
-            "127.0.0.1:18789",
-        ] {
-            assert!(check_url(bad).is_err(), "{bad}");
-        }
+    }
+
+    #[test]
+    fn the_tokens_directory_can_be_moved_out_of_the_data_dir() {
+        let data = Path::new("/data/wats");
+        assert_eq!(dir_with(data, None), Path::new("/data/wats/openclaw"));
+        assert_eq!(
+            dir_with(data, Some("".into())),
+            Path::new("/data/wats/openclaw")
+        );
+        assert_eq!(
+            dir_with(data, Some("/wats-link".into())),
+            Path::new("/wats-link")
+        );
+    }
+
+    #[test]
+    fn insecure_hosts_are_named_for_the_warning() {
+        let host = |raw: &str| insecure_host(&check_url(raw, true).unwrap());
+        assert_eq!(host("http://openclaw:18789").as_deref(), Some("openclaw"));
+        assert_eq!(host("http://10.0.0.5:18789").as_deref(), Some("10.0.0.5"));
+        assert_eq!(host("http://[fd00::2]:18789").as_deref(), Some("[fd00::2]"));
+        assert_eq!(host("http://127.0.0.1:18789"), None);
+        assert_eq!(host("http://localhost:18789"), None);
+        assert_eq!(host("https://openclaw:18789"), None);
     }
 
     #[test]

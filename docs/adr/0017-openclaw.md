@@ -240,6 +240,43 @@ radius than our `locked` runs.
 4. **The end-to-end test runs against Vincent's own OpenClaw**, through
    the restricted `wats` agent, on a hermetic wats pair.
 
+## Addendum: plain http to a private gateway (2026-10-18)
+
+OpenClaw and a wats node in Docker Compose talk over a Docker network
+(`http://openclaw:18789`): not loopback, and with no certificate to offer.
+A new setting, **`agent.openclaw_insecure_ok`** (default `false`), widens
+the plain-http rule of `agent.openclaw_url`:
+
+- **Without it**, plain http is accepted for loopback only (127.0.0.0/8,
+  ::1, `localhost`), as before; https always.
+- **With it**, plain http is also accepted to a **private address**: RFC
+  1918 IPv4 (10/8, 172.16/12, 192.168/16), IPv4 link-local (169.254/16),
+  IPv6 unique local (fc00::/7) and link-local (fe80::/10), or a
+  **single-label host name** (no dot, such as a Compose service name).
+  Never a public IP, nor a dotted name: `openclaw.local` (mDNS) is refused
+  too, to keep the rule simple. Names are not resolved when the config is
+  checked; IP literals are checked against the ranges. An IPv4-mapped IPv6
+  literal is not private.
+- The key is a safety setting (ADR 0011 addendum): a change is flagged
+  until `wats config ack`. The node logs `hook token sent over plain http to
+  <host> (agent.openclaw_insecure_ok)` at startup when it uses it.
+- `wats config set` checks the URL and the flag together when the file is
+  saved: unsetting the flag under a private http URL is refused.
+
+`deploy/openclaw/compose.yaml` is the example: no published gateway port,
+the hook token in a git-ignored env file, never in an image
+([docker.md](../docker.md#openclaw-and-wats-in-docker)).
+
+**The node key never enters OpenClaw's container.** OpenClaw's tools are
+strong, so its container gets neither the node's key nor its data
+directory. The key is a Compose secret of the `wats` service
+(`WATS_SECRET_FILE`); the two containers share one volume holding the
+node's socket and the OpenClaw tokens. Two environment variables make
+that possible: `WATS_MCP_SOCKET` names the node's socket instead of
+`<data dir>/mcp.sock` (with it, `wats mcp` attaches or fails, and never
+starts a node of its own), and `WATS_OPENCLAW_DIR` names the tokens'
+directory instead of `<data dir>/openclaw`.
+
 ## Consequences
 
 - New runtime `openclaw` in `RUNTIMES`, with a forward runner beside the
