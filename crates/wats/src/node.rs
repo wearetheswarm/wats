@@ -344,6 +344,11 @@ enum Origin {
     Pulled,
 }
 
+/// Largest canonical size of an event of a version this node does not
+/// understand that it stores and relays (policy, ADR 0010 A4 addendum).
+/// Understood versions keep their own validity caps (16 KiB for v1 and v2).
+pub const OPAQUE_RELAY_MAX_BYTES: usize = 32 * 1024;
+
 /// Share of `storage.max` that opaque events may take (B4).
 pub const OPAQUE_SHARE_PERCENT: u64 = 5;
 /// Extra proof of work required from events of a version this node does not
@@ -1502,16 +1507,23 @@ impl Node {
             AnyEvent::Known(e) => e.canonical_size()?,
             AnyEvent::Opaque(r) => serde_json_canonicalizer::to_vec(&r.wire)?.len(),
         };
-        if size > crate::event::MAX_EVENT_BYTES {
-            bail!("event is {size} bytes canonicalized, above the relay limit");
-        }
         // Opaque events of a version this node does not understand (B4):
         // relayed only a little ahead of what we understand, with more
-        // proof of work, and within a share of storage.max.
+        // proof of work, within a share of storage.max, and up to a larger
+        // size than understood versions, so that a post-quantum version
+        // with bigger keys and signatures still travels.
         let unknown_version = match &event {
             AnyEvent::Opaque(r) => !understood(r.v),
             AnyEvent::Known(_) => false,
         };
+        let cap = if unknown_version {
+            OPAQUE_RELAY_MAX_BYTES
+        } else {
+            crate::event::MAX_EVENT_BYTES
+        };
+        if size > cap {
+            bail!("event is {size} bytes canonicalized, above the relay limit of {cap}");
+        }
         if let AnyEvent::Opaque(r) = &event
             && unknown_version
             && r.v > UNDERSTOOD_VERSIONS.1.saturating_add(RELAY_VERSIONS_AHEAD)

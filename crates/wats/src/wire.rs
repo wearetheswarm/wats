@@ -101,8 +101,8 @@ pub const MAX_EVENT_DEPTH: usize = 20;
 /// Most entries in `refs`.
 pub const MAX_REFS: usize = 256;
 /// Longest `author` or `sig`, in hex characters, across all versions.
-pub const MAX_KEY_HEX: usize = 8 * 1024;
-pub const MAX_SIG_HEX: usize = 64 * 1024;
+pub const MAX_AUTHOR_CHARS: usize = 8 * 1024;
+pub const MAX_SIG_CHARS: usize = 64 * 1024;
 /// Longest `kind`.
 pub const MAX_KIND_BYTES: usize = 64;
 
@@ -148,11 +148,14 @@ fn jcs(value: &impl serde::Serialize) -> Result<Vec<u8>, EventError> {
     Ok(serde_json_canonicalizer::to_vec(value)?)
 }
 
-fn is_hex(s: &str) -> bool {
+/// Core shape of `author` and `sig` (ADR 0010 A4 addendum): a non-empty
+/// string over the base64url alphabet `[A-Za-z0-9_-]`, a superset of
+/// lowercase hex. The version decides the exact encoding (v1 and v2:
+/// lowercase hex of a fixed length).
+fn is_key_token(s: &str) -> bool {
     !s.is_empty()
-        && s.len().is_multiple_of(2)
         && s.bytes()
-            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
 }
 
 /// The canonical pieces of an event, as hashed.
@@ -348,11 +351,11 @@ impl RawEvent {
         let net = text("net")?;
         let kind = text("kind")?;
         let pow = text("pow")?;
-        if !is_hex(&author) || author.len() > MAX_KEY_HEX {
-            return Err(invalid("author must be lowercase hex"));
+        if !is_key_token(&author) || author.len() > MAX_AUTHOR_CHARS {
+            return Err(invalid("author must be 1-8192 chars of [A-Za-z0-9_-]"));
         }
-        if !is_hex(&sig) || sig.len() > MAX_SIG_HEX {
-            return Err(invalid("sig must be lowercase hex"));
+        if !is_key_token(&sig) || sig.len() > MAX_SIG_CHARS {
+            return Err(invalid("sig must be 1-65536 chars of [A-Za-z0-9_-]"));
         }
         let ts = wire
             .get("ts")

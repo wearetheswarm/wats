@@ -63,8 +63,8 @@ GREASE_PREFIX = "_grease"
 MAX_RELAY_VERSION = 65_535
 MAX_EVENT_DEPTH = 20
 MAX_REFS = 256
-MAX_KEY_HEX = 8 * 1024
-MAX_SIG_HEX = 64 * 1024
+MAX_AUTHOR_CHARS = 8 * 1024
+MAX_SIG_CHARS = 64 * 1024
 MAX_KIND_BYTES = 64
 MAX_NET_BYTES = 64
 # Proof of work, "<alg>:<payload>" (wire.rs `pow_syntax_ok`).
@@ -172,9 +172,15 @@ def is_lower_hex(s: str) -> bool:
     return all(c in "0123456789abcdef" for c in s)
 
 
-def is_hex(s: str) -> bool:
-    """Core shape of `author` and `sig`: lowercase hex of any even length."""
-    return s != "" and len(s) % 2 == 0 and is_lower_hex(s)
+KEY_TOKEN_CHARS = frozenset(
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
+)
+
+
+def is_key_token(s: str) -> bool:
+    """Core shape of `author` and `sig` (wire.rs `is_key_token`): a
+    non-empty base64url-alphabet string; the version decides the encoding."""
+    return s != "" and all(c in KEY_TOKEN_CHARS for c in s)
 
 
 def parse_hex(s: str, nbytes: int, what: str) -> bytes:
@@ -324,10 +330,10 @@ def check_core(value) -> Checked:
 
     author, event_id, sig = text("author"), text("id"), text("sig")
     net, kind, pow_ = text("net"), text("kind"), text("pow")
-    if not is_hex(author) or len(author) > MAX_KEY_HEX:
-        raise Invalid("author must be lowercase hex")
-    if not is_hex(sig) or len(sig) > MAX_SIG_HEX:
-        raise Invalid("sig must be lowercase hex")
+    if not is_key_token(author) or len(author) > MAX_AUTHOR_CHARS:
+        raise Invalid("author must be 1-8192 chars of [A-Za-z0-9_-]")
+    if not is_key_token(sig) or len(sig) > MAX_SIG_CHARS:
+        raise Invalid("sig must be 1-65536 chars of [A-Za-z0-9_-]")
     ts = as_u64(wire.get("ts"))
     if ts is None or ts > MAX_SAFE_INTEGER:
         raise Invalid("ts must be a non-negative integer")
