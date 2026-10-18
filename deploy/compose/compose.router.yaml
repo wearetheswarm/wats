@@ -3,7 +3,6 @@
 #
 #   cd /opt/wearetheswarm           # on the VM, next to .env
 #   cp router.env.example .env      # set WATS_VERSION (and quotas if needed)
-#   docker login ghcr.io            # classic PAT with read:packages only
 #   docker compose -f compose.router.yaml up -d
 #
 # Host networking: the node binds UDP 7842 directly on the VM's public IPv4
