@@ -644,12 +644,63 @@ fn lock_data_dir(dir: &Path) -> Result<std::fs::File> {
         .open(&path)
         .with_context(|| format!("open {}", path.display()))?;
     match file.try_lock() {
-        Ok(()) => Ok(file),
-        Err(std::fs::TryLockError::WouldBlock) => bail!(
-            "another wats node is using {}; stop it or choose another data dir (--dir / WATS_DIR)",
-            dir.display()
-        ),
+        Ok(()) => {
+            write_lock_holder(&file);
+            Ok(file)
+        }
+        Err(std::fs::TryLockError::WouldBlock) => {
+            let holder = std::fs::read_to_string(&path)
+                .ok()
+                .and_then(|text| serde_json::from_str::<LockHolder>(&text).ok());
+            match holder {
+                Some(h) => bail!(
+                    "another wats node is using {}: pid {}, wats {} ({}), started {}. \
+                     Stop it (`kill {}`), or choose another data dir (--dir / WATS_DIR)",
+                    dir.display(),
+                    h.pid,
+                    h.version,
+                    h.exe,
+                    h.started,
+                    h.pid
+                ),
+                // A node older than this message writes no holder.
+                None => bail!(
+                    "another wats node is using {}; stop it or choose another data dir (--dir / WATS_DIR)",
+                    dir.display()
+                ),
+            }
+        }
         Err(std::fs::TryLockError::Error(e)) => Err(e.into()),
+    }
+}
+
+/// Who holds the data directory lock, written into the lock file by the
+/// holder so that a second `wats` can say which process to stop.
+#[derive(Debug, Serialize, Deserialize)]
+struct LockHolder {
+    pid: u32,
+    version: String,
+    exe: String,
+    started: String,
+}
+
+/// Record this process in the lock file it holds (best effort).
+fn write_lock_holder(mut file: &std::fs::File) {
+    use std::io::{Seek, Write};
+    let holder = LockHolder {
+        pid: std::process::id(),
+        version: env!("CARGO_PKG_VERSION").to_string(),
+        exe: std::env::current_exe()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|_| "unknown path".into()),
+        started: crate::runs::format_time(now_secs()),
+    };
+    if let Ok(json) = serde_json::to_vec(&holder) {
+        let _ = file
+            .set_len(0)
+            .and_then(|()| file.seek(std::io::SeekFrom::Start(0)))
+            .and_then(|_| file.write_all(&json))
+            .and_then(|()| file.flush());
     }
 }
 
