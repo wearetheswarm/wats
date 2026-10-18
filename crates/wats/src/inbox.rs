@@ -139,20 +139,25 @@ impl InboxKey {
     /// Parse the secret as written by [`InboxKey::secret_hex`]: the 32-byte
     /// seed in hex, surrounding whitespace ignored.
     pub fn from_secret_str(s: &str) -> Result<Self> {
-        let seed = hex::decode(s.trim()).context("an inbox secret is hex")?;
-        ensure!(
-            seed.len() == SECRET_BYTES,
-            "an inbox secret is {SECRET_BYTES} bytes, not {}",
-            seed.len()
-        );
-        Self::from_seed(&seed)
+        let mut seed = hex::decode(s.trim()).context("an inbox secret is hex")?;
+        let key = if seed.len() == SECRET_BYTES {
+            Self::from_seed(&seed)
+        } else {
+            Err(anyhow::anyhow!(
+                "an inbox secret is {SECRET_BYTES} bytes, not {}",
+                seed.len()
+            ))
+        };
+        seed.iter_mut().for_each(|b| *b = 0);
+        std::hint::black_box(&seed);
+        key
     }
 
-    /// Read a secret file.
+    /// Read a secret file, or standard input when `path` is `-` (e.g.
+    /// `sops decrypt inbox.key.enc | wats inbox read --key -`).
     pub fn load(path: &Path) -> Result<Self> {
-        let text = std::fs::read_to_string(path)
-            .with_context(|| format!("read inbox secret {}", path.display()))?;
-        Self::from_secret_str(&text)
+        let secret = crate::identity::read_secret(path, "inbox secret")?;
+        Self::from_secret_str(secret.as_str()?)
     }
 
     /// The secret (the X-Wing seed) in hex.

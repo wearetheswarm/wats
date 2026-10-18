@@ -30,6 +30,10 @@ services:
       WATS_STORAGE_MAX: "${WATS_STORAGE_MAX:-25G}"
       # Collect crash reports from nodes (ADR 0013): /data/wats/reports/.
       WATS_REPORT_ACCEPT: "${WATS_REPORT_ACCEPT:-true}"
+      # On a guardian halt, stay up and serve only the halt events, so that
+      # late nodes still learn about it (halt.serve, ADR 0016). Releases
+      # before the halt ignore the variable.
+      WATS_HALT_SERVE: "${WATS_HALT_SERVE:-true}"
       WATS_MAX_BLOB_SIZE: "${WATS_MAX_BLOB_SIZE:-256M}"
       RUST_LOG: "${RUST_LOG:-wats=info,iroh=warn}"
     volumes:

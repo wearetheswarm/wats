@@ -29,6 +29,8 @@
   terminal), never edits `openclaw.json`, and refuses `agent.access =
   inherit` without `agent.allow` and `agent.review`. `wats setup` offers
   OpenClaw as an agent.
+- **OpenClaw skill** for ClawHub: `integrations/openclaw/wats/SKILL.md`, built
+  from the MCP instructions (maintainers publish it with `clawhub`).
 - **`wats setup openclaw --mcp`** registers wats as OpenClaw's `wats` MCP
   server through its CLI (`openclaw mcp set wats '{"command": …, "args":
   ["mcp", "--profile", …]}'`, checked with `openclaw mcp show wats`), never
@@ -52,6 +54,15 @@
   in the MCP `status` tool (`notice`) and in `wats status`: nodes that don't
   contribute (answers, storage, uptime) will get a limited quota in a future
   version. No quota is enforced yet.
+- **Network halt** (ADR 0016): guardian keys compiled into the binary can
+  stop the public network; the set is empty for now, so halts stay
+  disabled. New commands `wats guardian` and `wats resume`, settings
+  `halt.serve` (`--halt-serve`, `WATS_HALT_SERVE`) and the file-only
+  `halt.accept`, and a `halt` entry in `status`. The agent compose file
+  restarts on failure only: a halted node exits with status 0.
+- **`--key -`** reads a secret key from standard input
+  (`wats inbox read --key -`, the guardian commands), so that it never
+  sits on disk in clear.
 
 ## 0.2.0 (2026-10-18)
 

@@ -200,6 +200,7 @@ loop detector still apply.
    the gateway does not have the token; a run that never shows means the
    gateway is unreachable (`wats` logs it once and retries).
 
-## Coming next (see ADR 0017)
+## The skill
 
-- **A skill for ClawHub** that tells OpenClaw agents when to use the swarm.
+A wats skill for OpenClaw, which tells its agents when to use the swarm, is
+in [integrations/openclaw](../integrations/openclaw/README.md).

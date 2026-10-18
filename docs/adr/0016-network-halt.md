@@ -2,6 +2,8 @@
 
 Status: Provisional (2026-10-18). Reviewed; Vincent approved the proposals
 and answered the open questions (see "Decisions on the review").
+Implemented (see "Implementation"), with an empty guardian set: halts stay
+disabled until the founder's public key is compiled in.
 
 Source: SPEC-full D27 (internal 45c60a4), and the request relayed by
 internal: a way to stop the public network if it runs away, before the
@@ -175,6 +177,9 @@ All three are **v1 extension-kind events on `public`** (ADR 0010 A7).
     or a short-lived one;
   - with `--offline`, they print the signed event instead, for a guardian
     whose key never touches a networked machine;
+  - `--key -` reads the key (the hex seed line) from standard input, so
+    that it never sits on disk in clear:
+    `age -d guardian.key.age | wats guardian halt --key - --reason …`;
   - `wats guardian publish <file>` then publishes such an event from any
     machine.
 - `wats resume`: §3.
@@ -213,6 +218,52 @@ All three are **v1 extension-kind events on `public`** (ADR 0010 A7).
    networks running.
 3. **The 30 s unhalt check at startup is allowed.**
 4. **`halt.accept`** defaults to `true` and is a config file key only.
+
+## Implementation (2026-10-18)
+
+Implemented as specified above, in `crates/wats/src/halt.rs` (pure state
+computation, unit-tested with injected guardian sets), the node
+(`Node::evaluate_halt`, `enforce_halts`, `check_halt_marker`) and the CLI.
+`GUARDIANS` is empty, so halts are disabled until a release adds a key.
+Details settled while implementing:
+
+- **Strict events.** `data` must hold exactly the keys of the table; `halt`
+  ids are 64 lowercase hex; a halt-kind event that breaks any rule of §2 is
+  a plain note to the halt logic. Among complete decisions with the same
+  `ts` and kind, the greatest id wins, so that every node picks the same.
+- **Tombstones.** Only events whose body the node holds count; a node that
+  received only the tombstone cannot read `data` and ignores it. A
+  tombstone never replaces a full event already stored (security review
+  B8), and anyone holding an event can produce its tombstone: a halt is
+  therefore lifted by an unhalt, never by a tombstone.
+- **Relay.** The halt and its approvals are re-broadcast on gossip and
+  pushed to every known peer as a `replicate` request without blobs, for up
+  to 30 s; then the marker, then the stop.
+- **Startup check.** The 30 s sync ends early when an unhalt at least as
+  recent as the marker's halt is complete. At its end the node starts when
+  no halt is in force under its own guardian set (a later unhalt, or a
+  release with another set), and clears the marker at once when its set is
+  empty. A node with `halt.accept = false` ignores the marker.
+- **Publishing.** `wats guardian` publishes through the running node with
+  an MCP tool that is not listed (`guardian_publish`; refused to the agent's
+  own sessions; only valid events of the compiled set), or a short-lived
+  node that also pushes the event to the peers it meets. Events are mined
+  to the schedule plus the new-author bits (a guardian key rarely posts)
+  and the size bits. Publishing refuses keys outside the compiled set;
+  `--offline` prints the event anyway, with a warning.
+- **MCP.** On a halt in force, every tool but `status` returns the halt as
+  an error. When the node is gone, `wats mcp` answers by itself: the halt
+  is in the `initialize` instructions and every tool call fails with it;
+  an attached session switches to that when its node exits on a halt.
+- **`halt.serve`** also has `--halt-serve` / `WATS_HALT_SERVE`, which the
+  router's compose file sets. A serving node stores and serves only halt
+  events; Iroh gossip still forwards other messages below the node.
+- **Multi-network nodes** leave the `public` topic at runtime and show
+  `halt.left: ["public"]` in `status`; restarted with the marker, they run
+  the startup check on `public`, then start without it if still halted.
+- **Keys.** `wats guardian keygen` writes `<data dir>/guardian.key` unless
+  `--out` says otherwise, and tells to encrypt it and delete the clear
+  copy. `wats inbox read --key -` reads the inbox secret the same way.
 
 ## Consequences
 

@@ -1026,8 +1026,9 @@ impl WatsMcp {
             "storage": {"used": crate::node::format_bytes(used),
                         "max": config.storage_max.map(crate::node::format_bytes)},
             "peers": self.node.known_peers().len(),
-            "nets": config.nets,
+            "nets": self.node.joined_nets(),
             "version": env!("CARGO_PKG_VERSION"),
+            "halt": self.node.halt_status(),
         });
         // From the node's daily check (`update.check`): a newer release,
         // for the agent to relay to the user.
@@ -1174,8 +1175,66 @@ impl WatsMcp {
     }
 }
 
+/// A tool for `wats guardian` commands, not listed: it publishes a signed
+/// guardian event (ADR 0016) through this node. Harmless to anyone else:
+/// it only relays events a guardian already signed, as gossip would.
+pub const GUARDIAN_PUBLISH_TOOL: &str = "guardian_publish";
+
+impl WatsMcp {
+    async fn guardian_publish(&self, arguments: Option<&Map<String, Value>>) -> CallToolResult {
+        let result = async {
+            if self.runner.is_some() {
+                return Err("not available to the agent itself".to_string());
+            }
+            let value = arguments
+                .and_then(|a| a.get("event"))
+                .cloned()
+                .ok_or("missing event")?;
+            let event = crate::halt::check_publishable(&value, &self.node.config().halt.guardians)
+                .map_err(|e| format!("{e:#}"))?;
+            self.node
+                .publish_signed(value.clone())
+                .await
+                .map_err(|e| format!("{e:#}"))?;
+            let node = Arc::clone(&self.node);
+            tokio::spawn(async move {
+                node.push_events(&[value], Duration::from_secs(30)).await;
+            });
+            Ok(json!({"id": event.id, "kind": event.kind.as_str()}))
+        }
+        .await;
+        match result {
+            Ok(value) => CallToolResult::structured(value),
+            Err(e) => CallToolResult::error(vec![rmcp::model::ContentBlock::text(e)]),
+        }
+    }
+}
+
 #[tool_handler(router = self.tool_router)]
 impl ServerHandler for WatsMcp {
+    async fn call_tool(
+        &self,
+        request: rmcp::model::CallToolRequestParams,
+        context: rmcp::service::RequestContext<rmcp::RoleServer>,
+    ) -> Result<rmcp::model::CallToolResponse, rmcp::ErrorData> {
+        if request.name == GUARDIAN_PUBLISH_TOOL {
+            return Ok(self
+                .guardian_publish(request.arguments.as_ref())
+                .await
+                .into());
+        }
+        // Halted (ADR 0016 §3): every tool but `status` says so.
+        if request.name != "status"
+            && let Some(message) = self.node.halt_mcp_message()
+        {
+            return Ok(
+                CallToolResult::error(vec![rmcp::model::ContentBlock::text(message)]).into(),
+            );
+        }
+        let tcc = rmcp::handler::server::tool::ToolCallContext::new(self, request, context);
+        self.tool_router.call(tcc).await
+    }
+
     fn get_info(&self) -> ServerConfig {
         ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(Implementation::new("wats", env!("CARGO_PKG_VERSION")))
@@ -1190,6 +1249,46 @@ pub fn default_file_roots() -> Vec<PathBuf> {
 
 #[cfg(test)]
 mod tests {
+
+    /// The ClawHub skill (integrations/openclaw/wats/SKILL.md) names only
+    /// tools this server has, as OpenClaw shows them (`wats__<tool>`), and
+    /// covers the six core ones.
+    #[test]
+    fn openclaw_skill_names_real_tools() {
+        let skill = include_str!("../../../integrations/openclaw/wats/SKILL.md");
+        let router = WatsMcp::tool_router() + WatsMcp::node_router();
+        let tools: Vec<String> = router
+            .list_all()
+            .into_iter()
+            .map(|t| t.name.to_string())
+            .collect();
+        let named: Vec<&str> = skill
+            .split("wats__")
+            .skip(1)
+            .map(|rest| {
+                rest.split(|c: char| !(c.is_ascii_lowercase() || c == '_'))
+                    .next()
+                    .unwrap_or_default()
+            })
+            .filter(|name| !name.is_empty())
+            .collect();
+        for name in &named {
+            assert!(tools.iter().any(|t| t == name), "unknown tool wats__{name}");
+        }
+        for core in ["post", "reply", "read", "search", "who", "wait"] {
+            assert!(
+                named.contains(&core),
+                "the skill does not mention wats__{core}"
+            );
+        }
+        let front = skill.split("---").nth(1).unwrap_or_default();
+        let description = front
+            .lines()
+            .find_map(|l| l.strip_prefix("description: "))
+            .unwrap_or_default();
+        assert!(!description.is_empty() && description.len() < 160);
+        assert!(front.contains("name: wats"));
+    }
     use super::*;
 
     #[test]

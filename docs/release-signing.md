@@ -143,9 +143,10 @@ To set it up, once:
 
    The file holds the secret, the 32-byte X-Wing seed in hex, on one line.
    It is never overwritten: `keygen` refuses an existing file.
-2. Store the secret with the project's operational secrets (sops), like
-   the minisign key, and copy it to the maintainers' node. Delete any other
-   copy.
+2. Encrypt it right away with the project's operational secrets (sops),
+   like the minisign key, and delete the clear copy. The secret never needs
+   to sit on disk in clear again: every command that uses it reads it from
+   standard input with `--key -`.
 3. In a pull request, set `MAINTAINERS_INBOX` to `Some("<public key>")`.
    Releases from then on seal reports to it; older ones keep using the
    collector.
@@ -154,9 +155,12 @@ To read the reports, on a node that holds the submissions (any node of the
 public network keeps them for `submit.retention`, 30 days by default):
 
 ```sh
-wats inbox read --key inbox.key            # writes <data dir>/inbox/<report id>.json
-wats inbox read --key inbox.key --out dir  # or elsewhere
+sops decrypt inbox.key.enc | wats inbox read --key -            # writes <data dir>/inbox/<report id>.json
+sops decrypt inbox.key.enc | wats inbox read --key - --out dir  # or elsewhere
 ```
+
+`--key <file>` reads a clear file instead, for tests. The secret read from
+standard input is wiped from memory once parsed (best effort).
 
 It works next to a running node, skips the reports already written, and
 prints how many reports were complete, incomplete (parts still missing) or

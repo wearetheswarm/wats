@@ -177,6 +177,26 @@ for.**
   key is compiled in, reports go to the router as a `crash_report`
   request, and the router stores them with size, rate and retention
   limits.
+- **Guardian halts** (ADR 0016): `HALT_THRESHOLD` of the guardian keys
+  compiled into the binary can stop the public network on every node that
+  accepts halts (the default). Stolen guardian keys, at least
+  `HALT_THRESHOLD` of them, are a **network-wide denial of service and
+  nothing more**: every accepting node stops until an unhalt or a local
+  `wats resume`, but the thief cannot run code, delete data, change a
+  setting or push an upgrade, and cannot single out one node rather than
+  the whole public network (private networks are out of reach: a node on
+  them only leaves `public`). A guardian gone rogue under 1-of-1 is the
+  same case. Mitigations: keys kept offline and encrypted (commands read
+  them from standard input, `--key -`), m-of-n as soon as there are
+  independent guardians, the 24 h approval window (approvals cannot be
+  stitched together later), `wats resume` with its per-halt override,
+  `halt.accept = false` (a config.toml key only, deliberately not offered
+  by `wats setup` nor listed by `wats config list`; such a node warns at
+  every start and shows `halt: {accept: false}` in `status`), and
+  replacing the set through a signed release. A forged tombstone cannot
+  lift a halt: a tombstone never replaces an event a node already holds.
+  Lost keys below the threshold mean no halt and no unhalt: a halt in
+  effect is then cleared with `wats resume` or a release with a new set.
 
 ## Known gaps
 

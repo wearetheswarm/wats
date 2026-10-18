@@ -55,6 +55,19 @@ pub struct Settings {
     pub agent: AgentSettings,
     #[serde(default)]
     pub update: UpdateSettings,
+    #[serde(default)]
+    pub halt: HaltSettings,
+}
+
+/// `[halt]`: guardian halts (ADR 0016).
+#[derive(Debug, Default, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HaltSettings {
+    /// `false` ignores guardian halts. A file key only: no flag, not in
+    /// `wats setup` nor in the listed keys ([`HIDDEN_KEYS`]).
+    pub accept: Option<bool>,
+    /// Keep serving halt events instead of exiting on a halt (the router).
+    pub serve: Option<bool>,
 }
 
 /// `[update]`: the daily release check and opt-in auto-upgrade
@@ -490,6 +503,12 @@ pub const KEYS: &[Key] = &[
         "collect crash reports from other nodes (our router only)",
     ),
     key(
+        "halt.serve",
+        ValueType::Bool,
+        "false",
+        "on a guardian halt, keep serving halt events instead of stopping (our router only)",
+    ),
+    key(
         "submit.retention",
         ValueType::Retention,
         "30d",
@@ -678,13 +697,26 @@ pub const KEYS: &[Key] = &[
     ),
 ];
 
+/// Keys accepted by `wats config` and in the file, but never listed nor
+/// suggested: `halt.accept` (ADR 0016 §3) is a deliberate choice, made in
+/// the file, not offered.
+pub const HIDDEN_KEYS: &[Key] = &[key(
+    "halt.accept",
+    ValueType::Bool,
+    "true",
+    "false: this node ignores guardian halts of the public network (ADR 0016)",
+)];
+
 pub fn find_key(name: &str) -> Result<&'static Key> {
-    KEYS.iter().find(|k| k.name == name).with_context(|| {
-        format!(
-            "unknown key {name:?}; known keys: {}",
-            KEYS.iter().map(|k| k.name).collect::<Vec<_>>().join(", ")
-        )
-    })
+    KEYS.iter()
+        .chain(HIDDEN_KEYS)
+        .find(|k| k.name == name)
+        .with_context(|| {
+            format!(
+                "unknown key {name:?}; known keys: {}",
+                KEYS.iter().map(|k| k.name).collect::<Vec<_>>().join(", ")
+            )
+        })
 }
 
 /// Check a value of the key `name`, as given on the command line, and turn

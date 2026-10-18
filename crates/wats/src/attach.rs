@@ -184,7 +184,23 @@ async fn serve_session(node: Arc<Node>, stream: tokio::net::UnixStream) -> Resul
     {
         server = server.runner_session(run);
     }
-    server.serve((reader, write)).await?.waiting().await?;
+    // A node that stops on a guardian halt, or only serves halt events,
+    // ends its sessions (ADR 0016 §3).
+    let stopped = |o: &crate::node::HaltOutcome| {
+        matches!(
+            o,
+            crate::node::HaltOutcome::Serving | crate::node::HaltOutcome::Exit(_)
+        )
+    };
+    let mut outcome = node.halt_outcome();
+    if stopped(&outcome.borrow()) {
+        return Ok(());
+    }
+    let running = server.serve((reader, write)).await?;
+    tokio::select! {
+        result = running.waiting() => { result?; }
+        _ = outcome.wait_for(stopped) => {}
+    }
     Ok(())
 }
 
@@ -274,7 +290,13 @@ pub async fn attach(
                 }
             }
         }
-        // The node went away: wait for the next one.
+        // The node went away: on a guardian halt, say so to the client
+        // from here on (ADR 0016 §3); otherwise wait for the next one.
+        if let Some(marker) = crate::halt::read_marker(data_dir) {
+            crate::halt::serve_halted_mcp(stdin, stdout, &crate::halt::mcp_message(&marker))
+                .await?;
+            return Ok(true);
+        }
         let mut next = None;
         for _ in 0..300 {
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;

@@ -490,3 +490,81 @@ async fn vouch_on_an_answer_warns() -> anyhow::Result<()> {
     node.shutdown().await?;
     Ok(())
 }
+
+/// `wats guardian` publishes through the running node with a tool that is
+/// not listed; once a halt is in force, every tool but `status` says so.
+#[tokio::test(flavor = "multi_thread")]
+async fn guardian_events_through_mcp_and_a_halted_session() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let guardian = ed25519_dalek::SigningKey::from_bytes(&[7; 32]);
+    let mut config = NodeConfig::new(dir.path().join("node"));
+    config.mode = NetworkMode::Loopback;
+    config.pow_bits = Some(0);
+    config.min_pow_bits = Some(0);
+    config.halt.guardians = wats::halt::Guardians {
+        keys: vec![wats::identity::author_id(&guardian)],
+        threshold: 1,
+        window: wats::halt::HALT_APPROVAL_WINDOW,
+    };
+    let node = Node::start(config).await?;
+    let server = WatsMcp::new(node.clone(), vec![]);
+    let (server_io, client_io) = tokio::io::duplex(64 * 1024);
+    tokio::spawn(async move {
+        server
+            .serve(server_io)
+            .await?
+            .waiting()
+            .await
+            .map(|_| ())
+            .map_err(anyhow::Error::from)
+    });
+    let client = ().serve(client_io).await?;
+    let tools = client.list_all_tools().await?;
+    assert!(
+        tools
+            .iter()
+            .all(|t| t.name != wats::mcp::GUARDIAN_PUBLISH_TOOL)
+    );
+
+    let now = wats::node::now_secs();
+    let stranger = ed25519_dalek::SigningKey::from_bytes(&[8; 32]);
+    let forged = wats::halt::sign(wats::halt::halt_draft("no", now)?, &stranger, now, Some(0))?;
+    let refused = call(
+        &client,
+        wats::mcp::GUARDIAN_PUBLISH_TOOL,
+        json!({"event": forged}),
+    )
+    .await;
+    assert_eq!(refused.is_error, Some(true), "{refused:?}");
+
+    let halt = wats::halt::sign(
+        wats::halt::halt_draft("runaway", now)?,
+        &guardian,
+        now,
+        Some(0),
+    )?;
+    let published = structured(
+        &call(
+            &client,
+            wats::mcp::GUARDIAN_PUBLISH_TOOL,
+            json!({"event": halt}),
+        )
+        .await,
+    );
+    assert_eq!(published["id"], halt.id.as_str());
+
+    let status = structured(&call(&client, "status", json!({})).await);
+    assert_eq!(status["halt"]["accept"], true, "{status}");
+    assert_eq!(
+        status["halt"]["in_effect"]["id"],
+        halt.id.as_str(),
+        "{status}"
+    );
+    assert_eq!(status["halt"]["in_effect"]["reason"], "runaway");
+    let search = call(&client, "search", json!({})).await;
+    assert_eq!(search.is_error, Some(true));
+    assert!(format!("{:?}", search.content).contains("halted by its guardians"));
+    client.cancel().await?;
+    node.shutdown().await?;
+    Ok(())
+}
