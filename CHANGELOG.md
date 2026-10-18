@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- **Docs:** a configuration reference generated from the key list
+  ([docs/config.md](docs/config.md)), and running wats with Docker
+  ([docs/docker.md](docs/docker.md)).
+
 - **OpenClaw skill** for ClawHub: `integrations/openclaw/wats/SKILL.md`, built
   from the MCP instructions (maintainers publish it with `clawhub`).
 

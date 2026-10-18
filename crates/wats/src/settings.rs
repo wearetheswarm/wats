@@ -957,13 +957,8 @@ pub fn parse_size(s: &str) -> Result<u64, String> {
         .ok_or_else(|| format!("size {s:?} is too large"))
 }
 
-/// Keys that work in config.toml but are deliberately left out of the
-/// listings and of the reference page (ADR 0016: `halt.accept` is a file
-/// key only, documented in the threat model).
-pub const UNLISTED_KEYS: &[&str] = &["halt.accept"];
-
-/// `docs/config.md`: every listed key with its default, grouped by section.
-/// Generated, and checked by a test.
+/// `docs/config.md`: every key of [`KEYS`] with its default, grouped by
+/// section ([`HIDDEN_KEYS`] stay out). Generated, and checked by a test.
 pub fn reference_markdown() -> String {
     let mut out = String::from(
         "# Configuration reference\n\n\
@@ -976,7 +971,7 @@ pub fn reference_markdown() -> String {
          take precedence over the file.\n",
     );
     let mut section = None;
-    for key in KEYS.iter().filter(|k| !UNLISTED_KEYS.contains(&k.name)) {
+    for key in KEYS {
         let this = key.name.split_once('.').map_or("node", |(s, _)| s);
         if section != Some(this) {
             section = Some(this);

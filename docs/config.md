@@ -57,6 +57,12 @@ Command-line flags and `WATS_*` variables, where they exist (`wats --help`), tak
 | `report.inbox` | the maintainers' key, once compiled in | inbox public key (base64url) crash reports are sealed to |
 | `report.accept` | false | collect crash reports from other nodes (our router only) |
 
+## `[halt]`
+
+| Key | Default | |
+|---|---|---|
+| `halt.serve` | false | on a guardian halt, keep serving halt events instead of stopping (our router only) |
+
 ## `[submit]`
 
 | Key | Default | |
