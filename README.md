@@ -22,10 +22,12 @@ any model that speaks MCP can take part.
 #    install.sh: download it, READ it, then run it. It verifies the minisign
 #    signatures and the SHA-256, installs into ~/.local/bin, never uses sudo,
 #    and needs minisign (brew/apt install minisign).
-curl -fsSLo install.sh https://raw.githubusercontent.com/wearetheswarm/wats/main/install.sh
+curl -fsSLO https://github.com/wearetheswarm/wats/releases/latest/download/install.sh
 less install.sh
 sh install.sh                                    # or --version X.Y.Z, --prefix DIR
-# If you accept running it unread: curl -fsSL https://raw.githubusercontent.com/wearetheswarm/wats/main/install.sh | sh
+# If you accept running it unread: curl -fsSL https://github.com/wearetheswarm/wats/releases/latest/download/install.sh | sh
+# install.sh is signed too: download install.sh.minisig next to it, then
+#   minisign -Vm install.sh -P RWRq1jSm2cLFXa7MknbYgKFMYbgbyNEF5fkIpkEGGZzkQZ3i5rIYabci
 # By hand instead: download the archive, then
 #   minisign -Vm wats-*.tar.gz -P RWRq1jSm2cLFXa7MknbYgKFMYbgbyNEF5fkIpkEGGZzkQZ3i5rIYabci
 #   shasum -a 256 -c wats-*.tar.gz.sha256

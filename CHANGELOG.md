@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- **install.sh comes with each release**, signed with minisign like the
+  archives: `https://github.com/wearetheswarm/wats/releases/latest/download/install.sh` is always the latest release's installer,
+  and `install.sh.minisig` verifies it.
 - **Partial answers instead of silence** (ADR 0018 §1–2): the run prompt
   says what the run can use (`{access}`: with `locked`, it cannot run,
   build or test anything), and the runner's and MCP instructions tell an

@@ -15,8 +15,9 @@ name: release
 # a .sha256, each signed with minisign (.minisig) with the key held in the
 # MINISIGN_SECRET_KEY secret; without it the run fails
 # (docs/release-signing.md). Download: gh release download vX.Y.Z -R wearetheswarm/wats
-# Windows native and the cargo-dist installers come with the public launch
-# (installers need public releases).
+# The Linux leg also attaches install.sh and its .minisig, so that
+# releases/latest/download/install.sh is the latest release's installer.
+# Windows native comes once the node supports it.
 #
 # No `latest` tag: deployments pin a version (WATS_VERSION in the router .env).
 # The image is linux/amd64 only (the OVH VM). arm64 is a later option, built
@@ -151,10 +152,14 @@ jobs:
       # secret key, and checks that this public key is the one published in
       # README.md and docs/release-signing.md (an error otherwise). A key with
       # a password fails here: stdin is closed, so minisign cannot prompt.
+      # The Linux leg also signs install.sh, attached to the release so that
+      # releases/latest/download/install.sh is the installer of the latest
+      # release (README).
       - name: Sign
         env:
           MINISIGN_SECRET_KEY: ${{ secrets.MINISIGN_SECRET_KEY }}
           NAME: ${{ steps.package.outputs.name }}
+          INSTALLER: ${{ matrix.target == env.IMAGE_TARGET }}
         run: |
           key="$RUNNER_TEMP/minisign.key"
           pubfile="$RUNNER_TEMP/minisign.pub"
@@ -165,7 +170,9 @@ jobs:
             exit 1
           fi
           pub="$(tail -n 1 "$pubfile")"
-          for f in "$NAME.tar.gz" "$NAME.tar.gz.sha256"; do
+          files=("$NAME.tar.gz" "$NAME.tar.gz.sha256")
+          if [ "$INSTALLER" = true ]; then files+=(install.sh); fi
+          for f in "${files[@]}"; do
             minisign -S -s "$key" -m "$f" < /dev/null
             minisign -V -P "$pub" -m "$f"
             cat "$f.minisig"
@@ -188,11 +195,13 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ github.event.release.tag_name }}
           NAME: ${{ steps.package.outputs.name }}
+          INSTALLER: ${{ matrix.target == env.IMAGE_TARGET }}
         run: |
           files=("$NAME.tar.gz" "$NAME.tar.gz.sha256")
           for f in "$NAME.tar.gz.minisig" "$NAME.tar.gz.sha256.minisig"; do
             if [ -f "$f" ]; then files+=("$f"); fi
           done
+          if [ "$INSTALLER" = true ]; then files+=(install.sh install.sh.minisig); fi
           gh release upload "$TAG" "${files[@]}" --clobber
 
       - name: Keep as a workflow artifact (manual runs)
@@ -204,6 +213,7 @@ jobs:
             ${{ steps.package.outputs.name }}.tar.gz
             ${{ steps.package.outputs.name }}.tar.gz.sha256
             ${{ steps.package.outputs.name }}.tar.gz*.minisig
+            install.sh.minisig
           retention-days: 7
 
       # Image: the static Linux binary built above, on distroless static.
