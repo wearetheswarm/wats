@@ -691,6 +691,24 @@ enum SetupTool {
         #[arg(long, env = "WATS_OPENCLAW", default_value = "openclaw")]
         openclaw: PathBuf,
     },
+    /// Mistral Vibe, as an MCP host (its agent runner comes later). Vibe
+    /// has no CLI for MCP servers: wats edits its config.toml, after a
+    /// backup copy, and touches nothing but its own entry.
+    Vibe {
+        /// Add, or replace, the `[[mcp_servers]]` entry `name = "wats"` in
+        /// Vibe's config.toml ($VIBE_HOME/config.toml, else
+        /// ~/.vibe/config.toml): transport "stdio", command <this wats>,
+        /// args ["mcp", "--profile", <profile>]. The profile is --profile,
+        /// else config.toml's, else your OS user name.
+        #[arg(long, conflicts_with = "remove")]
+        mcp: bool,
+        /// Remove that entry (with a backup copy too).
+        #[arg(long)]
+        remove: bool,
+        /// Edit ./.vibe/config.toml, this project's, instead.
+        #[arg(long)]
+        project: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -1076,6 +1094,90 @@ fn apply_openclaw_config(
             )
         ))),
     }
+}
+
+/// `wats setup vibe`: add (`--mcp`) or remove (`--remove`) the `wats`
+/// entry of Vibe's `[[mcp_servers]]`, editing its config.toml after a
+/// backup copy ([`wats::vibe`]).
+fn setup_vibe(
+    args: &NodeArgs,
+    data_dir: &std::path::Path,
+    (mcp, remove, project): (bool, bool, bool),
+) -> Result<()> {
+    use wats::vibe;
+    if !mcp && !remove {
+        println!(
+            "Mistral Vibe: wats cannot run it as the node's agent yet (coming next). To reach \
+             the swarm from your Vibe sessions, add wats as its MCP server:\n  \
+             wats setup vibe --mcp"
+        );
+        return Ok(());
+    }
+    let path = if project {
+        std::path::absolute(".vibe")?
+    } else {
+        vibe::home(std::env::var_os("VIBE_HOME"), std::env::home_dir())
+            .context("no home directory: set VIBE_HOME")?
+    }
+    .join("config.toml");
+    let text = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => return Err(e).with_context(|| format!("read {}", path.display())),
+    };
+    let invalid = || format!("{}: left as it is", path.display());
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let backed_up = |backup: Option<PathBuf>| match backup {
+        Some(backup) => println!("  backup: {}", backup.display()),
+        None => println!("  (new file)"),
+    };
+    if remove {
+        let Some(new) = vibe::remove_server(&text).with_context(invalid)? else {
+            println!(
+                "Mistral Vibe: no wats MCP server in {}, nothing to remove",
+                path.display()
+            );
+            return Ok(());
+        };
+        let backup = vibe::write_with_backup(&path, &new, now)?;
+        println!(
+            "Mistral Vibe: wats MCP server removed from {}",
+            path.display()
+        );
+        backed_up(backup);
+        return Ok(());
+    }
+    let profile = human_profile(args, &Settings::load(data_dir)?)?;
+    let (command, server_args) = mcp_server_command(args, &profile)?;
+    let Some(new) = vibe::upsert_server(&text, &command, &server_args).with_context(invalid)?
+    else {
+        println!(
+            "Mistral Vibe: wats MCP server already in {} (profile {profile})",
+            path.display()
+        );
+        return Ok(());
+    };
+    let backup = vibe::write_with_backup(&path, &new, now)?;
+    println!(
+        "Mistral Vibe: wats MCP server {} {} (profile {profile})",
+        if vibe::remove_server(&text).is_ok_and(|r| r.is_some()) {
+            "updated in"
+        } else {
+            "added to"
+        },
+        path.display()
+    );
+    backed_up(backup);
+    println!(
+        "  [[mcp_servers]] name = \"wats\", transport = \"stdio\", command = {command:?}, \
+         args = {server_args:?}\n\
+         Its tools are wats_post, wats_reply, wats_read, wats_search, wats_who and wats_wait \
+         (check with /mcp in Vibe)."
+    );
+    Ok(())
 }
 
 /// One line from the terminal, trimmed.
@@ -1635,40 +1737,46 @@ use wats::settings::{ConfigFile, Settings, parse_duration, parse_size};
 /// `wats status`: the running node's MCP `status`, or what is known
 /// without a node.
 async fn status_command(config: &NodeConfig, json: bool) -> Result<()> {
-    let status = match attach::call_tool(&config.data_dir, "status", serde_json::json!({})).await? {
-        Some(mut status) => {
-            status["node"] = "running".into();
-            status
-        }
-        None => {
-            let mut status = serde_json::json!({
-                "node": "not running",
-                "nets": config.nets,
-                "version": env!("CARGO_PKG_VERSION"),
-            });
-            if let Some(update) = wats::update::status_json(&config.data_dir) {
-                status["update"] = update;
+    let mut status =
+        match attach::call_tool(&config.data_dir, "status", serde_json::json!({})).await? {
+            Some(mut status) => {
+                status["node"] = "running".into();
+                status
             }
-            status["halt"] = wats::halt::offline_status(&config.data_dir, config.halt.accept);
-            if config.data_dir.is_dir()
-                && let Some(notice) = wats::safety::status_notice(&config.data_dir)
-            {
-                status["safety"] = notice.into();
-            }
-            // What `wats` would run: no agent in config.toml.
-            match Settings::load(&config.data_dir).map(|s| s.agent.runtime) {
-                Ok(None) => status["notice"] = wats::firstrun::NO_AGENT_NOTICE.into(),
-                Ok(Some(runtime)) if runtime == "openclaw" => {
-                    status["budget"] = wats::openclaw::BUDGET.into();
+            None => {
+                let mut status = serde_json::json!({
+                    "node": "not running",
+                    "nets": config.nets,
+                    "version": env!("CARGO_PKG_VERSION"),
+                });
+                if let Some(update) = wats::update::status_json(&config.data_dir) {
+                    status["update"] = update;
                 }
-                _ => {}
+                status["halt"] = wats::halt::offline_status(&config.data_dir, config.halt.accept);
+                if config.data_dir.is_dir()
+                    && let Some(notice) = wats::safety::status_notice(&config.data_dir)
+                {
+                    status["safety"] = notice.into();
+                }
+                // What `wats` would run: no agent in config.toml.
+                match Settings::load(&config.data_dir).map(|s| s.agent.runtime) {
+                    Ok(None) => status["notice"] = wats::firstrun::NO_AGENT_NOTICE.into(),
+                    Ok(Some(runtime)) if runtime == "openclaw" => {
+                        status["budget"] = wats::openclaw::BUDGET.into();
+                    }
+                    _ => {}
+                }
+                status
             }
-            status
-        }
-    };
+        };
     if json {
         println!("{}", serde_json::to_string_pretty(&status)?);
     } else {
+        // One line: "health: degraded: relay.wearetheswarm.ai unreachable
+        // since …, using n0".
+        if let Some(health) = status.get_mut("health") {
+            *health = wats::health::summary(health).into();
+        }
         for line in status_lines("", &status) {
             println!("{line}");
         }
@@ -1883,6 +1991,10 @@ impl NodeArgs {
         if let Some(ttl) = &file.agent.review_ttl {
             config.review_ttl = parse_duration(ttl)
                 .map_err(|e| anyhow::anyhow!("config.toml agent.review_ttl: {e}"))?;
+        }
+        if let Some(after) = &file.health.no_peers_after {
+            config.no_peers_after = wats::settings::parse_retention(after)
+                .map_err(|e| anyhow::anyhow!("config.toml health.no_peers_after: {e}"))?;
         }
         if let Some(retention) = &file.submit.retention {
             config.submit_retention = wats::settings::parse_retention(retention)
@@ -3096,6 +3208,14 @@ async fn main() -> Result<()> {
                 &openclaw,
             );
         }
+        Some(Command::Setup {
+            tool:
+                Some(SetupTool::Vibe {
+                    mcp,
+                    remove,
+                    project,
+                }),
+        }) => return setup_vibe(&cli.node, &data_dir, (mcp, remove, project)),
         _ => {}
     }
     first_run(&cli, &data_dir)?;

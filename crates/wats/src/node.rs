@@ -159,6 +159,9 @@ pub struct NodeConfig {
     /// Guardian halts (ADR 0016): `halt.accept`, `halt.serve`, and the
     /// compiled guardian set (tests inject their own; never config.toml).
     pub halt: crate::halt::HaltConfig,
+    /// Warn when the node has had no connected peer for this long
+    /// (`health.no_peers_after`); `None` never does.
+    pub no_peers_after: Option<Duration>,
 }
 
 impl NodeConfig {
@@ -192,6 +195,7 @@ impl NodeConfig {
             submit_retention: Some(DEFAULT_SUBMIT_RETENTION),
             update: Default::default(),
             halt: Default::default(),
+            no_peers_after: Some(crate::health::DEFAULT_NO_PEERS_AFTER),
             bootstrap: Vec::new(),
             default_bootstrap: Vec::new(),
             port: None,
@@ -568,6 +572,10 @@ pub struct Node {
     local_authors: std::sync::Mutex<HashSet<String>>,
     /// Exclusive lock on the data directory, released by `shutdown`.
     lock: std::sync::Mutex<Option<std::fs::File>>,
+    /// This node's view of the infrastructure (see [`crate::health`]).
+    health: std::sync::Mutex<crate::health::Health>,
+    /// Bootstrap nodes and peers configured, for the bootstrap check.
+    seed_ids: Vec<EndpointId>,
 }
 
 impl std::fmt::Debug for Node {
@@ -710,6 +718,21 @@ impl Node {
         if !cached.is_empty() {
             info!(peers = cached.len(), "dialing peers met before");
         }
+        let seed_ids: Vec<EndpointId> = config
+            .peers
+            .iter()
+            .map(|p| p.id)
+            .chain(config.bootstrap.iter().map(|b| b.id))
+            .chain(config.default_bootstrap.iter().map(|b| b.id))
+            .filter(|id| *id != endpoint.id())
+            .collect();
+        let health = crate::health::Health::new(crate::health::Plan::new(
+            config.mode == NetworkMode::Loopback,
+            config.infra,
+            seed_ids.len(),
+            cached.len(),
+            config.no_peers_after,
+        ));
         let mut seeds = config.bootstrap.clone();
         let fallback = if cached.is_empty() {
             seeds.extend(config.default_bootstrap.iter().cloned());
@@ -788,6 +811,8 @@ impl Node {
             runner_tokens: Default::default(),
             local_authors: Default::default(),
             lock: std::sync::Mutex::new(Some(lock)),
+            health: std::sync::Mutex::new(health),
+            seed_ids,
         });
         node.measure_storage().await;
         if node.config.storage_max.is_some() {
@@ -874,6 +899,7 @@ impl Node {
                 }
             });
         }
+        node.spawn_health_checks();
         if !node.config.halt.accept {
             warn!("this node ignores guardian halts (halt.accept = false)");
         }
@@ -907,6 +933,132 @@ impl Node {
 
     pub fn endpoint(&self) -> &Endpoint {
         self.router.endpoint()
+    }
+
+    /// The `health` value of `status`: this node's view of the
+    /// infrastructure (see [`crate::health`]).
+    pub fn health_json(&self) -> serde_json::Value {
+        self.health
+            .lock()
+            .map(|h| h.json())
+            .unwrap_or_else(|_| serde_json::json!({"state": "unknown"}))
+    }
+
+    fn health_applies(&self, what: crate::health::What) -> bool {
+        self.health.lock().map(|h| h.applies(what)).unwrap_or(false)
+    }
+
+    /// Feeds observations to the health state machine; logs what changed.
+    fn observe_health(&self, observed: Vec<(crate::health::What, Option<crate::health::Problem>)>) {
+        let now = now_secs();
+        let transitions: Vec<crate::health::Transition> = match self.health.lock() {
+            Ok(mut health) => observed
+                .into_iter()
+                .filter_map(|(what, problem)| health.observe(what, problem, now))
+                .collect(),
+            Err(_) => return,
+        };
+        for transition in transitions {
+            transition.log();
+        }
+    }
+
+    /// The health checks: relay, bootstrap and peers every
+    /// [`crate::health::CHECK_EVERY`], the directories every
+    /// [`crate::health::LOOKUP_PROBE_EVERY`]. Checks that cannot apply
+    /// never run.
+    fn spawn_health_checks(self: &Arc<Self>) {
+        use crate::health::What;
+        let weak = Arc::downgrade(self);
+        tokio::spawn(supervise("health checks", move || {
+            let weak = weak.clone();
+            async move {
+                loop {
+                    tokio::time::sleep(crate::health::CHECK_EVERY).await;
+                    let Some(node) = weak.upgrade() else { break };
+                    if node.endpoint().is_closed() {
+                        break;
+                    }
+                    node.check_health().await;
+                }
+            }
+        }));
+        if self.health_applies(What::Lookup) {
+            let weak = Arc::downgrade(self);
+            tokio::spawn(supervise("lookup probe", move || {
+                let weak = weak.clone();
+                async move {
+                    tokio::time::sleep(crate::health::LOOKUP_FIRST_PROBE_AFTER).await;
+                    loop {
+                        let Some(node) = weak.upgrade() else { break };
+                        if node.endpoint().is_closed() {
+                            break;
+                        }
+                        let mut probes = Vec::new();
+                        for directory in node.config.infra.publish_to() {
+                            let probe =
+                                crate::health::probe(node.endpoint(), directory, now_secs()).await;
+                            probes.push((directory, probe));
+                        }
+                        if node.endpoint().is_closed() {
+                            break;
+                        }
+                        let problem = crate::health::lookup_problem(&probes);
+                        node.observe_health(vec![(What::Lookup, problem)]);
+                        drop(node);
+                        tokio::time::sleep(crate::health::LOOKUP_PROBE_EVERY).await;
+                    }
+                }
+            }));
+        }
+    }
+
+    async fn check_health(&self) {
+        use crate::health::{What, bootstrap_problem, peers_problem, relay_problem};
+        use iroh::Watcher as _;
+        let mut observed = Vec::new();
+        if self.health_applies(What::Relay) {
+            let home: Vec<(String, bool)> = self
+                .endpoint()
+                .home_relay_status()
+                .get()
+                .iter()
+                .map(|s| (s.url().to_string(), s.is_connected()))
+                .collect();
+            observed.push((What::Relay, relay_problem(self.config.infra, &home)));
+        }
+        let neighbors = self.neighbors();
+        if self.health_applies(What::Bootstrap) {
+            let mut reachable = self.seed_ids.iter().any(|id| neighbors.contains(id));
+            for id in &self.seed_ids {
+                if reachable {
+                    break;
+                }
+                if let Some(info) = self.endpoint().remote_info(*id).await {
+                    reachable = info
+                        .addrs()
+                        .any(|a| matches!(a.usage(), iroh::endpoint::TransportAddrUsage::Active));
+                }
+            }
+            let newest = if reachable {
+                None
+            } else {
+                let mut cached =
+                    crate::peer_cache::load(&self.config.data_dir, self.endpoint_id(), now_secs());
+                if self.config.mode == NetworkMode::Loopback {
+                    cached = crate::peer_cache::loopback_only(cached);
+                }
+                cached.iter().map(|p| p.last_seen).max()
+            };
+            observed.push((
+                What::Bootstrap,
+                bootstrap_problem(reachable, newest, now_secs()),
+            ));
+        }
+        if self.health_applies(What::Peers) {
+            observed.push((What::Peers, peers_problem(neighbors.len())));
+        }
+        self.observe_health(observed);
     }
 
     pub fn endpoint_id(&self) -> EndpointId {

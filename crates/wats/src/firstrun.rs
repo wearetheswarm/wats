@@ -20,8 +20,9 @@ use anyhow::{Context, Result};
 
 use crate::settings::{self, ConfigFile, FILE_NAME, RUNTIMES, Settings};
 
-/// The agent CLIs looked for on `PATH`. Only [`RUNTIMES`] can run.
-pub const AGENT_CLIS: [&str; 3] = ["claude", "codex", "openclaw"];
+/// The agent CLIs looked for on `PATH`. Only [`RUNTIMES`] can run; the
+/// others (Mistral Vibe) are listed as MCP hosts.
+pub const AGENT_CLIS: [&str; 4] = ["claude", "codex", "openclaw", "vibe"];
 
 /// Shown when the node runs no agent (startup, `status`). A future
 /// policy: no quota is enforced today.
@@ -38,6 +39,12 @@ pub const NO_AGENT_FOUND: &str = "No agent CLI found: install Claude Code \
 /// agents can use the wats tools.
 pub const OPENCLAW_MCP_HINT: &str = "OpenClaw found: to reach the swarm from your OpenClaw \
 agents, register wats as its MCP server: wats setup openclaw --mcp";
+
+/// Shown by setup when Mistral Vibe is on `PATH`: not an agent runtime
+/// yet, but an MCP host.
+pub const VIBE_MCP_HINT: &str = "Mistral Vibe found: to reach the swarm from your Vibe \
+sessions, add wats as its MCP server: wats setup vibe --mcp (running it as the node's agent \
+comes next)";
 
 /// Shown by setup when OpenClaw is the node's agent: the gateway side is
 /// set up apart (tokens, MCP entries, the config block to paste).
@@ -435,6 +442,9 @@ pub fn setup(
     {
         writeln!(out, "{OPENCLAW_MCP_HINT}")?;
     }
+    if found.iter().any(|f| f.name == "vibe") {
+        writeln!(out, "{VIBE_MCP_HINT}")?;
+    }
     Ok(choices)
 }
 
@@ -509,6 +519,36 @@ mod tests {
         setup(data.path(), &mut "".as_bytes(), &mut out, Some(&path)).unwrap();
         let said = String::from_utf8(out).unwrap();
         assert!(!said.contains("openclaw"), "{said}");
+    }
+
+    /// Mistral Vibe on PATH: listed, not offered as the agent, its MCP
+    /// setup suggested.
+    #[cfg(unix)]
+    #[test]
+    fn vibe_is_listed_as_mcp_only() {
+        let bin = tempfile::tempdir().unwrap();
+        let vibe = fake_cli(bin.path(), "vibe");
+        let path = std::env::join_paths([bin.path()]).unwrap();
+        let found = detect_agents(Some(&path));
+        assert_eq!(
+            found,
+            [Found {
+                name: "vibe",
+                path: vibe
+            }]
+        );
+        assert!(!found[0].supported());
+        let data = tempfile::tempdir().unwrap();
+        let mut out = Vec::new();
+        let choices = setup(data.path(), &mut "".as_bytes(), &mut out, Some(&path)).unwrap();
+        let said = String::from_utf8(out).unwrap();
+        assert_eq!(choices.runtime, None);
+        assert!(
+            said.contains("(agent: not supported yet; MCP: wats setup vibe --mcp)"),
+            "{said}"
+        );
+        assert!(said.contains(NO_AGENT_FOUND), "{said}");
+        assert!(said.contains(VIBE_MCP_HINT), "{said}");
     }
 
     fn run(found: &[Found], settings: &Settings, input: &str) -> (Choices, String) {

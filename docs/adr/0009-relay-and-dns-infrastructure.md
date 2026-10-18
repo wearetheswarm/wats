@@ -170,8 +170,44 @@ Known limitations:
   for nodes that fell back. Users who want no third party set
   `WATS_INFRA=wats`.
 - **Our services must be monitored.** Failures no longer show up as broken
-  nodes; they show up as fallback warnings in logs.
+  nodes; they show up as fallback warnings in logs, and in each node's
+  health (addendum below).
 - **Choice without a rebuild**, through `--infra` / `WATS_INFRA` / `infra`.
 - **Mixed profiles interoperate**, as long as they share at least one
   directory, or know each other's addresses. `wats+n0` shares one with
   every other profile except `none`.
+
+## Health alerts (addendum, 2026-10-18)
+
+The fallback hides outages of our services, which is its purpose, but
+someone has to notice them. Rather than a central monitor (one more host,
+seeing only its own network path), every node watches its own view and
+reports it in its log and in `status` (`health`,
+[docs/agent.md](../agent.md#infra-health)):
+
+- **Relay**: from `Endpoint::home_relay_status()` (Iroh 1.3), the home
+  relays and whether each is connected. Degraded when ours is not connected
+  (`wats+n0`: "unreachable, using n0"; `wats`: "no relay"), or none is.
+  It alerts after 30 s, longer than the 15 s fallback delay, and the 15 s
+  retries of ours alone every 5 minutes are not reported as changes.
+- **Address lookup**: Iroh's pkarr publisher does not expose the outcome of
+  its publishes, nor resolvers that of lookups. So every 5 minutes the node
+  resolves its own record through each directory it publishes to (pkarr
+  over HTTPS with `PkarrRelayClient`, then DNS with the endpoint's
+  resolver): not found, older than 15 minutes (Iroh republishes every 5),
+  or missing from DNS is a failing directory, ours or n0's.
+- **Bootstrap**: no bootstrap node or configured peer is a gossip neighbor
+  or has an active path (`Endpoint::remote_info`), and the peer cache is
+  empty or a day old.
+- **Peers**: no gossip neighbor for `health.no_peers_after` (5 minutes).
+
+Checks that cannot apply are off: relay and lookup in loopback mode and
+with `none`, bootstrap and peers when there is nothing to connect to.
+Each issue is logged once when it starts, once if it changes for good, and
+once when it clears.
+
+Not detected: the cause (our host down, DNS, or the node's own network
+are told apart only by which checks fail together); lookups of other
+peers that fail while our own record resolves; a relay that accepts
+connections but does not forward. The node's own outage cannot be told
+from the infrastructure's: an offline node reports everything degraded.

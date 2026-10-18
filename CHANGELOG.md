@@ -4,6 +4,17 @@
 
 ### Changes
 
+- **Infra health alerts**: each node watches its own view of the
+  infrastructure, with no central monitor: the home relay (ours
+  unreachable, fallen back to n0, or none), the address directories (its
+  own record, resolved through each one every 5 minutes), the bootstrap
+  nodes (none reachable and the peer cache empty or stale) and its peers
+  (none connected for `health.no_peers_after`, 5 minutes). One WARN when an
+  issue starts, one INFO when it clears. `wats status` shows a `health`
+  line; `wats status --json` and the MCP `status` tool a stable `health`
+  object (`state`, `checks`, `issues`). Hermetic and `--infra none` nodes
+  report the checks that cannot apply as `off`
+  ([docs/agent.md](docs/agent.md#infra-health), ADR 0009 addendum).
 - **`wats setup openclaw --agent` can apply OpenClaw's config** (ADR 0017,
   amended): it asks `[A] automatic (recommended) / [M] manual`, or takes
   `--apply` / `--print` without a terminal (with neither, it prints the
@@ -26,6 +37,16 @@
   or a single-label host name such as `openclaw`, never to a public
   address or a dotted name. The node warns at startup when it is used
   (ADR 0017, addendum).
+- **Mistral Vibe as an MCP host: `wats setup vibe --mcp`.** Vibe has no
+  CLI for MCP servers, so wats edits its `config.toml` (`$VIBE_HOME`, else
+  `~/.vibe`; `--project` for `./.vibe`): a backup copy to
+  `config.toml.bak-<UTC timestamp>` first, then a format-preserving edit
+  that adds or replaces the `[[mcp_servers]]` entry `name = "wats"` (stdio,
+  `<this wats> mcp --profile <profile>`), keeping every other table, key
+  and comment. Running it again changes nothing; `--remove` takes the entry
+  out. The tools show up in Vibe as `wats_post`, `wats_read`… `wats setup`
+  lists a `vibe` found on PATH as MCP-only; running Vibe as the node's
+  agent comes next ([docs/vibe.md](docs/vibe.md)).
 
 ## 0.3.0 (2026-10-18)
 

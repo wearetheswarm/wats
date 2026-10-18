@@ -1028,3 +1028,145 @@ fn safety_changes_are_flagged_until_acked() {
         "{out:?}"
     );
 }
+
+/// `wats setup vibe`: wats edits Mistral Vibe's config.toml itself (a
+/// throwaway HOME and VIBE_HOME; no `vibe` ever runs). A fresh VIBE_HOME
+/// gets the file with the entry; an existing file is backed up and keeps
+/// every other byte; a second run changes nothing; another profile
+/// replaces the entry; `--remove` takes it out again; without VIBE_HOME it
+/// is ~/.vibe, with `--project` ./.vibe. `wats setup` lists a `vibe` on
+/// PATH as MCP-only.
+#[test]
+fn setup_vibe_edits_its_config() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("d");
+    let vibe_home = dir.path().join("v");
+    let config = vibe_home.join("config.toml");
+    let run = |vibe_home: Option<&std::path::Path>, cwd: &std::path::Path, args: &[&str]| {
+        let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_wats"));
+        command
+            .env("WATS_HERMETIC", "1")
+            .env("HOME", dir.path())
+            .env("PATH", "/bin:/usr/bin")
+            .env("USER", "alice")
+            .env_remove("WATS_PROFILE")
+            .env_remove("VIBE_HOME")
+            .current_dir(cwd)
+            .arg("--dir")
+            .arg(&data)
+            .args(["setup", "vibe"])
+            .args(args)
+            .stdin(std::process::Stdio::null());
+        if let Some(home) = vibe_home {
+            command.env("VIBE_HOME", home);
+        }
+        let out = command.output().unwrap();
+        assert!(out.status.success(), "{out:?}");
+        String::from_utf8(out.stdout).unwrap()
+    };
+    let backups = || -> Vec<std::path::PathBuf> {
+        let mut found: Vec<_> = std::fs::read_dir(&vibe_home)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .filter(|p| p.to_string_lossy().contains("config.toml.bak-"))
+            .collect();
+        found.sort();
+        found
+    };
+    let exe = std::fs::canonicalize(env!("CARGO_BIN_EXE_wats")).unwrap();
+    let entry = format!(
+        "[[mcp_servers]]\nname = \"wats\"\ntransport = \"stdio\"\ncommand = \"{}\"\n\
+         args = [\"--dir\", \"{}\", \"mcp\", \"--profile\", \"alice\"]\n",
+        exe.display(),
+        data.display()
+    );
+    let home = dir.path();
+
+    // No flag: points to --mcp, writes nothing.
+    let said = run(Some(&vibe_home), home, &[]);
+    assert!(said.contains("wats setup vibe --mcp"), "{said}");
+    assert!(!vibe_home.exists());
+
+    // A fresh VIBE_HOME: the file is created, no backup.
+    let said = run(Some(&vibe_home), home, &["--mcp"]);
+    assert!(
+        said.contains("added to") && said.contains("(new file)"),
+        "{said}"
+    );
+    assert_eq!(std::fs::read_to_string(&config).unwrap(), entry);
+    assert!(backups().is_empty());
+
+    // An existing config with another server and comments.
+    let original = "# my Vibe settings\nactive_model = \"devstral-2\"\n\n\
+                    [[mcp_servers]]\n# web pages\nname = \"fetch\"\ntransport = \"stdio\"\n\
+                    command = \"uvx\"\nargs = [\"mcp-server-fetch\"]  # pinned later\n\n\
+                    [tools.bash]\npermission = \"ask\"\n";
+    std::fs::write(&config, original).unwrap();
+    let said = run(Some(&vibe_home), home, &["--mcp"]);
+    assert!(said.contains("added to"), "{said}");
+    let found = backups();
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert!(said.contains(&found[0].display().to_string()), "{said}");
+    assert_eq!(std::fs::read_to_string(&found[0]).unwrap(), original);
+    let text = std::fs::read_to_string(&config).unwrap();
+    let added = format!("\n{entry}");
+    assert_eq!(text.matches(&added).count(), 1, "{text}");
+    assert_eq!(text.replacen(&added, "", 1), original);
+
+    // Again: nothing changes, no new backup.
+    let said = run(Some(&vibe_home), home, &["--mcp"]);
+    assert!(said.contains("already in"), "{said}");
+    assert_eq!(std::fs::read_to_string(&config).unwrap(), text);
+    assert_eq!(backups().len(), 1);
+
+    // Another profile: the entry is replaced, not duplicated.
+    let said = run(Some(&vibe_home), home, &["--profile", "ops", "--mcp"]);
+    assert!(said.contains("updated in"), "{said}");
+    let text = std::fs::read_to_string(&config).unwrap();
+    assert_eq!(text.matches("name = \"wats\"").count(), 1, "{text}");
+    assert!(text.contains("\"--profile\", \"ops\"]"), "{text}");
+    assert_eq!(backups().len(), 2);
+
+    // --remove: the original comes back, with a backup.
+    let said = run(Some(&vibe_home), home, &["--remove"]);
+    assert!(said.contains("removed from"), "{said}");
+    assert_eq!(std::fs::read_to_string(&config).unwrap(), original);
+    assert_eq!(backups().len(), 3);
+    let said = run(Some(&vibe_home), home, &["--remove"]);
+    assert!(said.contains("nothing to remove"), "{said}");
+
+    // Without VIBE_HOME: ~/.vibe. With --project: ./.vibe.
+    run(None, home, &["--mcp"]);
+    let home_config = home.join(".vibe").join("config.toml");
+    assert_eq!(std::fs::read_to_string(&home_config).unwrap(), entry);
+    let project = home.join("p");
+    std::fs::create_dir_all(&project).unwrap();
+    run(Some(&vibe_home), &project, &["--mcp", "--project"]);
+    assert_eq!(
+        std::fs::read_to_string(project.join(".vibe").join("config.toml")).unwrap(),
+        entry
+    );
+    assert_eq!(std::fs::read_to_string(&config).unwrap(), original);
+
+    // Detection: a fake `vibe` on PATH (never run).
+    let bin = home.join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    fake_cli(&bin, "vibe");
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_wats"))
+        .env("WATS_HERMETIC", "1")
+        .env("HOME", home)
+        .env("PATH", &bin)
+        .arg("--dir")
+        .arg(home.join("d2"))
+        .arg("setup")
+        .stdin(std::process::Stdio::null())
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{out:?}");
+    let said = String::from_utf8(out.stdout).unwrap();
+    assert!(
+        said.contains("(agent: not supported yet; MCP: wats setup vibe --mcp)"),
+        "{said}"
+    );
+    assert!(said.contains("Mistral Vibe found"), "{said}");
+}
