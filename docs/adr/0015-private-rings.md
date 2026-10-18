@@ -1,8 +1,9 @@
 # 0015. Private rings (event v2)
 
 Status: Provisional (2026-10-18). The design was reviewed, and Vincent
-decided its open questions (see "Decisions on the review" below). Nothing
-is implemented yet; phase (a) starts first.
+decided its open questions (see "Decisions on the review" below). Phase
+(a1) is implemented: the v2 validity rules of §8, for both kinds, and the
+node policy of `submit` (§5). Nothing else yet.
 
 Sources: SPEC-full §2.4 and the §7 entries "No special node",
 "Swarm-maintained wats through a maintainers ring", "Ring manifest" and
@@ -262,18 +263,24 @@ invalid. Everything else a ring needs is an *inner* kind, hidden in `ct`.
     and per-peer rate limits (ADR 0007 B4, ADR 0014).
   - **Proof of work: the public network's rules plus a premium.**
     Submissions always follow the public network's policy (the schedule
-    keyed to `ts`, the size bits, the new-author bits, which a one-off key
-    always pays). Even a ring with its own lower policy cannot lower it.
-    v2 nodes add **2 bits** on top (`submit.extra_pow_bits`), the same
-    premium as for unknown versions. A 16 KiB submission from a fresh key
-    therefore costs 21 + 2 (size) + 4 (new author) + 2 = 29 bits. That
-    is about 3 minutes on one core of an Apple M4 Pro, and about 5 on a
-    mid-range laptop: acceptable for a crash report sent in the
-    background, and a real cost for a flood. Small submissions cost less
-    (a 4 KiB one: 27 bits, under a minute and a half).
-  - **Retention.** Nodes may drop `submit` events older than 30 days
-    (`submit.retention`, a setting; 0 keeps them). Members read them well
-    before that, and the ring keeps what it needs inside.
+    keyed to `ts` and the size bits). Even a ring with its own lower
+    policy cannot lower it. They pay **no new-author bits** (decided by
+    Vincent): reporters use a one-off key by design, and the premium
+    already prices them. v2 nodes add **2 bits** on top (the constant
+    `SUBMIT_EXTRA_POW_BITS`, not a setting), the same premium as for
+    unknown versions. A 16 KiB submission therefore costs 21 + 2 (size)
+    + 2 = 25 bits, about 10 seconds on one core of an Apple M4 Pro. A
+    typical report, deflate-compressed, lands around 23 to 25 bits:
+    acceptable for a crash report sent in the background, and a real cost
+    for a flood.
+    - v1 nodes still price a `submit` as an unknown version: schedule,
+      size, new-author bits and their 2 opaque bits. Until they upgrade, a
+      submission mined at the v2 price may not cross them, while v2 nodes
+      relay it.
+  - **Retention.** Nodes drop `submit` events older than 30 days, and
+    refuse them (`submit.retention`, a setting, e.g. `30d` or `12h`; 0
+    keeps them). Members read them well before that, and the ring keeps
+    what it needs inside.
   - v2 nodes add a submission quota and a rate per inbox.
 - **The payload** is a JSON object, for example:
 
@@ -285,11 +292,10 @@ invalid. Everything else a ring needs is an *inner* kind, hidden in `ct`.
   - `type` is `crash`, `security`, `join` or `request`.
   - `reply` is optional. With it, the ring can answer with a submission
     to the inbox of that one-off key.
-  - Payloads over about 11 KiB are split into parts. Each part after the
-    first cites the first in the clear `refs`, so a reader can gather
-    them. This links the parts but nothing else: they share the same
-    one-off author anyway. A 64 KiB crash report (ADR 0013) is at most 6
-    parts.
+  - Payloads over about 11 KiB are split into parts. Parts are grouped
+    by their (shared) one-off author and by a report id inside `ct`,
+    since v2 `refs` is always `[]`. A 64 KiB crash report (ADR 0013) is at
+    most 6 parts.
 - **Join requests** are submissions of type `join` carrying the joiner's
   MLS `KeyPackage` and a `reply` key. The admin answers with a submission
   to the reply inbox. It carries the `Welcome`, the ratchet tree in an
@@ -385,6 +391,10 @@ invalid. Everything else a ring needs is an *inner* kind, hidden in `ct`.
 
 ### 8. v2 validity without decrypting
 
+Implemented (phase a1): `crates/wats/src/v2.rs`, `tools/verify-py` and the
+vectors in `docs/test-vectors/`. v2 events are validated, then stored as
+opaque rows, never indexed or shown.
+
 The Python verifier (`tools/verify-py`) and every node, member or not,
 check the following. Group signatures, MLS and HPKE are member-side
 policy, not validity: two nodes always agree on whether an event is valid.
@@ -398,7 +408,8 @@ policy, not validity: two nodes always agree on whether an event is valid.
    - `ext` is exactly `{"epoch": n}`, plus capped `_grease*` keys.
    - The body is exactly `ct`, plus capped `_grease*` keys.
    - `ct` is canonical base64url and decodes to between 1 and 12,288
-     bytes.
+     bytes. (The 16 KiB size cap binds first: 12,288 bytes of base64url
+     are already 16,384 characters.)
    - `sig` is 256 hex characters:
      - its first 64 bytes verify as the author's signature over
        `"wats/event/v2" || id` (ZIP 215);
@@ -427,7 +438,8 @@ of them and never shows it.
 ### 9. Phases
 
 - **(a) Sealed inbox and crash reports.**
-  - v2 `submit` validity in Rust and Python, with vectors.
+  - v2 `submit` validity in Rust and Python, with vectors. Done in (a1),
+    with `sealed` validity too (§8), and the `submit` node policy.
   - The `hpke` dependency.
   - `wats report send` seals the report to the maintainers' inbox key,
     compiled into the binary like the bootstrap list.

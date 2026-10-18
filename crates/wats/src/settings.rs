@@ -47,6 +47,8 @@ pub struct Settings {
     #[serde(default)]
     pub limits: LimitsSettings,
     #[serde(default)]
+    pub submit: SubmitSettings,
+    #[serde(default)]
     pub agent: AgentSettings,
     #[serde(default)]
     pub update: UpdateSettings,
@@ -133,6 +135,12 @@ pub struct ReportSettings {
     pub crashes: Option<bool>,
     pub collector: Option<String>,
     pub accept: Option<bool>,
+}
+
+#[derive(Debug, Default, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SubmitSettings {
+    pub retention: Option<String>,
 }
 
 #[derive(Debug, Default, Clone, Deserialize)]
@@ -276,6 +284,8 @@ pub enum ValueType {
     /// `locked`, `workspace` or `inherit`.
     Access,
     Duration,
+    /// A duration with the units s, m, h or d, or 0 for forever.
+    Retention,
     Size,
     Integer,
     /// A non-negative number, e.g. dollars.
@@ -454,6 +464,12 @@ pub const KEYS: &[Key] = &[
         ValueType::Bool,
         "false",
         "collect crash reports from other nodes (our router only)",
+    ),
+    key(
+        "submit.retention",
+        ValueType::Retention,
+        "30d",
+        "drop sealed-inbox submissions older than this (0: keep them)",
     ),
     key(
         "agent.runtime",
@@ -669,6 +685,10 @@ fn toml_value(key: &Key, raw: &str) -> Result<toml_edit::Value> {
             parse_duration(raw).map_err(invalid)?;
             raw.into()
         }
+        ValueType::Retention => {
+            parse_retention(raw).map_err(invalid)?;
+            raw.into()
+        }
         ValueType::Size => {
             parse_size(raw).map_err(invalid)?;
             raw.into()
@@ -808,6 +828,17 @@ impl ConfigFile {
         std::fs::rename(&tmp, &self.path)?;
         Ok(())
     }
+}
+
+/// Parse a retention: `0` (keep forever, `None`) or a duration as
+/// [`parse_duration`] (e.g. 30d, 12h).
+pub fn parse_retention(s: &str) -> Result<Option<Duration>, String> {
+    let s = s.trim();
+    let digits = s.trim_end_matches(|c: char| !c.is_ascii_digit());
+    if !digits.is_empty() && digits.bytes().all(|b| b == b'0') {
+        return Ok(None);
+    }
+    parse_duration(s).map(Some)
 }
 
 /// Parse a duration: a number with an optional unit s, m, h or d (e.g.
@@ -993,6 +1024,15 @@ mod tests {
 
     #[test]
     fn durations_and_sizes() {
+        assert_eq!(parse_retention("0"), Ok(None));
+        assert_eq!(parse_retention("0d"), Ok(None));
+        assert_eq!(
+            parse_retention("30d"),
+            Ok(Some(Duration::from_secs(30 * 24 * 3600)))
+        );
+        assert_eq!(parse_retention("2h"), Ok(Some(Duration::from_secs(7200))));
+        assert!(parse_retention("xd").is_err());
+        assert!(parse_retention("-1").is_err());
         assert_eq!(parse_duration("30s"), Ok(Duration::from_secs(30)));
         assert_eq!(parse_duration("7d"), Ok(Duration::from_secs(7 * 86400)));
         assert_eq!(parse_duration("5m"), Ok(Duration::from_secs(300)));

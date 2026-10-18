@@ -15,9 +15,10 @@ use ed25519_dalek::SigningKey;
 use serde_json::{Map, Value, json};
 
 use wats::event::{BlobRef, Draft, Kind, next_key_commitment, rotate_signature};
+use wats::v2::{b64url_encode, sign_v2, sign_v2_value};
 use wats::wire::{
-    AnyEvent, BODY_HASH_KEY, HEADER_KEYS, REFS_KEY, UNHASHED_KEYS, digest, sign_v1, sign_value,
-    v1_message,
+    AnyEvent, BODY_HASH_KEY, EXT_KEY, HEADER_KEYS, REFS_KEY, UNHASHED_KEYS, digest, sign_v1,
+    sign_value, v1_message,
 };
 
 const DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../docs/test-vectors");
@@ -144,12 +145,81 @@ fn tombstone(event: &Value) -> Value {
         .filter(|(k, _)| {
             HEADER_KEYS.contains(&k.as_str())
                 || k.as_str() == REFS_KEY
+                || k.as_str() == EXT_KEY
                 || UNHASHED_KEYS.contains(&k.as_str())
         })
         .map(|(k, v)| (k.clone(), v.clone()))
         .collect();
     t.insert(BODY_HASH_KEY.into(), json!(digest(full).unwrap().body_hash));
     Value::Object(t)
+}
+
+/// v2 test keys: the author of the submissions, the author of the sealed
+/// events, and the test group key of their ring's epoch (ADR 0015 §8:
+/// the vectors document the group signature; verifiers check its shape
+/// only).
+const SUBMIT_SEED: u8 = 8;
+const SEALED_SEED: u8 = 9;
+const GROUP_SEED: u8 = 10;
+const RING_NET: &str = "ring:0f1e2d3c4b5a69788796a5b4c3d2e1f0";
+const INBOX: &str = "inbox:00112233445566778899aabbccddeeff";
+
+/// The header and body of the v2 `submit` vector: `enc` is 1,120 fixed
+/// bytes, `ct` a small fixed payload.
+fn submit_parts() -> (Map<String, Value>, Map<String, Value>) {
+    let enc: Vec<u8> = (0..1120u32).map(|i| (i % 251) as u8).collect();
+    (
+        obj(
+            json!({"v": 2, "ts": 1_760_800_000u64, "net": "public", "thread": null,
+                   "parent": null, "refs": [], "kind": "submit", "ext": {"to": INBOX}}),
+        ),
+        obj(json!({"enc": b64url_encode(&enc),
+                   "ct": b64url_encode(b"sealed crash report, test vector")})),
+    )
+}
+
+/// The header and body of the v2 `sealed` vector.
+fn sealed_parts() -> (Map<String, Value>, Map<String, Value>) {
+    (
+        obj(
+            json!({"v": 2, "ts": 1_760_800_100u64, "net": RING_NET, "thread": null,
+                   "parent": null, "refs": [], "kind": "sealed", "ext": {"epoch": 3}}),
+        ),
+        obj(json!({"ct": b64url_encode(b"an MLS PrivateMessage, test vector")})),
+    )
+}
+
+type Edit<'a> = &'a dyn Fn(&mut Map<String, Value>, &mut Map<String, Value>);
+
+/// Sign v2 parts after `f` changed them: submit with its author, sealed
+/// with its author and the test group key.
+fn v2_signed(sealed: bool, f: Edit) -> Value {
+    let (mut h, mut b) = if sealed {
+        sealed_parts()
+    } else {
+        submit_parts()
+    };
+    f(&mut h, &mut b);
+    if sealed {
+        sign_v2_value(h, b, &key(SEALED_SEED), Some(&key(GROUP_SEED)), 0).unwrap()
+    } else {
+        sign_v2_value(h, b, &key(SUBMIT_SEED), None, 0).unwrap()
+    }
+}
+
+fn v2_case(sealed: bool, f: Edit) -> String {
+    serde_json::to_string(&v2_signed(sealed, f)).unwrap()
+}
+
+/// A v2 event with its `sig` replaced by `sig(id)`.
+fn v2_with_sig(sealed: bool, sig: &dyn Fn(&[u8; 32]) -> String) -> String {
+    let mut event = v2_signed(sealed, &|_, _| {});
+    let id: [u8; 32] = hex::decode(event["id"].as_str().unwrap())
+        .unwrap()
+        .try_into()
+        .unwrap();
+    event["sig"] = json!(sig(&id));
+    serde_json::to_string(&event).unwrap()
 }
 
 fn valid_vectors() -> Value {
@@ -307,9 +377,9 @@ fn valid_vectors() -> Value {
     }
     .sign(&key(1), 1_760_600_300, 0)
     .unwrap();
-    let v2 = sign_value(
+    let v3 = sign_value(
         obj(
-            json!({"v": 2, "ts": 1_760_600_000u64, "net": "public", "thread": null,
+            json!({"v": 3, "ts": 1_760_600_000u64, "net": "public", "thread": null,
                    "parent": null, "refs": [note.id], "kind": "poll",
                    "ext": {"expires": 1_760_603_600u64, "_grease_77": true}}),
         ),
@@ -318,10 +388,16 @@ fn valid_vectors() -> Value {
         4,
     )
     .unwrap();
-    let mut v2_other_suite = v2.clone();
-    // A future suite: other key and signature formats, not checked by v1
-    // nodes (ADR 0010, A4). The id does not cover `sig`.
-    v2_other_suite["sig"] = json!("5a".repeat(2420));
+    let mut v3_other_suite = v3.clone();
+    // A future suite: other key and signature formats, not checked by
+    // nodes that do not know it (ADR 0010, A4). The id does not cover `sig`.
+    v3_other_suite["sig"] = json!("5a".repeat(2420));
+    let v2_submit = v2_signed(false, &|_, _| {});
+    let v2_sealed = v2_signed(true, &|_, _| {});
+    let v2_sealed_grease = v2_signed(true, &|h, b| {
+        h["ext"]["_grease_5d"] = json!("x");
+        b.insert("_grease_a1".into(), json!([1, "y"]));
+    });
 
     let pow_variant = |pow: &str| {
         let mut w = obj(serde_json::to_value(&note).unwrap());
@@ -347,14 +423,18 @@ fn valid_vectors() -> Value {
             accept("v1-clarify", "clarify: an agent working on an ask (seed 01's) asks back for a choice, with options, a default and a deadline. Always a reply.", Some(2), serde_json::to_value(&clarify).unwrap()),
             accept("v1-answer-choice", "The requester answers the clarify: an answer whose parent is the clarify, with data.choice.", Some(1), serde_json::to_value(&choice).unwrap()),
             accept("v1-grease-body-key", "A GREASE body key: accepted, hashed, ignored.", Some(1), serde_json::to_value(&greased).unwrap()),
-            accept("v2-opaque", "A future version: unknown kind, header extension ext (with a GREASE key), unknown body field, refs. Relayed by v1 nodes without understanding it.", Some(3), v2),
-            accept("v2-opaque-other-suite", "The same, with a signature of another suite and size: v1 nodes do not check signatures of versions they do not know.", None, v2_other_suite),
+            accept("v3-opaque", "A future version: unknown kind, header extension ext (with a GREASE key), unknown body field, refs. Relayed by nodes that do not understand it (here v3, signed with the v1 suite for the record).", Some(3), v3),
+            accept("v3-opaque-other-suite", "The same, with a signature of another suite and size: nodes do not check signatures of versions they do not know.", None, v3_other_suite),
             accept("v1-tombstone", "v1-react-reply with its body dropped: body_hash replaces the body fields; id and sig unchanged, signature still checked.", Some(2), tombstone(&reply)),
             accept("zip215-noncanonical-R", "ZIP 215: an ordinary author key (seed 07); R is a non-canonical encoding of the identity (y = p + 1) and s = k * a, so the cofactored equation holds. R is hashed as received: accepted.", Some(7), with_noncanonical_r(7)),
             accept("v1-blob-url-other-scheme", "A blob URL with a scheme other than https: valid (nodes only follow https, by policy).", Some(1), serde_json::to_value(&other_scheme).unwrap()),
             accept("v1-tags-non-ascii", "Tags with non-ASCII labels: each label an IDNA2008 U-label in NFC, of one script (lang:fran\u{e7}ais is Latin; the Japanese label mixes Han, Hiragana and Katakana, which UTS #39 highly restrictive allows).", Some(1), serde_json::to_value(&unicode_tags).unwrap()),
             accept("v1-pow-unknown-alg", "A proof of work of an algorithm this node does not know (eqx): valid, since validity checks only the syntax \"<alg>:<payload>\". A node stores and relays it as an opaque event, under the opaque quota, and never shows it nor takes it as no work.", Some(1), pow_variant("eqx:AAECAwQFBgcICQoLDA0ODw")),
             accept("v1-pow-b3-not-decimal", "pow b3 with a payload that is not a decimal nonce: valid syntax; a node that knows b3 counts it as no work, so it passes only where no proof of work is required.", Some(1), pow_variant("b3:abc_DEF-9")),
+            accept("v2-submit", "v2 submit (ADR 0015 §5, §8): a sealed-inbox submission on the public net, ext.to the inbox id, enc 1,120 fixed bytes and a small ct, both canonical base64url; sig is the author's Ed25519 signature over \"wats/event/v2\" || id. Validated, then stored opaque: its content is encrypted.", Some(SUBMIT_SEED), v2_submit.clone()),
+            accept("v2-sealed", "v2 sealed (ADR 0015 §3, §8): a ring event, net ring:<32 hex>, ext.epoch, body exactly ct. sig is the author's signature over \"wats/event/v2\" || id, then the epoch's group signature over \"wats/ring/v2\" || id made with the test group key (Ed25519 seed 0a repeated 32 times); verifiers check the group signature as shape only (S < l).", Some(SEALED_SEED), v2_sealed),
+            accept("v2-submit-tombstone", "v2-submit with its body dropped: body_hash replaces enc and ct; the header (ext included) and the signature rules stay.", Some(SUBMIT_SEED), tombstone(&v2_submit)),
+            accept("v2-sealed-grease", "v2 sealed with GREASE keys in ext and in the body, each set within 64 bytes of JCS: accepted, hashed, ignored.", Some(SEALED_SEED), v2_sealed_grease),
             accept("v1-title-unicode-16", "A title with U+A7DB LATIN SMALL LETTER LAMBDA, assigned in Unicode 16.0 (unassigned in 15.1): v1 pins Unicode 16.0.0.", Some(1), serde_json::to_value(&unicode_16_title).unwrap()),
         ],
     })
@@ -429,7 +509,7 @@ fn invalid_vectors() -> Value {
             reject("data-too-deep", "v1: data nests at most 16 levels", modified(&|w| { w.insert("data".into(), nest(17)); })),
             reject("event-too-deep", "core: an event nests at most 20 levels (opaque versions too)", {
                 let v = sign_value(
-                    obj(json!({"v": 2, "ts": 1u64, "net": "public", "thread": null, "parent": null, "kind": "poll"})),
+                    obj(json!({"v": 3, "ts": 1u64, "net": "public", "thread": null, "parent": null, "kind": "poll"})),
                     obj(json!({"deep": nest(20)})),
                     &signer, 0,
                 ).unwrap();
@@ -552,6 +632,47 @@ fn invalid_vectors() -> Value {
             reject("pow-alg-too-long", "pow alg is at most 16 chars", pow_case(&format!("{}:1", "a".repeat(17)))),
             reject("pow-payload-not-base64url", "pow payload is base64url [A-Za-z0-9_-], no padding (here +, / and =)", pow_case("eqx:ab+/cd==")),
             reject("pow-payload-too-long", "pow payload is at most 2048 chars", pow_case(&format!("eqx:{}", "A".repeat(2049)))),
+            reject("v2-unknown-kind", "v2: kind is sealed or submit (here poll)", v2_case(false, &|h, _| { h["kind"] = json!("poll"); })),
+            reject("v2-thread-set", "v2: thread and parent are null", v2_case(false, &|h, _| {
+                h["thread"] = json!("aa".repeat(32));
+                h["parent"] = json!("aa".repeat(32));
+            })),
+            reject("v2-refs-not-empty", "v2: refs is []", v2_case(false, &|h, _| { h["refs"] = json!(["aa".repeat(32)]); })),
+            reject("v2-refs-missing", "v2: refs is present, as []", v2_case(false, &|h, _| { h.remove("refs"); })),
+            reject("v2-sealed-net-not-ring", "v2 sealed: net matches ^ring:[0-9a-f]{32}$", v2_case(true, &|h, _| { h["net"] = json!("public"); })),
+            reject("v2-sealed-ext-no-epoch", "v2 sealed: ext is exactly {\"epoch\": n} plus capped _grease* keys (here {})", v2_case(true, &|h, _| { h["ext"] = json!({}); })),
+            reject("v2-sealed-ext-extra-key", "v2 sealed: no ext key other than epoch and _grease* (here lang)", v2_case(true, &|h, _| { h["ext"]["lang"] = json!("en"); })),
+            reject("v2-sealed-body-extra-key", "v2 sealed: the body is exactly ct plus capped _grease* keys (here a text in clear)", v2_case(true, &|_, b| { b.insert("text".into(), json!("in clear")); })),
+            reject("v2-ct-padded", "v2: binary values are base64url without padding (here ct with ==)", v2_case(true, &|_, b| { b["ct"] = json!(format!("{}==", b64url_encode(b"abcd"))); })),
+            reject("v2-ct-trailing-bits", "v2: binary values are canonical base64url, no non-zero bit after the last whole byte (here YWJjZB, whose canonical form is YWJjZA)", v2_case(true, &|_, b| { b["ct"] = json!("YWJjZB"); })),
+            reject("v2-ct-empty", "v2 sealed: ct decodes to 1-12,288 bytes (here empty)", v2_case(true, &|_, b| { b["ct"] = json!(""); })),
+            reject("v2-submit-enc-length", "v2 submit: enc decodes to exactly 1,120 bytes (here 1,119)", v2_case(false, &|_, b| { b["enc"] = json!(b64url_encode(&[7; 1119])); })),
+            reject("v2-submit-net-ring", "v2 submit: net is not a ring: net", v2_case(false, &|h, _| { h["net"] = json!(RING_NET); })),
+            reject("v2-submit-to-malformed", "v2 submit: ext.to is inbox:<32 lowercase hex> (here uppercase hex)", v2_case(false, &|h, _| { h["ext"] = json!({"to": format!("inbox:{}", INBOX["inbox:".len()..].to_uppercase())}); })),
+            reject("v2-sealed-sig-author-only", "v2 sealed: sig is 256 hex chars, the author signature then the group signature (here the author signature alone, 128 hex)", v2_with_sig(true, &|id| hex::encode(sign_v2(&key(SEALED_SEED), id)))),
+            reject("v2-sealed-group-s-not-canonical", "v2 sealed: the group signature's scalar S (its last 32 bytes, little-endian) is < l (here S + l)", v2_with_sig(true, &|id| {
+                let mut group = wats::v2::sign_ring(&key(GROUP_SEED), id);
+                let mut carry = 0u16;
+                for (i, l) in L.iter().enumerate() {
+                    let sum = group[32 + i] as u16 + *l as u16 + carry;
+                    group[32 + i] = sum as u8;
+                    carry = sum >> 8;
+                }
+                format!("{}{}", hex::encode(sign_v2(&key(SEALED_SEED), id)), hex::encode(group))
+            })),
+            reject("v2-author-sig-v1-prefix", "v2: the author signature covers \"wats/event/v2\" || id (here \"wats/event/v1\" || id)", v2_with_sig(false, &|id| hex::encode(sign_v1(&key(SUBMIT_SEED), id)))),
+            reject("v2-ext-grease-too-large", "v2: the GREASE ext keys, as one JCS object (keys included), are at most 64 bytes (here 65)", v2_case(false, &|h, _| { h["ext"]["_grease_big"] = json!("g".repeat(47)); })),
+            reject("v2-author-small-order", "v2: the author key passes the v1 checks, not of small order (here order 8, with R the identity and s = 0, which ZIP 215 alone accepts)", {
+                let (h, b) = submit_parts();
+                let mut wire = b;
+                wire.extend(h);
+                wire.insert("author".into(), json!(ORDER_8));
+                wire.insert("pow".into(), json!("b3:0"));
+                let id = digest(&wire).unwrap().id;
+                wire.insert("id".into(), json!(hex::encode(id)));
+                wire.insert("sig".into(), json!(format!("{IDENTITY}{}", "00".repeat(32))));
+                serde_json::to_string(&wire).unwrap()
+            }),
             reject("blob-name-trailing-dot", "v1: a blob name does not end with a dot or a space", modified(&|w| {
                 w.insert("blobs".into(), json!([{"hash": "ab".repeat(32), "name": "report.", "size": 1, "url": null}]));
             })),

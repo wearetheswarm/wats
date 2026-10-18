@@ -449,6 +449,35 @@ impl Store {
         Ok(())
     }
 
+    /// Drop the stored v2 `submit` events (opaque rows, tombstones
+    /// included) whose `ts` is before `before`: the retention of
+    /// submissions (ADR 0015 §5). Returns how many were dropped.
+    pub fn delete_submits_before(&self, before: u64) -> Result<usize> {
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        let rows: Vec<(i64, i64)> = {
+            let mut stmt = tx.prepare(
+                "SELECT seq, LENGTH(json) FROM events
+                 WHERE opaque = 1 AND v = 2 AND kind = 'submit' AND ts < ?",
+            )?;
+            let rows = stmt.query_map([before.min(i64::MAX as u64) as i64], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })?;
+            rows.collect::<rusqlite::Result<_>>()?
+        };
+        let mut freed = 0u64;
+        for (seq, len) in &rows {
+            delete_opaque_row(&tx, *seq)?;
+            freed = freed.saturating_add((*len).max(0) as u64);
+        }
+        tx.commit()?;
+        self.opaque_bytes.fetch_sub(
+            freed.min(self.opaque_bytes.load(Ordering::Relaxed)),
+            Ordering::Relaxed,
+        );
+        Ok(rows.len())
+    }
+
     /// Any stored event, understood or not, as raw wire JSON with its version.
     /// When this node first stored an event of `author` (unix seconds), if
     /// ever: the age behind the new-author proof of work (ADR 0010).

@@ -1082,6 +1082,10 @@ impl NodeArgs {
             config.review_ttl = parse_duration(ttl)
                 .map_err(|e| anyhow::anyhow!("config.toml agent.review_ttl: {e}"))?;
         }
+        if let Some(retention) = &file.submit.retention {
+            config.submit_retention = wats::settings::parse_retention(retention)
+                .map_err(|e| anyhow::anyhow!("config.toml submit.retention: {e}"))?;
+        }
         config.review_notify = file.agent.notify.unwrap_or(false);
         config.report_accept = self.report_accept || file.report.accept.unwrap_or(false);
         config.limits = file.limits.limits();

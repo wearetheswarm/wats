@@ -440,8 +440,9 @@ another core change.
 
 ### Process
 
-- **Vectors**: `events.json` (17 accept cases) and `events-invalid.json`
-  (68 reject cases, raw JSON text, each isolating one rule).
+- **Vectors**: `events.json` (21 accept cases) and `events-invalid.json`
+  (87 reject cases, raw JSON text, each isolating one rule), event v2
+  (ADR 0015 §8) included.
   - Accept cases include a ZIP 215 edge case: a non-canonical `R` with an
     ordinary key. An order-8 key with `s = 0` and a non-canonical `A`,
     accepted by ZIP 215 alone, are reject cases (A1 addendum).

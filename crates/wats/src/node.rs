@@ -146,6 +146,9 @@ pub struct NodeConfig {
     /// Replication factor k for blobs: how many peers are asked to hold a
     /// blob at publish time (SPEC §2.5, §7).
     pub replication: usize,
+    /// Stored v2 `submit` events older than this are dropped, and older
+    /// ones refused (`submit.retention`, ADR 0015 §5). `None` keeps them.
+    pub submit_retention: Option<Duration>,
     /// The daily release check and `update.auto` (`[update]`). Off unless
     /// set; never in loopback mode.
     pub update: crate::update::UpdatePolicy,
@@ -178,6 +181,7 @@ impl NodeConfig {
             report_collector: None,
             report_auto: false,
             replication: 3,
+            submit_retention: Some(DEFAULT_SUBMIT_RETENTION),
             update: Default::default(),
             bootstrap: Vec::new(),
             default_bootstrap: Vec::new(),
@@ -345,6 +349,15 @@ pub const OPAQUE_SHARE_PERCENT: u64 = 5;
 /// Extra proof of work required from events of a version this node does not
 /// understand (B4): carrying them costs every node, understanding nothing.
 pub const OPAQUE_EXTRA_POW_BITS: u32 = 2;
+
+/// Extra proof of work required from a v2 `submit` (ADR 0015 §5), on top of
+/// the public network's schedule and size bits. A submission pays no
+/// new-author bits: its author is a one-off key by design.
+pub const SUBMIT_EXTRA_POW_BITS: u32 = 2;
+/// Default retention of v2 `submit` events (`submit.retention`): 30 days.
+pub const DEFAULT_SUBMIT_RETENTION: Duration = Duration::from_secs(30 * 24 * 3600);
+/// How often expired submissions are dropped.
+const SUBMIT_TIDY_SECS: u64 = 3600;
 
 fn understood(v: u64) -> bool {
     (UNDERSTOOD_VERSIONS.0..=UNDERSTOOD_VERSIONS.1).contains(&v)
@@ -738,6 +751,25 @@ impl Node {
                         tokio::time::sleep(Duration::from_secs(STORAGE_MEASURE_SECS)).await;
                         let Some(node) = weak.upgrade() else { break };
                         node.measure_storage().await;
+                    }
+                }
+            }));
+        }
+        if node.config.submit_retention.is_some() {
+            let weak = Arc::downgrade(&node);
+            tokio::spawn(supervise("submit retention", move || {
+                let weak = weak.clone();
+                async move {
+                    loop {
+                        if let Some(node) = weak.upgrade()
+                            && let Err(e) = node.drop_expired_submits()
+                        {
+                            warn!("dropping expired submissions: {e:#}");
+                        }
+                        tokio::time::sleep(Duration::from_secs(SUBMIT_TIDY_SECS)).await;
+                        if weak.strong_count() == 0 {
+                            break;
+                        }
                     }
                 }
             }));
@@ -1423,10 +1455,20 @@ impl Node {
         Ok(())
     }
 
-    /// Verify an untrusted wire event, apply node policy, store it.
-    /// Events of versions this node does not understand are verified
-    /// against the invariant core and stored opaque (ADR 0007). Returns the
-    /// event and whether it is new; `None` if the policy rejects it.
+    /// Drop the stored v2 `submit` events older than `submit.retention`
+    /// (ADR 0015 §5). Returns how many were dropped.
+    pub fn drop_expired_submits(&self) -> Result<usize> {
+        let Some(retention) = self.config.submit_retention else {
+            return Ok(0);
+        };
+        let before = now_secs().saturating_sub(retention.as_secs());
+        let dropped = self.store.delete_submits_before(before)?;
+        if dropped > 0 {
+            info!(dropped, "dropped submissions older than submit.retention");
+        }
+        Ok(dropped)
+    }
+
     /// The base difficulty of the network policy for an event of `author`
     /// at `ts` (before the size bits): the schedule at `ts`, plus the
     /// new-author bits when `pushed` (ADR 0010, PoW policy).
@@ -1442,6 +1484,10 @@ impl Node {
         Ok(bits)
     }
 
+    /// Verify an untrusted wire event, apply node policy, store it.
+    /// Events of versions this node does not understand are verified
+    /// against the invariant core and stored opaque (ADR 0007). Returns the
+    /// event and whether it is new; `None` if the policy rejects it.
     fn accept_value(
         &self,
         value: serde_json::Value,
@@ -1479,16 +1525,32 @@ impl Node {
         // A proof of work of an algorithm this node does not know is not
         // measured, nor taken as no work: the event is opaque (`from_value`)
         // and only the opaque quota below bounds it (ADR 0010, PoW).
+        // A v2 submission (ADR 0015 §5): the public network's schedule and
+        // size bits, no new-author bits (one-off keys by design), plus
+        // SUBMIT_EXTRA_POW_BITS; kept for submit.retention only.
+        let submit = matches!(&event, AnyEvent::Opaque(r)
+            if r.v == crate::v2::VERSION && r.kind == crate::v2::KIND_SUBMIT);
+        if submit
+            && let Some(retention) = self.config.submit_retention
+            && event.ts().saturating_add(retention.as_secs()) < now_secs()
+        {
+            bail!("submission older than submit.retention: not kept");
+        }
         if let Some(work) = event.pow_work() {
             let base = match self.config.min_pow_bits {
                 Some(bits) => bits,
-                None => {
-                    self.policy_pow_bits(event.author(), event.ts(), origin == Origin::Pushed)?
-                }
+                None => self.policy_pow_bits(
+                    event.author(),
+                    event.ts(),
+                    origin == Origin::Pushed && !submit,
+                )?,
             };
             let mut required = crate::event::required_pow_bits(base, size);
             if unknown_version {
                 required = required.saturating_add(OPAQUE_EXTRA_POW_BITS);
+            }
+            if submit {
+                required = required.saturating_add(SUBMIT_EXTRA_POW_BITS);
             }
             if work < required {
                 bail!(

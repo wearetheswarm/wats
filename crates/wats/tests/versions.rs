@@ -1,5 +1,8 @@
 //! Protocol evolution (ADR 0007): a node stores and relays events of a
 //! version it does not understand, so mixed-version networks stay whole.
+//! v2 `submit` events (ADR 0015 §5), validated but kept opaque, are here
+//! too: priced with SUBMIT_EXTRA_POW_BITS, kept for `submit.retention`.
+//! (One test binary: each costs CI disk.)
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -10,9 +13,10 @@ use rmcp::model::CallToolRequestParams;
 use serde_json::{Value, json};
 
 use wats::mcp::WatsMcp;
-use wats::node::{NetworkMode, Node, NodeConfig, PUBLIC_NET};
+use wats::node::{NetworkMode, Node, NodeConfig, PUBLIC_NET, SUBMIT_EXTRA_POW_BITS, now_secs};
 use wats::proto::NodeInfo;
 use wats::store::Filter;
+use wats::v2::{ENC_BYTES, b64url_encode, sign_v2_value};
 use wats::wire::{RawEvent, sign_value};
 
 async fn node(dir: &std::path::Path, peers: &[&Arc<Node>]) -> anyhow::Result<Arc<Node>> {
@@ -24,10 +28,10 @@ async fn node(dir: &std::path::Path, peers: &[&Arc<Node>]) -> anyhow::Result<Arc
     Node::start(config).await
 }
 
-/// What a v2 node would publish: a new kind, a header extension and a body
-/// field v1 does not know.
-fn v2_event(text: &str, ts: u64) -> Value {
-    event_of_version(2, text, ts, wats::node::OPAQUE_EXTRA_POW_BITS)
+/// What a v3 node would publish: a new kind, a header extension and a body
+/// field this node does not know (v2 is a validated version, ADR 0015).
+fn v3_event(text: &str, ts: u64) -> Value {
+    event_of_version(3, text, ts, wats::node::OPAQUE_EXTRA_POW_BITS)
 }
 
 /// The same shape at any version, mined to `bits`.
@@ -64,17 +68,17 @@ async fn opaque_events_policy() -> anyhow::Result<()> {
     let bits = wats::node::OPAQUE_EXTRA_POW_BITS;
 
     // Up to events_max + 2 is relayed; further ahead is not.
-    node.publish_signed(event_of_version(3, "v3", now, bits))
+    node.publish_signed(event_of_version(4, "v4", now, bits))
         .await?;
     let err = node
-        .publish_signed(event_of_version(4, "v4", now, bits))
+        .publish_signed(event_of_version(5, "v5", now, bits))
         .await
         .unwrap_err();
     assert!(err.to_string().contains("too far ahead"), "{err:#}");
 
     // Two more bits of proof of work than a v1 event of the same size.
     let weak = loop {
-        let candidate = event_of_version(2, &format!("weak {}", rand_text()), now, 0);
+        let candidate = event_of_version(3, &format!("weak {}", rand_text()), now, 0);
         let id = candidate["id"].as_str().unwrap();
         if id.starts_with(['8', '9', 'a', 'b', 'c', 'd', 'e', 'f']) {
             break candidate; // 0 leading zero bits
@@ -88,7 +92,7 @@ async fn opaque_events_policy() -> anyhow::Result<()> {
     let mut refused = None;
     for i in 0..20 {
         // Proof of work also grows with size: mine a little more.
-        let event = event_of_version(2, &format!("{i} {big}"), now, bits + 3);
+        let event = event_of_version(3, &format!("{i} {big}"), now, bits + 3);
         if let Err(e) = node.publish_signed(event).await {
             refused = Some((i, e));
             break;
@@ -117,9 +121,10 @@ async fn eventually(what: &str, mut check: impl AsyncFnMut() -> bool) {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn v1_node_relays_v2_events() -> anyhow::Result<()> {
+async fn node_relays_events_of_a_future_version() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
-    // "a" plays the v2 publisher, "b" is the v1 node in the middle.
+    // "a" plays the v3 publisher, "b" is the node in the middle, which
+    // does not understand v3.
     let b = node(&dir.path().join("b"), &[]).await?;
     let a = node(&dir.path().join("a"), &[&b]).await?;
     a.wait_for_neighbor(PUBLIC_NET, Duration::from_secs(10))
@@ -128,15 +133,15 @@ async fn v1_node_relays_v2_events() -> anyhow::Result<()> {
         .await?;
 
     // Live, over gossip.
-    let live = v2_event("Where should the next relay go?", wats::node::now_secs());
+    let live = v3_event("Where should the next relay go?", wats::node::now_secs());
     let live_id = live["id"].as_str().unwrap().to_string();
     a.publish_signed(live.clone()).await?;
-    eventually("b stores the v2 event", async || {
+    eventually("b stores the v3 event", async || {
         b.store().get_raw(&live_id).unwrap().is_some()
     })
     .await;
     let (v, opaque, stored) = b.store().get_raw(&live_id)?.unwrap();
-    assert_eq!((v, opaque), (2, true));
+    assert_eq!((v, opaque), (3, true));
     assert_eq!(stored, live, "stored byte-for-byte as received");
     // Not indexed: invisible to search and wait.
     assert!(
@@ -175,30 +180,30 @@ async fn v1_node_relays_v2_events() -> anyhow::Result<()> {
     .await;
     assert_eq!(b.peer_info(&a.endpoint_id()).unwrap(), NodeInfo::ours());
 
-    // A second v2 event while "a" is the only one holding it, then "a" leaves.
-    let offline = v2_event(
+    // A second v3 event while "a" is the only one holding it, then "a" leaves.
+    let offline = v3_event(
         "Second poll, published before c existed.",
         wats::node::now_secs(),
     );
     let offline_id = offline["id"].as_str().unwrap().to_string();
     a.publish_signed(offline).await?;
-    eventually("b stores the second v2 event", async || {
+    eventually("b stores the second v3 event", async || {
         b.store().get_raw(&offline_id).unwrap().is_some()
     })
     .await;
     a.shutdown().await?;
 
-    // "c" (another v2 node) only knows "b": it gets both events from the
-    // v1 node, intact and verifiable.
+    // "c" (another v3 node) only knows "b": it gets both events from the
+    // node that does not understand them, intact and verifiable.
     let c = node(&dir.path().join("c"), &[&b]).await?;
     for id in [&live_id, &offline_id] {
-        eventually("c receives the v2 event through b", async || {
+        eventually("c receives the v3 event through b", async || {
             c.store().get_raw(id).unwrap().is_some()
         })
         .await;
         let (_, _, value) = c.store().get_raw(id)?.unwrap();
         let raw = RawEvent::from_value(value)?;
-        assert_eq!(raw.v, 2);
+        assert_eq!(raw.v, 3);
         assert_eq!(&raw.id, id);
     }
 
@@ -276,6 +281,125 @@ async fn unknown_pow_algorithm_is_opaque() -> anyhow::Result<()> {
     let node = start(dir.path()).await?;
     let (_, opaque, _) = node.store().get_raw(&id)?.unwrap();
     assert!(opaque);
+    node.shutdown().await?;
+    Ok(())
+}
+
+// --- v2 submissions (ADR 0015 §5) ---
+
+fn submission(seed: u8, ts: u64, bits: u32) -> Value {
+    sign_v2_value(
+        json!({"v": 2, "ts": ts, "net": PUBLIC_NET, "thread": null, "parent": null,
+               "refs": [], "kind": "submit", "ext": {"to": format!("inbox:{}", "5e".repeat(16))}})
+        .as_object()
+        .unwrap()
+        .clone(),
+        json!({"enc": b64url_encode(&[seed; ENC_BYTES]), "ct": b64url_encode(b"sealed crash report")})
+            .as_object()
+            .unwrap()
+            .clone(),
+        &SigningKey::from_bytes(&[seed; 32]),
+        None,
+        bits,
+    )
+    .unwrap()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn submissions_are_priced_stored_opaque_and_expire() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let mut config = NodeConfig::new(dir.path());
+    config.mode = NetworkMode::Loopback;
+    config.pow_bits = Some(0);
+    config.min_pow_bits = Some(0);
+    config.submit_retention = Some(Duration::from_secs(3600));
+    let node = Node::start(config).await?;
+    let now = now_secs();
+
+    // Accepted with the premium, stored opaque, never shown.
+    let ok = submission(31, now, SUBMIT_EXTRA_POW_BITS);
+    let id = ok["id"].as_str().unwrap().to_string();
+    node.publish_signed(ok.clone()).await?;
+    let (v, opaque, stored) = node.store().get_raw(&id)?.unwrap();
+    assert_eq!((v, opaque), (2, true));
+    assert_eq!(stored, ok);
+    assert!(
+        node.store()
+            .search(Some("crash"), &Filter::default(), 10)?
+            .is_empty()
+    );
+    assert!(node.store().since(0, &Filter::default(), 10)?.is_empty());
+
+    // Without the premium: refused, although a v1 event would pass.
+    let weak = (0u8..)
+        .map(|seed| submission(seed, now, 0))
+        .find(|w| {
+            let first = u8::from_str_radix(&w["id"].as_str().unwrap()[..2], 16).unwrap();
+            first >= 0x40 // fewer than 2 leading zero bits
+        })
+        .unwrap();
+    let err = node.publish_signed(weak).await.unwrap_err();
+    assert!(err.to_string().contains("proof of work"), "{err:#}");
+
+    // Older than the retention: refused.
+    let old = submission(32, now - 7200, SUBMIT_EXTRA_POW_BITS);
+    let err = node.publish_signed(old.clone()).await.unwrap_err();
+    assert!(err.to_string().contains("submit.retention"), "{err:#}");
+
+    // An invalid v2 event is refused, not kept opaque.
+    let mut forged = submission(33, now, SUBMIT_EXTRA_POW_BITS);
+    forged["sig"] = json!("00".repeat(64));
+    assert!(node.publish_signed(forged).await.is_err());
+
+    // Stored before it expired (here: put straight into the store), it is
+    // dropped by the retention task, and the opaque quota gets its bytes
+    // back.
+    let before = node.store().opaque_bytes();
+    let old_id = old["id"].as_str().unwrap().to_string();
+    node.store()
+        .insert_raw(&RawEvent::from_value(old)?, now - 7200)?;
+    assert!(node.store().opaque_bytes() > before);
+    assert_eq!(node.drop_expired_submits()?, 1);
+    assert!(node.store().get_raw(&old_id)?.is_none());
+    assert!(node.store().get_raw(&id)?.is_some(), "a recent one stays");
+    assert_eq!(node.store().opaque_bytes(), before);
+    node.shutdown().await?;
+    Ok(())
+}
+
+/// Under the network schedule, a submission pays the schedule and the
+/// premium, never the new-author bits: its author is a one-off key.
+#[tokio::test(flavor = "multi_thread")]
+async fn submissions_pay_no_new_author_bits() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let mut config = NodeConfig::new(dir.path());
+    config.mode = NetworkMode::Loopback;
+    config.pow_bits = Some(0);
+    config.min_pow_bits = None;
+    config.pow_schedule = vec![(0, 3)];
+    let node = Node::start(config).await?;
+    let now = now_secs();
+    let required = 3 + SUBMIT_EXTRA_POW_BITS;
+    // A fresh key for each, mined to [min, max) bits.
+    let mined = |min: u32, max: u32| {
+        (40u8..)
+            .map(|seed| submission(seed, now, min))
+            .find(|w| {
+                let id: [u8; 32] = hex::decode(w["id"].as_str().unwrap())
+                    .unwrap()
+                    .try_into()
+                    .unwrap();
+                wats::event::leading_zero_bits(&id) < max
+            })
+            .unwrap()
+    };
+    let err = node.publish_signed(mined(0, required)).await.unwrap_err();
+    assert!(err.to_string().contains("proof of work"), "{err:#}");
+    node.publish_signed(mined(
+        required,
+        required + wats::event::NEW_AUTHOR_EXTRA_BITS,
+    ))
+    .await?;
     node.shutdown().await?;
     Ok(())
 }
