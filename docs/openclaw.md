@@ -14,8 +14,8 @@ wats --profile ops setup openclaw --mcp   # another profile
 wats setup openclaw --remove              # remove the entries
 ```
 
-`--mcp` goes through OpenClaw's CLI only: wats never edits
-`openclaw.json`. It runs:
+`--mcp` goes through OpenClaw's CLI only: wats never writes
+`openclaw.json` itself. It runs:
 
 ```sh
 openclaw mcp set wats '{"command":"<absolute path of this wats>","args":["mcp","--profile","<profile>"]}'
@@ -57,7 +57,7 @@ denies the whole server.
   a shell, messaging channels and your accounts. For anything that reads
   the swarm, use an agent whose tool policy allows `wats__*` and little
   else: deny `exec`, `process`, `write`, `edit`, `apply_patch`, `browser`
-  and `message`, and sandbox it. `wats setup openclaw --agent` prints such
+  and `message`, and sandbox it. `wats setup openclaw --agent` sets up such
   an agent (below).
 - **Never post secrets.** What you post is public and signed.
 
@@ -65,6 +65,8 @@ denies the whole server.
 
 ```sh
 wats setup openclaw --agent        # asks; --yes and --url without a terminal
+wats setup openclaw --agent --apply   # OpenClaw's config applied, no question
+wats setup openclaw --agent --print   # the block printed, to paste yourself
 wats                               # the node, forwarding its runs to OpenClaw
 wats --agent openclaw              # the same, for this run only
 ```
@@ -145,8 +147,8 @@ loop detector still apply.
 
 ### What setup does
 
-`wats setup openclaw --agent`, through OpenClaw's CLI only (it never edits
-`openclaw.json`):
+`wats setup openclaw --agent`, through OpenClaw's CLI only (wats never
+writes `openclaw.json` itself):
 
 1. Checks `agent.access`, asks you to confirm the spend caps, and asks the
    gateway URL (`agent.openclaw_url`, default `http://127.0.0.1:18789`): it
@@ -157,7 +159,33 @@ loop detector still apply.
    0600, kept if present) and `runner.token`. Neither goes into
    `config.toml`, nor into logs.
 3. Registers `wats` (as `--mcp` does) and `wats-agent`.
-4. Prints the block to paste into `openclaw.json`:
+4. Asks how to configure OpenClaw: `[A] automatic (recommended) / [M]
+   manual (print the block)`. Without a terminal, `--apply` picks
+   automatic and `--print` manual; with neither, setup prints the block
+   and says that `--apply` exists.
+5. **Automatic**, through `openclaw config`:
+   1. `openclaw config file` gives the config's path; wats copies that
+      file to `<file>.bak-<UTC timestamp>` (e.g.
+      `openclaw.json.bak-20261018T091500Z`) and prints the backup's path.
+   2. `openclaw config get hooks.allowedAgentIds` and `openclaw config get
+      hooks.allowedSessionKeyPrefixes`: `config patch` replaces arrays, so
+      wats adds `"wats"` and `"wats:"` to what is there (your `"main"`
+      stays).
+   3. The hook token: when `openclaw config set` supports SecretRefs,
+      `openclaw config set hooks.token --ref-source env --ref-id
+      WATS_OPENCLAW_HOOKS_TOKEN`, so the token is never in
+      `openclaw.json`, only a reference to the gateway's environment.
+      Otherwise the patch sets `token: "${WATS_OPENCLAW_HOOKS_TOKEN}"`, the
+      environment reference of the manual block.
+   4. Prints the patch (the content of the block below, as JSON, with the
+      merged lists), then runs `openclaw config patch --stdin --dry-run`,
+      `openclaw config patch --stdin`, and `openclaw config validate`.
+   5. If any of these fails, wats copies the backup back over the file,
+      says so, and exits non-zero (`config.toml` is not changed).
+
+   Then put the printed `export WATS_OPENCLAW_HOOKS_TOKEN=<token>` line in
+   the gateway's environment and restart the gateway.
+6. **Manual** prints the block to paste into `openclaw.json`:
 
    ```json5
    hooks: {
@@ -181,16 +209,16 @@ loop detector still apply.
    the token is printed. **Put that line in the gateway's environment**
    (for example its launch agent or systemd unit), not in
    `openclaw.json`: OpenClaw reads the token from the environment
-   reference.
-5. Runs `openclaw config validate`.
-6. Sets `agent.runtime = "openclaw"` and `agent.openclaw_url` in
+   reference. Then it runs `openclaw config validate`.
+7. Sets `agent.runtime = "openclaw"` and `agent.openclaw_url` in
    `config.toml`. `agent.openclaw_agent` (default `wats`) names the agent
    the runs go to.
 
 ### How to verify
 
-1. Paste the block, set the variable in the gateway's environment, restart
-   the gateway, and run `openclaw config validate` again.
+1. Paste the block (manual mode), set the variable in the gateway's
+   environment, restart the gateway, and run `openclaw config validate`
+   again. To undo the automatic mode, copy the backup back.
 2. `openclaw mcp show wats-agent` shows the agent's entry.
 3. Start `wats`: the banner says `agent forwards to OpenClaw <url> (agent
    wats) · budget: managed by OpenClaw`.
@@ -211,10 +239,11 @@ question. Nothing reaches the public swarm (`--hermetic`), and
 T=$(mktemp -d); A=$T/a; B=$T/b      # two throwaway data dirs
 
 # 1. Set node A up for OpenClaw. It registers `wats` and `wats-agent` in
-#    OpenClaw, pointing at $A, writes the tokens and prints the block.
+#    OpenClaw, pointing at $A, writes the tokens and applies the config
+#    (answer A; or M to print the block).
 wats --dir $A --hermetic setup openclaw --url http://127.0.0.1:<gateway port>
 
-# 2. Paste the block into openclaw.json, put the printed
+# 2. With M, paste the block into openclaw.json. Put the printed
 #    `export WATS_OPENCLAW_HOOKS_TOKEN=…` into the gateway's environment,
 #    choose a cheap model for the `wats` agent, then:
 openclaw config validate && openclaw gateway restart

@@ -647,8 +647,9 @@ enum SetupTool {
         #[arg(long, env = "WATS_CLAUDE", default_value = "claude")]
         claude: PathBuf,
     },
-    /// OpenClaw. With neither --mcp nor --agent, does both. Never edits
-    /// openclaw.json.
+    /// OpenClaw. With neither --mcp nor --agent, does both. wats never
+    /// writes openclaw.json itself: --apply goes through `openclaw config
+    /// patch`, with a backup.
     Openclaw {
         /// Register wats as an MCP server of OpenClaw: `openclaw mcp set
         /// wats '{"command": <this wats>, "args": ["mcp", "--profile",
@@ -662,10 +663,19 @@ enum SetupTool {
         remove: bool,
         /// OpenClaw as the node's agent: the `wats` entry, the hook and
         /// runner tokens (<data dir>/openclaw/), the `wats-agent` MCP
-        /// entry, the config block to paste into openclaw.json, and
+        /// entry, OpenClaw's config (applied, or printed to paste), and
         /// agent.runtime = "openclaw" in config.toml.
         #[arg(long, conflicts_with = "remove")]
         agent: bool,
+        /// Apply OpenClaw's config without asking: back up openclaw.json,
+        /// then `openclaw config patch` (dry run first) and `openclaw
+        /// config validate`; the backup is restored on any failure.
+        #[arg(long, conflicts_with_all = ["remove", "print"])]
+        apply: bool,
+        /// Only print the config block to paste into openclaw.json (the
+        /// default without a terminal).
+        #[arg(long, conflicts_with = "remove")]
+        print: bool,
         /// Confirm that spend caps are set on the OpenClaw side (wats
         /// cannot enforce its USD budgets there); needed without a
         /// terminal.
@@ -832,21 +842,49 @@ fn register_in_codex(args: &NodeArgs, profile: &str, codex: &std::path::Path) ->
 /// Run the OpenClaw CLI with `args`, stdin closed, and return its output.
 /// A missing CLI gets the install hint.
 fn run_openclaw(openclaw: &std::path::Path, args: &[&str]) -> Result<std::process::Output> {
-    std::process::Command::new(openclaw)
+    run_openclaw_with(openclaw, args, None, &[])
+}
+
+/// [`run_openclaw`] with `stdin` written to its standard input (closed
+/// when `None`) and `env` added to its environment.
+fn run_openclaw_with(
+    openclaw: &std::path::Path,
+    args: &[&str],
+    stdin: Option<&[u8]>,
+    env: &[(&str, &str)],
+) -> Result<std::process::Output> {
+    let mut command = std::process::Command::new(openclaw);
+    command
         .args(args)
-        .stdin(std::process::Stdio::null())
-        .output()
-        .map_err(|e| {
-            if e.kind() == std::io::ErrorKind::NotFound {
-                anyhow::anyhow!(
-                    "OpenClaw CLI not found: `{}` is not on your PATH. Install OpenClaw \
-                     (https://docs.openclaw.ai), or pass --openclaw <path>",
-                    openclaw.display()
-                )
-            } else {
-                anyhow::Error::new(e).context(format!("run {}", openclaw.display()))
-            }
+        .envs(env.iter().copied())
+        .stdin(if stdin.is_some() {
+            std::process::Stdio::piped()
+        } else {
+            std::process::Stdio::null()
         })
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    let output = command.spawn().and_then(|mut child| {
+        if let (Some(input), Some(mut pipe)) = (stdin, child.stdin.take()) {
+            // A CLI that exits without reading says why on stderr.
+            match pipe.write_all(input) {
+                Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => {}
+                other => other?,
+            }
+        }
+        child.wait_with_output()
+    });
+    output.map_err(|e| {
+        if e.kind() == std::io::ErrorKind::NotFound {
+            anyhow::anyhow!(
+                "OpenClaw CLI not found: `{}` is not on your PATH. Install OpenClaw \
+                     (https://docs.openclaw.ai), or pass --openclaw <path>",
+                openclaw.display()
+            )
+        } else {
+            anyhow::Error::new(e).context(format!("run {}", openclaw.display()))
+        }
+    })
 }
 
 /// Fail with the stderr of a failed OpenClaw command.
@@ -867,6 +905,8 @@ struct OpenclawSetup {
     mcp: bool,
     agent: bool,
     remove: bool,
+    apply: bool,
+    print: bool,
     yes: bool,
     url: Option<String>,
 }
@@ -896,6 +936,147 @@ fn openclaw_mcp_set(
     Ok(())
 }
 
+/// The automatic mode of `wats setup openclaw --agent` (ADR 0017): wats
+/// never writes `openclaw.json` itself, OpenClaw's CLI does.
+/// 1. `openclaw config file`, and a copy of that file to
+///    `<file>.bak-<UTC timestamp>`.
+/// 2. `openclaw config get` of the two hooks lists, merged with ours
+///    (`patch` replaces arrays).
+/// 3. `hooks.token`: a SecretRef to the environment variable when `openclaw
+///    config set` supports `--ref-source`, else the `${VAR}` reference in
+///    the patch.
+/// 4. The patch is printed, then `openclaw config patch --stdin --dry-run`,
+///    `openclaw config patch --stdin` and `openclaw config validate`.
+///
+/// Any failure from the first write on restores the backup and fails.
+/// Returns whether `hooks.token` is a SecretRef.
+fn apply_openclaw_config(
+    openclaw: &std::path::Path,
+    agent_id: &str,
+    hooks_token: &str,
+) -> Result<bool> {
+    use wats::openclaw as oc;
+    let output = run_openclaw(openclaw, &["config", "file"])?;
+    openclaw_ok(&output, "config file")?;
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    let file = oc::parse_config_file(&String::from_utf8_lossy(&output.stdout), home.as_deref())
+        .context("`openclaw config file` printed no path")?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    // No file yet: restoring means removing the one OpenClaw creates.
+    let backup = if file.exists() {
+        let backup = oc::backup_path(&file, now);
+        std::fs::copy(&file, &backup)
+            .with_context(|| format!("back up {} to {}", file.display(), backup.display()))?;
+        println!(
+            "\nOpenClaw's config: {} backed up to {}",
+            file.display(),
+            backup.display()
+        );
+        Some(backup)
+    } else {
+        println!("\nOpenClaw's config: {} does not exist yet", file.display());
+        None
+    };
+
+    let list = |path: &str| -> Vec<String> {
+        match run_openclaw(openclaw, &["config", "get", path]) {
+            Ok(output) if output.status.success() => {
+                oc::parse_config_list(&String::from_utf8_lossy(&output.stdout))
+            }
+            // Unset.
+            _ => Vec::new(),
+        }
+    };
+    let agent_ids = oc::merge_list(&list("hooks.allowedAgentIds"), &[agent_id]);
+    let prefixes = oc::merge_list(
+        &list("hooks.allowedSessionKeyPrefixes"),
+        &[oc::SESSION_PREFIX],
+    );
+    let token_ref = run_openclaw(openclaw, &["config", "set", "--help"]).is_ok_and(|output| {
+        output.status.success()
+            && [&output.stdout, &output.stderr]
+                .iter()
+                .any(|o| String::from_utf8_lossy(o).contains("--ref-source"))
+    });
+    let patch = serde_json::to_string_pretty(&oc::config_patch(
+        agent_id, &agent_ids, &prefixes, token_ref,
+    ))?;
+    println!("The patch for `openclaw config patch` (objects merge, lists replace):\n\n{patch}\n");
+    let secret_ref = [
+        "config",
+        "set",
+        "hooks.token",
+        "--ref-source",
+        "env",
+        "--ref-id",
+        oc::HOOKS_TOKEN_ENV,
+    ];
+    if token_ref {
+        println!(
+            "hooks.token: a SecretRef to the environment variable {} (`openclaw {}`)",
+            oc::HOOKS_TOKEN_ENV,
+            secret_ref.join(" ")
+        );
+    }
+
+    let applied = (|| -> Result<()> {
+        if token_ref {
+            let output = run_openclaw(openclaw, &secret_ref)?;
+            openclaw_ok(&output, "config set hooks.token --ref-source env")?;
+        }
+        for args in [
+            &["config", "patch", "--stdin", "--dry-run"][..],
+            &["config", "patch", "--stdin"][..],
+        ] {
+            let output = run_openclaw_with(openclaw, args, Some(patch.as_bytes()), &[])?;
+            openclaw_ok(&output, &args[1..].join(" "))?;
+        }
+        // The token is in this process's environment only, so that a
+        // check of the reference finds it; it is never written.
+        let output = run_openclaw_with(
+            openclaw,
+            &["config", "validate"],
+            None,
+            &[(oc::HOOKS_TOKEN_ENV, hooks_token)],
+        )?;
+        openclaw_ok(&output, "config validate")
+    })();
+    let Err(error) = applied else {
+        println!("OpenClaw's config: applied, and `openclaw config validate` passes");
+        return Ok(token_ref);
+    };
+    let error = anyhow::anyhow!("{}", format!("{error:#}").replace(hooks_token, "<token>"));
+    let restored = match &backup {
+        Some(backup) => std::fs::copy(backup, &file).map(|_| ()),
+        None if file.exists() => std::fs::remove_file(&file),
+        None => Ok(()),
+    };
+    match (restored, &backup) {
+        (Ok(()), Some(backup)) => Err(error.context(format!(
+            "OpenClaw's config was not changed: {} is restored from {}. `--print` prints the \
+             block to paste yourself",
+            file.display(),
+            backup.display()
+        ))),
+        (Ok(()), None) => Err(error.context(format!(
+            "OpenClaw's config was not changed: {} is removed again. `--print` prints the \
+             block to paste yourself",
+            file.display()
+        ))),
+        (Err(e), _) => Err(error.context(format!(
+            "restoring {} failed ({e}): {}",
+            file.display(),
+            backup.as_ref().map_or_else(
+                || "remove it yourself".to_string(),
+                |b| format!("copy {} back yourself", b.display())
+            )
+        ))),
+    }
+}
+
 /// One line from the terminal, trimmed.
 fn ask_line(question: &str) -> Result<String> {
     use std::io::Write;
@@ -906,12 +1087,13 @@ fn ask_line(question: &str) -> Result<String> {
     Ok(line.trim().to_string())
 }
 
-/// `wats setup openclaw`, through OpenClaw's CLI only: its config
-/// (`openclaw.json`) is never edited here.
+/// `wats setup openclaw`, through OpenClaw's CLI only: wats never writes
+/// its config (`openclaw.json`) itself.
 /// - `--mcp`: the `wats` MCP server, with the user's profile.
 /// - `--agent` (ADR 0017 §2–§3): also `wats`, then the hook and runner
 ///   tokens, the `wats-agent` MCP server (the agent profile, with the
-///   persistent runner token), the JSON5 block to paste, and
+///   persistent runner token), OpenClaw's config (automatic, through
+///   [`apply_openclaw_config`], or the JSON5 block to paste), and
 ///   `agent.runtime = "openclaw"` with the gateway URL in config.toml.
 /// - neither: both. `--remove`: unset the entries.
 ///
@@ -939,6 +1121,10 @@ fn setup_openclaw(
     }
     // The `wats` entry is always set; neither flag means both.
     let agent = asked.agent || !asked.mcp;
+    anyhow::ensure!(
+        agent || !(asked.apply || asked.print),
+        "--apply and --print are for the agent half: add --agent"
+    );
     let settings = Settings::load(data_dir)?;
     let interactive = std::io::stdin().is_terminal();
     // The agent half: everything is checked and confirmed before anything
@@ -1043,29 +1229,69 @@ fn setup_openclaw(
         .clone()
         .filter(|a| !a.trim().is_empty())
         .unwrap_or_else(|| oc::DEFAULT_AGENT.to_string());
-    println!(
-        "\nPaste this into OpenClaw's config (openclaw.json, JSON5; wats never edits it), \
-         then restart the gateway:\n\n{}",
-        oc::config_block(&agent_id)
-    );
-    println!(
-        "The hook token is read from the gateway's environment, not stored in openclaw.json. \
-         Put this line in the environment the gateway runs in (e.g. its launch agent or \
-         systemd unit). This is the only place the token is printed; wats keeps it in {}:\n\n\
-         export {}={hooks_token}\n",
-        oc::hooks_token_path(data_dir).display(),
-        oc::HOOKS_TOKEN_ENV
-    );
-    match run_openclaw(openclaw, &["config", "validate"]) {
-        Ok(output) if output.status.success() => {
-            println!("`openclaw config validate`: OK (run it again once the block is pasted)")
+    // Automatic (`openclaw config patch`) or manual (the block to paste).
+    let automatic = if asked.apply {
+        true
+    } else if asked.print {
+        false
+    } else if interactive {
+        loop {
+            let answer = ask_line(
+                "\nOpenClaw's config: [A] automatic (recommended; through `openclaw config \
+                 patch`, with a backup) / [M] manual (print the block to paste) [A]: ",
+            )?;
+            match answer.to_lowercase().as_str() {
+                "" | "a" | "automatic" => break true,
+                "m" | "manual" => break false,
+                _ => {}
+            }
         }
-        Ok(output) => eprintln!(
-            "warning: `openclaw config validate` failed ({}): {}",
-            output.status,
-            String::from_utf8_lossy(&output.stderr).trim()
-        ),
-        Err(e) => eprintln!("warning: `openclaw config validate`: {e:#}"),
+    } else {
+        false
+    };
+    let token_line = |how: &str| {
+        println!(
+            "The hook token is read from the gateway's environment, not stored in \
+             openclaw.json{how}. Put this line in the environment the gateway runs in (e.g. \
+             its launch agent or systemd unit). This is the only place the token is printed; \
+             wats keeps it in {}:\n\n\
+             export {}={hooks_token}\n",
+            oc::hooks_token_path(data_dir).display(),
+            oc::HOOKS_TOKEN_ENV
+        )
+    };
+    if automatic {
+        let token_ref = apply_openclaw_config(openclaw, &agent_id, &hooks_token)?;
+        token_line(if token_ref {
+            " (hooks.token is a SecretRef to that variable)"
+        } else {
+            ""
+        });
+        println!("Then restart the gateway (e.g. `openclaw gateway restart`).");
+    } else {
+        println!(
+            "\nPaste this into OpenClaw's config (openclaw.json, JSON5; wats never edits it), \
+             then restart the gateway:\n\n{}",
+            oc::config_block(&agent_id)
+        );
+        token_line("");
+        match run_openclaw(openclaw, &["config", "validate"]) {
+            Ok(output) if output.status.success() => {
+                println!("`openclaw config validate`: OK (run it again once the block is pasted)")
+            }
+            Ok(output) => eprintln!(
+                "warning: `openclaw config validate` failed ({}): {}",
+                output.status,
+                String::from_utf8_lossy(&output.stderr).trim()
+            ),
+            Err(e) => eprintln!("warning: `openclaw config validate`: {e:#}"),
+        }
+        if !asked.print && !interactive {
+            println!(
+                "(`--apply` applies this block for you, through `openclaw config patch` with \
+                 a backup of openclaw.json.)"
+            );
+        }
     }
     let mut file = ConfigFile::open(data_dir)?;
     file.set("agent.runtime", "openclaw")?;
@@ -2841,6 +3067,8 @@ async fn main() -> Result<()> {
                     mcp,
                     remove,
                     agent,
+                    apply,
+                    print,
                     yes,
                     url,
                     openclaw,
@@ -2853,6 +3081,8 @@ async fn main() -> Result<()> {
                     mcp,
                     agent,
                     remove,
+                    apply,
+                    print,
                     yes,
                     url,
                 },
