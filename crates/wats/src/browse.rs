@@ -107,39 +107,89 @@ pub fn browse(store: &Store, query: &Query) -> Result<Value> {
     Ok(out)
 }
 
+/// One line of a thread outline.
+struct Line {
+    id: String,
+    parent: Option<String>,
+    kind: String,
+    author: String,
+    title: String,
+    ts: u64,
+}
+
+impl Line {
+    fn of(event: &Event) -> Self {
+        Self {
+            id: event.id.clone(),
+            parent: event.parent.clone(),
+            kind: event.kind.as_str().to_string(),
+            author: event.author.clone(),
+            title: title(event),
+            ts: event.ts,
+        }
+    }
+
+    /// A post whose body this node dropped (ADR 0020 §3): its header only.
+    fn dropped(tombstone: &Value, reason: crate::store::DropReason) -> Option<Self> {
+        let text = |key: &str| tombstone.get(key).and_then(Value::as_str);
+        Some(Self {
+            id: text("id")?.to_string(),
+            parent: text("parent").map(str::to_string),
+            kind: shown(text("kind")?),
+            author: text("author")?.to_string(),
+            title: format!("(body dropped: {reason})"),
+            ts: tombstone.get("ts").and_then(Value::as_u64)?,
+        })
+    }
+}
+
 /// One thread as a tree: depth-first from the root, replies under their
 /// parent, oldest first. Replies whose parent is not here hang at depth 1.
+/// Posts whose body this node dropped keep their place, as "(body dropped:
+/// reason)".
 fn outline(store: &Store, root: &str) -> Result<Value> {
     let posts = store.thread(root, MAX_OUTLINE)?;
-    let Some(root_event) = posts.iter().find(|s| s.event.id == root) else {
+    let truncated = posts.len() >= MAX_OUTLINE;
+    let mut lines: Vec<Line> = posts.iter().map(|s| Line::of(&s.event)).collect();
+    for tombstone in store.thread_opaque(root, MAX_OUTLINE)? {
+        let Some(id) = tombstone.get("id").and_then(Value::as_str) else {
+            continue;
+        };
+        if let Some(record) = store.drop_record(id)?
+            && let Some(line) = Line::dropped(&tombstone, record.reason)
+        {
+            lines.push(line);
+        }
+    }
+    // Oldest first, as the store gives each part.
+    lines.sort_by_key(|l| l.ts);
+    let Some(root_line) = lines.iter().find(|l| l.id == root) else {
         anyhow::bail!("no thread {root} on this node");
     };
-    let root_event = root_event.event.clone();
-    let mut children: HashMap<&str, Vec<&Event>> = HashMap::new();
-    for stored in &posts {
-        let e = stored.event.as_ref();
-        if e.id == root {
+    let mut children: HashMap<&str, Vec<&Line>> = HashMap::new();
+    for line in &lines {
+        if line.id == root {
             continue;
         }
-        let parent = e
+        let parent = line
             .parent
             .as_deref()
-            .filter(|p| posts.iter().any(|s| s.event.id == *p))
+            .filter(|p| lines.iter().any(|l| l.id == *p))
             .unwrap_or(root);
-        children.entry(parent).or_default().push(e);
+        children.entry(parent).or_default().push(line);
     }
-    let mut lines = Vec::new();
-    let mut stack: Vec<(&Event, usize)> = vec![(root_event.as_ref(), 0)];
-    while let Some((e, depth)) = stack.pop() {
-        lines.push(json!({
-            "id": e.id,
+    let mut out = Vec::new();
+    let mut stack: Vec<(&Line, usize)> = vec![(root_line, 0)];
+    while let Some((line, depth)) = stack.pop() {
+        out.push(json!({
+            "id": line.id,
             "depth": depth,
-            "kind": e.kind.as_str(),
-            "author": e.author.get(..12).unwrap_or(&e.author),
-            "title": title(e),
-            "ts": crate::update::format_timestamp(e.ts),
+            "kind": line.kind,
+            "author": line.author.get(..12).unwrap_or(&line.author),
+            "title": line.title,
+            "ts": crate::update::format_timestamp(line.ts),
         }));
-        if let Some(kids) = children.get(e.id.as_str()) {
+        if let Some(kids) = children.get(line.id.as_str()) {
             // Pushed in reverse so the oldest comes out first.
             for kid in kids.iter().rev() {
                 stack.push((kid, depth.saturating_add(1)));
@@ -148,8 +198,8 @@ fn outline(store: &Store, root: &str) -> Result<Value> {
     }
     Ok(json!({
         "thread": root,
-        "posts": lines,
-        "truncated": posts.len() >= MAX_OUTLINE,
+        "posts": out,
+        "truncated": truncated,
         "hint": "open a post with `read`",
     }))
 }
@@ -288,5 +338,51 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn dropped_posts_keep_their_place_in_the_outline() {
+        use crate::store::DropReason;
+        let store = Store::open_in_memory().unwrap();
+        let ask = post(
+            &store,
+            1,
+            100,
+            root(Kind::Ask, "A leaked key", &["cap:rust"]),
+        );
+        let answer = post(&store, 2, 200, reply(&ask, Kind::Answer, "Rotate it."));
+        post(&store, 1, 300, reply(&answer, Kind::React, "Done"));
+        store
+            .drop_body(&ask.id, DropReason::Own, None, None, 400)
+            .unwrap();
+        store
+            .drop_body(&answer.id, DropReason::Retraction, None, None, 400)
+            .unwrap();
+        let tree = browse(
+            &store,
+            &Query {
+                thread: Some(ask.id.clone()),
+                ..Query::default()
+            },
+        )
+        .unwrap();
+        let posts = tree["posts"].as_array().unwrap();
+        let shape: Vec<(u64, &str)> = posts
+            .iter()
+            .map(|p| (p["depth"].as_u64().unwrap(), p["title"].as_str().unwrap()))
+            .collect();
+        assert_eq!(
+            shape,
+            [
+                (0, "(body dropped: own)"),
+                (1, "(body dropped: retraction)"),
+                (2, "Done"),
+            ]
+        );
+        assert_eq!(posts[0]["kind"], "ask");
+        // The map leaves the dropped root out.
+        let map = browse(&store, &Query::default()).unwrap();
+        assert!(map["threads"].as_array().unwrap().is_empty());
+        assert!(map["tags"].as_array().unwrap().is_empty());
     }
 }

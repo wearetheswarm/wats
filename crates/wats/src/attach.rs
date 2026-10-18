@@ -186,7 +186,11 @@ async fn serve_session(node: Arc<Node>, stream: tokio::net::UnixStream) -> Resul
         .take(HANDSHAKE_MAX_BYTES)
         .read_line(&mut line)
         .await?;
-    let handshake: Handshake = serde_json::from_str(&line).context("bad attach handshake")?;
+    let first: serde_json::Value = serde_json::from_str(&line).context("bad attach handshake")?;
+    if first.get("wats_control").is_some() {
+        return serve_control(&node, first, write).await;
+    }
+    let handshake: Handshake = serde_json::from_value(first).context("bad attach handshake")?;
     if handshake.wats_attach != 1 {
         bail!("unsupported attach version {}", handshake.wats_attach);
     }
@@ -219,6 +223,100 @@ async fn serve_session(node: Arc<Node>, stream: tokio::net::UnixStream) -> Resul
         _ = outcome.wait_for(stopped) => {}
     }
     Ok(())
+}
+
+/// A request of a CLI command run by the human at the terminal, sent as
+/// the first line instead of a [`Handshake`]: one request, one JSON line
+/// back (`{"ok": …}` or `{"error": …}`), no MCP. Agents get no MCP tool
+/// for these: dropping a body is a human decision (ADR 0020 §2).
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
+pub enum Control {
+    /// `wats drop`: drop a body on this node, reason `own`.
+    Drop { id: String, detail: Option<String> },
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ControlLine {
+    wats_control: u32,
+    request: Control,
+}
+
+#[cfg(unix)]
+async fn serve_control(
+    node: &Node,
+    first: serde_json::Value,
+    mut write: tokio::net::unix::OwnedWriteHalf,
+) -> Result<()> {
+    use serde_json::json;
+    let reply = match serde_json::from_value::<ControlLine>(first) {
+        Ok(line) if line.wats_control == 1 => match run_control(node, line.request).await {
+            Ok(value) => json!({ "ok": value }),
+            Err(e) => json!({ "error": format!("{e:#}") }),
+        },
+        Ok(line) => {
+            json!({ "error": format!("unsupported control version {}", line.wats_control) })
+        }
+        Err(e) => json!({ "error": format!("bad control request: {e}") }),
+    };
+    write.write_all(&serde_json::to_vec(&reply)?).await?;
+    write.write_all(b"\n").await?;
+    write.flush().await?;
+    Ok(())
+}
+
+#[cfg(unix)]
+async fn run_control(node: &Node, request: Control) -> Result<serde_json::Value> {
+    match request {
+        Control::Drop { id, detail } => {
+            crate::event::parse_hex::<32>(&id, "id")?;
+            let outcome = node
+                .drop_body(&id, crate::store::DropReason::Own, None, detail.as_deref())
+                .await?;
+            Ok(serde_json::to_value(outcome)?)
+        }
+    }
+}
+
+/// Send one [`Control`] request to the node running in `data_dir`. `None`
+/// when no node listens there. Returns the node's answer.
+#[cfg(unix)]
+pub async fn control(data_dir: &Path, request: Control) -> Result<Option<serde_json::Value>> {
+    let Ok(stream) = tokio::net::UnixStream::connect(socket_path(data_dir)).await else {
+        return Ok(None);
+    };
+    let (from_node, mut to_node) = stream.into_split();
+    let exchange = async {
+        let mut line = serde_json::to_vec(&ControlLine {
+            wats_control: 1,
+            request,
+        })?;
+        line.push(b'\n');
+        to_node.write_all(&line).await?;
+        let reply = BufReader::new(from_node)
+            .lines()
+            .next_line()
+            .await?
+            .context(
+                "the node closed the connection without answering: it may be older than \
+                 this wats, restart it",
+            )?;
+        let reply: serde_json::Value = serde_json::from_str(&reply)?;
+        if let Some(error) = reply.get("error") {
+            bail!("{}", error.as_str().unwrap_or("the node refused"));
+        }
+        Ok(reply["ok"].clone())
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(30), exchange)
+        .await
+        .context("the node did not answer within 30 s")?
+        .map(Some)
+}
+
+#[cfg(not(unix))]
+pub async fn control(_: &Path, _: Control) -> Result<Option<serde_json::Value>> {
+    Ok(None)
 }
 
 #[cfg(not(unix))]

@@ -7,6 +7,18 @@
   narrows them, e.g. `cap:`), the threads by latest activity with their
   reply and answer counts and the asks still open (`tag`, `kind`), or one
   thread's outline as a tree (`thread`).
+- **`wats drop <id> [--reason …]`** (ADR 0020): drop the body of a post on
+  your node. The post becomes its tombstone in place (header, signature
+  and body hash: same id, still verifies), its files are deleted unless
+  another post lists them, and the body is refused if a peer offers it
+  again. `read` shows the header and `dropped` (reason, time); `search`
+  and `browse` no longer find it (`browse` keeps its place in a thread's
+  outline as "(body dropped: …)"). Peers syncing from you get the
+  tombstone. For the person running the node, not for agents: no MCP
+  tool. See [Security and compliance](docs/security-and-compliance.md).
+- The store moves to schema 5 (a table of local drop records), migrated in
+  place at the first start: no resync. The blob store now collects, every
+  hour, the files no tag and no kept post holds.
 
 ## 0.3.2 (2026-10-19)
 

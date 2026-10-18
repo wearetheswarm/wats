@@ -40,7 +40,7 @@ use crate::bootstrap::BootstrapEntry;
 use crate::event::{BlobRef, Draft, Event, is_safe_blob_name};
 use crate::identity::{DEFAULT_PROFILE, RootSecret, author_id};
 use crate::proto::{self, NodeInfo, Request, Response, WatsProtocol};
-use crate::store::{Inserted, Store};
+use crate::store::{DropOutcome, DropReason, Inserted, Store};
 use crate::supervise::supervise;
 use crate::wire::{AnyEvent, RELAY_VERSIONS_AHEAD, UNDERSTOOD_VERSIONS};
 
@@ -415,7 +415,7 @@ pub const OPAQUE_EXTRA_POW_BITS: u32 = 2;
 pub const SUBMIT_EXTRA_POW_BITS: u32 = 2;
 /// Default retention of v2 `submit` events (`submit.retention`): 30 days.
 pub const DEFAULT_SUBMIT_RETENTION: Duration = Duration::from_secs(30 * 24 * 3600);
-/// How often expired submissions are dropped.
+/// How often the store is tidied: expired submissions and drop records.
 const SUBMIT_TIDY_SECS: u64 = 3600;
 
 fn understood(v: u64) -> bool {
@@ -463,6 +463,118 @@ const MAX_PROVIDER_ATTEMPTS: usize = 4;
 /// each further failure up to [`PROVIDER_BACKOFF_MAX`] (B7).
 const PROVIDER_BACKOFF: Duration = Duration::from_secs(30);
 const PROVIDER_BACKOFF_MAX: Duration = Duration::from_secs(3600);
+
+/// How often the blob store collects the blobs nothing keeps: no tag
+/// (`wats/blob/<hash>`) and listed by no kept event, e.g. the blobs of a
+/// dropped body (ADR 0020 §2), or a fetch that failed half-way.
+const BLOB_GC_SECS: u64 = 3600;
+
+/// Keep every blob a kept full event lists: covers a fetched blob between
+/// its download and its tag. A store error skips the collection.
+fn protect_referenced<'a>(
+    store: &Store,
+    live: &'a mut HashSet<Hash>,
+) -> std::pin::Pin<
+    Box<dyn std::future::Future<Output = iroh_blobs::store::ProtectOutcome> + Send + Sync + 'a>,
+> {
+    let outcome = match store.referenced_blobs() {
+        Ok(hashes) => {
+            live.extend(hashes.iter().filter_map(|h| h.parse::<Hash>().ok()));
+            iroh_blobs::store::ProtectOutcome::Continue
+        }
+        Err(e) => {
+            warn!("blob collection skipped: {e:#}");
+            iroh_blobs::store::ProtectOutcome::Abort
+        }
+    };
+    Box::pin(std::future::ready(outcome))
+}
+
+/// Constrain a closure to the signature of a collection callback.
+fn gc_callback<F>(f: F) -> iroh_blobs::store::ProtectCb
+where
+    F: for<'a> Fn(
+            &'a mut HashSet<Hash>,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<Output = iroh_blobs::store::ProtectOutcome>
+                    + Send
+                    + Sync
+                    + 'a,
+            >,
+        > + Send
+        + Sync
+        + 'static,
+{
+    Arc::new(f)
+}
+
+/// Open the blob store of `dir`, collecting what nothing keeps every
+/// [`BLOB_GC_SECS`].
+async fn load_blobs(dir: &Path, store: Arc<Store>) -> Result<FsStore> {
+    let mut options = iroh_blobs::store::fs::options::Options::new(dir);
+    options.gc = Some(iroh_blobs::store::GcConfig {
+        interval: Duration::from_secs(BLOB_GC_SECS),
+        add_protected: Some(gc_callback(move |live| protect_referenced(&store, live))),
+    });
+    Ok(FsStore::load_with_opts(dir.join("blobs.db"), options).await?)
+}
+
+/// Delete every tag of blob `hash` (`wats/blob/<hash>`, and the automatic
+/// tag of an import by an older release): the next collection removes it,
+/// unless a kept event lists it.
+async fn unpin_blob(blobs: &FsStore, hash: Hash) -> Result<()> {
+    let mut names = Vec::new();
+    let mut tags = blobs.tags().list().await?;
+    while let Some(tag) = tags.next().await {
+        let tag = tag?;
+        if tag.hash == hash {
+            names.push(tag.name);
+        }
+    }
+    for name in names {
+        blobs.tags().delete(name).await?;
+    }
+    Ok(())
+}
+
+/// Untag the blobs a drop freed (best effort: a failure is logged, the
+/// body is gone anyway).
+async fn unpin_freed(blobs: &FsStore, outcome: &DropOutcome) {
+    for hash in &outcome.freed_blobs {
+        let Ok(parsed) = hash.parse::<Hash>() else {
+            continue;
+        };
+        if let Err(e) = unpin_blob(blobs, parsed).await {
+            warn!(%hash, "blob of a dropped body not untagged: {e:#}");
+        }
+    }
+}
+
+/// [`Node::drop_body`] with no node running on `data_dir` (`wats drop`):
+/// holds the data directory lock meanwhile. The blobs it frees are deleted
+/// by the next collection of a running node.
+pub async fn drop_body_offline(
+    data_dir: &Path,
+    id: &str,
+    reason: DropReason,
+    detail: Option<&str>,
+) -> Result<DropOutcome> {
+    let path = data_dir.join("events.sqlite");
+    if !path.exists() {
+        bail!("no event store in {}", data_dir.display());
+    }
+    let lock = lock_data_dir(data_dir)?;
+    let store = Store::open(&path)?;
+    let outcome = store.drop_body(id, reason, None, detail, now_secs())?;
+    if !outcome.freed_blobs.is_empty() {
+        let blobs = FsStore::load(data_dir.join("blobs")).await?;
+        unpin_freed(&blobs, &outcome).await;
+        blobs.shutdown().await.ok();
+    }
+    drop(lock);
+    Ok(outcome)
+}
 
 /// Make sure `dir` is a real directory, creating it if missing: never a
 /// symlink (security review D).
@@ -936,9 +1048,9 @@ impl Node {
             lookup.add_endpoint_info(peer.clone());
         }
 
-        let blobs = FsStore::load(config.data_dir.join("blobs")).await?;
         let store = Arc::new(Store::open(&config.data_dir.join("events.sqlite"))?);
         revalidate_opaque(&store)?;
+        let blobs = load_blobs(&config.data_dir.join("blobs"), Arc::clone(&store)).await?;
         let gossip = Gossip::builder()
             .max_message_size(GOSSIP_MAX_MESSAGE_BYTES)
             .spawn(endpoint.clone());
@@ -1023,16 +1135,21 @@ impl Node {
                 }
             }));
         }
-        if node.config.submit_retention.is_some() {
+        {
+            // Store tidying: expired submissions (ADR 0015 §5) and expired
+            // `evicted` drop records (ADR 0020 §2).
             let weak = Arc::downgrade(&node);
-            tokio::spawn(supervise("submit retention", move || {
+            tokio::spawn(supervise("store tidy", move || {
                 let weak = weak.clone();
                 async move {
                     loop {
-                        if let Some(node) = weak.upgrade()
-                            && let Err(e) = node.drop_expired_submits()
-                        {
-                            warn!("dropping expired submissions: {e:#}");
+                        if let Some(node) = weak.upgrade() {
+                            if let Err(e) = node.drop_expired_submits() {
+                                warn!("dropping expired submissions: {e:#}");
+                            }
+                            if let Err(e) = node.expire_drop_records() {
+                                warn!("expiring drop records: {e:#}");
+                            }
                         }
                         tokio::time::sleep(Duration::from_secs(SUBMIT_TIDY_SECS)).await;
                         if weak.strong_count() == 0 {
@@ -1569,10 +1686,14 @@ impl Node {
             if !is_safe_blob_name(&name) {
                 bail!("blob name {name:?} is not allowed");
             }
-            let tag = self.blobs.add_path(&path).await?;
-            self.pin(tag.hash).await?;
+            // Held by a temporary tag until pinned under our own name: no
+            // automatic tag, so that dropping the post frees the blob.
+            let added = self.blobs.add_path(&path).temp_tag().await?;
+            let hash = added.hash();
+            self.pin(hash).await?;
+            drop(added);
             refs.push(BlobRef {
-                hash: tag.hash.to_hex().to_string(),
+                hash: hash.to_hex().to_string(),
                 name,
                 size: meta.len(),
                 url: None,
@@ -2117,6 +2238,47 @@ impl Node {
         Ok(dropped)
     }
 
+    /// Delete the `evicted` drop records older than 30 days (ADR 0020 §2).
+    pub fn expire_drop_records(&self) -> Result<usize> {
+        let before = now_secs().saturating_sub(crate::store::EVICTED_RECORD_SECS);
+        let expired = self.store.expire_evicted_records(before)?;
+        if expired > 0 {
+            debug!(expired, "expired evicted drop records");
+        }
+        Ok(expired)
+    }
+
+    /// Drop the body of event `id` here (ADR 0020 §2): the store keeps its
+    /// tombstone and a drop record, and the blobs no kept event lists are
+    /// untagged, for the next collection to delete them.
+    pub async fn drop_body(
+        &self,
+        id: &str,
+        reason: DropReason,
+        trigger: Option<&str>,
+        detail: Option<&str>,
+    ) -> Result<DropOutcome> {
+        let outcome = self
+            .store
+            .drop_body(id, reason, trigger, detail, now_secs())?;
+        unpin_freed(&self.blobs, &outcome).await;
+        info!(%id, %reason, held = outcome.held, body = outcome.body_dropped,
+              blobs = outcome.freed_blobs.len(), "body dropped");
+        Ok(outcome)
+    }
+
+    /// Whether this node keeps blob `hash` under a tag.
+    pub async fn blob_pinned(&self, hash: &str) -> Result<bool> {
+        let hash: Hash = hash.parse()?;
+        let mut tags = self.blobs.tags().list().await?;
+        while let Some(tag) = tags.next().await {
+            if tag?.hash == hash {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
     /// The base difficulty of the network policy for an event of `author`
     /// at `ts` (before the size bits): the schedule at `ts`, plus the
     /// new-author bits when `pushed` (ADR 0010, PoW policy).
@@ -2240,6 +2402,17 @@ impl Node {
                 self.store.insert_raw(r, now_secs())?
             }
         };
+        // A body this node dropped (ADR 0020): what was kept is its
+        // tombstone, so callers see that, and fetch no blob, hint no
+        // provider and relay no body.
+        if inserted == Inserted::Dropped {
+            debug!(id = %event.id(), "body dropped here: refused, tombstone kept");
+            let tombstone = match &event {
+                AnyEvent::Known(e) => crate::wire::tombstone(&serde_json::to_value(e)?)?,
+                AnyEvent::Opaque(r) => crate::wire::tombstone(&r.to_value())?,
+            };
+            return Ok(Some((AnyEvent::Opaque(tombstone), false)));
+        }
         let new = inserted != Inserted::Duplicate;
         if new
             && let AnyEvent::Known(e) = &event
@@ -2271,6 +2444,13 @@ impl Node {
         let Some((event, _)) = self.accept_value(value.clone(), Origin::Pushed)? else {
             bail!("rejected by node policy");
         };
+        // A node never pushes a body it dropped (ADR 0020 §3).
+        if let AnyEvent::Opaque(raw) = &event
+            && raw.tombstoned
+            && value.get(crate::wire::BODY_HASH_KEY).is_none()
+        {
+            bail!("the body of {} was dropped here: not published", raw.id);
+        }
         let Some(sender) = self.sender(event.net()) else {
             bail!("this node has not joined network {:?}", event.net());
         };
