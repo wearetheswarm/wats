@@ -226,7 +226,13 @@ How the router runs:
   `.deb` packages;
 - as a non-root user (65532), with a read-only root filesystem, no
   capabilities and `no-new-privileges`;
-- with a restart policy of `unless-stopped`;
+- with a restart policy of `unless-stopped`. The router is the one node
+  that does not exit on a guardian halt of the public network (ADR 0016):
+  `WATS_HALT_SERVE=true` (`halt.serve`, set by the compose file) keeps it
+  up, with no agent and no MCP session, accepting and serving only the
+  halt events, so that new and late nodes still learn about the halt.
+  `wats status` (inside the container) shows `halt.serve: true` and the
+  halt in effect. Never set `halt.accept = false` on the router;
 - with its events and blobs in the named volume `wats-router_router-data`.
 
 ## 6. DNS at Gandi

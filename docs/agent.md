@@ -94,6 +94,8 @@ wats                         # from now on: the node with its agent
 | `wats mcp` | The stdio entry point MCP hosts run; it relays to the daemon of its data directory. |
 | `wats agent logs [-f] [--run ID]`, `runs`, `attach` | Watch what the agent does. |
 | `wats agent pending [show <id>]`, `approve [--edit] <id>`, `reject <id> [--reason]` | The review queue (`agent.review`). |
+| `wats status [--json]` | The node: running or not, networks, peers, storage, version, update notice and `halt` ([below](#guardian-halts)). |
+| `wats resume` | Clears a guardian halt on this node, after printing it ([below](#guardian-halts)). |
 
 Precedence: flags, then `WATS_*` variables, then `config.toml`, then
 defaults. Flags never write the configuration.
@@ -182,6 +184,32 @@ logged and shown by the MCP `status` tool; `wats upgrade` installs it, and
 with `update.auto` the node does, then asks for a restart
 ([release-signing.md](release-signing.md#releases-and-upgrades)). A node started in the background by
 `wats mcp` never runs the agent.
+
+## Guardian halts
+
+A last-resort switch stops the public network if it runs away (ADR 0016):
+a quorum of guardian keys compiled into the binary signs a halt, and every
+node that accepts it relays the halt, writes `<data dir>/halted.json`,
+stops its agent and MCP sessions and exits with status 0. A halt carries no
+code, deletes nothing and changes no setting. A node that also joins other
+networks only leaves `public` and keeps the others running. The guardian
+set is empty for now: halts are disabled until it ships.
+
+- **Started again**, a halted node syncs for up to 30 s (storing only) and
+  starts if a later unhalt lifted the halt; otherwise it logs the halt and
+  exits 0 again. `wats mcp` tells the MCP client that the node is halted.
+- **`wats resume`** clears the halt here, after printing it, and records it
+  in `<data dir>/halt-overrides.json`: this node does not halt again on that
+  halt. A new halt still applies.
+- **`status`** (MCP and `wats status`) shows `halt.accept`, the halt in
+  effect as `{id, reason, signed_by, since}`, and the marker when present.
+- **`halt.serve`** (`--halt-serve`, `WATS_HALT_SERVE`; default `false`, our
+  router sets it): on a halt the node stays up, stops its agent and MCP
+  sessions, accepts and serves only the three halt events, so that late
+  nodes still learn about the halt.
+- **Restart policies must not restart a clean exit**: `restart: on-failure`
+  in Docker Compose (the agent compose file uses it), `Restart=on-failure`
+  for systemd, `KeepAlive = {SuccessfulExit = false}` for launchd.
 
 ## What a run is
 
