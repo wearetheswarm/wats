@@ -459,8 +459,9 @@ pub fn check_version_output(binary: &Path, version: Version) -> Result<()> {
 // Where releases come from
 
 /// The release source: `WATS_UPDATE_URL`, else `update.url`, else GitHub.
-/// A token from `GH_TOKEN` or `GITHUB_TOKEN` is sent to api.github.com
-/// only (the repository may be private), never to a mirror.
+/// A token from `GH_TOKEN` or `GITHUB_TOKEN`, optional (it only raises
+/// GitHub's rate limits), is sent to api.github.com only, never to a
+/// mirror.
 #[derive(Debug, Clone)]
 pub struct Source {
     base: String,
@@ -521,8 +522,9 @@ impl Source {
             .map_err(|e| anyhow!("cannot reach {url}: {e}"))?;
         let status = response.status();
         if !status.is_success() {
-            let hint = if self.token.is_none() && Self::is_github(&self.base) {
-                " (the repository may be private: set GH_TOKEN or GITHUB_TOKEN)"
+            let rate_limited = matches!(status.as_u16(), 403 | 429);
+            let hint = if rate_limited && self.token.is_none() && Self::is_github(&self.base) {
+                " (GitHub's rate limit? set GH_TOKEN or GITHUB_TOKEN to raise it)"
             } else {
                 ""
             };

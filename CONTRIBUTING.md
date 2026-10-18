@@ -67,7 +67,7 @@ Tests and manual experiments must be hermetic:
 - **Commands that register MCP servers** (`wats setup …`, `wats --agent …`) should run with a throwaway `HOME`, so that your own Claude Code or Codex configuration is left alone.
 - **Runs with real models cost money:** keep them few, short and hermetic.
 
-CI runs the same checks on Linux for every pull request and every push to `main`, plus a DCO check on pull requests. While the repository is private, the Actions budget is tight: macOS runs only weekly and on manual dispatch, and new jobs or operating systems are not added without discussion. Pull requests are merged (rebase) only once CI is green.
+CI runs the same checks on Linux and macOS for every pull request and every push to `main`, plus a DCO check on pull requests. The required checks on `main` are `ci` (which aggregates the per-OS checks) and `dco`. Pull requests are squash-merged only once CI is green.
 
 ## Code of Conduct
 
