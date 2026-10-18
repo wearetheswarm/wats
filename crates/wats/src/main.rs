@@ -1787,8 +1787,22 @@ async fn status_command(config: &NodeConfig, json: bool) -> Result<()> {
         if let (Some(connectivity), Some(map)) = (connectivity, status.as_object_mut()) {
             map.insert("connectivity".into(), connectivity.into());
         }
+        // One line per unanswered ask of this profile (ADR 0018 §4).
+        let unanswered = status
+            .as_object_mut()
+            .and_then(|map| map.remove("unanswered"));
         for line in status_lines("", &status) {
             println!("{line}");
+        }
+        for ask in unanswered
+            .as_ref()
+            .and_then(|u| u.as_array())
+            .into_iter()
+            .flatten()
+        {
+            if let Some(notice) = ask["notice"].as_str() {
+                println!("unanswered: {notice}");
+            }
         }
     }
     Ok(())
@@ -2001,6 +2015,10 @@ impl NodeArgs {
         if let Some(ttl) = &file.agent.review_ttl {
             config.review_ttl = parse_duration(ttl)
                 .map_err(|e| anyhow::anyhow!("config.toml agent.review_ttl: {e}"))?;
+        }
+        if let Some(after) = &file.ask.unanswered_after {
+            config.unanswered_after = wats::settings::parse_retention(after)
+                .map_err(|e| anyhow::anyhow!("config.toml ask.unanswered_after: {e}"))?;
         }
         if let Some(after) = &file.health.no_peers_after {
             config.no_peers_after = wats::settings::parse_retention(after)
