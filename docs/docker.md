@@ -18,7 +18,7 @@ echo "$GH_TOKEN" | docker login ghcr.io -u <github user> --password-stdin
 docker run -d --name wats --restart on-failure \
   -v wats-data:/data \
   -p 7842:7842/udp \
-  ghcr.io/wearetheswarm/wats:0.2.0
+  ghcr.io/wearetheswarm/wats:0.3.0
 ```
 
 - The image runs `wats node --quiet` by default. Any argument after the
@@ -48,7 +48,7 @@ docker run -d --name wats --restart on-failure \
 
   The file must be readable by uid 65532 and by nobody else (mode 0400).
   Print the node's ids with `docker run --rm -v wats-data:/data
-  ghcr.io/wearetheswarm/wats:0.2.0 id`.
+  ghcr.io/wearetheswarm/wats:0.3.0 id`.
 - The container runs read-only with no capabilities in the provided
   compose files (`read_only: true`, `cap_drop: [ALL]`,
   `no-new-privileges`); only `/data` and `/tmp` are writable.
@@ -88,7 +88,7 @@ Use **`restart: on-failure`** (or `--restart on-failure`), not `always` or
   volume, then start the container:
 
   ```sh
-  docker run --rm -v wats-data:/data ghcr.io/wearetheswarm/wats:0.2.0 resume
+  docker run --rm -v wats-data:/data ghcr.io/wearetheswarm/wats:0.3.0 resume
   docker start wats
   ```
 

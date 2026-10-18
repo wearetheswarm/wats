@@ -1,6 +1,32 @@
 # Changelog
 
-## Unreleased
+## 0.3.0 (unreleased)
+
+### Upgrading from 0.2.0
+
+- `wats upgrade` installs it: 0.2.0 verifies the release's minisign
+  signatures with the key it carries. Restart the node afterwards.
+- No store change: events are kept.
+- Docker: the agent compose now restarts on failure only (a halted node
+  exits cleanly and must stay stopped). Recreate the container to pick it up.
+
+### Keys in this release
+
+Both are public keys, compiled into the binary; their secrets are kept
+offline by the maintainers.
+
+- **Guardian set** (network halt, ADR 0016): 1 of 1, approval window 24 h.
+  Founder, Vincent Carluer:
+  `3f1675fefba2606f3b5187597e9e9087c708cf4c98c5709b3523186a114370bb`.
+  **Halts are enabled from this release** ([docs/network-halt.md](docs/network-halt.md)).
+- **Maintainers' inbox** (crash reports, ADR 0015 §5): id
+  `inbox:6579c82d9bda63d4eea8adeeff05e383`
+  ([docs/release-signing.md](docs/release-signing.md#inbox-key)).
+
+### Changes
+
+- **`wats status`** (`--json`): the node's state for humans, as the MCP
+  `status` tool returns it, now with the networks; it never starts a node.
 
 - **Keys in the binary.**
   - Maintainers' inbox, the default destination of crash reports:
