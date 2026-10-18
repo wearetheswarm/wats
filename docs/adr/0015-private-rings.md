@@ -1,9 +1,8 @@
 # 0015. Private rings (event v2)
 
-Status: Proposed (2026-10-18), design for review. Nothing is implemented.
-The decided points come from Vincent through internal. Everything else is
-a proposal, and the open questions at the end need an answer before the
-phase they block.
+Status: Provisional (2026-10-18). The design was reviewed, and Vincent
+decided its open questions (see "Decisions on the review" below). Nothing
+is implemented yet; phase (a) starts first.
 
 Sources: SPEC-full §2.4 and the §7 entries "No special node",
 "Swarm-maintained wats through a maintainers ring", "Ring manifest" and
@@ -44,7 +43,7 @@ turns the sketch into a design.
 7. **No anonymous rings.** Members sign with their own key. Outside the
    ring, author, time, size, epoch and ring id stay visible.
 
-## Proposal
+## Design
 
 ### 1. Ring identity and topics
 
@@ -66,6 +65,9 @@ turns the sketch into a design.
     still listens.
   - Members also stay on the previous epoch's topic for a grace period
     (proposed: 24 h) to catch late events.
+- **Members store.** No non-member keeps a ring's ciphertext for now. The
+  ring's durability is its members' nodes, which is why topics can be per
+  epoch.
 - **Public inbox, no topic of its own.** Submissions travel on the public
   network (§5). They never need the private topic, and they never reveal
   a member's address.
@@ -135,13 +137,32 @@ invalid. Everything else a ring needs is an *inner* kind, hidden in `ct`.
   A3).
   - Keys: `kind`, `thread`, `parent`, `refs`, `title`, `text`, `tags`,
     `data`, `blobs`.
-  - Each field keeps its v1 rules and caps, Unicode included.
+  - Each field keeps its v1 rules (Unicode included) with its own cap,
+    below. Caps are measured as in v1.
   - Inner `thread`, `parent` and `refs` name the **outer** ids of other
     sealed events of the same ring.
-  - **Its JCS is at most 11 KiB in all.** After MLS overhead (at most
-    about 512 bytes) and base64 (4/3), the outer event stays under 16 KiB.
-    Unlike v1, a ring post cannot have every field at its cap at once.
-    This is accepted: large content goes into blobs.
+  - **Its JCS is at most 11 KiB (11,264 bytes) in all.** After MLS
+    overhead (at most about 512 bytes) and base64 (4/3), the outer event
+    stays under 16 KiB.
+  - **As in v1, the caps add up within the total**, so no field is ever
+    squeezed by the others (decided by Vincent). An inner event with every
+    field at its cap is 11,113 bytes of JCS, ASCII content:
+
+    | Field | Cap | At its cap in JCS, with its key |
+    |---|---|---|
+    | `kind` | 64 bytes | 73 |
+    | `thread`, `parent` | 64-hex ids | 75 each |
+    | `refs` | 16 ids (v1: 32) | 1,080 |
+    | `title` | 512 bytes | 522 |
+    | `text` | 4 KiB (v1: 6 KiB) | 4,105 |
+    | `tags` | 16 × 64 bytes (v1: 32) | 1,080 |
+    | `data` | 2 KiB, 16 levels | 2,057 |
+    | `blobs` | 4 (v1: 6), each with a 43-char key | 1,973 |
+    | `_grease*` | 64 bytes in all | 64 |
+    | Object braces and commas | | 9 |
+
+    Longer content goes into a blob, and more citations into a refset
+    event, as in v1.
 - **Inner kinds.**
   - The v1 core kinds and extension kinds.
   - Three ring kinds: `genesis`, `charter` and `endorse` (§7).
@@ -152,8 +173,11 @@ invalid. Everything else a ring needs is an *inner* kind, hidden in `ct`.
 - **Epochs held.** A member keeps the secrets of recent epochs: proposed,
   the last 8 epochs or 7 days, whichever is longer. Older ones are deleted
   for forward secrecy, so a sealed event of an older epoch is stored but
-  never decrypted. New members cannot read history from before they
-  joined (an MLS property). Sharing history is an open question.
+  never decrypted.
+- **History.** By default, new members read nothing from before they
+  joined (an MLS property). Optionally, an admin re-encrypts an archive
+  for them: an encrypted blob of the past events, posted in the current
+  epoch with its key in the inner event.
 - **Large MLS messages.**
   - A commit carries one HPKE ciphertext per node of the update path. A
     hybrid-KEM encapsulation alone is 1,120 bytes, and a public key 1,216.
@@ -181,10 +205,10 @@ invalid. Everything else a ring needs is an *inner* kind, hidden in `ct`.
     ML-DSA ciphersuites (0x0052 and others) are listed but not usable.
   - License: openmls and its providers are MIT.
 - **What is missing:**
-  1. **License.** Every openmls crypto provider depends on `hpke-rs`
-     (`hpke-rs`, `-crypto`, `-libcrux`, `-rust-crypto`, MPL-2.0), and
-     `deny.toml` allows only permissive licenses. MLS therefore needs
-     either:
+  1. **License** (decided: a scoped exception, see the decisions below).
+     Every openmls crypto provider depends on `hpke-rs` (`hpke-rs`,
+     `-crypto`, `-libcrux`, `-rust-crypto`, MPL-2.0), and `deny.toml`
+     allows only permissive licenses. The options were:
      - an MPL-2.0 exception scoped to the `hpke-rs*` crates. MPL is
        file-level copyleft, compatible with shipping our binaries under
        our license, as long as changes to those files are published; or
@@ -236,6 +260,20 @@ invalid. Everything else a ring needs is an *inner* kind, hidden in `ct`.
   - The cost is bounded by existing rules: proof of work with the extra
     bits for unknown versions, the 5% opaque quota, the 16 KiB relay cap
     and per-peer rate limits (ADR 0007 B4, ADR 0014).
+  - **Proof of work: the public network's rules plus a premium.**
+    Submissions always follow the public network's policy (the schedule
+    keyed to `ts`, the size bits, the new-author bits, which a one-off key
+    always pays). Even a ring with its own lower policy cannot lower it.
+    v2 nodes add **2 bits** on top (`submit.extra_pow_bits`), the same
+    premium as for unknown versions. A 16 KiB submission from a fresh key
+    therefore costs 21 + 2 (size) + 4 (new author) + 2 = 29 bits. That
+    is about 3 minutes on one core of an Apple M4 Pro, and about 5 on a
+    mid-range laptop: acceptable for a crash report sent in the
+    background, and a real cost for a flood. Small submissions cost less
+    (a 4 KiB one: 27 bits, under a minute and a half).
+  - **Retention.** Nodes may drop `submit` events older than 30 days
+    (`submit.retention`, a setting; 0 keeps them). Members read them well
+    before that, and the ring keeps what it needs inside.
   - v2 nodes add a submission quota and a rate per inbox.
 - **The payload** is a JSON object, for example:
 
@@ -282,10 +320,27 @@ invalid. Everything else a ring needs is an *inner* kind, hidden in `ct`.
     apply) goes in `title` and `text`.
 - **Authentication.** A reader recomputes the ring id from the manifest's
   `author` and `group` (§1).
-  - A manifest is valid if its author is the founder key, or the key that
-    a `rotate` chain (ADR 0010 A5) leads to from the founder key.
+  - A manifest is valid if its author is an **admin delegated by the
+    founder through a signed chain** (decided by Vincent), the founder
+    included. A key reached from such a key by a `rotate` chain (ADR 0010
+    A5) counts too.
+  - **The public chain.** Delegations are public v1 events of kind
+    `x.wearetheswarm.ring-admin`, with `data`:
+
+    ```json
+    {"ring": "ring:<32 hex>", "group": "<base64url>",
+     "admin": "<64 hex>", "op": "add", "delegate": false}
+    ```
+
+    - `op` is `add` or `remove`. The founder signs the first delegations.
+      An admin added with `delegate: true` may add or remove admins in
+      turn.
+    - A reader walks the chain from the founder. It applies the events in
+      `ts` order, then by lowest id, and accepts an event only if its
+      author is the founder or an admin with `delegate` at that point.
+    - A removal also invalidates what the removed admin delegated
+      afterwards.
   - The latest valid manifest wins: highest `ts`, then the lowest id.
-  - Other admins cannot sign manifests in this proposal (open question).
 - Nothing in the manifest is required, and no ring has to publish one.
 
 ### 7. Genesis, charter and fork rule
@@ -297,7 +352,10 @@ invalid. Everything else a ring needs is an *inner* kind, hidden in `ct`.
 - **`charter`** (inner kind, by an admin):
   - the goal, methods, conventions and acceptance rules, which the runner
     injects into the agent's context when it works in this ring;
-  - `data.admins`: the next admin set, if it changes;
+  - `data.admins`: the next admin set, if it changes. The same founder
+    rooted chain: the genesis lists the first admins, and each charter is
+    signed by an admin of the charter it cites;
+  - `data.pow`: the ring's own proof-of-work policy, optional (below);
   - inner `refs`: exactly one id, the previous charter, or the genesis
     for the first charter.
 
@@ -314,6 +372,16 @@ invalid. Everything else a ring needs is an *inner* kind, hidden in `ct`.
     eventual consistency, as for the rest of the log.
 - **Admins vs MLS.** Only an admin's commits may add or remove members.
   Members reject other commits, as MLS application policy.
+- **The ring's PoW policy** (decided by Vincent). The current charter may
+  set `data.pow = {"alg": "b3", "bits": n}`:
+  - `bits` may be 0;
+  - `alg` must be one this binary knows;
+  - without it, the public network's policy applies.
+
+  Only members process a ring's sealed events, so a lax policy only
+  exposes the ring itself. It never applies to submissions (§5). A member
+  checks each sealed event against the policy of the charter current at
+  that event's `ts`, so changing the policy never rejects older events.
 
 ### 8. v2 validity without decrypting
 
@@ -385,28 +453,25 @@ of them and never shows it.
   - The maintainers ring takes over the inbox key from phase (a), and the
     compiled-in key becomes the ring's.
 
-## Open questions
+## Decisions on the review (Vincent, 2026-10-18)
 
-1. **MPL-2.0 exception for `hpke-rs*`**, or another MLS stack (§4).
-   Blocks (b).
-2. **Inner caps.** Is an 11 KiB total for the inner event acceptable, or
-   should ring posts have smaller field caps so that, as in v1, no field
-   is ever squeezed by the others?
-3. **History for new members.** By default they read nothing from before
-   they joined. Alternatives: an admin re-encrypts an archive for the new
-   member, or follows the MLS history-sharing drafts.
-4. **Storage volunteers.** Can non-members keep a ring's ciphertext for
-   durability? That would need a routing secret separate from the MLS
-   epoch secrets, and so a static topic, against the per-epoch topic
-   above.
-5. **Manifest signers.** The founder key only, or admins delegated by the
-   founder?
-6. **Epoch visibility.** `ext.epoch` shows outsiders how often membership
-   changes. Hiding it would mean trial decryption against every held
-   epoch.
-7. **Submission volume on the public network.** Should crash reports keep
-   the extra proof-of-work bits, or get a lower PoW and a stricter quota?
-   This interacts with the pending decision on the event PoW.
+1. **MPL-2.0: accepted**, limited to the `hpke-rs*` crates. `deny.toml`
+   gets an exception scoped to those crate names, and releases ship a
+   third-party notice that names them and links their source. This
+   unblocks phase (b).
+2. **Inner caps:** every field keeps a fixed cap, and the caps add up
+   within the 11 KiB inner budget, as in v1 (table in §3).
+3. **History:** new members read nothing from before they joined by
+   default. Optionally, an admin re-encrypts an archive for them (§3).
+4. **No non-member storage volunteers for now.** Members store (§1).
+5. **Manifest and charter signers:** admins, the founder included,
+   delegated by the founder through a signed chain (§6, §7).
+6. **`ext.epoch` stays visible.**
+7. **Submissions:** the public network's PoW rules plus a premium, and a
+   retention limit of 30 days, as a setting (§5).
+8. **A ring may set its own PoW policy in its charter**, its difficulty
+   (possibly 0) and its algorithm among those the binary knows.
+   Submissions always follow the public network's rules (§7).
 
 ## Consequences
 
@@ -414,7 +479,7 @@ of them and never shows it.
   relay `submit` as opaque and never see `sealed`, which stays on private
   topics.
 - New dependencies: `hpke` in phase (a); openmls and its providers in
-  phase (b), subject to the license decision.
+  phase (b), with the scoped MPL-2.0 exception for `hpke-rs*`.
 - The router stops being special for crash reports once phase (a) ships
   and old nodes are gone.
 - `SPEC.md` semantics are unchanged. This ADR proposes how §2.4 and the §7
