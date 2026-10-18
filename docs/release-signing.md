@@ -46,6 +46,49 @@ script that pins it), verify the checksum file's own signature first:
 minisign -Vm wats-X.Y.Z-<target>.tar.gz.sha256 -P RWRq1jSm2cLFXa7MknbYgKFMYbgbyNEF5fkIpkEGGZzkQZ3i5rIYabci
 ```
 
+## Releases and upgrades
+
+`wats upgrade` does the checks above by itself: it looks up the latest
+release (or `--version X.Y.Z`), downloads the archive of its platform with
+the `.sha256` and both `.minisig`, and refuses to install unless both
+signatures verify with the public key compiled into the binary (the one
+above), each trusted comment names the expected file
+(`file:wats-X.Y.Z-<target>.tar.gz`, `….sha256`), and the SHA-256 matches.
+It then writes the new binary next to the current one, checks that it runs
+(`--version`), renames it over the current one, and keeps the previous one
+as `<binary>.old` (`wats upgrade --rollback` puts it back). A running node
+keeps the old version until it is restarted; `wats upgrade` says so.
+`wats upgrade --check` only reports.
+
+Releases are looked up through the GitHub API
+(`https://api.github.com/repos/wearetheswarm/wats`). While the repository is
+private, set `GH_TOKEN` or `GITHUB_TOKEN`; the token is only sent to
+api.github.com. `update.url` (or `WATS_UPDATE_URL`) points to a mirror
+serving the same JSON (`/releases/latest`, `/releases/tags/vX.Y.Z`, assets
+with a `browser_download_url`). Drafts and prereleases are never offered.
+
+The node checks the latest release at most once a day (`update.check`,
+default on; never with `--hermetic` or `--loopback`), caches the answer in
+`<data dir>/update.json`, logs a newer version once, and reports it in the
+MCP `status` tool (`update: {current, latest, available, security,
+checked_at}`) so that agents can tell their user. With `update.auto = true`
+(off by default) the node installs a release by itself, with the same
+checks, once it is `update.delay` old (7 days after its `published_at`), and
+logs that a restart is needed: it never restarts itself, the daemon picks
+the new binary up at its next start.
+
+**Marking a security release.** A release is a security release when its
+name or notes contain `[security]` (any case), or when a line of its notes
+starts with `Security:`, for example:
+
+```text
+Security: fixes a crash on a malformed sync page (GHSA-…).
+```
+
+The node then flags the update as `security` in its log and in `status`.
+Security releases wait `update.delay` too, unless the user set
+`update.security_delay` (no default) to install them sooner.
+
 ## How releases are signed
 
 The `release` workflow (`.github/workflows/release.yml`) builds each

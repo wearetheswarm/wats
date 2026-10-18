@@ -297,6 +297,21 @@ enum Command {
         #[command(subcommand)]
         action: AgentAction,
     },
+    /// Upgrade this binary to the latest release: downloads the archive of
+    /// this platform, checks its minisign signature (key compiled in) and
+    /// SHA-256, then replaces the binary, keeping the previous one as
+    /// `<binary>.old`. A running node keeps the old version until restarted.
+    Upgrade {
+        /// Only say whether a newer release exists.
+        #[arg(long, conflicts_with = "rollback")]
+        check: bool,
+        /// Install this release (X.Y.Z) instead of the latest.
+        #[arg(long, value_name = "X.Y.Z", conflicts_with = "rollback")]
+        version: Option<String>,
+        /// Put `<binary>.old` back.
+        #[arg(long)]
+        rollback: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -1065,6 +1080,12 @@ impl NodeArgs {
         config.review_notify = file.agent.notify.unwrap_or(false);
         config.report_accept = self.report_accept || file.report.accept.unwrap_or(false);
         config.limits = file.limits.limits();
+        config.update = file.update.policy()?;
+        // Hermetic and loopback nodes never look for releases.
+        if self.hermetic || self.loopback {
+            config.update.check = false;
+            config.update.auto = false;
+        }
         config.report_auto = file.report.crashes.unwrap_or(false);
         config.report_collector = match &file.report.collector {
             Some(id) => Some(
@@ -1985,6 +2006,29 @@ async fn main() -> Result<()> {
     // Commands that work even when config.toml does not load.
     match cli.command {
         Some(Command::Config { action }) => return config_command(&data_dir, action),
+        // Works with a broken config.toml: a newer version may fix it.
+        Some(Command::Upgrade {
+            check,
+            version,
+            rollback,
+        }) => {
+            let url = match Settings::load(&data_dir) {
+                Ok(settings) => settings.update.url,
+                Err(e) => {
+                    tracing::warn!("{e:#}; using the default release source");
+                    None
+                }
+            };
+            return wats::update::upgrade_command(wats::update::UpgradeOptions {
+                check,
+                version,
+                rollback,
+                hermetic: cli.node.hermetic,
+                url,
+                data_dir,
+            })
+            .await;
+        }
         // `logs -f` and `attach` follow forever: Ctrl-C (whose handler is
         // installed above) must end them.
         Some(Command::Report { action }) => {
@@ -2068,6 +2112,7 @@ async fn main() -> Result<()> {
         Some(Command::Id { host }) => return print_id(&config, &host),
         Some(
             Command::Config { .. }
+            | Command::Upgrade { .. }
             | Command::Agent { .. }
             | Command::Setup { .. }
             | Command::Report { .. },

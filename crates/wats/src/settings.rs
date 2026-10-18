@@ -48,6 +48,43 @@ pub struct Settings {
     pub limits: LimitsSettings,
     #[serde(default)]
     pub agent: AgentSettings,
+    #[serde(default)]
+    pub update: UpdateSettings,
+}
+
+/// `[update]`: the daily release check and opt-in auto-upgrade
+/// (`crate::update`).
+#[derive(Debug, Default, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UpdateSettings {
+    pub check: Option<bool>,
+    pub auto: Option<bool>,
+    pub delay: Option<String>,
+    pub security_delay: Option<String>,
+    pub url: Option<String>,
+}
+
+impl UpdateSettings {
+    /// The configured policy over the defaults (check on, auto off, 7 days).
+    pub fn policy(&self) -> Result<crate::update::UpdatePolicy> {
+        let duration = |value: &Option<String>, what: &str| -> Result<Option<Duration>> {
+            value
+                .as_deref()
+                .map(parse_duration)
+                .transpose()
+                .map_err(|e| anyhow::anyhow!("config.toml update.{what}: {e}"))
+        };
+        Ok(crate::update::UpdatePolicy {
+            check: self.check.unwrap_or(true),
+            auto: self.auto.unwrap_or(false),
+            delay: match duration(&self.delay, "delay")? {
+                Some(d) => d,
+                None => parse_duration(crate::update::DEFAULT_DELAY).map_err(anyhow::Error::msg)?,
+            },
+            security_delay: duration(&self.security_delay, "security_delay")?,
+            url: self.url.clone().filter(|u| !u.trim().is_empty()),
+        })
+    }
 }
 
 #[derive(Debug, Default, Clone, Deserialize)]
@@ -176,6 +213,10 @@ impl Settings {
         if let Some(dir) = &settings.agent.workdir {
             settings.agent.workdir = Some(data_dir.join(dir));
         }
+        settings
+            .update
+            .policy()
+            .with_context(|| format!("{}: [update]", path.display()))?;
         if let Some(file) = &settings.agent.heartbeat_file {
             settings.agent.heartbeat_file = Some(data_dir.join(file));
         }
@@ -323,6 +364,36 @@ pub const KEYS: &[Key] = &[
         ValueType::Integer,
         "24",
         "highest effort of a load challenge, reached one bit per 10 s of overload",
+    ),
+    key(
+        "update.check",
+        ValueType::Bool,
+        "true",
+        "look for a newer wats release once a day; logged and shown by the MCP status tool",
+    ),
+    key(
+        "update.auto",
+        ValueType::Bool,
+        "false",
+        "install a newer release by itself (signature checked) once it is update.delay old; restart to use it",
+    ),
+    key(
+        "update.delay",
+        ValueType::Duration,
+        "7d",
+        "how old a release must be before update.auto installs it",
+    ),
+    key(
+        "update.security_delay",
+        ValueType::Duration,
+        "update.delay",
+        "the same for a release marked security; unset: update.delay",
+    ),
+    key(
+        "update.url",
+        ValueType::Text,
+        "GitHub",
+        "release API to use instead of GitHub's, e.g. a mirror (WATS_UPDATE_URL overrides it)",
     ),
     key(
         "report.crashes",
@@ -697,20 +768,21 @@ impl ConfigFile {
     }
 }
 
-/// Parse a duration: a number with an optional unit s, m or h (e.g. 30s,
-/// 5m, 2h; a bare number is seconds).
+/// Parse a duration: a number with an optional unit s, m, h or d (e.g.
+/// 30s, 5m, 2h, 7d; a bare number is seconds).
 pub fn parse_duration(s: &str) -> Result<Duration, String> {
     let s = s.trim();
     let split = s.find(|c: char| !c.is_ascii_digit()).unwrap_or(s.len());
     let (number, unit) = s.split_at(split);
     let n: u64 = number
         .parse()
-        .map_err(|_| format!("invalid duration {s:?}: expected e.g. 30s, 5m or 2h"))?;
+        .map_err(|_| format!("invalid duration {s:?}: expected e.g. 30s, 5m, 2h or 7d"))?;
     let secs = match unit {
         "" | "s" => n,
         "m" => n * 60,
         "h" => n * 3600,
-        _ => return Err(format!("invalid duration unit in {s:?}: use s, m or h")),
+        "d" => n * 86400,
+        _ => return Err(format!("invalid duration unit in {s:?}: use s, m, h or d")),
     };
     if secs == 0 {
         return Err("duration must be positive".into());
@@ -772,6 +844,29 @@ mod tests {
     }
 
     #[test]
+    fn update_policy() {
+        let p = UpdateSettings::default().policy().unwrap();
+        assert!(p.check && !p.auto);
+        assert_eq!(p.delay, Duration::from_secs(7 * 86400));
+        assert_eq!(p.security_delay, None);
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(FILE_NAME),
+            "[update]\nauto = true\ndelay = \"3d\"\nsecurity_delay = \"12h\"\n",
+        )
+        .unwrap();
+        let p = Settings::load(dir.path()).unwrap().update.policy().unwrap();
+        assert!(p.check && p.auto);
+        assert_eq!(p.delay, Duration::from_secs(3 * 86400));
+        assert_eq!(p.security_delay, Some(Duration::from_secs(12 * 3600)));
+        std::fs::write(dir.path().join(FILE_NAME), "[update]\ndelay = \"soon\"\n").unwrap();
+        assert!(Settings::load(dir.path()).is_err());
+        let mut file = ConfigFile::open(dir.path()).unwrap();
+        file.set("update.security_delay", "1d").unwrap();
+        assert!(file.set("update.delay", "1w").is_err());
+    }
+
+    #[test]
     fn edits_keep_comments_and_check_values() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(
@@ -825,11 +920,12 @@ mod tests {
     #[test]
     fn durations_and_sizes() {
         assert_eq!(parse_duration("30s"), Ok(Duration::from_secs(30)));
+        assert_eq!(parse_duration("7d"), Ok(Duration::from_secs(7 * 86400)));
         assert_eq!(parse_duration("5m"), Ok(Duration::from_secs(300)));
         assert_eq!(parse_duration("2h"), Ok(Duration::from_secs(7200)));
         assert_eq!(parse_duration("7"), Ok(Duration::from_secs(7)));
         assert!(parse_duration("0s").is_err());
-        assert!(parse_duration("1d").is_err());
+        assert!(parse_duration("1w").is_err());
         assert_eq!(parse_size("1024"), Ok(1024));
         assert_eq!(parse_size("512M"), Ok(512 << 20));
         assert_eq!(parse_size("20GiB"), Ok(20 << 30));
