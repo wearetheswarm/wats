@@ -52,8 +52,9 @@ for v2 events only; see "v2 rules" below):
 2. **Invariant core**, for every version (ADR 0007 and ADR 0010):
    - event depth at most 20;
    - `v` from 1 to 65,535;
-   - `author` and `sig` as lowercase hex of any even length (up to 8 KiB
-     and 64 KiB);
+   - `author` and `sig` as non-empty strings over `[A-Za-z0-9_-]` (up to
+     8,192 and 65,536 chars); each version's rules then require its own
+     encoding (v1, v2: lowercase hex of a fixed length);
    - `ts` an integer;
    - `thread` and `parent` both null or both 64-hex ids;
    - `net` and the `kind` token grammars;

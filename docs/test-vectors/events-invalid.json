@@ -206,9 +206,15 @@
     },
     {
       "expect": "reject",
+      "json": "{\"author\":\"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\",\"blobs\":[],\"data\":{},\"id\":\"30f5bda8d4a1cedc5e41fb4c1499701f85c89c823910842f2c23bc14a52fd021\",\"kind\":\"note\",\"net\":\"public\",\"parent\":null,\"pow\":\"b3:0\",\"refs\":[],\"sig\":\"cf21fe43dbba50b6b109b9932f95a64db245821bf2a508c2dce7f4c4f229bab5931b417565e0a483d8d047375508ac12c3e473618cbf3b6a046f34aaf74f9a04\",\"tags\":[],\"text\":\"base event\",\"thread\":null,\"title\":\"test post\",\"ts\":1760500000,\"v\":1}",
+      "name": "v1-author-not-hex",
+      "rule": "v1: author is 64 lowercase hex chars (the core allows base64url for later versions)"
+    },
+    {
+      "expect": "reject",
       "json": "{\"author\":\"8A88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c\",\"blobs\":[],\"data\":{},\"id\":\"6fb4c0692aa3960a00eebca1fb8010accb1aaffa42494804fb256d6512baab6d\",\"kind\":\"note\",\"net\":\"public\",\"parent\":null,\"pow\":\"b3:0\",\"refs\":[],\"sig\":\"c7f27e38ef5a892516ce1f8128ca7c84e86846fee1c7aeb2ee1072a12b144c66eb809009cbf2de0ed2f11e3538328838a32d9f808aeaae13e76afad6fcb8f103\",\"tags\":[],\"text\":\"base event\",\"thread\":null,\"title\":\"test post\",\"ts\":1760500000,\"v\":1}",
       "name": "uppercase-hex",
-      "rule": "core: hex is lowercase"
+      "rule": "v1: author is lowercase hex (here two uppercase chars, which also breaks the id)"
     },
     {
       "expect": "reject",

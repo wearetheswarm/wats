@@ -10,7 +10,8 @@ bis "Protocol evolution".
 - Input is parsed under a strict JSON profile.
 - `refs` is a core header key.
 - The kind token is `[a-z0-9._-]{1,64}`.
-- `author` and `sig` are hex of any length.
+- `author` and `sig` are hex of any length (widened to the base64url
+  alphabet, ADR 0010 A4 addendum).
 - **The signature is not checked for versions whose suite the node does not know**: one suite per version.
 - `_grease*` names are reserved.
 
