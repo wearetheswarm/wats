@@ -111,6 +111,51 @@ fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     file.write_all(bytes)
 }
 
+/// Largest secret file (or standard input) [`read_secret`] reads.
+const MAX_SECRET_BYTES: u64 = 64 * 1024;
+
+/// A secret read by [`read_secret`]: its text, overwritten with zeros when
+/// dropped (best effort: copies made while parsing are not tracked).
+pub struct SecretText(Vec<u8>);
+
+impl SecretText {
+    /// The secret without surrounding whitespace (the trailing newline).
+    pub fn as_str(&self) -> anyhow::Result<&str> {
+        Ok(std::str::from_utf8(&self.0)
+            .map_err(|_| anyhow::anyhow!("a secret is text (hex)"))?
+            .trim())
+    }
+}
+
+impl Drop for SecretText {
+    fn drop(&mut self) {
+        self.0.iter_mut().for_each(|b| *b = 0);
+        std::hint::black_box(&self.0);
+    }
+}
+
+/// Read a secret key from `path`, or from standard input when `path` is
+/// `-`, so that a key kept encrypted never touches the disk in clear:
+/// `age -d guardian.key.age | wats guardian halt --key - …`.
+pub fn read_secret(path: &Path, what: &str) -> anyhow::Result<SecretText> {
+    use anyhow::Context;
+    use std::io::Read;
+    let mut bytes = Vec::new();
+    if path == Path::new("-") {
+        std::io::stdin()
+            .take(MAX_SECRET_BYTES)
+            .read_to_end(&mut bytes)
+            .with_context(|| format!("read the {what} from standard input"))?;
+    } else {
+        std::fs::File::open(path)
+            .and_then(|f| f.take(MAX_SECRET_BYTES).read_to_end(&mut bytes))
+            .with_context(|| format!("read the {what} {}", path.display()))?;
+    }
+    let secret = SecretText(bytes);
+    anyhow::ensure!(!secret.as_str()?.is_empty(), "the {what} is empty");
+    Ok(secret)
+}
+
 /// Lowercase hex public key of an author key, as used in `Event::author`.
 pub fn author_id(key: &SigningKey) -> String {
     hex::encode(key.verifying_key().as_bytes())

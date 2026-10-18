@@ -186,6 +186,17 @@ struct NodeArgs {
         value_parser = clap::builder::BoolishValueParser::new()
     )]
     report_accept: bool,
+    /// On a guardian halt of the public network, keep serving halt events
+    /// instead of stopping (halt.serve; our router). Accepts true/false,
+    /// 1/0, yes/no, on/off from the environment.
+    #[arg(
+        long,
+        global = true,
+        env = "WATS_HALT_SERVE",
+        action = clap::ArgAction::SetTrue,
+        value_parser = clap::builder::BoolishValueParser::new()
+    )]
+    halt_serve: bool,
     /// Relay and address-lookup services: wats+n0 (the default:
     /// WeAreTheSwarm's own first, Iroh's public ones operated by n0 as
     /// fallback), wats (ours only), n0 (n0's only) or none.
@@ -311,6 +322,17 @@ enum Command {
         #[command(subcommand)]
         action: InboxAction,
     },
+    /// Guardian halts of the public network (ADR 0016): keys, and the
+    /// signed halt, approve and unhalt events. For WeAreTheSwarm's
+    /// guardians; a key outside the compiled set has no effect.
+    Guardian {
+        #[command(subcommand)]
+        action: GuardianAction,
+    },
+    /// Clear this node's guardian halt locally (`<data dir>/halted.json`),
+    /// after printing it, and record it in `halt-overrides.json` so that
+    /// this node does not halt again on it. A new halt still applies.
+    Resume,
     /// Watch what the agent runner does: transcripts of its runs.
     Agent {
         #[command(subcommand)]
@@ -348,6 +370,63 @@ enum ReportAction {
 }
 
 #[derive(Debug, Subcommand)]
+enum GuardianAction {
+    /// Draw a guardian key: its seed goes to a new file (mode 0600, never
+    /// overwritten), the public key is printed. Encrypt the file right
+    /// away (age, sops) and delete the clear copy.
+    Keygen {
+        /// Where to write the seed [default: <data dir>/guardian.key].
+        #[arg(long)]
+        out: Option<PathBuf>,
+    },
+    /// Sign, mine and publish a halt of the public network.
+    Halt {
+        #[command(flatten)]
+        key: GuardianKey,
+        /// Why, in 1-512 bytes: every node logs it.
+        #[arg(long)]
+        reason: String,
+    },
+    /// Sign, mine and publish an approval of a halt or an unhalt.
+    Approve {
+        #[command(flatten)]
+        key: GuardianKey,
+        /// The id of the halt or unhalt approved.
+        id: String,
+    },
+    /// Sign, mine and publish an unhalt, lifting a halt and every older one.
+    Unhalt {
+        #[command(flatten)]
+        key: GuardianKey,
+        /// The id of the halt lifted.
+        halt: String,
+        /// Why, in 1-512 bytes.
+        #[arg(long)]
+        reason: String,
+    },
+    /// Publish a signed guardian event (from `--offline`), through the
+    /// running node or a short-lived one.
+    Publish {
+        /// The event JSON file, or `-` for standard input.
+        file: PathBuf,
+    },
+}
+
+/// The key of a guardian command.
+#[derive(Debug, Args)]
+struct GuardianKey {
+    /// The guardian key file, or `-` to read it from standard input, so
+    /// that it never touches the disk in clear:
+    /// `age -d guardian.key.age | wats guardian halt --key - …`.
+    #[arg(long)]
+    key: PathBuf,
+    /// Print the signed event as JSON instead of publishing it (publish it
+    /// later from any machine with `wats guardian publish`).
+    #[arg(long)]
+    offline: bool,
+}
+
+#[derive(Debug, Subcommand)]
 enum InboxAction {
     /// Generate an inbox key pair: the secret goes to a new file (mode
     /// 0600, never overwritten; back it up in sops), the public key and
@@ -361,7 +440,8 @@ enum InboxAction {
     /// write each complete crash report to `<out>/<report id>.json`
     /// (existing files are left alone).
     Read {
-        /// The inbox secret file.
+        /// The inbox secret file, or `-` to read it from standard input
+        /// (`sops decrypt inbox.key.enc | wats inbox read --key -`).
         #[arg(long)]
         key: PathBuf,
         /// Output directory [default: <data dir>/inbox].
@@ -971,6 +1051,7 @@ async fn status_command(config: &NodeConfig, json: bool) -> Result<()> {
             if let Some(update) = wats::update::status_json(&config.data_dir) {
                 status["update"] = update;
             }
+            status["halt"] = wats::halt::offline_status(&config.data_dir, config.halt.accept);
             status
         }
     };
@@ -1198,6 +1279,9 @@ impl NodeArgs {
         }
         config.review_notify = file.agent.notify.unwrap_or(false);
         config.report_accept = self.report_accept || file.report.accept.unwrap_or(false);
+        // halt.accept: config.toml only, never a flag (ADR 0016 §3).
+        config.halt.accept = file.halt.accept.unwrap_or(true);
+        config.halt.serve = self.halt_serve || file.halt.serve.unwrap_or(false);
         config.limits = file.limits.limits();
         config.update = file.update.policy()?;
         // Hermetic and loopback nodes never look for releases.
@@ -1256,6 +1340,9 @@ impl NodeArgs {
         }
         if self.report_accept {
             args.push("--report-accept".into());
+        }
+        if self.halt_serve {
+            args.push("--halt-serve".into());
         }
         for net in &self.nets {
             args.push(format!("--net={net}").into());
@@ -1335,13 +1422,44 @@ fn spawn_background_node(args: &NodeArgs, dir: &std::path::Path, idle_exit: u64)
     Ok(())
 }
 
+/// The halt marker this node obeys, if any: none when it ignores halts,
+/// and a marker left by a release with guardians is cleared by one with
+/// none (an empty set disables halts).
+fn halted_marker(config: &NodeConfig) -> Option<wats::halt::Marker> {
+    if !config.halt.accept {
+        return None;
+    }
+    let marker = wats::halt::read_marker(&config.data_dir)?;
+    if !config.halt.guardians.enabled() {
+        tracing::info!("no guardian set in this release: the halt marker is cleared");
+        let _ = wats::halt::remove_marker(&config.data_dir);
+        return None;
+    }
+    Some(marker)
+}
+
+/// Answer an MCP client on stdio while this node is halted (ADR 0016 §3).
+async fn serve_halted_mcp(marker: &wats::halt::Marker) -> Result<()> {
+    use tokio::io::AsyncBufReadExt;
+    let lines = tokio::io::BufReader::new(tokio::io::stdin()).lines();
+    wats::halt::serve_halted_mcp(lines, tokio::io::stdout(), &wats::halt::mcp_message(marker)).await
+}
+
 /// Serve this session through the node that owns `dir`, starting one in
 /// the background if none runs.
 #[cfg(unix)]
-async fn mcp_attached(args: &NodeArgs, dir: &std::path::Path, idle_exit: u64) -> Result<()> {
+async fn mcp_attached(args: &NodeArgs, config: &NodeConfig, idle_exit: u64) -> Result<()> {
+    let dir = config.data_dir.as_path();
     let attach = || attach::attach(dir, args.profile.clone(), default_file_roots());
     if attach().await? {
         return Ok(());
+    }
+    // Halted (ADR 0016 §3): this session says so; a background node still
+    // starts to look for an unhalt, for the next sessions.
+    if let Some(marker) = halted_marker(config) {
+        tracing::warn!("{}", marker.message());
+        spawn_background_node(args, dir, idle_exit)?;
+        return serve_halted_mcp(&marker).await;
     }
     spawn_background_node(args, dir, idle_exit)?;
     for _ in 0..150 {
@@ -1465,6 +1583,9 @@ async fn run_node(node: Arc<Node>, run: NodeRun, mut shutdown: Shutdown) -> Resu
             }
         }))
     });
+    // Guardian halts (ADR 0016 §3): relay, marker, then stop below.
+    node.enforce_halts();
+    let mut halt_outcome = node.halt_outcome();
     if !quiet {
         print_line(json!({
             "type": "ready",
@@ -1538,6 +1659,21 @@ async fn run_node(node: Arc<Node>, run: NodeRun, mut shutdown: Shutdown) -> Resu
             _ = node.stop_requested() => {
                 tracing::info!("handing the data directory over");
                 break;
+            }
+            Ok(()) = halt_outcome.changed() => {
+                let outcome = halt_outcome.borrow_and_update().clone();
+                match outcome {
+                    wats::node::HaltOutcome::Exit(halt) => {
+                        let marker = wats::halt::Marker::new(&halt, 0);
+                        tracing::warn!("{}; stopping (exit status 0)", marker.message());
+                        break;
+                    }
+                    wats::node::HaltOutcome::Serving => {
+                        tracing::warn!("guardian halt: agent and MCP sessions stopped, serving halt events only");
+                        let _ = stop_agent.send(true);
+                    }
+                    wats::node::HaltOutcome::LeftPublic | wats::node::HaltOutcome::Running => {}
+                }
             }
         }
     }
@@ -2082,11 +2218,31 @@ async fn run_mcp(node: Arc<Node>, mut shutdown: Shutdown) -> Result<()> {
         tracing::warn!("MCP sessions cannot attach to this node: {e:#}");
         attach::Sessions::default()
     });
+    node.enforce_halts();
+    let mut halt_outcome = node.halt_outcome();
     let server = WatsMcp::new(Arc::clone(&node), default_file_roots());
     let service = server.serve(rmcp::transport::stdio()).await?;
-    tokio::select! {
-        result = service.waiting() => { result?; }
-        _ = &mut shutdown => return node.shutdown().await,
+    let waiting = service.waiting();
+    tokio::pin!(waiting);
+    loop {
+        tokio::select! {
+            result = &mut waiting => { result?; break; }
+            _ = &mut shutdown => return node.shutdown().await,
+            Ok(()) = halt_outcome.changed() => {
+                if let wats::node::HaltOutcome::Exit(halt) = halt_outcome.borrow_and_update().clone() {
+                    // The node stops; this session stays, every tool
+                    // telling the client about the halt, until it leaves.
+                    tracing::warn!("{}", wats::halt::Marker::new(&halt, 0).message());
+                    let _ = std::fs::remove_file(attach::socket_path(&node.config().data_dir));
+                    node.shutdown().await?;
+                    tokio::select! {
+                        _ = &mut waiting => {}
+                        _ = &mut shutdown => {}
+                    }
+                    return Ok(());
+                }
+            }
+        }
     }
     // Other sessions attached to this node: keep serving them.
     while sessions.active() > 0 {
@@ -2167,6 +2323,10 @@ async fn main() -> Result<()> {
             return report_command(&cli.node, &data_dir, action).await;
         }
         Some(Command::Inbox { action }) => return inbox_command(&data_dir, action),
+        Some(Command::Guardian { action }) => {
+            return guardian_command(&cli.node, &data_dir, action).await;
+        }
+        Some(Command::Resume) => return resume_command(&data_dir),
         Some(Command::Agent { action }) => {
             return tokio::select! {
                 result = agent_watch(&data_dir, action) => result,
@@ -2229,8 +2389,12 @@ async fn main() -> Result<()> {
         Some(Command::Mcp {
             idle_exit,
             in_process: false,
-        }) => return mcp_attached(&cli.node, &data_dir, idle_exit).await,
+        }) => return mcp_attached(&cli.node, &config, idle_exit).await,
         Some(Command::Mcp { .. }) => {
+            if let Some(marker) = halted_marker(&config) {
+                tracing::warn!("{}", marker.message());
+                return serve_halted_mcp(&marker).await;
+            }
             config.role = wats::node::NodeRole::InProcess;
             crash_context(&config);
             let node = Node::start(config).await?;
@@ -2249,6 +2413,8 @@ async fn main() -> Result<()> {
             | Command::Agent { .. }
             | Command::Setup { .. }
             | Command::Report { .. }
+            | Command::Guardian { .. }
+            | Command::Resume
             | Command::Inbox { .. },
         ) => {
             unreachable!("handled above")
@@ -2303,8 +2469,31 @@ async fn main() -> Result<()> {
         print_banner(&config, agent.as_ref());
     }
     crash_context(&config);
+    let check_marker = config.halt.accept
+        && !config.halt.serve
+        && config.nets.iter().any(|n| n == wats::node::PUBLIC_NET)
+        && wats::halt::read_marker(&config.data_dir).is_some();
     let node = Node::start(config).await?;
     wats::crash::set_own_id(node.endpoint_id().to_string());
+    // Stopped on a guardian halt before (ADR 0016 §3): a bounded sync looks
+    // for an unhalt, with no agent, no MCP and no publishing.
+    if check_marker && node.check_halt_marker(wats::halt::STARTUP_CHECK).await {
+        let message = wats::halt::read_marker(&node.config().data_dir)
+            .map(|m| m.message())
+            .unwrap_or_default();
+        if node
+            .config()
+            .nets
+            .iter()
+            .any(|n| n != wats::node::PUBLIC_NET)
+        {
+            node.leave_net(wats::node::PUBLIC_NET);
+            tracing::warn!("{message}; running without the public network");
+        } else {
+            tracing::warn!("{message}");
+            return node.shutdown().await;
+        }
+    }
     // For tests of crash reporting only.
     if std::env::var("WATS_CRASH_TEST").as_deref() == Ok("panic") {
         tracing::warn!("crash test requested");
@@ -2472,6 +2661,144 @@ async fn report_command(
             println!("sent {id} {how}");
         }
     }
+    Ok(())
+}
+
+/// `wats resume` (ADR 0016 §3).
+fn resume_command(data_dir: &std::path::Path) -> Result<()> {
+    match wats::halt::resume(data_dir, unix_now())? {
+        None => println!(
+            "{} has no halt marker: this node is not halted",
+            data_dir.display()
+        ),
+        Some(marker) => {
+            println!(
+                "overriding halt {}: {} (signed by {}, since {})",
+                marker.halt,
+                marker.reason,
+                marker.signed_by.join(", "),
+                wats::runs::format_time(marker.since)
+            );
+            println!(
+                "marker cleared; this node will not halt again on this halt (recorded in {}), \
+                 a new halt still applies. Start the node again with `wats`.",
+                data_dir.join(wats::halt::OVERRIDES_FILE).display()
+            );
+        }
+    }
+    Ok(())
+}
+
+/// `wats guardian …` (ADR 0016 §5).
+async fn guardian_command(
+    args: &NodeArgs,
+    data_dir: &std::path::Path,
+    action: GuardianAction,
+) -> Result<()> {
+    let guardians = wats::halt::Guardians::compiled();
+    let (key, draft) = match action {
+        GuardianAction::Keygen { out } => {
+            let out = out.unwrap_or_else(|| data_dir.join("guardian.key"));
+            if let Some(parent) = out.parent().filter(|p| !p.as_os_str().is_empty()) {
+                std::fs::create_dir_all(parent)?;
+            }
+            let key = wats::halt::keygen(&out)?;
+            let public = wats::identity::author_id(&key);
+            println!("secret written to {} (mode 0600)", out.display());
+            println!("public key: {public}");
+            println!(
+                "Encrypt it now (age, sops), keep it offline, and delete this clear copy; \
+                 the guardian commands read it from standard input with --key -, e.g. \
+                 `age -d guardian.key.age | wats guardian halt --key - --reason …`."
+            );
+            if !guardians.contains(&public) {
+                println!(
+                    "It is not in this release's guardian set: add it to GUARDIANS (src/halt.rs)."
+                );
+            }
+            return Ok(());
+        }
+        GuardianAction::Publish { file } => {
+            let bytes = if file == std::path::Path::new("-") {
+                let mut bytes = Vec::new();
+                std::io::Read::read_to_end(&mut std::io::stdin(), &mut bytes)?;
+                bytes
+            } else {
+                std::fs::read(&file).with_context(|| format!("read {}", file.display()))?
+            };
+            let value: serde_json::Value =
+                serde_json::from_slice(&bytes).context("not an event (JSON)")?;
+            return publish_guardian_event(args, data_dir, value).await;
+        }
+        GuardianAction::Halt { key, reason } => {
+            let ts = unix_now();
+            (key, wats::halt::halt_draft(&reason, ts).map(|d| (d, ts))?)
+        }
+        GuardianAction::Approve { key, id } => (key, (wats::halt::approve_draft(&id)?, unix_now())),
+        GuardianAction::Unhalt { key, halt, reason } => {
+            let ts = unix_now();
+            (key, (wats::halt::unhalt_draft(&halt, &reason, ts)?, ts))
+        }
+    };
+    let (draft, ts) = draft;
+    let signing = wats::halt::load_key(&key.key)?;
+    if !guardians.contains(&wats::identity::author_id(&signing)) {
+        eprintln!(
+            "warning: this key is not in this release's guardian set; nodes treat its events \
+             as plain notes"
+        );
+    }
+    let pow_bits = args.pow_bits;
+    let event =
+        tokio::task::spawn_blocking(move || wats::halt::sign(draft, &signing, ts, pow_bits))
+            .await??;
+    let value = serde_json::to_value(&event)?;
+    if key.offline {
+        println!("{value}");
+        return Ok(());
+    }
+    publish_guardian_event(args, data_dir, value).await
+}
+
+/// Publish a signed guardian event through the running node, or a
+/// short-lived one that also pushes it to the peers it meets.
+async fn publish_guardian_event(
+    args: &NodeArgs,
+    data_dir: &std::path::Path,
+    value: serde_json::Value,
+) -> Result<()> {
+    let event = wats::halt::check_publishable(&value, &wats::halt::Guardians::compiled())?;
+    let arguments = json!({ "event": value });
+    if attach::call_tool(data_dir, wats::mcp::GUARDIAN_PUBLISH_TOOL, arguments)
+        .await?
+        .is_some()
+    {
+        println!(
+            "published {} ({}) through the running node",
+            event.id, event.kind
+        );
+        return Ok(());
+    }
+    let settings = Settings::load(data_dir)?;
+    let mut config = args.config(&settings)?;
+    config.storage_max = None;
+    let node = Node::start(config).await?;
+    if let Err(e) = node
+        .wait_for_neighbor(wats::node::PUBLIC_NET, Duration::from_secs(15))
+        .await
+    {
+        eprintln!("{e:#}: the event is stored here and relayed when the node next runs");
+    }
+    let result = node.publish_signed(value.clone()).await;
+    if result.is_ok() {
+        let pushed = node.push_events(&[value], Duration::from_secs(15)).await;
+        tracing::info!(peers = pushed, "guardian event pushed");
+        // Let gossip carry it before this node stops.
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    }
+    node.shutdown().await?;
+    result?;
+    println!("published {} ({})", event.id, event.kind);
     Ok(())
 }
 

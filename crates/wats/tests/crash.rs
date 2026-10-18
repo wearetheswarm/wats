@@ -163,17 +163,22 @@ async fn panic_report_show_and_send() -> anyhow::Result<()> {
             .is_empty()
     })
     .await;
-    // `wats inbox read` next to the running node: the exact report bytes.
+    // `wats inbox read` next to the running node: the exact report bytes,
+    // with the secret on standard input (`sops decrypt … | … --key -`).
     let out = dir.path().join("read");
-    let read = std::process::Command::new(env!("CARGO_BIN_EXE_wats"))
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_wats"))
         .env("WATS_HERMETIC", "1")
         .arg("--dir")
         .arg(&inbox_dir)
-        .args(["inbox", "read", "--key"])
-        .arg(&key_file)
+        .args(["inbox", "read", "--key", "-"])
         .arg("--out")
         .arg(&out)
-        .output()?;
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()?;
+    std::io::Write::write_all(&mut child.stdin.take().unwrap(), &std::fs::read(&key_file)?)?;
+    let read = child.wait_with_output()?;
     let stdout = String::from_utf8_lossy(&read.stdout);
     assert!(
         read.status.success(),

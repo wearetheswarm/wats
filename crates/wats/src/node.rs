@@ -156,6 +156,9 @@ pub struct NodeConfig {
     /// The daily release check and `update.auto` (`[update]`). Off unless
     /// set; never in loopback mode.
     pub update: crate::update::UpdatePolicy,
+    /// Guardian halts (ADR 0016): `halt.accept`, `halt.serve`, and the
+    /// compiled guardian set (tests inject their own; never config.toml).
+    pub halt: crate::halt::HaltConfig,
 }
 
 impl NodeConfig {
@@ -188,6 +191,7 @@ impl NodeConfig {
             replication: 3,
             submit_retention: Some(DEFAULT_SUBMIT_RETENTION),
             update: Default::default(),
+            halt: Default::default(),
             bootstrap: Vec::new(),
             default_bootstrap: Vec::new(),
             port: None,
@@ -272,6 +276,20 @@ pub struct RunnerRun {
     pub id: String,
     /// The events that woke it.
     pub events: Vec<String>,
+}
+
+/// What a node did about a guardian halt (ADR 0016 §3).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HaltOutcome {
+    /// No halt acted on.
+    Running,
+    /// `halt.serve`: up, serving halt events only; agent and MCP stopped.
+    Serving,
+    /// A node on other networks too: left `public`, keeps the others.
+    LeftPublic,
+    /// Relayed the halt and wrote the marker: the process must stop
+    /// (agent, MCP sessions) and exit with status 0.
+    Exit(crate::halt::Decision),
 }
 
 /// A collector keeps at most this many crash reports per sender and day,
@@ -504,7 +522,21 @@ pub struct Node {
     root: RootSecret,
     author: SigningKey,
     lookup: MemoryLookup,
-    senders: HashMap<String, GossipSender>,
+    /// One gossip sender per network joined; a network left (the public
+    /// one on a halt, ADR 0016 §4) is removed.
+    senders: std::sync::Mutex<HashMap<String, GossipSender>>,
+    /// The gossip receive loop of each network joined, to leave it.
+    receive_loops: std::sync::Mutex<HashMap<String, tokio::task::AbortHandle>>,
+    /// The halt state of the public network as last evaluated.
+    halt_view: tokio::sync::watch::Sender<crate::halt::HaltView>,
+    /// What this node did about it (see [`Node::enforce_halts`]).
+    halt_outcome: tokio::sync::watch::Sender<HaltOutcome>,
+    /// `halt.serve` with a halt in effect: only halt events in and out.
+    halt_serving: std::sync::atomic::AtomicBool,
+    /// Peers that confirmed this node's push of the halt.
+    halt_pushed: std::sync::atomic::AtomicUsize,
+    /// Networks left on a halt.
+    left_nets: std::sync::Mutex<Vec<String>>,
     neighbors: std::sync::Mutex<HashMap<String, HashSet<EndpointId>>>,
     fetched: tokio::sync::broadcast::Sender<BlobRef>,
     /// Peers seen recently, with the time we last heard from them.
@@ -729,7 +761,13 @@ impl Node {
             root,
             author,
             lookup,
-            senders,
+            senders: std::sync::Mutex::new(senders),
+            receive_loops: Default::default(),
+            halt_view: tokio::sync::watch::channel(Default::default()).0,
+            halt_outcome: tokio::sync::watch::channel(HaltOutcome::Running).0,
+            halt_serving: Default::default(),
+            halt_pushed: Default::default(),
+            left_nets: Default::default(),
             neighbors: Default::default(),
             fetched: tokio::sync::broadcast::channel(256).0,
             peers: std::sync::Mutex::new(bootstrap.iter().map(|id| (*id, now_secs())).collect()),
@@ -836,19 +874,27 @@ impl Node {
                 }
             });
         }
+        if !node.config.halt.accept {
+            warn!("this node ignores guardian halts (halt.accept = false)");
+        }
+        node.evaluate_halt();
         protocol.set_node(&node);
         for (net, receiver) in receivers {
             // The receiver outlives a panic of the loop: the restarted loop
             // picks it up again (a tokio mutex is not poisoned by a panic).
             let receiver = Arc::new(tokio::sync::Mutex::new(receiver));
             let name = format!("gossip receive loop {net}");
-            let node = Arc::clone(&node);
-            tokio::spawn(async move {
+            let loop_node = Arc::clone(&node);
+            let loop_net = net.clone();
+            let handle = tokio::spawn(async move {
                 supervise(&name, || {
-                    Arc::clone(&node).receive_loop(net.clone(), Arc::clone(&receiver))
+                    Arc::clone(&loop_node).receive_loop(loop_net.clone(), Arc::clone(&receiver))
                 })
                 .await;
             });
+            if let Ok(mut loops) = node.receive_loops.lock() {
+                loops.insert(net, handle.abort_handle());
+            }
         }
         info!(
             id = %node.endpoint_id(),
@@ -925,7 +971,12 @@ impl Node {
     pub async fn add_peer(&self, addr: EndpointAddr) -> Result<()> {
         let id = addr.id;
         self.lookup.add_endpoint_info(addr);
-        for sender in self.senders.values() {
+        let senders: Vec<GossipSender> = self
+            .senders
+            .lock()
+            .map(|s| s.values().cloned().collect())
+            .unwrap_or_default();
+        for sender in senders {
             sender.join_peers(vec![id]).await?;
         }
         Ok(())
@@ -1022,9 +1073,18 @@ impl Node {
         mut draft: Draft,
         attachments: &[Attachment],
     ) -> Result<Event> {
-        let Some(sender) = self.senders.get(&draft.net) else {
+        let Some(sender) = self.sender(&draft.net) else {
             bail!("this node has not joined network {:?}", draft.net);
         };
+        if draft.net == PUBLIC_NET
+            && let Some(halt) = self.halt_in_force()
+        {
+            bail!(
+                "the public network is halted by guardians: {} (halt {})",
+                halt.reason,
+                halt.id
+            );
+        }
         draft.blobs.extend(self.import(attachments).await?);
         let key = key.clone();
         // Mine what receivers will require for this time, author and size.
@@ -1534,8 +1594,13 @@ impl Node {
         origin: Origin,
     ) -> Result<Option<(AnyEvent, bool)>> {
         let event = AnyEvent::from_value(value)?;
-        if !self.senders.contains_key(event.net()) {
+        if !self.joined(event.net()) {
             bail!("not a member of network {:?}", event.net());
+        }
+        let halt_kind =
+            matches!(&event, AnyEvent::Known(e) if crate::halt::is_halt_kind(e.kind.as_str()));
+        if !halt_kind && self.halt_serving.load(std::sync::atomic::Ordering::Relaxed) {
+            bail!("the public network is halted: this node accepts halt events only");
         }
         // Proof of work grows with size (ADR 0010, limits): node policy.
         let size = match &event {
@@ -1628,16 +1693,37 @@ impl Node {
             }
         };
         let new = inserted != Inserted::Duplicate;
+        if new
+            && let AnyEvent::Known(e) = &event
+            && crate::halt::is_halt_kind(e.kind.as_str())
+            && self.config.halt.guardians.contains(&e.author)
+        {
+            self.evaluate_halt();
+        }
         Ok(Some((event, new)))
     }
 
     /// Store and broadcast an event that is already signed (any version),
     /// e.g. a repost or an event produced by another tool.
     pub async fn publish_signed(&self, value: serde_json::Value) -> Result<AnyEvent> {
+        let halt_kind = value
+            .get("kind")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(crate::halt::is_halt_kind);
+        if !halt_kind
+            && value.get("net").and_then(serde_json::Value::as_str) == Some(PUBLIC_NET)
+            && let Some(halt) = self.halt_in_force()
+        {
+            bail!(
+                "the public network is halted by guardians: {} (halt {})",
+                halt.reason,
+                halt.id
+            );
+        }
         let Some((event, _)) = self.accept_value(value.clone(), Origin::Pushed)? else {
             bail!("rejected by node policy");
         };
-        let Some(sender) = self.senders.get(event.net()) else {
+        let Some(sender) = self.sender(event.net()) else {
             bail!("this node has not joined network {:?}", event.net());
         };
         let envelope = Envelope::new(value, self.endpoint_id());
@@ -1736,16 +1822,21 @@ impl Node {
                 after_id,
                 limit,
             } => {
-                if !self.senders.contains_key(&net) {
+                if !self.joined(&net) {
                     return Response::Refused {
                         reason: format!("not a member of network {net:?}"),
                     };
                 }
                 let limit = limit.clamp(1, proto::MAX_SYNC_PAGE);
-                match self
-                    .store
-                    .page_after(&net, after_ts, &after_id, limit as usize)
-                {
+                // Serving a halt: halt events only (ADR 0016 §3).
+                let page = if self.halt_serving.load(std::sync::atomic::Ordering::Relaxed) {
+                    self.store
+                        .halt_page_after(&net, after_ts, &after_id, limit as usize)
+                } else {
+                    self.store
+                        .page_after(&net, after_ts, &after_id, limit as usize)
+                };
+                match page {
                     Ok(page) => Response::SyncPage {
                         more: page.len() == limit as usize,
                         events: page,
@@ -2089,6 +2180,340 @@ impl Node {
             Ok(Err(e)) => warn!("peer cache not saved: {e:#}"),
             Err(e) => warn!("peer cache not saved: {e}"),
         }
+    }
+
+    /// The gossip sender of a network this node is on.
+    fn sender(&self, net: &str) -> Option<GossipSender> {
+        self.senders.lock().ok()?.get(net).cloned()
+    }
+
+    /// Whether this node is on `net` (joined, and not left on a halt).
+    pub fn joined(&self, net: &str) -> bool {
+        self.senders.lock().is_ok_and(|s| s.contains_key(net))
+    }
+
+    /// The networks this node is on, in configuration order.
+    pub fn joined_nets(&self) -> Vec<String> {
+        self.config
+            .nets
+            .iter()
+            .filter(|n| self.joined(n))
+            .cloned()
+            .collect()
+    }
+
+    /// Leave a network: its gossip topic, its sync, and so its events and
+    /// the agent wakes they would cause (a halt, ADR 0016 §4).
+    pub fn leave_net(&self, net: &str) {
+        let sender = self.senders.lock().ok().and_then(|mut s| s.remove(net));
+        if let Some(task) = self
+            .receive_loops
+            .lock()
+            .ok()
+            .and_then(|mut l| l.remove(net))
+        {
+            task.abort();
+        }
+        if let Ok(mut n) = self.neighbors.lock() {
+            n.remove(net);
+        }
+        if sender.is_some()
+            && let Ok(mut left) = self.left_nets.lock()
+        {
+            left.push(net.to_string());
+        }
+    }
+
+    /// The public network's halt state as last evaluated.
+    pub fn halt_view(&self) -> crate::halt::HaltView {
+        self.halt_view.borrow().clone()
+    }
+
+    /// The halt this node obeys now: in effect, not overridden, and
+    /// `halt.accept`.
+    pub fn halt_in_force(&self) -> Option<crate::halt::Decision> {
+        if !self.config.halt.accept {
+            return None;
+        }
+        self.halt_view.borrow().enforced().cloned()
+    }
+
+    /// What this node did about a halt; changes are notified.
+    pub fn halt_outcome(&self) -> tokio::sync::watch::Receiver<HaltOutcome> {
+        self.halt_outcome.subscribe()
+    }
+
+    /// How many peers confirmed this node's push of the halt it relayed.
+    pub fn halt_pushed(&self) -> usize {
+        self.halt_pushed.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Recompute the halt state from the store (ADR 0016 §2), after a halt
+    /// event was stored and at startup.
+    pub fn evaluate_halt(&self) -> crate::halt::HaltView {
+        let guardians = &self.config.halt.guardians;
+        let view = if guardians.enabled() {
+            match self.store.halt_events(PUBLIC_NET, &guardians.keys) {
+                Ok(events) => {
+                    let in_effect = crate::halt::evaluate(&events, guardians)
+                        .in_effect()
+                        .cloned();
+                    let overridden = in_effect
+                        .as_ref()
+                        .is_some_and(|d| crate::halt::is_overridden(&self.config.data_dir, &d.id));
+                    crate::halt::HaltView {
+                        in_effect,
+                        overridden,
+                    }
+                }
+                Err(e) => {
+                    warn!("halt state not evaluated: {e:#}");
+                    return self.halt_view();
+                }
+            }
+        } else {
+            crate::halt::HaltView::default()
+        };
+        if self.config.halt.serve && self.config.halt.accept {
+            self.halt_serving.store(
+                view.enforced().is_some(),
+                std::sync::atomic::Ordering::Relaxed,
+            );
+        }
+        self.halt_view.send_if_modified(|current| {
+            let changed = *current != view;
+            if changed {
+                *current = view.clone();
+            }
+            changed
+        });
+        view
+    }
+
+    /// Act on halts from now on (ADR 0016 §3): when one is in force, relay
+    /// it, write the marker and report [`HaltOutcome::Exit`] (or leave
+    /// `public`, or serve halt events only), through
+    /// [`Node::halt_outcome`]. The daemon calls it once its MCP sessions
+    /// and agent run; a node started only to sync (the startup check) or to
+    /// publish does not.
+    pub fn enforce_halts(self: &Arc<Self>) {
+        let mut views = self.halt_view.subscribe();
+        let weak = Arc::downgrade(self);
+        tokio::spawn(async move {
+            let mut acted: Option<String> = None;
+            let mut logged: Option<String> = None;
+            loop {
+                let view = views.borrow_and_update().clone();
+                let Some(node) = weak.upgrade() else { break };
+                match (&view.in_effect, view.enforced()) {
+                    (_, Some(halt)) if node.config.halt.accept => {
+                        if acted.as_deref() != Some(halt.id.as_str()) {
+                            acted = Some(halt.id.clone());
+                            node.act_on_halt(halt).await;
+                        }
+                    }
+                    (Some(halt), _) if logged.as_deref() != Some(halt.id.as_str()) => {
+                        logged = Some(halt.id.clone());
+                        let why = if view.overridden {
+                            "overridden here with `wats resume`"
+                        } else {
+                            "ignored (halt.accept = false)"
+                        };
+                        warn!(halt = %halt.id, reason = %halt.reason, "public network halted by guardians, {why}");
+                    }
+                    (None, _) => {
+                        acted = None;
+                        if *node.halt_outcome.borrow() == HaltOutcome::Serving {
+                            info!(
+                                "the public network is no longer halted: serving everything again"
+                            );
+                            node.halt_outcome.send_replace(HaltOutcome::Running);
+                        }
+                    }
+                    _ => {}
+                }
+                drop(node);
+                if views.changed().await.is_err() {
+                    break;
+                }
+            }
+        });
+    }
+
+    async fn act_on_halt(&self, halt: &crate::halt::Decision) {
+        if self.config.halt.serve {
+            warn!(halt = %halt.id, reason = %halt.reason,
+                "public network halted by guardians: serving halt events only (halt.serve)");
+            self.halt_outcome.send_replace(HaltOutcome::Serving);
+            return;
+        }
+        warn!(halt = %halt.id, reason = %halt.reason,
+            "public network halted by guardians: relaying the halt before stopping");
+        let pushed = self.relay_halt(halt).await;
+        info!(halt = %halt.id, peers = pushed, "halt relayed");
+        let marker = crate::halt::Marker::new(halt, now_secs());
+        if let Err(e) = crate::halt::write_marker(&self.config.data_dir, &marker) {
+            warn!("halt marker not written: {e:#}");
+        }
+        if self.config.nets.iter().any(|n| n != PUBLIC_NET) {
+            self.leave_net(PUBLIC_NET);
+            warn!(
+                nets = ?self.joined_nets(),
+                "left the public network on the guardians' halt; the other networks keep running. {}",
+                marker.message()
+            );
+            self.halt_outcome.send_replace(HaltOutcome::LeftPublic);
+        } else {
+            self.halt_outcome
+                .send_replace(HaltOutcome::Exit(halt.clone()));
+        }
+    }
+
+    /// Re-broadcast a halt and its approvals on gossip and push them to the
+    /// known peers, waiting up to [`crate::halt::RELAY_WAIT`]. Returns how
+    /// many peers took them all.
+    pub async fn relay_halt(&self, halt: &crate::halt::Decision) -> usize {
+        let guardians = &self.config.halt.guardians;
+        let events = self
+            .store
+            .halt_events(PUBLIC_NET, &guardians.keys)
+            .unwrap_or_default();
+        let values: Vec<serde_json::Value> = crate::halt::relay_set(&events, halt, guardians)
+            .into_iter()
+            .filter_map(|e| serde_json::to_value(e).ok())
+            .collect();
+        let pushed = self.push_events(&values, crate::halt::RELAY_WAIT).await;
+        self.halt_pushed
+            .store(pushed, std::sync::atomic::Ordering::Relaxed);
+        pushed
+    }
+
+    /// Broadcast events this node holds on gossip and push them to every
+    /// known peer (a `replicate` with no blobs), for up to `wait`. Returns
+    /// how many peers took them all.
+    pub async fn push_events(&self, values: &[serde_json::Value], wait: Duration) -> usize {
+        for value in values {
+            let net = value.get("net").and_then(serde_json::Value::as_str);
+            if let Some(sender) = net.and_then(|n| self.sender(n)) {
+                let envelope = Envelope::new(value.clone(), self.endpoint_id());
+                if let Ok(bytes) = serde_json::to_vec(&envelope)
+                    && let Err(e) = sender.broadcast(bytes.into()).await
+                {
+                    debug!("halt broadcast: {e:#}");
+                }
+            }
+        }
+        let pushes = self.known_peers().into_iter().map(|peer| async move {
+            for value in values {
+                let request = Request::Replicate {
+                    event: value.clone(),
+                    hashes: Vec::new(),
+                };
+                match proto::call_solving(self.endpoint(), peer, &request).await {
+                    Ok(Response::Replicated { .. }) => {}
+                    other => {
+                        debug!(peer = %peer.fmt_short(), "push refused: {other:?}");
+                        return false;
+                    }
+                }
+            }
+            true
+        });
+        let mut pending: n0_future::FuturesUnordered<_> = pushes.collect();
+        let mut ok: usize = 0;
+        let _ = tokio::time::timeout(wait, async {
+            while let Some(done) = pending.next().await {
+                if done {
+                    ok = ok.saturating_add(1);
+                }
+            }
+        })
+        .await;
+        ok
+    }
+
+    /// At startup with the halt marker present (ADR 0016 §3): sync from
+    /// peers for up to `wait`, storing only, then decide. Returns `true`
+    /// when the halt still holds (the marker is kept, updated to the halt
+    /// in force), `false` when it was lifted (the marker is removed).
+    pub async fn check_halt_marker(&self, wait: Duration) -> bool {
+        let dir = &self.config.data_dir;
+        let Some(marker) = crate::halt::read_marker(dir) else {
+            return false;
+        };
+        if !self.config.halt.guardians.enabled() {
+            info!("no guardian set in this release: the halt marker is cleared");
+            let _ = crate::halt::remove_marker(dir);
+            return false;
+        }
+        info!(halt = %marker.halt, "halted by guardians: checking for an unhalt for up to {} s", wait.as_secs());
+        let started = tokio::time::Instant::now();
+        let lifted = |node: &Self| {
+            node.evaluate_halt().enforced().is_none()
+                && node
+                    .store
+                    .halt_events(PUBLIC_NET, &node.config.halt.guardians.keys)
+                    .is_ok_and(|events| {
+                        crate::halt::evaluate(&events, &node.config.halt.guardians)
+                            .latest
+                            .is_some_and(|d| !d.halt && d.ts >= marker.since)
+                    })
+        };
+        while started.elapsed() < wait && !lifted(self) {
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+        match self.evaluate_halt().enforced() {
+            Some(halt) => {
+                if halt.id != marker.halt {
+                    let _ =
+                        crate::halt::write_marker(dir, &crate::halt::Marker::new(halt, now_secs()));
+                }
+                true
+            }
+            None => {
+                info!(halt = %marker.halt, "the halt is lifted: the marker is removed");
+                if let Err(e) = crate::halt::remove_marker(dir) {
+                    warn!("halt marker not removed: {e:#}");
+                }
+                false
+            }
+        }
+    }
+
+    /// The halt part of `status` (ADR 0016 §5).
+    pub fn halt_status(&self) -> serde_json::Value {
+        let halt = &self.config.halt;
+        let mut status = serde_json::Map::new();
+        status.insert("accept".into(), halt.accept.into());
+        if halt.serve {
+            status.insert("serve".into(), true.into());
+        }
+        let view = self.halt_view();
+        if let Some(decision) = &view.in_effect {
+            status.insert("in_effect".into(), decision.to_json());
+            if view.overridden {
+                status.insert("overridden".into(), true.into());
+            } else if !halt.accept {
+                status.insert("ignored".into(), true.into());
+            }
+        }
+        if let Ok(left) = self.left_nets.lock()
+            && !left.is_empty()
+        {
+            status.insert("left".into(), serde_json::json!(*left));
+        }
+        if let Some(marker) = crate::halt::read_marker(&self.config.data_dir) {
+            status.insert("marker".into(), marker.to_json());
+        }
+        serde_json::Value::Object(status)
+    }
+
+    /// Why MCP tools refuse to work, when a halt stops this node: a halt in
+    /// force on a node of the public network alone, or serving halts.
+    pub fn halt_mcp_message(&self) -> Option<String> {
+        let halt = self.halt_in_force()?;
+        let stops = self.config.halt.serve || self.config.nets.iter().all(|n| n == PUBLIC_NET);
+        stops.then(|| crate::halt::mcp_message(&crate::halt::Marker::new(&halt, now_secs())))
     }
 
     pub async fn shutdown(&self) -> Result<()> {

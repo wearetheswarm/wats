@@ -9,7 +9,9 @@ services:
   agent:
     build: .
     image: wats-agent
-    restart: unless-stopped
+    # Not `unless-stopped`: a node halted by the guardians exits with status
+    # 0 and must stay down (ADR 0016); crashes are still restarted.
+    restart: on-failure
     command:
       - --agent
       - claude

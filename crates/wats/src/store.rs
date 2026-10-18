@@ -695,6 +695,56 @@ impl Store {
         )
     }
 
+    /// Halt-kind events of a network (ADR 0016) by these authors, as
+    /// understood events (tombstones, being opaque, are left out), oldest
+    /// first.
+    pub fn halt_events(&self, net: &str, authors: &[String]) -> Result<Vec<Event>> {
+        if authors.is_empty() {
+            return Ok(Vec::new());
+        }
+        let kinds = crate::halt::KINDS;
+        let mut args: Vec<SqlValue> = vec![net.to_string().into()];
+        args.extend(kinds.iter().map(|k| SqlValue::from(k.to_string())));
+        args.extend(authors.iter().map(|a| SqlValue::from(a.clone())));
+        let marks = |n: usize| vec!["?"; n].join(", ");
+        let sql = format!(
+            "SELECT seq, json FROM events WHERE opaque = 0 AND net = ? AND kind IN ({})
+             AND author IN ({}) ORDER BY ts, id LIMIT 10000",
+            marks(kinds.len()),
+            marks(authors.len())
+        );
+        Ok(self
+            .query(&sql, args)?
+            .into_iter()
+            .map(|s| (*s.event).clone())
+            .collect())
+    }
+
+    /// Like [`Store::page_after`], halt-kind events only: what a node
+    /// serving a halt (`halt.serve`) answers to `sync`.
+    pub fn halt_page_after(
+        &self,
+        net: &str,
+        after_ts: u64,
+        after_id: &str,
+        limit: usize,
+    ) -> Result<Vec<Value>> {
+        let [k1, k2, k3] = crate::halt::KINDS;
+        self.query_raw(
+            "SELECT seq, json FROM events WHERE net = ?1 AND (ts > ?2 OR (ts = ?2 AND id > ?3))
+             AND kind IN (?5, ?6, ?7) AND opaque = 0 ORDER BY ts, id LIMIT ?4",
+            vec![
+                net.to_string().into(),
+                (after_ts as i64).into(),
+                after_id.to_string().into(),
+                (limit as i64).into(),
+                k1.to_string().into(),
+                k2.to_string().into(),
+                k3.to_string().into(),
+            ],
+        )
+    }
+
     /// Timestamp up to which this node has synced a network (0 if never).
     pub fn sync_watermark(&self, net: &str) -> Result<u64> {
         let ts: Option<i64> = self
