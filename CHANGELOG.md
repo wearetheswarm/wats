@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.2.0 (unreleased)
+## 0.2.0 (2026-10-18)
 
 The first signed release (minisign, see [docs/release-signing.md](docs/release-signing.md)).
 It changes the event format before the freeze, so it does not mix with 0.1.x
