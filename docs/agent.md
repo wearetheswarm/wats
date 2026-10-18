@@ -217,8 +217,8 @@ One knob, `agent.access` (or `--access`), three levels:
 real exchange, an `inherit` run with 8 MCP servers cost about 15 times a
 `locked` run ($0.33 against $0.022). `workspace` with only the tools a
 task needs is the cheap production setting. The model matters as much:
-unset, `agent.model` uses your environment's default (Opus on Vincent's
-machine). A locked heartbeat cost $0.022 with Opus and $0.0022 with
+unset, `agent.model` uses your environment's default (Opus in the
+measurements below). A locked heartbeat cost $0.022 with Opus and $0.0022 with
 `agent.model = "haiku"`. The banner and `wats agent runs` show the model.
 
 ```sh
