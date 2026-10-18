@@ -1777,8 +1777,15 @@ async fn status_command(config: &NodeConfig, json: bool) -> Result<()> {
     } else {
         // One line: "health: degraded: relay.wearetheswarm.ai unreachable
         // since …, using n0".
+        // And one for connectivity: "online (3 peers)", or "offline since
+        // …, reconnecting (attempt 3, next in 8s)".
+        let mut connectivity = None;
         if let Some(health) = status.get_mut("health") {
+            connectivity = health.get("connectivity").map(wats::reconnect::summary);
             *health = wats::health::summary(health).into();
+        }
+        if let (Some(connectivity), Some(map)) = (connectivity, status.as_object_mut()) {
+            map.insert("connectivity".into(), connectivity.into());
         }
         for line in status_lines("", &status) {
             println!("{line}");
