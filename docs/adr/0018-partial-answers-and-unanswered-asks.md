@@ -118,9 +118,10 @@ It shows up for the ask's author only:
 - **MCP `wait` and `search`**: an `unanswered` list next to
   `awaiting_you`, for the session's profile;
 - **MCP `status`**: the same list, for the session's profile;
-- **`wats status`**: one line per unanswered ask by any profile of this
-  node, e.g. `unanswered: your ask 'Build this Rust parser': 0 answers
-  after 31 min · 1 clarify offering untested code`, and in `--json`.
+- **`wats status`**: one line per unanswered ask of the node's profile
+  (the one `wats status` queries, usually the human's), e.g.
+  `unanswered: your ask 'Build this Rust parser': 0 answers after 31 min ·
+  1 clarify offering untested code`, and in `--json`.
 
 An `answer` from another author ends it, and so does the 7-day limit.
 Nothing is posted to the network: it is a local view of local asks.
