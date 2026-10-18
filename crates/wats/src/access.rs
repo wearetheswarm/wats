@@ -549,6 +549,43 @@ fn codex_servers() -> usize {
         .unwrap_or(0)
 }
 
+/// What a run can use, in one sentence for its prompt (`{access}`,
+/// ADR 0018 §1): an agent that knows it cannot build or test offers what
+/// it can do instead of failing or declining silently.
+pub fn prompt_line(runtime: &str, access: Access, workdir: &Path, tools: &[String]) -> String {
+    const NOTHING_TO_RUN: &str = "You cannot run, build or test anything in this run.";
+    let shell = tools
+        .iter()
+        .any(|t| t == "Bash" || t.starts_with("Bash(") || t == "shell_tool");
+    match access {
+        Access::Locked if runtime == "openclaw" => format!(
+            "Your OpenClaw agent's tool policy for wats runs, normally the wats tools only. \
+             Unless you see other tools, assume this: {NOTHING_TO_RUN}"
+        ),
+        Access::Locked => format!(
+            "Only the wats tools: no shell, no files, no compiler or interpreter. {NOTHING_TO_RUN}"
+        ),
+        Access::Workspace if runtime == "openclaw" => {
+            "Your OpenClaw agent's tool policy, with the tools added to it.".to_string()
+        }
+        Access::Workspace if tools.is_empty() => format!(
+            "Only the wats tools, in {}. {NOTHING_TO_RUN}",
+            workdir.display()
+        ),
+        Access::Workspace => format!(
+            "The wats tools plus {} in {}, nothing outside it.{}",
+            tools.join(", "),
+            workdir.display(),
+            if shell {
+                String::new()
+            } else {
+                format!(" No shell: {NOTHING_TO_RUN}")
+            }
+        ),
+        Access::Inherit => "The tools of your runtime's own configuration.".to_string(),
+    }
+}
+
 /// Inputs of the banner summary.
 pub struct Describe<'a> {
     pub runtime: &'a str,
@@ -640,6 +677,40 @@ pub fn describe(d: &Describe) -> Summary {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn the_prompt_says_what_a_run_can_use() {
+        let dir = Path::new("/w");
+        let cannot = "You cannot run, build or test anything in this run.";
+        let locked = prompt_line("claude", Access::Locked, dir, &[]);
+        assert!(
+            locked.starts_with("Only the wats tools: no shell"),
+            "{locked}"
+        );
+        assert!(locked.ends_with(cannot), "{locked}");
+        assert!(prompt_line("openclaw", Access::Locked, dir, &[]).ends_with(cannot));
+        let read_only = prompt_line("claude", Access::Workspace, dir, &["Read".into()]);
+        assert_eq!(
+            read_only,
+            format!("The wats tools plus Read in /w, nothing outside it. No shell: {cannot}")
+        );
+        let shell = prompt_line(
+            "claude",
+            Access::Workspace,
+            dir,
+            &["Read".into(), "Bash(cargo:*)".into()],
+        );
+        assert_eq!(
+            shell,
+            "The wats tools plus Read, Bash(cargo:*) in /w, nothing outside it."
+        );
+        assert!(prompt_line("claude", Access::Workspace, dir, &[]).ends_with(cannot));
+        assert_eq!(
+            prompt_line("codex", Access::Inherit, dir, &[]),
+            "The tools of your runtime's own configuration."
+        );
+    }
+
     use super::*;
 
     #[test]

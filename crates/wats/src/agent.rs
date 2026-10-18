@@ -323,6 +323,73 @@ impl Trigger {
 
 const WHY_ASK: &str = "ask";
 const WHY_REPLY: &str = "reply to one of the agent's posts";
+const WHY_DEADLINE: &str = "a clarify of the agent's got no answer by its deadline";
+
+/// How often the runner looks for its clarifies past their deadline.
+const DEADLINE_CHECK_EVERY: Duration = Duration::from_secs(30);
+/// Clarifies whose deadline passed longer ago than this are left alone.
+const DEADLINE_LOOKBACK_SECS: u64 = 3 * 86_400;
+
+/// The clarifies the agent `me` posted with a `data.default` and a
+/// `data.deadline` that passed (within [`DEADLINE_LOOKBACK_SECS`]) with
+/// no reply from the asker, and that the agent has not acted on since
+/// (no post of its own in the thread after the deadline): each wakes it
+/// once to go on with the default (ADR 0018 §3). Returns them with the
+/// asker's author id, and the soonest deadline still to come.
+pub fn clarifies_past_deadline(
+    node: &Node,
+    me: &str,
+    now: u64,
+) -> (Vec<(Arc<Event>, String)>, Option<u64>) {
+    let mine = Filter {
+        kinds: vec![Kind::Clarify],
+        author: Some(me.to_string()),
+        ..Filter::default()
+    };
+    let Ok(found) = node.store().search(None, &mine, 200) else {
+        return (Vec::new(), None);
+    };
+    let oldest = now.saturating_sub(DEADLINE_LOOKBACK_SECS);
+    let mut due = Vec::new();
+    let mut next: Option<u64> = None;
+    for stored in found {
+        let clarify = stored.event;
+        let Some(deadline) = clarify
+            .data
+            .get("deadline")
+            .and_then(serde_json::Value::as_u64)
+        else {
+            continue;
+        };
+        if clarify.data.get("default").is_none() || deadline < oldest {
+            continue;
+        }
+        if deadline > now {
+            next = Some(next.map_or(deadline, |n| n.min(deadline)));
+            continue;
+        }
+        let Some(asker) = clarify
+            .parent
+            .as_deref()
+            .and_then(|p| node.store().get(p).ok().flatten())
+            .map(|p| p.event.author.clone())
+        else {
+            continue;
+        };
+        let Ok(thread) = node.store().thread(clarify.thread_root(), 1000) else {
+            continue;
+        };
+        let settled = thread.iter().any(|s| {
+            let e = &s.event;
+            (e.author == asker && e.parent.as_deref() == Some(clarify.id.as_str()))
+                || (e.author == me && e.id != clarify.id && e.ts >= deadline)
+        });
+        if !settled {
+            due.push((clarify, asker));
+        }
+    }
+    (due, next)
+}
 
 /// What the runner makes of a new event.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -412,9 +479,10 @@ fn count(n: usize, one: &str, many: &str) -> String {
 
 /// The prompt of one run: the heartbeat template (HEARTBEAT.md) with its
 /// variables filled: `{agent_profile}`, `{user}`, `{agent.about}`,
-/// `{reasons}`, `{cursor}` and `{events}` (one line per event: id · kind ·
-/// author · title). A template without `{events}` gets that context
-/// appended.
+/// `{reasons}`, `{cursor}`, `{access}` (what the run can use, see
+/// [`access::prompt_line`]) and `{events}` (one line per event: id · kind ·
+/// author · title). A template without `{access}` or `{events}` gets
+/// that context appended.
 /// `- id · kind · author · title` for each event.
 fn event_lines(node: &Node, ids: &[String]) -> Vec<String> {
     let mut lines: Vec<String> = ids
@@ -455,10 +523,20 @@ pub fn prompt(node: &Node, config: &AgentConfig, since: i64, trigger: &Trigger) 
     let (reasons, events) = match trigger {
         Trigger::Events(ids) => {
             let asks = ids.iter().filter(|(_, why)| *why == WHY_ASK).count();
-            let replies = ids.len() - asks;
+            let deadlines = ids.iter().filter(|(_, why)| *why == WHY_DEADLINE).count();
+            let replies = ids.len() - asks - deadlines;
             let mut reasons = Vec::new();
             if asks > 0 {
                 reasons.push(count(asks, "new ask", "new asks"));
+            }
+            if deadlines > 0 {
+                reasons.push(format!(
+                    "{} got no answer by {} deadline: `read` it and go on with its \
+                     `data.default`, by posting only, the result clearly marked \
+                     (untested, partial), or not at all if the default is the way out",
+                    count(deadlines, "clarify of yours", "clarifies of yours"),
+                    if deadlines == 1 { "its" } else { "their" }
+                ));
             }
             if replies > 0 {
                 reasons.push(count(
@@ -481,6 +559,12 @@ pub fn prompt(node: &Node, config: &AgentConfig, since: i64, trigger: &Trigger) 
         config.about.trim()
     };
     let cursor = format!("since={since}");
+    let access = access::prompt_line(
+        &config.runtime,
+        config.access,
+        &config.workdir,
+        &config.tools,
+    );
     let template = config.heartbeat_text.trim_end();
     let mut prompt = template
         .replace("{agent_profile}", &config.profile)
@@ -488,7 +572,11 @@ pub fn prompt(node: &Node, config: &AgentConfig, since: i64, trigger: &Trigger) 
         .replace("{agent.about}", about)
         .replace("{reasons}", &reasons)
         .replace("{cursor}", &cursor)
+        .replace("{access}", &access)
         .replace("{events}", &events);
+    if !template.contains("{access}") {
+        prompt.push_str(&format!("\n\nWhat you can use in this run: {access}"));
+    }
     if !template.contains("{events}") {
         prompt.push_str(&format!(
             "\n\n---\nYou are {}. You were woken because: {reasons}.\nNew since your last run ({cursor}):\n{events}\n",
@@ -1193,6 +1281,10 @@ pub async fn run(
         }
     }
     write_cursor(&config.work_dir, since);
+    // Clarifies past their deadline already queued (ADR 0018 §3).
+    let mut deadline_checked: Option<Instant> = None;
+    let mut next_deadline: Option<u64> = None;
+    let mut deadline_queued: std::collections::HashSet<String> = Default::default();
     let mut last_run: Option<Instant> = None;
     let mut last_heartbeat = Instant::now();
     let mut runs: VecDeque<Instant> = VecDeque::new();
@@ -1312,6 +1404,26 @@ pub async fn run(
                 wakes.prune(unix_now);
                 if backoff_until.is_some_and(|t| now < t) {
                     continue;
+                }
+                // Every 30 s (new clarifies), and at the soonest deadline.
+                if deadline_checked.is_none_or(|t| now.duration_since(t) >= DEADLINE_CHECK_EVERY)
+                    || next_deadline.is_some_and(|d| unix_now >= d)
+                {
+                    deadline_checked = Some(now);
+                    let (due, next) = clarifies_past_deadline(&node, &me, unix_now);
+                    next_deadline = next;
+                    for (clarify, asker) in due {
+                        if deadline_queued.insert(clarify.id.clone()) {
+                            info!(event = short(&clarify.id), "queued for the agent: {WHY_DEADLINE}");
+                            pending.push(Queued {
+                                id: clarify.id.clone(),
+                                why: WHY_DEADLINE,
+                                author: asker,
+                                thread: clarify.thread_root().to_string(),
+                                held: None,
+                            });
+                        }
+                    }
                 }
                 let debounced = last_run.is_none_or(|t| now.duration_since(t) >= config.every);
                 // Events stay queued until a run actually starts with them.

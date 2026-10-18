@@ -159,6 +159,16 @@ async fn agent_wakes_on_asks_and_heartbeats() -> anyhow::Result<()> {
         "{prompt}"
     );
     assert!(prompt.contains("Who can review my CSV?"), "{prompt}");
+    // It knows it cannot build or test anything (ADR 0018 §1), and what to
+    // do about an ask it can only do in part.
+    assert!(
+        prompt.contains(
+            "What you can use in this run: Only the wats tools: no shell, no files, no \
+             compiler or interpreter. You cannot run, build or test anything in this run."
+        ),
+        "{prompt}"
+    );
+    assert!(prompt.contains("Don't decline silently"), "{prompt}");
     assert!(!prompt.contains('{'), "every variable is filled: {prompt}");
     // Only the user acknowledges changed safety settings.
     assert!(!prompt.contains("config ack"), "{prompt}");
@@ -2238,5 +2248,124 @@ async fn heartbeats_offer_older_unanswered_asks() -> anyhow::Result<()> {
         }
     }
     a.shutdown().await?;
+    Ok(())
+}
+
+/// A clarify of the agent's with a default and a deadline that passes
+/// with no reply from the asker wakes it once, to go on with the default;
+/// one the asker answered in time does not (ADR 0018 §3).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_clarify_past_its_deadline_wakes_the_agent_for_its_default() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let a = node(&dir.path().join("a"), &[]).await?;
+    let b = node(&dir.path().join("b"), &[&a]).await?;
+    a.wait_for_neighbor(PUBLIC_NET, Duration::from_secs(10))
+        .await?;
+    let agent = a.author_key("agent")?;
+    let clarify = |on: &wats::event::Event, deadline: u64| Draft {
+        net: PUBLIC_NET.into(),
+        thread: Some(on.thread_root().to_string()),
+        parent: Some(on.id.clone()),
+        kind: Some(Kind::Clarify),
+        text: "I can write it, not compile it here.".into(),
+        data: serde_json::json!({"options": ["untested code", "no thanks"],
+                                 "default": "untested code", "deadline": deadline})
+        .as_object()
+        .unwrap()
+        .clone(),
+        ..Draft::default()
+    };
+    let soon = wats::node::now_secs() + 5;
+    let silent = b.publish(ask("Build this Rust parser"), &[]).await?;
+    let replied = b.publish(ask("Port this C code"), &[]).await?;
+    for id in [&silent.id, &replied.id] {
+        let a = Arc::clone(&a);
+        let id = id.clone();
+        eventually("ask on a", move || a.store().get(&id).unwrap().is_some()).await;
+    }
+    let lapsed = a.publish_as(&agent, clarify(&silent, soon), &[]).await?;
+    let answered = a.publish_as(&agent, clarify(&replied, soon), &[]).await?;
+    let choice = b
+        .publish(
+            Draft {
+                net: PUBLIC_NET.into(),
+                thread: Some(replied.id.clone()),
+                parent: Some(answered.id.clone()),
+                kind: Some(Kind::Answer),
+                text: "No thanks.".into(),
+                data: serde_json::json!({"choice": "no thanks"})
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+                ..Draft::default()
+            },
+            &[],
+        )
+        .await?;
+
+    let config = AgentConfig {
+        runtime: "claude".into(),
+        profile: "agent".into(),
+        user: "alice".into(),
+        about: String::new(),
+        caps: vec![],
+        every: Duration::from_secs(1),
+        heartbeat: Duration::from_secs(3600),
+        max_runs_per_hour: 100,
+        allow: vec![],
+        ignore_local: true,
+        heartbeat_text: DEFAULT_HEARTBEAT.into(),
+        command: fake_agent(dir.path()),
+        mcp_command: "/usr/bin/true".into(),
+        mcp_args: vec![],
+        extra_args: vec![],
+        run_timeout: Duration::from_secs(10),
+        max_turns: 10,
+        budget: wats::budget::Budget::default(),
+        wakes: wats::wake::WakeLimits::unlimited(),
+        codex_disable: vec![],
+        access: wats::access::Access::Locked,
+        workdir: std::path::PathBuf::from("/nonexistent"),
+        tools: vec![],
+        model: None,
+        work_dir: dir.path().join("work"),
+        keep_runs: 100,
+        keep_days: 30,
+        openclaw: Default::default(),
+        catchup: None,
+    };
+    {
+        let a = Arc::clone(&a);
+        let id = choice.id.clone();
+        eventually("the choice on a", move || {
+            a.store().get(&id).unwrap().is_some()
+        })
+        .await;
+    }
+    let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+    let runner = tokio::spawn(wats::agent::run(Arc::clone(&a), config, async {
+        let _ = stopped.await;
+    }));
+    // Nothing before the deadline (a second short of it, for clock rounding).
+    while wats::node::now_secs() + 1 < soon {
+        assert!(runs(dir.path()).is_empty(), "nothing before the deadline");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    eventually("a run at the deadline", || !runs(dir.path()).is_empty()).await;
+    let (prompt, _) = runs(dir.path()).remove(0);
+    assert!(prompt.contains(&lapsed.id), "{prompt}");
+    assert!(
+        prompt.contains("1 clarify of yours got no answer by its deadline"),
+        "{prompt}"
+    );
+    assert!(prompt.contains("by posting only"), "{prompt}");
+    assert!(!prompt.contains(&answered.id), "answered in time: {prompt}");
+    // Once.
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    assert_eq!(runs(dir.path()).len(), 1);
+    let _ = stop.send(());
+    runner.await??;
+    a.shutdown().await?;
+    b.shutdown().await?;
     Ok(())
 }
