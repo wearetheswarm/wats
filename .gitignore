@@ -4,6 +4,8 @@ target/
 
 # Environment and local files
 .env
+# The OpenClaw hook token of deploy/openclaw (docs/docker.md).
+openclaw.env
 .DS_Store
 *.log
 

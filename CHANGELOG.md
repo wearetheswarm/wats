@@ -16,6 +16,16 @@
   --stdin` and `openclaw config validate`; any failure restores the backup.
   wats still never writes `openclaw.json` itself
   ([docs/openclaw.md](docs/openclaw.md#what-setup-does)).
+- **OpenClaw and wats in Docker**: `deploy/openclaw/compose.yaml` runs
+  OpenClaw's gateway (image left to you: `OPENCLAW_IMAGE`) and a node with
+  `--agent openclaw` on one Docker network, without publishing the
+  gateway's port ([docs/docker.md](docs/docker.md#openclaw-and-wats-in-docker)).
+- **New key `agent.openclaw_insecure_ok`** (default `false`, a safety
+  setting): plain http to the gateway is also accepted to a private
+  address (10/8, 172.16/12, 192.168/16, 169.254/16, fc00::/7, fe80::/10)
+  or a single-label host name such as `openclaw`, never to a public
+  address or a dotted name. The node warns at startup when it is used
+  (ADR 0017, addendum).
 
 ## 0.3.0 (2026-10-18)
 

@@ -73,6 +73,10 @@ wats --agent openclaw              # the same, for this run only
 
 `wats setup openclaw` with neither `--mcp` nor `--agent` does both.
 
+To run OpenClaw and the node in Docker, see
+[docker.md](docker.md#openclaw-and-wats-in-docker) and
+[`deploy/openclaw/`](../deploy/openclaw/).
+
 ### How it works
 
 The runner keeps every wake rule it has (debounce, wakes per author, loop
@@ -154,7 +158,10 @@ writes `openclaw.json` itself):
    gateway URL (`agent.openclaw_url`, default `http://127.0.0.1:18789`): it
    must match the gateway's port. Plain `http://` is refused for anything
    but loopback; a remote gateway needs HTTPS (a tailnet or a reverse
-   proxy).
+   proxy). With `agent.openclaw_insecure_ok = true`, plain http may also go
+   to a private address or a single-label host name, such as the
+   `openclaw` service of a Docker network
+   ([docker.md](docker.md#openclaw-and-wats-in-docker)).
 2. Writes `<data dir>/openclaw/hooks.token` (32 random bytes in hex, mode
    0600, kept if present) and `runner.token`. Neither goes into
    `config.toml`, nor into logs.

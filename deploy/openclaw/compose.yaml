@@ -1,0 +1,97 @@
+# Example: OpenClaw and a wats node in Docker, OpenClaw as the node's agent
+# (ADR 0017; docs/docker.md, "OpenClaw and wats in Docker").
+#
+# The wats node forwards each agent run to the gateway over plain http on
+# the internal network `swarm` (http://openclaw:18789, allowed by
+# agent.openclaw_insecure_ok); OpenClaw's restricted `wats` agent answers
+# through `wats mcp`, which attaches to the node via the shared volume.
+# The gateway port is never published: keep it that way.
+#
+# Placeholders: OPENCLAW_IMAGE (no default: the image OpenClaw's docs give,
+# pinned) and the gateway's own settings (listening beyond loopback, its
+# auth), which are OpenClaw's: see docs.openclaw.ai.
+#
+# Setup, from this directory:
+#   1. export OPENCLAW_IMAGE=<OpenClaw's gateway image, pinned>
+#      docker compose up -d --build
+#      Both start; agent runs fail until step 4 (no hook token yet).
+#   2. Let the node use plain http on this network, and name the agent:
+#        docker compose exec openclaw wats config set agent.openclaw_insecure_ok true
+#        docker compose exec openclaw wats config set agent.profile helper
+#   3. Set wats up in OpenClaw (inside the openclaw container, where the
+#      `openclaw` CLI is): MCP entries, tokens, OpenClaw's config, and
+#      agent.openclaw_url in config.toml. --print instead of --apply prints
+#      the block to paste into openclaw.json yourself.
+#        docker compose exec openclaw wats setup openclaw --agent --apply --yes \
+#          --url http://openclaw:18789
+#   4. It prints `export WATS_OPENCLAW_HOOKS_TOKEN=<token>`. Put
+#      `WATS_OPENCLAW_HOOKS_TOKEN=<token>` in ./openclaw.env (mode 0600,
+#      git-ignored, never in an image), make the gateway listen on the
+#      container's network (OpenClaw's gateway bind setting), set spend
+#      caps on the OpenClaw side, then:
+#        docker compose up -d --force-recreate
+#   5. Acknowledge the safety settings changed in steps 2-3, as the user:
+#        docker compose exec openclaw wats config ack
+# Logs: docker compose logs -f wats   (one line per forwarded run)
+# Runs: docker compose exec openclaw wats agent runs
+
+name: wats-openclaw
+
+services:
+  openclaw:
+    build:
+      context: .
+      args:
+        OPENCLAW_IMAGE: ${OPENCLAW_IMAGE:?set OPENCLAW_IMAGE}
+        WATS_IMAGE: ghcr.io/wearetheswarm/wats:${WATS_VERSION:-0.3.0}
+    image: wats-openclaw
+    restart: on-failure
+    # The hook token, from `wats setup openclaw`; absent before step 4.
+    env_file:
+      - path: ./openclaw.env
+        required: false
+    environment:
+      # The profile of the `wats` MCP entry (your own OpenClaw agents).
+      WATS_PROFILE: ${WATS_PROFILE:-me}
+    # Model provider keys and channel accounts stay in this container (its
+    # environment or its home volume): the wats node never sees them.
+    volumes:
+      - openclaw-home:/home/openclaw
+      # The node's data directory: `wats mcp` attaches to its socket.
+      - wats-data:/data
+    # The node must own the data directory before OpenClaw starts `wats mcp`.
+    depends_on: [wats]
+    # `swarm` is shared with the node; `egress` reaches the model provider.
+    networks: [swarm, egress]
+    # No `ports:`: the gateway is for the wats node only. Drop read_only if
+    # your OpenClaw image needs more writable paths than its home and /tmp.
+    read_only: true
+    tmpfs: ["/tmp"]
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+
+  wats:
+    image: ghcr.io/wearetheswarm/wats:${WATS_VERSION:-0.3.0}
+    # Not `unless-stopped`: a node halted by the guardians exits with status
+    # 0 and must stay down (ADR 0016); crashes are still restarted.
+    restart: on-failure
+    command: ["node", "--quiet", "--agent", "openclaw"]
+    volumes:
+      - wats-data:/data
+    # `swarm` reaches the gateway; `egress` reaches the other nodes.
+    networks: [swarm, egress]
+    read_only: true
+    tmpfs: ["/tmp"]
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+
+networks:
+  # Both are bridges on this host: the forwards (and the hook token in
+  # them) never leave it. Only `egress` routes out.
+  swarm:
+    internal: true
+  egress: {}
+
+volumes:
+  openclaw-home:
+  wats-data:

@@ -683,7 +683,8 @@ enum SetupTool {
         yes: bool,
         /// The OpenClaw gateway (agent.openclaw_url); default
         /// http://127.0.0.1:18789, asked on a terminal. Plain http is for
-        /// loopback only.
+        /// loopback only, or a private address with
+        /// agent.openclaw_insecure_ok (e.g. http://openclaw:18789 in Docker).
         #[arg(long)]
         url: Option<String>,
         /// The OpenClaw CLI.
@@ -1172,7 +1173,7 @@ fn setup_openclaw(
             }
             None => default,
         };
-        oc::check_url(&url)?;
+        oc::check_url(&url, settings.agent.openclaw_insecure_ok == Some(true))?;
         Some(url.trim().trim_end_matches('/').to_string())
     } else {
         None
@@ -2385,7 +2386,13 @@ fn agent_config(
     if runtime == "openclaw" {
         wats::openclaw::check_access(access, &allow, file.review == Some(true))?;
         if let Some(url) = &file.openclaw_url {
-            wats::openclaw::check_url(url).context("config.toml agent.openclaw_url")?;
+            let checked = wats::openclaw::check_url(url, file.openclaw_insecure_ok == Some(true))
+                .context("config.toml agent.openclaw_url")?;
+            if let Some(host) = wats::openclaw::insecure_host(&checked) {
+                tracing::warn!(
+                    "hook token sent over plain http to {host} (agent.openclaw_insecure_ok)"
+                );
+            }
             openclaw.url = url.trim().to_string();
         }
         if let Some(agent) = file

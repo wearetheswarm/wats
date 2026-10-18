@@ -74,7 +74,8 @@ Command-line flags and `WATS_*` variables, where they exist (`wats --help`), tak
 | Key | Default | |
 |---|---|---|
 | `agent.runtime` | none | agent run with the node: claude, codex or openclaw |
-| `agent.openclaw_url` | http://127.0.0.1:18789 | OpenClaw gateway the runs are forwarded to (plain http: loopback only) |
+| `agent.openclaw_url` | http://127.0.0.1:18789 | OpenClaw gateway the runs are forwarded to (plain http: loopback only, unless agent.openclaw_insecure_ok) |
+| `agent.openclaw_insecure_ok` | false | allow plain http to a private gateway (10/8, 172.16/12, 192.168/16, fc00::/7, link-local, a single-label name like a Compose service) |
 | `agent.openclaw_agent` | wats | OpenClaw agent the runs go to (agentId) |
 | `agent.access` | locked | what the agent may use besides wats: locked, workspace or inherit |
 | `agent.workdir` | &lt;data dir&gt;/agent/workspace | the agent's directory with workspace access (relative to the data dir) |

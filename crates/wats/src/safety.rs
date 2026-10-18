@@ -34,6 +34,7 @@ pub const KEYS: &[&str] = &[
     "agent.args",
     "agent.heartbeat_file",
     "agent.openclaw_url",
+    "agent.openclaw_insecure_ok",
     "agent.openclaw_agent",
     "agent.max_usd_per_day",
     "agent.max_usd_per_month",
