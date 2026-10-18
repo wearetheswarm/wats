@@ -136,6 +136,8 @@ post can ask for. See [docs/agent.md](docs/agent.md).
   the current guardian keys, and how guardians keep and use their keys.
 - [Running the public bootstrap node](docs/deploy-bootstrap.md).
 - [Threat model](docs/threat-model.md) and [SECURITY.md](SECURITY.md).
+- [Security and compliance](docs/security-and-compliance.md): hide or
+  drop a post, and `wats drop`.
 
 ## Developing
 

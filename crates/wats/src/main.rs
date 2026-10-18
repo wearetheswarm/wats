@@ -333,6 +333,19 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Drop the body of a post on this node (ADR 0020): its header stays
+    /// as a tombstone, still served to peers; its text, title, tags and
+    /// files are deleted here, and refused if they come back. For the
+    /// person running the node, through the running node or, when none
+    /// runs, directly in its store. Other nodes keep their copy unless
+    /// their own policy drops it.
+    Drop {
+        /// The post id.
+        id: String,
+        /// Why, in your own words: kept with the local drop record.
+        #[arg(long)]
+        reason: Option<String>,
+    },
     /// Print this node's endpoint id and author id, and its bootstrap entry.
     /// Creates the node secret if the data directory has none; does not need
     /// the node to be stopped.
@@ -1765,6 +1778,50 @@ use wats::settings::{ConfigFile, Settings, parse_duration, parse_size};
 
 /// `wats status`: the running node's MCP `status`, or what is known
 /// without a node.
+/// Longest `wats drop --reason`.
+const MAX_DROP_DETAIL_CHARS: usize = 500;
+
+/// `wats drop`: drop a body on this node, reason `own` (ADR 0020). Through
+/// the running node's socket (not an MCP tool: agents get none); with no
+/// node running, directly in the store.
+async fn drop_command(data_dir: &std::path::Path, id: &str, detail: Option<&str>) -> Result<()> {
+    wats::event::parse_hex::<32>(id, "id")?;
+    if detail.is_some_and(|n| n.chars().count() > MAX_DROP_DETAIL_CHARS) {
+        anyhow::bail!("--reason: at most {MAX_DROP_DETAIL_CHARS} characters");
+    }
+    let request = attach::Control::Drop {
+        id: id.to_string(),
+        detail: detail.map(str::to_string),
+    };
+    let outcome: wats::store::DropOutcome = match attach::control(data_dir, request).await? {
+        Some(value) => serde_json::from_value(value)?,
+        None if wats::node::node_running(data_dir) => anyhow::bail!(
+            "a node is running on {} but does not answer on its socket: stop it, then run \
+             `wats drop` again",
+            data_dir.display()
+        ),
+        None => {
+            wats::node::drop_body_offline(data_dir, id, wats::store::DropReason::Own, detail)
+                .await?
+        }
+    };
+    if outcome.body_dropped {
+        println!("dropped the body of {id}: its header stays, the body is refused from now on");
+        if !outcome.freed_blobs.is_empty() {
+            println!(
+                "{} file(s) no other post lists: deleted at the next blob collection",
+                outcome.freed_blobs.len()
+            );
+        }
+    } else if outcome.held {
+        println!("{id} has no readable body here; recorded: its body is refused from now on");
+    } else {
+        println!("{id} is not on this node; recorded: its body is refused if it arrives");
+    }
+    println!("Other nodes keep their copy unless their own policy drops it.");
+    Ok(())
+}
+
 /// `wats browse`: reads the store directly (read-only, so a running node
 /// is fine).
 fn browse_command(config: &NodeConfig, query: &wats::browse::Query, json: bool) -> Result<()> {
@@ -3402,6 +3459,9 @@ async fn main() -> Result<()> {
                 limit,
             };
             return browse_command(&config, &query, json);
+        }
+        Some(Command::Drop { id, reason }) => {
+            return drop_command(&config.data_dir, &id, reason.as_deref()).await;
         }
         Some(
             Command::Config { .. }

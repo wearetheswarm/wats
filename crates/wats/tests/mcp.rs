@@ -684,3 +684,103 @@ async fn browse_maps_tags_threads_and_outlines() -> anyhow::Result<()> {
     node.shutdown().await?;
     Ok(())
 }
+
+/// `wats drop` through the running node's socket (ADR 0020): `read` then
+/// shows the post's header and `dropped`, never the body; `search` and
+/// `browse` no longer find it; its file is untagged.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_dropped_post_reads_as_its_header() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let data = dir.path().join("n");
+    let node = loopback_node(&data, None).await?;
+    let shared = dir.path().join("shared");
+    std::fs::create_dir_all(&shared)?;
+    std::fs::write(shared.join("key.txt"), "s3cr3t")?;
+    let asker = client_for(WatsMcp::new(node.clone(), vec![shared.clone()])).await?;
+    let helper = client_for(WatsMcp::new(node.clone(), vec![]).with_profile("helper")?).await?;
+    let ask = structured(
+        &call(
+            &asker,
+            "post",
+            json!({"title": "My leaked key", "text": "Here it is: s3cr3t", "kind": "ask",
+                   "tags": ["cap:secrets"],
+                   "blobs": [{"path": shared.join("key.txt").to_str().unwrap()}]}),
+        )
+        .await,
+    );
+    let ask_id = ask["id"].as_str().unwrap().to_string();
+    let answer = structured(
+        &call(
+            &helper,
+            "reply",
+            json!({"post_id": ask_id, "text": "Rotate it now.", "kind": "answer"}),
+        )
+        .await,
+    );
+    let answer_id = answer["id"].as_str().unwrap().to_string();
+    let hash = node.store().get(&ask_id)?.unwrap().event.blobs[0]
+        .hash
+        .clone();
+    assert!(node.blob_pinned(&hash).await?);
+
+    // No MCP tool drops a body.
+    let tools = asker.list_all_tools().await?;
+    assert!(tools.iter().all(|t| !t.name.contains("drop")));
+
+    let _sessions = wats::attach::serve(Arc::clone(&node))?;
+    let outcome = wats::attach::control(
+        &data,
+        wats::attach::Control::Drop {
+            id: ask_id.clone(),
+            detail: Some("a secret".into()),
+        },
+    )
+    .await?
+    .expect("the node answers");
+    assert_eq!(outcome["body_dropped"], true, "{outcome}");
+    assert_eq!(outcome["freed_blobs"], json!([hash]));
+    assert!(!node.blob_pinned(&hash).await?);
+    let bad = wats::attach::control(
+        &data,
+        wats::attach::Control::Drop {
+            id: "not an id".into(),
+            detail: None,
+        },
+    )
+    .await;
+    assert!(bad.is_err());
+
+    let read = structured(&call(&asker, "read", json!({"id": ask_id})).await);
+    let post = &read["post"];
+    assert_eq!(post["id"], ask_id.as_str(), "{read}");
+    assert_eq!(post["kind"], "ask");
+    assert_eq!(post["author"], node.author_id());
+    assert!(post["ts"].as_u64().is_some());
+    assert_eq!(post["dropped"]["reason"], "own");
+    assert!(post["dropped"]["at"].as_u64().is_some());
+    assert!(
+        post["dropped"].get("note").is_none(),
+        "the detail stays local"
+    );
+    for gone in ["text", "title", "tags", "data", "blobs"] {
+        assert!(post.get(gone).is_none(), "{gone}: {read}");
+    }
+    assert!(!read.to_string().contains("s3cr3t"), "{read}");
+    assert_eq!(read["thread_root"], ask_id.as_str());
+    assert_eq!(read["thread"][0]["id"], answer_id.as_str());
+
+    // The reply's thread lists the dropped root by its header.
+    let reply = structured(&call(&asker, "read", json!({"id": answer_id})).await);
+    assert_eq!(reply["unreadable"][0]["id"], ask_id.as_str(), "{reply}");
+    assert_eq!(reply["unreadable"][0]["dropped"]["reason"], "own");
+    assert_eq!(reply["post"]["parent"], ask_id.as_str());
+
+    let found = structured(&call(&asker, "search", json!({"text": "leaked key"})).await);
+    assert!(!found.to_string().contains(&ask_id), "{found}");
+    let tree = structured(&call(&asker, "browse", json!({"thread": ask_id})).await);
+    assert_eq!(tree["posts"][0]["title"], "(body dropped: own)", "{tree}");
+    let map = structured(&call(&asker, "browse", json!({})).await);
+    assert_eq!(map["tags"], json!([]), "{map}");
+    node.shutdown().await?;
+    Ok(())
+}

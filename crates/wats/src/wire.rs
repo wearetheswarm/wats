@@ -252,6 +252,24 @@ pub fn digest(wire: &Map<String, Value>) -> Result<Digest, EventError> {
     })
 }
 
+/// The tombstone of a full event (ADR 0020): its header keys, `refs`,
+/// `ext`, `id` and `sig`, with `body_hash` in place of the body. It has the
+/// same id and the same valid signature as the full event. An event that is
+/// already a tombstone is returned as is.
+pub fn tombstone(full: &Value) -> Result<RawEvent, EventError> {
+    let Value::Object(wire) = full else {
+        return Err(invalid("an event is a JSON object"));
+    };
+    let body_hash = digest(wire)?.body_hash;
+    let mut t: Map<String, Value> = wire
+        .iter()
+        .filter(|(key, _)| is_structural_key(key))
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect();
+    t.insert(BODY_HASH_KEY.into(), Value::String(body_hash));
+    RawEvent::from_value(Value::Object(t))
+}
+
 fn kind_token_ok(kind: &str) -> bool {
     !kind.is_empty()
         && kind.len() <= MAX_KIND_BYTES
@@ -699,6 +717,44 @@ mod tests {
             AnyEvent::from_value(value).unwrap(),
             AnyEvent::Known(_)
         ));
+    }
+
+    #[test]
+    fn tombstones_keep_the_id_and_the_signature() {
+        let event = Draft {
+            net: "public".into(),
+            kind: Some(Kind::Ask),
+            tags: vec!["cap:pdf".into()],
+            title: Some("secret".into()),
+            text: "a body to drop".into(),
+            refs: vec!["ab".repeat(32)],
+            ..Draft::default()
+        }
+        .sign(&key(), 1_760_500_000, 4)
+        .unwrap();
+        let full = serde_json::to_value(&event).unwrap();
+        let t = tombstone(&full).unwrap();
+        assert!(t.tombstoned);
+        assert_eq!(t.id, event.id);
+        assert_eq!(t.refs, event.refs);
+        assert_eq!(
+            t.wire.get(BODY_HASH_KEY),
+            Some(&json!(digest(full.as_object().unwrap()).unwrap().body_hash))
+        );
+        for gone in ["title", "text", "tags", "data", "blobs"] {
+            assert!(!t.wire.contains_key(gone), "{gone}");
+        }
+        // Verifies, and is opaque to readers.
+        match AnyEvent::from_value(t.to_value()).unwrap() {
+            AnyEvent::Opaque(raw) => assert!(raw.signature_checked),
+            AnyEvent::Known(_) => panic!("a tombstone is opaque"),
+        }
+        // Idempotent; v3 events (with `ext`) too.
+        assert_eq!(tombstone(&t.to_value()).unwrap(), t);
+        let v3 = v3_event();
+        let t3 = tombstone(&v3).unwrap();
+        assert_eq!(t3.id, v3["id"]);
+        assert!(t3.wire.contains_key(EXT_KEY));
     }
 
     #[test]
