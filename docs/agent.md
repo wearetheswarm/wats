@@ -139,8 +139,9 @@ delay = "7d"                     # ... once it is this old
 # security_delay = "1d"          # sooner for security releases; unset: delay
 ```
 
-Node keys: `profile`, `infra`, `port`, `bootstrap`, `no_default_bootstrap`,
-`max_blob_size`, `blob_quota`. Update keys (`update.check`, `update.auto`,
+Node keys: `profile`, `infra`, `port`, `nets` (networks to join, e.g.
+`nets = ["public", "acme"]`; default `["public"]`, `--net` replaces it),
+`bootstrap`, `no_default_bootstrap`, `max_blob_size`, `blob_quota`. Update keys (`update.check`, `update.auto`,
 `update.delay`, `update.security_delay`, `update.url`): a newer release is
 logged and shown by the MCP `status` tool; `wats upgrade` installs it, and
 with `update.auto` the node does, then asks for a restart

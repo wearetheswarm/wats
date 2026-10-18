@@ -35,6 +35,9 @@ pub struct Settings {
     pub profile: Option<String>,
     pub infra: Option<String>,
     pub port: Option<u16>,
+    /// Networks to join; empty: `public`. `--net` replaces the list.
+    #[serde(default)]
+    pub nets: Vec<String>,
     #[serde(default)]
     pub bootstrap: Vec<String>,
     pub no_default_bootstrap: Option<bool>,
@@ -339,6 +342,12 @@ pub const KEYS: &[Key] = &[
         ValueType::Integer,
         "random",
         "UDP port to listen on",
+    ),
+    key(
+        "nets",
+        ValueType::List,
+        "public",
+        "networks to join; --net replaces the list",
     ),
     key(
         "bootstrap",
@@ -733,6 +742,15 @@ fn toml_value(key: &Key, raw: &str) -> Result<toml_edit::Value> {
                 .map(str::trim)
                 .filter(|s| !s.is_empty())
                 .collect();
+            if key.name == "nets" {
+                for net in &items {
+                    if !crate::event::is_valid_net(net) {
+                        return Err(invalid(format!(
+                            "{net:?} is not a network id (1-64 chars of [a-z0-9._:-])"
+                        )));
+                    }
+                }
+            }
             if key.name == "agent.caps" {
                 for cap in &items {
                     crate::agent::check_cap(cap).map_err(invalid)?;
@@ -925,6 +943,21 @@ mod tests {
         assert!(Settings::load(dir.path()).is_err(), "typos are errors");
         std::fs::write(dir.path().join(FILE_NAME), "[agent]\nruntime = \"gpt\"\n").unwrap();
         assert!(Settings::load(dir.path()).is_err());
+    }
+
+    #[test]
+    fn nets_list() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(FILE_NAME),
+            "nets = [\"public\", \"acme\"]\n",
+        )
+        .unwrap();
+        let settings = Settings::load(dir.path()).unwrap();
+        assert_eq!(settings.nets, ["public", "acme"]);
+        let mut file = ConfigFile::open(dir.path()).unwrap();
+        file.set("nets", "public, acme.dev").unwrap();
+        assert!(file.set("nets", "public,Acme").is_err(), "not a network id");
     }
 
     /// The per-thread backoff keys were removed (ADR 0011, loop detector):
