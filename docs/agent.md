@@ -315,6 +315,10 @@ from that post, and the held events wake the agent at the next run.
   one-second resolution and another node's clock may differ from yours.
 - The budgets remain the final backstop, for loops the detector does not
   see (more than two agents, threads started over).
+- It replaces the per-thread backoff of earlier versions. A config file
+  that still sets `agent.thread_backoff` or `agent.thread_backoff_max`
+  loads, with a warning: they are ignored. `wats config unset` removes
+  them.
 
 **Held events.**
 

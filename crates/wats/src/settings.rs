@@ -129,6 +129,12 @@ pub struct AgentSettings {
     pub max_runs_per_hour: Option<usize>,
     pub wakes_per_author_per_hour: Option<usize>,
     pub loop_max_exchanges: Option<usize>,
+    /// Removed keys ([`REMOVED_KEYS`]): still accepted, ignored, with a
+    /// warning.
+    #[serde(default)]
+    pub thread_backoff: Option<serde::de::IgnoredAny>,
+    #[serde(default)]
+    pub thread_backoff_max: Option<serde::de::IgnoredAny>,
     #[serde(default)]
     pub allow: Vec<String>,
     pub heartbeat_file: Option<PathBuf>,
@@ -172,6 +178,9 @@ impl Settings {
             crate::agent::check_cap(cap)
                 .map_err(|why| anyhow::anyhow!("{}: agent.caps: {why}", path.display()))?;
         }
+        for name in settings.removed_keys() {
+            warn_removed(name);
+        }
         if let Some(dir) = &settings.agent.workdir {
             settings.agent.workdir = Some(data_dir.join(dir));
         }
@@ -179,6 +188,40 @@ impl Settings {
             settings.agent.heartbeat_file = Some(data_dir.join(file));
         }
         Ok(settings)
+    }
+
+    /// The [`REMOVED_KEYS`] set in the file.
+    pub fn removed_keys(&self) -> Vec<&'static str> {
+        let set = [
+            self.agent.thread_backoff.is_some(),
+            self.agent.thread_backoff_max.is_some(),
+        ];
+        REMOVED_KEYS
+            .iter()
+            .zip(set)
+            .filter_map(|(name, set)| set.then_some(*name))
+            .collect()
+    }
+}
+
+/// Keys that are no longer used: a file that sets them still loads (they
+/// are ignored, with a warning), `wats config set` refuses them, and
+/// `wats config unset` removes them.
+pub const REMOVED_KEYS: [&str; 2] = ["agent.thread_backoff", "agent.thread_backoff_max"];
+
+/// Why a removed key is ignored.
+pub fn removed_key_message(name: &str) -> String {
+    format!("{name} is no longer used (loop detector, ADR 0011); remove it")
+}
+
+/// Log once per process that a removed key is set.
+fn warn_removed(name: &'static str) {
+    static WARNED: std::sync::Mutex<Vec<&'static str>> = std::sync::Mutex::new(Vec::new());
+    if let Ok(mut warned) = WARNED.lock()
+        && !warned.contains(&name)
+    {
+        warned.push(name);
+        tracing::warn!("{}", removed_key_message(name));
     }
 }
 
@@ -640,6 +683,9 @@ impl ConfigFile {
     }
 
     pub fn set(&mut self, name: &str, raw: &str) -> Result<()> {
+        if REMOVED_KEYS.contains(&name) {
+            bail!("{}", removed_key_message(name));
+        }
         let key = find_key(name)?;
         let value = toml_value(key, raw)?;
         let (table, leaf) = Self::split(name);
@@ -663,7 +709,9 @@ impl ConfigFile {
 
     /// Remove a key; returns whether it was set.
     pub fn unset(&mut self, name: &str) -> Result<bool> {
-        find_key(name)?;
+        if !REMOVED_KEYS.contains(&name) {
+            find_key(name)?;
+        }
         let (table, leaf) = Self::split(name);
         Ok(match table {
             Some(t) => self
@@ -765,6 +813,34 @@ mod tests {
         assert!(Settings::load(dir.path()).is_err());
     }
 
+    /// The per-thread backoff keys were removed (ADR 0011, loop detector):
+    /// a file that still sets them loads, and they can be unset.
+    #[test]
+    fn removed_keys_still_load_and_can_be_unset() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(FILE_NAME),
+            "[agent]\nruntime = \"claude\"\nthread_backoff = \"1m\"\nthread_backoff_max = \"1h\"\n",
+        )
+        .unwrap();
+        let settings = Settings::load(dir.path()).unwrap();
+        assert_eq!(settings.agent.runtime.as_deref(), Some("claude"));
+        assert_eq!(settings.removed_keys(), REMOVED_KEYS);
+        assert_eq!(settings.agent.loop_max_exchanges, None);
+        let mut file = ConfigFile::open(dir.path()).unwrap();
+        for removed in REMOVED_KEYS {
+            assert!(file.unset(removed).unwrap());
+        }
+        file.save().unwrap();
+        assert!(
+            Settings::load(dir.path())
+                .unwrap()
+                .removed_keys()
+                .is_empty()
+        );
+        assert!(Settings::default().removed_keys().is_empty());
+    }
+
     #[test]
     fn edits_keep_comments_and_check_values() {
         let dir = tempfile::tempdir().unwrap();
@@ -780,7 +856,10 @@ mod tests {
         file.set("agent.wakes_per_author_per_hour", "0").unwrap();
         file.set("agent.loop_max_exchanges", "0").unwrap();
         assert!(file.set("agent.loop_max_exchanges", "many").is_err());
-        assert!(file.set("agent.thread_backoff", "1m").is_err(), "removed");
+        for removed in REMOVED_KEYS {
+            let err = file.set(removed, "1m").unwrap_err().to_string();
+            assert_eq!(err, removed_key_message(removed));
+        }
         file.set("no_default_bootstrap", "yes").unwrap();
         assert!(file.set("agent.every", "soon").is_err());
         assert!(file.set("agent.runtime", "gpt").is_err());
