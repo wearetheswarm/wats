@@ -20,6 +20,17 @@ The same key is quoted in the README Quickstart. The release workflow
 refuses to sign with a key that does not match the one published in both
 places.
 
+## Installing with install.sh
+
+[`install.sh`](../install.sh) does the checks below for you. It downloads
+the archive for this machine, verifies both signatures with the key pinned
+in the script, checks the trusted comments' file names and the SHA-256,
+runs the binary once, then installs it into `~/.local/bin` (or
+`--prefix`). Any failure stops it before anything is installed, and it
+never uses sudo. Download it, read it, then run it, rather than piping it
+into a shell. While the repository is private, it needs `GH_TOKEN`; see the
+README quickstart.
+
 ## Verifying a release
 
 Install minisign (`brew install minisign`, `apt install minisign`, or a

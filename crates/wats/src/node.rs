@@ -1225,12 +1225,25 @@ impl Node {
         token
     }
 
-    /// The run a token belongs to, while it runs.
+    /// The run a token belongs to, while it runs. The persistent token of
+    /// OpenClaw's `wats-agent` MCP entry (`openclaw/runner.token`, ADR 0017
+    /// §3) is valid as long as its file exists: OpenClaw starts that MCP
+    /// server itself, outside any run.
     pub fn runner_run(&self, token: &str) -> Option<RunnerRun> {
-        self.runner_tokens
+        if let Some(run) = self
+            .runner_tokens
             .lock()
             .ok()
             .and_then(|tokens| tokens.get(token).cloned())
+        {
+            return Some(run);
+        }
+        crate::openclaw::is_persistent_runner_token(&self.config.data_dir, token).then(|| {
+            RunnerRun {
+                id: "openclaw".into(),
+                events: Vec::new(),
+            }
+        })
     }
 
     pub fn end_runner_token(&self, token: &str) {

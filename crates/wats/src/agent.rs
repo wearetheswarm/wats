@@ -8,6 +8,9 @@
 //! the heartbeat is due. One run at a time, each with a timeout, a cap on
 //! runs per hour, a wake limit per author and a loop detector per thread
 //! (see [`crate::wake`]). Every run leaves a transcript (see [`crate::runs`]).
+//!
+//! With the `openclaw` runtime, a run spawns nothing: it is forwarded to
+//! the OpenClaw gateway (see [`crate::openclaw`]), one thread per run.
 
 use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
@@ -97,6 +100,8 @@ pub struct AgentConfig {
     /// `keep_days`, are deleted.
     pub keep_runs: usize,
     pub keep_days: u64,
+    /// With the `openclaw` runtime: the gateway the runs are forwarded to.
+    pub openclaw: crate::openclaw::Target,
 }
 
 /// Why a run happened.
@@ -376,12 +381,126 @@ async fn announce_if_changed(node: &Arc<Node>, config: &AgentConfig) {
 /// A run in progress.
 struct Running {
     record: RunRecord,
-    /// Marks the run's MCP session as a runner session.
-    token: String,
-    child: tokio::process::Child,
+    /// Marks the run's MCP session as a runner session (OpenClaw's has a
+    /// persistent token instead).
+    token: Option<String>,
+    work: Work,
     started: Instant,
     deadline: tokio::time::Instant,
     transcript: PathBuf,
+    /// What woke it, queued again if the OpenClaw gateway was down.
+    woke: Vec<Queued>,
+    feedback: Vec<String>,
+}
+
+/// What a run waits on: the agent CLI, or the forward to OpenClaw.
+enum Work {
+    Child(tokio::process::Child),
+    Forward(tokio::task::JoinHandle<crate::openclaw::Reply>),
+}
+
+/// A new run: its record, and its transcript with the header written.
+fn open_run(config: &AgentConfig, trigger: &Trigger) -> Result<(RunRecord, PathBuf)> {
+    let mut record = RunRecord::new(
+        &config.runtime,
+        &config.profile,
+        trigger.name(),
+        &trigger.events(),
+    );
+    record.access = config.access.to_string();
+    record.model = config.model.clone().unwrap_or_default();
+    std::fs::create_dir_all(runs::runs_dir(&config.work_dir))?;
+    let base = record.id.clone();
+    let mut n = 1;
+    while runs::transcript_path(&config.work_dir, &record.id).exists() {
+        n += 1;
+        record.id = format!("{base}-{n}");
+    }
+    let transcript = runs::transcript_path(&config.work_dir, &record.id);
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&transcript)?;
+    runs::write_line(&mut file, &record.header())?;
+    std::fs::write(runs::current_path(&config.work_dir), &record.id)?;
+    Ok((record, transcript))
+}
+
+/// Record a run that could not start.
+fn fail_run(
+    config: &AgentConfig,
+    mut record: RunRecord,
+    transcript: &std::path::Path,
+    error: &str,
+) {
+    record.status = "failed".into();
+    record.error = Some(error.to_string());
+    if let Ok(mut f) = std::fs::OpenOptions::new().append(true).open(transcript) {
+        let _ = runs::write_line(&mut f, &record.footer());
+    }
+    let _ = runs::append_index(&config.work_dir, &record);
+    let _ = std::fs::remove_file(runs::current_path(&config.work_dir));
+}
+
+/// Start one OpenClaw run: post the wake to the gateway (ADR 0017 §2), in
+/// the session of its thread (`wats:<root>`), or `wats:heartbeat`.
+fn start_forward(
+    config: &AgentConfig,
+    trigger: &Trigger,
+    prompt: &str,
+    thread: Option<&str>,
+    isolated: &Arc<std::sync::atomic::AtomicBool>,
+) -> Result<Running> {
+    use crate::openclaw;
+    let (record, transcript) = open_run(config, trigger)?;
+    let token = match openclaw::read_token(&config.openclaw.token_file) {
+        Ok(token) => token,
+        Err(e) => {
+            let error =
+                format!("no OpenClaw hook token ({e:#}): run `wats setup openclaw --agent`");
+            fail_run(config, record, &transcript, &error);
+            anyhow::bail!(error);
+        }
+    };
+    let session_key = match thread {
+        Some(root) => format!("wats:{root}"),
+        None => "wats:heartbeat".to_string(),
+    };
+    let request = openclaw::Request {
+        endpoint: config.openclaw.endpoint(),
+        token,
+        run_id: record.id.clone(),
+        agent: config.openclaw.agent.clone(),
+        message: openclaw::message(prompt),
+        session_key,
+        model: config.model.clone(),
+        timeout: config.run_timeout,
+    };
+    if let Ok(mut f) = std::fs::OpenOptions::new().append(true).open(&transcript) {
+        // The message itself stays out: it can be large.
+        let _ = runs::write_line(
+            &mut f,
+            &json!({
+                "type": "openclaw_forward", "url": request.endpoint, "agentId": request.agent,
+                "sessionKey": request.session_key, "bytes": request.message.len(),
+            }),
+        );
+    }
+    let isolated = Arc::clone(isolated);
+    let task = tokio::spawn(async move { openclaw::forward(request, &isolated).await });
+    Ok(Running {
+        record,
+        token: None,
+        work: Work::Forward(task),
+        started: Instant::now(),
+        // A backstop: the HTTP request times out first.
+        deadline: tokio::time::Instant::now()
+            + openclaw::http_timeout(config.run_timeout)
+            + Duration::from_secs(5),
+        transcript,
+        woke: Vec::new(),
+        feedback: Vec::new(),
+    })
 }
 
 /// Start one run: a transcript header, then the agent CLI with its output
@@ -445,28 +564,8 @@ async fn start_run(
     prompt: String,
     remaining_usd: f64,
 ) -> Result<Running> {
-    let mut record = RunRecord::new(
-        &config.runtime,
-        &config.profile,
-        trigger.name(),
-        &trigger.events(),
-    );
-    record.access = config.access.to_string();
-    record.model = config.model.clone().unwrap_or_default();
-    std::fs::create_dir_all(runs::runs_dir(&config.work_dir))?;
-    let base = record.id.clone();
-    let mut n = 1;
-    while runs::transcript_path(&config.work_dir, &record.id).exists() {
-        n += 1;
-        record.id = format!("{base}-{n}");
-    }
-    let transcript = runs::transcript_path(&config.work_dir, &record.id);
-    let mut file = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&transcript)?;
-    runs::write_line(&mut file, &record.header())?;
-    std::fs::write(runs::current_path(&config.work_dir), &record.id)?;
+    let (record, transcript) = open_run(config, trigger)?;
+    let file = std::fs::OpenOptions::new().append(true).open(&transcript)?;
     let token = node.new_runner_token(crate::node::RunnerRun {
         id: record.id.clone(),
         events: trigger.events(),
@@ -525,13 +624,7 @@ async fn start_run(
     let mut child = match spawned {
         Ok(child) => child,
         Err(e) => {
-            record.status = "failed".into();
-            record.error = Some(e.to_string());
-            if let Ok(mut f) = std::fs::OpenOptions::new().append(true).open(&transcript) {
-                let _ = runs::write_line(&mut f, &record.footer());
-            }
-            let _ = runs::append_index(&config.work_dir, &record);
-            let _ = std::fs::remove_file(runs::current_path(&config.work_dir));
+            fail_run(config, record, &transcript, &e.to_string());
             node.end_runner_token(&token);
             return Err(e).with_context(|| format!("start {}", config.command.display()));
         }
@@ -543,34 +636,117 @@ async fn start_run(
     }
     Ok(Running {
         record,
-        token,
-        child,
+        token: Some(token),
+        work: Work::Child(child),
         started: Instant::now(),
         deadline: tokio::time::Instant::now() + config.run_timeout,
         transcript,
+        woke: Vec::new(),
+        feedback: Vec::new(),
     })
 }
 
 /// How a run ended.
 enum Outcome {
     Exited(Option<i32>),
+    Forwarded(crate::openclaw::Reply),
     TimedOut,
     Stopped,
 }
 
-/// Close a run: kill it if needed, write the transcript footer and the
-/// index record, prune old transcripts.
-async fn finish_run(node: &Node, config: &AgentConfig, mut running: Running, outcome: Outcome) {
-    node.end_runner_token(&running.token);
-    if !matches!(outcome, Outcome::Exited(_)) {
-        let _ = running.child.kill().await;
+/// What the loop does after a run.
+enum Finished {
+    Done,
+    /// The OpenClaw gateway was down: queue the wake again.
+    Deferred(String),
+    /// No run before this (the gateway's `Retry-After`).
+    Backoff(Duration),
+}
+
+/// `completion.status` as a run status.
+fn completion_status(completion: Option<&str>) -> &'static str {
+    match completion.map(str::to_ascii_lowercase).as_deref() {
+        Some("error" | "failed" | "failure" | "aborted" | "cancelled") => "error",
+        Some("timeout" | "timed_out" | "timedout") => "timeout",
+        _ => "ok",
     }
+}
+
+/// Close a run: kill it if needed, write the transcript footer and the
+/// index record, prune old transcripts. A deferred OpenClaw run leaves no
+/// record: it is retried.
+async fn finish_run(
+    node: &Node,
+    config: &AgentConfig,
+    running: Running,
+    outcome: Outcome,
+) -> Finished {
+    use crate::openclaw::Reply;
+    if let Some(token) = &running.token {
+        node.end_runner_token(token);
+    }
+    match running.work {
+        Work::Child(mut child) => {
+            if !matches!(outcome, Outcome::Exited(_)) {
+                let _ = child.kill().await;
+            }
+        }
+        Work::Forward(task) => task.abort(),
+    }
+    let mut finished = Finished::Done;
     let mut record = running.record;
     record.seconds = Some(running.started.elapsed().as_secs_f64());
     match outcome {
         Outcome::Exited(code) => record.exit = code,
+        Outcome::Forwarded(reply) => {
+            let said = match &reply {
+                Reply::Done {
+                    completion,
+                    disposition,
+                    isolated,
+                } => {
+                    record.status = completion_status(completion.as_deref()).into();
+                    record.completion = completion.clone();
+                    record.reply = disposition.clone();
+                    format!(
+                        "turn ended: completion {}, reply {}{}",
+                        completion.as_deref().unwrap_or("?"),
+                        disposition.as_deref().unwrap_or("?"),
+                        if *isolated { " (isolated session)" } else { "" }
+                    )
+                }
+                Reply::Failed { error, retry_after } => {
+                    record.status = "failed".into();
+                    record.error = Some(error.clone());
+                    if let Some(after) = retry_after {
+                        finished = Finished::Backoff(*after);
+                    }
+                    error.clone()
+                }
+                Reply::Deferred(why) => {
+                    finished = Finished::Deferred(why.clone());
+                    why.clone()
+                }
+                Reply::TimedOut => {
+                    record.status = "timeout".into();
+                    "no answer within the timeout".into()
+                }
+            };
+            if let Ok(mut f) = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&running.transcript)
+            {
+                let _ =
+                    runs::write_line(&mut f, &json!({"type": "openclaw_reply", "outcome": said}));
+            }
+        }
         Outcome::TimedOut => record.status = "timeout".into(),
         Outcome::Stopped => record.status = "stopped".into(),
+    }
+    if matches!(finished, Finished::Deferred(_)) {
+        let _ = std::fs::remove_file(&running.transcript);
+        let _ = std::fs::remove_file(runs::current_path(&config.work_dir));
+        return finished;
     }
     if record.status.is_empty() {
         record.status = if record.exit == Some(0) {
@@ -581,7 +757,10 @@ async fn finish_run(node: &Node, config: &AgentConfig, mut running: Running, out
         .into();
     }
     runs::read_result(&running.transcript, &mut record);
-    if let Err(e) = crate::budget::record(&config.work_dir, record.started, record.cost_usd) {
+    // A forward the gateway refused ran no turn.
+    if record.status != "failed"
+        && let Err(e) = crate::budget::record(&config.work_dir, record.started, record.cost_usd)
+    {
         warn!("agent spend ledger: {e}");
     }
     let footer = record.footer();
@@ -604,23 +783,40 @@ async fn finish_run(node: &Node, config: &AgentConfig, mut running: Running, out
             exit = record.exit.unwrap_or(-1), turns = record.turns.unwrap_or(0), cost = %cost,
             "agent run"
         ),
-        status => {
-            warn!(run = %record.id, seconds = record.seconds.unwrap_or(0.0), "agent run {status}")
-        }
+        status => match &record.error {
+            Some(error) if record.runtime == "openclaw" => warn!(
+                run = %record.id, seconds = record.seconds.unwrap_or(0.0),
+                "agent run {status}: {error}"
+            ),
+            _ => {
+                warn!(run = %record.id, seconds = record.seconds.unwrap_or(0.0), "agent run {status}")
+            }
+        },
     }
     if let Err(e) = runs::prune(&config.work_dir, config.keep_runs, config.keep_days) {
         warn!("agent runs retention: {e}");
     }
+    finished
 }
 
 async fn wait_running(running: &mut Option<Running>) -> Outcome {
     let Some(running) = running.as_mut() else {
         return std::future::pending().await;
     };
-    match tokio::time::timeout_at(running.deadline, running.child.wait()).await {
-        Ok(Ok(status)) => Outcome::Exited(status.code()),
-        Ok(Err(_)) => Outcome::Exited(None),
-        Err(_) => Outcome::TimedOut,
+    match &mut running.work {
+        Work::Child(child) => match tokio::time::timeout_at(running.deadline, child.wait()).await {
+            Ok(Ok(status)) => Outcome::Exited(status.code()),
+            Ok(Err(_)) => Outcome::Exited(None),
+            Err(_) => Outcome::TimedOut,
+        },
+        Work::Forward(task) => match tokio::time::timeout_at(running.deadline, task).await {
+            Ok(Ok(reply)) => Outcome::Forwarded(reply),
+            Ok(Err(e)) => Outcome::Forwarded(crate::openclaw::Reply::Failed {
+                error: format!("forward task: {e}"),
+                retry_after: None,
+            }),
+            Err(_) => Outcome::TimedOut,
+        },
     }
 }
 
@@ -786,9 +982,29 @@ pub async fn run(
     let mut running: Option<Running> = None;
     let mut capped = false;
     let mut paused_until: Option<u64> = None;
+    let openclaw = config.runtime == "openclaw";
+    // OpenClaw: the gateway refused caller session keys (for the process).
+    let isolated = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    // OpenClaw: the gateway was down at the last run (logged once).
+    let mut gateway_down = false;
+    // OpenClaw: no run before this (`Retry-After`).
+    let mut backoff_until: Option<Instant> = None;
     let mut tick = tokio::time::interval(Duration::from_secs(1));
     tokio::pin!(shutdown);
     info!(runtime = %config.runtime, profile = %config.profile, author = %me, "agent runner started");
+    if openclaw {
+        info!(
+            gateway = %config.openclaw.url, agent_id = %config.openclaw.agent,
+            "agent runs are forwarded to OpenClaw (POST /hooks/agent)"
+        );
+        info!("{}", crate::openclaw::SPEND_CAPS);
+        if crate::openclaw::read_token(&config.openclaw.token_file).is_err() {
+            warn!(
+                "no OpenClaw hook token in {}: runs will fail until `wats setup openclaw --agent`",
+                config.openclaw.token_file.display()
+            );
+        }
+    }
 
     loop {
         tokio::select! {
@@ -799,8 +1015,45 @@ pub async fn run(
                 break;
             }
             outcome = wait_running(&mut running) => {
-                if let Some(run) = running.take() {
-                    finish_run(&node, &config, run, outcome).await;
+                if let Some(mut run) = running.take() {
+                    let woke = std::mem::take(&mut run.woke);
+                    let taken = std::mem::take(&mut run.feedback);
+                    match finish_run(&node, &config, run, outcome).await {
+                        Finished::Deferred(why) => {
+                            // Not a run: it does not count, and what woke
+                            // it waits for the next one.
+                            runs.pop_back();
+                            if !gateway_down {
+                                warn!(
+                                    "agent run deferred: {why}; {} events kept for the next run",
+                                    woke.len()
+                                );
+                                gateway_down = true;
+                            }
+                            let mut queue: Vec<Queued> = woke
+                                .into_iter()
+                                .map(|q| Queued { held: None, ..q })
+                                .collect();
+                            queue.retain(|q| !pending.iter().any(|p| p.id == q.id));
+                            queue.append(&mut pending);
+                            pending = queue;
+                            for id in taken.into_iter().rev() {
+                                if !feedback.contains(&id) {
+                                    feedback.insert(0, id);
+                                }
+                            }
+                        }
+                        Finished::Backoff(after) => {
+                            gateway_down = false;
+                            warn!("agent runs paused for {} s (the gateway's Retry-After)", after.as_secs());
+                            backoff_until = Some(Instant::now() + after);
+                        }
+                        Finished::Done => {
+                            if std::mem::take(&mut gateway_down) {
+                                info!("the OpenClaw gateway answers again");
+                            }
+                        }
+                    }
                 }
             }
             event = events.recv() => match event {
@@ -840,12 +1093,29 @@ pub async fn run(
                 }
                 let unix_now = unix_now();
                 wakes.prune(unix_now);
+                if backoff_until.is_some_and(|t| now < t) {
+                    continue;
+                }
                 let debounced = last_run.is_none_or(|t| now.duration_since(t) >= config.every);
                 // Events stay queued until a run actually starts with them.
-                let ready = if debounced {
+                let mut ready = if debounced {
                     ready(&node, &me, &mut pending, &wakes, &config.wakes, unix_now)
                 } else {
                     Vec::new()
+                };
+                // OpenClaw: one session per thread, so one thread per run;
+                // the others wait for the next run.
+                let thread = if openclaw && !ready.is_empty() {
+                    let root = pending
+                        .iter()
+                        .find(|q| q.id == ready[0].0)
+                        .map(|q| q.thread.clone());
+                    ready.retain(|(id, _)| {
+                        pending.iter().any(|q| &q.id == id && Some(&q.thread) == root.as_ref())
+                    });
+                    root
+                } else {
+                    None
                 };
                 let trigger = if !ready.is_empty() {
                     Some(Trigger::Events(ready))
@@ -885,7 +1155,8 @@ pub async fn run(
                     }
                 };
                 let mut text = prompt(&node, &config, since, &trigger);
-                text.push_str(&feedback_section(&node, &std::mem::take(&mut feedback)));
+                let taken = std::mem::take(&mut feedback);
+                text.push_str(&feedback_section(&node, &taken));
                 // What the human said about the posts they rejected.
                 if let Some(data_dir) = config.work_dir.parent() {
                     let feedback = crate::review::take_feedback(data_dir);
@@ -897,10 +1168,12 @@ pub async fn run(
                 }
                 // Everything up to now is covered by this run.
                 since = node.store().last_seq()?;
+                let mut woke = Vec::new();
                 if let Trigger::Events(ids) = &trigger {
                     let ids: std::collections::HashSet<&str> =
                         ids.iter().map(|(id, _)| id.as_str()).collect();
-                    let (woke, kept): (Vec<Queued>, Vec<Queued>) = std::mem::take(&mut pending)
+                    let kept;
+                    (woke, kept) = std::mem::take(&mut pending)
                         .into_iter()
                         .partition(|q| ids.contains(q.id.as_str()));
                     pending = kept;
@@ -910,8 +1183,17 @@ pub async fn run(
                 last_run = Some(now);
                 last_heartbeat = now;
                 info!(trigger = %trigger.label(), "waking the agent");
-                match start_run(&node, &config, &trigger, text, remaining_usd).await {
-                    Ok(run) => running = Some(run),
+                let started = if openclaw {
+                    start_forward(&config, &trigger, &text, thread.as_deref(), &isolated)
+                } else {
+                    start_run(&node, &config, &trigger, text, remaining_usd).await
+                };
+                match started {
+                    Ok(mut run) => {
+                        run.woke = woke;
+                        run.feedback = taken;
+                        running = Some(run);
+                    }
                     Err(e) => warn!(trigger = %trigger.label(), "agent run failed to start: {e:#}"),
                 }
             }

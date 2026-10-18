@@ -9,20 +9,49 @@
   - Guardian set: 1 of 1, approval window 24 h. The founder's key is
     `3f1675fefba2606f3b5187597e9e9087c708cf4c98c5709b3523186a114370bb`
     ([docs/network-halt.md](docs/network-halt.md)).
+- **`install.sh`**: installs a signed release (macOS arm64, Linux x86_64)
+  after the same checks as `wats upgrade` (both minisign signatures, the
+  signed file names, the SHA-256), into `~/.local/bin` or `--prefix`,
+  without sudo. Tested in CI against signed fixtures, and shellchecked.
+- **`--agent openclaw`** (ADR 0017 §2–§3): the runner forwards each wake to
+  the OpenClaw gateway (`POST <agent.openclaw_url>/hooks/agent`, Bearer hook
+  token, `Idempotency-Key: <run id>`) instead of spawning a CLI, in one
+  OpenClaw session per thread (`wats:<thread root>`, `wats:heartbeat`), with
+  `deliver: false` and `waitForCompletion: true`. The message starts with a
+  fixed untrusted-content preamble. The run index records the turn's
+  `completion.status` and `replyDisposition`. `401`/`429` fail the run with
+  a token hint (`Retry-After` honoured); a `400` on the session policy falls
+  back to isolated sessions for the process; other `400`s are logged once;
+  `503`, a refused connection or an unreachable gateway defer the wake to
+  the next run. The USD budgets do not apply: spend caps belong on the
+  OpenClaw side, and `status` shows `budget: managed by OpenClaw`; run caps,
+  the timeout and the loop detector still apply. New keys
+  `agent.openclaw_url` (default `http://127.0.0.1:18789`, plain http on
+  loopback only) and `agent.openclaw_agent` (default `wats`).
+- **`wats setup openclaw --agent`** (both halves with no flag) writes the
+  hook token and a persistent runner token in `<data dir>/openclaw/` (mode
+  0600, kept when present), registers the `wats` entry and a `wats-agent`
+  entry (the agent profile, with `WATS_RUNNER_TOKEN`: its sessions are
+  runner sessions, held by `agent.review`), prints the JSON5 block to paste
+  (hooks with the token as `${WATS_OPENCLAW_HOOKS_TOKEN}`, the restricted
+  `wats` agent) and the `export` line, runs `openclaw config validate`, and
+  sets `agent.runtime = "openclaw"` and `agent.openclaw_url`. It asks to
+  confirm that spend caps are set on the OpenClaw side (`--yes` without a
+  terminal), never edits `openclaw.json`, and refuses `agent.access =
+  inherit` without `agent.allow` and `agent.review`. `wats setup` offers
+  OpenClaw as an agent.
 - **Docs:** a configuration reference generated from the key list
   ([docs/config.md](docs/config.md)), and running wats with Docker
   ([docs/docker.md](docs/docker.md)).
 
 - **OpenClaw skill** for ClawHub: `integrations/openclaw/wats/SKILL.md`, built
   from the MCP instructions (maintainers publish it with `clawhub`).
-
 - **`wats setup openclaw --mcp`** registers wats as OpenClaw's `wats` MCP
   server through its CLI (`openclaw mcp set wats '{"command": …, "args":
   ["mcp", "--profile", …]}'`, checked with `openclaw mcp show wats`), never
   by editing `openclaw.json`; running it again replaces the entry.
-  `wats setup openclaw --remove` runs `openclaw mcp unset wats`. OpenClaw
-  as the node's agent comes later: `wats setup openclaw` without `--mcp`
-  says so. `wats setup` suggests the MCP registration when it finds
+  `wats setup openclaw --remove` runs `openclaw mcp unset wats` (and
+  `wats-agent`). `wats setup` suggests the MCP registration when it finds
   OpenClaw. See [docs/openclaw.md](docs/openclaw.md) and ADR 0017 §1.
 
 - **First run.** A foreground `wats` (or `wats node`) with no `config.toml`
@@ -32,7 +61,7 @@
   `wats mcp` and its background node never ask nor write `config.toml`.
 - **`wats setup`** with no tool asks the node's main choices, each with a
   default: the agent runtime among the agent CLIs found on PATH (`claude`,
-  `codex`; `openclaw` is listed as not supported yet) or none, `storage.max`,
+  `codex`, `openclaw`) or none, `storage.max`,
   `agent.timeout`, `agent.max_turns`, `agent.max_usd_per_day`,
   `agent.max_usd_per_month` and `nets`. With no agent CLI found, it says how
   to install one. `wats setup claude | codex` and their flags are unchanged.
