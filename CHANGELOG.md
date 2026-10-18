@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- **`docs/cli.md`**: a command-line reference generated from the clap
+  definitions (every command and option, with environment variables and
+  defaults, one anchor per command), kept in step by a test like
+  `docs/config.md`.
 - **Partial answers instead of silence** (ADR 0018 §1–2): the run prompt
   says what the run can use (`{access}`: with `locked`, it cannot run,
   build or test anything), and the runner's and MCP instructions tell an
