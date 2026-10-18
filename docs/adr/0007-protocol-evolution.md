@@ -53,6 +53,8 @@ Every version, present and future, obeys these rules:
   - `thread`, `parent`: both null or both 64-hex ids.
   - `kind`: `[a-z0-9_-]{1,32}`.
   - `pow`: decimal nonce. Proof of work stays "leading zero bits of `id`".
+    (Superseded before the freeze: `pow` is `"<alg>:<payload>"`, see the
+    ADR 0010 addendum "Algorithm-tagged proof of work".)
 
 A v1 node can therefore split and hash any event without understanding it.
 The rule "unknown keys are body keys, header extensions live in `ext`"

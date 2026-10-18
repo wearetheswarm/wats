@@ -17,7 +17,12 @@
 //! - **Hashing**, BLAKE3 in key-derivation mode for domain separation:
 //!   `body = hex(BLAKE3-derive("wats event body v1", JCS(body)))` and
 //!   `id = BLAKE3-derive("wats event id v1", JCS(header + body))`.
-//!   Proof of work is the number of leading zero bits of `id`.
+//! - **Proof of work** is tagged with its algorithm: `pow` is
+//!   `"<alg>:<payload>"`, `alg` 1-16 chars of `[a-z0-9]`, `payload` 1-2048
+//!   chars of base64url `[A-Za-z0-9_-]`. Validity checks only this syntax;
+//!   the algorithm and the difficulty are node policy. A node measures the
+//!   work of the algorithms it knows ([`POW_ALG_B3`]: the leading zero bits
+//!   of `id`) and treats an event of any other algorithm as opaque.
 //! - **Signature**: the suite (key type, signature algorithm, signed
 //!   message) is determined by `v`, one suite per version. A node relays
 //!   versions it does not understand after checking shape, id and policy,
@@ -73,6 +78,19 @@ pub const EXT_KEY: &str = "ext";
 pub const UNHASHED_KEYS: [&str; 2] = ["id", "sig"];
 /// Present instead of the body keys on a tombstoned event.
 pub const BODY_HASH_KEY: &str = "body_hash";
+/// Longest proof-of-work algorithm name, and longest payload (ADR 0010,
+/// algorithm-tagged PoW). 2 KiB of base64url holds an Equihash-size
+/// solution.
+pub const MAX_POW_ALG_BYTES: usize = 16;
+pub const MAX_POW_PAYLOAD_BYTES: usize = 2048;
+/// The first proof-of-work algorithm: the payload is a decimal nonce of
+/// 1-20 digits, and the work is the number of leading zero bits of `id`.
+pub const POW_ALG_B3: &str = "b3";
+/// Context of the challenge a later, solution-carrying algorithm hashes:
+/// `BLAKE3-derive("wats pow v1", JCS(header with pow = "<alg>:"))`, which
+/// binds the solution to the event.
+pub const POW_CHALLENGE_CONTEXT: &str = "wats pow v1";
+
 /// Reserved prefix for GREASE keys and values (ADR 0010, A8).
 pub const GREASE_PREFIX: &str = "_grease";
 
@@ -85,6 +103,36 @@ pub const MAX_KEY_HEX: usize = 8 * 1024;
 pub const MAX_SIG_HEX: usize = 64 * 1024;
 /// Longest `kind`.
 pub const MAX_KIND_BYTES: usize = 64;
+
+/// Whether `pow` has the core syntax `"<alg>:<payload>"`.
+pub fn pow_syntax_ok(pow: &str) -> bool {
+    let Some((alg, payload)) = pow.split_once(':') else {
+        return false;
+    };
+    (1..=MAX_POW_ALG_BYTES).contains(&alg.len())
+        && alg
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
+        && (1..=MAX_POW_PAYLOAD_BYTES).contains(&payload.len())
+        && payload
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+}
+
+/// The work of a proof of work this node knows how to measure, or `None`
+/// for an unknown algorithm. `b3` with a payload that is not a decimal
+/// nonce of 1-20 digits counts as no work.
+pub fn pow_work(pow: &str, id: &[u8; 32]) -> Option<u32> {
+    let (alg, payload) = pow.split_once(':')?;
+    match alg {
+        POW_ALG_B3 => {
+            let nonce_ok =
+                (1..=20).contains(&payload.len()) && payload.bytes().all(|b| b.is_ascii_digit());
+            Some(if nonce_ok { leading_zero_bits(id) } else { 0 })
+        }
+        _ => None,
+    }
+}
 
 pub fn is_grease(s: &str) -> bool {
     s.starts_with(GREASE_PREFIX)
@@ -311,8 +359,11 @@ impl RawEvent {
         if !kind_token_ok(&kind) {
             return Err(invalid("kind must be 1-64 chars of [a-z0-9._-]"));
         }
-        if pow.is_empty() || pow.len() > 20 || !pow.bytes().all(|b| b.is_ascii_digit()) {
-            return Err(invalid("pow must be a decimal nonce"));
+        if !pow_syntax_ok(&pow) {
+            return Err(invalid(
+                "pow must be \"<alg>:<payload>\": alg 1-16 chars of [a-z0-9], \
+                 payload 1-2048 chars of [A-Za-z0-9_-]",
+            ));
         }
         let refs = match wire.get(REFS_KEY) {
             Some(value) => check_refs(value)?,
@@ -360,10 +411,18 @@ impl RawEvent {
         }
     }
 
-    pub fn pow_bits(&self) -> u32 {
-        parse_hex::<32>(&self.id, "id")
-            .map(|id| leading_zero_bits(&id))
-            .unwrap_or(0)
+    /// The proof of work, `"<alg>:<payload>"`.
+    pub fn pow(&self) -> &str {
+        self.wire
+            .get("pow")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+    }
+
+    /// The work of its proof of work, `None` for an algorithm this node
+    /// does not know.
+    pub fn pow_work(&self) -> Option<u32> {
+        pow_work(self.pow(), &parse_hex::<32>(&self.id, "id").ok()?)
     }
 
     pub fn thread_root(&self) -> &str {
@@ -448,7 +507,9 @@ impl AnyEvent {
         let mut raw = RawEvent::from_value(value)?;
         raw.verify_signature()?;
         let (min, max) = UNDERSTOOD_VERSIONS;
-        if raw.tombstoned || raw.v < min || raw.v > max {
+        // An event whose proof of work this node cannot measure is opaque
+        // too, whatever its version: never shown, never taken as no work.
+        if raw.tombstoned || raw.v < min || raw.v > max || raw.pow_work().is_none() {
             return Ok(AnyEvent::Opaque(raw));
         }
         crate::event::check_v1_wire(&raw.wire)?;
@@ -484,10 +545,12 @@ impl AnyEvent {
         }
     }
 
-    pub fn pow_bits(&self) -> u32 {
+    /// The work of its proof of work, `None` for an algorithm this node
+    /// does not know (always known for a `Known` event).
+    pub fn pow_work(&self) -> Option<u32> {
         match self {
-            AnyEvent::Known(e) => e.pow_bits(),
-            AnyEvent::Opaque(r) => r.pow_bits(),
+            AnyEvent::Known(e) => Some(e.pow_bits()),
+            AnyEvent::Opaque(r) => r.pow_work(),
         }
     }
 }
@@ -514,7 +577,7 @@ pub fn sign_value(
     }
     let mut nonce: u64 = 0;
     let id = loop {
-        wire.insert("pow".into(), Value::String(nonce.to_string()));
+        wire.insert("pow".into(), Value::String(format!("{POW_ALG_B3}:{nonce}")));
         let digest = digest(&wire)?;
         if leading_zero_bits(&digest.id) >= pow_bits {
             break digest.id;
@@ -583,6 +646,50 @@ mod tests {
     }
 
     #[test]
+    fn pow_is_algorithm_tagged() {
+        for ok in [
+            "b3:0",
+            "b3:18446744073709551615",
+            "eqx:AAECAw",
+            "a:-_",
+            "z9z9z9z9z9z9z9z9:x",
+        ] {
+            assert!(pow_syntax_ok(ok), "{ok}");
+        }
+        let long_alg = format!("{}:1", "a".repeat(17));
+        let long_payload = format!("eqx:{}", "A".repeat(MAX_POW_PAYLOAD_BYTES + 1));
+        let max_payload = format!("eqx:{}", "A".repeat(MAX_POW_PAYLOAD_BYTES));
+        assert!(pow_syntax_ok(&max_payload));
+        for bad in [
+            "0",
+            "b3",
+            "b3:",
+            ":1",
+            "B3:1",
+            "b-3:1",
+            "b3:1=",
+            "b3:a+b",
+            "b3:a/b",
+            "b3:é",
+            "b3:1:2",
+            &long_alg,
+            &long_payload,
+        ] {
+            assert!(!pow_syntax_ok(bad), "{bad}");
+        }
+        let id = {
+            let mut id = [0xffu8; 32];
+            id[0] = 0;
+            id[1] = 0x0f;
+            id
+        };
+        assert_eq!(pow_work("b3:123", &id), Some(12));
+        assert_eq!(pow_work("b3:abc", &id), Some(0), "b3 needs a decimal nonce");
+        assert_eq!(pow_work(&format!("b3:{}", "1".repeat(21)), &id), Some(0));
+        assert_eq!(pow_work("eqx:AAAA", &id), None, "unknown algorithm");
+    }
+
+    #[test]
     fn future_versions_are_checked_and_kept_opaque() {
         let value = v2_event();
         let AnyEvent::Opaque(raw) = AnyEvent::from_value(value.clone()).unwrap() else {
@@ -591,7 +698,7 @@ mod tests {
         assert_eq!(raw.v, 2);
         assert!(!raw.signature_checked, "unknown suite: not checked");
         assert_eq!(raw.display_kind(), Kind::Note);
-        assert!(raw.pow_bits() >= 4);
+        assert!(raw.pow_work().unwrap() >= 4);
         for (key, new) in [
             ("options", json!(["c"])),
             ("ext", json!({"lang": "fr"})),

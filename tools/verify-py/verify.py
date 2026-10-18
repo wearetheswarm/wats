@@ -19,7 +19,8 @@ Pipeline for one event (raw bytes as received):
    body hash and id with BLAKE3-derive_key and JCS (`check_core`).
 3. Signature, only for versions whose suite is known (v1: Ed25519 over
    "wats/event/v1" || id, ZIP 215), tombstones included (`verify_signature`).
-4. v1 rules, only for v1 events that are not tombstoned (`check_v1`).
+4. v1 rules, only for v1 events that are not tombstoned and whose proof of
+   work uses an algorithm this verifier knows (`b3`) (`check_v1`).
    Everything else is accepted as opaque after steps 1-3.
 """
 
@@ -60,7 +61,14 @@ MAX_KEY_HEX = 8 * 1024
 MAX_SIG_HEX = 64 * 1024
 MAX_KIND_BYTES = 64
 MAX_NET_BYTES = 64
-MAX_POW_DIGITS = 20
+# Proof of work, "<alg>:<payload>" (wire.rs `pow_syntax_ok`).
+MAX_POW_ALG_BYTES = 16
+MAX_POW_PAYLOAD_BYTES = 2048
+POW_ALG_B3 = "b3"
+POW_ALG_CHARS = frozenset("abcdefghijklmnopqrstuvwxyz0123456789")
+POW_PAYLOAD_CHARS = frozenset(
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
+)
 MAX_SAFE_INTEGER = 2**53 - 1
 
 # --- v1 rules (event.rs) -----------------------------------------------------
@@ -305,8 +313,8 @@ def check_core(value) -> Checked:
         raise Invalid("net must be 1-64 chars of [a-z0-9._:-]")
     if not kind_token_ok(kind):
         raise Invalid("kind must be 1-64 chars of [a-z0-9._-]")
-    if pow_ == "" or len(pow_) > MAX_POW_DIGITS or not all(c in "0123456789" for c in pow_):
-        raise Invalid("pow must be a decimal nonce")
+    if not pow_syntax_ok(pow_):
+        raise Invalid("pow must be \"<alg>:<payload>\": alg 1-16 chars of [a-z0-9], payload 1-2048 chars of [A-Za-z0-9_-]")
     if REFS_KEY in wire:
         check_refs(wire[REFS_KEY])
     body_jcs, body_hash, header_jcs, computed_id = split_and_hash(wire)
@@ -325,6 +333,19 @@ def check_core(value) -> Checked:
 
 
 # --- 3. Signature suites (one per version, ADR 0010 A4) ---------------------------
+
+
+def pow_syntax_ok(pow_: str) -> bool:
+    """The core syntax of `pow` (wire.rs `pow_syntax_ok`). Validity checks
+    nothing else: the algorithm and the difficulty are node policy."""
+    alg, sep, payload = pow_.partition(":")
+    return (
+        sep == ":"
+        and 1 <= len(alg) <= MAX_POW_ALG_BYTES
+        and all(c in POW_ALG_CHARS for c in alg)
+        and 1 <= len(payload) <= MAX_POW_PAYLOAD_BYTES
+        and all(c in POW_PAYLOAD_CHARS for c in payload)
+    )
 
 
 def check_v1_key(key: bytes, what: str) -> None:
@@ -636,6 +657,8 @@ def check_event(raw: bytes) -> Checked:
     verify_signature(value, checked)
     if checked.tombstoned or checked.v != VERSION:
         return checked  # opaque: core (and known-suite signature) only
+    if value["pow"].partition(":")[0] != POW_ALG_B3:
+        return checked  # opaque: a proof of work this verifier cannot measure
     check_v1(value)
     checked.opaque = False
     return checked

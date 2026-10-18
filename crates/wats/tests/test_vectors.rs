@@ -74,8 +74,13 @@ fn reject(name: &str, rule: &str, raw: String) -> Value {
 
 /// Recompute the id and v1 signature of a modified wire event, so that only
 /// the rule under test can fail.
-fn resign(mut wire: Map<String, Value>, signer: &SigningKey) -> Value {
-    wire.insert("pow".into(), json!("0"));
+fn resign(wire: Map<String, Value>, signer: &SigningKey) -> Value {
+    resign_with_pow(wire, signer, "b3:0")
+}
+
+/// [`resign`] with a given `pow`, valid or not.
+fn resign_with_pow(mut wire: Map<String, Value>, signer: &SigningKey, pow: &str) -> Value {
+    wire.insert("pow".into(), json!(pow));
     // When the change breaks the split itself (e.g. ext in v1), there is no
     // id to recompute: keep the old one, the rule under test fails first.
     if let Ok(d) = digest(&wire) {
@@ -91,7 +96,7 @@ fn with_raw_signature(author: &str, r: &str) -> Value {
     let mut wire = obj(json!({
         "v": 1, "author": author, "ts": 1_760_700_000u64, "net": "public",
         "thread": null, "parent": null, "refs": [], "kind": "note", "tags": [],
-        "title": "ZIP 215", "text": "ZIP 215 edge case", "data": {}, "blobs": [], "pow": "0",
+        "title": "ZIP 215", "text": "ZIP 215 edge case", "data": {}, "blobs": [], "pow": "b3:0",
     }));
     let id = digest(&wire).unwrap().id;
     wire.insert("id".into(), json!(hex::encode(id)));
@@ -110,7 +115,7 @@ fn with_noncanonical_r(seed: u8) -> Value {
     let mut wire = obj(json!({
         "v": 1, "author": hex::encode(author), "ts": 1_760_700_000u64, "net": "public",
         "thread": null, "parent": null, "refs": [], "kind": "note", "tags": [],
-        "title": "ZIP 215", "text": "ZIP 215 edge case", "data": {}, "blobs": [], "pow": "0",
+        "title": "ZIP 215", "text": "ZIP 215 edge case", "data": {}, "blobs": [], "pow": "b3:0",
     }));
     let id = digest(&wire).unwrap().id;
     let r = hex::decode(IDENTITY_NONCANONICAL).unwrap();
@@ -318,6 +323,13 @@ fn valid_vectors() -> Value {
     // nodes (ADR 0010, A4). The id does not cover `sig`.
     v2_other_suite["sig"] = json!("5a".repeat(2420));
 
+    let pow_variant = |pow: &str| {
+        let mut w = obj(serde_json::to_value(&note).unwrap());
+        w.remove("id");
+        w.remove("sig");
+        resign_with_pow(w, &key(1), pow)
+    };
+
     json!({
         "description": "WeAreTheSwarm event test vectors: events every implementation must ACCEPT. \
     Rules: ADR 0007 and ADR 0010 (strict JSON input, header/body split, \
@@ -341,6 +353,8 @@ fn valid_vectors() -> Value {
             accept("zip215-noncanonical-R", "ZIP 215: an ordinary author key (seed 07); R is a non-canonical encoding of the identity (y = p + 1) and s = k * a, so the cofactored equation holds. R is hashed as received: accepted.", Some(7), with_noncanonical_r(7)),
             accept("v1-blob-url-other-scheme", "A blob URL with a scheme other than https: valid (nodes only follow https, by policy).", Some(1), serde_json::to_value(&other_scheme).unwrap()),
             accept("v1-tags-non-ascii", "Tags with non-ASCII labels: each label an IDNA2008 U-label in NFC, of one script (lang:fran\u{e7}ais is Latin; the Japanese label mixes Han, Hiragana and Katakana, which UTS #39 highly restrictive allows).", Some(1), serde_json::to_value(&unicode_tags).unwrap()),
+            accept("v1-pow-unknown-alg", "A proof of work of an algorithm this node does not know (eqx): valid, since validity checks only the syntax \"<alg>:<payload>\". A node stores and relays it as an opaque event, under the opaque quota, and never shows it nor takes it as no work.", Some(1), pow_variant("eqx:AAECAwQFBgcICQoLDA0ODw")),
+            accept("v1-pow-b3-not-decimal", "pow b3 with a payload that is not a decimal nonce: valid syntax; a node that knows b3 counts it as no work, so it passes only where no proof of work is required.", Some(1), pow_variant("b3:abc_DEF-9")),
             accept("v1-title-unicode-16", "A title with U+A7DB LATIN SMALL LETTER LAMBDA, assigned in Unicode 16.0 (unassigned in 15.1): v1 pins Unicode 16.0.0.", Some(1), serde_json::to_value(&unicode_16_title).unwrap()),
         ],
     })
@@ -365,6 +379,8 @@ fn invalid_vectors() -> Value {
         serde_json::to_string(&resign(w, &signer)).unwrap()
     };
     let raw_base = serde_json::to_string(&base).unwrap();
+    let pow_case =
+        |pow: &str| serde_json::to_string(&resign_with_pow(wire.clone(), &signer, pow)).unwrap();
 
     let mut bad_sig = wire.clone();
     let mut sig = hex::decode(bad_sig["sig"].as_str().unwrap()).unwrap();
@@ -529,6 +545,13 @@ fn invalid_vectors() -> Value {
             reject("blob-name-windows-reserved-ext", "v1: a blob name is not a Windows device name, with or without an extension (here nul.txt)", modified(&|w| {
                 w.insert("blobs".into(), json!([{"hash": "ab".repeat(32), "name": "nul.txt", "size": 1, "url": null}]));
             })),
+            reject("pow-bare-decimal", "pow is \"<alg>:<payload>\": the bare decimal nonce of earlier drafts is invalid", pow_case("0")),
+            reject("pow-empty-payload", "pow payload is 1-2048 chars", pow_case("b3:")),
+            reject("pow-empty-alg", "pow alg is 1-16 chars of [a-z0-9]", pow_case(":123")),
+            reject("pow-alg-uppercase", "pow alg is 1-16 chars of [a-z0-9]", pow_case("B3:123")),
+            reject("pow-alg-too-long", "pow alg is at most 16 chars", pow_case(&format!("{}:1", "a".repeat(17)))),
+            reject("pow-payload-not-base64url", "pow payload is base64url [A-Za-z0-9_-], no padding (here +, / and =)", pow_case("eqx:ab+/cd==")),
+            reject("pow-payload-too-long", "pow payload is at most 2048 chars", pow_case(&format!("eqx:{}", "A".repeat(2049)))),
             reject("blob-name-trailing-dot", "v1: a blob name does not end with a dot or a space", modified(&|w| {
                 w.insert("blobs".into(), json!([{"hash": "ab".repeat(32), "name": "report.", "size": 1, "url": null}]));
             })),

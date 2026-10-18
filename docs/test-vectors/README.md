@@ -14,13 +14,16 @@ format. The rules are in [ADR 0002](../adr/0002-event-format-v1.md),
   - future-version events that v1 nodes relay without understanding them,
     including one with a signature of another suite;
   - a tombstone;
+  - proofs of work: an unknown algorithm (valid, opaque) and a `b3` payload
+    that is not a decimal nonce (valid, no work);
   - ZIP 215 edge cases: an order-8 key, and non-canonical `R` and `A`.
 - [`events-invalid.json`](events-invalid.json) lists events every
   implementation must **reject**, as the exact JSON text received. Each case
   names the rule it breaks: signature, malleated `s`, bare-id signature, id
   mismatch, duplicate key, float, exponent, unsafe integer, lone surrogate,
   depth bombs, unknown kind, unknown field, `ext` in v1, the `refs` rules,
-  `rotate` without a new key, uppercase hex.
+  `rotate` without a new key, uppercase hex, and `pow` syntax (a bare decimal
+  nonce, empty or malformed `alg` and payload, a payload over 2048 chars).
 
 Both files are generated and checked by `crates/wats/tests/test_vectors.rs`.
 While the format is provisional, regenerate them with:

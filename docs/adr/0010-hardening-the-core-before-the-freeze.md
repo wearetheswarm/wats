@@ -368,10 +368,52 @@ characters) and bidi tricks (`invoice\u{202E}fdp.exe` displays as
   Rust and Python agreed on about 180,000 random tags, titles, blob names
   and NFC inputs.
 
+### Algorithm-tagged proof of work (addendum, 2026-10-18)
+
+Decided by Vincent before the freeze: the proof of work must be able to
+evolve, toward an Equi-X-like puzzle under a permissive license, without
+another core change.
+
+- **Core syntax.** `pow` is `"<alg>:<payload>"`:
+  - `alg`: 1-16 chars of `[a-z0-9]`;
+  - `payload`: 1-2048 chars of base64url `[A-Za-z0-9_-]`, no padding.
+    2 KiB holds an Equihash-size solution (1,344 bytes for (200, 9), 1,792
+    chars), and Equi-X needs 16 bytes.
+
+  The bare decimal nonce of earlier drafts is invalid: the network is
+  reset before the soft freeze (store schema 4 drops stored events).
+- **Validity checks only this syntax.** The algorithm and the difficulty
+  are node policy.
+- **The first algorithm is `b3`.** The payload is a decimal nonce of 1-20
+  digits, and the work is the number of leading zero bits of `id`, as
+  before. A `b3` payload that is not such a nonce counts as no work.
+- **An unknown algorithm** is never measured and never taken as no work:
+  - the node treats the event as opaque, like an event of an unknown
+    version (ADR 0007): stored byte for byte, relayed, never indexed or
+    shown, counted in the opaque quota;
+  - a release that learns the algorithm re-validates those rows at start
+    and upgrades the valid ones;
+  - the opaque quota and the per-peer rate limits are what bound such
+    events, since their work cannot be checked.
+- **Transition to a new algorithm** mirrors ADR 0007's version rule:
+  publishers keep producing the old algorithm until most nodes understand
+  the new one, then switch. A node may accept both for as long as it
+  wants.
+- **A solution-carrying algorithm** (an asymmetric puzzle such as Equi-X)
+  binds its solution to the event by solving for the challenge
+  `BLAKE3-derive_key("wats pow v1", JCS(header with pow = "<alg>:"))`: the
+  header with everything but the payload. Its work is then the puzzle's,
+  not the leading zero bits of `id`. `b3` needs no challenge: its nonce is
+  hashed into `id` directly.
+- **Vectors**: accept an unknown algorithm (opaque) and a `b3` with a
+  non-decimal payload. Reject a bare decimal nonce, an empty `alg` or
+  payload, an uppercase or 17-char `alg`, a payload with `+`, `/` or `=`,
+  and a 2,049-char payload.
+
 ### Process
 
-- **Vectors**: `events.json` (15 accept cases) and `events-invalid.json`
-  (61 reject cases, raw JSON text, each isolating one rule).
+- **Vectors**: `events.json` (17 accept cases) and `events-invalid.json`
+  (68 reject cases, raw JSON text, each isolating one rule).
   - Accept cases include a ZIP 215 edge case: a non-canonical `R` with an
     ordinary key. An order-8 key with `s = 0` and a non-canonical `A`,
     accepted by ZIP 215 alone, are reject cases (A1 addendum).

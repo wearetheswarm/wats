@@ -22,7 +22,7 @@ use crate::event::{Event, Kind};
 pub const INDEXED_TAGS: usize = 16;
 use crate::wire::RawEvent;
 
-const SCHEMA_VERSION: i64 = 3;
+const SCHEMA_VERSION: i64 = 4;
 
 const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS events (
@@ -218,11 +218,12 @@ impl Store {
             )?;
         }
         conn.execute_batch(SCHEMA)?;
-        if (1..3).contains(&version) {
+        if (1..4).contains(&version) {
             // v2 -> v3: the event format was hardened before the freeze (ADR
             // 0010): events stored earlier hash differently and can no longer
-            // be verified. The store is a cache of the swarm: drop them, the
-            // node syncs again.
+            // be verified. v3 -> v4: `pow` became algorithm-tagged
+            // ("b3:<nonce>"), and the bare decimal nonce is invalid. The store
+            // is a cache of the swarm: drop them, the node syncs again.
             conn.execute_batch(
                 "DELETE FROM event_tags; DELETE FROM events; DELETE FROM sync_state;
                  INSERT INTO events_fts (events_fts) VALUES ('rebuild');",
@@ -912,6 +913,27 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    #[test]
+    fn migrates_schema_v3_by_dropping_bare_nonce_events() {
+        let store = Store::open_in_memory().unwrap();
+        store
+            .insert(&post(1, 10, Kind::Note, &[], "old"), 10)
+            .unwrap();
+        let conn = store.conn.into_inner().unwrap();
+        conn.pragma_update(None, "user_version", 3).unwrap();
+        let store = Store::init(conn).unwrap();
+        assert_eq!(
+            store.count().unwrap(),
+            0,
+            "pre-tagged-pow events are dropped"
+        );
+        let conn = store.conn.into_inner().unwrap();
+        let version: i64 = conn
+            .pragma_query_value(None, "user_version", |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
     }
 
     #[test]

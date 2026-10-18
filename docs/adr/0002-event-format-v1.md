@@ -30,7 +30,8 @@ encoded, or what the size limits are.
   Unknown fields are rejected (`v` gates extensions).
 - Hashes, keys and signatures are lowercase hex: `id` and blob `hash` 64
   chars, `author` 64 chars, `sig` 128 chars.
-- `ts` is Unix time in seconds (integer). `pow` is a decimal nonce string.
+- `ts` is Unix time in seconds (integer). `pow` is a decimal nonce string
+  (now `"b3:<nonce>"`, ADR 0010 addendum "Algorithm-tagged proof of work").
 
 ### Id, proof of work and signature
 
