@@ -175,12 +175,16 @@ provisioning creates it; otherwise:
 sudo install -d -o root -g docker -m 2775 /opt/wearetheswarm
 ```
 
-The repository is private, so copy the two files from your Mac:
+Fetch the two files on the VM:
 
 ```sh
-scp deploy/compose/compose.router.yaml deploy/compose/router.env.example vps:/opt/wearetheswarm/
-ssh vps 'cd /opt/wearetheswarm && cp router.env.example .env && chmod 0640 .env'
+ssh vps 'cd /opt/wearetheswarm \
+  && for f in compose.router.yaml router.env.example; do \
+       curl -fsSLO https://raw.githubusercontent.com/wearetheswarm/wats/main/deploy/compose/$f; done \
+  && cp router.env.example .env && chmod 0640 .env'
 ```
+
+(Or copy them from a checkout with `scp`.)
 
 Edit `/opt/wearetheswarm/.env` on the VM (it holds no secret):
 

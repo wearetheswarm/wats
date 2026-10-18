@@ -5,8 +5,9 @@ a static `x86_64` (linux/amd64) binary on distroless, running as uid
 65532, with its data directory at `/data/wats`. There is no `latest` tag:
 you always pin a version.
 
-While the repository is private, pulling the image needs a GitHub token
-with `read:packages`:
+The image package is still private for now (its visibility is set apart
+from the repository's), so pulling it needs a GitHub token with
+`read:packages`:
 
 ```sh
 echo "$GH_TOKEN" | docker login ghcr.io -u <github user> --password-stdin

@@ -10,8 +10,13 @@
 # --prefix). Any failure stops before anything is installed. Never uses
 # sudo. Afterwards, `wats upgrade` keeps it up to date.
 #
-# Read this script before running it. While the repository is private,
-# GitHub needs a token: set GH_TOKEN (or GITHUB_TOKEN), or log in with `gh`.
+# Read this script before running it:
+#
+#   curl -fsSLo install.sh https://raw.githubusercontent.com/wearetheswarm/wats/main/install.sh
+#   less install.sh && sh install.sh
+#
+# GH_TOKEN (or GITHUB_TOKEN) is optional: when set, GitHub's API is used
+# with it, which only helps with GitHub's rate limits.
 #
 # Needs: curl, tar, minisign, and shasum or sha256sum.
 # Docs: docs/release-signing.md.
@@ -106,13 +111,13 @@ if [ -z "$VERSION" ]; then
     [ -z "$BASE_URL" ] || die "a mirror (WATS_INSTALL_BASE_URL) needs --version"
     if [ -n "$TOKEN" ]; then
         auth_api "releases/latest" "$WORK/latest.json" \
-            || die "cannot read the latest release from GitHub (is GH_TOKEN valid for $REPO?)"
+            || die "cannot read the latest release from GitHub (is GH_TOKEN valid? unset it to go without)"
         VERSION="$(tr ',' '\n' < "$WORK/latest.json" | sed -n 's/.*"tag_name": *"v\{0,1\}\([^"]*\)".*/\1/p' | head -n 1)"
     else
-        # Public repository: the latest release page redirects to its tag.
+        # Without a token: the latest release page redirects to its tag.
         VERSION="$(curl -fsSI "https://github.com/$REPO/releases/latest" 2>/dev/null \
             | sed -n 's#^[Ll]ocation: .*/tag/v\{0,1\}\([0-9][^[:space:]]*\).*#\1#p' | tr -d '\r' | head -n 1)" || true
-        [ -n "$VERSION" ] || die "cannot find the latest release: the repository is private for now, so set GH_TOKEN (a token that can read $REPO), or pass --version"
+        [ -n "$VERSION" ] || die "cannot find the latest release on github.com/$REPO: check your connection, or pass --version"
     fi
     [ -n "$VERSION" ] || die "cannot find the latest release version"
 fi
@@ -129,9 +134,9 @@ if [ -n "$BASE_URL" ]; then
         fetch "$BASE_URL/v$VERSION/$f" "$WORK/$f" || die "cannot download $f from $BASE_URL"
     done
 elif [ -n "$TOKEN" ]; then
-    # Private repository: release assets come through the API, by id.
+    # With a token: release assets come through the API, by id.
     auth_api "releases/tags/v$VERSION" "$WORK/release.json" \
-        || die "release v$VERSION not found, or GH_TOKEN cannot read $REPO"
+        || die "release v$VERSION not found, or GH_TOKEN is not valid (unset it to go without)"
     # Each asset object starts with its API "url" and later has its "name".
     # shellcheck disable=SC2020 # three separators, each to a newline
     tr ',{}' '\n\n\n' < "$WORK/release.json" > "$WORK/release.lines"
@@ -149,7 +154,7 @@ elif [ -n "$TOKEN" ]; then
 else
     for f in $FILES; do
         fetch "https://github.com/$REPO/releases/download/v$VERSION/$f" "$WORK/$f" \
-            || die "cannot download $f: the repository is private for now, so set GH_TOKEN; otherwise check that release v$VERSION exists and is signed"
+            || die "cannot download $f: check that release v$VERSION exists and is signed, and your connection"
     done
 fi
 
