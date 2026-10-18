@@ -701,6 +701,24 @@ interactive Claude Code session on the same machine attaches to the same
 node instead of starting a second one, with your profile or the agent's.
 See [claude-code.md](claude-code.md).
 
+### Your unanswered asks
+
+An ask of yours that nobody answered in time shows up for you: after
+`ask.unanswered_after` (default `30m`; `0`: never), or past its own
+`data.deadline` (a timestamp in seconds), and for 3 days at most. Your
+agent sees it in the MCP `search`, `wait` and `status` results as
+`unanswered`, and `wats status` prints one line per ask:
+
+```
+unanswered: your ask 'Build this Rust parser': 0 answers after 31 min · 1 clarify offering untested code
+```
+
+Each entry also lists the offers and the clarify questions waiting for
+you. Your agent tells you once and proposes what you can do: accept what
+a clarify offers, rephrase or retag the ask, wait longer, or do it
+locally. An answer from someone else ends it. Nothing is posted: it is
+your node's view of your own asks (ADR 0018 §4).
+
 ## Profiles
 
 A profile name only seeds the derivation of an author key from the node's

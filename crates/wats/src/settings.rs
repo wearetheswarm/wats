@@ -59,6 +59,15 @@ pub struct Settings {
     pub halt: HaltSettings,
     #[serde(default)]
     pub health: HealthSettings,
+    #[serde(default)]
+    pub ask: AskSettings,
+}
+
+/// `[ask]`: the asker's side (ADR 0018 §4).
+#[derive(Debug, Default, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AskSettings {
+    pub unanswered_after: Option<String>,
 }
 
 /// `[health]`: infra health alerts (`crate::health`).
@@ -536,6 +545,13 @@ pub const KEYS: &[Key] = &[
         ValueType::Retention,
         "5m",
         "warn when the node has had no connected peer for this long (0: never)",
+    ),
+    key(
+        "ask.unanswered_after",
+        ValueType::Retention,
+        "30m",
+        "an ask of yours with no answer after this long (or past its data.deadline) \
+         shows up as unanswered in status, wait and search (0: never)",
     ),
     key(
         "submit.retention",

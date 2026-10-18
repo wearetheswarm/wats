@@ -568,3 +568,78 @@ async fn guardian_events_through_mcp_and_a_halted_session() -> anyhow::Result<()
     node.shutdown().await?;
     Ok(())
 }
+
+/// An ask with no answer past its deadline shows up for its author, in
+/// search, wait and status, with the clarify waiting for them; an answer
+/// from someone else ends it (ADR 0018 §4).
+#[tokio::test(flavor = "multi_thread")]
+async fn unanswered_asks_surface_for_their_author() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let node = loopback_node(&dir.path().join("n"), None).await?;
+    let asker = client_for(WatsMcp::new(node.clone(), vec![])).await?;
+    let helper = client_for(WatsMcp::new(node.clone(), vec![]).with_profile("helper")?).await?;
+    let past = wats::node::now_secs() - 1;
+    let ask = structured(
+        &call(
+            &asker,
+            "post",
+            json!({"title": "Build this Rust parser", "text": "It must compile.", "kind": "ask",
+                   "data": {"deadline": past}}),
+        )
+        .await,
+    );
+    let ask_id = ask["id"].as_str().unwrap();
+    // A fresh ask without a deadline is not listed (30 minutes by default).
+    structured(
+        &call(
+            &asker,
+            "post",
+            json!({"title": "Fresh question", "text": "Anyone?", "kind": "ask"}),
+        )
+        .await,
+    );
+
+    let found = structured(&call(&asker, "search", json!({})).await);
+    let unanswered = found["unanswered"].as_array().expect("unanswered");
+    assert_eq!(unanswered.len(), 1, "{found}");
+    assert_eq!(unanswered[0]["id"], ask_id);
+    assert_eq!(
+        unanswered[0]["notice"],
+        "your ask 'Build this Rust parser': 0 answers after 0 min"
+    );
+
+    let clarify = structured(
+        &call(
+            &helper,
+            "reply",
+            json!({"post_id": ask_id, "text": "I can write it, not compile it here.",
+                   "kind": "clarify",
+                   "data": {"options": ["untested code", "no thanks"], "default": "untested code"}}),
+        )
+        .await,
+    );
+    let waited = structured(&call(&asker, "wait", json!({"timeout": 1})).await);
+    assert_eq!(
+        waited["unanswered"][0]["notice"],
+        "your ask 'Build this Rust parser': 0 answers after 0 min · 1 clarify offering untested code"
+    );
+    assert_eq!(waited["unanswered"][0]["clarifies"][0]["id"], clarify["id"]);
+    let status = structured(&call(&asker, "status", json!({})).await);
+    assert_eq!(status["unanswered"][0]["id"], ask_id, "{status}");
+    // Not the helper's ask.
+    let theirs = structured(&call(&helper, "status", json!({})).await);
+    assert!(theirs.get("unanswered").is_none(), "{theirs}");
+
+    structured(
+        &call(
+            &helper,
+            "reply",
+            json!({"post_id": ask_id, "text": "Here is untested code.", "kind": "answer"}),
+        )
+        .await,
+    );
+    let answered = structured(&call(&asker, "search", json!({})).await);
+    assert!(answered.get("unanswered").is_none(), "{answered}");
+    node.shutdown().await?;
+    Ok(())
+}
