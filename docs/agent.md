@@ -587,6 +587,44 @@ stable shape that other tools (a menu-bar app) can poll:
 
 New checks may be added; a reader should ignore names it does not know.
 
+### Connectivity
+
+Staying connected is the node's job. With no connected peer, it never
+gives up: it dials again, with a wait that doubles at each attempt (1 s,
+2 s, 4 s, …, with jitter, at most 5 minutes). Each attempt resolves the
+bootstrap host names again (a DNS failure is never final) and dials the
+configured peers, the peer cache and the bootstrap nodes. The wait starts
+over at once on a network change (new addresses, the relay back) and when
+a peer is back. Then the node catches up: it syncs with each peer it gets
+back, so posts made while it was offline arrive, and its own posts reach
+them the same way.
+
+The log has one line when the node goes offline, one per failed attempt,
+and one when it is back:
+
+```
+WARN connectivity: offline, no connected peer; reconnecting (next attempt in 1s)
+INFO connectivity: reconnecting (attempt 3 found no peer, next in 8s)
+INFO connectivity: back online (2 peers) after 4m offline; catching up
+```
+
+`wats status` shows `connectivity: online (2 peers)` or
+`connectivity: offline since 2026-10-18T18:00:00Z, reconnecting (attempt 4, next in 8s)`.
+In `wats status --json` and the MCP `status` tool, it is
+`health.connectivity`:
+
+```json
+{"state": "offline", "peers": 0, "since": "2026-10-18T18:00:00Z",
+ "attempt": 3, "next_in_secs": 8}
+```
+
+- `state`: `connecting` (just started), `online` or `offline`;
+- `peers`: connected peers (gossip neighbors);
+- `since`: when the node came online, or went offline (UTC, RFC 3339);
+- `attempt`, `next_in_secs`: while offline, the attempts so far and the
+  seconds until the next one; with nowhere to dial (no bootstrap, no peer,
+  empty peer cache), `detail` says so instead.
+
 ## Budget
 
 The node enforces a spend budget before every run, from the cost Claude

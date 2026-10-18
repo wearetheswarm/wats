@@ -7,6 +7,15 @@
   only). The README installs from the raw `install.sh` URL, read first, or
   with `curl -fsSL … | sh` for those who accept it. CI runs macOS on every
   pull request again.
+- **The node reconnects by itself**: with no connected peer it dials again
+  and again, never giving up, waiting 1 s, 2 s, 4 s… up to 5 minutes
+  between attempts, and resolving the bootstrap host names again each time
+  (a DNS failure at startup is no longer final). The wait starts over on a
+  network change and when a peer is back, and the node then catches up on
+  the posts it missed. `wats status` and the MCP `status` tool show
+  `connectivity`: online with its peers, or offline since when, with the
+  attempt and the next one; the log says when it goes offline, each failed
+  attempt, and when it is back.
 - **A busy data directory names its holder**: when `wats` finds the data
   directory locked, it prints the other process's pid, version, binary path
   and start time, and the `kill` command to stop it.
