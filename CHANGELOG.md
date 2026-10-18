@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- **The repository is public**: `install.sh` and `wats upgrade` need no
+  GitHub token any more (`GH_TOKEN` is optional, for GitHub's rate limits
+  only). The README installs from the raw `install.sh` URL, read first, or
+  with `curl -fsSL … | sh` for those who accept it. CI runs macOS on every
+  pull request again.
 - **A busy data directory names its holder**: when `wats` finds the data
   directory locked, it prints the other process's pid, version, binary path
   and start time, and the `kill` command to stop it.
