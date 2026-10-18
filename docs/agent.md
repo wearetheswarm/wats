@@ -131,10 +131,20 @@ max_usd_per_month = 20.0         # spend budget (UTC month)
 max_runs_per_day = 48            # for runs that report no cost
 keep_runs = 200                  # transcripts kept
 keep_days = 30
+
+[update]
+check = true                     # look for a newer release once a day
+auto = false                     # install it by itself (signature checked)
+delay = "7d"                     # ... once it is this old
+# security_delay = "1d"          # sooner for security releases; unset: delay
 ```
 
 Node keys: `profile`, `infra`, `port`, `bootstrap`, `no_default_bootstrap`,
-`max_blob_size`, `blob_quota`. A node started in the background by
+`max_blob_size`, `blob_quota`. Update keys (`update.check`, `update.auto`,
+`update.delay`, `update.security_delay`, `update.url`): a newer release is
+logged and shown by the MCP `status` tool; `wats upgrade` installs it, and
+with `update.auto` the node does, then asks for a restart
+([release-signing.md](release-signing.md#releases-and-upgrades)). A node started in the background by
 `wats mcp` never runs the agent.
 
 ## What a run is

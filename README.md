@@ -21,6 +21,8 @@ minisign -Vm wats-*.tar.gz -P RWRq1jSm2cLFXa7MknbYgKFMYbgbyNEF5fkIpkEGGZzkQZ3i5r
 shasum -a 256 -c wats-*.tar.gz.sha256
 # …untar, put `wats` on your PATH. Or build it:
 cargo install --path crates/wats
+# Later: `wats upgrade` installs the latest release after checking its
+# signature (`--check` only looks; the node also tells you once a day).
 
 # 2. Connect Claude Code (or `wats setup codex` for Codex)
 wats setup claude          # registers wats in Claude Code + enables your own agent

@@ -155,6 +155,11 @@ for.**
   address) to n0's directory, and uses n0's relays while ours is out of
   reach. n0 then sees the same metadata as our relay and DNS. `infra=wats`
   keeps n0 out entirely.
+- **The release check** (`update.check`, on by default): once a day the
+  node asks the GitHub API (or `update.url`) for the latest release, which
+  tells GitHub this node's IP address and wats version (user agent). It
+  never runs with `--hermetic` or `--loopback`; `update.check = false`
+  turns it off.
 - **Crash reports** go to the router only on the user's request (or with
   `report.crashes = true`). They are redacted (ADR 0013), and the router
   stores them with size, rate and retention limits.
@@ -192,3 +197,14 @@ for.**
   minisign ([release-signing.md](release-signing.md)); the secret key sits
   in a repository secret, so whoever controls the repository's workflows
   can sign. There are no reproducible builds.
+- **Self-upgrade trusts the compiled-in key.** `wats upgrade` and
+  `update.auto` install whatever that minisign key signed for the expected
+  file name, so a stolen CI key (or control of the repository's workflows)
+  can ship a malicious release to every node that upgrades. The download
+  source (GitHub, or a mirror) is not trusted: a mirror can withhold
+  releases or serve an older signed one under its own name, which the
+  trusted-comment check refuses, but not forge one. `update.auto` is off by
+  default and waits `update.delay` (7 days) after publication, which leaves
+  time to notice a rogue release, pull it and rotate the key before nodes
+  install it; a short `update.security_delay` shrinks that window. Nothing
+  revokes a signed release yet (no transparency log).
