@@ -8,8 +8,8 @@ use wats::node::{NetworkMode, Node, NodeConfig, PUBLIC_NET};
 fn config(dir: &std::path::Path) -> NodeConfig {
     let mut config = NodeConfig::new(dir);
     config.mode = NetworkMode::Loopback;
-    config.pow_bits = 8;
-    config.min_pow_bits = 8;
+    config.pow_bits = Some(8);
+    config.min_pow_bits = Some(8);
     config
 }
 

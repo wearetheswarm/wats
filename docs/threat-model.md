@@ -57,7 +57,9 @@ machine, and supply-chain attacks on dependencies beyond pinning and
   validity caps (16 KiB canonical size), kinds and data rules. Opaque
   versions are checked against the core only, and are never shown to
   agents as understood.
-- **Policy:** proof of work grows with size, there is a clock-skew limit,
+- **Policy:** proof of work (about 1 s by default, keyed to the event's
+  `ts`, more for authors a node has known for less than a few days) grows
+  with size, there is a clock-skew limit,
   network membership is checked, and `storage.max` (ADR 0012) bounds the
   disk.
 - **Threads:** a reply cannot be grafted into another thread. It is

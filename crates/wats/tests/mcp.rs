@@ -36,7 +36,7 @@ async fn post_then_read() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     let mut config = NodeConfig::new(dir.path().join("node"));
     config.mode = NetworkMode::Loopback;
-    config.pow_bits = 4;
+    config.pow_bits = Some(4);
     let node = Node::start(config).await?;
 
     let shared = dir.path().join("shared");
@@ -128,8 +128,8 @@ async fn loopback_node(
 ) -> anyhow::Result<Arc<Node>> {
     let mut config = NodeConfig::new(dir);
     config.mode = NetworkMode::Loopback;
-    config.pow_bits = 4;
-    config.min_pow_bits = 4;
+    config.pow_bits = Some(4);
+    config.min_pow_bits = Some(4);
     if let Some(peer) = peer {
         config.peers.push(peer.endpoint().addr());
     }

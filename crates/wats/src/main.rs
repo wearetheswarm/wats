@@ -231,10 +231,12 @@ struct NodeArgs {
     /// Networks to join (repeatable). Defaults to "public".
     #[arg(long = "net", global = true, value_delimiter = ',')]
     nets: Vec<String>,
-    /// Proof-of-work difficulty (leading zero bits) for our posts.
+    /// Proof-of-work difficulty (leading zero bits) for our posts, instead
+    /// of the network schedule [default: 21, +4 for a new author].
     #[arg(long, global = true)]
     pow_bits: Option<u32>,
-    /// Minimum proof-of-work difficulty accepted from other nodes.
+    /// Minimum proof-of-work difficulty accepted from other nodes, instead
+    /// of the network schedule [default: 21, +4 for new authors].
     #[arg(long, global = true)]
     min_pow_bits: Option<u32>,
     /// Author profile to post as (a distinct key derived from the node's
@@ -1051,10 +1053,10 @@ impl NodeArgs {
             }
         }
         if let Some(bits) = self.pow_bits {
-            config.pow_bits = bits;
+            config.pow_bits = Some(bits);
         }
         if let Some(bits) = self.min_pow_bits {
-            config.min_pow_bits = bits;
+            config.min_pow_bits = Some(bits);
         }
         if let Some(ttl) = &file.agent.review_ttl {
             config.review_ttl = parse_duration(ttl)

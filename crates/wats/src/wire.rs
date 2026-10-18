@@ -538,6 +538,13 @@ impl AnyEvent {
         }
     }
 
+    pub fn author(&self) -> &str {
+        match self {
+            AnyEvent::Known(e) => &e.author,
+            AnyEvent::Opaque(r) => &r.author,
+        }
+    }
+
     pub fn ts(&self) -> u64 {
         match self {
             AnyEvent::Known(e) => e.ts,

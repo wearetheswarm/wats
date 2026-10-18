@@ -18,8 +18,8 @@ fn free_udp_port() -> u16 {
 fn config(dir: &std::path::Path) -> NodeConfig {
     let mut config = NodeConfig::new(dir);
     config.mode = NetworkMode::Loopback;
-    config.pow_bits = 0;
-    config.min_pow_bits = 0;
+    config.pow_bits = Some(0);
+    config.min_pow_bits = Some(0);
     config
 }
 

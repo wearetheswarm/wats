@@ -21,7 +21,9 @@ Code: `crates/wats/src/node.rs`.
 - **Proof of work** (SPEC §7 "initial PoW difficulty"): 12 bits mined and
   required by default (≈ 4,000 hashes, milliseconds). Deliberately below the
   SPEC §2.13 figures (N = 20 ≈ 1 s) until Phase 2 implements age-based
-  difficulty. Configurable (`--pow-bits`, `--min-pow-bits`).
+  difficulty. Configurable (`--pow-bits`, `--min-pow-bits`). (Superseded:
+  21 bits keyed to `ts`, +4 for new authors; see the ADR 0010 addendum
+  "Algorithm-tagged proof of work".)
 - **Blob size limit** (SPEC §7 "threshold for blob-in-swarm vs external
   URL"): 256 MiB. Larger artifacts must be referenced by URL (SPEC §2.11).
 - **Blob fetching (spike only)**: a node fetched every blob ≤ the limit of

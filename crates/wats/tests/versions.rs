@@ -18,8 +18,8 @@ use wats::wire::{RawEvent, sign_value};
 async fn node(dir: &std::path::Path, peers: &[&Arc<Node>]) -> anyhow::Result<Arc<Node>> {
     let mut config = NodeConfig::new(dir);
     config.mode = NetworkMode::Loopback;
-    config.pow_bits = 0;
-    config.min_pow_bits = 0;
+    config.pow_bits = Some(0);
+    config.min_pow_bits = Some(0);
     config.peers = peers.iter().map(|p| p.endpoint().addr()).collect();
     Node::start(config).await
 }
@@ -55,8 +55,8 @@ async fn opaque_events_policy() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     let mut config = NodeConfig::new(dir.path());
     config.mode = NetworkMode::Loopback;
-    config.pow_bits = 0;
-    config.min_pow_bits = 0;
+    config.pow_bits = Some(0);
+    config.min_pow_bits = Some(0);
     // 2 MB: the opaque quota is 5% of it, 100 kB.
     config.storage_max = Some(2_000_000);
     let node = Node::start(config).await?;
@@ -217,8 +217,8 @@ async fn unknown_pow_algorithm_is_opaque() -> anyhow::Result<()> {
     let start = |dir: &std::path::Path| {
         let mut config = NodeConfig::new(dir);
         config.mode = NetworkMode::Loopback;
-        config.pow_bits = 0;
-        config.min_pow_bits = 16;
+        config.pow_bits = Some(0);
+        config.min_pow_bits = Some(16);
         Node::start(config)
     };
     let node = start(dir.path()).await?;

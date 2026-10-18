@@ -93,10 +93,19 @@ pub struct NodeConfig {
     pub secret_file: Option<PathBuf>,
     /// Author profile used for posts (SPEC §2.2).
     pub profile: String,
-    /// Proof-of-work difficulty mined on our own posts.
-    pub pow_bits: u32,
-    /// Minimum proof-of-work difficulty accepted from others.
-    pub min_pow_bits: u32,
+    /// Proof-of-work difficulty mined on our own posts. `None`: the network
+    /// schedule at the post's time, plus the new-author bits while this
+    /// node has known our author for less than a few days (ADR 0010).
+    pub pow_bits: Option<u32>,
+    /// Minimum proof-of-work difficulty accepted from others. `None`: the
+    /// network schedule at the event's time, plus the new-author bits on
+    /// events pushed to us (gossip, replicate, publish), not on events we
+    /// pull (sync). `Some`: a flat difficulty (tests, private networks).
+    pub min_pow_bits: Option<u32>,
+    /// The network's base difficulty keyed to `ts`
+    /// ([`crate::event::POW_SCHEDULE`]), used when `pow_bits` or
+    /// `min_pow_bits` is `None`.
+    pub pow_schedule: Vec<(u64, u32)>,
     /// Largest blob this node publishes or fetches, in bytes.
     pub max_blob_bytes: u64,
     /// Disk budget for blobs fetched from others (replicas and reads), in
@@ -148,8 +157,9 @@ impl NodeConfig {
             nets: vec![PUBLIC_NET.to_string()],
             peers: Vec::new(),
             profile: DEFAULT_PROFILE.to_string(),
-            pow_bits: 12,
-            min_pow_bits: 12,
+            pow_bits: None,
+            min_pow_bits: None,
+            pow_schedule: crate::event::POW_SCHEDULE.to_vec(),
             max_blob_bytes: 256 * 1024 * 1024,
             blob_quota: None,
             storage_max: None,
@@ -314,6 +324,16 @@ pub fn dir_size(dir: &Path) -> u64 {
             _ => 0,
         })
         .sum()
+}
+
+/// How an event reached this node, for the proof-of-work policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Origin {
+    /// Gossip, a replicate request, or a local publish: live events,
+    /// subject to the new-author bits.
+    Pushed,
+    /// A sync page this node asked for: history, at the schedule only.
+    Pulled,
 }
 
 /// Share of `storage.max` that opaque events may take (B4).
@@ -897,10 +917,13 @@ impl Node {
         };
         draft.blobs.extend(self.import(attachments).await?);
         let key = key.clone();
-        // Mine what receivers will require for this size.
-        let pow_bits =
-            crate::event::required_pow_bits(self.config.pow_bits, draft.estimated_size(&key)?);
+        // Mine what receivers will require for this time, author and size.
         let ts = now_secs();
+        let base = match self.config.pow_bits {
+            Some(bits) => bits,
+            None => self.policy_pow_bits(&hex::encode(key.verifying_key().as_bytes()), ts, true)?,
+        };
+        let pow_bits = crate::event::required_pow_bits(base, draft.estimated_size(&key)?);
         let event = tokio::task::spawn_blocking(move || draft.sign(&key, ts, pow_bits)).await??;
         self.store.insert(&event, ts)?;
         let envelope = Envelope::new(serde_json::to_value(&event)?, self.endpoint_id());
@@ -1311,7 +1334,7 @@ impl Node {
         if envelope.ev < 1 {
             bail!("bad envelope version {}", envelope.ev);
         }
-        let Some((event, new)) = self.accept_value(envelope.event)? else {
+        let Some((event, new)) = self.accept_value(envelope.event, Origin::Pushed)? else {
             return Ok(());
         };
         if event.net() != net {
@@ -1336,7 +1359,26 @@ impl Node {
     /// Events of versions this node does not understand are verified
     /// against the invariant core and stored opaque (ADR 0007). Returns the
     /// event and whether it is new; `None` if the policy rejects it.
-    fn accept_value(&self, value: serde_json::Value) -> Result<Option<(AnyEvent, bool)>> {
+    /// The base difficulty of the network policy for an event of `author`
+    /// at `ts` (before the size bits): the schedule at `ts`, plus the
+    /// new-author bits when `pushed` (ADR 0010, PoW policy).
+    fn policy_pow_bits(&self, author: &str, ts: u64, pushed: bool) -> Result<u32> {
+        let mut bits = crate::event::scheduled_pow_bits(&self.config.pow_schedule, ts);
+        if pushed {
+            let known_for = self
+                .store
+                .author_first_seen(author)?
+                .map(|first| now_secs().saturating_sub(first));
+            bits = bits.saturating_add(crate::event::new_author_extra_bits(known_for));
+        }
+        Ok(bits)
+    }
+
+    fn accept_value(
+        &self,
+        value: serde_json::Value,
+        origin: Origin,
+    ) -> Result<Option<(AnyEvent, bool)>> {
         let event = AnyEvent::from_value(value)?;
         if !self.senders.contains_key(event.net()) {
             bail!("not a member of network {:?}", event.net());
@@ -1370,7 +1412,13 @@ impl Node {
         // measured, nor taken as no work: the event is opaque (`from_value`)
         // and only the opaque quota below bounds it (ADR 0010, PoW).
         if let Some(work) = event.pow_work() {
-            let mut required = crate::event::required_pow_bits(self.config.min_pow_bits, size);
+            let base = match self.config.min_pow_bits {
+                Some(bits) => bits,
+                None => {
+                    self.policy_pow_bits(event.author(), event.ts(), origin == Origin::Pushed)?
+                }
+            };
+            let mut required = crate::event::required_pow_bits(base, size);
             if unknown_version {
                 required = required.saturating_add(OPAQUE_EXTRA_POW_BITS);
             }
@@ -1409,7 +1457,7 @@ impl Node {
     /// Store and broadcast an event that is already signed (any version),
     /// e.g. a repost or an event produced by another tool.
     pub async fn publish_signed(&self, value: serde_json::Value) -> Result<AnyEvent> {
-        let Some((event, _)) = self.accept_value(value.clone())? else {
+        let Some((event, _)) = self.accept_value(value.clone(), Origin::Pushed)? else {
             bail!("rejected by node policy");
         };
         let Some(sender) = self.senders.get(event.net()) else {
@@ -1537,7 +1585,7 @@ impl Node {
                 }
             }
             Request::Replicate { event, hashes } => {
-                let event = match self.accept_value(event) {
+                let event = match self.accept_value(event, Origin::Pushed) {
                     Ok(Some((AnyEvent::Known(event), _))) => event,
                     // Opaque events are stored; their blobs are unknown to us.
                     Ok(Some((AnyEvent::Opaque(_), _))) => {
@@ -1608,7 +1656,7 @@ impl Node {
                 {
                     bail!("peer sent an out-of-order sync page");
                 }
-                match self.accept_value(value) {
+                match self.accept_value(value, Origin::Pulled) {
                     Ok(Some((_, true))) => new = new.saturating_add(1),
                     Ok(_) => {}
                     Err(e) => debug!(%id, "sync: rejected event: {e:#}"),

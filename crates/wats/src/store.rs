@@ -450,6 +450,17 @@ impl Store {
     }
 
     /// Any stored event, understood or not, as raw wire JSON with its version.
+    /// When this node first stored an event of `author` (unix seconds), if
+    /// ever: the age behind the new-author proof of work (ADR 0010).
+    pub fn author_first_seen(&self, author: &str) -> Result<Option<u64>> {
+        let first: Option<i64> = self.conn().query_row(
+            "SELECT MIN(received_at) FROM events WHERE author = ?",
+            [author],
+            |r| r.get(0),
+        )?;
+        Ok(first.map(|t| u64::try_from(t).unwrap_or(0)))
+    }
+
     pub fn get_raw(&self, id: &str) -> Result<Option<(u64, bool, Value)>> {
         let conn = self.conn();
         let row: Option<(i64, i64, String)> = conn
