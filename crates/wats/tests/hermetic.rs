@@ -713,3 +713,113 @@ fn resume_clears_the_halt_marker_and_status_shows_it() {
         "{err}"
     );
 }
+
+/// Safety settings: recorded silently the first time, any change (an
+/// agent editing config.toml, or `wats config set`) shown by `wats status`
+/// and warned at startup until `wats config ack`.
+#[test]
+fn safety_changes_are_flagged_until_acked() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("d");
+    std::fs::create_dir_all(&data).unwrap();
+    let status = |data: &std::path::Path| -> serde_json::Value {
+        let out = wats(data, &["status", "--json"]);
+        assert!(out.status.success(), "{out:?}");
+        serde_json::from_slice(&out.stdout).unwrap()
+    };
+    // First run: the baseline, silently.
+    assert!(status(&data).get("safety").is_none());
+    assert!(data.join("safety.json").exists());
+
+    let set = wats(&data, &["config", "set", "halt.accept", "false"]);
+    assert!(set.status.success(), "{set:?}");
+    assert!(
+        String::from_utf8_lossy(&set.stdout)
+            .contains("safety setting changed: run `wats config ack` to acknowledge"),
+        "{set:?}"
+    );
+    // Not a safety key: nothing to acknowledge.
+    let set = wats(&data, &["config", "set", "agent.heartbeat", "2h"]);
+    assert!(!String::from_utf8_lossy(&set.stdout).contains("safety"));
+    // As an agent with a shell would: edit the file.
+    let path = data.join("config.toml");
+    let mut text = std::fs::read_to_string(&path).unwrap();
+    text.push_str("\n[update]\nauto = true\n");
+    std::fs::write(&path, text).unwrap();
+
+    let notice = status(&data)["safety"].as_str().unwrap().to_string();
+    assert!(
+        notice.starts_with("safety settings changed on "),
+        "{notice}"
+    );
+    assert!(notice.contains("halt.accept default→false"), "{notice}");
+    assert!(notice.contains("update.auto default→true"), "{notice}");
+    assert!(!notice.contains("agent.heartbeat"), "{notice}");
+    assert!(
+        notice.contains("run `wats config ack` in a terminal; agents must not run it"),
+        "{notice}"
+    );
+    let text = String::from_utf8_lossy(&wats(&data, &["status"]).stdout).into_owned();
+    assert!(
+        text.contains("safety: safety settings changed on "),
+        "{text}"
+    );
+
+    // The daemon warns at startup.
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_wats"))
+        .env("WATS_HERMETIC", "1")
+        .arg("--dir")
+        .arg(&data)
+        .arg("--quiet")
+        .stderr(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    // The running node's MCP `status` tool shows it too.
+    let mut running = status(&data);
+    for _ in 0..40 {
+        if running["node"] == "running" {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(250));
+        running = status(&data);
+    }
+    child.kill().unwrap();
+    let out = child.wait_with_output().unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("safety settings changed on "), "{err}");
+    assert_eq!(running["node"], "running", "{running}");
+    assert_eq!(
+        running["safety"].as_str(),
+        Some(notice.as_str()),
+        "{running}"
+    );
+
+    let ack = wats(&data, &["config", "ack"]);
+    assert!(ack.status.success(), "{ack:?}");
+    let printed = String::from_utf8_lossy(&ack.stdout);
+    assert!(
+        printed.contains("halt.accept") && printed.contains("update.auto"),
+        "{printed}"
+    );
+    assert!(status(&data).get("safety").is_none());
+    let ack = wats(&data, &["config", "ack"]);
+    assert!(String::from_utf8_lossy(&ack.stdout).contains("no safety setting changed"));
+
+    // A workspace that is, or contains, the data directory is refused.
+    for workdir in [".", ".."] {
+        let out = wats(&data, &["config", "set", "agent.workdir", workdir]);
+        assert!(!out.status.success(), "{workdir}: {out:?}");
+    }
+    std::fs::write(
+        &path,
+        "[agent]\nruntime = \"claude\"\naccess = \"workspace\"\nworkdir = \"..\"\ncommand = \"/nonexistent\"\n",
+    )
+    .unwrap();
+    let out = wats(&data, &["--quiet"]);
+    assert!(!out.status.success(), "{out:?}");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("contains the data directory"),
+        "{out:?}"
+    );
+}

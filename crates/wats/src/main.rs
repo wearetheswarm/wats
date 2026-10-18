@@ -693,6 +693,10 @@ enum ConfigAction {
     Unset { key: String },
     /// List every key, its value and what it does.
     List,
+    /// Acknowledge changed safety settings (halts, review, access,
+    /// budgets, updates, reports): print what changed, then record the
+    /// current values. Run it yourself, never through an agent.
+    Ack,
 }
 
 /// The OS user name as a profile name: lowercase, `[a-z0-9_-]`, at most 50
@@ -1319,10 +1323,44 @@ fn first_run(cli: &Cli, data_dir: &std::path::Path) -> Result<()> {
     Ok(())
 }
 
-/// `wats config get | set | unset | list`.
+/// Record the safety baseline before `wats config set|unset` changes a
+/// safety key, so that the change is flagged even on a first run.
+fn safety_before(data_dir: &std::path::Path, key: &str) -> Option<String> {
+    if !wats::safety::KEYS.contains(&key) {
+        return None;
+    }
+    if let Err(e) = wats::safety::check(data_dir) {
+        tracing::warn!("{e:#}");
+    }
+    wats::safety::current(data_dir).ok()?.remove(key)
+}
+
+/// After `wats config set|unset`: tell the user a safety key changed.
+fn safety_after(data_dir: &std::path::Path, key: &str, before: Option<String>) {
+    let Some(before) = before else { return };
+    let after = wats::safety::current(data_dir)
+        .ok()
+        .and_then(|mut c| c.remove(key));
+    if after.as_ref() != Some(&before) {
+        println!("{}", wats::safety::SET_HINT);
+    }
+}
+
+/// `wats config get | set | unset | list | ack`.
 fn config_command(data_dir: &std::path::Path, action: ConfigAction) -> Result<()> {
     let mut file = ConfigFile::open(data_dir)?;
     match action {
+        ConfigAction::Ack => {
+            let changes = wats::safety::ack(data_dir)?;
+            if changes.is_empty() {
+                println!("no safety setting changed since the last acknowledgement");
+            } else {
+                for c in &changes {
+                    println!("{:<34} {} → {}", c.key, c.from, c.to);
+                }
+                println!("acknowledged: these values are the new baseline");
+            }
+        }
         ConfigAction::Get { key } => {
             let key = wats::settings::find_key(&key)?;
             match file.get(key.name) {
@@ -1331,13 +1369,20 @@ fn config_command(data_dir: &std::path::Path, action: ConfigAction) -> Result<()
             }
         }
         ConfigAction::Set { key, value } => {
+            if key == "agent.workdir" {
+                wats::access::check_workdir(&data_dir.join(&value), data_dir)?;
+            }
+            let before = safety_before(data_dir, &key);
             file.set(&key, &value)?;
             file.save()?;
+            safety_after(data_dir, &key, before);
         }
         ConfigAction::Unset { key } => {
+            let before = safety_before(data_dir, &key);
             if file.unset(&key)? {
                 file.save()?;
             }
+            safety_after(data_dir, &key, before);
         }
         ConfigAction::List => {
             println!("# {}", file.path().display());
@@ -1378,6 +1423,11 @@ async fn status_command(config: &NodeConfig, json: bool) -> Result<()> {
                 status["update"] = update;
             }
             status["halt"] = wats::halt::offline_status(&config.data_dir, config.halt.accept);
+            if config.data_dir.is_dir()
+                && let Some(notice) = wats::safety::status_notice(&config.data_dir)
+            {
+                status["safety"] = notice.into();
+            }
             // What `wats` would run: no agent in config.toml.
             match Settings::load(&config.data_dir).map(|s| s.agent.runtime) {
                 Ok(None) => status["notice"] = wats::firstrun::NO_AGENT_NOTICE.into(),
@@ -2099,6 +2149,11 @@ fn agent_config(
         .or(file.access.as_deref())
         .unwrap_or("locked")
         .parse()?;
+    if access == wats::access::Access::Workspace
+        && let Some(workdir) = &file.workdir
+    {
+        wats::access::check_workdir(workdir, data_dir)?;
+    }
     let mut budget = budget_of(file);
     let mut openclaw = wats::openclaw::Target::default();
     if runtime == "openclaw" {
@@ -2847,6 +2902,14 @@ async fn main() -> Result<()> {
         }
     };
     let agent = agent_config(&cli.node, &daemon.agent, &settings.agent, &data_dir)?;
+    // Safety settings changed since the user last acknowledged them (an
+    // agent may have edited config.toml): warn at every start until
+    // `wats config ack`.
+    match wats::safety::check(&data_dir) {
+        Ok(Some(notice)) => tracing::warn!("{}", notice.message()),
+        Ok(None) => {}
+        Err(e) => tracing::warn!("safety settings could not be checked: {e:#}"),
+    }
     if let Some(agent) = &agent
         && settings.agent.review == Some(true)
         && !config.review_profiles.contains(&agent.profile)

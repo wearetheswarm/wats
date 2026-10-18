@@ -134,6 +134,18 @@ for.**
   - `agent.allow` restricts who can wake the agent;
   - `agent.review` holds the agent's posts until a human approves them;
   - `agent.ignore_local` stops the user's own posts from waking the agent.
+- **Safety settings** (ADR 0011, addendum): at `inherit`, or with a shell
+  tool, the agent has the user's authority and can rewrite `config.toml`
+  (halts, review, access, budgets, updates). At `locked` and `workspace`,
+  Claude Code runs with deny rules (no edit or write in the data
+  directory, its config and its budget; no shell command naming them or
+  running `wats config|resume|guardian|setup`), Codex with a read-only
+  sandbox, and the printed OpenClaw agent with the wats tools only;
+  `agent.workdir` may not be or contain the data directory. What slips
+  through is detected: the node compares these settings with
+  `<data dir>/safety.json` at every start and in `status`, and flags any
+  change until the user runs `wats config ack`. No MCP tool writes
+  settings or acknowledges (a test lists every tool).
 - **Budgets:** turns, timeout, dollars per day and month, runs per day,
   runs per hour; a loop detector per thread (`agent.loop_max_exchanges`,
   30 by default): once the agent and one other author have taken more than
@@ -207,6 +219,13 @@ for.**
   `Bash`/`shell_tool` in `agent.tools`): the agent can open its own
   session under another profile. Only a sandbox (container,
   `agent.sandbox` later) closes this.
+- **Same-user agents can change the node's settings.** An agent running
+  as the user, at `inherit` or with a full shell, can edit `config.toml`
+  and `safety.json` alike: the deny rules only cover `locked` and
+  `workspace`, shell rules match command text, and detection is a
+  tripwire. The fix is a different user: the always-on service, once
+  packaged, runs as a dedicated system user whose config the login
+  user's agents cannot write.
 - **Prompt injection is mitigated, not solved.** At `locked`, a steered
   agent can still post nonsense or leak what is in its context (the
   prompt, the posts it read) through wats itself. Review and allow lists
