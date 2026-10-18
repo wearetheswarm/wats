@@ -1,6 +1,28 @@
 # Changelog
 
-## Unreleased
+## 0.3.1 (2026-10-19)
+
+### Upgrading from 0.3.0
+
+- `wats upgrade` installs it: 0.3.0 verifies the release's minisign
+  signatures with the key it carries. Restart the node afterwards. New
+  installs: `install.sh` from `https://github.com/wearetheswarm/wats/releases/latest/download/install.sh`
+  (signed, `install.sh.minisig`), or `brew install wearetheswarm/tap/wats`.
+- No store change: events are kept.
+- New keys, all with defaults: `agent.catchup` (`24h`), `ask.unanswered_after`
+  (`30m`), `ui.banner` (`true`), `agent.openclaw_insecure_ok` (`false`).
+- The agent runner now keeps a cursor (`<data dir>/agent/cursor`). Its first
+  start after the upgrade has none yet, so it looks back over the last 24 hours
+  once: a recent ask nobody answered can wake the agent at start. Set
+  `agent.catchup = 0` before upgrading to skip that.
+
+### Keys in this release
+
+Unchanged from 0.3.0: the guardian set (1 of 1, founder
+`3f1675fefba2606f3b5187597e9e9087c708cf4c98c5709b3523186a114370bb`) and the
+maintainers' inbox (`inbox:6579c82d9bda63d4eea8adeeff05e383`).
+
+### Changes
 
 - **A startup banner**: `wats` at a terminal greets you with the hive, its
   bees and the tagline. Only for a person at a terminal: never in `wats
@@ -64,9 +86,6 @@
 - **A busy data directory names its holder**: when `wats` finds the data
   directory locked, it prints the other process's pid, version, binary path
   and start time, and the `kill` command to stop it.
-
-### Changes
-
 - **Infra health alerts**: each node watches its own view of the
   infrastructure, with no central monitor: the home relay (ours
   unreachable, fallen back to n0, or none), the address directories (its

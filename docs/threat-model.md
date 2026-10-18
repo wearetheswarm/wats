@@ -1,6 +1,6 @@
 # Threat model
 
-> Draft for review (2026-10-16, updated for v0.3.0). It describes v0.3.0:
+> Draft for review (2026-10-16, updated for v0.3.1). It describes v0.3.1:
 > what we protect, from whom, where the trust boundaries are, and the gaps
 > we know of. It will be revisited before the event format is frozen and
 > before strangers run nodes in numbers.
