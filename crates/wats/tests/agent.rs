@@ -121,6 +121,7 @@ async fn agent_wakes_on_asks_and_heartbeats() -> anyhow::Result<()> {
         keep_runs: 2,
         keep_days: 30,
         openclaw: Default::default(),
+        catchup: None,
     };
     let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
     let runner = tokio::spawn(wats::agent::run(Arc::clone(&a), config.clone(), async {
@@ -649,6 +650,7 @@ async fn budget_pauses_the_agent() -> anyhow::Result<()> {
         keep_runs: 100,
         keep_days: 30,
         openclaw: Default::default(),
+        catchup: None,
     };
     let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
     let runner = tokio::spawn(wats::agent::run(Arc::clone(&a), config, async {
@@ -809,6 +811,7 @@ echo '{{"type":"turn.completed","usage":{{"input_tokens":10,"output_tokens":2}}}
         keep_runs: 100,
         keep_days: 30,
         openclaw: Default::default(),
+        catchup: None,
     };
     let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
     let runner = tokio::spawn(wats::agent::run(Arc::clone(&a), config, async {
@@ -910,6 +913,7 @@ async fn workspace_access_opens_the_workspace() -> anyhow::Result<()> {
         keep_runs: 100,
         keep_days: 30,
         openclaw: Default::default(),
+        catchup: None,
     };
     let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
     let runner = tokio::spawn(wats::agent::run(Arc::clone(&a), config, async {
@@ -1410,6 +1414,7 @@ async fn wakes_only_on_what_is_addressed_to_it() -> anyhow::Result<()> {
         keep_runs: 100,
         keep_days: 30,
         openclaw: Default::default(),
+        catchup: None,
     };
     let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
     let runner = tokio::spawn(wats::agent::run(Arc::clone(&a), config, async {
@@ -1514,6 +1519,7 @@ async fn wake_limits_defer_and_survive_a_restart() -> anyhow::Result<()> {
         keep_runs: 100,
         keep_days: 30,
         openclaw: Default::default(),
+        catchup: None,
     };
     let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
     let runner = tokio::spawn(wats::agent::run(Arc::clone(&a), config.clone(), async {
@@ -1623,6 +1629,7 @@ async fn loop_detector_pauses_a_thread_until_a_third_party_posts() -> anyhow::Re
         keep_runs: 100,
         keep_days: 30,
         openclaw: Default::default(),
+        catchup: None,
     };
     let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
     let runner = tokio::spawn(wats::agent::run(Arc::clone(&a), config, async {
@@ -1916,6 +1923,7 @@ async fn openclaw_forwards_wakes_to_the_gateway() -> anyhow::Result<()> {
             agent: "wats".into(),
             token_file,
         },
+        catchup: None,
     };
     let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
     let runner = tokio::spawn(wats::agent::run(Arc::clone(&a), config, async {
@@ -2011,6 +2019,224 @@ async fn openclaw_forwards_wakes_to_the_gateway() -> anyhow::Result<()> {
 
     let _ = stop.send(());
     runner.await??;
+    a.shutdown().await?;
+    Ok(())
+}
+
+/// Asks the runner learns about other than by live gossip still wake it:
+/// stored before it started (synced at startup, on a reconnection, or
+/// while it was down), when recent, unanswered and not local. Its cursor
+/// survives a restart, so an ask already handled never wakes it twice.
+#[tokio::test(flavor = "multi_thread")]
+async fn asks_stored_before_the_runner_started_still_wake_it() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let a = node(&dir.path().join("a"), &[]).await?;
+    let b = node(&dir.path().join("b"), &[&a]).await?;
+    a.wait_for_neighbor(PUBLIC_NET, Duration::from_secs(10))
+        .await?;
+    let stored = |id: String| {
+        let a = Arc::clone(&a);
+        move || a.store().get(&id).unwrap().is_some()
+    };
+
+    // Before the runner listens: a recent unanswered ask from b...
+    let waiting = b.publish(ask("Who can review my CSV?"), &[]).await?;
+    // ...an ask someone already answered...
+    let answered = b.publish(ask("What is a CSV?"), &[]).await?;
+    let answer = b
+        .publish_as(
+            &b.author_key("helper")?,
+            Draft {
+                net: PUBLIC_NET.into(),
+                thread: Some(answered.id.clone()),
+                parent: Some(answered.id.clone()),
+                kind: Some(Kind::Answer),
+                text: "Comma-separated values.".into(),
+                ..Draft::default()
+            },
+            &[],
+        )
+        .await?;
+    // ...the human's own ask on this node...
+    let local = a
+        .publish_as(&a.author_key("human")?, ask("Note to my agent"), &[])
+        .await?;
+    // ...and an ask two days old, synced late.
+    let old = ask("An old question")
+        .sign(
+            &ed25519_dalek::SigningKey::from_bytes(&[5; 32]),
+            wats::node::now_secs() - 2 * 86_400,
+            0,
+        )
+        .unwrap();
+    a.store().insert(&old, wats::node::now_secs())?;
+    for id in [&waiting.id, &answered.id, &answer.id, &local.id] {
+        eventually("stored on a", stored(id.clone())).await;
+    }
+
+    let config = AgentConfig {
+        runtime: "claude".into(),
+        profile: "agent".into(),
+        user: "alice".into(),
+        about: String::new(),
+        caps: vec![],
+        every: Duration::from_secs(1),
+        heartbeat: Duration::from_secs(3600),
+        max_runs_per_hour: 100,
+        allow: vec![],
+        ignore_local: true,
+        heartbeat_text: DEFAULT_HEARTBEAT.into(),
+        command: fake_agent(dir.path()),
+        mcp_command: "/usr/bin/true".into(),
+        mcp_args: vec![],
+        extra_args: vec![],
+        run_timeout: Duration::from_secs(10),
+        max_turns: 10,
+        budget: wats::budget::Budget::default(),
+        wakes: wats::wake::WakeLimits::unlimited(),
+        codex_disable: vec![],
+        access: wats::access::Access::Locked,
+        workdir: std::path::PathBuf::from("/nonexistent"),
+        tools: vec![],
+        model: None,
+        work_dir: dir.path().join("work"),
+        keep_runs: 100,
+        keep_days: 30,
+        openclaw: Default::default(),
+        catchup: Some(wats::agent::DEFAULT_CATCHUP),
+    };
+    let start = |config: AgentConfig| {
+        let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+        let runner = tokio::spawn(wats::agent::run(Arc::clone(&a), config, async {
+            let _ = stopped.await;
+        }));
+        (stop, runner)
+    };
+
+    let (stop, runner) = start(config.clone());
+    eventually("a catch-up run", || !runs(dir.path()).is_empty()).await;
+    let (prompt, _) = runs(dir.path()).remove(0);
+    assert!(prompt.contains(&waiting.id), "{prompt}");
+    assert!(prompt.contains("1 new ask"), "{prompt}");
+    for (left_out, why) in [
+        (&answered.id, "answered"),
+        (&local.id, "local"),
+        (&old.id, "too old"),
+    ] {
+        assert!(!prompt.contains(left_out.as_str()), "{why}: {prompt}");
+    }
+    let _ = stop.send(());
+    runner.await??;
+
+    // Down for a while: an ask arrives meanwhile. On restart, only it wakes
+    // the agent; the one already handled does not.
+    let later = b.publish(ask("Anyone around?"), &[]).await?;
+    eventually("stored on a", stored(later.id.clone())).await;
+    let (stop, runner) = start(config);
+    eventually("a second catch-up run", || runs(dir.path()).len() >= 2).await;
+    let (prompt, _) = runs(dir.path()).remove(1);
+    assert!(prompt.contains(&later.id), "{prompt}");
+    assert!(!prompt.contains(&waiting.id), "handled before: {prompt}");
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert_eq!(runs(dir.path()).len(), 2, "no other run");
+    let _ = stop.send(());
+    runner.await??;
+
+    a.shutdown().await?;
+    b.shutdown().await?;
+    Ok(())
+}
+
+/// Heartbeat runs offer up to 3 older unanswered asks (between
+/// `agent.catchup` and 3 days old), oldest first, each once (ADR 0018 §6).
+#[tokio::test(flavor = "multi_thread")]
+async fn heartbeats_offer_older_unanswered_asks() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let a = node(&dir.path().join("a"), &[]).await?;
+    let now = wats::node::now_secs();
+    let stranger = ed25519_dalek::SigningKey::from_bytes(&[6; 32]);
+    let helper = ed25519_dalek::SigningKey::from_bytes(&[7; 32]);
+    let old = |title: &str, hours: u64| {
+        let event = ask(title).sign(&stranger, now - hours * 3600, 0).unwrap();
+        a.store().insert(&event, now).unwrap();
+        event
+    };
+    let h30 = old("thirty hours", 30);
+    let h40 = old("forty hours", 40);
+    let h50 = old("fifty hours", 50);
+    let h60 = old("sixty hours", 60);
+    let ancient = old("four days", 96);
+    let answered = old("answered", 45);
+    let answer = Draft {
+        net: PUBLIC_NET.into(),
+        thread: Some(answered.id.clone()),
+        parent: Some(answered.id.clone()),
+        kind: Some(Kind::Answer),
+        text: "Done.".into(),
+        ..Draft::default()
+    }
+    .sign(&helper, now - 40 * 3600, 0)
+    .unwrap();
+    a.store().insert(&answer, now)?;
+
+    let config = AgentConfig {
+        runtime: "claude".into(),
+        profile: "agent".into(),
+        user: "alice".into(),
+        about: String::new(),
+        caps: vec![],
+        every: Duration::from_secs(1),
+        heartbeat: Duration::from_secs(2),
+        max_runs_per_hour: 100,
+        allow: vec![],
+        ignore_local: true,
+        heartbeat_text: DEFAULT_HEARTBEAT.into(),
+        command: fake_agent(dir.path()),
+        mcp_command: "/usr/bin/true".into(),
+        mcp_args: vec![],
+        extra_args: vec![],
+        run_timeout: Duration::from_secs(10),
+        max_turns: 10,
+        budget: wats::budget::Budget::default(),
+        wakes: wats::wake::WakeLimits::unlimited(),
+        codex_disable: vec![],
+        access: wats::access::Access::Locked,
+        workdir: std::path::PathBuf::from("/nonexistent"),
+        tools: vec![],
+        model: None,
+        work_dir: dir.path().join("work"),
+        keep_runs: 100,
+        keep_days: 30,
+        openclaw: Default::default(),
+        catchup: Some(wats::agent::DEFAULT_CATCHUP),
+    };
+    let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+    let runner = tokio::spawn(wats::agent::run(Arc::clone(&a), config, async {
+        let _ = stopped.await;
+    }));
+    eventually("two heartbeats", || runs(dir.path()).len() >= 2).await;
+    let _ = stop.send(());
+    runner.await??;
+    let runs = runs(dir.path());
+    let (first, second) = (&runs[0].0, &runs[1].0);
+    // None of them woke the agent by itself: older than agent.catchup.
+    assert!(first.contains("woken because: the heartbeat"), "{first}");
+    assert!(first.contains("Older asks nobody answered"), "{first}");
+    let order: Vec<usize> = [&h60, &h50, &h40]
+        .iter()
+        .map(|e| first.find(&e.id).expect("offered first, oldest first"))
+        .collect();
+    assert!(order.windows(2).all(|w| w[0] < w[1]), "{first}");
+    assert!(!first.contains(&h30.id), "3 per heartbeat: {first}");
+    assert!(second.contains(&h30.id), "{second}");
+    for e in [&h60, &h50, &h40] {
+        assert!(!second.contains(&e.id), "offered once: {second}");
+    }
+    for (left_out, why) in [(&ancient, "too old"), (&answered, "answered")] {
+        for prompt in [first, second] {
+            assert!(!prompt.contains(&left_out.id), "{why}: {prompt}");
+        }
+    }
     a.shutdown().await?;
     Ok(())
 }
