@@ -56,7 +56,9 @@ order:
    - `ts` an integer;
    - `thread` and `parent` both null or both 64-hex ids;
    - `net` and the `kind` token grammars;
-   - `pow` 1 to 20 decimal digits;
+   - `pow` is `"<alg>:<payload>"`, `alg` 1 to 16 chars of `[a-z0-9]` and
+     `payload` 1 to 2048 chars of base64url (`[A-Za-z0-9_-]`); a v1 event
+     whose `alg` is not `b3` is opaque;
    - `refs`, when present: at most 256 ids, lowercase hex, strictly
      ascending.
 

@@ -1366,15 +1366,19 @@ impl Node {
                 UNDERSTOOD_VERSIONS.1
             );
         }
-        let mut required = crate::event::required_pow_bits(self.config.min_pow_bits, size);
-        if unknown_version {
-            required = required.saturating_add(OPAQUE_EXTRA_POW_BITS);
-        }
-        if event.pow_bits() < required {
-            bail!(
-                "insufficient proof of work: {} bits for {size} bytes, {required} required",
-                event.pow_bits()
-            );
+        // A proof of work of an algorithm this node does not know is not
+        // measured, nor taken as no work: the event is opaque (`from_value`)
+        // and only the opaque quota below bounds it (ADR 0010, PoW).
+        if let Some(work) = event.pow_work() {
+            let mut required = crate::event::required_pow_bits(self.config.min_pow_bits, size);
+            if unknown_version {
+                required = required.saturating_add(OPAQUE_EXTRA_POW_BITS);
+            }
+            if work < required {
+                bail!(
+                    "insufficient proof of work: {work} bits for {size} bytes, {required} required"
+                );
+            }
         }
         if event.ts() > now_secs().saturating_add(MAX_CLOCK_SKEW_SECS) {
             bail!("event timestamp is in the future");

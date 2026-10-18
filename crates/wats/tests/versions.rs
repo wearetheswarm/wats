@@ -206,3 +206,76 @@ async fn v1_node_relays_v2_events() -> anyhow::Result<()> {
     c.shutdown().await?;
     Ok(())
 }
+
+/// A proof of work of an algorithm this node does not know (ADR 0010,
+/// algorithm-tagged PoW): the event is stored and relayed opaque, under the
+/// opaque quota, never shown and never refused as "no work". A `b3` proof
+/// below the required difficulty is still refused.
+#[tokio::test(flavor = "multi_thread")]
+async fn unknown_pow_algorithm_is_opaque() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let start = |dir: &std::path::Path| {
+        let mut config = NodeConfig::new(dir);
+        config.mode = NetworkMode::Loopback;
+        config.pow_bits = 0;
+        config.min_pow_bits = 16;
+        Node::start(config)
+    };
+    let node = start(dir.path()).await?;
+    let key = SigningKey::from_bytes(&[42; 32]);
+    let note = wats::event::Draft {
+        net: PUBLIC_NET.into(),
+        kind: Some(wats::event::Kind::Note),
+        title: Some("a puzzle from the future".into()),
+        text: "mined with an algorithm this node does not know".into(),
+        ..Default::default()
+    }
+    .sign(&key, wats::node::now_secs(), 0)?;
+    let with_pow = |pow: &str| {
+        let mut wire = serde_json::to_value(&note).unwrap();
+        wire["pow"] = json!(pow);
+        let d = wats::wire::digest(wire.as_object().unwrap()).unwrap();
+        wire["id"] = json!(hex::encode(d.id));
+        wire["sig"] = json!(hex::encode(wats::wire::sign_v1(&key, &d.id)));
+        wire
+    };
+
+    // b3 with less than 16 bits: refused.
+    let weak = (0..)
+        .map(|n| with_pow(&format!("b3:{n}")))
+        .find(|w| {
+            w["id"]
+                .as_str()
+                .unwrap()
+                .starts_with(['8', '9', 'a', 'b', 'c', 'd', 'e', 'f'])
+        })
+        .unwrap();
+    let err = node.publish_signed(weak).await.unwrap_err();
+    assert!(err.to_string().contains("proof of work"), "{err:#}");
+
+    // An unknown algorithm: accepted, but opaque.
+    let future = with_pow("eqx:AAECAwQFBgcICQoLDA0ODw");
+    let id = future["id"].as_str().unwrap().to_string();
+    node.publish_signed(future.clone()).await?;
+    let (v, opaque, stored) = node.store().get_raw(&id)?.unwrap();
+    assert_eq!((v, opaque), (1, true));
+    assert_eq!(stored, future);
+    assert!(
+        node.store().opaque_bytes() > 0,
+        "counted in the opaque quota"
+    );
+    assert!(
+        node.store()
+            .search(Some("puzzle"), &Filter::default(), 10)?
+            .is_empty(),
+        "never shown"
+    );
+
+    // Still opaque after a restart, which re-validates opaque v1 rows.
+    node.shutdown().await?;
+    let node = start(dir.path()).await?;
+    let (_, opaque, _) = node.store().get_raw(&id)?.unwrap();
+    assert!(opaque);
+    node.shutdown().await?;
+    Ok(())
+}

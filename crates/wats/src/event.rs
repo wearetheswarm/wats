@@ -13,8 +13,9 @@
 //! ```
 //!
 //! JCS is RFC 8785, applied to input parsed under the strict profile of
-//! [`crate::strict_json`]. The id doubles as the proof-of-work target: `pow`
-//! is a nonce chosen so that the id has N leading zero bits.
+//! [`crate::strict_json`]. The id doubles as the proof-of-work target: our
+//! events carry `pow = "b3:<nonce>"`, a nonce chosen so that the id has N
+//! leading zero bits ([`crate::wire::pow_work`]).
 
 // Network input must never panic the node (security review, item D).
 #![deny(
@@ -738,19 +739,19 @@ impl Draft {
             text: self.text,
             data: self.data,
             blobs: self.blobs,
-            pow: String::new(),
+            pow: format!("{}:", wire::POW_ALG_B3),
             sig: String::new(),
             grease: self.grease,
         };
         // "pow" sorts in the middle of the header keys: canonicalize once
-        // with an empty nonce, then splice decimal nonces (which need no
-        // escaping) between the quotes.
+        // with an empty nonce ("b3:"), then splice decimal nonces (which
+        // need no escaping) before the closing quote.
         let Value::Object(wire_map) = serde_json::to_value(&event)? else {
             return Err(invalid("an event serializes to an object"));
         };
         let (header, _, _) = wire::header_object(&wire_map)?;
         let template = jcs(&header)?;
-        let marker = br#""pow":"""#;
+        let marker = format!(r#""pow":"{}:""#, wire::POW_ALG_B3).into_bytes();
         let split = template
             .windows(marker.len())
             .position(|w| w == marker)
@@ -759,14 +760,14 @@ impl Draft {
         let (prefix, suffix) = template.split_at(split);
         let mut nonce: u64 = 0;
         let (id, pow) = loop {
-            let pow = nonce.to_string();
+            let digits = nonce.to_string();
             let mut hasher = blake3::Hasher::new_derive_key(wire::ID_CONTEXT);
             hasher.update(prefix);
-            hasher.update(pow.as_bytes());
+            hasher.update(digits.as_bytes());
             hasher.update(suffix);
             let id: [u8; 32] = hasher.finalize().into();
             if leading_zero_bits(&id) >= pow_bits {
-                break (id, pow);
+                break (id, format!("{}:{digits}", wire::POW_ALG_B3));
             }
             nonce = nonce
                 .checked_add(1)
@@ -808,7 +809,7 @@ impl Draft {
             text: self.text.clone(),
             data: self.data.clone(),
             blobs: self.blobs.clone(),
-            pow: "9".repeat(20),
+            pow: format!("{}:{}", wire::POW_ALG_B3, "9".repeat(20)),
             sig: "0".repeat(128),
             grease: self.grease.clone(),
         };
@@ -900,10 +901,12 @@ impl Event {
         self.check_rules()
     }
 
-    /// Proof-of-work difficulty actually achieved by this event.
+    /// Proof-of-work difficulty actually achieved by this event (0 for an
+    /// algorithm this node does not know, which a stored event never has).
     pub fn pow_bits(&self) -> u32 {
         parse_hex::<32>(&self.id, "id")
-            .map(|id| leading_zero_bits(&id))
+            .ok()
+            .and_then(|id| wire::pow_work(&self.pow, &id))
             .unwrap_or(0)
     }
 
@@ -1522,7 +1525,7 @@ mod tests {
             br#"{"blobs":[],"data":{},"tags":["lang:en"],"text":"hello swarm","title":"hello"}"#,
         ));
         let header = format!(
-            r#"{{"author":"{}","body":"{body}","kind":"note","net":"public","parent":null,"pow":"0","refs":[],"thread":null,"ts":1760500000,"v":1}}"#,
+            r#"{{"author":"{}","body":"{body}","kind":"note","net":"public","parent":null,"pow":"b3:0","refs":[],"thread":null,"ts":1760500000,"v":1}}"#,
             event.author
         );
         assert_eq!(
