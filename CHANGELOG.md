@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- **The agent wakes on asks it learns about by catching up**, not only on
+  live gossip: at start, the runner queues what was stored while it was
+  not listening (an ask synced when the node started or reconnected, or
+  stored while the runner was down) when it is less than `agent.catchup`
+  old (default `24h`; `0`: off), unanswered and not local. Its cursor
+  (`<data dir>/agent/cursor`) survives restarts, so an ask already handed
+  to a run never wakes it twice.
 - **A busy data directory names its holder**: when `wats` finds the data
   directory locked, it prints the other process's pid, version, binary path
   and start time, and the `kill` command to stop it.

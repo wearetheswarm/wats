@@ -2532,7 +2532,13 @@ fn agent_config(
         budget.max_usd_per_day = f64::INFINITY;
         budget.max_usd_per_month = f64::INFINITY;
     }
+    let catchup = match &file.catchup {
+        Some(value) => wats::settings::parse_retention(value)
+            .map_err(|e| anyhow::anyhow!("config.toml agent.catchup: {e}"))?,
+        None => Some(wats::agent::DEFAULT_CATCHUP),
+    };
     Ok(Some(wats::agent::AgentConfig {
+        catchup,
         openclaw,
         runtime,
         ignore_local: args.ignore_local.or(file.ignore_local).unwrap_or(true),
