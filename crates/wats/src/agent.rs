@@ -6,10 +6,10 @@
 //! Waking is cheap when idle: the node watches incoming events itself and
 //! only spawns the agent when there is something new (debounced), or when
 //! the heartbeat is due. One run at a time, each with a timeout, a cap on
-//! runs per hour, and wake limits per author and per thread (see
-//! [`crate::wake`]). Every run leaves a transcript (see [`crate::runs`]).
+//! runs per hour, a wake limit per author and a loop detector per thread
+//! (see [`crate::wake`]). Every run leaves a transcript (see [`crate::runs`]).
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::Arc;
@@ -28,7 +28,7 @@ use crate::identity::author_id;
 use crate::node::Node;
 use crate::runs::{self, RunRecord};
 use crate::store::Filter;
-use crate::wake::{WakeLimits, WakeState};
+use crate::wake::{Hold, WakeLimits, WakeState, loop_turns};
 
 /// Shipped when no `--heartbeat-file` is given (crates/wats/assets/HEARTBEAT.md).
 pub const DEFAULT_HEARTBEAT: &str = include_str!("../assets/HEARTBEAT.md");
@@ -74,7 +74,7 @@ pub struct AgentConfig {
     pub max_turns: u32,
     /// Spend budget, enforced before each run.
     pub budget: crate::budget::Budget,
-    /// Wakes per author and backoff per thread (see [`crate::wake`]).
+    /// Wakes per author and the loop detector (see [`crate::wake`]).
     pub wakes: WakeLimits,
     /// Codex features to disable (filled at start from
     /// [`access::CODEX_DENIED_FEATURES`], what the installed Codex knows,
@@ -636,15 +636,16 @@ struct Queued {
     author: String,
     /// Its thread root.
     thread: String,
-    /// Whether a hold by the wake limits was logged.
-    held: bool,
+    /// The hold by the wake limits last logged for it (`author`, `loop`),
+    /// so that each is logged once.
+    held: Option<&'static str>,
 }
 
 /// How far back the wake state is rebuilt from the run index at start.
 const WAKE_HISTORY_SECS: u64 = 86_400;
 
 /// The wake state as the runs of the last day left it: each run triggered
-/// by events counts for their authors and threads, as it did live.
+/// by events counts for their authors, as it did live.
 fn wake_history(node: &Node, config: &AgentConfig, now: u64) -> WakeState {
     let mut state = WakeState::default();
     let since = now.saturating_sub(WAKE_HISTORY_SECS);
@@ -658,41 +659,82 @@ fn wake_history(node: &Node, config: &AgentConfig, now: u64) -> WakeState {
             .filter_map(|id| node.store().get(id).ok().flatten())
             .map(|stored| stored.event)
             .collect();
-        state.record(
-            &config.wakes,
-            events.iter().map(|e| e.author.as_str()),
-            events.iter().map(|e| e.thread_root()),
-            record.started,
-        );
+        state.record(events.iter().map(|e| e.author.as_str()), record.started);
     }
-    state.prune(&config.wakes, now);
+    state.prune(now);
     state
+}
+
+/// Whether `thread` is paused for the agent `me` by the loop detector
+/// (see [`loop_turns`]), read from the thread's events in the store.
+fn loop_hold(node: &Node, me: &str, limits: &WakeLimits, thread: &str) -> Option<Hold> {
+    if limits.loop_max_exchanges == 0 {
+        return None;
+    }
+    let authors = match node
+        .store()
+        .thread_authors_newest(thread, limits.loop_scan())
+    {
+        Ok(authors) => authors,
+        Err(e) => {
+            warn!(thread = short(thread), "agent loop detector: {e:#}");
+            return None;
+        }
+    };
+    let (turns, other) = loop_turns(me, authors.iter().map(String::as_str));
+    limits.loop_detected(turns).then(|| Hold::Loop {
+        turns,
+        other: other.unwrap_or_default().to_string(),
+    })
 }
 
 /// The queued events the wake limits let wake the agent at `now`; the
 /// others stay queued, each hold logged once.
 fn ready(
+    node: &Node,
+    me: &str,
     queue: &mut [Queued],
     state: &WakeState,
     limits: &WakeLimits,
     now: u64,
 ) -> Vec<(String, &'static str)> {
     let mut ready = Vec::new();
+    let mut threads: HashMap<String, Option<Hold>> = HashMap::new();
     for queued in queue.iter_mut() {
-        match state.check(limits, &queued.author, &queued.thread, now) {
-            None => ready.push((queued.id.clone(), queued.why)),
-            Some(hold) => {
-                if !queued.held {
-                    warn!(
-                        event = short(&queued.id),
-                        author = short(&queued.author),
-                        "agent wake deferred: {}; kept for the next allowed run, {}",
-                        hold.describe(limits),
-                        budget::until(hold.until())
-                    );
-                    queued.held = true;
-                }
-            }
+        let hold = state.check(limits, &queued.author, now).or_else(|| {
+            threads
+                .entry(queued.thread.clone())
+                .or_insert_with(|| loop_hold(node, me, limits, &queued.thread))
+                .clone()
+        });
+        let Some(hold) = hold else {
+            ready.push((queued.id.clone(), queued.why));
+            continue;
+        };
+        let kind = match hold {
+            Hold::Author { .. } => "author",
+            Hold::Loop { .. } => "loop",
+        };
+        if queued.held == Some(kind) {
+            continue;
+        }
+        queued.held = Some(kind);
+        match &hold {
+            Hold::Author { until, .. } => warn!(
+                event = short(&queued.id),
+                author = short(&queued.author),
+                "agent wake deferred: {}; kept for the next allowed run, {}",
+                hold.describe(limits),
+                budget::until(*until)
+            ),
+            Hold::Loop { .. } => warn!(
+                event = short(&queued.id),
+                author = short(&queued.author),
+                "agent wake paused: loop detected in thread {}: {}; kept until a human \
+                 or a third party posts in the thread",
+                short(&queued.thread),
+                hold.describe(limits)
+            ),
         }
     }
     ready
@@ -773,7 +815,7 @@ pub async fn run(
                                     why,
                                     author: event.author.clone(),
                                     thread: event.thread_root().to_string(),
-                                    held: false,
+                                    held: None,
                                 });
                             }
                         }
@@ -797,11 +839,11 @@ pub async fn run(
                     runs.pop_front();
                 }
                 let unix_now = unix_now();
-                wakes.prune(&config.wakes, unix_now);
+                wakes.prune(unix_now);
                 let debounced = last_run.is_none_or(|t| now.duration_since(t) >= config.every);
                 // Events stay queued until a run actually starts with them.
                 let ready = if debounced {
-                    ready(&mut pending, &wakes, &config.wakes, unix_now)
+                    ready(&node, &me, &mut pending, &wakes, &config.wakes, unix_now)
                 } else {
                     Vec::new()
                 };
@@ -862,12 +904,7 @@ pub async fn run(
                         .into_iter()
                         .partition(|q| ids.contains(q.id.as_str()));
                     pending = kept;
-                    wakes.record(
-                        &config.wakes,
-                        woke.iter().map(|q| q.author.as_str()),
-                        woke.iter().map(|q| q.thread.as_str()),
-                        unix_now,
-                    );
+                    wakes.record(woke.iter().map(|q| q.author.as_str()), unix_now);
                 }
                 runs.push_back(now);
                 last_run = Some(now);

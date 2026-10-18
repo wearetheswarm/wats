@@ -1424,9 +1424,9 @@ async fn wakes_only_on_what_is_addressed_to_it() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Wake limits: a second reply in the same thread waits for the thread's
-/// backoff, then wakes the agent (deferred, not dropped); after a restart,
-/// the per-author limit still counts the runs of the run index.
+/// Wake limits: a second reply in the same thread wakes the agent again
+/// (no per-thread backoff); after a restart, the per-author limit still
+/// counts the runs of the run index.
 #[tokio::test(flavor = "multi_thread")]
 async fn wake_limits_defer_and_survive_a_restart() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
@@ -1467,11 +1467,7 @@ async fn wake_limits_defer_and_survive_a_restart() -> anyhow::Result<()> {
         run_timeout: Duration::from_secs(10),
         max_turns: 10,
         budget: wats::budget::Budget::default(),
-        wakes: wats::wake::WakeLimits {
-            per_author_per_hour: 0,
-            thread_backoff: Duration::from_secs(5),
-            thread_backoff_max: Duration::from_secs(60),
-        },
+        wakes: wats::wake::WakeLimits::unlimited(),
         codex_disable: vec![],
         access: wats::access::Access::Locked,
         workdir: std::path::PathBuf::from("/nonexistent"),
@@ -1492,21 +1488,12 @@ async fn wake_limits_defer_and_survive_a_restart() -> anyhow::Result<()> {
     let second = b
         .publish(reply_to(&question, "Here is another one."), &[])
         .await?;
-    eventually("the deferred reply's run", || runs(dir.path()).len() >= 2).await;
+    eventually("the second reply's run", || runs(dir.path()).len() >= 2).await;
     let all = runs(dir.path());
     assert!(all[0].0.contains(&first.id), "{}", all[0].0);
     assert!(all[1].0.contains(&second.id), "{}", all[1].0);
     assert!(!all[1].0.contains(&first.id), "{}", all[1].0);
-    // The second run waited for the thread's backoff (5 s), however fast
-    // the reply arrived.
-    let index = wats::runs::list(&dir.path().join("work"));
-    assert_eq!(index.len(), 2);
-    assert!(
-        index[1].started >= index[0].started + 4,
-        "{} then {}",
-        index[0].started,
-        index[1].started
-    );
+    assert_eq!(wats::runs::list(&dir.path().join("work")).len(), 2);
     let _ = stop.send(());
     runner.await??;
 
@@ -1530,6 +1517,121 @@ async fn wake_limits_defer_and_survive_a_restart() -> anyhow::Result<()> {
     let _ = stop.send(());
     runner.await??;
     for n in [a, b] {
+        n.shutdown().await?;
+    }
+    Ok(())
+}
+
+/// Loop detector (agent.loop_max_exchanges = 3): once the agent and b have
+/// taken more than 3 turns in a row in a thread, b's next reply no longer
+/// wakes the agent; it is kept, and wakes it as soon as a third author (c)
+/// posts in the thread.
+#[tokio::test(flavor = "multi_thread")]
+async fn loop_detector_pauses_a_thread_until_a_third_party_posts() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let a = node(&dir.path().join("a"), &[]).await?;
+    let b = node(&dir.path().join("b"), &[&a]).await?;
+    let c = node(&dir.path().join("c"), &[&a]).await?;
+    a.wait_for_neighbor(PUBLIC_NET, Duration::from_secs(10))
+        .await?;
+    let reply_to = |parent: &wats::event::Event, kind: Kind, text: &str| Draft {
+        net: PUBLIC_NET.into(),
+        thread: Some(parent.thread_root().to_string()),
+        parent: Some(parent.id.clone()),
+        kind: Some(kind),
+        text: text.into(),
+        ..Draft::default()
+    };
+    let agent_key = a.author_key("agent")?;
+    // Turn 1: the agent asks.
+    let question = a
+        .publish_as(&agent_key, ask("Who has a CSV sample?"), &[])
+        .await?;
+    eventually_async(|| async {
+        b.store().get(&question.id).unwrap().is_some()
+            && c.store().get(&question.id).unwrap().is_some()
+    })
+    .await;
+
+    let config = AgentConfig {
+        runtime: "claude".into(),
+        profile: "agent".into(),
+        user: "alice".into(),
+        about: String::new(),
+        caps: vec![],
+        every: Duration::from_secs(1),
+        heartbeat: Duration::from_secs(3600),
+        max_runs_per_hour: 100,
+        allow: vec![],
+        ignore_local: true,
+        heartbeat_text: DEFAULT_HEARTBEAT.into(),
+        command: fake_agent(dir.path()),
+        mcp_command: "/usr/bin/true".into(),
+        mcp_args: vec![],
+        extra_args: vec![],
+        run_timeout: Duration::from_secs(10),
+        max_turns: 10,
+        budget: wats::budget::Budget::default(),
+        wakes: wats::wake::WakeLimits {
+            per_author_per_hour: 0,
+            loop_max_exchanges: 3,
+        },
+        codex_disable: vec![],
+        access: wats::access::Access::Locked,
+        workdir: std::path::PathBuf::from("/nonexistent"),
+        tools: vec![],
+        model: None,
+        work_dir: dir.path().join("work"),
+        keep_runs: 100,
+        keep_days: 30,
+    };
+    let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+    let runner = tokio::spawn(wats::agent::run(Arc::clone(&a), config, async {
+        let _ = stopped.await;
+    }));
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    // Turn 2: b answers; 2 turns, the agent wakes.
+    let answer = b
+        .publish(reply_to(&question, Kind::Answer, "I do."), &[])
+        .await?;
+    eventually("a run", || !runs(dir.path()).is_empty()).await;
+    // Turn 3: the (fake) agent asks for more.
+    let clarify = a
+        .publish_as(
+            &agent_key,
+            reply_to(&answer, Kind::Clarify, "With headers?"),
+            &[],
+        )
+        .await?;
+    eventually_async(|| async { b.store().get(&clarify.id).unwrap().is_some() }).await;
+    // Turn 4: b replies; 4 turns > 3, the thread is paused for the agent.
+    let again = b
+        .publish(reply_to(&clarify, Kind::Answer, "Yes, with headers."), &[])
+        .await?;
+    eventually_async(|| async { a.store().get(&again.id).unwrap().is_some() }).await;
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    assert_eq!(runs(dir.path()).len(), 1, "paused: loop detected");
+
+    // A third author posts in the thread (not to the agent: it does not
+    // wake it by itself); b's held reply now wakes the agent.
+    let third = c
+        .publish(
+            reply_to(&question, Kind::Note, "Try the open data portal."),
+            &[],
+        )
+        .await?;
+    eventually("the held reply's run", || runs(dir.path()).len() >= 2).await;
+    let all = runs(dir.path());
+    assert!(all[1].0.contains(&again.id), "{}", all[1].0);
+    // Woken by b's held reply, not by c's post.
+    let index = wats::runs::list(&dir.path().join("work"));
+    assert_eq!(index.len(), 2);
+    assert_eq!(index[1].events, std::slice::from_ref(&again.id));
+    assert!(!index[1].events.contains(&third.id));
+    let _ = stop.send(());
+    runner.await??;
+    for n in [a, b, c] {
         n.shutdown().await?;
     }
     Ok(())

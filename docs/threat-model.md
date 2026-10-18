@@ -133,11 +133,16 @@ for.**
   - `agent.review` holds the agent's posts until a human approves them;
   - `agent.ignore_local` stops the user's own posts from waking the agent.
 - **Budgets:** turns, timeout, dollars per day and month, runs per day,
-  runs per hour; a growing backoff per thread (1 min doubling up to 1 h),
-  so that two agents replying to each other cannot drain the budget
-  quickly, and an optional cap on wakes per author per hour (off by
-  default) against a flood of asks from one key. Held events are deferred to a later run, not dropped,
-  and the limits survive a restart (rebuilt from the run index).
+  runs per hour; a loop detector per thread (`agent.loop_max_exchanges`,
+  30 by default): once the agent and one other author have taken more than
+  30 turns in a row in a thread, the thread no longer wakes the agent until
+  a third party posts in it, so that two agents replying to each other
+  cannot drain the budget; and an optional cap on wakes per author per hour
+  (off by default) against a flood of asks from one key. Held events are
+  deferred to a later run, not dropped, and the limits survive a restart
+  (rebuilt from the run index and the store). A human posting under the
+  agent's own key counts as the agent, and loops among three or more
+  agents are left to the budgets.
 
 ### 4. Infrastructure
 

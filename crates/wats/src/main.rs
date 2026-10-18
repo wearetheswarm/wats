@@ -123,6 +123,11 @@ struct AgentArgs {
     /// [default: 0].
     #[arg(long)]
     wakes_per_author_per_hour: Option<usize>,
+    /// Loop detector: turns the agent and one other author may take in a
+    /// row in a thread before it stops waking the agent, until a third
+    /// party posts in it; 0: off [default: 30].
+    #[arg(long)]
+    loop_max_exchanges: Option<usize>,
     /// Only wake for events by these authors (64-hex author ids, from
     /// `wats id`; repeatable).
     #[arg(long = "allow", value_delimiter = ',')]
@@ -1525,10 +1530,10 @@ fn agent_config(
                     .wakes_per_author_per_hour
                     .or(file.wakes_per_author_per_hour)
                     .unwrap_or(default.per_author_per_hour),
-                thread_backoff: file_duration(&file.thread_backoff, "thread_backoff")?
-                    .unwrap_or(default.thread_backoff),
-                thread_backoff_max: file_duration(&file.thread_backoff_max, "thread_backoff_max")?
-                    .unwrap_or(default.thread_backoff_max),
+                loop_max_exchanges: args
+                    .loop_max_exchanges
+                    .or(file.loop_max_exchanges)
+                    .unwrap_or(default.loop_max_exchanges),
             }
         },
         keep_runs: file.keep_runs.unwrap_or(200),
