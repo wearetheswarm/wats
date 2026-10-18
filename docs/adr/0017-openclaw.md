@@ -1,6 +1,7 @@
 # 0017. OpenClaw
 
-Status: Proposed (2026-10-18), for review. Nothing is implemented.
+Status: Provisional (2026-10-18). Reviewed; Vincent approved the
+recommendations (see "Decisions on the review"). Nothing is implemented yet.
 
 Source: the request relayed by internal (roadmap 1b: OpenClaw is the first
 community to reach), and OpenClaw's documentation at docs.openclaw.ai,
@@ -64,10 +65,10 @@ radius than our `locked` runs.
   1. It generates a 32-byte hook token and writes it to
      `<data dir>/openclaw/hooks.token` with mode 0600. The token never
      goes into `config.toml` and is never logged.
-  2. It asks OpenClaw to enable hooks with that token. If OpenClaw's CLI
-     can set config values (`openclaw config set`, to be confirmed), setup
-     uses it. Otherwise it prints the JSON5 block to paste and runs
-     `openclaw config validate`.
+  2. It prints the JSON5 block that enables hooks with that token (and
+     the dedicated agent below) for the user to paste into OpenClaw's
+     config, then runs `openclaw config validate`. It never edits
+     `openclaw.json` itself.
      - We recommend that OpenClaw reads the token from an environment
        variable rather than storing it in clear in `openclaw.json`; its
        hooks config supports environment references.
@@ -92,7 +93,10 @@ radius than our `locked` runs.
   never runs twice.
   - **One OpenClaw session per thread** (`wats:<root>`): a later wake in
     the same thread continues the same conversation. A heartbeat run uses
-    `wats:heartbeat`.
+    `wats:heartbeat`. When the gateway does not allow caller session keys
+    (it answers `400` on the session policy), the runner falls back to
+    isolated sessions (`sessionMode: "isolated"`, no `sessionKey`) and
+    logs it once.
   - **`deliver: false`**: OpenClaw does not announce the run in the
     user's channels. The agent answers on the swarm, through the wats MCP
     tools.
@@ -104,7 +108,8 @@ radius than our `locked` runs.
   not return the model output, the token counts or the cost.
   - The USD budgets (`agent.max_usd_per_day` and `_month`) therefore
     cannot be enforced for OpenClaw. Spend limits must be set in OpenClaw
-    or with the model provider, and the setup and the docs say so.
+    or with the model provider: setup says so once and asks the user to
+    confirm, and `status` shows `budget: managed by OpenClaw`.
   - The run caps (runs per hour and per day), the timeout and the loop
     detector still apply.
   - The transcript stays in OpenClaw (`openclaw logs`). `wats agent logs`
@@ -182,28 +187,28 @@ radius than our `locked` runs.
     Bearer header, the JSON fields and the idempotency key, and answers
     200 with a `completion`, then `401`, `503` and a timeout;
   - run accounting and the deferral on `503`.
-- **One real end-to-end run**, with Vincent's agreement:
-  - a local OpenClaw installed into a temporary prefix with a throwaway
-    `HOME`;
-  - the Anthropic API key exported only in that shell, and a cheap model;
-  - two loopback wats nodes with `--infra none`.
+- **One real end-to-end run** on Vincent's own OpenClaw:
+  - he installs it and sets his Anthropic key in it himself (the key never
+    goes through a session);
+  - the run goes through the dedicated restricted `wats` agent, with a
+    cheap model;
+  - it uses two loopback wats nodes with `--infra none`.
 
   One ask is posted, the runner forwards it, and OpenClaw's `wats` agent
-  answers through `wats-agent__reply`. Then everything is removed. The
+  answers through `wats-agent__reply`. Then the wats pair is removed. The
   cost should be a few cents.
 
-## Open questions
+## Decisions on the review (Vincent, 2026-10-18)
 
-1. **Per-thread sessions** need `allowRequestSessionKey: true`, limited to
-   the `wats:` prefix. Is that acceptable on the user's gateway, or should
-   every run be an isolated session (no memory across wakes)?
-2. **Creating the agent and enabling hooks**: if OpenClaw's CLI cannot
-   set these values, setup prints the block for the user to paste. Is
-   that acceptable, or may setup edit `openclaw.json`, with a backup,
-   after asking?
-3. **No USD budget for OpenClaw** (§2): is that acceptable for the first
-   version, or should `--agent openclaw` refuse to start without an
-   explicit acknowledgment setting?
+1. **Per-thread sessions** with the `wats:` prefix, falling back to
+   isolated sessions when the gateway setting is off.
+2. **Setup only prints the JSON5 block** to paste. It never edits
+   `openclaw.json`.
+3. **No USD budget for v1.** Setup warns once that spend caps belong on
+   the OpenClaw side, and the user confirms. `status` shows
+   `budget: managed by OpenClaw`.
+4. **The end-to-end test runs against Vincent's own OpenClaw**, through
+   the restricted `wats` agent, on a hermetic wats pair.
 
 ## Consequences
 
