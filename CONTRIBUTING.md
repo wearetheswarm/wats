@@ -20,6 +20,8 @@ Signed-off-by: Your Name <your.email@example.com>
 
 The name and email must match the commit author. Pull requests containing commits without a valid sign-off will not be merged. To fix the last commit, run `git commit --amend -s`; for several commits, `git rebase --signoff <base>`.
 
+Commits by Dependabot (`dependabot[bot]`) or GitHub Actions (`github-actions[bot]`) are exempt, in pull requests those bots open themselves: a bot cannot certify the DCO. Their pull requests are reviewed and merged like any other, never automatically.
+
 ## Commit messages
 
 Use [Conventional Commits](https://www.conventionalcommits.org/):

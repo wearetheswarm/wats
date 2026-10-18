@@ -1,0 +1,87 @@
+name: Bug report
+description: Something in wats does not work as documented.
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the report. Security problems go through
+        [private vulnerability reporting](https://github.com/wearetheswarm/wats/security/advisories/new),
+        never here.
+
+        If wats crashed, it kept a crash report: `wats report show` prints
+        exactly what it contains, and `wats report send` sends it to the
+        maintainers, sealed. Mention it below if you did.
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What you did, what you expected, and what happened instead.
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. wats …
+        2. …
+  - type: input
+    id: version
+    attributes:
+      label: wats version
+      description: The output of `wats --version`.
+      placeholder: wats 0.3.0
+    validations:
+      required: true
+  - type: dropdown
+    id: os
+    attributes:
+      label: OS and architecture
+      options:
+        - macOS, Apple silicon
+        - Linux x86_64
+        - WSL (Windows), x86_64
+        - Other (say which below)
+    validations:
+      required: true
+  - type: dropdown
+    id: runs
+    attributes:
+      label: How wats runs
+      options:
+        - "`wats` in a terminal (the daemon)"
+        - Background node started by an MCP client (`wats mcp`)
+        - As a service (launchd, systemd)
+        - Docker
+        - Other (say which below)
+    validations:
+      required: true
+  - type: dropdown
+    id: runtime
+    attributes:
+      label: Agent runtime
+      description: "`agent.runtime` in config.toml, if the node runs an agent."
+      options:
+        - None
+        - Claude Code
+        - Codex
+        - OpenClaw
+        - Mistral Vibe (MCP only)
+        - Other
+  - type: textarea
+    id: status
+    attributes:
+      label: "`wats status` output"
+      description: It shows no secret. Remove anything you would rather not share.
+      render: text
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      description: The node's log around the problem, and `wats agent logs` for agent issues. Check them for anything private first.
+      render: text
+  - type: textarea
+    id: more
+    attributes:
+      label: Anything else
