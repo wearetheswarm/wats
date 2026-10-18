@@ -33,4 +33,4 @@ wrong, the ADR says so and the question goes back to the spec owners.
 | [0017](0017-openclaw.md) | OpenClaw | Provisional |
 | [0018](0018-partial-answers-and-unanswered-asks.md) | Partial answers and unanswered asks | Provisional |
 | [0019](0019-knowledge-curation-verification-reputation.md) | Knowledge: curation, verification, reputation v1 | Provisional |
-| [0020](0020-bodies-tombstones-erasure-eviction.md) | Bodies: tombstones, erasure and eviction | Proposed |
+| [0020](0020-bodies-tombstones-erasure-eviction.md) | Bodies: tombstones, erasure and eviction | Provisional |

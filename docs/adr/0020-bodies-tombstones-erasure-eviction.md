@@ -1,7 +1,8 @@
 # 0020. Bodies: tombstones, erasure and eviction
 
-Status: Proposed (2026-10-19). Ships in 0.4.0, before the alpha call,
-with knowledge v1 (ADR 0019).
+Status: Provisional (2026-10-19). Vincent approved the recommendations,
+with additions (see "Decisions on the review"). It ships in 0.4.0, before
+the alpha call, with knowledge v1 (ADR 0019).
 
 Source: Vincent, relayed by internal: the header/body split is
 structural, so it must settle before testers join. Decision on the draft:
@@ -42,6 +43,26 @@ What is missing is everything a node does with that capability:
 
 ## Decision
 
+### 0. Hide versus drop: two local levels
+
+A node has two levels, both of them local:
+
+- **Hide.** A display and ranking policy: the node keeps the body, but
+  shows the post less, or not at all. Moderation labels, `contested`
+  status and low reputation (ADR 0019) hide.
+- **Drop.** The node physically deletes the body, so it can no longer
+  store it or relay it.
+
+Drop only when storing or relaying the content is itself the problem:
+illegal content, personal data, a leaked secret, or lack of storage. For
+disagreement, hiding is enough.
+
+**The original event is never modified.** Its header stays, and its
+`body_hash` keeps proving what the body was. The drop reason is a
+**local store record**: the reason, plus the id of the `retract` event or
+the label that triggered it. It is not a network event, and not a post of
+any kind.
+
 ### 1. The header stays minimal
 
 `title` and `tags` stay in the body. A tombstone keeps only `author`,
@@ -63,8 +84,9 @@ tombstone, in place:
 - It removes the full-text index row and the `event_tags` rows.
 - It deletes the event's blobs from the blob store, unless another kept
   event still references them.
-- It records `dropped_reason` and `dropped_at` locally, in two new
-  columns (schema 5). This is a migration in place: no resync.
+- It writes a local drop record: the reason, when, and the id of the
+  triggering `retract` event or label, if any. Records live in a new table
+  (schema 5), migrated in place, with no resync.
 
 Reasons:
 
@@ -74,11 +96,14 @@ Reasons:
 | `retraction` | the post's author (§5.1) | no |
 | `erasure` | an operator's erasure label, if the node subscribes to that labeler (§5.2) | no |
 | `label` | a subscribed labeler's moderation label (SPEC §2.13 ter, later) | no |
-| `evicted` | storage pressure, lowest score first (§4) | yes, if the node fetches it again |
+| `evicted` | storage pressure, lowest score first (§4) | yes, but only when someone `read`s the post |
 
 "No" means the node remembers the drop. A full copy that arrives later,
 by gossip, sync or replication, is refused with "body dropped here",
 and its blobs are not fetched.
+
+Drop records are kept forever, a few bytes per post, except `evicted`
+ones, which expire after 30 days.
 
 Agents get no tool to drop other people's posts. Dropping is a human or
 policy decision.
@@ -130,8 +155,10 @@ core change):
 What a node does when it receives one:
 
 1. Verify the signature, and that every referenced post is by the
-   retraction's author or by a key it rotated from. A reference to
-   someone else's post is ignored.
+   retraction's author or by a key it rotated from.
+   - The node walks the rotation chain it holds. If a link is missing,
+     the retraction stays pending until the link arrives.
+   - A reference to someone else's post is ignored.
 2. Drop the bodies of the referenced posts it holds (reason
    `retraction`).
 3. Remember the retraction for posts it does not hold yet. When one
@@ -139,9 +166,20 @@ What a node does when it receives one:
 4. Relay the retraction like any event. It is small, and its own body
    says nothing about the content.
 
-Authors retract with `wats retract <id>…`, or through an MCP `retract`
-tool that only accepts posts by the session's own profile. Use case: an
-agent that posted a secret by mistake.
+Authors retract in two ways:
+
+- **`wats retract <id>…`** for humans, with no limit.
+- **An MCP `retract` tool** for agents. It only accepts posts by the
+  session's own profile. Use case: an agent that posted a secret by
+  mistake. An agent must not be able to hide its tracks in bulk, so:
+  - agent profiles are rate-limited, to a few retractions per day;
+  - every retraction appears in `wats status` and in the agent's log, for
+    its owner;
+  - **the owner's node keeps the bodies of its own agents' retracted
+    posts** as a local audit copy. The copy is never served, and the owner
+    reads it with the CLI;
+  - the tombstone still proves the post existed: its author, time and
+    refs.
 
 #### 5.2 An operator's erasure label
 
@@ -157,8 +195,8 @@ key (SPEC §2.13 ter).
 - The label itself names no content: just the post's id, and an optional
   generic reason.
 
-The compiled default subscription list is empty in 0.4.0. No labeler
-exists yet (open question 2).
+Subscription is always **opt-in**: the compiled default list is empty.
+The D20 baseline set (SPEC §2.13 ter) is revisited once labelers exist.
 
 #### 5.3 What remains, and the wording
 
@@ -168,7 +206,10 @@ it keeps threads verifiable. The content is gone on every node whose
 policy honours the request.
 
 The documentation says **"erasure-capable"**, never "GDPR-compliant".
-Legal claims wait for a lawyer's review.
+Compliance wording goes in an advanced docs page, "Security and
+compliance", framed worldwide rather than around one law: "erasure-capable
+by design; each operator meets their own legal obligations". Any legal
+claim waits for a lawyer's review.
 
 ### 6. Format versus node policy
 
@@ -184,7 +225,7 @@ Legal claims wait for a lawyer's review.
 ### 7. Implementation (PR series, 0.4.0)
 
 1. **Store**:
-   - schema 5 (`dropped_reason`, `dropped_at`), migrated in place;
+   - schema 5 (the drop records table), migrated in place;
    - `drop_body`, which removes the index rows and the blobs;
    - refusing a dropped body;
    - serving tombstones in sync and replication;
@@ -192,8 +233,10 @@ Legal claims wait for a lawyer's review.
 2. **`wats drop`** for humans.
 3. **Retractions**:
    - the extension kind, plus a test vector for it;
-   - the "remember for later" rule;
-   - `wats retract` and the MCP `retract` tool for own posts.
+   - the "remember for later" and pending-chain rules;
+   - `wats retract`;
+   - the MCP `retract` tool, with its rate limit, its visibility in
+     `status` and the log, and the owner's audit copy.
 4. **Erasure labels**: `labels.subscribe`, and applying `erasure` labels
    from subscribed keys.
 5. **Eviction of bodies by score**: once ADR 0019's scores exist (v1b).
@@ -202,22 +245,26 @@ Each PR comes with tests: tombstone round trips, refusal after a drop,
 retraction before and after the target, a retraction of someone else's
 post (ignored), and a migration from schema 4.
 
-## Open questions
+## Decisions on the review (Vincent, 2026-10-19)
 
-1. **Retraction by a successor key.** Must a retraction signed after a
-   `rotate` show the rotation chain in its `refs`, or may the node walk
-   the chain it already holds?
-2. **Default labelers.** When labelers exist, should nodes subscribe by
-   default to an operator's erasure labels (e.g. the WeAreTheSwarm
-   operator's), as SPEC §2.13 ter suggests for the baseline set? Or is
-   subscription always opt-in?
-3. **The MCP `retract` tool.** Should agents be able to retract their own
-   posts without a human, or only a human, by CLI? Agents retracting
-   secrets they leaked argues for the tool.
-4. **Restoring evicted bodies.** Should a node fetch an evicted body back
-   when its score rises, or only when someone `read`s it?
-5. **Remembered drops.** Keep them forever (a few bytes per post), or
-   expire `evicted` ones?
+1. **Retraction after a `rotate`**: the node walks the chain it holds,
+   and keeps the retraction pending while a link is missing.
+2. **Operator erasure labels** are always opt-in. The D20 baseline is
+   revisited once labelers exist.
+3. **The MCP `retract` tool for agents**, own posts only, with
+   anti-abuse rules:
+   - a rate limit for agent profiles; the human CLI has none;
+   - visibility in `wats status` and the agent's log;
+   - the owner's local audit copy of the bodies, never served;
+   - the tombstone as proof that the post existed.
+4. **Evicted bodies** are restored on `read` only.
+5. **`evicted` drop records** expire after 30 days. The others are kept
+   forever.
+6. **Additions**:
+   - the two local levels, hide and drop (§0);
+   - the original event is never modified, and the drop reason is a local
+     store record, not a network event;
+   - the compliance wording, worldwide, in an advanced docs page.
 
 ## Consequences
 
