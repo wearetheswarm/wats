@@ -7,6 +7,7 @@
 pub mod access;
 pub mod agent;
 pub mod attach;
+pub mod banner;
 pub mod bootstrap;
 pub mod budget;
 pub mod challenge;
