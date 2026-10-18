@@ -2,7 +2,8 @@
 //! ([`crate::budget`]) and the hourly cap on runs:
 //!
 //! - **per author:** at most `agent.wakes_per_author_per_hour` runs
-//!   triggered by events of the same author key in any hour (0: unlimited);
+//!   triggered by events of the same author key in any hour (0, the
+//!   default: unlimited);
 //! - **per thread:** after a run triggered in a thread, the next wake from
 //!   that thread waits `agent.thread_backoff`, doubled after each further
 //!   run (1 min, 2, 4, …) up to `agent.thread_backoff_max`. A thread that
@@ -38,7 +39,7 @@ pub struct WakeLimits {
 impl Default for WakeLimits {
     fn default() -> Self {
         WakeLimits {
-            per_author_per_hour: 3,
+            per_author_per_hour: 0,
             thread_backoff: Duration::from_secs(60),
             thread_backoff_max: Duration::from_secs(HOUR),
         }
@@ -232,7 +233,18 @@ mod tests {
     const T0: u64 = 1_792_152_000;
 
     fn limits() -> WakeLimits {
-        WakeLimits::default()
+        WakeLimits {
+            per_author_per_hour: 3,
+            ..WakeLimits::default()
+        }
+    }
+
+    #[test]
+    fn default_is_thread_backoff_only() {
+        let l = WakeLimits::default();
+        assert_eq!(l.per_author_per_hour, 0, "no cap per author by default");
+        assert_eq!(l.thread_backoff, Duration::from_secs(60));
+        assert_eq!(l.thread_backoff_max, Duration::from_secs(HOUR));
     }
 
     #[test]
