@@ -40,9 +40,16 @@ tracing = "=0.1.44"
 url = "=2.5.8"
 tracing-subscriber = { version = "=0.3.23", features = ["env-filter"] }
 ed25519-zebra = { version = "=5.0.0", default-features = false, features = ["std"] }
+# `wats upgrade` and the update check (src/update.rs). reqwest and rustls
+# are already in the tree through iroh, with the same features.
+reqwest = { version = "=0.13.5", default-features = false, features = ["rustls-no-provider"] }
+rustls = { version = "=0.23.46", default-features = false, features = ["ring", "std"] }
+minisign-verify = "=0.3.0"
+sha2 = "=0.11.1"
+flate2 = { version = "=1.1.10", default-features = false, features = ["rust_backend"] }
+tar = { version = "=0.4.46", default-features = false }
 
 [dev-dependencies]
-sha2 = "=0.11.1"
 rmcp = { version = "=3.5.1", features = ["client", "transport-child-process"] }
 tempfile = "=3.27.0"
 

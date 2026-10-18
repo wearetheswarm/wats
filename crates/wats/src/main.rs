@@ -123,6 +123,11 @@ struct AgentArgs {
     /// [default: 0].
     #[arg(long)]
     wakes_per_author_per_hour: Option<usize>,
+    /// Loop detector: turns the agent and one other author may take in a
+    /// row in a thread before it stops waking the agent, until a third
+    /// party posts in it; 0: off [default: 30].
+    #[arg(long)]
+    loop_max_exchanges: Option<usize>,
     /// Only wake for events by these authors (64-hex author ids, from
     /// `wats id`; repeatable).
     #[arg(long = "allow", value_delimiter = ',')]
@@ -296,6 +301,21 @@ enum Command {
     Agent {
         #[command(subcommand)]
         action: AgentAction,
+    },
+    /// Upgrade this binary to the latest release: downloads the archive of
+    /// this platform, checks its minisign signature (key compiled in) and
+    /// SHA-256, then replaces the binary, keeping the previous one as
+    /// `<binary>.old`. A running node keeps the old version until restarted.
+    Upgrade {
+        /// Only say whether a newer release exists.
+        #[arg(long, conflicts_with = "rollback")]
+        check: bool,
+        /// Install this release (X.Y.Z) instead of the latest.
+        #[arg(long, value_name = "X.Y.Z", conflicts_with = "rollback")]
+        version: Option<String>,
+        /// Put `<binary>.old` back.
+        #[arg(long)]
+        rollback: bool,
     },
 }
 
@@ -1069,6 +1089,12 @@ impl NodeArgs {
         config.review_notify = file.agent.notify.unwrap_or(false);
         config.report_accept = self.report_accept || file.report.accept.unwrap_or(false);
         config.limits = file.limits.limits();
+        config.update = file.update.policy()?;
+        // Hermetic and loopback nodes never look for releases.
+        if self.hermetic || self.loopback {
+            config.update.check = false;
+            config.update.auto = false;
+        }
         config.report_auto = file.report.crashes.unwrap_or(false);
         config.report_collector = match &file.report.collector {
             Some(id) => Some(
@@ -1531,10 +1557,10 @@ fn agent_config(
                     .wakes_per_author_per_hour
                     .or(file.wakes_per_author_per_hour)
                     .unwrap_or(default.per_author_per_hour),
-                thread_backoff: file_duration(&file.thread_backoff, "thread_backoff")?
-                    .unwrap_or(default.thread_backoff),
-                thread_backoff_max: file_duration(&file.thread_backoff_max, "thread_backoff_max")?
-                    .unwrap_or(default.thread_backoff_max),
+                loop_max_exchanges: args
+                    .loop_max_exchanges
+                    .or(file.loop_max_exchanges)
+                    .unwrap_or(default.loop_max_exchanges),
             }
         },
         keep_runs: file.keep_runs.unwrap_or(200),
@@ -1989,6 +2015,29 @@ async fn main() -> Result<()> {
     // Commands that work even when config.toml does not load.
     match cli.command {
         Some(Command::Config { action }) => return config_command(&data_dir, action),
+        // Works with a broken config.toml: a newer version may fix it.
+        Some(Command::Upgrade {
+            check,
+            version,
+            rollback,
+        }) => {
+            let url = match Settings::load(&data_dir) {
+                Ok(settings) => settings.update.url,
+                Err(e) => {
+                    tracing::warn!("{e:#}; using the default release source");
+                    None
+                }
+            };
+            return wats::update::upgrade_command(wats::update::UpgradeOptions {
+                check,
+                version,
+                rollback,
+                hermetic: cli.node.hermetic,
+                url,
+                data_dir,
+            })
+            .await;
+        }
         // `logs -f` and `attach` follow forever: Ctrl-C (whose handler is
         // installed above) must end them.
         Some(Command::Report { action }) => {
@@ -2072,6 +2121,7 @@ async fn main() -> Result<()> {
         Some(Command::Id { host }) => return print_id(&config, &host),
         Some(
             Command::Config { .. }
+            | Command::Upgrade { .. }
             | Command::Agent { .. }
             | Command::Setup { .. }
             | Command::Report { .. },

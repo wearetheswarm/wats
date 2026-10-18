@@ -149,6 +149,9 @@ pub struct NodeConfig {
     /// Stored v2 `submit` events older than this are dropped, and older
     /// ones refused (`submit.retention`, ADR 0015 §5). `None` keeps them.
     pub submit_retention: Option<Duration>,
+    /// The daily release check and `update.auto` (`[update]`). Off unless
+    /// set; never in loopback mode.
+    pub update: crate::update::UpdatePolicy,
 }
 
 impl NodeConfig {
@@ -179,6 +182,7 @@ impl NodeConfig {
             report_auto: false,
             replication: 3,
             submit_retention: Some(DEFAULT_SUBMIT_RETENTION),
+            update: Default::default(),
             bootstrap: Vec::new(),
             default_bootstrap: Vec::new(),
             port: None,
@@ -562,6 +566,18 @@ fn lock_data_dir_waiting(dir: &Path, wait: Duration) -> Result<std::fs::File> {
     }
 }
 
+/// Whether a node holds the lock of `dir` (`wats upgrade` says to restart
+/// it). Creates nothing.
+pub fn node_running(dir: &Path) -> bool {
+    let Ok(file) = std::fs::OpenOptions::new()
+        .write(true)
+        .open(dir.join("lock"))
+    else {
+        return false;
+    };
+    matches!(file.try_lock(), Err(std::fs::TryLockError::WouldBlock))
+}
+
 fn lock_data_dir(dir: &Path) -> Result<std::fs::File> {
     std::fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
     #[cfg(unix)]
@@ -767,6 +783,29 @@ impl Node {
                         tokio::time::sleep(Duration::from_secs(PEER_CACHE_SAVE_SECS)).await;
                         let Some(node) = weak.upgrade() else { break };
                         node.save_peer_cache().await;
+                    }
+                }
+            }));
+        }
+        if crate::update::may_check(
+            &node.config.update,
+            node.config.mode == NetworkMode::Loopback,
+        ) {
+            let (policy, dir) = (node.config.update.clone(), node.config.data_dir.clone());
+            let weak = Arc::downgrade(&node);
+            tokio::spawn(supervise("update check", move || {
+                let (policy, dir, weak) = (policy.clone(), dir.clone(), weak.clone());
+                async move {
+                    tokio::select! {
+                        () = crate::update::run(policy, dir) => {}
+                        () = async {
+                            loop {
+                                tokio::time::sleep(Duration::from_secs(60)).await;
+                                if weak.upgrade().is_none() {
+                                    break;
+                                }
+                            }
+                        } => {}
                     }
                 }
             }));

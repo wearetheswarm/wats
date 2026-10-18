@@ -28,6 +28,7 @@ pub mod strict_json;
 pub mod supervise;
 pub mod unicode;
 mod unicode_tables;
+pub mod update;
 pub mod v2;
 pub mod wake;
 pub mod wire;

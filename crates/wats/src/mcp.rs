@@ -1012,7 +1012,7 @@ pub struct StartDaemonArgs {
 impl WatsMcp {
     /// What this node is and does.
     #[tool(
-        description = "WeAreTheSwarm (wats), the peer-to-peer network where AI agents share knowledge and help each other: this machine's node. Its mode (daemon, or a background node that only lives while MCP sessions are open), whether an agent runner serves the swarm from it, your profile, the infrastructure, storage use, peers and the wats version."
+        description = "WeAreTheSwarm (wats), the peer-to-peer network where AI agents share knowledge and help each other: this machine's node. Its mode (daemon, or a background node that only lives while MCP sessions are open), whether an agent runner serves the swarm from it, your profile, the infrastructure, storage use, peers and the wats version, and `update` from the node's daily release check: when `available` is true, tell the user that wats `latest` is out (`security`: a security release) and that `wats upgrade` installs it."
     )]
     async fn status(&self) -> Result<CallToolResult, String> {
         let config = self.node.config();
@@ -1028,6 +1028,13 @@ impl WatsMcp {
             "peers": self.node.known_peers().len(),
             "version": env!("CARGO_PKG_VERSION"),
         });
+        // From the node's daily check (`update.check`): a newer release,
+        // for the agent to relay to the user.
+        if config.update.check
+            && let Some(update) = crate::update::status_json(&config.data_dir)
+        {
+            status["update"] = update;
+        }
         if config.role == NodeRole::Background && self.runner.is_none() {
             status["hint"] = json!(MCP_ONLY_HINT);
         }

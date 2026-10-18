@@ -50,6 +50,43 @@ pub struct Settings {
     pub submit: SubmitSettings,
     #[serde(default)]
     pub agent: AgentSettings,
+    #[serde(default)]
+    pub update: UpdateSettings,
+}
+
+/// `[update]`: the daily release check and opt-in auto-upgrade
+/// (`crate::update`).
+#[derive(Debug, Default, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UpdateSettings {
+    pub check: Option<bool>,
+    pub auto: Option<bool>,
+    pub delay: Option<String>,
+    pub security_delay: Option<String>,
+    pub url: Option<String>,
+}
+
+impl UpdateSettings {
+    /// The configured policy over the defaults (check on, auto off, 7 days).
+    pub fn policy(&self) -> Result<crate::update::UpdatePolicy> {
+        let duration = |value: &Option<String>, what: &str| -> Result<Option<Duration>> {
+            value
+                .as_deref()
+                .map(parse_duration)
+                .transpose()
+                .map_err(|e| anyhow::anyhow!("config.toml update.{what}: {e}"))
+        };
+        Ok(crate::update::UpdatePolicy {
+            check: self.check.unwrap_or(true),
+            auto: self.auto.unwrap_or(false),
+            delay: match duration(&self.delay, "delay")? {
+                Some(d) => d,
+                None => parse_duration(crate::update::DEFAULT_DELAY).map_err(anyhow::Error::msg)?,
+            },
+            security_delay: duration(&self.security_delay, "security_delay")?,
+            url: self.url.clone().filter(|u| !u.trim().is_empty()),
+        })
+    }
 }
 
 #[derive(Debug, Default, Clone, Deserialize)]
@@ -136,8 +173,13 @@ pub struct AgentSettings {
     pub heartbeat: Option<String>,
     pub max_runs_per_hour: Option<usize>,
     pub wakes_per_author_per_hour: Option<usize>,
-    pub thread_backoff: Option<String>,
-    pub thread_backoff_max: Option<String>,
+    pub loop_max_exchanges: Option<usize>,
+    /// Removed keys ([`REMOVED_KEYS`]): still accepted, ignored, with a
+    /// warning.
+    #[serde(default)]
+    pub thread_backoff: Option<serde::de::IgnoredAny>,
+    #[serde(default)]
+    pub thread_backoff_max: Option<serde::de::IgnoredAny>,
     #[serde(default)]
     pub allow: Vec<String>,
     pub heartbeat_file: Option<PathBuf>,
@@ -181,13 +223,54 @@ impl Settings {
             crate::agent::check_cap(cap)
                 .map_err(|why| anyhow::anyhow!("{}: agent.caps: {why}", path.display()))?;
         }
+        for name in settings.removed_keys() {
+            warn_removed(name);
+        }
         if let Some(dir) = &settings.agent.workdir {
             settings.agent.workdir = Some(data_dir.join(dir));
         }
+        settings
+            .update
+            .policy()
+            .with_context(|| format!("{}: [update]", path.display()))?;
         if let Some(file) = &settings.agent.heartbeat_file {
             settings.agent.heartbeat_file = Some(data_dir.join(file));
         }
         Ok(settings)
+    }
+
+    /// The [`REMOVED_KEYS`] set in the file.
+    pub fn removed_keys(&self) -> Vec<&'static str> {
+        let set = [
+            self.agent.thread_backoff.is_some(),
+            self.agent.thread_backoff_max.is_some(),
+        ];
+        REMOVED_KEYS
+            .iter()
+            .zip(set)
+            .filter_map(|(name, set)| set.then_some(*name))
+            .collect()
+    }
+}
+
+/// Keys that are no longer used: a file that sets them still loads (they
+/// are ignored, with a warning), `wats config set` refuses them, and
+/// `wats config unset` removes them.
+pub const REMOVED_KEYS: [&str; 2] = ["agent.thread_backoff", "agent.thread_backoff_max"];
+
+/// Why a removed key is ignored.
+pub fn removed_key_message(name: &str) -> String {
+    format!("{name} is no longer used (loop detector, ADR 0011); remove it")
+}
+
+/// Log once per process that a removed key is set.
+fn warn_removed(name: &'static str) {
+    static WARNED: std::sync::Mutex<Vec<&'static str>> = std::sync::Mutex::new(Vec::new());
+    if let Ok(mut warned) = WARNED.lock()
+        && !warned.contains(&name)
+    {
+        warned.push(name);
+        tracing::warn!("{}", removed_key_message(name));
     }
 }
 
@@ -335,6 +418,36 @@ pub const KEYS: &[Key] = &[
         "highest effort of a load challenge, reached one bit per 10 s of overload",
     ),
     key(
+        "update.check",
+        ValueType::Bool,
+        "true",
+        "look for a newer wats release once a day; logged and shown by the MCP status tool",
+    ),
+    key(
+        "update.auto",
+        ValueType::Bool,
+        "false",
+        "install a newer release by itself (signature checked) once it is update.delay old; restart to use it",
+    ),
+    key(
+        "update.delay",
+        ValueType::Duration,
+        "7d",
+        "how old a release must be before update.auto installs it",
+    ),
+    key(
+        "update.security_delay",
+        ValueType::Duration,
+        "update.delay",
+        "the same for a release marked security; unset: update.delay",
+    ),
+    key(
+        "update.url",
+        ValueType::Text,
+        "GitHub",
+        "release API to use instead of GitHub's, e.g. a mirror (WATS_UPDATE_URL overrides it)",
+    ),
+    key(
         "report.crashes",
         ValueType::Bool,
         "false",
@@ -451,20 +564,15 @@ pub const KEYS: &[Key] = &[
     key(
         "agent.wakes_per_author_per_hour",
         ValueType::Integer,
-        "3",
+        "0",
         "runs one author's posts can trigger per hour (0: unlimited)",
     ),
     key(
-        "agent.thread_backoff",
-        ValueType::Duration,
-        "1m",
-        "wait before a thread wakes the agent again, doubled after each run",
-    ),
-    key(
-        "agent.thread_backoff_max",
-        ValueType::Duration,
-        "1h",
-        "longest thread backoff; a thread quiet this long after it starts over",
+        "agent.loop_max_exchanges",
+        ValueType::Integer,
+        "30",
+        "turns the agent and one other author may take in a row in a thread \
+         before it stops waking the agent, until a third party posts (0: off)",
     ),
     key(
         "agent.allow",
@@ -666,6 +774,9 @@ impl ConfigFile {
     }
 
     pub fn set(&mut self, name: &str, raw: &str) -> Result<()> {
+        if REMOVED_KEYS.contains(&name) {
+            bail!("{}", removed_key_message(name));
+        }
         let key = find_key(name)?;
         let value = toml_value(key, raw)?;
         let (table, leaf) = Self::split(name);
@@ -689,7 +800,9 @@ impl ConfigFile {
 
     /// Remove a key; returns whether it was set.
     pub fn unset(&mut self, name: &str) -> Result<bool> {
-        find_key(name)?;
+        if !REMOVED_KEYS.contains(&name) {
+            find_key(name)?;
+        }
         let (table, leaf) = Self::split(name);
         Ok(match table {
             Some(t) => self
@@ -717,37 +830,32 @@ impl ConfigFile {
     }
 }
 
-/// Parse a retention: `0` (keep forever, `None`), a number of days with
-/// the unit d (e.g. 30d), or a duration as [`parse_duration`].
+/// Parse a retention: `0` (keep forever, `None`) or a duration as
+/// [`parse_duration`] (e.g. 30d, 12h).
 pub fn parse_retention(s: &str) -> Result<Option<Duration>, String> {
     let s = s.trim();
     let digits = s.trim_end_matches(|c: char| !c.is_ascii_digit());
     if !digits.is_empty() && digits.bytes().all(|b| b == b'0') {
         return Ok(None);
     }
-    if let Some(days) = s.strip_suffix('d') {
-        let days: u64 = days
-            .parse()
-            .map_err(|_| format!("invalid retention {s:?}: expected e.g. 30d, 12h or 0"))?;
-        return Ok(Some(Duration::from_secs(days.saturating_mul(24 * 3600))));
-    }
     parse_duration(s).map(Some)
 }
 
-/// Parse a duration: a number with an optional unit s, m or h (e.g. 30s,
-/// 5m, 2h; a bare number is seconds).
+/// Parse a duration: a number with an optional unit s, m, h or d (e.g.
+/// 30s, 5m, 2h, 7d; a bare number is seconds).
 pub fn parse_duration(s: &str) -> Result<Duration, String> {
     let s = s.trim();
     let split = s.find(|c: char| !c.is_ascii_digit()).unwrap_or(s.len());
     let (number, unit) = s.split_at(split);
     let n: u64 = number
         .parse()
-        .map_err(|_| format!("invalid duration {s:?}: expected e.g. 30s, 5m or 2h"))?;
+        .map_err(|_| format!("invalid duration {s:?}: expected e.g. 30s, 5m, 2h or 7d"))?;
     let secs = match unit {
         "" | "s" => n,
         "m" => n * 60,
         "h" => n * 3600,
-        _ => return Err(format!("invalid duration unit in {s:?}: use s, m or h")),
+        "d" => n * 86400,
+        _ => return Err(format!("invalid duration unit in {s:?}: use s, m, h or d")),
     };
     if secs == 0 {
         return Err("duration must be positive".into());
@@ -808,6 +916,57 @@ mod tests {
         assert!(Settings::load(dir.path()).is_err());
     }
 
+    /// The per-thread backoff keys were removed (ADR 0011, loop detector):
+    /// a file that still sets them loads, and they can be unset.
+    #[test]
+    fn removed_keys_still_load_and_can_be_unset() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(FILE_NAME),
+            "[agent]\nruntime = \"claude\"\nthread_backoff = \"1m\"\nthread_backoff_max = \"1h\"\n",
+        )
+        .unwrap();
+        let settings = Settings::load(dir.path()).unwrap();
+        assert_eq!(settings.agent.runtime.as_deref(), Some("claude"));
+        assert_eq!(settings.removed_keys(), REMOVED_KEYS);
+        assert_eq!(settings.agent.loop_max_exchanges, None);
+        let mut file = ConfigFile::open(dir.path()).unwrap();
+        for removed in REMOVED_KEYS {
+            assert!(file.unset(removed).unwrap());
+        }
+        file.save().unwrap();
+        assert!(
+            Settings::load(dir.path())
+                .unwrap()
+                .removed_keys()
+                .is_empty()
+        );
+        assert!(Settings::default().removed_keys().is_empty());
+    }
+
+    #[test]
+    fn update_policy() {
+        let p = UpdateSettings::default().policy().unwrap();
+        assert!(p.check && !p.auto);
+        assert_eq!(p.delay, Duration::from_secs(7 * 86400));
+        assert_eq!(p.security_delay, None);
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(FILE_NAME),
+            "[update]\nauto = true\ndelay = \"3d\"\nsecurity_delay = \"12h\"\n",
+        )
+        .unwrap();
+        let p = Settings::load(dir.path()).unwrap().update.policy().unwrap();
+        assert!(p.check && p.auto);
+        assert_eq!(p.delay, Duration::from_secs(3 * 86400));
+        assert_eq!(p.security_delay, Some(Duration::from_secs(12 * 3600)));
+        std::fs::write(dir.path().join(FILE_NAME), "[update]\ndelay = \"soon\"\n").unwrap();
+        assert!(Settings::load(dir.path()).is_err());
+        let mut file = ConfigFile::open(dir.path()).unwrap();
+        file.set("update.security_delay", "1d").unwrap();
+        assert!(file.set("update.delay", "1w").is_err());
+    }
+
     #[test]
     fn edits_keep_comments_and_check_values() {
         let dir = tempfile::tempdir().unwrap();
@@ -821,8 +980,12 @@ mod tests {
         file.set("agent.allow", "aa, bb").unwrap();
         file.set("agent.max_runs_per_hour", "6").unwrap();
         file.set("agent.wakes_per_author_per_hour", "0").unwrap();
-        file.set("agent.thread_backoff", "30s").unwrap();
-        assert!(file.set("agent.thread_backoff_max", "0s").is_err());
+        file.set("agent.loop_max_exchanges", "0").unwrap();
+        assert!(file.set("agent.loop_max_exchanges", "many").is_err());
+        for removed in REMOVED_KEYS {
+            let err = file.set(removed, "1m").unwrap_err().to_string();
+            assert_eq!(err, removed_key_message(removed));
+        }
         file.set("no_default_bootstrap", "yes").unwrap();
         assert!(file.set("agent.every", "soon").is_err());
         assert!(file.set("agent.runtime", "gpt").is_err());
@@ -849,7 +1012,7 @@ mod tests {
         assert_eq!(settings.agent.allow, ["aa", "bb"]);
         assert_eq!(settings.agent.max_runs_per_hour, Some(6));
         assert_eq!(settings.agent.wakes_per_author_per_hour, Some(0));
-        assert_eq!(settings.agent.thread_backoff.as_deref(), Some("30s"));
+        assert_eq!(settings.agent.loop_max_exchanges, Some(0));
         assert_eq!(settings.no_default_bootstrap, Some(true));
         let mut file = ConfigFile::open(dir.path()).unwrap();
         assert_eq!(file.get("agent.runtime").as_deref(), Some("\"claude\""));
@@ -871,11 +1034,12 @@ mod tests {
         assert!(parse_retention("xd").is_err());
         assert!(parse_retention("-1").is_err());
         assert_eq!(parse_duration("30s"), Ok(Duration::from_secs(30)));
+        assert_eq!(parse_duration("7d"), Ok(Duration::from_secs(7 * 86400)));
         assert_eq!(parse_duration("5m"), Ok(Duration::from_secs(300)));
         assert_eq!(parse_duration("2h"), Ok(Duration::from_secs(7200)));
         assert_eq!(parse_duration("7"), Ok(Duration::from_secs(7)));
         assert!(parse_duration("0s").is_err());
-        assert!(parse_duration("1d").is_err());
+        assert!(parse_duration("1w").is_err());
         assert_eq!(parse_size("1024"), Ok(1024));
         assert_eq!(parse_size("512M"), Ok(512 << 20));
         assert_eq!(parse_size("20GiB"), Ok(20 << 30));

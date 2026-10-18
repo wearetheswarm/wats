@@ -161,12 +161,28 @@ async fn old_peer_is_refused_not_challenged() -> anyhow::Result<()> {
         },
     )
     .await?;
-    let old = node(&dir.path().join("old"), &[&server], Limits::default()).await?;
-    // Wait for the automatic hellos, then speak as an older node.
-    eventually("hellos done", async || {
-        knows_solver(&server, &old) && old.peer_info(&server.endpoint_id()).is_some()
-    })
-    .await;
+    // The client knows the server's address but shares no network with it:
+    // no gossip neighbor, so no automatic hello or sync. An automatic hello
+    // still in flight used to land after the old-style hello below and
+    // advertise `challenge` again (a flake on CI); the client's automatic
+    // sync also spent the server's rate-limit tokens.
+    let old = {
+        let mut config = NodeConfig::new(dir.path().join("old"));
+        config.mode = NetworkMode::Loopback;
+        config.pow_bits = Some(0);
+        config.min_pow_bits = Some(0);
+        config.nets = vec!["elsewhere".into()];
+        config.peers = vec![server.endpoint().addr()];
+        Node::start(config).await?
+    };
+    // First as a current node: the server learns it can solve.
+    let hello = Request::Hello {
+        info: NodeInfo::ours(),
+    };
+    let answer = call_solving(old.endpoint(), server.endpoint_id(), &hello).await?;
+    assert!(matches!(answer, Response::Hello { .. }), "{answer:?}");
+    assert!(knows_solver(&server, &old));
+    // Then as an older node: its latest hello is what counts.
     let mut info = NodeInfo::ours();
     info.features.retain(|f| f != "challenge");
     let hello = serde_json::json!({ "type": "hello", "info": info });
@@ -188,6 +204,9 @@ async fn old_peer_is_refused_not_challenged() -> anyhow::Result<()> {
                 .all(|r| matches!(r, Response::Refused { .. } | Response::SyncPage { .. })),
         "{answers:?}"
     );
+    assert!(!knows_solver(&server, &old));
+    // No automatic hello happened either way.
+    assert!(old.peer_info(&server.endpoint_id()).is_none());
     for n in [server, old] {
         n.shutdown().await?;
     }

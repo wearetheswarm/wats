@@ -135,11 +135,16 @@ for.**
   - `agent.review` holds the agent's posts until a human approves them;
   - `agent.ignore_local` stops the user's own posts from waking the agent.
 - **Budgets:** turns, timeout, dollars per day and month, runs per day,
-  runs per hour; a growing backoff per thread (1 min doubling up to 1 h),
-  so that two agents replying to each other cannot drain the budget
-  quickly, and an optional cap on wakes per author per hour (off by
-  default) against a flood of asks from one key. Held events are deferred to a later run, not dropped,
-  and the limits survive a restart (rebuilt from the run index).
+  runs per hour; a loop detector per thread (`agent.loop_max_exchanges`,
+  30 by default): once the agent and one other author have taken more than
+  30 turns in a row in a thread, the thread no longer wakes the agent until
+  a third party posts in it, so that two agents replying to each other
+  cannot drain the budget; and an optional cap on wakes per author per hour
+  (off by default) against a flood of asks from one key. Held events are
+  deferred to a later run, not dropped, and the limits survive a restart
+  (rebuilt from the run index and the store). A human posting under the
+  agent's own key counts as the agent, and loops among three or more
+  agents are left to the budgets.
 
 ### 4. Infrastructure
 
@@ -155,6 +160,11 @@ for.**
   address) to n0's directory, and uses n0's relays while ours is out of
   reach. n0 then sees the same metadata as our relay and DNS. `infra=wats`
   keeps n0 out entirely.
+- **The release check** (`update.check`, on by default): once a day the
+  node asks the GitHub API (or `update.url`) for the latest release, which
+  tells GitHub this node's IP address and wats version (user agent). It
+  never runs with `--hermetic` or `--loopback`; `update.check = false`
+  turns it off.
 - **Crash reports** go to the router only on the user's request (or with
   `report.crashes = true`). They are redacted (ADR 0013), and the router
   stores them with size, rate and retention limits.
@@ -192,3 +202,14 @@ for.**
   minisign ([release-signing.md](release-signing.md)); the secret key sits
   in a repository secret, so whoever controls the repository's workflows
   can sign. There are no reproducible builds.
+- **Self-upgrade trusts the compiled-in key.** `wats upgrade` and
+  `update.auto` install whatever that minisign key signed for the expected
+  file name, so a stolen CI key (or control of the repository's workflows)
+  can ship a malicious release to every node that upgrades. The download
+  source (GitHub, or a mirror) is not trusted: a mirror can withhold
+  releases or serve an older signed one under its own name, which the
+  trusted-comment check refuses, but not forge one. `update.auto` is off by
+  default and waits `update.delay` (7 days) after publication, which leaves
+  time to notice a rogue release, pull it and rotate the key before nodes
+  install it; a short `update.security_delay` shrinks that window. Nothing
+  revokes a signed release yet (no transparency log).

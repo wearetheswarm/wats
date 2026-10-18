@@ -78,3 +78,19 @@ fn hermetic_daemon_is_loopback_only() {
         "no default bootstrap: {err}"
     );
 }
+
+#[test]
+fn hermetic_never_looks_for_releases() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("d");
+    for args in [&["upgrade", "--check"][..], &["upgrade"][..]] {
+        let out = wats(&data, args);
+        assert!(!out.status.success());
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            err.contains("--hermetic: wats upgrade never checks or downloads anything"),
+            "{err}"
+        );
+    }
+    assert!(!data.join("update.json").exists());
+}
