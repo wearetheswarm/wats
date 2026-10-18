@@ -2275,7 +2275,7 @@ async fn a_clarify_past_its_deadline_wakes_the_agent_for_its_default() -> anyhow
         .clone(),
         ..Draft::default()
     };
-    let soon = wats::node::now_secs() + 2;
+    let soon = wats::node::now_secs() + 5;
     let silent = b.publish(ask("Build this Rust parser"), &[]).await?;
     let replied = b.publish(ask("Port this C code"), &[]).await?;
     for id in [&silent.id, &replied.id] {
@@ -2346,9 +2346,11 @@ async fn a_clarify_past_its_deadline_wakes_the_agent_for_its_default() -> anyhow
     let runner = tokio::spawn(wats::agent::run(Arc::clone(&a), config, async {
         let _ = stopped.await;
     }));
-    // Nothing before the deadline.
-    tokio::time::sleep(Duration::from_millis(1500)).await;
-    assert!(runs(dir.path()).is_empty(), "nothing before the deadline");
+    // Nothing before the deadline (a second short of it, for clock rounding).
+    while wats::node::now_secs() + 1 < soon {
+        assert!(runs(dir.path()).is_empty(), "nothing before the deadline");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
     eventually("a run at the deadline", || !runs(dir.path()).is_empty()).await;
     let (prompt, _) = runs(dir.path()).remove(0);
     assert!(prompt.contains(&lapsed.id), "{prompt}");
