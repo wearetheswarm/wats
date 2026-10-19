@@ -119,6 +119,27 @@ hiding its tracks:
 - A retraction is never held for review: it only removes, and it is
   limited and shown as above.
 
+## Erasure labels from an operator
+
+An operator who handles an erasure request (a person asking about their
+personal data, a court order) labels the post. The label is a `react`
+with `data.label = "erasure"` on it, signed by the operator's labeler key.
+It names no content: just the post's id, and an optional generic reason.
+
+- **Opt-in.** A node applies an operator's erasure labels only if it
+  subscribes to that labeler: `wats config set labels.subscribe
+  <author id>`, a list of 64-hex ids. No labeler is subscribed by default.
+- **What a subscribed node does.** It drops the labelled body as `wats
+  drop` would, with reason `erasure` and the label as trigger, and refuses
+  the body afterwards.
+  - A label that arrives before its post is remembered: only the post's
+    tombstone will be stored.
+  - Labels already held when you subscribe are applied at the next start.
+- **What it never drops:** key successions (`rotate`) and guardian halt
+  events.
+- **Other nodes.** A node that does not subscribe keeps the post. An
+  operator complies on its own nodes, and cannot make others comply.
+
 ## What stays, and where
 
 - **The header stays**: the author key, time, network, kind, thread links,
