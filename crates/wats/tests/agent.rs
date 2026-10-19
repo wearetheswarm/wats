@@ -118,6 +118,7 @@ async fn agent_wakes_on_asks_and_heartbeats() -> anyhow::Result<()> {
         tools: vec![],
         model: None,
         work_dir: dir.path().join("work"),
+        data_dir: dir.path().to_path_buf(),
         keep_runs: 2,
         keep_days: 30,
         openclaw: Default::default(),
@@ -431,13 +432,13 @@ fn setup_claude_registers_and_enables() {
     std::fs::remove_file(&log).unwrap();
     let said = setup(&["--mcp"]);
     assert!(said.contains("already registered"), "{said}");
-    assert!(!said.contains("agent.runtime"), "{said}");
+    assert!(!said.contains(".runtime"), "{said}");
     assert!(!log.exists());
 
     // --agent only touches config.toml; project scope always re-adds.
     std::fs::remove_file(data.join("config.toml")).unwrap();
     let said = setup(&["--agent"]);
-    assert!(said.contains("agent.runtime"), "{said}");
+    assert!(said.contains("agents.claude.runtime"), "{said}");
     assert!(said.contains("Describe its role"), "{said}");
     let said = setup(&["--agent", "--about", "I translate French."]);
     assert!(!said.contains("Describe its role"), "{said}");
@@ -621,6 +622,252 @@ async fn bare_wats_runs_agents_from_config_toml() {
     assert!(!out.status.success(), "a typo in config.toml is an error");
 }
 
+/// `wats --dir <data> <args…>` with a fixed OS user; stdout, and whether
+/// it succeeded.
+fn wats_out(data: &Path, args: &[&str]) -> (bool, String, String) {
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_wats"))
+        .env("USER", "tester")
+        .env_remove("WATS_PROFILE")
+        .arg("--dir")
+        .arg(data)
+        .args(args)
+        .output()
+        .unwrap();
+    (
+        out.status.success(),
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+    )
+}
+
+/// `wats status --json` of a running node, once it answers.
+async fn running_status(data: &Path) -> serde_json::Value {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        let (ok, out, _) = wats_out(data, &["status", "--json"]);
+        if ok
+            && let Ok(status) = serde_json::from_str::<serde_json::Value>(&out)
+            && status["node"] == "running"
+        {
+            return status;
+        }
+        assert!(tokio::time::Instant::now() < deadline, "no running node");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+}
+
+/// ADR 0021: two agents of config.toml both run, each with its own
+/// profile and directory; `status` lists both; `wats agent runs` needs
+/// `--name`.
+#[tokio::test(flavor = "multi_thread")]
+async fn two_agents_from_config_both_run() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("data");
+    std::fs::create_dir_all(&data).unwrap();
+    let (one, two) = (dir.path().join("one"), dir.path().join("two"));
+    std::fs::create_dir_all(&one).unwrap();
+    std::fs::create_dir_all(&two).unwrap();
+    let (fake_one, fake_two) = (fake_agent(&one), fake_agent(&two));
+    std::fs::write(
+        data.join("config.toml"),
+        format!(
+            "[agents.claude]\nruntime = \"claude\"\ncommand = \"{}\"\nheartbeat = \"2s\"\n\n\
+             [agents.reviewer]\nruntime = \"claude\"\ncommand = \"{}\"\nheartbeat = \"2s\"\n\
+             about = \"I review.\"\n\n\
+             [agents.off]\nruntime = \"claude\"\nenabled = false\n",
+            fake_one.display(),
+            fake_two.display()
+        ),
+    )
+    .unwrap();
+    let mut node = tokio::process::Command::new(env!("CARGO_BIN_EXE_wats"))
+        .env("USER", "tester")
+        .env_remove("WATS_PROFILE")
+        .args(["--loopback", "--pow-bits=0", "--min-pow-bits=0", "--dir"])
+        .arg(&data)
+        .args(["--quiet"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    let status = running_status(&data).await;
+    let runner = status["runner"].as_str().unwrap_or_default().to_string();
+    assert!(
+        runner.contains("claude as tester-claude") && runner.contains("claude as tester-reviewer"),
+        "{status}"
+    );
+    let agents = status["agents"].as_array().cloned().unwrap_or_default();
+    let state = |name: &str| {
+        agents
+            .iter()
+            .find(|a| a["name"] == name)
+            .map(|a| (a["state"].clone(), a["profile"].clone()))
+    };
+    assert_eq!(
+        state("claude"),
+        Some(("running".into(), "tester-claude".into()))
+    );
+    assert_eq!(
+        state("reviewer"),
+        Some(("running".into(), "tester-reviewer".into()))
+    );
+    assert_eq!(state("off"), Some(("disabled".into(), "tester-off".into())));
+
+    // Both run (a heartbeat each), each with its own fake CLI and
+    // directory.
+    eventually("both agents ran", || {
+        !runs(&one).is_empty() && !runs(&two).is_empty()
+    })
+    .await;
+    let claude = data.join("agent").join("claude");
+    let reviewer = data.join("agent").join("reviewer");
+    assert!(claude.join("mcp-tester-claude.json").exists());
+    assert!(reviewer.join("mcp-tester-reviewer.json").exists());
+    assert!(runs(&two)[0].0.contains("I review."), "its own role");
+    let cwd = std::fs::read_to_string(two.join("runs").join("run-0.cwd")).unwrap();
+    assert!(cwd.contains("reviewer"), "{cwd}");
+
+    // `wats agent runs`: one agent at a time.
+    let (ok, _, err) = wats_out(&data, &["agent", "runs"]);
+    assert!(!ok && err.contains("several agents"), "{err}");
+    eventually("the run is indexed", || {
+        let (ok, out, _) = wats_out(&data, &["agent", "runs", "--name", "reviewer", "--json"]);
+        ok && out.contains("\"profile\":\"tester-reviewer\"")
+    })
+    .await;
+    let (ok, out, _) = wats_out(&data, &["agent", "--name", "claude", "runs", "--json"]);
+    assert!(ok && !out.contains("tester-reviewer"), "{out}");
+    let (ok, _, err) = wats_out(&data, &["agent", "runs", "--name", "nobody"]);
+    assert!(!ok && err.contains("no agent named"), "{err}");
+    node.kill().await.unwrap();
+    let _ = node.wait().await;
+
+    // Not running: what `wats` would run.
+    let (_, out, _) = wats_out(&data, &["status"]);
+    assert!(
+        out.contains("agent claude (claude): enabled, posts as tester-claude"),
+        "{out}"
+    );
+    assert!(out.contains("agent reviewer (claude): enabled"), "{out}");
+    assert!(out.contains("agent off (claude): disabled"), "{out}");
+}
+
+/// `--agent claude:reviewer`: the runtime claude as the agent reviewer,
+/// with `[agents.reviewer]`'s settings; flags apply to every agent, but
+/// `--agent-profile` only to one.
+#[tokio::test(flavor = "multi_thread")]
+async fn agent_flag_takes_a_name() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("data");
+    std::fs::create_dir_all(&data).unwrap();
+    std::fs::write(
+        data.join("config.toml"),
+        "[agents.reviewer]\nprofile = \"rev\"\nheartbeat = \"2h\"\n",
+    )
+    .unwrap();
+    let base = |extra: &[&str]| {
+        let mut cmd = tokio::process::Command::new(env!("CARGO_BIN_EXE_wats"));
+        cmd.env("USER", "tester")
+            .env_remove("WATS_PROFILE")
+            .args(["--loopback", "--dir"])
+            .arg(&data)
+            .args(["--agent-command", "/usr/bin/true"])
+            .args(extra);
+        cmd
+    };
+    // No runtime in the table: a bare `wats` runs nothing.
+    let banner = banner_of(&mut base(&[])).await;
+    assert!(banner.contains("agent: off"), "{banner}");
+    let banner = banner_of(&mut base(&["--agent", "claude:reviewer"])).await;
+    assert!(
+        banner.contains("agent reviewer (claude, default model): on, posts as rev"),
+        "{banner}"
+    );
+    assert!(banner.contains("heartbeat 2h"), "{banner}");
+    // A new name: the defaults; flags apply to both.
+    let banner = banner_of(&mut base(&[
+        "--agent",
+        "claude:reviewer",
+        "--agent",
+        "claude:helper",
+        "--every",
+        "5m",
+    ]))
+    .await;
+    assert!(
+        banner.contains("agents: reviewer (claude as rev), helper (claude as tester-helper)"),
+        "{banner}"
+    );
+    assert_eq!(banner.matches("every 5m at most").count(), 2, "{banner}");
+    assert!(
+        banner.contains("wats agent logs -f --name helper"),
+        "{banner}"
+    );
+    let out = base(&[
+        "--agent",
+        "claude",
+        "--agent",
+        "claude:helper",
+        "--agent-profile",
+        "x",
+    ])
+    .output()
+    .await
+    .unwrap();
+    assert!(!out.status.success());
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("--agent-profile"),
+        "{out:?}"
+    );
+    let out = base(&["--agent", "claude:Bad"]).output().await.unwrap();
+    assert!(!out.status.success(), "names are checked");
+}
+
+/// ADR 0021 §3: a background node (`--idle-exit`, as `wats mcp` starts
+/// it) runs no agent unless `agent.with_mcp = true`.
+#[tokio::test(flavor = "multi_thread")]
+async fn background_node_runs_agents_only_with_mcp() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("data");
+    std::fs::create_dir_all(&data).unwrap();
+    let config =
+        "[agents.claude]\nruntime = \"claude\"\ncommand = \"/usr/bin/true\"\nheartbeat = \"1h\"\n";
+    std::fs::write(data.join("config.toml"), config).unwrap();
+    let start = || {
+        tokio::process::Command::new(env!("CARGO_BIN_EXE_wats"))
+            .env("USER", "tester")
+            .env_remove("WATS_PROFILE")
+            .args(["--loopback", "--pow-bits=0", "--min-pow-bits=0", "--dir"])
+            .arg(&data)
+            .args(["node", "--quiet", "--idle-exit", "60"])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap()
+    };
+    let mut node = start();
+    let status = running_status(&data).await;
+    assert_eq!(status["mode"], "background", "{status}");
+    assert!(status["runner"].is_null(), "off by default: {status}");
+    assert_eq!(status["agents"][0]["state"], "enabled", "{status}");
+    node.kill().await.unwrap();
+    let _ = node.wait().await;
+
+    std::fs::write(
+        data.join("config.toml"),
+        format!("{config}\n[agent]\nwith_mcp = true\n"),
+    )
+    .unwrap();
+    let mut node = start();
+    let status = running_status(&data).await;
+    assert_eq!(status["runner"], "claude as tester-claude", "{status}");
+    assert_eq!(status["agents"][0]["state"], "running", "{status}");
+    node.kill().await.unwrap();
+    let _ = node.wait().await;
+}
+
 /// The spend budget: once the reported cost reaches the daily budget, the
 /// runner stops starting runs, and the remaining budget caps each run.
 #[tokio::test(flavor = "multi_thread")]
@@ -657,6 +904,7 @@ async fn budget_pauses_the_agent() -> anyhow::Result<()> {
         tools: vec![],
         model: Some("haiku".into()),
         work_dir: dir.path().join("work"),
+        data_dir: dir.path().to_path_buf(),
         keep_runs: 100,
         keep_days: 30,
         openclaw: Default::default(),
@@ -731,7 +979,7 @@ fn setup_codex_registers_once() {
         said.contains("Codex: wats MCP server registered (profile alice)"),
         "{said}"
     );
-    assert!(said.contains("agent.runtime = \"codex\""), "{said}");
+    assert!(said.contains("agents.codex.runtime = \"codex\""), "{said}");
     let calls = std::fs::read_to_string(&log).unwrap();
     let add = calls.lines().last().unwrap();
     assert!(add.starts_with("mcp add wats -- /"), "{add}");
@@ -818,6 +1066,7 @@ echo '{{"type":"turn.completed","usage":{{"input_tokens":10,"output_tokens":2}}}
         tools: vec![],
         model: Some("gpt-test".into()),
         work_dir: work.clone(),
+        data_dir: work.parent().unwrap().to_path_buf(),
         keep_runs: 100,
         keep_days: 30,
         openclaw: Default::default(),
@@ -920,6 +1169,7 @@ async fn workspace_access_opens_the_workspace() -> anyhow::Result<()> {
         tools: vec!["Read".into(), "Grep".into()],
         model: None,
         work_dir: work.clone(),
+        data_dir: work.parent().unwrap().to_path_buf(),
         keep_runs: 100,
         keep_days: 30,
         openclaw: Default::default(),
@@ -1079,7 +1329,7 @@ async fn runner_token_marks_the_session_over_the_socket() -> anyhow::Result<()> 
     config.pow_bits = Some(0);
     config.min_pow_bits = Some(0);
     config.review_profiles = vec!["agent".into()];
-    config.runner = Some("openclaw as agent".into());
+    config.runners = vec!["openclaw as agent".into()];
     let node = Node::start(config).await?;
     let _sessions = wats::attach::serve(Arc::clone(&node))?;
     // An OpenClaw runner: its budget is OpenClaw's.
@@ -1162,11 +1412,12 @@ fn setup_access_and_review_queue() {
         fake.to_str().unwrap(),
     ]);
     assert!(said.contains("agent workspace:"), "{said}");
-    assert!(data.join("agent/workspace/CLAUDE.md").exists());
+    // A new agent (ADR 0021): its own directory, agent/claude.
+    assert!(data.join("agent/claude/workspace/CLAUDE.md").exists());
     let config = std::fs::read_to_string(data.join("config.toml")).unwrap();
     assert!(config.contains("access = \"workspace\""), "{config}");
     assert!(config.contains("tools = [\"Read\", \"Grep\"]"), "{config}");
-    assert!(wats(&["config", "list"]).contains("agent.access"));
+    assert!(wats(&["config", "list"]).contains("agents.claude.access"));
 
     let draft = Draft {
         net: PUBLIC_NET.into(),
@@ -1193,10 +1444,13 @@ fn setup_access_and_review_queue() {
         "{pending}"
     );
     assert_eq!(
-        wats::review::take_feedback(&data),
+        wats::review::take_feedback(&data, "agent"),
         ["- Your note \"held title\" was rejected by your human: too vague"]
     );
-    assert!(wats::review::take_feedback(&data).is_empty(), "consumed");
+    assert!(
+        wats::review::take_feedback(&data, "agent").is_empty(),
+        "consumed"
+    );
 
     // show, and approve --edit through $EDITOR.
     let three = wats::review::hold(&data, "agent", &draft, &[], Default::default()).unwrap();
@@ -1269,6 +1523,7 @@ async fn review_tools_are_for_humans_only() -> anyhow::Result<()> {
     let run = wats::node::RunnerRun {
         id: "20261016T000000Z-events".into(),
         events: vec![ask.id.clone()],
+        ..Default::default()
     };
     let agent = serve(
         wats::mcp::WatsMcp::new(Arc::clone(&a), vec![])
@@ -1421,6 +1676,7 @@ async fn wakes_only_on_what_is_addressed_to_it() -> anyhow::Result<()> {
         tools: vec![],
         model: None,
         work_dir: dir.path().join("work"),
+        data_dir: dir.path().to_path_buf(),
         keep_runs: 100,
         keep_days: 30,
         openclaw: Default::default(),
@@ -1526,6 +1782,7 @@ async fn wake_limits_defer_and_survive_a_restart() -> anyhow::Result<()> {
         tools: vec![],
         model: None,
         work_dir: dir.path().join("work"),
+        data_dir: dir.path().to_path_buf(),
         keep_runs: 100,
         keep_days: 30,
         openclaw: Default::default(),
@@ -1636,6 +1893,7 @@ async fn loop_detector_pauses_a_thread_until_a_third_party_posts() -> anyhow::Re
         tools: vec![],
         model: None,
         work_dir: dir.path().join("work"),
+        data_dir: dir.path().to_path_buf(),
         keep_runs: 100,
         keep_days: 30,
         openclaw: Default::default(),
@@ -1926,6 +2184,7 @@ async fn openclaw_forwards_wakes_to_the_gateway() -> anyhow::Result<()> {
         tools: vec![],
         model: Some("cheap-model".into()),
         work_dir: work.clone(),
+        data_dir: work.parent().unwrap().to_path_buf(),
         keep_runs: 50,
         keep_days: 30,
         openclaw: wats::openclaw::Target {
@@ -1987,7 +2246,12 @@ async fn openclaw_forwards_wakes_to_the_gateway() -> anyhow::Result<()> {
     // 400 on the session policy: the same run retries without a session
     // key, and so do the later ones.
     let second = a.publish_as(&human, ask("second question"), &[]).await?;
-    eventually("the isolated retry", || records().len() == 2).await;
+    // The run's record can land before the gateway stub has logged the
+    // retry it answered: wait for both.
+    eventually("the isolated retry", || {
+        records().len() == 2 && requests().len() >= 3
+    })
+    .await;
     let all = requests();
     assert_eq!(all[1].body["sessionKey"], format!("wats:{}", second.id));
     assert_eq!(all[2].body["sessionMode"], "isolated");
@@ -2002,7 +2266,10 @@ async fn openclaw_forwards_wakes_to_the_gateway() -> anyhow::Result<()> {
 
     // 401: the run fails, pointing to the token.
     a.publish_as(&human, ask("third question"), &[]).await?;
-    eventually("a failed run", || records().len() == 3).await;
+    eventually("a failed run", || {
+        records().len() == 3 && requests().len() >= 4
+    })
+    .await;
     let run = records().remove(2);
     assert_eq!(run.status, "failed");
     assert!(
@@ -2013,7 +2280,10 @@ async fn openclaw_forwards_wakes_to_the_gateway() -> anyhow::Result<()> {
 
     // 503: deferred, no record; the next run forwards the same wake.
     let fourth = a.publish_as(&human, ask("fourth question"), &[]).await?;
-    eventually("the retried run", || records().len() == 4).await;
+    eventually("the retried run", || {
+        records().len() == 4 && requests().len() >= 6
+    })
+    .await;
     let all = requests();
     assert_eq!(all.len(), 6);
     let message = |n: usize| all[n].body["message"].as_str().unwrap().to_string();
@@ -2110,6 +2380,7 @@ async fn asks_stored_before_the_runner_started_still_wake_it() -> anyhow::Result
         tools: vec![],
         model: None,
         work_dir: dir.path().join("work"),
+        data_dir: dir.path().to_path_buf(),
         keep_runs: 100,
         keep_days: 30,
         openclaw: Default::default(),
@@ -2215,6 +2486,7 @@ async fn heartbeats_offer_older_unanswered_asks() -> anyhow::Result<()> {
         tools: vec![],
         model: None,
         work_dir: dir.path().join("work"),
+        data_dir: dir.path().to_path_buf(),
         keep_runs: 100,
         keep_days: 30,
         openclaw: Default::default(),
@@ -2329,6 +2601,7 @@ async fn a_clarify_past_its_deadline_wakes_the_agent_for_its_default() -> anyhow
         tools: vec![],
         model: None,
         work_dir: dir.path().join("work"),
+        data_dir: dir.path().to_path_buf(),
         keep_runs: 100,
         keep_days: 30,
         openclaw: Default::default(),
@@ -2365,6 +2638,110 @@ async fn a_clarify_past_its_deadline_wakes_the_agent_for_its_default() -> anyhow
     assert_eq!(runs(dir.path()).len(), 1);
     let _ = stop.send(());
     runner.await??;
+    a.shutdown().await?;
+    b.shutdown().await?;
+    Ok(())
+}
+
+/// ADR 0018 §7: an answer or a clarify to an ask the human posted from
+/// OpenClaw wakes OpenClaw's main session (`/hooks/wake`, mode now) with a
+/// self-contained line; replies to other asks, and the asker's own posts in
+/// the thread, do not.
+#[tokio::test(flavor = "multi_thread")]
+async fn replies_to_an_openclaw_ask_wake_its_main_session() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let ok = r#"{"ok":true,"eventOutcome":"queued"}"#;
+    let (url, seen) = gateway_stub(vec![(200, ok, Duration::ZERO); 4]);
+    let data = dir.path().join("a");
+    let token_file = wats::openclaw::hooks_token_path(&data);
+    std::fs::create_dir_all(token_file.parent().unwrap())?;
+    std::fs::write(&token_file, "s3cret-hook-token\n")?;
+    let mut config = NodeConfig::new(&data);
+    config.mode = NetworkMode::Loopback;
+    config.pow_bits = Some(0);
+    config.min_pow_bits = Some(0);
+    config.openclaw_notify = Some(wats::openclaw::Notify {
+        url,
+        token_file: token_file.clone(),
+    });
+    let a = Node::start(config).await?;
+    let b = node(&dir.path().join("b"), &[&a]).await?;
+    a.wait_for_neighbor(PUBLIC_NET, Duration::from_secs(10))
+        .await?;
+
+    // The human's ask, from OpenClaw (what the MCP `post` tool records).
+    let human = a.author_key("human")?;
+    let asked = a.publish_as(&human, ask("Draw a bee logo"), &[]).await?;
+    a.store()
+        .set_ask_notify(&asked.id, "openclaw", wats::node::now_secs())?;
+    // Another ask, not from OpenClaw.
+    let other = a.publish_as(&human, ask("Another question"), &[]).await?;
+    let reply = |to: &wats::event::Event, kind: Kind, text: &str, data: serde_json::Value| Draft {
+        net: PUBLIC_NET.into(),
+        thread: Some(to.id.clone()),
+        parent: Some(to.id.clone()),
+        kind: Some(kind),
+        text: text.into(),
+        data: data.as_object().cloned().unwrap_or_default(),
+        ..Draft::default()
+    };
+    for id in [&asked.id, &other.id] {
+        let b = Arc::clone(&b);
+        let id = id.clone();
+        eventually("ask on b", move || b.store().get(&id).unwrap().is_some()).await;
+    }
+    let clarify = b
+        .publish(
+            reply(
+                &asked,
+                Kind::Clarify,
+                "To the asker: I can't render a PNG in this run. Reply with your choice.",
+                serde_json::json!({"options": ["SVG instead", "no thanks"], "default": "SVG instead"}),
+            ),
+            &[],
+        )
+        .await?;
+    b.publish(
+        reply(
+            &other,
+            Kind::Answer,
+            "Not for OpenClaw.",
+            serde_json::json!({}),
+        ),
+        &[],
+    )
+    .await?;
+    // The asker's own reply in its thread: no wake.
+    a.publish_as(
+        &human,
+        reply(&asked, Kind::Answer, "Never mind.", serde_json::json!({})),
+        &[],
+    )
+    .await?;
+
+    let requests = || seen.lock().unwrap().clone();
+    eventually("a wake", || !requests().is_empty()).await;
+    tokio::time::sleep(Duration::from_millis(800)).await;
+    let all = requests();
+    assert_eq!(
+        all.len(),
+        1,
+        "only the clarify to the OpenClaw ask: {all:?}"
+    );
+    let wake = &all[0];
+    assert!(wake.line.starts_with("POST /hooks/wake "), "{}", wake.line);
+    assert_eq!(
+        wake.header("authorization"),
+        Some("Bearer s3cret-hook-token")
+    );
+    assert_eq!(wake.body["mode"], "now");
+    let text = wake.body["text"].as_str().unwrap();
+    assert!(
+        text.contains("Your swarm ask 'Draw a bee logo' got a clarify"),
+        "{text}"
+    );
+    assert!(text.contains("Options: SVG instead / no thanks"), "{text}");
+    assert!(text.contains(&clarify.id), "{text}");
     a.shutdown().await?;
     b.shutdown().await?;
     Ok(())

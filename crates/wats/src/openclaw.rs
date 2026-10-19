@@ -93,10 +93,10 @@ pub fn runner_token_path(data_dir: &Path) -> PathBuf {
     dir(data_dir).join("runner.token")
 }
 
-/// Whether a node's runner (`NodeConfig::runner`, "openclaw as …") is
-/// OpenClaw.
-pub fn is_runner(runner: Option<&str>) -> bool {
-    runner.is_some_and(|r| r.starts_with("openclaw "))
+/// Whether one of a node's runners (`NodeConfig::runners`, "openclaw as
+/// …") is OpenClaw.
+pub fn is_runner(runners: &[String]) -> bool {
+    runners.iter().any(|r| r.starts_with("openclaw "))
 }
 
 /// Whether `host` is loopback (127.0.0.0/8, ::1, `localhost`).
@@ -259,6 +259,103 @@ impl Target {
     pub fn endpoint(&self) -> String {
         format!("{}/hooks/agent", self.url.trim_end_matches('/'))
     }
+}
+
+/// Where the node tells the human's OpenClaw that its swarm asks got
+/// replies (ADR 0018 §7): `<url>/hooks/wake`, with the hook token.
+#[derive(Debug, Clone)]
+pub struct Notify {
+    pub url: String,
+    pub token_file: PathBuf,
+}
+
+impl Notify {
+    /// `<url>/hooks/wake`.
+    pub fn endpoint(&self) -> String {
+        format!("{}/hooks/wake", self.url.trim_end_matches('/'))
+    }
+}
+
+/// Longest notification text: a short line, as OpenClaw asks for wakes.
+const NOTIFY_MAX_CHARS: usize = 600;
+
+/// The one-line notification of a reply to the human's ask: who replied,
+/// how, what it says, and how to answer.
+pub fn notify_text(ask_title: &str, reply: &crate::event::Event, from: &str) -> String {
+    use crate::event::Kind;
+    let flat = |s: &str| {
+        crate::unicode::escape_format(&s.split_whitespace().collect::<Vec<_>>().join(" "))
+            .into_owned()
+    };
+    let gist: String = flat(reply.title.as_deref().unwrap_or(&reply.text))
+        .chars()
+        .take(240)
+        .collect();
+    let mut text = match reply.kind {
+        Kind::Clarify => format!(
+            "Your swarm ask '{}' got a clarify from {from}: {gist}",
+            flat(ask_title)
+        ),
+        _ => format!(
+            "Your swarm ask '{}' got an answer from {from}: {gist}",
+            flat(ask_title)
+        ),
+    };
+    if let Some(options) = reply.data.get("options").and_then(Value::as_array) {
+        let options: Vec<String> = options.iter().filter_map(Value::as_str).map(flat).collect();
+        if !options.is_empty() {
+            text.push_str(&format!(". Options: {}", options.join(" / ")));
+        }
+    }
+    if !reply.blobs.is_empty() {
+        text.push_str(&format!(
+            ". It has {} attached file{} ({}): wats__read with fetch_blobs gets them, to send to the user",
+            reply.blobs.len(),
+            if reply.blobs.len() == 1 { "" } else { "s" },
+            reply
+                .blobs
+                .iter()
+                .map(|b| flat(&b.name))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+    text.push_str(&format!(
+        ". Read it with wats__read (post {}){}.",
+        reply.id,
+        if reply.kind == Kind::Clarify {
+            "; reply to it with your choice"
+        } else {
+            ""
+        }
+    ));
+    text.chars().take(NOTIFY_MAX_CHARS).collect()
+}
+
+/// Wake the human's OpenClaw main session with `text` (`POST
+/// /hooks/wake`, `mode: "now"`). The token is never logged.
+pub async fn wake(notify: &Notify, text: &str) -> Result<()> {
+    let token = read_token(&notify.token_file)?;
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let client = reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(10))
+        .timeout(Duration::from_secs(30))
+        .build()?;
+    let response = client
+        .post(notify.endpoint())
+        .bearer_auth(token)
+        .header("Content-Type", "application/json")
+        .body(json!({"text": text, "mode": "now"}).to_string())
+        .send()
+        .await
+        .map_err(|e| anyhow::anyhow!("cannot reach the OpenClaw gateway: {e}"))?;
+    let status = response.status();
+    anyhow::ensure!(
+        status.is_success(),
+        "the OpenClaw gateway answered HTTP {} to /hooks/wake",
+        status.as_u16()
+    );
+    Ok(())
 }
 
 /// The forwarded message: the preamble, then the wake prompt.

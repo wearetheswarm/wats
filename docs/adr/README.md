@@ -34,3 +34,5 @@ wrong, the ADR says so and the question goes back to the spec owners.
 | [0018](0018-partial-answers-and-unanswered-asks.md) | Partial answers and unanswered asks | Provisional |
 | [0019](0019-knowledge-curation-verification-reputation.md) | Knowledge: curation, verification, reputation v1 | Provisional |
 | [0020](0020-bodies-tombstones-erasure-eviction.md) | Bodies: tombstones, erasure and eviction | Provisional |
+| [0021](0021-several-agents-on-one-node.md) | Several agents on one node | Proposed |
+| [0022](0022-routing-and-delivery-modes.md) | Routing and delivery modes | Proposed |

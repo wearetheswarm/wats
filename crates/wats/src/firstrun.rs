@@ -146,7 +146,9 @@ pub struct Choices {
 
 /// The value of `key` in `settings`, as `wats config set` takes it.
 fn current(settings: &Settings, key: &str) -> Option<String> {
-    let agent = &settings.agent;
+    let agent = settings
+        .primary_agent()
+        .map_or(&settings.agent, |(_, table)| table);
     match key {
         "storage.max" => settings.storage.max.clone(),
         "agent.timeout" => agent.timeout.clone(),
@@ -279,7 +281,10 @@ pub fn prompt(
         out,
         "wats setup: the node's main choices. Enter accepts the [default]."
     )?;
-    let runtime = ask_runtime(input, out, found, settings.agent.runtime.as_deref())?;
+    let primary = settings
+        .primary_agent()
+        .and_then(|(_, table)| table.runtime.clone());
+    let runtime = ask_runtime(input, out, found, primary.as_deref())?;
     let openclaw = runtime.as_deref() == Some("openclaw");
     if openclaw {
         writeln!(out, "{}", crate::openclaw::SPEND_CAPS)?;
@@ -339,19 +344,39 @@ pub fn render(choices: &Choices) -> Result<String> {
     text.push_str("\n[storage]\n");
     line(&mut text, "storage.max")?;
     text.push_str(
-        "\n[agent]\n# agent run with the node: claude, codex or openclaw (default: none)\n",
+        "\n# The agents the node runs, one [agents.<name>] table each (ADR 0021); the\n\
+         # name defaults to the runtime: claude, codex or openclaw.\n",
     );
     match &choices.runtime {
-        Some(runtime) => text.push_str(&format!(
-            "runtime = {}\n",
-            settings::check_value("agent.runtime", runtime)?
-        )),
-        None => text.push_str("# runtime = \"claude\"\n"),
-    }
-    for (key, _, agent_only) in QUESTIONS {
-        if agent_only {
-            text.push('\n');
-            line(&mut text, key)?;
+        Some(runtime) => {
+            crate::roster::check_name(runtime).map_err(anyhow::Error::msg)?;
+            text.push_str(&format!(
+                "[agents.{runtime}]\nruntime = {}\n",
+                settings::check_value("agent.runtime", runtime)?
+            ));
+            for (key, _, agent_only) in QUESTIONS {
+                if agent_only {
+                    text.push('\n');
+                    line(&mut text, key)?;
+                }
+            }
+        }
+        None => {
+            // Commented: an example to uncomment.
+            let mut example = String::from("[agents.claude]\nruntime = \"claude\"\n");
+            for (key, _, agent_only) in QUESTIONS {
+                if agent_only {
+                    example.push('\n');
+                    line(&mut example, key)?;
+                }
+            }
+            for l in example.lines() {
+                match l {
+                    "" => text.push('\n'),
+                    l if l.starts_with('#') => text.push_str(&format!("{l}\n")),
+                    l => text.push_str(&format!("# {l}\n")),
+                }
+            }
         }
     }
     toml::from_str::<Settings>(&text).context("the generated config.toml does not load")?;
@@ -370,18 +395,53 @@ pub fn apply(data_dir: &Path, choices: &Choices) -> Result<PathBuf> {
             .with_context(|| format!("write {}", path.display()))?;
         return Ok(path);
     }
+    // The agents as they were (ADR 0021).
+    let before = Settings::load(data_dir)?;
+    let enabled = before.enabled_agents();
+    let primary = before.primary_agent();
     let mut file = ConfigFile::open(data_dir)?;
-    match &choices.runtime {
-        Some(runtime) => file.set("agent.runtime", runtime)?,
-        None => {
-            file.unset("agent.runtime")?;
+    let agent_key = |agent: &str, key: &str| match key.strip_prefix("agent.") {
+        Some(leaf) => format!("agents.{agent}.{leaf}"),
+        None => key.to_string(),
+    };
+    let target = match &choices.runtime {
+        Some(runtime) => {
+            // The agent asked about keeps its name when it keeps its
+            // runtime; another runtime is the agent named after it.
+            let name = match &primary {
+                Some((name, table)) if table.runtime.as_deref() == Some(runtime) => name.clone(),
+                _ => runtime.clone(),
+            };
+            file.set(&agent_key(&name, "agent.runtime"), runtime)?;
+            if file.get(&agent_key(&name, "agent.enabled")).is_some() {
+                file.unset(&agent_key(&name, "agent.enabled"))?;
+            }
+            // Switching the node's single agent: the previous one is kept,
+            // off.
+            if let [(old, _)] = enabled.as_slice()
+                && *old != name
+            {
+                file.set(&agent_key(old, "agent.enabled"), "false")?;
+            }
+            Some(name)
         }
-    }
+        None => {
+            // No agent: every agent is kept, off.
+            for (name, _) in &enabled {
+                file.set(&agent_key(name, "agent.enabled"), "false")?;
+            }
+            None
+        }
+    };
     for (key, value) in &choices.values {
-        if is_default(key, value) {
-            file.unset(key)?;
+        let key = match &target {
+            Some(name) => agent_key(name, key),
+            None => key.to_string(),
+        };
+        if is_default(&key, value) {
+            file.unset(&key)?;
         } else {
-            file.set(key, value)?;
+            file.set(&key, value)?;
         }
     }
     file.save()?;
@@ -606,21 +666,59 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         apply(dir.path(), &choices).unwrap();
         let settings = Settings::load(dir.path()).unwrap();
-        assert_eq!(settings.agent.runtime.as_deref(), Some("codex"));
+        // The new form (ADR 0021): [agents.codex].
+        let codex = &settings.agents["codex"];
+        assert_eq!(codex.runtime.as_deref(), Some("codex"));
         assert_eq!(settings.storage.max.as_deref(), Some("20G"));
-        assert_eq!(settings.agent.max_turns, Some(5));
-        assert_eq!(settings.agent.max_usd_per_month, Some(10.0));
+        assert_eq!(codex.max_turns, Some(5));
+        assert_eq!(codex.max_usd_per_month, Some(10.0));
         assert_eq!(settings.nets, ["public", "acme"]);
         // Again on the same file: the current values are the defaults, and
-        // choosing no agent unsets it, keeping the rest.
+        // choosing no agent turns it off, keeping the rest.
         let (again, said) = run(&found(&["claude", "codex"]), &settings, "0\n\n\n");
         assert!(said.contains("[codex]") && said.contains("[20G]"), "{said}");
         assert_eq!(again.runtime, None);
         apply(dir.path(), &again).unwrap();
         let settings = Settings::load(dir.path()).unwrap();
-        assert_eq!(settings.agent.runtime, None);
-        assert_eq!(settings.agent.max_turns, Some(5));
+        assert!(settings.enabled_agents().is_empty());
+        assert_eq!(settings.agents["codex"].max_turns, Some(5));
         assert_eq!(settings.nets, ["public", "acme"]);
+        // Claude this time: codex is kept, off; claude runs.
+        let (claude, _) = run(&found(&["claude", "codex"]), &settings, "1\n");
+        apply(dir.path(), &claude).unwrap();
+        let settings = Settings::load(dir.path()).unwrap();
+        assert_eq!(
+            settings.enabled_agents(),
+            [("claude".to_string(), "claude".to_string())]
+        );
+        assert_eq!(settings.agents["codex"].enabled, Some(false));
+    }
+
+    /// An old `[agent]` file: `wats setup` rewrites it as
+    /// `[agents.<runtime>]`, keeping its profile.
+    #[test]
+    fn setup_rewrites_the_old_agent_table() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(FILE_NAME),
+            "[agent]\nruntime = \"codex\"\nmax_turns = 7\n",
+        )
+        .unwrap();
+        let settings = Settings::load(dir.path()).unwrap();
+        let (choices, _) = run(&found(&["codex"]), &settings, "\n\n\n\n\n\n\n");
+        assert_eq!(choices.runtime.as_deref(), Some("codex"));
+        apply(dir.path(), &choices).unwrap();
+        let settings = Settings::load(dir.path()).unwrap();
+        let codex = &settings.agents["codex"];
+        assert_eq!(codex.max_turns, Some(7));
+        assert_eq!(codex.legacy_dir, Some(true));
+        assert!(
+            codex
+                .profile
+                .as_deref()
+                .is_some_and(|p| p.ends_with("-agent"))
+        );
+        assert!(settings.agent.runtime.is_none());
     }
 
     /// OpenClaw is offered as an agent; its spend caps are its own, so the

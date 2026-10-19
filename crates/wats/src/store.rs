@@ -22,7 +22,7 @@ use crate::event::{Event, Kind};
 pub const INDEXED_TAGS: usize = 16;
 use crate::wire::RawEvent;
 
-const SCHEMA_VERSION: i64 = 4;
+const SCHEMA_VERSION: i64 = 5;
 
 const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS events (
@@ -46,6 +46,15 @@ CREATE TABLE IF NOT EXISTS events (
 CREATE INDEX IF NOT EXISTS events_net_ts ON events (net, ts, id);
 CREATE INDEX IF NOT EXISTS events_thread ON events (thread);
 CREATE INDEX IF NOT EXISTS events_author_kind ON events (author, kind);
+-- Rotations and retractions are looked up by kind (ADR 0020 §5.1).
+CREATE INDEX IF NOT EXISTS events_kind ON events (kind);
+
+-- Asks a human posted from an MCP host the node can notify (ADR 0018 §7).
+CREATE TABLE IF NOT EXISTS ask_notify (
+    ask    TEXT PRIMARY KEY,
+    client TEXT NOT NULL,
+    at     INTEGER NOT NULL
+);
 
 CREATE TABLE IF NOT EXISTS event_tags (
     seq INTEGER NOT NULL REFERENCES events (seq),
@@ -64,6 +73,18 @@ CREATE VIRTUAL TABLE IF NOT EXISTS events_fts USING fts5 (
 CREATE TRIGGER IF NOT EXISTS events_fts_insert AFTER INSERT ON events BEGIN
     INSERT INTO events_fts (rowid, text, tags) VALUES (new.seq, new.text, new.tags);
 END;
+
+-- Local drop records (ADR 0020, schema 5): bodies this node dropped, or
+-- will refuse when they arrive. Never shared.
+CREATE TABLE IF NOT EXISTS dropped (
+    id      TEXT PRIMARY KEY,
+    reason  TEXT NOT NULL,
+    at      INTEGER NOT NULL,
+    -- The id of the retract event or label that caused the drop, if any.
+    trigger TEXT,
+    -- The human's own words (`wats drop --reason`), if any.
+    detail    TEXT
+);
 "#;
 
 /// SQL condition on a row `e` of the thread rooted at `?1`: not grafted
@@ -74,6 +95,99 @@ const NOT_GRAFTED: &str = "(e.id = ?1 OR (
     NOT EXISTS (SELECT 1 FROM events r WHERE r.id = ?1 AND r.opaque = 0 AND r.net <> e.net)
     AND NOT EXISTS (SELECT 1 FROM events p WHERE p.id = e.parent AND p.opaque = 0
         AND (p.net <> e.net OR COALESCE(p.thread, p.id) <> e.thread))))";
+
+/// Insert an opaque row (an event this node does not understand, or a
+/// tombstone) unless one with its id exists. Returns the rows changed.
+fn insert_opaque_row(
+    conn: &Connection,
+    raw: &RawEvent,
+    json: &str,
+    received_at: u64,
+) -> Result<usize> {
+    Ok(conn.execute(
+        "INSERT OR IGNORE INTO events (id, author, ts, net, thread, parent, kind, text, tags, json, received_at, v, opaque)
+         VALUES (?, ?, ?, ?, ?, ?, ?, '', '', ?, ?, ?, 1)",
+        params![
+            raw.id,
+            raw.author,
+            raw.ts as i64,
+            raw.net,
+            raw.thread,
+            raw.parent,
+            raw.kind,
+            json,
+            received_at as i64,
+            raw.v as i64,
+        ],
+    )?)
+}
+
+/// Whether a kept full event lists blob `hash`.
+fn blob_referenced(conn: &Connection, hash: &str) -> Result<bool> {
+    Ok(conn.query_row(
+        "SELECT EXISTS (SELECT 1 FROM events e WHERE e.opaque = 0 AND instr(e.json, ?1) > 0
+             AND EXISTS (SELECT 1 FROM json_each(e.json, '$.blobs') b
+                         WHERE json_extract(b.value, '$.hash') = ?1))",
+        [hash],
+        |r| r.get(0),
+    )?)
+}
+
+/// Most keys walked back along a rotation chain (ADR 0010 A5): enough
+/// for any honest history, a bound for a forged web of rotations.
+const MAX_ROTATION_KEYS: usize = 256;
+
+/// Whether `author` is `successor`, or a key that rotated into it,
+/// directly or through a chain of `rotate` events this node holds in full
+/// (both keys signed each link).
+fn rotated_into(conn: &Connection, successor: &str, author: &str) -> Result<bool> {
+    if successor == author {
+        return Ok(true);
+    }
+    let mut stmt = conn.prepare_cached(
+        "SELECT DISTINCT author FROM events WHERE kind = 'rotate' AND opaque = 0 AND v = 1
+             AND json_extract(json, '$.data.new_key') = ?",
+    )?;
+    let mut seen = std::collections::HashSet::from([successor.to_string()]);
+    let mut frontier = vec![successor.to_string()];
+    while let Some(key) = frontier.pop() {
+        let rows = stmt.query_map([&key], |r| r.get::<_, String>(0))?;
+        for predecessor in rows {
+            let predecessor = predecessor?;
+            if predecessor == author {
+                return Ok(true);
+            }
+            if seen.len() < MAX_ROTATION_KEYS && seen.insert(predecessor.clone()) {
+                frontier.push(predecessor);
+            }
+        }
+    }
+    Ok(false)
+}
+
+/// The id of a retraction held here (full or tombstone) that cites post
+/// `target` and whose author is `author` or a key `author` rotated into:
+/// the retraction that applies to that post, if any.
+fn retraction_citing(conn: &Connection, target: &str, author: &str) -> Result<Option<String>> {
+    let citing: Vec<(String, String)> = {
+        let mut stmt = conn.prepare_cached(
+            "SELECT e.id, e.author FROM events e WHERE e.kind = ?1 AND e.v = 1
+                 AND e.thread IS NULL AND e.parent IS NULL
+                 AND EXISTS (SELECT 1 FROM json_each(e.json, '$.refs') r WHERE r.value = ?2)
+             ORDER BY e.seq",
+        )?;
+        let rows = stmt.query_map(params![crate::retract::KIND, target], |r| {
+            Ok((r.get(0)?, r.get(1)?))
+        })?;
+        rows.collect::<rusqlite::Result<_>>()?
+    };
+    for (id, retractor) in citing {
+        if rotated_into(conn, &retractor, author)? {
+            return Ok(Some(id));
+        }
+    }
+    Ok(None)
+}
 
 /// Remove an opaque row and its (empty) full-text entry.
 fn delete_opaque_row(tx: &rusqlite::Transaction<'_>, seq: i64) -> Result<()> {
@@ -120,6 +234,108 @@ pub struct ThreadSummary {
 pub enum Inserted {
     New(i64),
     Duplicate,
+    /// A full event whose body this node dropped (ADR 0020): only its
+    /// tombstone is kept, the body is refused. Its blobs must not be
+    /// fetched.
+    Dropped,
+}
+
+/// Why this node dropped a body (ADR 0020 §2). A local record, never
+/// shared.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DropReason {
+    /// The human running the node (`wats drop`).
+    Own,
+    /// The post's author retracted it.
+    Retraction,
+    /// An operator's erasure label, from a subscribed labeler.
+    Erasure,
+    /// A subscribed labeler's moderation label.
+    Label,
+    /// Storage pressure. The only reason whose body is accepted again;
+    /// its record expires after [`EVICTED_RECORD_SECS`].
+    Evicted,
+}
+
+/// How long an `evicted` drop record is kept (ADR 0020 §2): 30 days. The
+/// other records are kept forever.
+pub const EVICTED_RECORD_SECS: u64 = 30 * 24 * 3600;
+
+impl DropReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            DropReason::Own => "own",
+            DropReason::Retraction => "retraction",
+            DropReason::Erasure => "erasure",
+            DropReason::Label => "label",
+            DropReason::Evicted => "evicted",
+        }
+    }
+}
+
+impl std::fmt::Display for DropReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl std::str::FromStr for DropReason {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> Result<Self> {
+        Ok(match s {
+            "own" => DropReason::Own,
+            "retraction" => DropReason::Retraction,
+            "erasure" => DropReason::Erasure,
+            "label" => DropReason::Label,
+            "evicted" => DropReason::Evicted,
+            other => bail!("unknown drop reason {other:?}"),
+        })
+    }
+}
+
+/// A local drop record (ADR 0020 §0): why and when this node dropped a
+/// body, or decided to refuse it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DropRecord {
+    pub reason: DropReason,
+    /// Unix seconds.
+    pub at: u64,
+    /// The id of the retract event or label that caused the drop.
+    pub trigger: Option<String>,
+    /// The human's own words (`wats drop --reason`).
+    pub detail: Option<String>,
+}
+
+/// What [`Store::drop_body`] did.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct DropOutcome {
+    /// The event was stored here (full or not). When it was not, the record
+    /// is kept for later: the body is refused when it arrives.
+    pub held: bool,
+    /// A full body was replaced by its tombstone.
+    pub body_dropped: bool,
+    /// Blob hashes of the dropped body that no kept event references any
+    /// more: the node deletes them.
+    pub freed_blobs: Vec<String>,
+}
+
+/// What [`Store::apply_retraction`] did with one referenced post.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Applied {
+    /// Held and by the retraction's author (or a key it rotated from): its
+    /// body was dropped, or, held as a tombstone, recorded as retracted.
+    Dropped(DropOutcome),
+    /// Not held yet: recorded, so only its tombstone is stored when it
+    /// arrives, once its author is checked then.
+    Remembered,
+    /// Held, by another author as far as this node knows (someone else's
+    /// post, or a rotation link not held yet): ignored, body kept.
+    NotTheAuthor,
+    /// A key succession or a halt event: never retracted.
+    Unretractable,
+    /// Already dropped here, by this or another reason: left as it is.
+    AlreadyDropped,
 }
 
 /// Which events a query or a `wait` matches. Empty fields match everything;
@@ -250,6 +466,8 @@ impl Store {
                  INSERT INTO events_fts (events_fts) VALUES ('rebuild');",
             )?;
         }
+        // v4 -> v5: the drop records table (ADR 0020), created by SCHEMA
+        // above. Events are kept.
         conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         let opaque_bytes: i64 = conn.query_row(
             "SELECT COALESCE(SUM(LENGTH(json)), 0) FROM events WHERE opaque = 1",
@@ -286,9 +504,67 @@ impl Store {
                     |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
                 )
                 .optional()?;
+            // A body this node dropped is refused (ADR 0020 §2): only its
+            // tombstone is kept. An evicted one is accepted again.
+            let dropped: Option<String> = tx
+                .query_row(
+                    "SELECT reason FROM dropped WHERE id = ?",
+                    [&event.id],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            let refuse = match dropped.as_deref() {
+                None => false,
+                Some(reason) if reason == DropReason::Evicted.as_str() => {
+                    tx.execute("DELETE FROM dropped WHERE id = ?", [&event.id])?;
+                    false
+                }
+                // Recorded before the post arrived (ADR 0020 §5.1): only now
+                // can its author be checked, against every retraction held
+                // that cites it. None matches (someone else's post, or a
+                // rotation link still missing): the record goes, the body is
+                // stored; a later `rotate` applies the retraction again.
+                Some(reason) if reason == DropReason::Retraction.as_str() => {
+                    let trigger = if crate::retract::unretractable(event.kind.as_str()) {
+                        None
+                    } else {
+                        retraction_citing(&tx, &event.id, &event.author)?
+                    };
+                    match trigger {
+                        Some(trigger) => {
+                            tx.execute(
+                                "UPDATE dropped SET trigger = ?1 WHERE id = ?2",
+                                params![trigger, event.id],
+                            )?;
+                            true
+                        }
+                        None => {
+                            tx.execute("DELETE FROM dropped WHERE id = ?", [&event.id])?;
+                            false
+                        }
+                    }
+                }
+                Some(_) => true,
+            };
+            if refuse {
+                let mut added = 0;
+                if existing.is_none() {
+                    let tombstone = crate::wire::tombstone(&serde_json::to_value(event)?)?;
+                    let json = serde_json::to_string(&tombstone.wire)?;
+                    insert_opaque_row(&tx, &tombstone, &json, received_at)?;
+                    added = json.len() as u64;
+                }
+                tx.commit()?;
+                self.opaque_bytes.fetch_add(added, Ordering::Relaxed);
+                return Ok(Inserted::Dropped);
+            }
             let mut freed = 0;
             match existing {
-                Some((_, false, _)) => return Ok(Inserted::Duplicate),
+                Some((_, false, _)) => {
+                    // Commits the removal of an evicted record, if any.
+                    tx.commit()?;
+                    return Ok(Inserted::Duplicate);
+                }
                 // Same id, stored opaque: its tombstone (the id covers the
                 // body through its hash), or the event itself before this
                 // release understood its version. The full, understood
@@ -393,28 +669,257 @@ impl Store {
         let conn = self.conn();
         let json = serde_json::to_string(&raw.wire)?;
         let len = json.len() as u64;
-        let changed = conn.execute(
-            "INSERT OR IGNORE INTO events (id, author, ts, net, thread, parent, kind, text, tags, json, received_at, v, opaque)
-             VALUES (?, ?, ?, ?, ?, ?, ?, '', '', ?, ?, ?, 1)",
-            params![
-                raw.id,
-                raw.author,
-                raw.ts as i64,
-                raw.net,
-                raw.thread,
-                raw.parent,
-                raw.kind,
-                json,
-                received_at as i64,
-                raw.v as i64,
-            ],
-        )?;
+        let changed = insert_opaque_row(&conn, raw, &json, received_at)?;
         Ok(if changed == 0 {
             Inserted::Duplicate
         } else {
             self.opaque_bytes.fetch_add(len, Ordering::Relaxed);
             Inserted::New(conn.last_insert_rowid())
         })
+    }
+
+    /// Drop the body of event `id` in place (ADR 0020 §2), in one
+    /// transaction. A full event becomes its tombstone: same row and `seq`,
+    /// header columns kept (author, ts, net, thread, parent, kind), no
+    /// full-text entry, no tags. Whatever the row (full, already opaque,
+    /// or absent: remembered for later), the drop record is written or
+    /// updated, so that the body is refused when it arrives.
+    pub fn drop_body(
+        &self,
+        id: &str,
+        reason: DropReason,
+        trigger: Option<&str>,
+        detail: Option<&str>,
+        now: u64,
+    ) -> Result<DropOutcome> {
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        let row: Option<(i64, bool, String, String, String)> = tx
+            .query_row(
+                "SELECT seq, opaque, text, tags, json FROM events WHERE id = ?",
+                [id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+            )
+            .optional()?;
+        let mut outcome = DropOutcome {
+            held: row.is_some(),
+            ..DropOutcome::default()
+        };
+        let mut added = 0;
+        if let Some((seq, false, text, tags, json)) = row {
+            let full: Value = serde_json::from_str(&json).context("corrupt stored event")?;
+            let tombstone = crate::wire::tombstone(&full)?;
+            let tombstone = serde_json::to_string(&tombstone.wire)?;
+            // FTS5 removes an entry given the exact values it indexed; an
+            // opaque row keeps an empty entry, as `insert_raw` gives it.
+            tx.execute(
+                "INSERT INTO events_fts (events_fts, rowid, text, tags) VALUES ('delete', ?, ?, ?)",
+                params![seq, text, tags],
+            )?;
+            tx.execute(
+                "INSERT INTO events_fts (rowid, text, tags) VALUES (?, '', '')",
+                [seq],
+            )?;
+            tx.execute("DELETE FROM event_tags WHERE seq = ?", [seq])?;
+            tx.execute(
+                "UPDATE events SET json = ?, opaque = 1, text = '', tags = '' WHERE seq = ?",
+                params![tombstone, seq],
+            )?;
+            added = tombstone.len() as u64;
+            outcome.body_dropped = true;
+            let hashes = full
+                .get("blobs")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(|b| b.get("hash").and_then(Value::as_str));
+            for hash in hashes {
+                if !outcome.freed_blobs.iter().any(|h| h == hash) && !blob_referenced(&tx, hash)? {
+                    outcome.freed_blobs.push(hash.to_string());
+                }
+            }
+        }
+        tx.execute(
+            "INSERT INTO dropped (id, reason, at, trigger, detail) VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT (id) DO UPDATE SET reason = excluded.reason, at = excluded.at,
+                 trigger = excluded.trigger, detail = excluded.detail",
+            params![
+                id,
+                reason.as_str(),
+                now.min(i64::MAX as u64) as i64,
+                trigger,
+                detail
+            ],
+        )?;
+        tx.commit()?;
+        self.opaque_bytes.fetch_add(added, Ordering::Relaxed);
+        Ok(outcome)
+    }
+
+    /// The drop record of event `id`, if this node dropped its body.
+    pub fn drop_record(&self, id: &str) -> Result<Option<DropRecord>> {
+        let row: Option<(String, i64, Option<String>, Option<String>)> = self
+            .conn()
+            .query_row(
+                "SELECT reason, at, trigger, detail FROM dropped WHERE id = ?",
+                [id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .optional()?;
+        row.map(|(reason, at, trigger, detail)| {
+            Ok(DropRecord {
+                reason: reason.parse()?,
+                at: at.max(0) as u64,
+                trigger,
+                detail,
+            })
+        })
+        .transpose()
+    }
+
+    /// Delete the `evicted` drop records older than `before` (unix
+    /// seconds): after 30 days an evicted body is no longer remembered
+    /// (ADR 0020 §2). Returns how many were deleted.
+    pub fn expire_evicted_records(&self, before: u64) -> Result<usize> {
+        Ok(self.conn().execute(
+            "DELETE FROM dropped WHERE reason = ?1 AND at < ?2",
+            params![
+                DropReason::Evicted.as_str(),
+                before.min(i64::MAX as u64) as i64
+            ],
+        )?)
+    }
+
+    /// Whether `author` is `successor` or a key that rotated into it,
+    /// through the `rotate` events this node holds (ADR 0010 A5).
+    pub fn rotated_into(&self, successor: &str, author: &str) -> Result<bool> {
+        rotated_into(&self.conn(), successor, author)
+    }
+
+    /// `key` and every key it rotated to, directly or through a chain of
+    /// `rotate` events this node holds in full.
+    pub fn rotation_successors(&self, key: &str) -> Result<Vec<String>> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare_cached(
+            "SELECT DISTINCT json_extract(json, '$.data.new_key') FROM events
+                 WHERE kind = 'rotate' AND opaque = 0 AND v = 1 AND author = ?",
+        )?;
+        let mut keys = vec![key.to_string()];
+        let mut next = 0;
+        while let Some(current) = keys.get(next).cloned() {
+            next += 1;
+            let rows = stmt.query_map([&current], |r| r.get::<_, Option<String>>(0))?;
+            for successor in rows {
+                if let Some(successor) = successor?
+                    && keys.len() < MAX_ROTATION_KEYS
+                    && !keys.contains(&successor)
+                {
+                    keys.push(successor);
+                }
+            }
+        }
+        Ok(keys)
+    }
+
+    /// The retractions held here (full or tombstone) by these authors,
+    /// oldest first.
+    pub fn retractions_by(&self, authors: &[String]) -> Result<Vec<crate::retract::Retraction>> {
+        if authors.is_empty() {
+            return Ok(Vec::new());
+        }
+        let marks = vec!["?"; authors.len()].join(",");
+        let sql = format!(
+            "SELECT seq, json FROM events WHERE kind = ? AND v = 1 AND author IN ({marks})
+             ORDER BY seq"
+        );
+        let mut args = vec![SqlValue::from(crate::retract::KIND.to_string())];
+        args.extend(authors.iter().map(|a| SqlValue::from(a.clone())));
+        Ok(self
+            .query_raw(&sql, args)?
+            .into_iter()
+            .filter_map(|wire| match crate::wire::AnyEvent::from_value(wire) {
+                Ok(event) => crate::retract::Retraction::from_any(&event),
+                Err(_) => None,
+            })
+            .collect())
+    }
+
+    /// Apply a retraction this node holds (ADR 0020 §5.1), post by post:
+    /// see [`Applied`]. Posts already dropped are left as they are, so it
+    /// can run again (when a `rotate` arrives) at no cost.
+    pub fn apply_retraction(
+        &self,
+        retraction: &crate::retract::Retraction,
+        now: u64,
+    ) -> Result<Vec<(String, Applied)>> {
+        let mut out = Vec::new();
+        for id in &retraction.refs {
+            if *id == retraction.id {
+                continue;
+            }
+            let (row, record) = {
+                let conn = self.conn();
+                let row: Option<(String, String, bool)> = conn
+                    .query_row(
+                        "SELECT author, kind, opaque FROM events WHERE id = ?",
+                        [id],
+                        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                    )
+                    .optional()?;
+                let record: Option<String> = conn
+                    .query_row("SELECT reason FROM dropped WHERE id = ?", [id], |r| {
+                        r.get(0)
+                    })
+                    .optional()?;
+                (row, record)
+            };
+            // A drop for another reason (the human's, a label) stays as it
+            // is: a retraction never turns it into one that a later
+            // author check could undo.
+            let other = record.as_deref().is_some_and(|r| {
+                r != DropReason::Retraction.as_str() && r != DropReason::Evicted.as_str()
+            });
+            let retracted = record.as_deref() == Some(DropReason::Retraction.as_str());
+            let applied = match row {
+                Some((_, kind, _)) if crate::retract::unretractable(&kind) => {
+                    Applied::Unretractable
+                }
+                Some((author, _, _)) if !self.rotated_into(&retraction.author, &author)? => {
+                    Applied::NotTheAuthor
+                }
+                Some((_, _, opaque)) if other || (opaque && retracted) => Applied::AlreadyDropped,
+                Some(_) => Applied::Dropped(self.drop_body(
+                    id,
+                    DropReason::Retraction,
+                    Some(&retraction.id),
+                    None,
+                    now,
+                )?),
+                None if other || retracted => Applied::AlreadyDropped,
+                None => {
+                    self.drop_body(id, DropReason::Retraction, Some(&retraction.id), None, now)?;
+                    Applied::Remembered
+                }
+            };
+            out.push((id.clone(), applied));
+        }
+        Ok(out)
+    }
+
+    /// Every blob hash listed by a kept full event: the blobs the node
+    /// keeps from garbage collection.
+    pub fn referenced_blobs(&self) -> Result<Vec<String>> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare(
+            "SELECT DISTINCT json_extract(b.value, '$.hash') FROM events e,
+                 json_each(e.json, '$.blobs') b WHERE e.opaque = 0",
+        )?;
+        let rows = stmt.query_map([], |r| r.get::<_, Option<String>>(0))?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.extend(row?);
+        }
+        Ok(out)
     }
 
     /// Bytes of JSON held by opaque events (tombstones included).
@@ -756,6 +1261,25 @@ impl Store {
             });
         }
         Ok(out)
+    }
+
+    /// Remember that replies to `ask` go to the human's MCP host `client`.
+    pub fn set_ask_notify(&self, ask: &str, client: &str, at: u64) -> Result<()> {
+        self.conn().execute(
+            "INSERT OR REPLACE INTO ask_notify (ask, client, at) VALUES (?, ?, ?)",
+            params![ask, client, at as i64],
+        )?;
+        Ok(())
+    }
+
+    /// The MCP host to notify of replies to `ask`, if any.
+    pub fn ask_notify(&self, ask: &str) -> Result<Option<String>> {
+        Ok(self
+            .conn()
+            .query_row("SELECT client FROM ask_notify WHERE ask = ?", [ask], |r| {
+                r.get(0)
+            })
+            .optional()?)
     }
 
     /// Full-text search (BM25), newest first among equal ranks. Without
@@ -1251,25 +1775,7 @@ mod tests {
     /// The tombstone of a full event: header, refs and signature, with
     /// `body_hash` instead of the body.
     fn tombstone_of(event: &Event) -> RawEvent {
-        use crate::wire::{BODY_HASH_KEY, HEADER_KEYS, REFS_KEY, UNHASHED_KEYS, digest};
-        let full = match serde_json::to_value(event).unwrap() {
-            Value::Object(map) => map,
-            _ => unreachable!(),
-        };
-        let mut t: serde_json::Map<String, Value> = full
-            .iter()
-            .filter(|(k, _)| {
-                HEADER_KEYS.contains(&k.as_str())
-                    || k.as_str() == REFS_KEY
-                    || UNHASHED_KEYS.contains(&k.as_str())
-            })
-            .map(|(k, v)| (k.clone(), v.clone()))
-            .collect();
-        t.insert(
-            BODY_HASH_KEY.into(),
-            serde_json::json!(digest(&full).unwrap().body_hash),
-        );
-        let raw = RawEvent::from_value(Value::Object(t)).unwrap();
+        let raw = crate::wire::tombstone(&serde_json::to_value(event).unwrap()).unwrap();
         assert!(raw.tombstoned);
         raw
     }
@@ -1360,5 +1866,494 @@ mod tests {
         store.insert(&unknown_parent, 20).unwrap();
         assert!(!store.is_grafted(&unknown_parent).unwrap());
         assert_eq!(store.reply_count(&a.id).unwrap(), 2);
+    }
+
+    fn with_blobs(key: u8, ts: u64, text: &str, hashes: &[&str]) -> Event {
+        Draft {
+            net: "public".into(),
+            kind: Some(Kind::Offer),
+            title: Some(text.into()),
+            text: text.into(),
+            blobs: hashes
+                .iter()
+                .map(|h| crate::event::BlobRef {
+                    hash: h.to_string(),
+                    name: "file.txt".into(),
+                    size: 3,
+                    url: None,
+                })
+                .collect(),
+            ..Draft::default()
+        }
+        .sign(&SigningKey::from_bytes(&[key; 32]), ts, 0)
+        .unwrap()
+    }
+
+    fn by_tag(store: &Store, tag: &str) -> usize {
+        store
+            .search(
+                None,
+                &Filter {
+                    tags: vec![tag.into()],
+                    ..Filter::default()
+                },
+                10,
+            )
+            .unwrap()
+            .len()
+    }
+
+    fn found(store: &Store, text: &str) -> usize {
+        store
+            .search(Some(text), &Filter::default(), 10)
+            .unwrap()
+            .len()
+    }
+
+    #[test]
+    fn drop_body_keeps_the_header_and_forgets_the_body() {
+        let store = Store::open_in_memory().unwrap();
+        let root = post(1, 10, Kind::Ask, &["cap:pdf"], "a leaked secret phrase");
+        let answer = reply(&root, 2, 11, "an answer stays");
+        store.insert(&root, 10).unwrap();
+        store.insert(&answer, 11).unwrap();
+        let seq = store.get(&root.id).unwrap().unwrap().seq;
+        assert_eq!(found(&store, "secret"), 1);
+        assert_eq!(store.tag_counts(None, None, 10).unwrap().len(), 1);
+        assert_eq!(
+            store
+                .thread_summaries(None, None, None, 0, 10)
+                .unwrap()
+                .len(),
+            1
+        );
+
+        let outcome = store
+            .drop_body(&root.id, DropReason::Own, None, Some("personal data"), 100)
+            .unwrap();
+        assert!(outcome.held && outcome.body_dropped);
+        assert!(outcome.freed_blobs.is_empty());
+        // Not readable, not searchable, not tagged, not listed by browse.
+        assert!(store.get(&root.id).unwrap().is_none());
+        assert_eq!(found(&store, "secret"), 0);
+        assert_eq!(found(&store, "pdf"), 0);
+        assert_eq!(by_tag(&store, "cap:pdf"), 0);
+        assert!(store.tag_counts(None, None, 10).unwrap().is_empty());
+        assert!(
+            store
+                .thread_summaries(None, None, None, 0, 10)
+                .unwrap()
+                .is_empty()
+        );
+        let tag_rows: i64 = store
+            .conn()
+            .query_row(
+                "SELECT count(*) FROM event_tags WHERE seq = ?",
+                [seq],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(tag_rows, 0);
+        // The row is the tombstone, with its seq and header columns.
+        let (v, opaque, raw) = store.get_raw(&root.id).unwrap().unwrap();
+        assert_eq!((v, opaque), (1, true));
+        assert_eq!(raw, tombstone_of(&root).to_value());
+        let (kept_seq, author, ts, kind): (i64, String, i64, String) = store
+            .conn()
+            .query_row(
+                "SELECT seq, author, ts, kind FROM events WHERE id = ?",
+                [&root.id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            (kept_seq, author, ts, kind.as_str()),
+            (seq, root.author.clone(), 10, "ask")
+        );
+        // Sync pages serve the tombstone.
+        let page = store.page_after("public", 0, "", 10).unwrap();
+        let served = page.iter().find(|e| e["id"] == root.id).unwrap();
+        assert!(served.get("text").is_none() && served.get("body_hash").is_some());
+        // The thread survives: the reply still resolves.
+        assert_eq!(store.thread_opaque(&root.id, 10).unwrap().len(), 1);
+        assert_eq!(store.thread(&root.id, 10).unwrap().len(), 1);
+        assert_eq!(
+            store.drop_record(&root.id).unwrap().unwrap(),
+            DropRecord {
+                reason: DropReason::Own,
+                at: 100,
+                trigger: None,
+                detail: Some("personal data".into()),
+            }
+        );
+        // Dropping again updates the record; the index stays sound.
+        let again = store
+            .drop_body(
+                &root.id,
+                DropReason::Retraction,
+                Some(&answer.id),
+                None,
+                200,
+            )
+            .unwrap();
+        assert!(again.held && !again.body_dropped);
+        let record = store.drop_record(&root.id).unwrap().unwrap();
+        assert_eq!(record.reason, DropReason::Retraction);
+        assert_eq!(record.trigger.as_deref(), Some(answer.id.as_str()));
+        store
+            .conn()
+            .execute(
+                "INSERT INTO events_fts (events_fts) VALUES ('integrity-check')",
+                [],
+            )
+            .unwrap();
+        assert!(store.drop_record(&answer.id).unwrap().is_none());
+    }
+
+    #[test]
+    fn a_dropped_body_is_refused_afterwards() {
+        let store = Store::open_in_memory().unwrap();
+        let event = post(1, 10, Kind::Note, &["cap:pdf"], "drop me");
+        store.insert(&event, 10).unwrap();
+        store
+            .drop_body(&event.id, DropReason::Own, None, None, 20)
+            .unwrap();
+        let mut rx = store.subscribe();
+        assert_eq!(store.insert(&event, 30).unwrap(), Inserted::Dropped);
+        assert!(rx.try_recv().is_err(), "nothing new to announce");
+        assert!(store.get(&event.id).unwrap().is_none());
+        let (_, opaque, raw) = store.get_raw(&event.id).unwrap().unwrap();
+        assert!(opaque && raw.get("text").is_none());
+        assert_eq!(found(&store, "drop"), 0);
+        // A tombstone arriving is a duplicate.
+        assert_eq!(
+            store.insert_raw(&tombstone_of(&event), 31).unwrap(),
+            Inserted::Duplicate
+        );
+    }
+
+    #[test]
+    fn a_drop_record_for_an_absent_event_keeps_only_its_tombstone() {
+        let store = Store::open_in_memory().unwrap();
+        let event = post(1, 10, Kind::Note, &["cap:pdf"], "not here yet");
+        // A retraction record is checked against its author on arrival
+        // (see the retraction tests); a human's record is not.
+        let outcome = store
+            .drop_body(&event.id, DropReason::Own, None, None, 5)
+            .unwrap();
+        assert_eq!(outcome, DropOutcome::default());
+        assert!(store.get_raw(&event.id).unwrap().is_none());
+        let before = store.opaque_bytes();
+        assert_eq!(store.insert(&event, 10).unwrap(), Inserted::Dropped);
+        let (_, opaque, raw) = store.get_raw(&event.id).unwrap().unwrap();
+        assert!(opaque);
+        assert_eq!(raw, tombstone_of(&event).to_value());
+        assert!(store.opaque_bytes() > before);
+        assert_eq!(store.insert(&event, 11).unwrap(), Inserted::Dropped);
+        assert_eq!(store.count().unwrap(), 1);
+        assert_eq!(found(&store, "here"), 0);
+    }
+
+    #[test]
+    fn an_evicted_body_is_accepted_again_and_its_record_expires() {
+        let store = Store::open_in_memory().unwrap();
+        let event = post(1, 10, Kind::Note, &["cap:pdf"], "evict me");
+        store.insert(&event, 10).unwrap();
+        store
+            .drop_body(&event.id, DropReason::Evicted, None, None, 100)
+            .unwrap();
+        assert!(store.get(&event.id).unwrap().is_none());
+        assert!(matches!(
+            store.insert(&event, 120).unwrap(),
+            Inserted::New(_)
+        ));
+        assert_eq!(
+            store.get(&event.id).unwrap().unwrap().event.text,
+            "evict me"
+        );
+        assert!(
+            store.drop_record(&event.id).unwrap().is_none(),
+            "record removed"
+        );
+        assert_eq!(found(&store, "evict"), 1);
+        assert_eq!(by_tag(&store, "cap:pdf"), 1);
+
+        // Only evicted records expire, once older than the cutoff.
+        let other = post(2, 11, Kind::Note, &[], "own drop");
+        let fresh = "ef".repeat(32);
+        let cutoff = 100 + EVICTED_RECORD_SECS;
+        store
+            .drop_body(&event.id, DropReason::Evicted, None, None, 100)
+            .unwrap();
+        store
+            .drop_body(&other.id, DropReason::Own, None, None, 100)
+            .unwrap();
+        store
+            .drop_body(&fresh, DropReason::Evicted, None, None, cutoff)
+            .unwrap();
+        assert_eq!(store.expire_evicted_records(cutoff).unwrap(), 1);
+        assert!(store.drop_record(&event.id).unwrap().is_none());
+        assert!(store.drop_record(&other.id).unwrap().is_some());
+        assert!(store.drop_record(&fresh).unwrap().is_some());
+    }
+
+    #[test]
+    fn drop_body_frees_the_blobs_no_kept_event_lists() {
+        let store = Store::open_in_memory().unwrap();
+        let (shared, alone) = ("aa".repeat(32), "bb".repeat(32));
+        let dropped = with_blobs(1, 10, "two files", &[&shared, &alone]);
+        let kept = with_blobs(2, 11, "one of them", &[&shared]);
+        store.insert(&dropped, 10).unwrap();
+        store.insert(&kept, 11).unwrap();
+        let mut referenced = store.referenced_blobs().unwrap();
+        referenced.sort();
+        assert_eq!(referenced, vec![shared.clone(), alone.clone()]);
+        let outcome = store
+            .drop_body(&dropped.id, DropReason::Own, None, None, 20)
+            .unwrap();
+        assert_eq!(outcome.freed_blobs, vec![alone]);
+        assert_eq!(store.referenced_blobs().unwrap(), vec![shared]);
+    }
+
+    #[test]
+    fn migrates_schema_v4_keeping_events() {
+        let store = Store::open_in_memory().unwrap();
+        let event = post(1, 10, Kind::Note, &["cap:pdf"], "kept across the migration");
+        store.insert(&event, 10).unwrap();
+        let conn = store.conn.into_inner().unwrap();
+        conn.execute_batch("DROP TABLE dropped; PRAGMA user_version = 4;")
+            .unwrap();
+        let store = Store::init(conn).unwrap();
+        assert_eq!(store.count().unwrap(), 1, "no resync");
+        assert_eq!(found(&store, "migration"), 1);
+        store
+            .drop_body(&event.id, DropReason::Own, None, None, 20)
+            .unwrap();
+        assert!(store.drop_record(&event.id).unwrap().is_some());
+        let conn = store.conn.into_inner().unwrap();
+        let version: i64 = conn
+            .pragma_query_value(None, "user_version", |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, 5);
+    }
+
+    #[test]
+    fn read_only_opens_schema_5() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("events.sqlite");
+        let store = Store::open(&path).unwrap();
+        let event = post(1, 10, Kind::Note, &[], "read me");
+        store.insert(&event, 10).unwrap();
+        store
+            .drop_body(&event.id, DropReason::Own, None, None, 20)
+            .unwrap();
+        let ro = Store::open_read_only(&path).unwrap();
+        assert_eq!(
+            ro.drop_record(&event.id).unwrap().unwrap().reason,
+            DropReason::Own
+        );
+    }
+
+    #[test]
+    fn drop_reasons_round_trip() {
+        for reason in [
+            DropReason::Own,
+            DropReason::Retraction,
+            DropReason::Erasure,
+            DropReason::Label,
+            DropReason::Evicted,
+        ] {
+            assert_eq!(reason.as_str().parse::<DropReason>().unwrap(), reason);
+        }
+        assert!("whim".parse::<DropReason>().is_err());
+    }
+
+    fn key(seed: u8) -> SigningKey {
+        SigningKey::from_bytes(&[seed; 32])
+    }
+
+    /// A retraction by `seed` of `refs`, as stored and applied.
+    fn retraction(seed: u8, ts: u64, refs: &[&str]) -> (Event, crate::retract::Retraction) {
+        let draft =
+            crate::retract::draft("public", refs.iter().map(|r| r.to_string()).collect(), None)
+                .unwrap();
+        let event = draft.sign(&key(seed), ts, 0).unwrap();
+        let applied = crate::retract::Retraction::from_event(&event).unwrap();
+        (event, applied)
+    }
+
+    /// `old` hands over to `new` (both sign).
+    fn rotate(old: u8, new: u8, ts: u64) -> Event {
+        let next = key(new).verifying_key();
+        Draft {
+            net: "public".into(),
+            kind: Some(Kind::Rotate),
+            title: Some("rotate".into()),
+            text: "handing over".into(),
+            data: serde_json::json!({
+                "new_key": hex::encode(next.as_bytes()),
+                "new_key_sig": crate::event::rotate_signature(&key(new), key(old).verifying_key().as_bytes()),
+            })
+            .as_object()
+            .unwrap()
+            .clone(),
+            ..Draft::default()
+        }
+        .sign(&key(old), ts, 0)
+        .unwrap()
+    }
+
+    #[test]
+    fn a_retraction_drops_the_authors_post_and_refuses_it_afterwards() {
+        let store = Store::open_in_memory().unwrap();
+        let mine = post(1, 10, Kind::Note, &["cap:x"], "my leaked key");
+        let theirs = post(2, 11, Kind::Note, &[], "someone else's post");
+        store.insert(&mine, 10).unwrap();
+        store.insert(&theirs, 11).unwrap();
+        let (event, r) = retraction(1, 20, &[&mine.id, &theirs.id]);
+        store.insert(&event, 20).unwrap();
+        let applied = store.apply_retraction(&r, 30).unwrap();
+        let outcome = |id: &str| applied.iter().find(|(i, _)| i == id).unwrap().1.clone();
+        assert!(matches!(outcome(&mine.id), Applied::Dropped(o) if o.body_dropped));
+        // Someone else's post: ignored, body kept.
+        assert_eq!(outcome(&theirs.id), Applied::NotTheAuthor);
+        assert!(store.get(&theirs.id).unwrap().is_some());
+        assert!(store.drop_record(&theirs.id).unwrap().is_none());
+        assert!(store.get(&mine.id).unwrap().is_none());
+        let record = store.drop_record(&mine.id).unwrap().unwrap();
+        assert_eq!(record.reason, DropReason::Retraction);
+        assert_eq!(record.trigger.as_deref(), Some(event.id.as_str()));
+        // Refused afterwards; applying again changes nothing.
+        assert_eq!(store.insert(&mine, 40).unwrap(), Inserted::Dropped);
+        assert!(store.get(&mine.id).unwrap().is_none());
+        let again = store.apply_retraction(&r, 50).unwrap();
+        assert_eq!(again[0].1, Applied::AlreadyDropped);
+        assert_eq!(store.drop_record(&mine.id).unwrap().unwrap().at, 30);
+    }
+
+    #[test]
+    fn a_retraction_before_its_target_keeps_only_the_tombstone() {
+        let store = Store::open_in_memory().unwrap();
+        let mine = post(1, 10, Kind::Note, &[], "not here yet");
+        let (event, r) = retraction(1, 20, &[&mine.id]);
+        store.insert(&event, 20).unwrap();
+        assert_eq!(
+            store.apply_retraction(&r, 21).unwrap()[0].1,
+            Applied::Remembered
+        );
+        assert_eq!(store.insert(&mine, 30).unwrap(), Inserted::Dropped);
+        assert!(store.get(&mine.id).unwrap().is_none());
+        let (_, opaque, raw) = store.get_raw(&mine.id).unwrap().unwrap();
+        assert!(opaque && raw.get("body_hash").is_some() && raw.get("text").is_none());
+        // A forged retraction of the same post by someone else, stored
+        // later, does not change who the record trusts.
+        let (forged_mine, fm) = retraction(3, 23, &[&mine.id]);
+        store.insert(&forged_mine, 23).unwrap();
+        assert_eq!(
+            store.apply_retraction(&fm, 24).unwrap()[0].1,
+            Applied::NotTheAuthor
+        );
+        assert_eq!(
+            store
+                .drop_record(&mine.id)
+                .unwrap()
+                .unwrap()
+                .trigger
+                .as_deref(),
+            Some(event.id.as_str())
+        );
+    }
+
+    #[test]
+    fn a_retraction_of_an_absent_post_by_someone_else_is_undone_on_arrival() {
+        let store = Store::open_in_memory().unwrap();
+        let theirs = post(2, 10, Kind::Note, &[], "someone else's post");
+        // Key 3 claims it before it arrives: recorded, unchecked.
+        let (event, r) = retraction(3, 20, &[&theirs.id]);
+        store.insert(&event, 20).unwrap();
+        assert_eq!(
+            store.apply_retraction(&r, 21).unwrap()[0].1,
+            Applied::Remembered
+        );
+        // On arrival the author does not match: the record goes, the body
+        // is stored.
+        assert!(matches!(
+            store.insert(&theirs, 30).unwrap(),
+            Inserted::New(_)
+        ));
+        assert!(store.get(&theirs.id).unwrap().is_some());
+        assert!(store.drop_record(&theirs.id).unwrap().is_none());
+    }
+
+    #[test]
+    fn a_retraction_by_a_successor_key_follows_the_rotation_chain() {
+        let store = Store::open_in_memory().unwrap();
+        let old = post(4, 10, Kind::Note, &[], "by the old key");
+        store.insert(&old, 10).unwrap();
+        // Key 6 retracts a post by key 4: 4 -> 5 -> 6, links not held yet.
+        let (event, r) = retraction(6, 20, &[&old.id]);
+        store.insert(&event, 20).unwrap();
+        assert_eq!(
+            store.apply_retraction(&r, 21).unwrap()[0].1,
+            Applied::NotTheAuthor
+        );
+        assert!(store.get(&old.id).unwrap().is_some(), "pending: body kept");
+        let first = rotate(4, 5, 15);
+        store.insert(&first, 22).unwrap();
+        assert!(!store.rotated_into(&hex_key(6), &hex_key(4)).unwrap());
+        store.insert(&rotate(5, 6, 16), 23).unwrap();
+        assert!(store.rotated_into(&hex_key(6), &hex_key(4)).unwrap());
+        assert_eq!(
+            store.rotation_successors(&hex_key(5)).unwrap(),
+            [hex_key(5), hex_key(6)]
+        );
+        assert_eq!(
+            store.retractions_by(&[hex_key(6)]).unwrap(),
+            std::slice::from_ref(&r)
+        );
+        assert!(matches!(
+            store.apply_retraction(&r, 24).unwrap()[0].1,
+            Applied::Dropped(_)
+        ));
+        assert!(store.get(&old.id).unwrap().is_none());
+        // The chain also lets an absent post by the old key be refused on
+        // arrival.
+        let later = post(4, 11, Kind::Note, &[], "another one by the old key");
+        let (event, r) = retraction(6, 25, &[&later.id]);
+        store.insert(&event, 25).unwrap();
+        store.apply_retraction(&r, 26).unwrap();
+        assert_eq!(store.insert(&later, 27).unwrap(), Inserted::Dropped);
+        // Key successions are never retracted.
+        let (event, r) = retraction(4, 28, &[&first.id]);
+        store.insert(&event, 28).unwrap();
+        assert_eq!(
+            store.apply_retraction(&r, 29).unwrap()[0].1,
+            Applied::Unretractable
+        );
+        assert!(store.get(&first.id).unwrap().is_some());
+    }
+
+    #[test]
+    fn a_retraction_keeps_a_drop_for_another_reason() {
+        let store = Store::open_in_memory().unwrap();
+        let mine = post(1, 10, Kind::Note, &[], "dropped by the human");
+        store.insert(&mine, 10).unwrap();
+        store
+            .drop_body(&mine.id, DropReason::Own, None, Some("mine"), 11)
+            .unwrap();
+        let (event, r) = retraction(1, 20, &[&mine.id]);
+        store.insert(&event, 20).unwrap();
+        assert_eq!(
+            store.apply_retraction(&r, 21).unwrap()[0].1,
+            Applied::AlreadyDropped
+        );
+        assert_eq!(
+            store.drop_record(&mine.id).unwrap().unwrap().reason,
+            DropReason::Own
+        );
+    }
+
+    fn hex_key(seed: u8) -> String {
+        hex::encode(key(seed).verifying_key().as_bytes())
     }
 }

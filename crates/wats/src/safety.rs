@@ -23,6 +23,7 @@ use serde::{Deserialize, Serialize};
 pub const KEYS: &[&str] = &[
     "halt.accept",
     "halt.serve",
+    "agent.with_mcp",
     "agent.runtime",
     "agent.access",
     "agent.workdir",
@@ -53,6 +54,7 @@ pub const KEYS: &[&str] = &[
     "update.security_delay",
     "update.url",
     "limits.challenge",
+    "storage.gc",
 ];
 
 pub const FILE_NAME: &str = "safety.json";
@@ -130,19 +132,74 @@ pub fn current(data_dir: &Path) -> Result<BTreeMap<String, String>> {
     };
     let table: toml::Table =
         toml::from_str(&text).with_context(|| format!("invalid {}", path.display()))?;
-    Ok(KEYS
+    let shown = |value: Option<&toml::Value>| {
+        value
+            .and_then(|v| serde_json::to_string(v).ok())
+            .unwrap_or_else(|| DEFAULT.to_string())
+    };
+    let mut values: BTreeMap<String, String> = KEYS
         .iter()
         .map(|name| {
             let value = match name.split_once('.') {
                 Some((t, leaf)) => table.get(t).and_then(|t| t.get(leaf)),
                 None => table.get(*name),
             };
-            let shown = value
-                .and_then(|v| serde_json::to_string(v).ok())
-                .unwrap_or_else(|| DEFAULT.to_string());
-            (name.to_string(), shown)
+            (name.to_string(), shown(value))
         })
-        .collect())
+        .collect();
+    // Each agent's (ADR 0021).
+    for (name, agent) in table
+        .get("agents")
+        .and_then(|a| a.as_table())
+        .into_iter()
+        .flatten()
+    {
+        for leaf in agent_leaves() {
+            values.insert(format!("agents.{name}.{leaf}"), shown(agent.get(leaf)));
+        }
+    }
+    Ok(values)
+}
+
+/// The safety keys of one agent: those of `[agent]` but the node-wide
+/// ones, plus `enabled` and `legacy_dir`.
+fn agent_leaves() -> impl Iterator<Item = &'static str> {
+    KEYS.iter()
+        .filter_map(|k| k.strip_prefix("agent."))
+        .filter(|leaf| crate::settings::is_agent_leaf(leaf))
+        .chain(crate::settings::AGENT_ONLY_KEYS)
+}
+
+/// Whether `name` is a safety key: one of [`KEYS`], or the same key of an
+/// agent (`agents.<name>.<key>`).
+pub fn is_key(name: &str) -> bool {
+    KEYS.contains(&name)
+        || crate::settings::split_agents_key(name)
+            .is_some_and(|(_, leaf)| agent_leaves().any(|l| l == leaf))
+}
+
+/// The old `[agent]` table became `[agents.<name>]`: carry the
+/// acknowledged values over, so that the rewrite is no change while a
+/// change not yet acknowledged still shows.
+pub fn migrate_baseline(data_dir: &Path, name: &str) -> Result<()> {
+    let path = data_dir.join(FILE_NAME);
+    let Some(mut record) = read(&path)? else {
+        return Ok(());
+    };
+    for leaf in agent_leaves() {
+        let old = format!("agent.{leaf}");
+        if let Some(value) = record.baseline.get(&old).cloned() {
+            record
+                .baseline
+                .insert(format!("agents.{name}.{leaf}"), value);
+            record.baseline.insert(old, DEFAULT.to_string());
+        }
+    }
+    // Written by the rewrite itself.
+    record
+        .baseline
+        .insert(format!("agents.{name}.legacy_dir"), "true".to_string());
+    write(&path, &record)
 }
 
 fn read(path: &Path) -> Result<Option<Record>> {
@@ -180,7 +237,8 @@ fn diff(baseline: &BTreeMap<String, String>, now: &BTreeMap<String, String>) -> 
 
 /// Compare config.toml with the acknowledged values. The first time (no
 /// `safety.json`), record them silently. Keys a newer version added are
-/// recorded silently too.
+/// recorded silently too, but not a new agent's (`agents.<name>.*`): its
+/// keys start from `default`, so that an agent added to the file shows.
 pub fn check(data_dir: &Path) -> Result<Option<Notice>> {
     let now = current(data_dir)?;
     let path = data_dir.join(FILE_NAME);
@@ -197,7 +255,12 @@ pub fn check(data_dir: &Path) -> Result<Option<Notice>> {
     let mut dirty = false;
     for (key, value) in &now {
         if !record.baseline.contains_key(key) {
-            record.baseline.insert(key.clone(), value.clone());
+            let first = if key.starts_with("agents.") {
+                DEFAULT.to_string()
+            } else {
+                value.clone()
+            };
+            record.baseline.insert(key.clone(), first);
             dirty = true;
         }
     }

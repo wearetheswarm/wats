@@ -375,3 +375,224 @@ async fn a_serving_node_keeps_only_halt_events_flowing() -> anyhow::Result<()> {
     a.shutdown().await?;
     Ok(())
 }
+
+/// ADR 0020: a node that dropped a body serves its tombstone to `sync`,
+/// and refuses the body when a peer offers it again (sync or replicate),
+/// without fetching its blobs.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_dropped_body_is_served_as_its_tombstone_and_refused() -> anyhow::Result<()> {
+    use wats::store::DropReason;
+    let dir = tempfile::tempdir()?;
+    let a = Node::start(config(&dir.path().join("a"))).await?;
+    let mut b_config = config(&dir.path().join("b"));
+    b_config.peers.push(a.endpoint().addr());
+    let b = Node::start(b_config).await?;
+    a.wait_for_neighbor(PUBLIC_NET, Duration::from_secs(10))
+        .await?;
+    let file = dir.path().join("secret.txt");
+    std::fs::write(&file, b"a leaked secret")?;
+    let event = a
+        .publish(
+            Draft {
+                net: PUBLIC_NET.into(),
+                kind: Some(Kind::Note),
+                title: Some("oops".into()),
+                text: "a leaked secret".into(),
+                ..Draft::default()
+            },
+            &[Attachment {
+                path: file,
+                name: None,
+            }],
+        )
+        .await?;
+    eventually("event on b", || async {
+        b.store().get(&event.id).ok().flatten()
+    })
+    .await;
+
+    let outcome = a
+        .drop_body(&event.id, DropReason::Own, None, Some("a secret"))
+        .await?;
+    assert!(outcome.body_dropped);
+    assert_eq!(outcome.freed_blobs, [event.blobs[0].hash.clone()]);
+    assert!(!a.blob_pinned(&event.blobs[0].hash).await?);
+    assert!(a.store().get(&event.id)?.is_none());
+
+    // A syncs from B, which still holds the full event: refused.
+    a.sync_from(b.endpoint_id(), PUBLIC_NET).await?;
+    assert!(a.store().get(&event.id)?.is_none(), "body refused on sync");
+    // B pushes it with its blob: refused, nothing fetched.
+    let request = wats::proto::Request::Replicate {
+        event: serde_json::to_value(&event)?,
+        hashes: vec![event.blobs[0].hash.clone()],
+    };
+    let answer = wats::proto::call_solving(b.endpoint(), a.endpoint_id(), &request).await?;
+    assert!(
+        matches!(&answer, wats::proto::Response::Replicated { hashes } if hashes.is_empty()),
+        "{answer:?}"
+    );
+    assert!(a.store().get(&event.id)?.is_none(), "body refused on push");
+    assert!(!a.blob_pinned(&event.blobs[0].hash).await?);
+    // Republishing the full event from A is refused too.
+    assert!(
+        a.publish_signed(serde_json::to_value(&event)?)
+            .await
+            .is_err()
+    );
+
+    // A serves its tombstone to sync.
+    let request = wats::proto::Request::Sync {
+        net: PUBLIC_NET.into(),
+        after_ts: 0,
+        after_id: String::new(),
+        limit: 100,
+    };
+    let wats::proto::Response::SyncPage { events, .. } =
+        wats::proto::call_solving(b.endpoint(), a.endpoint_id(), &request).await?
+    else {
+        panic!("sync page expected");
+    };
+    let served = events
+        .iter()
+        .find(|e| e["id"] == event.id.as_str())
+        .expect("served");
+    assert!(served.get("text").is_none() && served.get("title").is_none());
+    assert!(served.get("body_hash").is_some());
+
+    // A third node syncing from A gets the tombstone, not the body. B,
+    // which keeps its full copy (its own policy), is gone by then.
+    b.shutdown().await?;
+    let mut c_config = config(&dir.path().join("c"));
+    c_config.peers.push(a.endpoint().addr());
+    let c = Node::start(c_config).await?;
+    c.wait_for_neighbor(PUBLIC_NET, Duration::from_secs(10))
+        .await?;
+    c.sync_from(a.endpoint_id(), PUBLIC_NET).await?;
+    let (_, opaque, raw) = c.store().get_raw(&event.id)?.expect("tombstone on c");
+    assert!(opaque && raw.get("text").is_none() && raw.get("body_hash").is_some());
+    assert!(c.store().get(&event.id)?.is_none());
+    c.shutdown().await?;
+    a.shutdown().await?;
+    Ok(())
+}
+
+/// `wats drop` with no node running: straight into the store, refused
+/// once the node runs again.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_body_dropped_offline_stays_dropped() -> anyhow::Result<()> {
+    use wats::store::DropReason;
+    let dir = tempfile::tempdir()?;
+    let data = dir.path().join("a");
+    let a = Node::start(config(&data)).await?;
+    let event = a
+        .publish(
+            Draft {
+                net: PUBLIC_NET.into(),
+                kind: Some(Kind::Note),
+                title: Some("oops".into()),
+                text: "drop me while stopped".into(),
+                ..Draft::default()
+            },
+            &[],
+        )
+        .await?;
+    // Not while the node holds the data directory.
+    assert!(
+        wats::node::drop_body_offline(&data, &event.id, DropReason::Own, None)
+            .await
+            .is_err()
+    );
+    a.shutdown().await?;
+    drop(a);
+    let outcome =
+        wats::node::drop_body_offline(&data, &event.id, DropReason::Own, Some("why")).await?;
+    assert!(outcome.held && outcome.body_dropped);
+    let a = Node::start(config(&data)).await?;
+    assert!(a.store().get(&event.id)?.is_none());
+    let record = a.store().drop_record(&event.id)?.expect("recorded");
+    assert_eq!(record.reason, DropReason::Own);
+    assert_eq!(record.detail.as_deref(), Some("why"));
+    a.shutdown().await?;
+    Ok(())
+}
+
+/// ADR 0020 §5.1: an author's retraction travels like any event, and the
+/// node that receives it drops the body it holds; a node that syncs later
+/// gets the retraction and refuses the body.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_retraction_propagates_and_peers_drop_the_body() -> anyhow::Result<()> {
+    use wats::store::DropReason;
+    let dir = tempfile::tempdir()?;
+    let a = Node::start(config(&dir.path().join("a"))).await?;
+    let mut b_config = config(&dir.path().join("b"));
+    b_config.peers.push(a.endpoint().addr());
+    let b = Node::start(b_config).await?;
+    a.wait_for_neighbor(PUBLIC_NET, Duration::from_secs(10))
+        .await?;
+    b.wait_for_neighbor(PUBLIC_NET, Duration::from_secs(10))
+        .await?;
+    let event = a
+        .publish(
+            Draft {
+                net: PUBLIC_NET.into(),
+                kind: Some(Kind::Note),
+                title: Some("oops".into()),
+                text: "my api key is sk-0000".into(),
+                ..Draft::default()
+            },
+            &[],
+        )
+        .await?;
+    eventually("event on b", || async {
+        b.store().get(&event.id).ok().flatten()
+    })
+    .await;
+
+    let retractions = a
+        .retract_as(
+            a.default_author(),
+            std::slice::from_ref(&event.id),
+            Some("posted a secret by mistake"),
+        )
+        .await?;
+    let [retraction] = retractions.as_slice() else {
+        panic!("one retraction expected: {retractions:?}");
+    };
+    assert_eq!(retraction.kind.as_str(), wats::retract::KIND);
+    assert_eq!(retraction.refs, std::slice::from_ref(&event.id));
+    assert!(a.store().get(&event.id)?.is_none(), "dropped on a at once");
+
+    let record = eventually("body dropped on b", || async {
+        b.store().drop_record(&event.id).ok().flatten()
+    })
+    .await;
+    assert_eq!(record.reason, DropReason::Retraction);
+    assert_eq!(record.trigger.as_deref(), Some(retraction.id.as_str()));
+    assert!(b.store().get(&event.id)?.is_none());
+    // The retraction itself is stored, as any event.
+    assert!(b.store().get(&retraction.id)?.is_some());
+
+    // A third node syncing from b: it gets the retraction and the
+    // tombstone, never the body.
+    let mut c_config = config(&dir.path().join("c"));
+    c_config.peers.push(b.endpoint().addr());
+    let c = Node::start(c_config).await?;
+    c.wait_for_neighbor(PUBLIC_NET, Duration::from_secs(10))
+        .await?;
+    c.sync_from(b.endpoint_id(), PUBLIC_NET).await?;
+    assert!(c.store().get(&retraction.id)?.is_some());
+    assert!(c.store().get(&event.id)?.is_none());
+    // Offered the full post by a, which no longer has it either: still
+    // refused by c (its record came with the retraction).
+    assert!(
+        c.publish_signed(serde_json::to_value(&event)?)
+            .await
+            .is_err()
+    );
+    assert!(c.store().get(&event.id)?.is_none());
+    c.shutdown().await?;
+    b.shutdown().await?;
+    a.shutdown().await?;
+    Ok(())
+}

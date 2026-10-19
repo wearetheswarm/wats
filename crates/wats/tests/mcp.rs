@@ -684,3 +684,295 @@ async fn browse_maps_tags_threads_and_outlines() -> anyhow::Result<()> {
     node.shutdown().await?;
     Ok(())
 }
+
+/// `wats drop` through the running node's socket (ADR 0020): `read` then
+/// shows the post's header and `dropped`, never the body; `search` and
+/// `browse` no longer find it; its file is untagged.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_dropped_post_reads_as_its_header() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let data = dir.path().join("n");
+    let node = loopback_node(&data, None).await?;
+    let shared = dir.path().join("shared");
+    std::fs::create_dir_all(&shared)?;
+    std::fs::write(shared.join("key.txt"), "s3cr3t")?;
+    let asker = client_for(WatsMcp::new(node.clone(), vec![shared.clone()])).await?;
+    let helper = client_for(WatsMcp::new(node.clone(), vec![]).with_profile("helper")?).await?;
+    let ask = structured(
+        &call(
+            &asker,
+            "post",
+            json!({"title": "My leaked key", "text": "Here it is: s3cr3t", "kind": "ask",
+                   "tags": ["cap:secrets"],
+                   "blobs": [{"path": shared.join("key.txt").to_str().unwrap()}]}),
+        )
+        .await,
+    );
+    let ask_id = ask["id"].as_str().unwrap().to_string();
+    let answer = structured(
+        &call(
+            &helper,
+            "reply",
+            json!({"post_id": ask_id, "text": "Rotate it now.", "kind": "answer"}),
+        )
+        .await,
+    );
+    let answer_id = answer["id"].as_str().unwrap().to_string();
+    let hash = node.store().get(&ask_id)?.unwrap().event.blobs[0]
+        .hash
+        .clone();
+    assert!(node.blob_pinned(&hash).await?);
+
+    // No MCP tool drops a body.
+    let tools = asker.list_all_tools().await?;
+    assert!(tools.iter().all(|t| !t.name.contains("drop")));
+
+    let _sessions = wats::attach::serve(Arc::clone(&node))?;
+    let outcome = wats::attach::control(
+        &data,
+        wats::attach::Control::Drop {
+            id: ask_id.clone(),
+            detail: Some("a secret".into()),
+        },
+    )
+    .await?
+    .expect("the node answers");
+    assert_eq!(outcome["body_dropped"], true, "{outcome}");
+    assert_eq!(outcome["freed_blobs"], json!([hash]));
+    assert!(!node.blob_pinned(&hash).await?);
+    let bad = wats::attach::control(
+        &data,
+        wats::attach::Control::Drop {
+            id: "not an id".into(),
+            detail: None,
+        },
+    )
+    .await;
+    assert!(bad.is_err());
+
+    let read = structured(&call(&asker, "read", json!({"id": ask_id})).await);
+    let post = &read["post"];
+    assert_eq!(post["id"], ask_id.as_str(), "{read}");
+    assert_eq!(post["kind"], "ask");
+    assert_eq!(post["author"], node.author_id());
+    assert!(post["ts"].as_u64().is_some());
+    assert_eq!(post["dropped"]["reason"], "own");
+    assert!(post["dropped"]["at"].as_u64().is_some());
+    assert!(
+        post["dropped"].get("note").is_none(),
+        "the detail stays local"
+    );
+    for gone in ["text", "title", "tags", "data", "blobs"] {
+        assert!(post.get(gone).is_none(), "{gone}: {read}");
+    }
+    assert!(!read.to_string().contains("s3cr3t"), "{read}");
+    assert_eq!(read["thread_root"], ask_id.as_str());
+    assert_eq!(read["thread"][0]["id"], answer_id.as_str());
+
+    // The reply's thread lists the dropped root by its header.
+    let reply = structured(&call(&asker, "read", json!({"id": answer_id})).await);
+    assert_eq!(reply["unreadable"][0]["id"], ask_id.as_str(), "{reply}");
+    assert_eq!(reply["unreadable"][0]["dropped"]["reason"], "own");
+    assert_eq!(reply["post"]["parent"], ask_id.as_str());
+
+    let found = structured(&call(&asker, "search", json!({"text": "leaked key"})).await);
+    assert!(!found.to_string().contains(&ask_id), "{found}");
+    let tree = structured(&call(&asker, "browse", json!({"thread": ask_id})).await);
+    assert_eq!(tree["posts"][0]["title"], "(body dropped: own)", "{tree}");
+    let map = structured(&call(&asker, "browse", json!({})).await);
+    assert_eq!(map["tags"], json!([]), "{map}");
+    node.shutdown().await?;
+    Ok(())
+}
+
+fn error_text(result: &CallToolResult) -> String {
+    assert_eq!(result.is_error, Some(true), "{result:?}");
+    serde_json::to_string(&result.content).unwrap()
+}
+
+async fn post_note(client: &Client, text: &str) -> String {
+    let posted = structured(
+        &call(
+            client,
+            "post",
+            json!({"title": "a post", "text": text, "kind": "note"}),
+        )
+        .await,
+    );
+    posted["id"].as_str().unwrap().to_string()
+}
+
+/// The MCP `retract` tool (ADR 0020 §5.1): own posts only; a human
+/// session has no limit and leaves no audit copy; `post` cannot publish a
+/// retraction behind its back.
+#[tokio::test(flavor = "multi_thread")]
+async fn retract_accepts_only_the_sessions_own_posts() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let data = dir.path().join("n");
+    let node = loopback_node(&data, None).await?;
+    let me = client_for(WatsMcp::new(node.clone(), vec![])).await?;
+    let helper = client_for(WatsMcp::new(node.clone(), vec![]).with_profile("helper")?).await?;
+    let tools = me.list_all_tools().await?;
+    assert!(tools.iter().any(|t| t.name == "retract"));
+    let mine = post_note(&me, "my token is s3cr3t").await;
+    let theirs = post_note(&helper, "the helper's post").await;
+
+    let refused = call(&me, "retract", json!({"ids": [theirs]})).await;
+    let text = error_text(&refused);
+    assert!(text.contains("is not yours"), "{text}");
+    assert!(node.store().get(&theirs)?.is_some());
+    // Not even mixed with one of mine: nothing is retracted.
+    let refused = call(&me, "retract", json!({"ids": [mine, theirs]})).await;
+    error_text(&refused);
+    assert!(node.store().get(&mine)?.is_some());
+
+    let done = structured(
+        &call(
+            &me,
+            "retract",
+            json!({"ids": [mine], "reason": "posted a secret by mistake"}),
+        )
+        .await,
+    );
+    assert_eq!(done["retracted"], json!([mine]), "{done}");
+    let read = structured(&call(&me, "read", json!({"id": mine})).await);
+    assert_eq!(read["post"]["dropped"]["reason"], "retraction", "{read}");
+    assert!(!read.to_string().contains("s3cr3t"));
+    // A human session: no log, no audit copy, nothing in status.
+    assert!(wats::retract::agent_log(&data)?.is_empty());
+    assert!(wats::retract::audit_copy(&data, &mine)?.is_none());
+    let status = structured(&call(&me, "status", json!({})).await);
+    assert!(status.get("agent_retractions").is_none(), "{status}");
+
+    // The retraction kind only goes through `retract`.
+    let sneaky = call(
+        &helper,
+        "post",
+        json!({"title": "Retraction", "text": "x", "kind": wats::retract::KIND,
+               "refs": [theirs]}),
+    )
+    .await;
+    assert!(error_text(&sneaky).contains("retract"));
+    assert!(node.store().get(&theirs)?.is_some());
+    node.shutdown().await?;
+    Ok(())
+}
+
+/// Agent profiles: at most 3 retracted posts per 24 hours, still counted
+/// after a restart; each retracted post kept as a local audit copy; shown
+/// to the owner in `status`.
+#[tokio::test(flavor = "multi_thread")]
+async fn agents_retract_under_a_rate_limit_with_an_audit_copy() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let data = dir.path().join("n");
+    let start = || async {
+        let mut config = NodeConfig::new(&data);
+        config.mode = NetworkMode::Loopback;
+        config.pow_bits = Some(4);
+        config.min_pow_bits = Some(4);
+        config.runners = vec!["claude as alice-agent".into()];
+        Node::start(config).await
+    };
+    let node = start().await?;
+    let agent = client_for(WatsMcp::new(node.clone(), vec![]).with_profile("alice-agent")?).await?;
+    let owner = client_for(WatsMcp::new(node.clone(), vec![])).await?;
+    let mut ids = Vec::new();
+    for n in 0..4 {
+        ids.push(post_note(&agent, &format!("body {n}")).await);
+    }
+    structured(&call(&agent, "retract", json!({"ids": [ids[0], ids[1]]})).await);
+    structured(
+        &call(
+            &agent,
+            "retract",
+            json!({"ids": [ids[2]], "reason": "leaked a path"}),
+        )
+        .await,
+    );
+    for id in &ids[..3] {
+        assert!(node.store().get(id)?.is_none(), "dropped");
+        let copy = wats::retract::audit_copy(&data, id)?.expect("audit copy");
+        assert_eq!(copy["id"], id.as_str());
+        assert!(
+            copy["text"].as_str().unwrap().starts_with("body "),
+            "{copy}"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(wats::retract::audit_path(&data, id))?
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
+    }
+    let refused = call(&agent, "retract", json!({"ids": [ids[3]]})).await;
+    assert!(error_text(&refused).contains("rate limit"));
+    assert!(node.store().get(&ids[3])?.is_some());
+    assert!(wats::retract::audit_copy(&data, &ids[3])?.is_none());
+
+    // The owner sees them; the agent's own status does not list them.
+    let status = structured(&call(&owner, "status", json!({})).await);
+    let shown = &status["agent_retractions"];
+    assert_eq!(shown["count"], 3, "{status}");
+    assert_eq!(shown["profiles"], json!(["alice-agent"]));
+    assert_eq!(shown["latest"]["reason"], "leaked a path");
+    for id in &ids[..3] {
+        assert!(shown["ids"].as_array().unwrap().contains(&json!(id)));
+    }
+    let agent_status = structured(&call(&agent, "status", json!({})).await);
+    assert!(agent_status.get("agent_retractions").is_none());
+    // The audit copies are never served: `read` shows the header only.
+    let read = structured(&call(&owner, "read", json!({"id": ids[0]})).await);
+    assert!(!read.to_string().contains("body 0"), "{read}");
+
+    // A restart does not reset the count.
+    agent.cancel().await?;
+    owner.cancel().await?;
+    node.shutdown().await?;
+    drop(node);
+    let node = start().await?;
+    let agent = client_for(WatsMcp::new(node.clone(), vec![]).with_profile("alice-agent")?).await?;
+    let refused = call(&agent, "retract", json!({"ids": [ids[3]]})).await;
+    assert!(error_text(&refused).contains("rate limit"));
+    // Not the owner's post either; the owner retracts it as the agent's
+    // profile (`wats retract --profile`), with no limit.
+    let owner = client_for(WatsMcp::new(node.clone(), vec![])).await?;
+    let not_mine = call(&owner, "retract", json!({"ids": [ids[3]]})).await;
+    assert!(error_text(&not_mine).contains("is not yours"));
+    let events = node
+        .retract_as(&node.author_key("alice-agent")?, &ids[3..], None)
+        .await?;
+    assert_eq!(events.len(), 1);
+    assert!(node.store().get(&ids[3])?.is_none());
+    node.shutdown().await?;
+    Ok(())
+}
+
+/// An ask posted from OpenClaw (`WATS_MCP_CLIENT=openclaw`) is remembered
+/// for notifications (ADR 0018 §7); one from another host is not.
+#[tokio::test(flavor = "multi_thread")]
+async fn asks_from_openclaw_are_remembered_for_notifications() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let node = loopback_node(&dir.path().join("n"), None).await?;
+    let openclaw =
+        client_for(WatsMcp::new(node.clone(), vec![]).with_client(Some("openclaw".into()))).await?;
+    let other = client_for(WatsMcp::new(node.clone(), vec![])).await?;
+    let post = |title: &str| json!({"title": title, "text": "Please.", "kind": "ask"});
+    let from_openclaw = structured(&call(&openclaw, "post", post("Draw a bee")).await);
+    let from_other = structured(&call(&other, "post", post("Sum these")).await);
+    let note = structured(
+        &call(
+            &openclaw,
+            "post",
+            json!({"title": "A note", "text": "FYI", "kind": "note"}),
+        )
+        .await,
+    );
+    let notify = |v: &Value| node.store().ask_notify(v["id"].as_str().unwrap()).unwrap();
+    assert_eq!(notify(&from_openclaw).as_deref(), Some("openclaw"));
+    assert_eq!(notify(&from_other), None);
+    assert_eq!(notify(&note), None, "only asks");
+    node.shutdown().await?;
+    Ok(())
+}

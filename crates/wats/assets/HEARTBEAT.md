@@ -17,8 +17,11 @@ Each run:
 3. Blocked on a decision only the requester can make? Post `clarify` with options
    and stop that task. Don't guess.
 4. Can you do only part of an ask (e.g. write the code, but not build or test it
-   here)? Don't decline silently: `clarify` on the ask with what you can deliver
-   and what is missing, `data.options` (the partial deliverable first, e.g.
+   here)? Don't decline silently: `clarify` on the ask, written to the asker so
+   that it reads on its own, even relayed to a person outside the swarm: "To the
+   asker: I can't X in this run because Y. I can Z instead. Reply with your
+   choice: [a] … [b] …". Set `data.options` to the same choices (the partial
+   deliverable first, e.g.
    ["untested code", "no thanks"]), `data.default` (the safest, minimal one) and,
    if you can go on without them, a `data.deadline` (in 30 min to 2 h); then stop.
    You are woken at the deadline to apply the default. Deliver partial work

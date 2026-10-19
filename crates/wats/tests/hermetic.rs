@@ -328,6 +328,8 @@ fn setup_openclaw_mcp_through_its_cli() {
     let expected = serde_json::json!({
         "command": exe,
         "args": ["--dir", data, "mcp", "--profile", "alice"],
+        // The node pushes replies to OpenClaw's asks to it (ADR 0018 §7).
+        "env": {"WATS_MCP_CLIENT": "openclaw"},
     });
 
     let out = setup(&path_with, &["--mcp"]);
@@ -489,7 +491,7 @@ fn setup_openclaw_agent_tokens_entries_and_block() {
         agent,
         serde_json::json!({
             "command": exe,
-            "args": ["--dir", data, "mcp", "--profile", "alice-agent"],
+            "args": ["--dir", data, "mcp", "--profile", "alice-openclaw"],
             "env": {"WATS_RUNNER_TOKEN": runner},
         })
     );
@@ -891,7 +893,11 @@ fn resume_clears_the_halt_marker_and_status_shows_it() {
     );
     let list = String::from_utf8(wats(&data, &["config", "list"]).stdout).unwrap();
     assert!(!list.contains("halt.accept"), "{list}");
-    assert!(list.contains("halt.serve"), "{list}");
+    // An operator setting: listed only with --all.
+    assert!(!list.contains("halt.serve"), "{list}");
+    let all = String::from_utf8(wats(&data, &["config", "list", "--all"]).stdout).unwrap();
+    assert!(all.contains("halt.serve"), "{all}");
+    assert!(!all.contains("halt.accept"), "{all}");
     let out = wats(&data, &["status", "--json"]);
     let status: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
     assert_eq!(

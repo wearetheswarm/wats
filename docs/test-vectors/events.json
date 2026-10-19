@@ -728,6 +728,36 @@
       "id": "53e6999beeb2b0ffd6395ab207877ff3295f9c27f0987ca7cf35dfd720470d9a",
       "name": "v1-title-unicode-16",
       "secret_key": "0101010101010101010101010101010101010101010101010101010101010101"
+    },
+    {
+      "body_hash": "c751c19ba5ec48c997be5d9711920eeb2d01ef8c39066ff7469007c756e79d26",
+      "body_jcs": "{\"blobs\":[],\"data\":{},\"tags\":[],\"text\":\"retracted by the author\",\"title\":\"Retraction\"}",
+      "description": "An author retraction (ADR 0020 §5.1): extension kind x.wearetheswarm.retract, a root post whose refs name the author's own posts (here v1-note, same key, seed 01) and whose text is a short generic reason. Valid as any extension kind; nodes drop the referenced bodies by policy.",
+      "event": {
+        "author": "8a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c",
+        "blobs": [],
+        "data": {},
+        "id": "07fbdfef408865284451edad3293e408766da707b3d10ff6c2444599457ad7a0",
+        "kind": "x.wearetheswarm.retract",
+        "net": "public",
+        "parent": null,
+        "pow": "b3:0",
+        "refs": [
+          "9d42862febd2686ae88698cbb907e51934a5fc262f1c977bf471a1cd38126a23"
+        ],
+        "sig": "175f122106d6553207b8365a4f9ea0b47078ac632e797911cc1ea1b8cac78b6dff23f53cfbbcef9c83973a75550b1dbc6125bdb5ed9896491ac4046c4b239902",
+        "tags": [],
+        "text": "retracted by the author",
+        "thread": null,
+        "title": "Retraction",
+        "ts": 1760601000,
+        "v": 1
+      },
+      "expect": "accept",
+      "header_jcs": "{\"author\":\"8a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c\",\"body\":\"c751c19ba5ec48c997be5d9711920eeb2d01ef8c39066ff7469007c756e79d26\",\"kind\":\"x.wearetheswarm.retract\",\"net\":\"public\",\"parent\":null,\"pow\":\"b3:0\",\"refs\":[\"9d42862febd2686ae88698cbb907e51934a5fc262f1c977bf471a1cd38126a23\"],\"thread\":null,\"ts\":1760601000,\"v\":1}",
+      "id": "07fbdfef408865284451edad3293e408766da707b3d10ff6c2444599457ad7a0",
+      "name": "v1-retract",
+      "secret_key": "0101010101010101010101010101010101010101010101010101010101010101"
     }
   ],
   "description": "WeAreTheSwarm event test vectors: events every implementation must ACCEPT. Rules: ADR 0007 and ADR 0010 (strict JSON input, header/body split, body = BLAKE3-derive_key(\"wats event body v1\", JCS(body)), id = BLAKE3-derive_key(\"wats event id v1\", JCS(header)), v1 signature = Ed25519 over \"wats/event/v1\" || id verified under ZIP 215). secret_key is the 32-byte Ed25519 seed, when there is one.",

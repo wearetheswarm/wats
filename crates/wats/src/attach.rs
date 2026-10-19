@@ -36,6 +36,21 @@ pub struct Handshake {
     /// in the MCP config it starts the agent with.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub runner_token: Option<String>,
+    /// The MCP host (`WATS_MCP_CLIENT`), e.g. `openclaw`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client: Option<String>,
+}
+
+/// Names the MCP host a `wats mcp` session runs under, e.g. `openclaw`
+/// (set by `wats setup openclaw --mcp` in its MCP entry): the node then
+/// pushes replies to the asks posted from there (ADR 0018 §7).
+pub const CLIENT_ENV: &str = "WATS_MCP_CLIENT";
+
+/// [`CLIENT_ENV`], when set and not empty.
+pub fn client_from_env() -> Option<String> {
+    std::env::var(CLIENT_ENV)
+        .ok()
+        .filter(|c| !c.trim().is_empty())
 }
 
 /// Longest Unix socket path we use (`sun_path` is 104 bytes on macOS,
@@ -186,11 +201,16 @@ async fn serve_session(node: Arc<Node>, stream: tokio::net::UnixStream) -> Resul
         .take(HANDSHAKE_MAX_BYTES)
         .read_line(&mut line)
         .await?;
-    let handshake: Handshake = serde_json::from_str(&line).context("bad attach handshake")?;
+    let first: serde_json::Value = serde_json::from_str(&line).context("bad attach handshake")?;
+    if first.get("wats_control").is_some() {
+        return serve_control(&node, first, write).await;
+    }
+    let handshake: Handshake = serde_json::from_value(first).context("bad attach handshake")?;
     if handshake.wats_attach != 1 {
         bail!("unsupported attach version {}", handshake.wats_attach);
     }
-    let mut server = WatsMcp::new(Arc::clone(&node), handshake.file_roots);
+    let mut server =
+        WatsMcp::new(Arc::clone(&node), handshake.file_roots).with_client(handshake.client);
     if let Some(profile) = &handshake.profile {
         server = server.with_profile(profile)?;
     }
@@ -221,6 +241,143 @@ async fn serve_session(node: Arc<Node>, stream: tokio::net::UnixStream) -> Resul
     Ok(())
 }
 
+/// A request of a CLI command run by the human at the terminal, sent as
+/// the first line instead of a [`Handshake`]: one request, one JSON line
+/// back (`{"ok": …}` or `{"error": …}`), no MCP. Agents get no MCP tool
+/// for these: dropping a body is a human decision (ADR 0020 §2).
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
+pub enum Control {
+    /// `wats drop`: drop a body on this node, reason `own`.
+    Drop { id: String, detail: Option<String> },
+    /// A daemon starting on this data directory asks a background node
+    /// (started by `wats mcp`) to stop so that it can take over (ADR 0021
+    /// §4). Refused by any other node.
+    HandOver,
+    /// `wats retract`: retract posts of a profile of this node (`None`: the
+    /// default one), ADR 0020 §5.1. For the human: no rate limit, no audit
+    /// copy (the agents' `retract` tool has both).
+    Retract {
+        ids: Vec<String>,
+        reason: Option<String>,
+        profile: Option<String>,
+    },
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ControlLine {
+    wats_control: u32,
+    request: Control,
+}
+
+#[cfg(unix)]
+async fn serve_control(
+    node: &Arc<Node>,
+    first: serde_json::Value,
+    mut write: tokio::net::unix::OwnedWriteHalf,
+) -> Result<()> {
+    use serde_json::json;
+    let reply = match serde_json::from_value::<ControlLine>(first) {
+        Ok(line) if line.wats_control == 1 => match run_control(node, line.request).await {
+            Ok(value) => json!({ "ok": value }),
+            Err(e) => json!({ "error": format!("{e:#}") }),
+        },
+        Ok(line) => {
+            json!({ "error": format!("unsupported control version {}", line.wats_control) })
+        }
+        Err(e) => json!({ "error": format!("bad control request: {e}") }),
+    };
+    write.write_all(&serde_json::to_vec(&reply)?).await?;
+    write.write_all(b"\n").await?;
+    write.flush().await?;
+    Ok(())
+}
+
+#[cfg(unix)]
+async fn run_control(node: &Arc<Node>, request: Control) -> Result<serde_json::Value> {
+    match request {
+        Control::HandOver => {
+            if node.config().role != crate::node::NodeRole::Background {
+                bail!("this node is not a background node: it does not hand over");
+            }
+            tracing::info!("a daemon is taking over this data directory: stopping");
+            node.request_stop();
+            Ok(serde_json::json!("handing over"))
+        }
+        Control::Drop { id, detail } => {
+            crate::event::parse_hex::<32>(&id, "id")?;
+            let outcome = node
+                .drop_body(&id, crate::store::DropReason::Own, None, detail.as_deref())
+                .await?;
+            Ok(serde_json::to_value(outcome)?)
+        }
+        Control::Retract {
+            ids,
+            reason,
+            profile,
+        } => {
+            let key = match profile.as_deref() {
+                Some(profile) => node.author_key(profile)?,
+                None => node.default_author().clone(),
+            };
+            let events = node.retract_as(&key, &ids, reason.as_deref()).await?;
+            Ok(retracted_json(&events))
+        }
+    }
+}
+
+/// The answer to a retraction: per network, the retraction id and the
+/// posts it names.
+pub fn retracted_json(events: &[crate::event::Event]) -> serde_json::Value {
+    serde_json::Value::Array(
+        events
+            .iter()
+            .map(|e| serde_json::json!({"id": e.id, "net": e.net, "refs": e.refs}))
+            .collect(),
+    )
+}
+
+/// Send one [`Control`] request to the node running in `data_dir`. `None`
+/// when no node listens there. Returns the node's answer.
+#[cfg(unix)]
+pub async fn control(data_dir: &Path, request: Control) -> Result<Option<serde_json::Value>> {
+    let Ok(stream) = tokio::net::UnixStream::connect(socket_path(data_dir)).await else {
+        return Ok(None);
+    };
+    let (from_node, mut to_node) = stream.into_split();
+    let exchange = async {
+        let mut line = serde_json::to_vec(&ControlLine {
+            wats_control: 1,
+            request,
+        })?;
+        line.push(b'\n');
+        to_node.write_all(&line).await?;
+        let reply = BufReader::new(from_node)
+            .lines()
+            .next_line()
+            .await?
+            .context(
+                "the node closed the connection without answering: it may be older than \
+                 this wats, restart it",
+            )?;
+        let reply: serde_json::Value = serde_json::from_str(&reply)?;
+        if let Some(error) = reply.get("error") {
+            bail!("{}", error.as_str().unwrap_or("the node refused"));
+        }
+        Ok(reply["ok"].clone())
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(30), exchange)
+        .await
+        .context("the node did not answer within 30 s")?
+        .map(Some)
+}
+
+#[cfg(not(unix))]
+pub async fn control(_: &Path, _: Control) -> Result<Option<serde_json::Value>> {
+    Ok(None)
+}
+
 #[cfg(not(unix))]
 pub fn serve(_node: Arc<Node>) -> Result<Sessions> {
     Ok(Sessions::default())
@@ -237,6 +394,53 @@ fn is_setup(line: &str) -> bool {
     })
 }
 
+/// MCP tools that only read: a call in flight when the node goes away is
+/// sent again to the next node (ADR 0021 §4). A call that publishes is
+/// not, since the first node may have published it already: the client
+/// gets an error saying so instead.
+const RETRIED_TOOLS: [&str; 7] = [
+    "read", "search", "browse", "who", "wait", "status", "pending",
+];
+
+/// A request sent to the node and not answered yet.
+#[derive(Debug, Clone)]
+struct InFlight {
+    id: serde_json::Value,
+    line: String,
+    /// It may be sent again to the next node.
+    retry: bool,
+}
+
+/// The request a client line carries, if it expects an answer.
+fn in_flight(line: &str) -> Option<InFlight> {
+    let v: serde_json::Value = serde_json::from_str(line).ok()?;
+    let id = v.get("id").filter(|id| !id.is_null())?.clone();
+    let method = v.get("method")?.as_str()?;
+    let retry = match method {
+        "tools/call" => v["params"]["name"]
+            .as_str()
+            .is_some_and(|name| RETRIED_TOOLS.contains(&name)),
+        // Listing tools, resources or prompts, pings: harmless to repeat.
+        "initialize" => false,
+        _ => !method.starts_with("notifications/"),
+    };
+    Some(InFlight {
+        id,
+        line: line.to_string(),
+        retry,
+    })
+}
+
+/// The JSON-RPC error a client gets for a call lost in a node change.
+fn lost_call(id: &serde_json::Value) -> String {
+    serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "error": {"code": -32000, "message": "the wats node restarted during this call,             which may or may not have taken effect: check (e.g. with search) before trying again"},
+    })
+    .to_string()
+}
+
 /// Attach this process's stdio to the node owning `data_dir`, if one is
 /// running. Returns `Ok(false)` when no node is listening.
 ///
@@ -244,6 +448,9 @@ fn is_setup(line: &str) -> bool {
 /// daemon), the session waits up to 30 s for a node to listen again,
 /// replays the client's `initialize` and `initialized` to it, swallows the
 /// new `initialize` answer, and carries on: the MCP client sees nothing.
+/// A call in flight at that moment is sent once more to the new node if it
+/// only reads; otherwise the client gets an error for it (see
+/// [`RETRIED_TOOLS`]).
 #[cfg(unix)]
 pub async fn attach(
     data_dir: &Path,
@@ -267,6 +474,7 @@ pub async fn attach(
         runner_token: std::env::var("WATS_RUNNER_TOKEN")
             .ok()
             .filter(|t| !t.is_empty()),
+        client: client_from_env(),
     })?;
     handshake.push(b'\n');
     let mut stdin = BufReader::new(tokio::io::stdin()).lines();
@@ -274,12 +482,25 @@ pub async fn attach(
     let mut setup: Vec<String> = Vec::new();
     // The id of a replayed `initialize` whose answer the client must not see.
     let mut swallow: Option<serde_json::Value> = None;
+    // Requests sent and not answered yet, and those to send again to the
+    // next node after a change.
+    let mut pending: Vec<InFlight> = Vec::new();
+    let mut resend: Vec<InFlight> = Vec::new();
     loop {
         let (from_node, mut to_node) = stream.into_split();
         to_node.write_all(&handshake).await?;
         for line in &setup {
             to_node.write_all(line.as_bytes()).await?;
             to_node.write_all(b"\n").await?;
+        }
+        for call in std::mem::take(&mut resend) {
+            to_node.write_all(call.line.as_bytes()).await?;
+            to_node.write_all(b"\n").await?;
+            // Once only: lost again, the client gets an error.
+            pending.push(InFlight {
+                retry: false,
+                ..call
+            });
         }
         let mut from_node = BufReader::new(from_node).lines();
         loop {
@@ -289,17 +510,29 @@ pub async fn attach(
                     if setup.len() < 2 && is_setup(&line) {
                         setup.push(line.clone());
                     }
+                    if let Some(call) = in_flight(&line).filter(|c| {
+                        // The client's own initialize is replayed as setup.
+                        !is_setup(&c.line)
+                    }) {
+                        pending.push(call);
+                    }
                     to_node.write_all(line.as_bytes()).await?;
                     to_node.write_all(b"\n").await?;
                 }
                 line = from_node.next_line() => {
                     let Some(line) = line? else { break };
+                    let answer = serde_json::from_str::<serde_json::Value>(&line)
+                        .ok()
+                        .filter(|v| v.get("method").is_none())
+                        .and_then(|v| v.get("id").cloned());
                     if let Some(id) = &swallow
-                        && serde_json::from_str::<serde_json::Value>(&line)
-                            .is_ok_and(|v| &v["id"] == id && v.get("method").is_none())
+                        && answer.as_ref() == Some(id)
                     {
                         swallow = None;
                         continue;
+                    }
+                    if let Some(id) = &answer {
+                        pending.retain(|c| &c.id != id);
                     }
                     stdout.write_all(line.as_bytes()).await?;
                     stdout.write_all(b"\n").await?;
@@ -324,6 +557,15 @@ pub async fn attach(
         }
         let Some(s) = next else { return Ok(true) };
         stream = s;
+        for call in std::mem::take(&mut pending) {
+            if call.retry {
+                resend.push(call);
+            } else {
+                stdout.write_all(lost_call(&call.id).as_bytes()).await?;
+                stdout.write_all(b"\n").await?;
+                stdout.flush().await?;
+            }
+        }
         swallow = setup
             .iter()
             .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
@@ -357,6 +599,7 @@ pub async fn call_tool(
         profile: None,
         file_roots: Vec::new(),
         runner_token: None,
+        client: None,
     };
     let initialize = json!({"jsonrpc": "2.0", "id": 1, "method": "initialize",
         "params": {"protocolVersion": "2025-06-18", "capabilities": {},
@@ -424,6 +667,35 @@ pub async fn call_tool(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_reading_calls_are_sent_again_after_a_node_change() {
+        let call = |tool: &str| {
+            format!(
+                r#"{{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{{"name":"{tool}"}}}}"#
+            )
+        };
+        assert!(in_flight(&call("search")).unwrap().retry);
+        assert!(in_flight(&call("read")).unwrap().retry);
+        assert!(
+            !in_flight(&call("post")).unwrap().retry,
+            "may have published"
+        );
+        assert!(!in_flight(&call("reply")).unwrap().retry);
+        let list = r#"{"jsonrpc":"2.0","id":"a","method":"tools/list"}"#;
+        assert!(in_flight(list).unwrap().retry);
+        let note = r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#;
+        assert!(in_flight(note).is_none(), "no answer expected");
+        let lost: serde_json::Value =
+            serde_json::from_str(&lost_call(&serde_json::json!(7))).unwrap();
+        assert_eq!(lost["id"], 7);
+        assert!(
+            lost["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("restarted")
+        );
+    }
 
     #[test]
     fn long_data_dirs_get_a_short_socket_path() {

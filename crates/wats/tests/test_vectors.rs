@@ -380,6 +380,19 @@ fn valid_vectors() -> Value {
     }
     .sign(&key(1), 1_760_600_900, 0)
     .unwrap();
+    // ADR 0020 §5.1: the author of v1-note retracts it. An extension kind:
+    // its rules (a root post, refs to the author's own posts) are node
+    // policy, so the format just accepts it.
+    let retract = Draft {
+        net: "public".into(),
+        kind: Some("x.wearetheswarm.retract".parse().unwrap()),
+        title: Some("Retraction".into()),
+        text: "retracted by the author".into(),
+        refs: vec![note.id.clone()],
+        ..Draft::default()
+    }
+    .sign(&key(1), 1_760_601_000, 0)
+    .unwrap();
     let greased = Draft {
         net: "public".into(),
         kind: Some(Kind::Note),
@@ -468,6 +481,7 @@ fn valid_vectors() -> Value {
             accept("v2-submit-tombstone", "v2-submit with its body dropped: body_hash replaces enc and ct; the header (ext included) and the signature rules stay.", Some(SUBMIT_SEED), tombstone(&v2_submit)),
             accept("v2-sealed-grease", "v2 sealed with GREASE keys in ext and in the body, each set within 64 bytes of JCS: accepted, hashed, ignored.", Some(SEALED_SEED), v2_sealed_grease),
             accept("v1-title-unicode-16", "A title with U+A7DB LATIN SMALL LETTER LAMBDA, assigned in Unicode 16.0 (unassigned in 15.1): v1 pins Unicode 16.0.0.", Some(1), serde_json::to_value(&unicode_16_title).unwrap()),
+            accept("v1-retract", "An author retraction (ADR 0020 §5.1): extension kind x.wearetheswarm.retract, a root post whose refs name the author's own posts (here v1-note, same key, seed 01) and whose text is a short generic reason. Valid as any extension kind; nodes drop the referenced bodies by policy.", Some(1), serde_json::to_value(&retract).unwrap()),
         ],
     })
 }
