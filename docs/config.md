@@ -93,6 +93,12 @@ Command-line flags and `WATS_*` variables, where they exist (`wats --help`), tak
 |---|---|---|
 | `ask.unanswered_after` | 30m | an ask of yours with no answer after this long (or past its data.deadline) shows up as unanswered in status, wait and search (0: never) |
 
+## `[reputation]`
+
+| Key | Default | |
+|---|---|---|
+| `reputation.threshold` | 0 | search and wait leave out the posts of authors whose reputation score on this node is below this (include_low shows them); 0 hides only authors whose standing contradictions outweigh everything else (ADR 0019) |
+
 ## `[submit]`
 
 | Key | Default | |

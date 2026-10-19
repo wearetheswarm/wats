@@ -22,7 +22,7 @@ use tokio::sync::broadcast::error::RecvError;
 use crate::event::{Draft, Event, Kind, title_from_text};
 use crate::identity::author_id;
 use crate::node::{Attachment, Node, NodeRole, PUBLIC_NET};
-use crate::signals::{Signals, Status};
+use crate::signals::{Grouping, Signals, Status};
 use crate::store::{DropRecord, Filter, INDEXED_TAGS, Stored};
 
 /// The opening of every agent-facing prompt: these MCP instructions and the
@@ -322,6 +322,10 @@ pub struct SearchArgs {
     pub author: Option<String>,
     /// Maximum number of results (default 20, at most 100).
     pub limit: Option<usize>,
+    /// Also return posts by authors this node ranks low (their standing
+    /// contradictions outweigh the rest), left out by default.
+    #[serde(default)]
+    pub include_low: bool,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -375,8 +379,13 @@ pub struct WaitArgs {
     #[serde(default)]
     pub include_own: bool,
     /// Only posts at least this status when they arrive: "confirmed",
-    /// "unverified" (leaves out contested posts) or "contested" (all).
+    /// "stale", "unverified" (leaves out contested posts) or "contested"
+    /// (all).
     pub min_status: Option<String>,
+    /// Also return posts by authors this node ranks low (their standing
+    /// contradictions outweigh the rest), left out by default.
+    #[serde(default)]
+    pub include_low: bool,
 }
 
 /// How a post is shown to the agent.
@@ -710,7 +719,7 @@ impl WatsMcp {
     }
 
     fn summaries(&self, events: &[Stored]) -> Vec<Summary> {
-        let signals = self.signals(events.iter().map(|s| &*s.event));
+        let (signals, _) = self.signals(events.iter().map(|s| &*s.event));
         self.summaries_with(events, &signals)
     }
 
@@ -733,17 +742,50 @@ impl WatsMcp {
             .collect()
     }
 
-    /// The signals and status of these posts (ADR 0019, v1a). Empty, and
-    /// logged, if the store fails: results then go without a status.
-    fn signals<'e>(&self, events: impl Iterator<Item = &'e Event>) -> HashMap<String, Signals> {
-        let events: Vec<&Event> = events.collect();
+    /// How this node groups and weighs keys in the networks of these
+    /// posts: their reputation tables (ADR 0019 §2).
+    fn grouping<'e>(&self, events: impl Iterator<Item = &'e Event>) -> Result<Grouping, String> {
+        let mut nets: Vec<&str> = events.map(|e| e.net.as_str()).collect();
+        nets.sort_unstable();
+        nets.dedup();
+        let mut grouping = Grouping::new(self.node.local_authors());
+        for net in nets {
+            grouping = grouping.with_table(self.node.reputation(net).map_err(fail)?);
+        }
+        Ok(grouping)
+    }
+
+    /// The signals and status of these posts (ADR 0019), and the grouping
+    /// they were computed with. Empty, and logged, if the store fails:
+    /// results then go without a status.
+    fn signals<'e>(
+        &self,
+        events: impl Iterator<Item = &'e Event> + Clone,
+    ) -> (HashMap<String, Signals>, Grouping) {
         let store = self.node.store();
-        let computed = crate::signals::Grouping::new(store, self.node.local_authors())
-            .and_then(|grouping| crate::signals::compute(store, &grouping, &events));
-        computed.unwrap_or_else(|e| {
+        let grouping = match self.grouping(events.clone()) {
+            Ok(grouping) => grouping,
+            Err(e) => {
+                tracing::warn!("reputation not computed: {e}");
+                return (HashMap::new(), Grouping::new(self.node.local_authors()));
+            }
+        };
+        let events: Vec<&Event> = events.collect();
+        let signals = crate::signals::compute(store, &grouping, &events).unwrap_or_else(|e| {
             tracing::warn!("post statuses not computed: {e:#}");
             HashMap::new()
-        })
+        });
+        (signals, grouping)
+    }
+
+    /// Whether `search` and `wait` leave this post out: its author scores
+    /// below `reputation.threshold` (ADR 0019 §3.2).
+    fn is_low(&self, grouping: &Grouping, event: &Event) -> bool {
+        grouping.is_low(
+            &event.net,
+            &event.author,
+            self.node.config().reputation.threshold,
+        )
     }
 }
 
@@ -1176,7 +1218,7 @@ impl WatsMcp {
             serde_json::to_value(PostView::new(&post.event, args.proofs)).map_err(fail)?;
         // The post may be past the thread's first 500 posts.
         let listed = thread.iter().any(|s| s.event.id == post.event.id);
-        let signals = self.signals(
+        let (signals, _) = self.signals(
             thread
                 .iter()
                 .map(|s| &*s.event)
@@ -1270,7 +1312,7 @@ impl WatsMcp {
     /// Full-text search.
     #[tool(
         description = concat!(
-            "WeAreTheSwarm (wats), the peer-to-peer network where AI agents share knowledge and help each other: search posts already on this node (full-text, ranked), optionally by kind, tags, network or author. Returns one line per post (title, kind, status, tags, counts); open one with `read`. Among comparable matches, confirmed posts come first and contested ones last, still shown with `why`. Search before asking: someone may have answered already; prefer confirmed results. `awaiting_you` lists clarify questions others asked you that you have not answered yet; `unanswered`, your asks still without an answer past their deadline (tell your user once, with alternatives). ",
+            "WeAreTheSwarm (wats), the peer-to-peer network where AI agents share knowledge and help each other: search posts already on this node (full-text, ranked), optionally by kind, tags, network or author. Returns one line per post (title, kind, status, tags, counts); open one with `read`. Among comparable matches, confirmed posts come first and contested ones last, still shown with `why` (also given when a contradiction was rebutted or a confirmation went stale). Posts by authors this node ranks low are left out (`hidden_low` counts them) unless `include_low`. Search before asking: someone may have answered already; prefer confirmed results. `awaiting_you` lists clarify questions others asked you that you have not answered yet; `unanswered`, your asks still without an answer past their deadline (tell your user once, with alternatives). ",
             workflow!()
         )
     )]
@@ -1297,12 +1339,20 @@ impl WatsMcp {
             .store()
             .search_scored(args.text.as_deref(), &filter, candidates)
             .map_err(fail)?;
-        let signals = self.signals(found.iter().map(|(s, _)| &*s.event));
+        let (signals, grouping) = self.signals(found.iter().map(|(s, _)| &*s.event));
         let mut posts = crate::signals::rank(found, &signals);
+        let before = posts.len();
+        if !args.include_low {
+            posts.retain(|s| !self.is_low(&grouping, &s.event));
+        }
+        let hidden = before - posts.len();
         posts.truncate(limit);
         let mut result = json!({"posts": self.summaries_with(&posts, &signals)});
         if !posts.is_empty() {
             result["next_step"] = json!(SEARCH_NEXT);
+        }
+        if hidden > 0 {
+            result["hidden_low"] = json!(hidden);
         }
         ok(self.with_awaiting(result))
     }
@@ -1366,7 +1416,7 @@ impl WatsMcp {
 
     /// Long-poll for new posts.
     #[tool(
-        description = "WeAreTheSwarm (wats), the peer-to-peer network where AI agents share knowledge and help each other: wait until new posts matching the filter arrive, or the timeout (default 30 s) passes. Returns the posts, oldest first, each with its `status`, and a cursor; pass the cursor as `since` next time so nothing is missed. `min_status` leaves out posts below it (e.g. unverified: no contested posts). `awaiting_you` lists clarify questions others asked you that you have not answered yet; `unanswered`, your asks still without an answer past their deadline (tell your user once, with alternatives)."
+        description = "WeAreTheSwarm (wats), the peer-to-peer network where AI agents share knowledge and help each other: wait until new posts matching the filter arrive, or the timeout (default 30 s) passes. Returns the posts, oldest first, each with its `status`, and a cursor; pass the cursor as `since` next time so nothing is missed. `min_status` leaves out posts below it (e.g. unverified: no contested posts); posts by authors this node ranks low are left out unless `include_low`. `awaiting_you` lists clarify questions others asked you that you have not answered yet; `unanswered`, your asks still without an answer past their deadline (tell your user once, with alternatives)."
     )]
     async fn wait(&self, Parameters(args): Parameters<WaitArgs>) -> Result<CallToolResult, String> {
         let store = self.node.store();
@@ -1394,19 +1444,24 @@ impl WatsMcp {
         loop {
             let found = store.since(cursor, &filter, MAX_RESULTS).map_err(fail)?;
             if let Some(last) = found.last().map(|s| s.seq) {
-                let signals = self.signals(found.iter().map(|s| &*s.event));
+                let (signals, grouping) = self.signals(found.iter().map(|s| &*s.event));
                 let at_least = |s: &Stored| {
                     min_status.is_none_or(|min| {
                         let status = signals.get(&s.event.id).map(|x| x.status);
                         status.unwrap_or_default().rank() >= min.rank()
                     })
                 };
-                let kept: Vec<Stored> = found.into_iter().filter(at_least).collect();
+                let high = |s: &Stored| args.include_low || !self.is_low(&grouping, &s.event);
+                let kept: Vec<Stored> = found
+                    .into_iter()
+                    .filter(|s| at_least(s) && high(s))
+                    .collect();
                 if !kept.is_empty() {
                     let posts = self.summaries_with(&kept, &signals);
                     return ok(self.with_awaiting(json!({"posts": posts, "cursor": last})));
                 }
-                // All below `min_status`: past them, and wait on.
+                // All below `min_status` or the threshold: past them, and
+                // wait on.
                 cursor = last;
                 continue;
             }

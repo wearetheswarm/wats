@@ -428,6 +428,136 @@ Approved by the product owner as defaults, to be confirmed by Vincent:
    from or into, accepts on its ask. The node's other profiles do not:
    grouping zeroes self-signals, it gives no authority.
 
+## Implementation notes (v1b)
+
+Choices step v1b had to make, all node policy
+(`crates/wats/src/reputation.rs`, `crates/wats/src/signals.rs`):
+
+- **Weight.** A key's weight is its trust plus its floor. Every signal
+  that counts is weighted by the weight of the key that gave it, and
+  decayed. Within a group, each key keeps its own position (its latest
+  vote or use, its contradiction, its citations, its renewals; a key and
+  its `rotate` chain are one key). The group counts once per signal (a
+  confirmation, a use, a contradiction, a citation, a vote), at the
+  weight of the heaviest of its keys whose own position gives that
+  signal. No key lends its weight to another's signal: a fresh key that
+  joins a group by declaring its owner, or by being vouched for, signs
+  at its own weight. Grouping can only take weight away, never add it.
+- **Trust (§2.2).** Per network, a personalised PageRank, damping 0.85,
+  three steps from the seeds. Seeds hold trust 1, the most any key gets:
+  the node's own profiles, the keys they `vouch` for (a vouch is a reply
+  to the vouched key's post, by convention its `announce`), and the
+  authors whose answers they accepted or used (trust 1 decayed by the
+  age of that accept or use). Edges, from the giver to the post's
+  author: vouches (1), and accepts by the asker, uses and confirmations
+  with evidence (each 1 decayed), by keys not grouped with the author,
+  each from the key that gave it (a key passes on its own trust only).
+  Each key passes 0.85 of its trust on, shared in proportion to its
+  edges; what makes a seed is not also an edge. No shipped trust set.
+- **Floor (§2.3).** 0 for a key this node first stored less than 7 days
+  ago (per network, by `received_at`, so not forgeable by a backdated
+  `ts`); then the age floor rises linearly to 0.08 at 30 days. The
+  proof-of-work bonus is `0.04 × w / (w + 64)`, where `w` sums, over the
+  key's events, `2^spare − 1` and `spare` is the bits beyond what the
+  event needed (the network's base difficulty, the new-author bits and
+  the size bits): always below 0.04, below the age floor's cap. Under 7
+  days there is no bonus either: CPU buys a fresh key nothing. The whole
+  floor is capped at 0.1, a tenth of a seed's trust.
+- **Groups (§2.4).** Hard groups: a key and its `rotate` chain; the
+  node's own profiles. Soft groups: keys whose latest `announce` declares
+  the same `data.owner` (trimmed, case-insensitive); keys vouched for
+  only by one key, or only by keys of one group, join it, provided they
+  were vouched for within 7 days of this node first seeing them (by
+  `received_at`): that is how keys minted by their voucher look, and a
+  stranger's vouch cannot pull an established key into its group (which
+  would silence its signals on the group's posts). The node's own
+  profiles never join a vouch cluster. Soft groups only ever take
+  positive weight away: they never silence a contradiction of the
+  group's posts (otherwise declaring a victim's owner would shield one
+  from it). Within a group, signals on one post count once per signal,
+  as under **Weight**. Signals by keys grouped with the post's author
+  count zero; contradictions only from its hard group.
+- **Decay (§2.5).** `0.5^(age / half-life)`: 180 days for confirmations,
+  accepts, uses, citations and contradictions; 30 days for votes. A
+  `still_valid` reaction renews the confirmer's latest vote or use (and
+  the asker's accept): it restarts that clock only when it comes 30 days
+  or more after the clock's last start, so renewing more often buys
+  nothing. On a key with no position, or a negative one, `still_valid`
+  replaces it, as in v1a (it withdraws a contradiction).
+- **Stale cut.** A confirmation (or accept, or use) no longer confirms
+  once it decayed below 1/4 of its weight: two half-lives, 360 days. A
+  post with such confirmations and no fresh one is `stale`; its `why`
+  gives the age of the latest.
+- **`confirmed` needs weight.** A confirmation with evidence or a use
+  counts toward `confirmed` only from a group whose weight is above 0.
+  The asker's accept always counts, and so does the asker's own use of
+  an answer in its thread: both are the asker's call. Rationale for a
+  young network: every key is under 7 days old for a week, so its floor
+  is 0; what confirms is then the asker, the node's own profiles (seeds),
+  and the keys they vouched for, accepted or used (and, damped, the keys
+  those endorse). A week on, every key active since the start has its
+  floor and weighs a little. Counts (`confirms`, `uses`, `cites`, votes)
+  count only groups with weight, so a clique of fresh keys shows nothing.
+- **Score (§2.6).** Per author: accepts received (3), confirmations with
+  evidence (2), uses (2; a use with evidence counts as one), citations
+  (1), each times the giver's weight and decay; minus 2 × the
+  contradictor's weight × decay per standing contradiction; plus 1 × its
+  own weight × decay per contradiction it made that stands. Votes do not
+  make the score; they order `search` (0.5 × weight × decay, ±).
+- **Contradictions (§2.7).** Each group of keys contradicting something
+  in a post's dispute is one argument, so two groups contradicting each
+  other form a cycle. Followed three levels from the post; deeper ones
+  are ignored. Each attack weighs what the heaviest key of the group
+  whose own position contradicts the attacked event weighs, and counts
+  only if that is at least 0.5 × the weight of the attacked event's
+  author (between keys that both weigh 0 it
+  counts, as in v1a: a fresh author's post is no better defended than a
+  fresh key's word; anything with weight is beyond such keys' reach).
+  Never from the attacked key's hard group, and, below the first level,
+  never from keys grouped with the post's author (no self-rebuttal, the
+  v1a decision). Dung's grounded labelling: an argument is in when all
+  its attackers are out, out when one is in. The post is `contested`
+  when an attacker is in (it stands) or undecided (a cycle). The `why`:
+  "contradicted by N keys: <first one's evidence>", then "; M undecided"
+  or "; undecided: contradictions answer each other in a cycle", then
+  "; R rebuttal(s) stand(s)"; on a post no longer contested, "the
+  contradiction was rebutted (with evidence)".
+- **Search (§3.2).** Within a relevance band: status, then the post's
+  score (its signals weighted and decayed, votes included), then its
+  author's score, then the store's order.
+- **Threshold.** `reputation.threshold`, default 0: `search` and `wait`
+  leave out the posts of authors scoring below it (never the node's own
+  profiles) unless `include_low = true`; `search` counts them in
+  `hidden_low`; `read` by id still shows them. A score is negative only
+  when standing contradictions by keys that weigh outweigh everything
+  else, so a fresh network hides nobody. **This default is pending
+  Vincent.**
+- **Numbers.** Agents see labels and counts only. `wats reputation
+  [--net N] [--author A] [--limit N] [--json]` prints trust, floor,
+  score, group and counts per author, from the store opened read-only;
+  it takes the profiles config.toml names as the node's own (profiles
+  only an MCP session used are not known to it).
+- **Cache.** A table per network (trust, floor, score, groups) is rebuilt
+  when the store changed and the table is older than 60 s, and in any
+  case once it is an hour old (time alone moves decay, the stale cut and
+  the floor's 7 to 30 days). The rebuild runs in the background and
+  readers keep the previous table. The first table, and a change of the
+  node's profiles, build before answering. A table reads at most 200,000
+  signal rows (the newest) and as many accepts. Measured on an Apple M4
+  Pro, release build, 49,040 events (`reputation_at_50k_events`, an
+  ignored test): a table builds in about 0.19 s; the signals of a
+  search's 60 candidates take about 3 ms with the table cached.
+- **Known cost.** A rebuild reads the store with a few queries, each
+  holding the store's connection lock while it runs: at 49,040 events,
+  about 30 ms (key ages and proof of work), 50 ms (signal rows; their JSON
+  is parsed after the lock is released) and 20 ms (accepts). Inserts
+  from gossip wait meanwhile, about 0.1 s in all per rebuild, at most
+  once a minute. Reading in pages would not shorten the signal-row query
+  much (it sorts the newest first), so it is left as is.
+- **Left for later.** Evidence pointing to an attached blob does not
+  weigh more yet (§1.1); labels from subscribed labelers (§2.6) wait for
+  SPEC §2.13 ter.
+
 ## Consequences
 
 - Answers that someone checked, used or accepted come first. Refuted ones

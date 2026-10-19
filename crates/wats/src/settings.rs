@@ -83,6 +83,8 @@ pub struct Settings {
     #[serde(default)]
     pub ask: AskSettings,
     #[serde(default)]
+    pub reputation: ReputationSettings,
+    #[serde(default)]
     pub labels: LabelSettings,
     #[serde(default)]
     pub ui: UiSettings,
@@ -131,6 +133,13 @@ pub struct LabelSettings {
 #[serde(deny_unknown_fields)]
 pub struct AskSettings {
     pub unanswered_after: Option<String>,
+}
+
+/// `[reputation]`: how this node weighs authors (ADR 0019 §2).
+#[derive(Debug, Default, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReputationSettings {
+    pub threshold: Option<f64>,
 }
 
 /// `[health]`: infra health alerts (`crate::health`).
@@ -504,6 +513,8 @@ pub enum ValueType {
     Integer,
     /// A non-negative number, e.g. dollars.
     Float,
+    /// Any finite number, negative ones included.
+    Number,
     Bool,
     /// Comma-separated on the command line, an array of strings in the file.
     List,
@@ -744,6 +755,14 @@ pub const KEYS: &[Key] = &[
         "30m",
         "an ask of yours with no answer after this long (or past its data.deadline) \
          shows up as unanswered in status, wait and search (0: never)",
+    ),
+    key(
+        "reputation.threshold",
+        ValueType::Number,
+        "0",
+        "search and wait leave out the posts of authors whose reputation score on this node \
+         is below this (include_low shows them); 0 hides only authors whose standing \
+         contradictions outweigh everything else (ADR 0019)",
     ),
     key(
         "submit.retention",
@@ -1118,6 +1137,15 @@ fn toml_value(key: &Key, raw: &str) -> Result<toml_edit::Value> {
                 .parse()
                 .map_err(|_| invalid(format!("{raw:?} is not a number")))?;
             if !n.is_finite() || n < 0.0 {
+                return Err(invalid(format!("{n} is out of range")));
+            }
+            n.into()
+        }
+        ValueType::Number => {
+            let n: f64 = raw
+                .parse()
+                .map_err(|_| invalid(format!("{raw:?} is not a number")))?;
+            if !n.is_finite() {
                 return Err(invalid(format!("{n} is out of range")));
             }
             n.into()
@@ -1668,6 +1696,22 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn the_reputation_threshold_takes_any_number() {
+        for (text, want) in [("0", 0.0), ("-2", -2.0), ("1.5", 1.5)] {
+            let settings = Settings::parse(&format!("[reputation]\nthreshold = {text}\n")).unwrap();
+            assert_eq!(settings.reputation.threshold, Some(want));
+            assert_eq!(
+                check_value("reputation.threshold", text)
+                    .unwrap()
+                    .as_float(),
+                Some(want)
+            );
+        }
+        assert!(check_value("reputation.threshold", "nan").is_err());
+        assert!(check_value("reputation.threshold", "low").is_err());
+    }
 
     #[test]
     fn loads_and_rejects() {
