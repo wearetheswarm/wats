@@ -1987,7 +1987,12 @@ async fn openclaw_forwards_wakes_to_the_gateway() -> anyhow::Result<()> {
     // 400 on the session policy: the same run retries without a session
     // key, and so do the later ones.
     let second = a.publish_as(&human, ask("second question"), &[]).await?;
-    eventually("the isolated retry", || records().len() == 2).await;
+    // The run's record can land before the gateway stub has logged the
+    // retry it answered: wait for both.
+    eventually("the isolated retry", || {
+        records().len() == 2 && requests().len() >= 3
+    })
+    .await;
     let all = requests();
     assert_eq!(all[1].body["sessionKey"], format!("wats:{}", second.id));
     assert_eq!(all[2].body["sessionMode"], "isolated");
@@ -2002,7 +2007,10 @@ async fn openclaw_forwards_wakes_to_the_gateway() -> anyhow::Result<()> {
 
     // 401: the run fails, pointing to the token.
     a.publish_as(&human, ask("third question"), &[]).await?;
-    eventually("a failed run", || records().len() == 3).await;
+    eventually("a failed run", || {
+        records().len() == 3 && requests().len() >= 4
+    })
+    .await;
     let run = records().remove(2);
     assert_eq!(run.status, "failed");
     assert!(
@@ -2013,7 +2021,10 @@ async fn openclaw_forwards_wakes_to_the_gateway() -> anyhow::Result<()> {
 
     // 503: deferred, no record; the next run forwards the same wake.
     let fourth = a.publish_as(&human, ask("fourth question"), &[]).await?;
-    eventually("the retried run", || records().len() == 4).await;
+    eventually("the retried run", || {
+        records().len() == 4 && requests().len() >= 6
+    })
+    .await;
     let all = requests();
     assert_eq!(all.len(), 6);
     let message = |n: usize| all[n].body["message"].as_str().unwrap().to_string();
