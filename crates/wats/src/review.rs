@@ -186,7 +186,7 @@ pub fn reject(data_dir: &Path, id: &str, reason: Option<&str>) -> Result<Held> {
         let line = serde_json::json!({
             "held": held.id, "kind": held.kind,
             "title": held.title.clone().unwrap_or_else(|| crate::event::title_from_text(&held.text)),
-            "reason": reason,
+            "reason": reason, "profile": held.profile,
         });
         let mut file = std::fs::OpenOptions::new()
             .create(true)
@@ -200,16 +200,32 @@ pub fn reject(data_dir: &Path, id: &str, reason: Option<&str>) -> Result<Held> {
     Ok(held)
 }
 
-/// The reviewer's feedback since the last run, consumed: one line per
-/// rejected post with a reason.
-pub fn take_feedback(data_dir: &Path) -> Vec<String> {
+/// The reviewer's feedback on the posts of the agent posting as `profile`
+/// since its last run, consumed: one line per rejected post with a reason.
+/// Lines for other agents stay (lines without a profile, written before
+/// ADR 0021, go to the first agent that asks).
+pub fn take_feedback(data_dir: &Path, profile: &str) -> Vec<String> {
+    // Several runners of one node read the same file.
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _guard = LOCK.lock();
     let path = feedback_path(data_dir);
     let Ok(text) = std::fs::read_to_string(&path) else {
         return Vec::new();
     };
-    let _ = std::fs::remove_file(&path);
-    text.lines()
+    let (mine, others): (Vec<Value>, Vec<Value>) = text
+        .lines()
         .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+        .partition(|v| v["profile"].as_str().is_none_or(|p| p == profile));
+    if others.is_empty() {
+        let _ = std::fs::remove_file(&path);
+    } else {
+        let rest: String = others.iter().map(|v| format!("{v}\n")).collect();
+        let tmp = path.with_extension("jsonl.tmp");
+        if std::fs::write(&tmp, rest).is_ok() {
+            let _ = std::fs::rename(&tmp, &path);
+        }
+    }
+    mine.into_iter()
         .map(|v| {
             format!(
                 "- Your {} \"{}\" was rejected by your human: {}",

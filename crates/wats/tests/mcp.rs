@@ -870,7 +870,7 @@ async fn agents_retract_under_a_rate_limit_with_an_audit_copy() -> anyhow::Resul
         config.mode = NetworkMode::Loopback;
         config.pow_bits = Some(4);
         config.min_pow_bits = Some(4);
-        config.runner = Some("claude as alice-agent".into());
+        config.runners = vec!["claude as alice-agent".into()];
         Node::start(config).await
     };
     let node = start().await?;

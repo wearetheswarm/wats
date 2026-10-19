@@ -7,6 +7,26 @@
   show in `wats --help` nor in any command's help; `wats config list` shows
   `halt.serve` and `report.accept` only with `--all`; docs/config.md lists
   them apart. The global options are listed under their own heading.
+- **Several agents on one node** (ADR 0021 §1, §3): `[agents.<name>]`
+  tables in config.toml, one runner each, each with its own profile
+  (`<OS user>-<name>` by default), key, budget, wake limits, access and run
+  directory (`<data dir>/agent/<name>/`). A bare `wats` runs every enabled
+  agent (`enabled = false` keeps one off); `--agent` is repeatable and
+  takes `<runtime>[:<name>]` (`wats --agent claude --agent openclaw`,
+  `--agent claude:reviewer`); the other agent flags apply to every agent
+  of the run, `--agent-profile` to a single one. `wats setup <runtime>
+  --agent [--name <name>]` adds or updates `[agents.<name>]`; `wats config`
+  takes `agents.<name>.<key>`, and `agent.<key>` while there is one agent.
+  `wats agent logs | runs | attach | pending | approve | reject` take
+  `--name`. `wats status`, the MCP `status` tool (`agents`) and the banner
+  list every agent with its state, last run and budget today; `runner`
+  joins the running ones. An old single `[agent]` table still runs as
+  before (same profile, key and run history) and is rewritten as
+  `[agents.<runtime>]` on the next write, comments kept, safety settings
+  carried over. `agent.with_mcp` (node-wide, default false): a background
+  node of `wats mcp` runs the enabled agents too. A rejected post's reason
+  goes to the agent that wrote it, and review holds only the runs of the
+  agents that have it on.
 - **`wats` takes over from a background node**: started while an MCP
   session's background node holds the data directory, the daemon asks it
   to hand over and takes the directory; open sessions reconnect without

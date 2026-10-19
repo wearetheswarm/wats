@@ -148,8 +148,11 @@ pub struct NodeConfig {
     /// How this node runs: a daemon (`wats`), a background node started by
     /// `wats mcp`, or inside one MCP process.
     pub role: NodeRole,
-    /// The agent runner, when the daemon runs one: "claude as alice-agent".
-    pub runner: Option<String>,
+    /// The agent runners this node runs (ADR 0021), one per agent:
+    /// "claude as alice-agent".
+    pub runners: Vec<String>,
+    /// Every agent of config.toml and of this run, for `status`.
+    pub agents: Vec<crate::agent::AgentInfo>,
     /// How long to wait for the data directory lock (a daemon taking over
     /// from a background node). Zero fails at once.
     pub lock_wait: Duration,
@@ -189,13 +192,24 @@ pub struct NodeConfig {
 }
 
 impl NodeConfig {
-    /// The profile the agent runner posts as (`runner` is "claude as
-    /// alice-agent"), when the daemon runs one.
-    pub fn runner_profile(&self) -> Option<&str> {
-        self.runner
-            .as_deref()?
-            .rsplit_once(" as ")
-            .map(|(_, profile)| profile)
+    /// The agent runners, joined ("claude as alice-agent, openclaw as
+    /// alice-openclaw"); `None` when this node runs none.
+    pub fn runner(&self) -> Option<String> {
+        (!self.runners.is_empty()).then(|| self.runners.join(", "))
+    }
+
+    /// The profiles the agent runners post as (each runner is "claude as
+    /// alice-agent").
+    pub fn runner_profiles(&self) -> Vec<&str> {
+        self.runners
+            .iter()
+            .filter_map(|r| r.rsplit_once(" as ").map(|(_, profile)| profile))
+            .collect()
+    }
+
+    /// Whether `profile` is one an agent runner posts as.
+    pub fn is_runner_profile(&self, profile: &str) -> bool {
+        self.runner_profiles().contains(&profile)
     }
 
     pub fn new(data_dir: impl Into<PathBuf>) -> Self {
@@ -216,7 +230,8 @@ impl NodeConfig {
             review_ttl: Duration::from_secs(24 * 3600),
             review_notify: false,
             role: NodeRole::Daemon,
-            runner: None,
+            runners: Vec::new(),
+            agents: Vec::new(),
             lock_wait: Duration::ZERO,
             relaunch_args: Vec::new(),
             report_accept: false,
@@ -316,6 +331,8 @@ pub struct RunnerRun {
     pub id: String,
     /// The events that woke it.
     pub events: Vec<String>,
+    /// The profile of the agent the run is for (empty: unknown).
+    pub profile: String,
 }
 
 /// What a node did about a guardian halt (ADR 0016 §3).
@@ -1974,6 +1991,13 @@ impl Node {
             RunnerRun {
                 id: "openclaw".into(),
                 events: Vec::new(),
+                profile: self
+                    .config
+                    .runners
+                    .iter()
+                    .find_map(|r| r.strip_prefix("openclaw as "))
+                    .unwrap_or_default()
+                    .to_string(),
             }
         })
     }
