@@ -2761,3 +2761,97 @@ async fn replies_to_an_openclaw_ask_wake_its_main_session() -> anyhow::Result<()
     b.shutdown().await?;
     Ok(())
 }
+
+/// ADR 0021 §2: two agents on one node. A post by one wakes the other,
+/// never itself; the human's post wakes neither (`ignore_local`).
+#[tokio::test(flavor = "multi_thread")]
+async fn local_agents_wake_each_other_but_not_on_the_humans_posts() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let data = dir.path().join("a");
+    let mut config = NodeConfig::new(&data);
+    config.mode = NetworkMode::Loopback;
+    config.pow_bits = Some(0);
+    config.min_pow_bits = Some(0);
+    config.runners = vec![
+        "claude as alice-coder".into(),
+        "claude as alice-reviewer".into(),
+    ];
+    let a = Node::start(config).await?;
+    let agent = |name: &str| {
+        let root = dir.path().join(name);
+        std::fs::create_dir_all(&root).unwrap();
+        AgentConfig {
+            runtime: "claude".into(),
+            profile: format!("alice-{name}"),
+            user: "alice".into(),
+            about: String::new(),
+            caps: vec![],
+            every: Duration::from_millis(300),
+            heartbeat: Duration::from_secs(3600),
+            max_runs_per_hour: 100,
+            allow: vec![],
+            ignore_local: true,
+            heartbeat_text: DEFAULT_HEARTBEAT.into(),
+            command: fake_agent(&root),
+            mcp_command: "/usr/bin/true".into(),
+            mcp_args: vec![],
+            extra_args: vec![],
+            run_timeout: Duration::from_secs(10),
+            max_turns: 10,
+            budget: wats::budget::Budget::default(),
+            wakes: wats::wake::WakeLimits::unlimited(),
+            codex_disable: vec![],
+            access: wats::access::Access::Locked,
+            workdir: std::path::PathBuf::from("/nonexistent"),
+            tools: vec![],
+            model: None,
+            work_dir: data.join("agent").join(name),
+            data_dir: data.clone(),
+            keep_runs: 20,
+            keep_days: 30,
+            openclaw: Default::default(),
+            catchup: None,
+        }
+    };
+    let mut stops = Vec::new();
+    let mut runners = Vec::new();
+    for name in ["coder", "reviewer"] {
+        let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+        runners.push(tokio::spawn(wats::agent::run(
+            Arc::clone(&a),
+            agent(name),
+            async {
+                let _ = stopped.await;
+            },
+        )));
+        stops.push(stop);
+    }
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // The human (the node's default profile) asks: nobody wakes.
+    let human = a.publish(ask("A note to myself"), &[]).await?;
+    // The coder agent asks: the reviewer wakes, the coder does not.
+    let coder = a.author_key("alice-coder")?;
+    let asked = a
+        .publish_as(&coder, ask("Please review my diff"), &[])
+        .await?;
+    let reviewer_runs = || runs(&dir.path().join("reviewer"));
+    eventually("the reviewer wakes", || !reviewer_runs().is_empty()).await;
+    let (prompt, _) = reviewer_runs().remove(0);
+    assert!(prompt.contains(&asked.id), "{prompt}");
+    assert!(!prompt.contains(&human.id), "the human's post: {prompt}");
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert!(
+        runs(&dir.path().join("coder")).is_empty(),
+        "an agent never wakes on its own post"
+    );
+
+    for stop in stops {
+        let _ = stop.send(());
+    }
+    for runner in runners {
+        runner.await??;
+    }
+    a.shutdown().await?;
+    Ok(())
+}

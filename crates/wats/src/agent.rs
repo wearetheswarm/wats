@@ -490,8 +490,13 @@ pub fn interest(
         return Interest::Ignore("own post");
     }
     // The human asks their own agent directly; their posts on this node
-    // (another profile) do not wake it.
-    if ignore_local && node.is_local_author(&event.author) {
+    // (another profile) do not wake it. Another agent of this node is not
+    // the human: its posts wake this one like a remote agent's (ADR 0021
+    // §2), within the same wake limits and loop detector.
+    if ignore_local
+        && node.is_local_author(&event.author)
+        && !node.is_local_agent_author(&event.author)
+    {
         return Interest::Ignore("local author, agent.ignore_local");
     }
     if !allow.is_empty() && !allow.iter().any(|a| a == &event.author) {

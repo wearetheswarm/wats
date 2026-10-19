@@ -21,6 +21,10 @@
   default with a desktop session, asked by `wats setup` The node
   records which client posted each of your asks, locally, until the ask's
   body is dropped.
+- **Agents on one node wake each other** (ADR 0021 §2): a post by one of
+  the node's agents wakes the others, never itself, so two agents on one
+  machine can collaborate; your own posts still don't wake them
+  (`ignore_local`). The loop detector and each agent's limits bound it.
 - **Erasure labels** (ADR 0020 §5.2): a node that subscribes to a labeler
   (`labels.subscribe`, opt-in, none by default) drops the bodies that
   labeler labels `erasure` (a `react` with `data.label = "erasure"`),
