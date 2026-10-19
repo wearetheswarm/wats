@@ -784,3 +784,167 @@ async fn a_dropped_post_reads_as_its_header() -> anyhow::Result<()> {
     node.shutdown().await?;
     Ok(())
 }
+
+fn error_text(result: &CallToolResult) -> String {
+    assert_eq!(result.is_error, Some(true), "{result:?}");
+    serde_json::to_string(&result.content).unwrap()
+}
+
+async fn post_note(client: &Client, text: &str) -> String {
+    let posted = structured(
+        &call(
+            client,
+            "post",
+            json!({"title": "a post", "text": text, "kind": "note"}),
+        )
+        .await,
+    );
+    posted["id"].as_str().unwrap().to_string()
+}
+
+/// The MCP `retract` tool (ADR 0020 §5.1): own posts only; a human
+/// session has no limit and leaves no audit copy; `post` cannot publish a
+/// retraction behind its back.
+#[tokio::test(flavor = "multi_thread")]
+async fn retract_accepts_only_the_sessions_own_posts() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let data = dir.path().join("n");
+    let node = loopback_node(&data, None).await?;
+    let me = client_for(WatsMcp::new(node.clone(), vec![])).await?;
+    let helper = client_for(WatsMcp::new(node.clone(), vec![]).with_profile("helper")?).await?;
+    let tools = me.list_all_tools().await?;
+    assert!(tools.iter().any(|t| t.name == "retract"));
+    let mine = post_note(&me, "my token is s3cr3t").await;
+    let theirs = post_note(&helper, "the helper's post").await;
+
+    let refused = call(&me, "retract", json!({"ids": [theirs]})).await;
+    let text = error_text(&refused);
+    assert!(text.contains("is not yours"), "{text}");
+    assert!(node.store().get(&theirs)?.is_some());
+    // Not even mixed with one of mine: nothing is retracted.
+    let refused = call(&me, "retract", json!({"ids": [mine, theirs]})).await;
+    error_text(&refused);
+    assert!(node.store().get(&mine)?.is_some());
+
+    let done = structured(
+        &call(
+            &me,
+            "retract",
+            json!({"ids": [mine], "reason": "posted a secret by mistake"}),
+        )
+        .await,
+    );
+    assert_eq!(done["retracted"], json!([mine]), "{done}");
+    let read = structured(&call(&me, "read", json!({"id": mine})).await);
+    assert_eq!(read["post"]["dropped"]["reason"], "retraction", "{read}");
+    assert!(!read.to_string().contains("s3cr3t"));
+    // A human session: no log, no audit copy, nothing in status.
+    assert!(wats::retract::agent_log(&data)?.is_empty());
+    assert!(wats::retract::audit_copy(&data, &mine)?.is_none());
+    let status = structured(&call(&me, "status", json!({})).await);
+    assert!(status.get("agent_retractions").is_none(), "{status}");
+
+    // The retraction kind only goes through `retract`.
+    let sneaky = call(
+        &helper,
+        "post",
+        json!({"title": "Retraction", "text": "x", "kind": wats::retract::KIND,
+               "refs": [theirs]}),
+    )
+    .await;
+    assert!(error_text(&sneaky).contains("retract"));
+    assert!(node.store().get(&theirs)?.is_some());
+    node.shutdown().await?;
+    Ok(())
+}
+
+/// Agent profiles: at most 3 retracted posts per 24 hours, still counted
+/// after a restart; each retracted post kept as a local audit copy; shown
+/// to the owner in `status`.
+#[tokio::test(flavor = "multi_thread")]
+async fn agents_retract_under_a_rate_limit_with_an_audit_copy() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let data = dir.path().join("n");
+    let start = || async {
+        let mut config = NodeConfig::new(&data);
+        config.mode = NetworkMode::Loopback;
+        config.pow_bits = Some(4);
+        config.min_pow_bits = Some(4);
+        config.runner = Some("claude as alice-agent".into());
+        Node::start(config).await
+    };
+    let node = start().await?;
+    let agent = client_for(WatsMcp::new(node.clone(), vec![]).with_profile("alice-agent")?).await?;
+    let owner = client_for(WatsMcp::new(node.clone(), vec![])).await?;
+    let mut ids = Vec::new();
+    for n in 0..4 {
+        ids.push(post_note(&agent, &format!("body {n}")).await);
+    }
+    structured(&call(&agent, "retract", json!({"ids": [ids[0], ids[1]]})).await);
+    structured(
+        &call(
+            &agent,
+            "retract",
+            json!({"ids": [ids[2]], "reason": "leaked a path"}),
+        )
+        .await,
+    );
+    for id in &ids[..3] {
+        assert!(node.store().get(id)?.is_none(), "dropped");
+        let copy = wats::retract::audit_copy(&data, id)?.expect("audit copy");
+        assert_eq!(copy["id"], id.as_str());
+        assert!(
+            copy["text"].as_str().unwrap().starts_with("body "),
+            "{copy}"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(wats::retract::audit_path(&data, id))?
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
+    }
+    let refused = call(&agent, "retract", json!({"ids": [ids[3]]})).await;
+    assert!(error_text(&refused).contains("rate limit"));
+    assert!(node.store().get(&ids[3])?.is_some());
+    assert!(wats::retract::audit_copy(&data, &ids[3])?.is_none());
+
+    // The owner sees them; the agent's own status does not list them.
+    let status = structured(&call(&owner, "status", json!({})).await);
+    let shown = &status["agent_retractions"];
+    assert_eq!(shown["count"], 3, "{status}");
+    assert_eq!(shown["profiles"], json!(["alice-agent"]));
+    assert_eq!(shown["latest"]["reason"], "leaked a path");
+    for id in &ids[..3] {
+        assert!(shown["ids"].as_array().unwrap().contains(&json!(id)));
+    }
+    let agent_status = structured(&call(&agent, "status", json!({})).await);
+    assert!(agent_status.get("agent_retractions").is_none());
+    // The audit copies are never served: `read` shows the header only.
+    let read = structured(&call(&owner, "read", json!({"id": ids[0]})).await);
+    assert!(!read.to_string().contains("body 0"), "{read}");
+
+    // A restart does not reset the count.
+    agent.cancel().await?;
+    owner.cancel().await?;
+    node.shutdown().await?;
+    drop(node);
+    let node = start().await?;
+    let agent = client_for(WatsMcp::new(node.clone(), vec![]).with_profile("alice-agent")?).await?;
+    let refused = call(&agent, "retract", json!({"ids": [ids[3]]})).await;
+    assert!(error_text(&refused).contains("rate limit"));
+    // Not the owner's post either; the owner retracts it as the agent's
+    // profile (`wats retract --profile`), with no limit.
+    let owner = client_for(WatsMcp::new(node.clone(), vec![])).await?;
+    let not_mine = call(&owner, "retract", json!({"ids": [ids[3]]})).await;
+    assert!(error_text(&not_mine).contains("is not yours"));
+    let events = node
+        .retract_as(&node.author_key("alice-agent")?, &ids[3..], None)
+        .await?;
+    assert_eq!(events.len(), 1);
+    assert!(node.store().get(&ids[3])?.is_none());
+    node.shutdown().await?;
+    Ok(())
+}

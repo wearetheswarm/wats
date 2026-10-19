@@ -28,6 +28,7 @@ pub mod openclaw;
 pub mod peer_cache;
 pub mod proto;
 pub mod reconnect;
+pub mod retract;
 pub mod review;
 pub mod runs;
 pub mod safety;

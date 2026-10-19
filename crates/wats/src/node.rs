@@ -37,7 +37,7 @@ use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
 
 use crate::bootstrap::BootstrapEntry;
-use crate::event::{BlobRef, Draft, Event, is_safe_blob_name};
+use crate::event::{BlobRef, Draft, Event, Kind, is_safe_blob_name};
 use crate::identity::{DEFAULT_PROFILE, RootSecret, author_id};
 use crate::proto::{self, NodeInfo, Request, Response, WatsProtocol};
 use crate::store::{DropOutcome, DropReason, Inserted, Store};
@@ -189,6 +189,15 @@ pub struct NodeConfig {
 }
 
 impl NodeConfig {
+    /// The profile the agent runner posts as (`runner` is "claude as
+    /// alice-agent"), when the daemon runs one.
+    pub fn runner_profile(&self) -> Option<&str> {
+        self.runner
+            .as_deref()?
+            .rsplit_once(" as ")
+            .map(|(_, profile)| profile)
+    }
+
     pub fn new(data_dir: impl Into<PathBuf>) -> Self {
         Self {
             data_dir: data_dir.into(),
@@ -1731,6 +1740,17 @@ impl Node {
                 halt.id
             );
         }
+        if draft
+            .kind
+            .as_ref()
+            .is_some_and(|k| crate::retract::is_retract(k.as_str()))
+        {
+            crate::retract::check_policy(
+                draft.thread.as_deref(),
+                draft.parent.as_deref(),
+                &draft.refs,
+            )?;
+        }
         draft.blobs.extend(self.import(attachments).await?);
         let key = key.clone();
         // Mine what receivers will require for this time, author and size.
@@ -1741,7 +1761,9 @@ impl Node {
         };
         let pow_bits = crate::event::required_pow_bits(base, draft.estimated_size(&key)?);
         let event = tokio::task::spawn_blocking(move || draft.sign(&key, ts, pow_bits)).await??;
-        self.store.insert(&event, ts)?;
+        if matches!(self.store.insert(&event, ts)?, Inserted::New(_)) {
+            self.on_stored(&AnyEvent::Known(event.clone())).await;
+        }
         let envelope = Envelope::new(serde_json::to_value(&event)?, self.endpoint_id());
         sender
             .broadcast(serde_json::to_vec(&envelope)?.into())
@@ -1756,6 +1778,70 @@ impl Node {
             });
         }
         Ok(event)
+    }
+
+    /// Retract posts of `key` (ADR 0020 §5.1): one `x.wearetheswarm.retract`
+    /// per network and per 32 posts, signed with `key`, published and
+    /// applied here (the bodies are dropped at once). Every post must be on
+    /// this node, by `key` or a key it rotated from, and not a key
+    /// succession nor a halt event. Checked before anything is published.
+    pub async fn retract_as(
+        self: &Arc<Self>,
+        key: &SigningKey,
+        ids: &[String],
+        reason: Option<&str>,
+    ) -> Result<Vec<Event>> {
+        let plan = self.retraction_plan(&author_id(key), ids)?;
+        // Checked before anything goes out.
+        crate::retract::reason_text(reason)?;
+        let mut published = Vec::new();
+        for (net, refs) in plan {
+            for chunk in refs.chunks(crate::retract::MAX_REFS) {
+                let draft = crate::retract::draft(&net, chunk.to_vec(), reason)?;
+                published.push(self.publish_as(key, draft, &[]).await?);
+            }
+        }
+        Ok(published)
+    }
+
+    /// The posts `ids` grouped by network, once each is checked: held here
+    /// (full or tombstone), by `author` or a key it rotated from, and
+    /// retractable. The errors name the post.
+    pub fn retraction_plan(
+        &self,
+        author: &str,
+        ids: &[String],
+    ) -> Result<Vec<(String, Vec<String>)>> {
+        if ids.is_empty() {
+            bail!("name at least one post to retract");
+        }
+        let mut plan: Vec<(String, Vec<String>)> = Vec::new();
+        for id in ids {
+            crate::event::parse_hex::<32>(id, "post id")?;
+            let Some((_, _, wire)) = self.store.get_raw(id)? else {
+                bail!("post {id} is not on this node");
+            };
+            let field = |k: &str| wire.get(k).and_then(serde_json::Value::as_str);
+            let (Some(net), Some(post_author), Some(kind)) =
+                (field("net"), field("author"), field("kind"))
+            else {
+                bail!("post {id} is malformed here");
+            };
+            if crate::retract::unretractable(kind) {
+                bail!("post {id} is a {kind} event: key successions and halts cannot be retracted");
+            }
+            if !self.store.rotated_into(author, post_author)? {
+                bail!(
+                    "post {id} is not yours (its author is {post_author}): retract only your own posts"
+                );
+            }
+            match plan.iter_mut().find(|(n, _)| n == net) {
+                Some((_, refs)) if refs.contains(id) => {}
+                Some((_, refs)) => refs.push(id.clone()),
+                None => plan.push((net.to_string(), vec![id.clone()])),
+            }
+        }
+        Ok(plan)
     }
 
     /// Ask the k peers closest to each blob of `event` to hold it (SPEC
@@ -2194,7 +2280,7 @@ impl Node {
         if envelope.ev < 1 {
             bail!("bad envelope version {}", envelope.ev);
         }
-        let Some((event, new)) = self.accept_value(envelope.event, Origin::Pushed)? else {
+        let Some((event, new)) = self.accept_value(envelope.event, Origin::Pushed).await? else {
             return Ok(());
         };
         if event.net() != net {
@@ -2289,7 +2375,7 @@ impl Node {
     /// Events of versions this node does not understand are verified
     /// against the invariant core and stored opaque (ADR 0007). Returns the
     /// event and whether it is new; `None` if the policy rejects it.
-    fn accept_value(
+    async fn accept_value(
         &self,
         value: serde_json::Value,
         origin: Origin,
@@ -2297,6 +2383,12 @@ impl Node {
         let event = AnyEvent::from_value(value)?;
         if !self.joined(event.net()) {
             bail!("not a member of network {:?}", event.net());
+        }
+        // A retraction's rules are node policy (ADR 0020 §5.1).
+        if let AnyEvent::Known(e) = &event
+            && crate::retract::is_retract(e.kind.as_str())
+        {
+            crate::retract::check_policy(e.thread.as_deref(), e.parent.as_deref(), &e.refs)?;
         }
         let halt_kind =
             matches!(&event, AnyEvent::Known(e) if crate::halt::is_halt_kind(e.kind.as_str()));
@@ -2412,7 +2504,77 @@ impl Node {
         {
             self.evaluate_halt();
         }
+        if new {
+            self.on_stored(&event).await;
+        }
         Ok(Some((event, new)))
+    }
+
+    /// What a new event changes beyond the store (ADR 0020 §5.1): a
+    /// retraction is applied; a `rotate` applies again the retractions of
+    /// its new key and of that key's successors, whose posts by the old key
+    /// could not be matched until now.
+    async fn on_stored(&self, event: &AnyEvent) {
+        if let Some(retraction) = crate::retract::Retraction::from_any(event) {
+            self.apply_retraction(&retraction).await;
+            return;
+        }
+        let AnyEvent::Known(rotate) = event else {
+            return;
+        };
+        if rotate.kind != Kind::Rotate {
+            return;
+        }
+        let Some(new_key) = rotate.data.get("new_key").and_then(|k| k.as_str()) else {
+            return;
+        };
+        let retractions = self
+            .store
+            .rotation_successors(new_key)
+            .and_then(|keys| self.store.retractions_by(&keys));
+        match retractions {
+            Ok(retractions) => {
+                for retraction in retractions {
+                    self.apply_retraction(&retraction).await;
+                }
+            }
+            Err(e) => warn!(rotate = %rotate.id, "retractions not re-evaluated: {e:#}"),
+        }
+    }
+
+    /// Apply a retraction held here: drop the bodies of the referenced
+    /// posts by its author (or by a key it rotated from) and untag their
+    /// blobs, remember the posts not held yet, ignore the others.
+    async fn apply_retraction(&self, retraction: &crate::retract::Retraction) {
+        let applied = match self.store.apply_retraction(retraction, now_secs()) {
+            Ok(applied) => applied,
+            Err(e) => {
+                warn!(retraction = %retraction.id, "retraction not applied: {e:#}");
+                return;
+            }
+        };
+        for (id, applied) in applied {
+            match applied {
+                crate::store::Applied::Dropped(outcome) => {
+                    unpin_freed(&self.blobs, &outcome).await;
+                    info!(%id, retraction = %retraction.id, body = outcome.body_dropped,
+                          blobs = outcome.freed_blobs.len(), "retracted by its author: body dropped");
+                }
+                crate::store::Applied::Remembered => debug!(
+                    %id, retraction = %retraction.id,
+                    "retracted post not held: its body is refused if it arrives by its author"
+                ),
+                crate::store::Applied::NotTheAuthor => debug!(
+                    %id, retraction = %retraction.id,
+                    "retraction of a post by another author (or a rotation link not held): ignored"
+                ),
+                crate::store::Applied::Unretractable => debug!(
+                    %id, retraction = %retraction.id,
+                    "retraction of a rotate or halt event: ignored"
+                ),
+                crate::store::Applied::AlreadyDropped => {}
+            }
+        }
     }
 
     /// Store and broadcast an event that is already signed (any version),
@@ -2432,7 +2594,7 @@ impl Node {
                 halt.id
             );
         }
-        let Some((event, _)) = self.accept_value(value.clone(), Origin::Pushed)? else {
+        let Some((event, _)) = self.accept_value(value.clone(), Origin::Pushed).await? else {
             bail!("rejected by node policy");
         };
         // A node never pushes a body it dropped (ADR 0020 §3).
@@ -2584,7 +2746,7 @@ impl Node {
                 }
             }
             Request::Replicate { event, hashes } => {
-                let event = match self.accept_value(event, Origin::Pushed) {
+                let event = match self.accept_value(event, Origin::Pushed).await {
                     Ok(Some((AnyEvent::Known(event), _))) => event,
                     // Opaque events are stored; their blobs are unknown to us.
                     Ok(Some((AnyEvent::Opaque(_), _))) => {
@@ -2712,7 +2874,7 @@ impl Node {
                 {
                     bail!("peer sent an out-of-order sync page");
                 }
-                match self.accept_value(value, Origin::Pulled) {
+                match self.accept_value(value, Origin::Pulled).await {
                     Ok(Some((_, true))) => new = new.saturating_add(1),
                     Ok(_) => {}
                     Err(e) => debug!(%id, "sync: rejected event: {e:#}"),

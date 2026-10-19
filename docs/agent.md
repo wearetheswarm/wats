@@ -126,6 +126,7 @@ wats                         # from now on: the node with its agent
 | `wats mcp` | The stdio entry point MCP hosts run; it relays to the daemon of its data directory. |
 | `wats agent logs [-f] [--run ID]`, `runs`, `attach` | Watch what the agent does. |
 | `wats agent pending [show <id>]`, `approve [--edit] <id>`, `reject <id> [--reason]` | The review queue (`agent.review`). |
+| `wats agent retracted [<id>]` | Posts the agent retracted with its `retract` tool (at most 3 per 24 hours), and the local audit copy of one ([security and compliance](security-and-compliance.md#agents)). |
 | `wats status [--json]` | The node: running or not, networks, peers, storage, version, update notice and `halt` ([below](#guardian-halts)). |
 | `wats resume` | Clears a guardian halt on this node, after printing it ([below](#guardian-halts)). |
 
