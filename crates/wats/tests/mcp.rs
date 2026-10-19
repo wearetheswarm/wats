@@ -1497,3 +1497,99 @@ async fn digests_become_knowledge_entries() -> anyhow::Result<()> {
     node.shutdown().await?;
     Ok(())
 }
+
+/// ADR 0022 for sessions: `post` fits a full author id in a `to:` tag and
+/// says what nodes read differently; a `claim` that loses the tie-break
+/// says so; `read` of an ask shows its delivery state.
+#[tokio::test(flavor = "multi_thread")]
+async fn sessions_see_how_an_ask_wants_to_be_served() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let node = loopback_node(&dir.path().join("n"), None).await?;
+    let asker = client_for(WatsMcp::new(node.clone(), vec![])).await?;
+    let worker = client_for(WatsMcp::new(node.clone(), vec![]).with_profile("worker")?).await?;
+    let instructions = asker
+        .peer_info()
+        .unwrap()
+        .instructions
+        .clone()
+        .unwrap_or_default();
+    assert!(
+        instructions.contains("post a `claim` first"),
+        "{instructions}"
+    );
+
+    let to = wats::identity::author_id(&ed25519_dalek::SigningKey::from_bytes(&[7; 32]));
+    let posted = structured(
+        &call(
+            &asker,
+            "post",
+            json!({"title": "Compile this", "text": "One worker, please.", "kind": "ask",
+                   "tags": [format!("to:{to}")], "data": {"mode": "one"}}),
+        )
+        .await,
+    );
+    assert_eq!(posted["post"]["tags"][0], format!("to:{}", &to[..32]));
+    assert!(posted.get("note").is_none(), "{posted}");
+    let odd = structured(
+        &call(
+            &asker,
+            "post",
+            json!({"title": "Odd", "text": "?", "kind": "ask", "data": {"mode": "split"}}),
+        )
+        .await,
+    );
+    assert!(
+        odd["note"].as_str().unwrap().contains("read it as any"),
+        "{odd}"
+    );
+
+    // Another node's agent claimed it first.
+    let ask = node
+        .store()
+        .get(posted["id"].as_str().unwrap())?
+        .unwrap()
+        .event;
+    let older = wats::event::Draft {
+        net: ask.net.clone(),
+        thread: Some(ask.id.clone()),
+        parent: Some(ask.id.clone()),
+        kind: Some(wats::event::Kind::Claim),
+        text: "mine".into(),
+        ..Default::default()
+    }
+    .sign(
+        &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
+        wats::node::now_secs() - 5,
+        0,
+    )
+    .unwrap();
+    node.store().insert(&older, wats::node::now_secs())?;
+    let claimed = structured(
+        &call(
+            &worker,
+            "reply",
+            json!({"post_id": ask.id, "text": "On it.", "kind": "claim", "data": {"lease": 600}}),
+        )
+        .await,
+    );
+    assert_eq!(claimed["delivery"]["mode"], "one", "{claimed}");
+    assert_eq!(claimed["delivery"]["expected"], "abstain", "{claimed}");
+    assert_eq!(claimed["delivery"]["your_claim_lost"], claimed["id"]);
+    assert!(
+        claimed["warning"]
+            .as_str()
+            .unwrap()
+            .contains("reply to your claim with kind release"),
+        "{claimed}"
+    );
+    let read = structured(&call(&asker, "read", json!({"id": ask.id})).await);
+    assert_eq!(read["delivery"]["mode"], "one", "{read}");
+    assert_eq!(read["delivery"]["cap"], 1, "{read}");
+    assert_eq!(
+        read["delivery"]["claims"][0]["id"],
+        older.id.as_str(),
+        "{read}"
+    );
+    node.shutdown().await?;
+    Ok(())
+}

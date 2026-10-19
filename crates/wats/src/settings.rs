@@ -128,11 +128,14 @@ pub struct LabelSettings {
     pub subscribe: Vec<String>,
 }
 
-/// `[ask]`: the asker's side (ADR 0018 §4).
+/// `[ask]`: the asker's side (ADR 0018 §4), and how this node's runners
+/// serve asks (ADR 0022).
 #[derive(Debug, Default, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AskSettings {
     pub unanswered_after: Option<String>,
+    pub cap_grace: Option<String>,
+    pub max_responders: Option<usize>,
 }
 
 /// `[reputation]`: how this node weighs authors (ADR 0019 §2).
@@ -755,6 +758,21 @@ pub const KEYS: &[Key] = &[
         "30m",
         "an ask of yours with no answer after this long (or past its data.deadline) \
          shows up as unanswered in status, wait and search (0: never)",
+    ),
+    key(
+        "ask.cap_grace",
+        ValueType::Duration,
+        "2m",
+        "an ask tagged cap:<x> wakes the agents with that capability first; the others \
+         wake only if none of them claimed or answered it within this (ADR 0022)",
+    ),
+    key(
+        "ask.max_responders",
+        ValueType::Integer,
+        "3",
+        "the agents of this node stay away from an ask once this many distinct nodes \
+         answered it or hold a live claim, unless the ask sets data.max (modes any and n; \
+         0: no cap)",
     ),
     key(
         "reputation.threshold",
