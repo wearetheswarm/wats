@@ -164,6 +164,8 @@ async fn hook_lists_a_pending_clarify_and_a_new_answer_once() {
         "{text}"
     );
     assert!(serde_json::from_str::<Value>(&text).is_err(), "{text}");
+    // Codex's prompt hook (0.116.0+), in the same burst: nothing new.
+    assert_eq!(hook("alice", "codex", "user-prompt-submit"), "");
     let text = context(&hook("alice", "claude", "session-start"), "SessionStart");
     assert!(text.contains(&clarify_id), "{text}");
 
@@ -399,7 +401,7 @@ fn fake_claude(dir: &Path) -> (PathBuf, PathBuf) {
 
 /// A fake `codex`: `features list` prints `features` (one per line);
 /// `mcp get` fails (not registered); the rest is logged.
-fn fake_codex(dir: &Path, features: &[&str]) -> (PathBuf, PathBuf) {
+fn fake_codex(dir: &Path, features: &[&str], version: &str) -> (PathBuf, PathBuf) {
     use std::os::unix::fs::PermissionsExt;
     let log = dir.join("codex.log");
     let fake = dir.join("codex");
@@ -412,6 +414,7 @@ fn fake_codex(dir: &Path, features: &[&str]) -> (PathBuf, PathBuf) {
         format!(
             "#!/bin/sh\necho \"$@\" >> {log}\n\
              if [ \"$1\" = features ]; then printf '{list}'; exit 0; fi\n\
+             if [ \"$1\" = --version ]; then echo 'codex-cli {version}'; exit 0; fi\n\
              if [ \"$2\" = get ]; then exit 1; fi\nexit 0\n",
             log = log.display()
         ),
@@ -586,7 +589,7 @@ fn setup_codex_hook_follows_detection() {
     // A Codex without hooks: skipped, config.toml untouched.
     let bin = tmp.path().join("old");
     std::fs::create_dir_all(&bin).unwrap();
-    let (codex, log) = fake_codex(&bin, &["shell_tool", "apps"]);
+    let (codex, log) = fake_codex(&bin, &["shell_tool", "apps"], "0.113.0");
     let said = setup(
         &home,
         &data,
@@ -603,12 +606,16 @@ fn setup_codex_hook_follows_detection() {
             .contains("features list")
     );
 
-    // An older Codex with `codex_hooks`, then a newer one with `hooks`.
-    for (name, feature) in [("older", "codex_hooks"), ("newer", "hooks")] {
+    // An older Codex with `codex_hooks` (SessionStart only), then a newer
+    // one with `hooks` and UserPromptSubmit.
+    for (name, feature, version) in [
+        ("older", "codex_hooks", "0.114.0"),
+        ("newer", "hooks", "0.116.0"),
+    ] {
         std::fs::write(&config, original).unwrap();
         let bin = tmp.path().join(name);
         std::fs::create_dir_all(&bin).unwrap();
-        let (codex, _) = fake_codex(&bin, &["shell_tool", feature]);
+        let (codex, _) = fake_codex(&bin, &["shell_tool", feature], version);
         let codex = codex.to_str().unwrap();
         let said = setup(&home, &data, &["codex", "--mcp", "--codex", codex]);
         assert!(
@@ -628,6 +635,23 @@ fn setup_codex_hook_follows_detection() {
                 .contains("wats notify --hook --host codex --event session-start --profile alice"),
             "{command}"
         );
+        let prompt = v
+            .get("hooks")
+            .and_then(|h| h.get("UserPromptSubmit"))
+            .and_then(|l| l[0]["hooks"][0]["command"].as_str());
+        assert!(said.contains("open /hooks in Codex once"), "{said}");
+        if version == "0.116.0" {
+            assert!(said.contains("[[hooks.UserPromptSubmit]]"), "{said}");
+            assert!(
+                prompt
+                    .unwrap()
+                    .contains("--host codex --event user-prompt-submit"),
+                "{text}"
+            );
+        } else {
+            assert!(!said.contains("UserPromptSubmit"), "{said}");
+            assert_eq!(prompt, None, "{text}");
+        }
         // Idempotent.
         let said = setup(&home, &data, &["codex", "--mcp", "--codex", codex]);
         assert!(said.contains("session hook already in"), "{said}");

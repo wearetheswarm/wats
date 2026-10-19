@@ -28,7 +28,8 @@
 //! contains [`MARKER`], after a backup copy of the file:
 //! - Claude Code: `hooks.UserPromptSubmit` and `hooks.SessionStart` in its
 //!   `settings.json` (JSON, key order and every other entry kept);
-//! - Codex: `[[hooks.SessionStart]]` in `config.toml` (toml_edit, comments
+//! - Codex: `[[hooks.SessionStart]]`, and `[[hooks.UserPromptSubmit]]`
+//!   since Codex 0.116.0, in `config.toml` (toml_edit, comments
 //!   kept), with the hooks feature on, only when the installed Codex lists
 //!   one in `codex features list` ([`codex_hook_feature`]).
 
@@ -660,8 +661,49 @@ pub fn codex_features(codex: &Path) -> Vec<String> {
         .collect()
 }
 
-/// Add or update our `SessionStart` hook in Codex's config.toml `text`,
-/// with `[features] <feature> = true`. `None`: already there.
+/// The first Codex version with a `UserPromptSubmit` hook.
+pub const CODEX_PROMPT_HOOK_SINCE: (u64, u64, u64) = (0, 116, 0);
+
+/// The installed Codex's version (`codex --version`, e.g. `codex-cli
+/// 0.116.0`); `None` when it fails or prints no version.
+pub fn codex_version(codex: &Path) -> Option<(u64, u64, u64)> {
+    let out = std::process::Command::new(codex)
+        .arg("--version")
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    parse_version(&String::from_utf8_lossy(&out.stdout))
+}
+
+/// The first `x.y.z` word of `text` (a `-alpha` or `+build` suffix left
+/// out).
+fn parse_version(text: &str) -> Option<(u64, u64, u64)> {
+    text.split_whitespace().find_map(|word| {
+        let core = word.trim_start_matches('v');
+        let core = core.split(['-', '+']).next()?;
+        let mut parts = core.split('.').map(|p| p.parse::<u64>().ok());
+        let version = (parts.next()??, parts.next()??, parts.next()??);
+        parts.next().is_none().then_some(version)
+    })
+}
+
+/// The events our hook goes on in a Codex of `version` that has hooks:
+/// `UserPromptSubmit` too since 0.116.0, `SessionStart` alone before, or
+/// when the version is unknown.
+pub fn codex_events(version: Option<(u64, u64, u64)>) -> &'static [HookEvent] {
+    match version {
+        Some(v) if v >= CODEX_PROMPT_HOOK_SINCE => &CLAUDE_EVENTS,
+        _ => &[HookEvent::SessionStart],
+    }
+}
+
+/// Add or update our hooks in Codex's config.toml `text`, one
+/// `[[hooks.<event>]]` per (event, command) of `entries`, with
+/// `[features] <feature> = true`. `None`: already there.
 ///
 /// ```toml
 /// [features]
@@ -670,7 +712,11 @@ pub fn codex_features(codex: &Path) -> Vec<String> {
 /// [[hooks.SessionStart]]
 /// hooks = [{ type = "command", command = "/usr/local/bin/wats notify --hook --host codex --event session-start --profile alice", timeout = 10 }]
 /// ```
-pub fn codex_upsert(text: &str, feature: &str, command: &str) -> Result<Option<String>> {
+pub fn codex_upsert(
+    text: &str,
+    feature: &str,
+    entries: &[(HookEvent, String)],
+) -> Result<Option<String>> {
     let mut doc: toml_edit::DocumentMut = text.parse().context("invalid TOML")?;
     let mut changed = false;
     let features = doc
@@ -682,9 +728,14 @@ pub fn codex_upsert(text: &str, feature: &str, command: &str) -> Result<Option<S
         features.insert(feature, toml_edit::value(true));
         changed = true;
     }
-    let ours = codex_ours(&doc);
-    let in_place = ours.len() == 1 && ours[0].1 == command;
-    if !in_place {
+    let mut ours = codex_ours(&doc);
+    let mut wanted: Vec<(String, String)> = entries
+        .iter()
+        .map(|(event, command)| (event.host_name().to_string(), command.clone()))
+        .collect();
+    ours.sort();
+    wanted.sort();
+    if ours != wanted {
         if !ours.is_empty() {
             codex_strip(&mut doc);
         }
@@ -697,20 +748,24 @@ pub fn codex_upsert(text: &str, feature: &str, command: &str) -> Result<Option<S
             })
             .as_table_mut()
             .context("`hooks` is not a table")?;
-        let list = hooks
-            .entry(HookEvent::SessionStart.host_name())
-            .or_insert_with(|| toml_edit::Item::ArrayOfTables(Default::default()))
-            .as_array_of_tables_mut()
-            .context("`hooks.SessionStart` is not an array of tables")?;
-        let mut hook = toml_edit::InlineTable::new();
-        hook.insert("type", "command".into());
-        hook.insert("command", command.into());
-        hook.insert("timeout", (HOOK_TIMEOUT_SECS as i64).into());
-        let mut items = toml_edit::Array::new();
-        items.push(hook);
-        let mut group = toml_edit::Table::new();
-        group.insert("hooks", toml_edit::value(items));
-        list.push(group);
+        for (event, command) in entries {
+            let list = hooks
+                .entry(event.host_name())
+                .or_insert_with(|| toml_edit::Item::ArrayOfTables(Default::default()))
+                .as_array_of_tables_mut()
+                .with_context(|| {
+                    format!("`hooks.{}` is not an array of tables", event.host_name())
+                })?;
+            let mut hook = toml_edit::InlineTable::new();
+            hook.insert("type", "command".into());
+            hook.insert("command", command.as_str().into());
+            hook.insert("timeout", (HOOK_TIMEOUT_SECS as i64).into());
+            let mut items = toml_edit::Array::new();
+            items.push(hook);
+            let mut group = toml_edit::Table::new();
+            group.insert("hooks", toml_edit::value(items));
+            list.push(group);
+        }
         changed = true;
     }
     Ok(changed.then(|| doc.to_string()))
@@ -1234,6 +1289,46 @@ mod tests {
     }
 
     #[test]
+    fn codex_events_follow_the_version() {
+        assert_eq!(parse_version("codex-cli 0.116.0\n"), Some((0, 116, 0)));
+        assert_eq!(
+            parse_version("codex-cli 0.120.1-alpha.2"),
+            Some((0, 120, 1))
+        );
+        assert_eq!(parse_version("v1.2.3"), Some((1, 2, 3)));
+        assert_eq!(parse_version("codex-cli dev"), None);
+        assert_eq!(parse_version("1.2"), None);
+        assert_eq!(codex_events(Some((0, 116, 0))), &CLAUDE_EVENTS);
+        assert_eq!(codex_events(Some((1, 0, 0))), &CLAUDE_EVENTS);
+        assert_eq!(codex_events(Some((0, 115, 9))), &[HookEvent::SessionStart]);
+        assert_eq!(codex_events(None), &[HookEvent::SessionStart]);
+    }
+
+    #[test]
+    fn codex_config_takes_both_events_and_upgrades_in_place() {
+        let start = "/bin/wats notify --hook --host codex --event session-start --profile alice";
+        let prompt =
+            "/bin/wats notify --hook --host codex --event user-prompt-submit --profile alice";
+        let one = [(HookEvent::SessionStart, start.to_string())];
+        let both = [
+            (HookEvent::UserPromptSubmit, prompt.to_string()),
+            (HookEvent::SessionStart, start.to_string()),
+        ];
+        let old = codex_upsert("", "hooks", &one).unwrap().unwrap();
+        // A newer Codex: the prompt hook is added, SessionStart kept once.
+        let new = codex_upsert(&old, "hooks", &both).unwrap().unwrap();
+        let v: toml::Table = toml::from_str(&new).unwrap();
+        assert_eq!(v["hooks"]["SessionStart"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            v["hooks"]["UserPromptSubmit"][0]["hooks"][0]["command"].as_str(),
+            Some(prompt)
+        );
+        assert_eq!(codex_upsert(&new, "hooks", &both).unwrap(), None);
+        let removed = codex_remove(&new).unwrap().unwrap();
+        assert!(!removed.contains("notify --hook"), "{removed}");
+    }
+
+    #[test]
     fn codex_config_round_trip() {
         let cmd =
             "/usr/local/bin/wats notify --hook --host codex --event session-start --profile alice";
@@ -1241,7 +1336,8 @@ mod tests {
                         [[hooks.SessionStart]]\nmatcher = \"startup\"\n\
                         hooks = [{ type = \"command\", command = \"~/mine.sh\" }]\n\n\
                         [mcp_servers.wats]\ncommand = \"wats\"\n";
-        let added = codex_upsert(original, "hooks", cmd).unwrap().unwrap();
+        let one = [(HookEvent::SessionStart, cmd.to_string())];
+        let added = codex_upsert(original, "hooks", &one).unwrap().unwrap();
         assert!(
             added.starts_with("# my codex\nmodel = \"gpt-5\"\n"),
             "{added}"
@@ -1257,7 +1353,7 @@ mod tests {
         assert_eq!(groups[1]["hooks"][0]["timeout"].as_integer(), Some(10));
         assert_eq!(v["mcp_servers"]["wats"]["command"].as_str(), Some("wats"));
         // Idempotent.
-        assert_eq!(codex_upsert(&added, "hooks", cmd).unwrap(), None);
+        assert_eq!(codex_upsert(&added, "hooks", &one).unwrap(), None);
         // Removed: the user's hook stays; the feature flag stays.
         let removed = codex_remove(&added).unwrap().unwrap();
         assert_eq!(
@@ -1270,7 +1366,7 @@ mod tests {
         assert_eq!(codex_remove(&removed).unwrap(), None);
 
         // A new file; older Codex: codex_hooks.
-        let fresh = codex_upsert("", "codex_hooks", cmd).unwrap().unwrap();
+        let fresh = codex_upsert("", "codex_hooks", &one).unwrap().unwrap();
         let v: toml::Table = toml::from_str(&fresh).unwrap();
         assert_eq!(v["features"]["codex_hooks"].as_bool(), Some(true));
         assert!(!fresh.contains("[hooks]\n"), "{fresh}");

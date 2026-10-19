@@ -1791,10 +1791,10 @@ fn install_claude_hooks(args: &NodeArgs, profile: &str, scope: &str) -> Result<(
     Ok(())
 }
 
-/// Add (or update) the SessionStart hook in Codex's config.toml, when
-/// this Codex has hooks.
+/// Add (or update) the session hooks in Codex's config.toml, when this
+/// Codex has hooks: SessionStart, and UserPromptSubmit since 0.116.0.
 fn install_codex_hooks(args: &NodeArgs, profile: &str, codex: &std::path::Path) -> Result<()> {
-    use wats::hook::{HookEvent, Host};
+    use wats::hook::Host;
     let Some(feature) = wats::hook::codex_hook_feature(&wats::hook::codex_features(codex)) else {
         println!(
             "Codex: no session hook: `{} features list` shows no hooks feature (Codex has hooks \
@@ -1808,19 +1808,36 @@ fn install_codex_hooks(args: &NodeArgs, profile: &str, codex: &std::path::Path) 
         return Ok(());
     }
     let path = codex_config()?;
-    let command = hook_command(args, Host::Codex, HookEvent::SessionStart, profile)?;
+    let events = wats::hook::codex_events(wats::hook::codex_version(codex));
+    let entries = events
+        .iter()
+        .map(|e| Ok((*e, hook_command(args, Host::Codex, *e, profile)?)))
+        .collect::<Result<Vec<_>>>()?;
     let text = read_or_empty(&path)?;
-    match wats::hook::codex_upsert(&text, feature, &command)
+    match wats::hook::codex_upsert(&text, feature, &entries)
         .with_context(|| format!("{}: left as it is", path.display()))?
     {
         None => println!("Codex: session hook already in {}", path.display()),
         Some(new) => {
+            let names: Vec<String> = events
+                .iter()
+                .map(|e| format!("[[hooks.{}]]", e.host_name()))
+                .collect();
+            let what = if events.len() > 1 {
+                "your sessions hear of the answers and clarifies to your asks at each prompt"
+            } else {
+                "each session starts with the answers and clarifies to your asks"
+            };
             println!(
-                "Codex: session hook ([[hooks.SessionStart]], features.{feature} = true) in {}: \
-                 each session starts with the answers and clarifies to your asks",
+                "Codex: session hook ({}, features.{feature} = true) in {}: {what}",
+                names.join(", "),
                 path.display()
             );
             write_settings(&path, &new)?;
+            println!(
+                "Codex: open /hooks in Codex once to review the hook: Codex runs a hook it did \
+                 not install only after that"
+            );
         }
     }
     Ok(())
