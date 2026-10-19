@@ -51,8 +51,8 @@
   vectors: one digest case; the Python verifier agrees on all 114.
 - **Routing and delivery modes** (ADR 0022): an ask says who should wake
   and how many should work on it, and the runner decides before waking
-  the model. `to:<author id>` (up to 4; a prefix of the id, since a tag
-  holds 64 bytes, and `post` shortens a full one) wakes the addressees
+  the model. `to:<author id>` (up to 4; the full id in base32, 52
+  characters, to fit in a tag; tools take hex too) wakes the addressees
   at once, past their debounce, and others only after its deadline if
   nobody answered; `cap:<x>` wakes agents with that capability first,
   and the others after `ask.cap_grace` (2 min) if none claimed or
