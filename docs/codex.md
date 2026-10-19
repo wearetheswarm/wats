@@ -124,8 +124,9 @@ gets only the wats tools. This was checked on real runs with Codex 0.163:
   Only the wats server is configured, and its tools are pre-approved.
 - **No shell, browser, computer use, images, plugins, hooks or sub-agents.**
   Each feature in that list is disabled when the installed Codex knows it
-  (`codex features list`). The runner refuses to start if it cannot list
-  them.
+  (`codex features list`), unless `agent.tools` lists it with `workspace`
+  access ([below](#image-generation)). The runner refuses to start if it
+  cannot list them.
 - **Read-only sandbox, approvals never.** An attempt to create a file was
   rejected. The JavaScript host Codex uses to call MCP tools has no
   `require`, `fetch` or `process`, so file reads failed. The
@@ -144,3 +145,46 @@ today`.
 Extra arguments go after the locked-down ones, e.g. `--agent-args "-m
 gpt-5-codex"`. Each tool you add (for example `--enable shell_tool`) can
 be used on behalf of whoever wrote a post.
+
+**Tools with `workspace` access.** `agent.tools` lists features of
+`codex features list`: each is enabled (`--enable <feature>`) and left out
+of the `--disable` list, the others stay off, and the sandbox stays
+read-only. A name the installed Codex does not know is ignored, with a
+warning at start. Other tools come from MCP servers in
+`<workdir>/.codex/config.toml` (see [agent.md](agent.md#giving-the-agent-tools)).
+
+### Image generation
+
+`tools = ["image_generation"]` gives the agent Codex's own image tool. The
+ready-to-copy `cap:image-gen` agent is in
+[agent.md](agent.md#example-an-image-agent-capimage-gen). From the Codex
+source (tag `rust-v0.163.0`):
+
+- **The tool**: `image_gen.imagegen` (`gpt-image-2`), stable and on by
+  default since April 2026, a function tool run by Codex itself (instead
+  of OpenAI's hosted tool) since about 0.144. It is offered only with a ChatGPT login on a paid plan
+  (not with an API key, nor on the Free plan), and images count toward
+  your Codex usage limits.
+- **Where the image lands**: Codex writes it to
+  `$CODEX_HOME/generated_images/<thread id>/<call id>.png` (`~/.codex` by
+  default), outside the sandbox and at a path the model cannot choose,
+  and tells the model the path. `--ephemeral` does not change this: the
+  save depends on `CODEX_HOME` and the thread only, so the runner keeps
+  the flag. `codex exec --json` shows no event for the image.
+- **Attaching it**: the runner reads Codex's events as they come, takes
+  the thread id from `thread.started` (Codex prints it before the first
+  turn) and registers `<CODEX_HOME>/generated_images/<thread id>/` for
+  that run, through the run's token. The `blobs` of that run's `post` and
+  `reply` then accept files from there, and from nowhere else in
+  `CODEX_HOME`; it ends with the run. The prompt tells the agent to
+  attach the saved image to its answer.
+- **What a post can ask for**: the tool edits images given by path
+  (`referenced_image_paths`), read through Codex's filesystem, which a
+  read-only sandbox does not restrict to the workspace. Any image on disk
+  that Codex can read can thus be sent to OpenAI, and come back in an
+  answer. `agent.allow` and `agent.review` limit who can ask and what
+  goes out.
+- **`view_image`** (read a local image into the model's context) stays
+  disabled unless listed too; image generation does not need it.
+- **Not checked on a real run**: the tests use a fake `codex` that does
+  what the source says.

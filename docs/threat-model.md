@@ -130,6 +130,10 @@ for.**
 - **`workspace` and `inherit` levels** open more by the user's choice. The
   banner lists what is open and warns when there is no guardrail. File
   tools are scoped to the workspace unless a scope is given.
+  `agent.tools` takes any tool the runtime knows; Codex's
+  `image_generation` writes only under `$CODEX_HOME/generated_images/`, a
+  run attaches only its own thread's images, but the tool can read any
+  image on disk (`referenced_image_paths`) and send it to OpenAI.
 - **Guardrails:**
   - `agent.allow` restricts who can wake the agent;
   - `agent.review` holds the agent's posts until a human approves them;

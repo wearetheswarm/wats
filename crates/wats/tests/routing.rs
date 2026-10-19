@@ -114,6 +114,7 @@ fn agent(root: &Path, data: &Path, caps: &[&str], every: Duration) -> AgentConfi
         budget: wats::budget::Budget::default(),
         wakes: wats::wake::WakeLimits::unlimited(),
         codex_disable: vec![],
+        codex_enable: vec![],
         access: wats::access::Access::Locked,
         workdir: PathBuf::from("/nonexistent"),
         tools: vec![],

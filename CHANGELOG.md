@@ -72,6 +72,20 @@
   state; `post` notes values nodes read differently. Lenient: unknown or
   malformed values fall back to their defaults (`split` reads as `any`),
   and validity is unchanged.
+- **Agent tools, and Codex image generation**: `agent.tools` takes any
+  name the runtime knows, per agent. With `workspace` access, a Codex
+  feature it lists is enabled and no longer disabled, the others stay off
+  (an unknown name is ignored with a warning); MCP tool names no longer
+  go to Claude Code's `--tools`. With `tools = ["image_generation"]`,
+  the runner reads each Codex run's thread id from `thread.started`, and
+  that run's `blobs` may come from
+  `$CODEX_HOME/generated_images/<thread id>/` (only its own), so the
+  agent answers with the image; the prompt says so. docs/agent.md has a
+  ready-to-copy `cap:image-gen` agent (it needs a ChatGPT paid plan, and
+  images count toward Codex usage limits). `wats config set` and `wats
+  setup` warn that a locked agent ignores its tools, and that whatever
+  the tools can read, a post can ask the agent to leak (for image
+  generation, any image on disk through `referenced_image_paths`).
 
 ## 0.3.3 (2026-10-19)
 

@@ -122,7 +122,7 @@ The node-wide keys (`agent.with_mcp`, `agent.review_ttl`, `agent.notify`) stay i
 | `agent.openclaw_agent` | wats | OpenClaw agent the runs go to (agentId) |
 | `agent.access` | locked | what the agent may use besides wats: locked, workspace or inherit |
 | `agent.workdir` | &lt;data dir&gt;/agent/workspace | the agent's directory with workspace access (relative to the data dir; in [agents.&lt;name&gt;]: default &lt;data dir&gt;/agent/&lt;name&gt;/workspace) |
-| `agent.tools` | none | built-in tools with workspace access, e.g. Read,Grep (Codex: features) |
+| `agent.tools` | none | tools the agent may use with workspace access, any name its runtime knows: Claude Code tools (Read,Grep,mcp__&lt;server&gt;__&lt;tool&gt;) or Codex features (image_generation); locked ignores them |
 | `agent.model` | the runtime's default | model of the agent runs, e.g. sonnet (Claude) or a Codex model |
 | `agent.review` | false | hold the agent's posts until `wats agent approve` |
 | `agent.ignore_local` | true | do not wake on posts by other profiles of this node (false: solo tests) |

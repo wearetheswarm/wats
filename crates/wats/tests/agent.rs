@@ -115,6 +115,7 @@ async fn agent_wakes_on_asks_and_heartbeats() -> anyhow::Result<()> {
         budget: wats::budget::Budget::default(),
         wakes: wats::wake::WakeLimits::unlimited(),
         codex_disable: vec![],
+        codex_enable: vec![],
         access: wats::access::Access::Locked,
         workdir: std::path::PathBuf::from("/nonexistent"),
         tools: vec![],
@@ -911,6 +912,7 @@ async fn budget_pauses_the_agent() -> anyhow::Result<()> {
         },
         wakes: wats::wake::WakeLimits::unlimited(),
         codex_disable: vec![],
+        codex_enable: vec![],
         access: wats::access::Access::Locked,
         workdir: std::path::PathBuf::from("/nonexistent"),
         tools: vec![],
@@ -1078,6 +1080,7 @@ echo '{{"type":"turn.completed","usage":{{"input_tokens":10,"output_tokens":2}}}
         budget: wats::budget::Budget::default(),
         wakes: wats::wake::WakeLimits::unlimited(),
         codex_disable: vec![],
+        codex_enable: vec![],
         access: wats::access::Access::Locked,
         workdir: std::path::PathBuf::from("/nonexistent"),
         tools: vec![],
@@ -1145,6 +1148,297 @@ echo '{{"type":"turn.completed","usage":{{"input_tokens":10,"output_tokens":2}}}
     Ok(())
 }
 
+/// The `cap:image-gen` demo agent of docs/agent.md: Codex in workspace
+/// access with `tools = ["image_generation"]`. The fake Codex does what
+/// the real one does (rust-v0.163.0): `thread.started` first, then the
+/// image saved to `$CODEX_HOME/generated_images/<thread>/<call>.png`;
+/// then it answers the ask through the wats MCP server with that file as
+/// a blob. The run's blobs may come from its own thread's directory only:
+/// another thread's image, or another file of CODEX_HOME, is refused.
+#[tokio::test(flavor = "multi_thread")]
+async fn codex_image_generation_answers_with_the_image() -> anyhow::Result<()> {
+    use rmcp::ServiceExt;
+    use rmcp::model::CallToolRequestParams;
+    use rmcp::transport::TokioChildProcess;
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir()?;
+    let dir_path = std::fs::canonicalize(dir.path())?;
+    let data = dir_path.join("data");
+    let out = dir_path.join("out");
+    let home = dir_path.join("home");
+    let codex_home = dir_path.join("codex-home");
+    for d in [&data, &out, &home, &codex_home] {
+        std::fs::create_dir_all(d)?;
+    }
+    let wats = env!("CARGO_BIN_EXE_wats");
+    let thread = "0199aaaa-bbbb-7ccc-8ddd-eeeeeeeeeeee";
+    let fake = dir_path.join("codex");
+    let call = |id: u32, path: &str| {
+        format!(
+            r#"call '{{"jsonrpc":"2.0","id":{id},"method":"tools/call","params":{{"name":"reply","arguments":{{"post_id":"'$ask'","text":"Here it is.","blobs":[{{"path":"{path}"}}]}}}}}}'
+wait_id {id}"#
+        )
+    };
+    let images = codex_home.join("generated_images");
+    std::fs::write(
+        &fake,
+        format!(
+            r#"#!/bin/sh
+if [ "$1" = features ]; then
+  printf 'shell_tool stable true\napps stable true\nimage_generation stable true\nview_image stable true\n'
+  exit 0
+fi
+echo "$@" > {out}/args
+cat > {out}/prompt
+token=$(sed -n 's/.*WATS_RUNNER_TOKEN="\([0-9a-f]*\)".*/\1/p' {out}/args)
+ask=$(sed -n 's/^- \([0-9a-f]\{{64\}}\) · ask .*/\1/p' {out}/prompt | head -n 1)
+echo '{{"type":"thread.started","thread_id":"{thread}"}}'
+mkdir -p "{images}/{thread}" "{images}/other-thread"
+printf '\211PNG\r\n\032\nimage' > "{images}/{thread}/ig_1.png"
+printf '\211PNG\r\n\032\nother' > "{images}/other-thread/ig_9.png"
+printf '\211PNG\r\n\032\nstray' > "{codex_home}/stray.png"
+fifo={out}/mcp.in
+rm -f $fifo; mkfifo $fifo
+WATS_RUNNER_TOKEN=$token {wats} --loopback --dir {data} mcp --profile imagegen < $fifo > {out}/mcp.out 2> {out}/mcp.err &
+pid=$!
+exec 3> $fifo
+call() {{ echo "$1" >&3; }}
+wait_id() {{
+  n=0
+  until grep -q "\"id\":$1," {out}/mcp.out 2>/dev/null; do
+    sleep 0.1; n=$((n+1)); [ $n -gt 300 ] && break
+  done
+}}
+call '{{"jsonrpc":"2.0","id":1,"method":"initialize","params":{{"protocolVersion":"2025-06-18","capabilities":{{}},"clientInfo":{{"name":"fake-codex","version":"0"}}}}}}'
+wait_id 1
+call '{{"jsonrpc":"2.0","method":"notifications/initialized"}}'
+{other}
+{stray}
+{own}
+exec 3>&-
+wait $pid
+echo '{{"type":"item.completed","item":{{"id":"i2","type":"agent_message","text":"Answered with the image."}}}}'
+echo '{{"type":"turn.completed","usage":{{"input_tokens":10,"output_tokens":2}}}}'
+"#,
+            out = out.display(),
+            images = images.display(),
+            codex_home = codex_home.display(),
+            data = data.display(),
+            other = call(2, &format!("{}/other-thread/ig_9.png", images.display())),
+            stray = call(3, &format!("{}/stray.png", codex_home.display())),
+            own = call(4, &format!("{}/{thread}/ig_1.png", images.display())),
+        ),
+    )?;
+    std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755))?;
+    std::fs::write(
+        data.join("config.toml"),
+        format!(
+            "[agents.imagegen]\nruntime = \"codex\"\naccess = \"workspace\"\n\
+             tools = [\"image_generation\"]\ncaps = [\"image-gen\"]\n\
+             about = \"I generate images on request (Codex image generation).\"\n\
+             profile = \"imagegen\"\ncommand = \"{}\"\nignore_local = false\n\
+             every = \"1s\"\nheartbeat = \"1h\"\n",
+            fake.display()
+        ),
+    )?;
+    let mut node = tokio::process::Command::new(wats)
+        .env("HOME", &home)
+        .env("CODEX_HOME", &codex_home)
+        .env("USER", "tester")
+        .env_remove("WATS_PROFILE")
+        .args(["--loopback", "--pow-bits=0", "--min-pow-bits=0", "--dir"])
+        .arg(&data)
+        .args(["--quiet"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true)
+        .spawn()?;
+    running_status(&data).await;
+    let mut cmd = tokio::process::Command::new(wats);
+    cmd.env("HOME", &home)
+        .args(["--loopback", "--profile", "human", "--dir"])
+        .arg(&data)
+        .args(["mcp", "--idle-exit", "1"]);
+    let human = ().serve(TokioChildProcess::new(cmd)?).await?;
+    let call_tool = |name: &'static str, args: serde_json::Value| {
+        let human = &human;
+        async move {
+            let result = human
+                .call_tool(
+                    CallToolRequestParams::new(name)
+                        .with_arguments(args.as_object().unwrap().clone()),
+                )
+                .await
+                .unwrap();
+            result
+                .structured_content
+                .clone()
+                .unwrap_or_else(|| panic!("{name}: {result:?}"))
+        }
+    };
+    let asked = call_tool(
+        "post",
+        serde_json::json!({
+            "title": "A lighthouse at dusk, as a PNG",
+            "text": "Generate an image of a lighthouse at dusk.",
+            "kind": "ask",
+            "tags": ["cap:image-gen"],
+            "data": {"mode": "one"},
+        }),
+    )
+    .await;
+    let ask = asked["id"].as_str().unwrap().to_string();
+    let work = data.join("agent").join("imagegen");
+    eventually("the image run is indexed", || {
+        wats::runs::list(&work).iter().any(|r| r.status == "ok")
+    })
+    .await;
+
+    let args = std::fs::read_to_string(out.join("args"))?;
+    assert!(args.contains("--enable image_generation"), "{args}");
+    assert!(!args.contains("--disable image_generation"), "{args}");
+    for off in ["shell_tool", "apps", "view_image"] {
+        assert!(args.contains(&format!("--disable {off}")), "{args}");
+    }
+    assert!(args.contains("--ephemeral --skip-git-repo-check"), "{args}");
+    assert!(args.contains("--sandbox read-only"), "{args}");
+    let prompt = std::fs::read_to_string(out.join("prompt"))?;
+    assert!(prompt.contains(&ask), "{prompt}");
+    assert!(prompt.contains(wats::access::IMAGES_LINE), "{prompt}");
+
+    let mcp = std::fs::read_to_string(out.join("mcp.out"))?;
+    let answer = |id: u32| {
+        mcp.lines()
+            .find(|l| l.contains(&format!("\"id\":{id},")))
+            .unwrap_or_default()
+            .to_string()
+    };
+    for refused in [answer(2), answer(3)] {
+        assert!(
+            refused.contains("outside the directories this node may share from"),
+            "{refused}\n{mcp}"
+        );
+    }
+    let own: serde_json::Value = serde_json::from_str(&answer(4))?;
+    let reply = own["result"]["structuredContent"]["id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("{mcp}"))
+        .to_string();
+    let read = call_tool("read", serde_json::json!({"id": reply})).await;
+    let read = &read["post"];
+    assert_eq!(read["kind"], "answer", "{read}");
+    assert_eq!(read["parent"], ask.as_str(), "{read}");
+    let blobs = read["blobs"].as_array().cloned().unwrap_or_default();
+    assert_eq!(blobs.len(), 1, "{read}");
+    assert_eq!(blobs[0]["name"], "ig_1.png", "{read}");
+    assert_eq!(blobs[0]["size"], 13, "{read}");
+
+    // The transcript has Codex's events, the footer after them.
+    let record = wats::runs::list(&work)
+        .into_iter()
+        .find(|r| r.status == "ok")
+        .unwrap();
+    assert_eq!(record.turns, Some(1));
+    let transcript = std::fs::read_to_string(wats::runs::transcript_path(&work, &record.id))?;
+    assert!(transcript.contains("thread.started"), "{transcript}");
+    assert!(
+        transcript
+            .trim_end()
+            .lines()
+            .last()
+            .unwrap()
+            .contains("wats_end"),
+        "{transcript}"
+    );
+    human.cancel().await?;
+    node.kill().await?;
+    Ok(())
+}
+
+/// `tools` on a locked agent: `wats config set` keeps it with a warning,
+/// and the agent still starts, with only the wats tools.
+#[tokio::test(flavor = "multi_thread")]
+async fn locked_agent_with_tools_warns_and_starts() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let data = dir.path().join("data");
+    std::fs::create_dir_all(&data)?;
+    let (ok, _, err) = wats_out(&data, &["config", "set", "agents.claude.runtime", "claude"]);
+    assert!(ok, "{err}");
+    let (ok, _, err) = wats_out(
+        &data,
+        &["config", "set", "agents.claude.tools", "Read,Grep"],
+    );
+    assert!(ok, "{err}");
+    assert!(
+        err.contains("warning: locked access ignores agents.claude.tools; use access workspace"),
+        "{err}"
+    );
+    assert_eq!(err.matches("warning:").count(), 1, "{err}");
+    let (ok, _, err) = wats_out(
+        &data,
+        &["config", "set", "agents.claude.access", "workspace"],
+    );
+    assert!(ok && !err.contains("locked access ignores"), "{err}");
+    let (ok, _, err) = wats_out(
+        &data,
+        &["config", "set", "agents.claude.tools", "image_generation"],
+    );
+    assert!(ok, "{err}");
+    assert!(err.contains("a post can ask the agent to leak"), "{err}");
+    assert!(err.contains("referenced_image_paths"), "{err}");
+
+    let a = node(&dir.path().join("a"), &[]).await?;
+    let work = dir.path().join("work");
+    let config = AgentConfig {
+        runtime: "claude".into(),
+        profile: "agent".into(),
+        user: "alice".into(),
+        about: String::new(),
+        caps: vec![],
+        every: Duration::from_secs(1),
+        heartbeat: Duration::from_secs(1),
+        max_runs_per_hour: 100,
+        allow: vec![],
+        ignore_local: true,
+        heartbeat_text: DEFAULT_HEARTBEAT.into(),
+        command: fake_agent(dir.path()),
+        mcp_command: "/opt/wats".into(),
+        mcp_args: vec!["mcp".into()],
+        extra_args: vec![],
+        run_timeout: Duration::from_secs(10),
+        max_turns: 10,
+        budget: wats::budget::Budget::default(),
+        wakes: wats::wake::WakeLimits::unlimited(),
+        codex_disable: vec![],
+        codex_enable: vec![],
+        access: wats::access::Access::Locked,
+        workdir: std::path::PathBuf::from("/nonexistent"),
+        tools: vec!["Read".into(), "image_generation".into()],
+        model: None,
+        work_dir: work.clone(),
+        data_dir: work.parent().unwrap().to_path_buf(),
+        keep_runs: 100,
+        keep_days: 30,
+        openclaw: Default::default(),
+        catchup: None,
+    };
+    let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+    let runner = tokio::spawn(wats::agent::run(Arc::clone(&a), config, async {
+        let _ = stopped.await;
+    }));
+    eventually("a locked run", || !runs(dir.path()).is_empty()).await;
+    let _ = stop.send(());
+    runner.await??;
+    let (_, args) = runs(dir.path()).remove(0);
+    assert!(
+        args.contains("--tools  --permission-mode dontAsk"),
+        "{args}"
+    );
+    assert!(args.contains("--allowedTools mcp__wats__* "), "{args}");
+    a.shutdown().await?;
+    Ok(())
+}
+
 /// `agent.access = workspace`: the run starts in the workspace (created
 /// with stub instructions), with its MCP servers merged into the generated
 /// config next to wats (which carries the run's token), and the listed
@@ -1181,6 +1475,7 @@ async fn workspace_access_opens_the_workspace() -> anyhow::Result<()> {
         budget: wats::budget::Budget::default(),
         wakes: wats::wake::WakeLimits::unlimited(),
         codex_disable: vec![],
+        codex_enable: vec![],
         access: wats::access::Access::Workspace,
         workdir: workdir.clone(),
         tools: vec!["Read".into(), "Grep".into()],
@@ -1688,6 +1983,7 @@ async fn wakes_only_on_what_is_addressed_to_it() -> anyhow::Result<()> {
         budget: wats::budget::Budget::default(),
         wakes: wats::wake::WakeLimits::unlimited(),
         codex_disable: vec![],
+        codex_enable: vec![],
         access: wats::access::Access::Locked,
         workdir: std::path::PathBuf::from("/nonexistent"),
         tools: vec![],
@@ -1794,6 +2090,7 @@ async fn wake_limits_defer_and_survive_a_restart() -> anyhow::Result<()> {
         budget: wats::budget::Budget::default(),
         wakes: wats::wake::WakeLimits::unlimited(),
         codex_disable: vec![],
+        codex_enable: vec![],
         access: wats::access::Access::Locked,
         workdir: std::path::PathBuf::from("/nonexistent"),
         tools: vec![],
@@ -1905,6 +2202,7 @@ async fn loop_detector_pauses_a_thread_until_a_third_party_posts() -> anyhow::Re
             loop_max_exchanges: 3,
         },
         codex_disable: vec![],
+        codex_enable: vec![],
         access: wats::access::Access::Locked,
         workdir: std::path::PathBuf::from("/nonexistent"),
         tools: vec![],
@@ -2196,6 +2494,7 @@ async fn openclaw_forwards_wakes_to_the_gateway() -> anyhow::Result<()> {
         budget: wats::budget::Budget::default(),
         wakes: wats::wake::WakeLimits::unlimited(),
         codex_disable: vec![],
+        codex_enable: vec![],
         access: wats::access::Access::Locked,
         workdir: std::path::PathBuf::from("/nonexistent"),
         tools: vec![],
@@ -2392,6 +2691,7 @@ async fn asks_stored_before_the_runner_started_still_wake_it() -> anyhow::Result
         budget: wats::budget::Budget::default(),
         wakes: wats::wake::WakeLimits::unlimited(),
         codex_disable: vec![],
+        codex_enable: vec![],
         access: wats::access::Access::Locked,
         workdir: std::path::PathBuf::from("/nonexistent"),
         tools: vec![],
@@ -2498,6 +2798,7 @@ async fn heartbeats_offer_older_unanswered_asks() -> anyhow::Result<()> {
         budget: wats::budget::Budget::default(),
         wakes: wats::wake::WakeLimits::unlimited(),
         codex_disable: vec![],
+        codex_enable: vec![],
         access: wats::access::Access::Locked,
         workdir: std::path::PathBuf::from("/nonexistent"),
         tools: vec![],
@@ -2613,6 +2914,7 @@ async fn a_clarify_past_its_deadline_wakes_the_agent_for_its_default() -> anyhow
         budget: wats::budget::Budget::default(),
         wakes: wats::wake::WakeLimits::unlimited(),
         codex_disable: vec![],
+        codex_enable: vec![],
         access: wats::access::Access::Locked,
         workdir: std::path::PathBuf::from("/nonexistent"),
         tools: vec![],
@@ -2803,6 +3105,7 @@ async fn local_agents_wake_each_other_but_not_on_the_humans_posts() -> anyhow::R
             budget: wats::budget::Budget::default(),
             wakes: wats::wake::WakeLimits::unlimited(),
             codex_disable: vec![],
+            codex_enable: vec![],
             access: wats::access::Access::Locked,
             workdir: std::path::PathBuf::from("/nonexistent"),
             tools: vec![],
