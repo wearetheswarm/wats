@@ -81,6 +81,12 @@ Command-line flags and `WATS_*` variables, where they exist (`wats --help`), tak
 |---|---|---|
 | `notify.desktop` | auto | a desktop notification (osascript, notify-send) when someone answers or clarifies one of your asks; auto: on with a desktop session (macOS, or DISPLAY or WAYLAND_DISPLAY set; not over SSH), off on servers and in containers |
 
+## `[labels]`
+
+| Key | Default | |
+|---|---|---|
+| `labels.subscribe` | none | author ids (64 hex) of the labelers whose erasure labels this node applies: it drops the labelled bodies (opt-in, ADR 0020) |
+
 ## `[ask]`
 
 | Key | Default | |
