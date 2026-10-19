@@ -135,7 +135,9 @@ impl Signals {
 /// Which keys the node takes for one author (ADR 0019 §2.4, as far as v1a
 /// goes): a key and the keys it rotated from or into (`rotate`), and the
 /// node's own profiles together. Signals by a key grouped with a post's
-/// author count zero on it; keys of one group count once.
+/// author count zero on it; keys of one group count once. Grouping only
+/// takes weight away: it gives no key an authority of another, such as
+/// accepting on its ask (see [`Grouping::same_key`]).
 pub struct Grouping<'a> {
     store: &'a Store,
     local: HashSet<String>,
@@ -155,7 +157,13 @@ impl<'a> Grouping<'a> {
     }
 
     pub fn same(&self, a: &str, b: &str) -> bool {
-        if a == b || (self.local.contains(a) && self.local.contains(b)) {
+        (self.local.contains(a) && self.local.contains(b)) || self.same_key(a, b)
+    }
+
+    /// Whether `a` and `b` are one key: the same, or linked by a chain of
+    /// `rotate` events either way. The node's other profiles are not.
+    pub fn same_key(&self, a: &str, b: &str) -> bool {
+        if a == b {
             return true;
         }
         if !self.rotations {
@@ -204,6 +212,8 @@ fn takes_position(data: &Map<String, Value>) -> bool {
 struct Position<'r> {
     react: Option<&'r SignalRow>,
     post: Option<&'r SignalRow>,
+    /// The group's posts that may count as citations of the post.
+    cites: Vec<&'r SignalRow>,
 }
 
 impl Position<'_> {
@@ -229,15 +239,24 @@ impl Position<'_> {
     fn contradicts(&self) -> bool {
         self.value() == Some(-1) && !self.used() && (self.evidence() || self.post.is_some())
     }
+
+    /// Whether the group cites the post: a post of it other than the
+    /// reasoning of its contradiction, if it contradicts.
+    fn cites(&self) -> bool {
+        let reasoning = self.post.filter(|_| self.contradicts()).map(|p| &p.id);
+        self.cites.iter().any(|c| Some(&c.id) != reasoning)
+    }
 }
 
 /// The positions of the groups of keys on a target, from the rows that
 /// point to it, oldest first. Keys grouped with any of `excluded` (the
-/// target's author, at least) count zero.
+/// target's author, at least) count zero. On a thread's root `ask`
+/// (`root_ask`), replies are its answers, not citations of it.
 fn positions<'r>(
     rows: &[&'r SignalRow],
     net: &str,
     excluded: &[&str],
+    root_ask: bool,
     grouping: &Grouping<'_>,
 ) -> Vec<(String, Position<'r>)> {
     let mut groups: Vec<(String, Position<'r>)> = Vec::new();
@@ -260,6 +279,7 @@ fn positions<'r>(
                     Position {
                         react: None,
                         post: None,
+                        cites: Vec::new(),
                     },
                 ));
                 groups.len() - 1
@@ -270,8 +290,13 @@ fn positions<'r>(
         // stays.
         if react {
             group.react = Some(row);
-        } else if group.post.is_none() {
+            continue;
+        }
+        if group.post.is_none() {
             group.post = Some(row);
+        }
+        if !(root_ask && row.reply) {
+            group.cites.push(row);
         }
     }
     groups
@@ -346,9 +371,10 @@ fn by_target(rows: &[SignalRow]) -> HashMap<&str, Vec<&SignalRow>> {
 }
 
 /// The answer accepted in each of these threads, if any: the latest
-/// `data.accept = true` by the author of the thread's `ask` (or a key
-/// grouped with it), unless a later `data.accept = false` on the same
-/// answer withdrew it. One accept per ask.
+/// `data.accept = true` by the author of the thread's `ask` (that key, or
+/// one it rotated from or into; not the node's other profiles), unless a
+/// later `data.accept = false` on the same answer withdrew it. One accept
+/// per ask.
 fn accepted(
     store: &Store,
     grouping: &Grouping<'_>,
@@ -366,7 +392,7 @@ fn accepted(
     for (thread, asker) in &asks {
         let by_asker: Vec<_> = reacts
             .iter()
-            .filter(|r| &r.thread == thread && grouping.same(asker, &r.author))
+            .filter(|r| &r.thread == thread && grouping.same_key(asker, &r.author))
             .collect();
         let Some(last) = by_asker.iter().rev().find(|r| r.accept) else {
             continue;
@@ -398,7 +424,14 @@ pub fn compute(
     let mut tallies = Vec::new();
     for post in posts {
         let mine = rows.get(post.id.as_str()).unwrap_or(&empty);
-        tallies.push(positions(mine, &post.net, &[&post.author], grouping));
+        let root_ask = post.thread.is_none() && post.kind == crate::event::Kind::Ask;
+        tallies.push(positions(
+            mine,
+            &post.net,
+            &[&post.author],
+            root_ask,
+            grouping,
+        ));
     }
 
     // Second level: the contradictions of each contradiction (v1a: one
@@ -425,6 +458,9 @@ pub fn compute(
         let mut signals = Signals::default();
         let mut contradictions = Vec::new();
         for (_, p) in tally {
+            if p.cites() {
+                signals.cites += 1;
+            }
             if p.value() == Some(1) {
                 signals.up += 1;
             }
@@ -445,14 +481,11 @@ pub fn compute(
                 excluded.extend(p.post.map(|r| r.author.as_str()));
                 let rebutted = [p.react, p.post].into_iter().flatten().any(|target| {
                     let theirs = rows2.get(target.id.as_str()).unwrap_or(&empty);
-                    positions(theirs, &post.net, &excluded, grouping)
+                    positions(theirs, &post.net, &excluded, false, grouping)
                         .iter()
                         .any(|(_, q)| q.contradicts())
                 });
                 contradictions.push(Contradiction { by: p, rebutted });
-            } else if p.post.is_some() {
-                // A post citing it, not the reasoning of a contradiction.
-                signals.cites += 1;
             }
         }
         if let Some(thread) = &post.thread
@@ -592,6 +625,31 @@ mod tests {
             )
         }
 
+        /// Key `old` hands over to key `new`.
+        fn rotate(&mut self, old: u8, new: u8) {
+            let next = key(new).verifying_key();
+            self.add(
+                old,
+                Draft {
+                    net: "public".into(),
+                    kind: Some(Kind::Rotate),
+                    title: Some("rotate".into()),
+                    text: "handing over".into(),
+                    data: json!({
+                        "new_key": hex::encode(next.as_bytes()),
+                        "new_key_sig": crate::event::rotate_signature(
+                            &key(new),
+                            key(old).verifying_key().as_bytes()
+                        ),
+                    })
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+                    ..Draft::default()
+                },
+            );
+        }
+
         fn signals_with(&self, local: &[u8], post: &Event) -> Signals {
             let local = local.iter().map(|s| id_of(*s)).collect();
             let grouping = Grouping::new(&self.store, local).unwrap();
@@ -675,24 +733,7 @@ mod tests {
         let mut g = Graph::new();
         let ask = g.root(1, Kind::Ask, "how?");
         let answer = g.reply(2, &ask, Kind::Answer, json!({}));
-        let next = key(5).verifying_key();
-        g.add(
-            2,
-            Draft {
-                net: "public".into(),
-                kind: Some(Kind::Rotate),
-                title: Some("rotate".into()),
-                text: "handing over".into(),
-                data: json!({
-                    "new_key": hex::encode(next.as_bytes()),
-                    "new_key_sig": crate::event::rotate_signature(&key(5), key(2).verifying_key().as_bytes()),
-                })
-                .as_object()
-                .unwrap()
-                .clone(),
-                ..Draft::default()
-            },
-        );
+        g.rotate(2, 5);
         g.reply(
             5,
             &answer,
@@ -870,6 +911,104 @@ mod tests {
         g.reply(4, &answer, Kind::Answer, json!({}));
         g.reply(6, &answer, Kind::React, json!({"value": 0}));
         assert_eq!(g.signals(&answer).cites, 2);
+    }
+
+    #[test]
+    fn a_rebuttal_from_the_authors_group_counts_zero() {
+        let mut g = Graph::new();
+        let ask = g.root(1, Kind::Ask, "how?");
+        // 2 is this node's profile, and so is 3; 2 also rotated into 5.
+        let answer = g.reply(2, &ask, Kind::Answer, json!({}));
+        g.rotate(2, 5);
+        let no = g.reply(
+            4,
+            &answer,
+            Kind::React,
+            json!({"value": -1, "evidence": "fails"}),
+        );
+        // The author's successor key rebutting: zero.
+        g.reply(
+            5,
+            &no,
+            Kind::React,
+            json!({"value": -1, "evidence": "works here"}),
+        );
+        assert_eq!(g.signals(&answer).status, Status::Contested);
+        // The node's other profile rebutting the node's post: zero.
+        g.reply(
+            3,
+            &no,
+            Kind::React,
+            json!({"value": -1, "evidence": "works here"}),
+        );
+        let s = g.signals_with(&[2, 3], &answer);
+        assert_eq!((s.status, s.rebutted), (Status::Contested, 0));
+        // Elsewhere, 3 is any other key: the rebuttal holds.
+        assert_eq!(g.signals(&answer).rebutted, 1);
+    }
+
+    #[test]
+    fn replies_to_a_root_ask_are_not_citations_of_it() {
+        let mut g = Graph::new();
+        let ask = g.root(1, Kind::Ask, "how?");
+        let answer = g.reply(2, &ask, Kind::Answer, json!({}));
+        g.reply(3, &ask, Kind::Note, json!({}));
+        assert_eq!(g.signals(&ask).cites, 0);
+        // A reply to an answer cites the answer.
+        g.reply(3, &answer, Kind::Answer, json!({}));
+        assert_eq!(g.signals(&answer).cites, 1);
+        // The ask cited in refs from another thread counts.
+        let other = g.root(4, Kind::Ask, "related?");
+        g.reply_citing(5, &other, Kind::Answer, json!({}), &[&ask]);
+        assert_eq!(g.signals(&ask).cites, 1);
+        // A reply to a note, or to an ask that is not a thread root, cites it.
+        let note = g.root(1, Kind::Note, "fyi");
+        g.reply(3, &note, Kind::Note, json!({}));
+        assert_eq!(g.signals(&note).cites, 1);
+        let follow_up = g.reply(1, &answer, Kind::Ask, json!({}));
+        g.reply(4, &follow_up, Kind::Answer, json!({}));
+        assert_eq!(g.signals(&follow_up).cites, 1);
+    }
+
+    #[test]
+    fn citations_never_come_from_the_authors_group_a_contradiction_or_a_react() {
+        let mut g = Graph::new();
+        let ask = g.root(1, Kind::Ask, "how?");
+        let answer = g.reply(2, &ask, Kind::Answer, json!({}));
+        let other = g.root(6, Kind::Ask, "again?");
+        // The author's successor key, and the node's other profile.
+        g.rotate(2, 5);
+        g.reply_citing(5, &other, Kind::Answer, json!({}), &[&answer]);
+        g.reply_citing(3, &other, Kind::Answer, json!({}), &[&answer]);
+        assert_eq!(g.signals_with(&[2, 3], &answer).cites, 0);
+        // A react, even with refs, never cites.
+        g.reply_citing(7, &other, Kind::React, json!({"value": 1}), &[&answer]);
+        g.reply(7, &answer, Kind::React, json!({"value": 0}));
+        assert_eq!(g.signals_with(&[2, 3], &answer).cites, 0);
+        // The reasoning of a contradiction is not a citation.
+        g.reply(4, &answer, Kind::Note, json!({}));
+        g.reply(4, &answer, Kind::React, json!({"value": -1}));
+        let s = g.signals_with(&[2, 3], &answer);
+        assert_eq!((s.contradicts, s.cites), (1, 0));
+    }
+
+    #[test]
+    fn only_the_askers_key_or_its_successor_accepts() {
+        let mut g = Graph::new();
+        // 1 is the human's profile, 3 its node's agent profile.
+        let ask = g.root(1, Kind::Ask, "how?");
+        let answer = g.reply(2, &ask, Kind::Answer, json!({}));
+        g.reply(3, &answer, Kind::React, json!({"accept": true}));
+        let s = g.signals_with(&[1, 3], &answer);
+        assert_eq!((s.accepts, s.status), (0, Status::Unverified));
+        // The asker's successor key accepts for it.
+        g.rotate(1, 5);
+        g.reply(5, &answer, Kind::React, json!({"accept": true}));
+        assert_eq!(g.signals_with(&[1, 3], &answer).accepts, 1);
+        // The node's agent's own answer accepted by its human: zero.
+        let agents = g.reply(3, &ask, Kind::Answer, json!({}));
+        g.reply(1, &agents, Kind::React, json!({"accept": true}));
+        assert_eq!(g.signals_with(&[1, 3], &agents).accepts, 0);
     }
 
     #[test]

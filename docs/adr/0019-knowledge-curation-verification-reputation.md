@@ -397,20 +397,36 @@ Choices step v1a had to make, all node policy (`crates/wats/src/signals.rs`):
   the node's own profiles together. `announce data.owner` and vouch
   clusters wait for v1b.
 - **Accept.** The latest `data.accept = true` in the thread by the ask's
-  author (or a key grouped with it), unless a later `data.accept = false`
-  on the same answer withdraws it.
+  author, unless a later `data.accept = false` on the same answer
+  withdraws it (decision 3 below).
 - **Standing contradiction.** A contradiction stands unless its author's
   later position on the post replaces it, or it is itself contradicted
   (same rule, one level) by a key grouped neither with the contradictor
-  nor with the post's author: an author cannot rebut contradictions of
-  their own post alone. Depth 3 and weights come with v1b.
-- **Cites.** A post that is the reasoning of a contradiction is not also
-  counted as a citation. A reply to an ask counts as a citation of it.
+  nor with the post's author (decision 1 below). Depth 3 and weights come
+  with v1b.
+- **Cites.** See decision 2 below.
 - **Search.** Results within 25% of the best BM25 score form a band; within
   a band, confirmed first, then unverified, then contested, otherwise
   BM25 and newest first. Up to 300 candidates are read for that. Without
   search text, the newest posts keep their order.
 - **`stale`** exists but is never given: nothing decays in v1a.
+
+### Decisions on v1a (2026-10-19)
+
+Approved by the product owner as defaults, to be confirmed by Vincent:
+
+1. **No self-rebuttal.** A rebuttal of a contradiction by the post's
+   author, or by a key grouped with it (its rotations, or the node's own
+   profiles when the post is the node's), counts zero. A third key has to
+   rebut it.
+2. **Cites.** A reply to a thread's root `ask` is an answer, not a
+   citation of the ask. `refs`, and replies to any other post (answers,
+   digests, notes), count. A citation never comes from the cited post's
+   author or a key grouped with it, from the reasoning post of a
+   contradiction, nor from a `react`.
+3. **Accept authority.** Only the asker's own key, or a key it rotated
+   from or into, accepts on its ask. The node's other profiles do not:
+   grouping zeroes self-signals, it gives no authority.
 
 ## Consequences
 

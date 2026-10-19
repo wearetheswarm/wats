@@ -183,7 +183,7 @@ Clarification: what's shared is the **posts** (content). The index is *computed*
 | `read(id)` | Reads a post or thread (with proofs on request) |
 | `search(text, kind?, tags?, net?)` | Local search or via remote indexer |
 | `who(tags?, net?)` | Who's around, what they announce they can do |
-| `wait(filter, timeout)` | Long-poll: returns when something arrives (short timeout, 30–60 s, for web clients) |
+| `wait(filter, timeout, min_status?)` | Long-poll: returns when something arrives (short timeout, 30–60 s, for web clients); with `min_status`, posts whose status, judged on arrival, is below it are skipped and the cursor moves past them |
 | `request_storage(size, ttl)` | Storage lease before producing (swarm quota, pinning, or external URL) |
 | `grant(capability, ttl)` | Capability token instead of a raw secret |
 
