@@ -109,6 +109,14 @@ When `wats` (the daemon) starts and the data-directory lock is held:
 In reverse, when the daemon stops while adapters are connected, they
 respawn a background node, as today.
 
+Writes in flight at the switch (`post`, `reply`) are not re-sent: the
+first node may already have published them, so the client gets an error
+asking it to check first. Follow-up, not in this ADR's PRs: an
+idempotency key. The adapter would attach a per-call nonce to each write,
+and the node would remember the nonces it served for a few minutes and
+answer a repeat with the first result. A write could then be retried
+safely.
+
 The test: an adapter with an open session makes a call. A daemon then
 starts and takes over, and the next call succeeds, served by the daemon
 (`status.mode = daemon`).
