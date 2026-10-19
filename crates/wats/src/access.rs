@@ -59,8 +59,8 @@ knows and how it should answer; it reads this file at every run.
 - Claude Code: skills go in `.claude/skills/`, MCP servers in `.mcp.json`,
   settings in `.claude/settings.json`.
 - Codex: MCP servers go in `.codex/config.toml` (`[mcp_servers.<name>]`).
-- Built-in tools are listed in `agent.tools` (`wats config set agent.tools
-  Read,Grep`).
+- Tools are listed in `agent.tools`: Claude Code tools (`wats config set
+  agent.tools Read,Grep`) or Codex features (`image_generation`).
 
 Whatever the agent can read here may end up posted to the swarm, and
 whatever it can do, a post can ask for.
@@ -309,7 +309,13 @@ pub fn claude_args(run: &ClaudeRun) -> Vec<String> {
                     .map(|name| format!("mcp__{name}__*")),
             );
             let rules: Vec<(String, String)> = run.tools.iter().map(|t| tool_rule(t)).collect();
-            let mut bases: Vec<String> = rules.iter().map(|(b, _)| b.clone()).collect();
+            // `--tools` lists built-in tools; MCP tools (`mcp__docs__search`)
+            // are only allowed.
+            let mut bases: Vec<String> = rules
+                .iter()
+                .map(|(b, _)| b.clone())
+                .filter(|b| !b.starts_with("mcp__"))
+                .collect();
             bases.dedup();
             allowed.extend(rules.into_iter().map(|(_, r)| r));
             out.extend(defaults(
@@ -421,6 +427,81 @@ pub const CODEX_DENIED_FEATURES: &[&str] = &[
     "standalone_web_search",
 ];
 
+/// The Codex feature that generates images (`image_gen.imagegen`, saved to
+/// `$CODEX_HOME/generated_images/<thread id>/<call id>.png`).
+pub const CODEX_IMAGE_GENERATION: &str = "image_generation";
+
+/// What a Codex run switches off and on, from `agent.tools` and the
+/// features the installed Codex knows.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct CodexFeatures {
+    /// The [`CODEX_DENIED_FEATURES`] it knows, but those `agent.tools` lists.
+    pub disable: Vec<String>,
+    /// Features `agent.tools` lists (workspace access): enabled.
+    pub enable: Vec<String>,
+    /// Names in `agent.tools` that are no feature of this Codex.
+    pub unknown: Vec<String>,
+}
+
+/// The features of a locked or workspace Codex run. Only `workspace`
+/// opens what `agent.tools` lists; `locked` ignores it.
+pub fn codex_features_for(access: Access, tools: &[String], known: &[String]) -> CodexFeatures {
+    let listed: &[String] = if access == Access::Workspace {
+        tools
+    } else {
+        &[]
+    };
+    let knows = |f: &str| known.iter().any(|k| k == f);
+    CodexFeatures {
+        disable: CODEX_DENIED_FEATURES
+            .iter()
+            .filter(|f| knows(f) && !listed.iter().any(|t| t == *f))
+            .map(|f| f.to_string())
+            .collect(),
+        enable: listed.iter().filter(|t| knows(t)).cloned().collect(),
+        unknown: listed.iter().filter(|t| !knows(t)).cloned().collect(),
+    }
+}
+
+/// Whether a Codex run can generate images: `inherit` (the user's own
+/// features), or `workspace` with `image_generation` in `agent.tools`.
+pub fn codex_generates_images(runtime: &str, access: Access, tools: &[String]) -> bool {
+    runtime == "codex"
+        && match access {
+            Access::Locked => false,
+            Access::Workspace => tools.iter().any(|t| t == CODEX_IMAGE_GENERATION),
+            Access::Inherit => true,
+        }
+}
+
+/// Where Codex keeps its state: `$CODEX_HOME`, else `~/.codex`.
+pub fn codex_home() -> Option<PathBuf> {
+    std::env::var_os("CODEX_HOME")
+        .filter(|h| !h.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| home().map(|h| h.join(".codex")))
+}
+
+/// Where Codex saves the images of one thread:
+/// `<codex home>/generated_images/<thread id>`, the id sanitized as Codex
+/// does (`ext/image-generation/src/artifact.rs`).
+pub fn codex_images_dir(codex_home: &Path, thread_id: &str) -> PathBuf {
+    let mut id: String = thread_id
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    if id.is_empty() {
+        id = "generated_image".into();
+    }
+    codex_home.join("generated_images").join(id)
+}
+
 /// The features the installed Codex knows (`codex features list`).
 pub async fn codex_features(command: &Path) -> Vec<String> {
     let Ok(out) = tokio::process::Command::new(command)
@@ -445,6 +526,8 @@ pub struct CodexRun<'a> {
     pub runner_token: &'a str,
     /// Features to disable (locked and workspace).
     pub disable: &'a [String],
+    /// Features `agent.tools` lists, enabled (workspace).
+    pub enable: &'a [String],
     /// `-c` overrides for the workspace's MCP servers.
     pub workspace_overrides: &'a [String],
     pub extra: &'a [String],
@@ -500,6 +583,11 @@ pub fn codex_args(run: &CodexRun) -> Vec<String> {
         for feature in run.disable {
             out.extend(["--disable".into(), feature.clone()]);
         }
+        if run.access == Access::Workspace {
+            for feature in run.enable {
+                out.extend(["--enable".into(), feature.clone()]);
+            }
+        }
     }
     out.extend(run.extra.iter().cloned());
     out.push("-".into());
@@ -536,9 +624,7 @@ fn claude_environment() -> (usize, String) {
 
 /// The user's Codex MCP servers.
 fn codex_servers() -> usize {
-    std::env::var_os("CODEX_HOME")
-        .map(PathBuf::from)
-        .or_else(|| home().map(|h| h.join(".codex")))
+    codex_home()
         .and_then(|d| std::fs::read_to_string(d.join("config.toml")).ok())
         .and_then(|t| t.parse::<toml_edit::DocumentMut>().ok())
         .and_then(|doc| {
@@ -557,7 +643,7 @@ pub fn prompt_line(runtime: &str, access: Access, workdir: &Path, tools: &[Strin
     let shell = tools
         .iter()
         .any(|t| t == "Bash" || t.starts_with("Bash(") || t == "shell_tool");
-    match access {
+    let line = match access {
         Access::Locked if runtime == "openclaw" => format!(
             "Your OpenClaw agent's tool policy for wats runs, normally the wats tools only. \
              Unless you see other tools, assume this: {NOTHING_TO_RUN}"
@@ -583,8 +669,19 @@ pub fn prompt_line(runtime: &str, access: Access, workdir: &Path, tools: &[Strin
             }
         ),
         Access::Inherit => "The tools of your runtime's own configuration.".to_string(),
+    };
+    if codex_generates_images(runtime, access, tools) {
+        format!("{line} {IMAGES_LINE}")
+    } else {
+        line
     }
 }
+
+/// What the prompt tells a Codex run that can generate images: the file
+/// is attachable (its run's thread directory, [`codex_images_dir`]).
+pub const IMAGES_LINE: &str = "Image generation saves each image to a file and its \
+     reply gives the path: to answer with an image, attach that file through `blobs` \
+     in your reply or post.";
 
 /// Inputs of the banner summary.
 pub struct Describe<'a> {
@@ -706,8 +803,13 @@ mod tests {
         );
         assert!(prompt_line("claude", Access::Workspace, dir, &[]).ends_with(cannot));
         assert_eq!(
-            prompt_line("codex", Access::Inherit, dir, &[]),
+            prompt_line("claude", Access::Inherit, dir, &[]),
             "The tools of your runtime's own configuration."
+        );
+        // Codex at inherit has its own image generation.
+        assert_eq!(
+            prompt_line("codex", Access::Inherit, dir, &[]),
+            format!("The tools of your runtime's own configuration. {IMAGES_LINE}")
         );
     }
 
@@ -736,13 +838,14 @@ mod tests {
                 "Read".into(),
                 "Grep(/srv/docs/**)".into(),
                 "WebFetch".into(),
+                "mcp__images__generate".into(),
             ],
             &["docs".into()],
         );
-        assert!(ws.contains("--tools Read,Grep,WebFetch"), "{ws}");
+        assert!(ws.contains("--tools Read,Grep,WebFetch "), "{ws}");
         assert!(
             ws.contains(
-                "--allowedTools mcp__wats__*,mcp__docs__*,Read(./**),Grep(/srv/docs/**),WebFetch"
+                "--allowedTools mcp__wats__*,mcp__docs__*,Read(./**),Grep(/srv/docs/**),WebFetch,mcp__images__generate"
             ),
             "{ws}"
         );
@@ -847,6 +950,7 @@ mod tests {
                 wats_args: &["--dir".into(), "/d".into(), "mcp".into()],
                 runner_token: "t",
                 disable: &["shell_tool".into()],
+                enable: &["image_generation".into()],
                 workspace_overrides: &[],
                 extra: &[],
             })
@@ -857,6 +961,120 @@ mod tests {
             assert!(!args.contains("danger-full-access"), "{args}");
             assert!(!args.contains("writable_roots"), "{args}");
         }
+    }
+
+    /// `agent.tools` with Codex, in workspace: a listed feature the
+    /// installed Codex knows is enabled and not disabled, every other
+    /// denied feature stays off, the sandbox stays read-only, and a name
+    /// Codex does not know is reported. Locked ignores the list.
+    #[test]
+    fn codex_tools_keep_listed_features_on() {
+        let known: Vec<String> = [
+            "shell_tool",
+            "apps",
+            "image_generation",
+            "view_image",
+            "goals",
+        ]
+        .map(str::to_string)
+        .to_vec();
+        let tools: Vec<String> = vec!["image_generation".into(), "Read".into()];
+        let features = codex_features_for(Access::Workspace, &tools, &known);
+        assert_eq!(features.enable, ["image_generation"]);
+        assert_eq!(features.unknown, ["Read"]);
+        assert_eq!(
+            features.disable,
+            ["shell_tool", "apps", "view_image", "goals"]
+        );
+        let args = codex_args(&CodexRun {
+            access: Access::Workspace,
+            wats_command: Path::new("/bin/wats"),
+            wats_args: &[],
+            runner_token: "t",
+            disable: &features.disable,
+            enable: &features.enable,
+            workspace_overrides: &[],
+            extra: &[],
+        })
+        .join(" ");
+        assert!(args.contains("--enable image_generation"), "{args}");
+        assert!(!args.contains("--disable image_generation"), "{args}");
+        for off in ["shell_tool", "apps", "view_image", "goals"] {
+            assert!(args.contains(&format!("--disable {off}")), "{args}");
+        }
+        assert!(args.contains("--sandbox read-only"), "{args}");
+        assert!(!args.contains("workspace-write"), "{args}");
+        assert!(!args.contains("writable_roots"), "{args}");
+        let locked = codex_features_for(Access::Locked, &tools, &known);
+        assert!(locked.enable.is_empty() && locked.unknown.is_empty());
+        assert!(locked.disable.iter().any(|f| f == "image_generation"));
+        let locked_args = codex_args(&CodexRun {
+            access: Access::Locked,
+            wats_command: Path::new("/bin/wats"),
+            wats_args: &[],
+            runner_token: "t",
+            disable: &locked.disable,
+            enable: &["image_generation".into()],
+            workspace_overrides: &[],
+            extra: &[],
+        })
+        .join(" ");
+        assert!(!locked_args.contains("--enable"), "{locked_args}");
+        assert!(
+            locked_args.contains("--disable image_generation"),
+            "{locked_args}"
+        );
+    }
+
+    /// The image directory of a run is its thread's, the id sanitized as
+    /// Codex does: no way out of `generated_images`.
+    #[test]
+    fn codex_images_dir_is_the_threads_own() {
+        let home = Path::new("/h/.codex");
+        assert_eq!(
+            codex_images_dir(home, "0199aaaa-bbbb_c"),
+            Path::new("/h/.codex/generated_images/0199aaaa-bbbb_c")
+        );
+        assert_eq!(
+            codex_images_dir(home, "../../x"),
+            Path::new("/h/.codex/generated_images/______x")
+        );
+        assert_eq!(
+            codex_images_dir(home, ""),
+            Path::new("/h/.codex/generated_images/generated_image")
+        );
+        assert!(codex_generates_images(
+            "codex",
+            Access::Workspace,
+            &["image_generation".into()]
+        ));
+        assert!(codex_generates_images("codex", Access::Inherit, &[]));
+        assert!(!codex_generates_images(
+            "codex",
+            Access::Locked,
+            &["image_generation".into()]
+        ));
+        assert!(!codex_generates_images(
+            "claude",
+            Access::Workspace,
+            &["image_generation".into()]
+        ));
+        let line = prompt_line(
+            "codex",
+            Access::Workspace,
+            Path::new("/w"),
+            &["image_generation".into()],
+        );
+        assert!(line.ends_with(IMAGES_LINE), "{line}");
+        assert!(
+            !prompt_line(
+                "codex",
+                Access::Locked,
+                Path::new("/w"),
+                &["image_generation".into()]
+            )
+            .contains("blobs")
+        );
     }
 
     #[test]

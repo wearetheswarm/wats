@@ -91,6 +91,7 @@ wats --dir ~/.wats-router id --host router.wearetheswarm.ai
 # created a new node secret at ~/.wats-router/secret.key
 # endpoint_id: <64 hex>
 # author_id: ...
+# author_to: to:... (the tag that addresses it)
 # bootstrap_entry: <64 hex>@router.wearetheswarm.ai:7842
 ```
 

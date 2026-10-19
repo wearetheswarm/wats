@@ -762,8 +762,8 @@ struct SetupKeys {
     /// The agent's directory with workspace access (agent.workdir).
     #[arg(long)]
     workdir: Option<PathBuf>,
-    /// Built-in tools allowed with workspace access (agent.tools), e.g.
-    /// Read,Grep.
+    /// Tools allowed with workspace access (agent.tools), any name the
+    /// runtime knows: Read,Grep (Claude Code), image_generation (Codex).
     #[arg(long)]
     tools: Option<String>,
     /// The agent's model (agent.model), e.g. sonnet; unset uses the
@@ -2093,6 +2093,14 @@ fn setup_tool(
             file.set(&key(leaf), value)?;
         }
         file.save()?;
+        if pairs
+            .iter()
+            .any(|(leaf, _)| *leaf == "tools" || *leaf == "access")
+        {
+            for warning in file.tools_warnings(&key("tools")) {
+                eprintln!("warning: {warning}");
+            }
+        }
         let settings = Settings::load(data_dir)?;
         let member = wats::roster::configured(&settings, data_dir, &os_user_profile())?
             .into_iter()
@@ -2105,7 +2113,7 @@ fn setup_tool(
             println!(
                 "agent workspace: {}\n  instructions: CLAUDE.md / AGENTS.md\n  skills: .claude/skills/\n  \
                  MCP servers: .mcp.json (Claude), .codex/config.toml (Codex)\n  \
-                 built-in tools: wats config set {} Read,Grep",
+                 tools: wats config set {} Read,Grep (Codex: image_generation)",
                 dir.display(),
                 key("tools")
             );
@@ -2245,6 +2253,9 @@ fn config_command(data_dir: &std::path::Path, action: ConfigAction) -> Result<()
             let before = safety_before(data_dir, &key);
             file.set(&key, &value)?;
             file.save()?;
+            for warning in file.tools_warnings(&key) {
+                eprintln!("warning: {warning}");
+            }
             safety_after(data_dir, before);
         }
         ConfigAction::Unset { key } => {
@@ -3495,6 +3506,9 @@ fn print_id(config: &NodeConfig, host: &str) -> Result<()> {
         .unwrap_or(wats::bootstrap::DEFAULT_BOOTSTRAP_PORT);
     println!("endpoint_id: {endpoint}");
     println!("author_id: {author} (profile {})", config.profile);
+    if let Some(to) = wats::delivery::to_tag(&author) {
+        println!("author_to: {to} (the tag that addresses it)");
+    }
     println!("bootstrap_entry: {endpoint}@{host}:{port}");
     Ok(())
 }
@@ -4316,6 +4330,7 @@ fn agent_config(
             .or(file.model.clone())
             .filter(|m| !m.trim().is_empty()),
         codex_disable: Vec::new(),
+        codex_enable: Vec::new(),
         access,
         workdir: member.workspace(),
         tools: file.tools.clone(),

@@ -21,6 +21,7 @@ use std::time::Duration;
 use serde_json::{Value, json};
 
 use crate::event::{Event, Kind};
+use crate::identity::{author_id_base32, author_id_from_base32};
 use crate::signals::Grouping;
 
 /// `claim.data.lease` when absent or malformed: 15 minutes.
@@ -37,12 +38,6 @@ pub const DEFAULT_CAP_GRACE: Duration = Duration::from_secs(120);
 pub const CLAIM_JITTER: Duration = Duration::from_secs(5);
 /// At most this many `to:` tags count on an ask.
 pub const MAX_TO: usize = 4;
-/// The shortest author id prefix a `to:` tag may carry. A tag holds 64
-/// bytes at most, so `to:` and a full 64-hex id do not fit: the tag
-/// carries a prefix of the id.
-pub const TO_MIN_HEX: usize = 16;
-/// The prefix length `post` shortens a full author id to in a `to:` tag.
-pub const TO_HEX: usize = 32;
 /// The largest `want` or `max` read; larger values are read as this.
 const MAX_COUNT: u64 = 1000;
 
@@ -103,7 +98,7 @@ pub struct Request {
     pub want: usize,
     /// `data.max`, when set and valid.
     pub max: Option<usize>,
-    /// Author id prefixes of its `to:` tags (lowercase hex, at most
+    /// The author ids its `to:` tags name (lowercase hex, at most
     /// [`MAX_TO`]).
     pub to: Vec<String>,
     /// Its `cap:` tags, lowercase.
@@ -113,7 +108,8 @@ pub struct Request {
 impl Request {
     /// Read from an ask, leniently: an unknown or malformed `mode` is
     /// `any`, and so is `n` without a valid `want`; a malformed `max` is
-    /// unset; malformed `to:` tags are ignored.
+    /// unset; a `to:` tag that does not carry a full author id in base32
+    /// is ignored.
     pub fn of(ask: &Event) -> Self {
         let mut mode = match ask.data.get("mode").and_then(Value::as_str) {
             Some(m) => match m.trim().to_ascii_lowercase().as_str() {
@@ -135,11 +131,9 @@ impl Request {
         let mut to: Vec<String> = Vec::new();
         let mut caps: Vec<String> = Vec::new();
         for tag in &ask.tags {
-            if let Some(id) = tag_value(tag, "to:") {
-                let id = id.to_ascii_lowercase();
-                if to.len() < MAX_TO
-                    && (TO_MIN_HEX..=64).contains(&id.len())
-                    && id.bytes().all(|b| b.is_ascii_hexdigit())
+            if let Some(value) = tag_value(tag, "to:") {
+                if let Some(id) = author_id_from_base32(value)
+                    && to.len() < MAX_TO
                     && !to.contains(&id)
                 {
                     to.push(id);
@@ -183,9 +177,9 @@ impl Request {
         }
     }
 
-    /// Whether a `to:` tag names the author `me`.
+    /// Whether a `to:` tag names the author `me` (an author id).
     pub fn addresses(&self, me: &str) -> bool {
-        self.to.iter().any(|prefix| me.starts_with(prefix.as_str()))
+        self.to.iter().any(|id| id.eq_ignore_ascii_case(me))
     }
 
     /// Whether an agent with these capability tags (`agent.caps` as
@@ -587,14 +581,54 @@ impl State {
     }
 }
 
-/// A `to:` tag with a full author id, shortened to [`TO_HEX`] characters
-/// so that it fits in a tag; any other tag as is.
-pub fn fit_to_tag(tag: String) -> String {
-    match tag_value(&tag, "to:") {
-        Some(id) if id.len() == 64 && id.bytes().all(|b| b.is_ascii_hexdigit()) => {
-            format!("to:{}", id[..TO_HEX].to_ascii_lowercase())
+/// The `to:` tag that addresses the author `id` (64 hex characters):
+/// `to:` and the id in lowercase base32, 55 bytes, so that it fits in a
+/// tag (ADR 0022 §1). `None` when `id` is not an author id.
+pub fn to_tag(id: &str) -> Option<String> {
+    author_id_base32(id).map(|b32| format!("to:{b32}"))
+}
+
+/// A `to:` tag in the form nodes read: an author id in hex (64
+/// characters) or base32 (52, either case) becomes `to:<base32>`; any
+/// other tag as is. With a note when a `to:` tag addresses nobody.
+pub fn normalize_to_tag(tag: String) -> (String, Option<String>) {
+    let Some(value) = tag_value(&tag, "to:") else {
+        return (tag, None);
+    };
+    let id = match value.len() {
+        64 => value.to_ascii_lowercase(),
+        _ => author_id_from_base32(value).unwrap_or_default(),
+    };
+    match to_tag(&id) {
+        Some(normalized) => (normalized, None),
+        None => {
+            let note = format!(
+                "{} is not a full author id (64 hex or 52 base32 characters): it addresses nobody",
+                short_tag(&tag)
+            );
+            (tag, Some(note))
         }
-        _ => tag,
+    }
+}
+
+/// [`normalize_to_tag`] on each tag, and the notes.
+pub fn normalize_to_tags(tags: Vec<String>) -> (Vec<String>, Vec<String>) {
+    let mut notes = Vec::new();
+    let tags = tags
+        .into_iter()
+        .map(|tag| {
+            let (tag, note) = normalize_to_tag(tag);
+            notes.extend(note);
+            tag
+        })
+        .collect();
+    (tags, notes)
+}
+
+fn short_tag(tag: &str) -> String {
+    match tag.char_indices().nth(24) {
+        Some((at, _)) => format!("{}...", &tag[..at]),
+        None => tag.to_string(),
     }
 }
 
@@ -789,10 +823,38 @@ mod tests {
         assert_eq!(notes(Kind::Ask, json!({"max": "lots"})).len(), 1);
         assert_eq!(notes(Kind::Claim, json!({"lease": 0})).len(), 1);
         assert!(notes(Kind::Claim, json!({"lease": 60})).is_empty());
-        let full = format!("to:{}", "AB".repeat(32));
-        assert_eq!(fit_to_tag(full), format!("to:{}", "ab".repeat(16)));
-        assert_eq!(fit_to_tag("to:abc".into()), "to:abc");
-        assert_eq!(fit_to_tag("cap:pdf".into()), "cap:pdf");
+    }
+
+    #[test]
+    fn to_tags_are_normalized_to_base32() {
+        let me = id(2);
+        let tag = to_tag(&me).unwrap();
+        assert_eq!(tag.len(), 55, "fits in a tag");
+        // Hex or base32, either case, give the same tag (tags are
+        // lowercase).
+        for given in [
+            format!("to:{me}"),
+            format!("TO:{}", me.to_ascii_uppercase()),
+            tag.clone(),
+            tag.to_ascii_uppercase(),
+        ] {
+            assert_eq!(normalize_to_tag(given), (tag.clone(), None));
+        }
+        // Anything else is kept as is, with a note.
+        for odd in [
+            format!("to:{}", &me[..32]),
+            format!("to:{}", &tag[3..54]),
+            "to:abc".to_string(),
+            format!("to:{}x", &me[..63]),
+        ] {
+            let (kept, note) = normalize_to_tag(odd.clone());
+            assert_eq!(kept, odd);
+            assert!(note.unwrap().contains("addresses nobody"));
+        }
+        assert_eq!(normalize_to_tag("cap:pdf".into()), ("cap:pdf".into(), None));
+        let (tags, notes) = normalize_to_tags(vec![format!("to:{me}"), "to:x".into()]);
+        assert_eq!(tags, [tag, "to:x".to_string()]);
+        assert_eq!(notes.len(), 1);
     }
 
     #[test]
@@ -811,26 +873,30 @@ mod tests {
     #[test]
     fn routing_tags() {
         let me = id(2);
+        let to = |seed: u8| to_tag(&id(seed)).unwrap();
         let r = Request::of(&ask(
             1,
             json!({}),
             &[
-                &format!("to:{}", &me[..32]),
+                &to(2),
+                // A prefix of an id, hex or base32, addresses nobody.
+                &format!("to:{}", &id(3)[..32]),
+                &to(4)[..54],
                 "to:abc",
-                "to:not-hex-not-hex-not-hex",
+                "to:not-base32-not-base32-not-base32-not-base32-not1",
                 "cap:pdf",
                 "cap:rust",
                 "topic:x",
             ],
         ));
-        assert_eq!(r.to, [me[..32].to_string()]);
+        assert_eq!(r.to, std::slice::from_ref(&me));
         assert!(r.addresses(&me));
-        assert!(!r.addresses(&id(3)));
+        assert!(!r.addresses(&id(3)) && !r.addresses(&id(4)));
         assert_eq!(r.caps, ["cap:pdf", "cap:rust"]);
         assert!(r.capable(&["cap:rust".into(), "cap:pdf".into()]));
         assert!(!r.capable(&["cap:rust".into()]), "every cap: is needed");
         // At most four `to:`.
-        let tags: Vec<String> = (2..8).map(|s| format!("to:{}", &id(s)[..16])).collect();
+        let tags: Vec<String> = (2..8).map(to).collect();
         let tags: Vec<&str> = tags.iter().map(String::as_str).collect();
         let r = Request::of(&ask(1, json!({}), &tags));
         assert_eq!(r.to.len(), MAX_TO);

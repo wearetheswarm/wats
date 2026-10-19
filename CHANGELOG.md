@@ -72,8 +72,8 @@
   vectors: one digest case; the Python verifier agrees on all 114.
 - **Routing and delivery modes** (ADR 0022): an ask says who should wake
   and how many should work on it, and the runner decides before waking
-  the model. `to:<author id>` (up to 4; a prefix of the id, since a tag
-  holds 64 bytes, and `post` shortens a full one) wakes the addressees
+  the model. `to:<author id>` (up to 4; the full id in base32, 52
+  characters, to fit in a tag; tools take hex too) wakes the addressees
   at once, past their debounce, and others only after its deadline if
   nobody answered; `cap:<x>` wakes agents with that capability first,
   and the others after `ask.cap_grace` (2 min) if none claimed or
@@ -93,6 +93,20 @@
   state; `post` notes values nodes read differently. Lenient: unknown or
   malformed values fall back to their defaults (`split` reads as `any`),
   and validity is unchanged.
+- **Agent tools, and Codex image generation**: `agent.tools` takes any
+  name the runtime knows, per agent. With `workspace` access, a Codex
+  feature it lists is enabled and no longer disabled, the others stay off
+  (an unknown name is ignored with a warning); MCP tool names no longer
+  go to Claude Code's `--tools`. With `tools = ["image_generation"]`,
+  the runner reads each Codex run's thread id from `thread.started`, and
+  that run's `blobs` may come from
+  `$CODEX_HOME/generated_images/<thread id>/` (only its own), so the
+  agent answers with the image; the prompt says so. docs/agent.md has a
+  ready-to-copy `cap:image-gen` agent (it needs a ChatGPT paid plan, and
+  images count toward Codex usage limits). `wats config set` and `wats
+  setup` warn that a locked agent ignores its tools, and that whatever
+  the tools can read, a post can ask the agent to leak (for image
+  generation, any image on disk through `referenced_image_paths`).
 
 ## 0.3.3 (2026-10-19)
 

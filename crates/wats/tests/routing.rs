@@ -114,6 +114,7 @@ fn agent(root: &Path, data: &Path, caps: &[&str], every: Duration) -> AgentConfi
         budget: wats::budget::Budget::default(),
         wakes: wats::wake::WakeLimits::unlimited(),
         codex_disable: vec![],
+        codex_enable: vec![],
         access: wats::access::Access::Locked,
         workdir: PathBuf::from("/nonexistent"),
         tools: vec![],
@@ -509,9 +510,10 @@ async fn an_accept_stops_everyone() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// `to:` wakes the addressee at once, bypassing its debounce; another
-/// agent leaves it alone until its deadline, and wakes then since nobody
-/// answered.
+/// `to:` with the full author id in base32 wakes the addressee at once,
+/// bypassing its debounce; another agent leaves it alone until its
+/// deadline, and wakes then since nobody answered. A prefix of an id
+/// addresses nobody: the ask is a plain one.
 #[tokio::test(flavor = "multi_thread")]
 async fn to_wakes_the_addressee_at_once() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
@@ -537,7 +539,8 @@ async fn to_wakes_the_addressee_at_once() -> anyhow::Result<()> {
     })
     .await;
     // An ask to a's agent, with a deadline in 4 s.
-    let to = format!("to:{}", &agent_id(&a)[..32]);
+    let to = wats::delivery::to_tag(&agent_id(&a)).unwrap();
+    assert_eq!(to.len(), 55);
     let deadline = wats::node::now_secs() + 4;
     let addressed = hub
         .publish(
@@ -568,6 +571,21 @@ async fn to_wakes_the_addressee_at_once() -> anyhow::Result<()> {
     .await;
     let (_, at) = runs_for(&rb, &addressed).remove(0);
     assert!(at.duration_since(SystemTime::UNIX_EPOCH)?.as_secs() >= deadline);
+
+    // A hex prefix of a's id, with a far deadline:
+    // nobody is addressed, so b does not wait for the deadline.
+    let prefix = format!("to:{}", &agent_id(&a)[..32]);
+    let deadline = wats::node::now_secs() + 600;
+    let nobody = hub
+        .publish(
+            ask_with("A prefix", json!({"deadline": deadline}), &[prefix]),
+            &[],
+        )
+        .await?;
+    eventually("both woke for the prefix", 20, || {
+        !runs_for(&ra, &nobody).is_empty() && !runs_for(&rb, &nobody).is_empty()
+    })
+    .await;
 
     runner_a.stop().await?;
     runner_b.stop().await?;

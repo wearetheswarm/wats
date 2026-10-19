@@ -404,6 +404,11 @@ pub struct RunnerRun {
     pub events: Vec<String>,
     /// The profile of the agent the run is for (empty: unknown).
     pub profile: String,
+    /// Directories it may share files from besides its session's working
+    /// directory: a Codex run's own image directory
+    /// (`$CODEX_HOME/generated_images/<thread id>`), registered by the
+    /// runner when the thread starts.
+    pub file_roots: Vec<PathBuf>,
 }
 
 /// What a node did about a guardian halt (ADR 0016 §3).
@@ -2888,8 +2893,35 @@ impl Node {
                     .find_map(|r| r.strip_prefix("openclaw as "))
                     .unwrap_or_default()
                     .to_string(),
+                file_roots: Vec::new(),
             }
         })
+    }
+
+    /// Let the run of `token` share files from `dir` too (a Codex run's
+    /// image directory, once its thread id is known), until it ends.
+    pub fn add_runner_file_root(&self, token: &str, dir: PathBuf) {
+        if let Ok(mut tokens) = self.runner_tokens.lock()
+            && let Some(run) = tokens.get_mut(token)
+            && !run.file_roots.contains(&dir)
+        {
+            run.file_roots.push(dir);
+        }
+    }
+
+    /// The directories the run `id` may share files from besides its
+    /// session's own, while it runs.
+    pub fn runner_file_roots(&self, id: &str) -> Vec<PathBuf> {
+        self.runner_tokens
+            .lock()
+            .ok()
+            .and_then(|tokens| {
+                tokens
+                    .values()
+                    .find(|run| run.id == id)
+                    .map(|run| run.file_roots.clone())
+            })
+            .unwrap_or_default()
     }
 
     pub fn end_runner_token(&self, token: &str) {

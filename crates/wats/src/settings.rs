@@ -479,6 +479,16 @@ impl Settings {
     }
 }
 
+/// Printed when an agent's tools are set: the rule the docs repeat.
+pub const TOOLS_WARNING: &str = "whatever these tools can read, a post can ask the agent to \
+     leak, and whatever they can do, a post can ask for (agent.allow and agent.review limit \
+     who and what)";
+
+/// Printed when Codex image generation is in an agent's tools.
+pub const IMAGE_GENERATION_WARNING: &str = "Codex image generation edits images from any \
+     path on disk (its `referenced_image_paths`): a post can ask for one, which is then sent \
+     to OpenAI; images count toward your Codex usage limits";
+
 /// Keys that are no longer used: a file that sets them still loads (they
 /// are ignored, with a warning), `wats config set` refuses them, and
 /// `wats config unset` removes them.
@@ -849,7 +859,9 @@ pub const KEYS: &[Key] = &[
         "agent.tools",
         ValueType::List,
         "none",
-        "built-in tools with workspace access, e.g. Read,Grep (Codex: features)",
+        "tools the agent may use with workspace access, any name its runtime knows: \
+         Claude Code tools (Read,Grep,mcp__<server>__<tool>) or Codex features \
+         (image_generation); locked ignores them",
     ),
     key(
         "agent.model",
@@ -1490,6 +1502,52 @@ impl ConfigFile {
         Ok(())
     }
 
+    /// Warnings after setting `name`, when it is an agent's `tools` or
+    /// `access`: locked access ignores the tools, and whatever the tools
+    /// can read, a post can ask the agent to leak.
+    pub fn tools_warnings(&self, name: &str) -> Vec<String> {
+        let Some((table, leaf @ ("tools" | "access"))) = name.rsplit_once('.') else {
+            return Vec::new();
+        };
+        if !(table == "agent" || table.starts_with("agents.")) {
+            return Vec::new();
+        }
+        let tools: Vec<String> = self
+            .place(&format!("{table}.tools"))
+            .ok()
+            .and_then(|place| self.item(&place))
+            .and_then(|item| item.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default();
+        if tools.is_empty() {
+            return Vec::new();
+        }
+        let access = self
+            .get(&format!("{table}.access"))
+            .map(|v| v.trim_matches('"').to_string())
+            .unwrap_or_else(|| "locked".into());
+        let mut out = Vec::new();
+        if access == "locked" {
+            out.push(format!(
+                "locked access ignores {table}.tools; use access workspace \
+                 (`wats config set {table}.access workspace`)"
+            ));
+        } else if leaf == "tools" {
+            out.push(TOOLS_WARNING.to_string());
+            if tools
+                .iter()
+                .any(|t| t == crate::access::CODEX_IMAGE_GENERATION)
+            {
+                out.push(IMAGE_GENERATION_WARNING.to_string());
+            }
+        }
+        out
+    }
+
     /// Remove a key; returns whether it was set.
     pub fn unset(&mut self, name: &str) -> Result<bool> {
         if !REMOVED_KEYS.contains(&name) {
@@ -2024,6 +2082,39 @@ mod tests {
             std::fs::write(&path, bad).unwrap();
             assert!(Settings::load(dir.path()).is_err(), "{bad}");
         }
+    }
+
+    /// `tools` takes any name; on a locked agent (access unset is locked)
+    /// it is kept, with one warning; with workspace access, the leak
+    /// warning, and Codex image generation's own.
+    #[test]
+    fn tools_take_any_name_and_warn() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut file = ConfigFile::open(dir.path()).unwrap();
+        file.set("agents.imagegen.runtime", "codex").unwrap();
+        file.set(
+            "agents.imagegen.tools",
+            "image_generation,mcp__x__y,Anything",
+        )
+        .unwrap();
+        let locked = file.tools_warnings("agents.imagegen.tools");
+        assert_eq!(locked.len(), 1, "{locked:?}");
+        assert!(
+            locked[0]
+                .starts_with("locked access ignores agents.imagegen.tools; use access workspace"),
+            "{locked:?}"
+        );
+        file.set("agents.imagegen.access", "workspace").unwrap();
+        assert!(file.tools_warnings("agents.imagegen.access").is_empty());
+        let open = file.tools_warnings("agents.imagegen.tools");
+        assert_eq!(open, [TOOLS_WARNING, IMAGE_GENERATION_WARNING]);
+        assert!(IMAGE_GENERATION_WARNING.contains("referenced_image_paths"));
+        file.set("agents.imagegen.access", "locked").unwrap();
+        assert_eq!(file.tools_warnings("agents.imagegen.access").len(), 1);
+        assert!(file.tools_warnings("agents.imagegen.about").is_empty());
+        file.save().unwrap();
+        let settings = Settings::load(dir.path()).unwrap();
+        assert_eq!(settings.agents["imagegen"].tools.len(), 3);
     }
 
     /// The first agent written after the single agent ran through `wats
