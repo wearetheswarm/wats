@@ -56,13 +56,6 @@ Command-line flags and `WATS_*` variables, where they exist (`wats --help`), tak
 | `report.crashes` | false | send crash reports without asking (wats report send otherwise) |
 | `report.collector` | our router | node id that collects crash reports (when no inbox key is known) |
 | `report.inbox` | the maintainers' key, once compiled in | inbox public key (base64url) crash reports are sealed to |
-| `report.accept` | false | collect crash reports from other nodes (our router only) |
-
-## `[halt]`
-
-| Key | Default | |
-|---|---|---|
-| `halt.serve` | false | on a guardian halt, keep serving halt events instead of stopping (our router only) |
 
 ## `[health]`
 
@@ -124,3 +117,12 @@ Command-line flags and `WATS_*` variables, where they exist (`wats --help`), tak
 | `agent.max_runs_per_day` | 48 | runs per day that report no cost |
 | `agent.keep_runs` | 200 | transcripts kept |
 | `agent.keep_days` | 30 | transcripts kept at most this many days |
+
+## Operator and test settings
+
+For the operators of infrastructure nodes (the public bootstrap node), and for tests. `wats config list` shows them only with `--all`. Their flags (`--report-accept`, `--halt-serve`), like the test flags `--hermetic` and `--loopback`, work but are hidden from `wats --help`.
+
+| Key | Default | |
+|---|---|---|
+| `report.accept` | false | collect crash reports from other nodes (our router only) |
+| `halt.serve` | false | on a guardian halt, keep serving halt events instead of stopping (our router only) |

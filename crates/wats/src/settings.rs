@@ -784,6 +784,16 @@ pub const KEYS: &[Key] = &[
 /// Keys accepted by `wats config` and in the file, but never listed nor
 /// suggested: `halt.accept` (ADR 0016 §3) is a deliberate choice, made in
 /// the file, not offered.
+/// Settings for the operators of infrastructure nodes (our router) and
+/// for tests: left out of `wats config list` unless `--all`, and listed
+/// apart in docs/config.md.
+pub const OPERATOR_KEYS: [&str; 2] = ["report.accept", "halt.serve"];
+
+/// Whether `name` is one of [`OPERATOR_KEYS`].
+pub fn is_operator_key(name: &str) -> bool {
+    OPERATOR_KEYS.contains(&name)
+}
+
 pub const HIDDEN_KEYS: &[Key] = &[key(
     "halt.accept",
     ValueType::Bool,
@@ -1087,7 +1097,7 @@ pub fn reference_markdown() -> String {
          take precedence over the file.\n",
     );
     let mut section = None;
-    for key in KEYS {
+    for key in KEYS.iter().filter(|k| !is_operator_key(k.name)) {
         let this = key.name.split_once('.').map_or("node", |(s, _)| s);
         if section != Some(this) {
             section = Some(this);
@@ -1110,6 +1120,20 @@ pub fn reference_markdown() -> String {
             key.name,
             cell(key.default),
             cell(key.help)
+        ));
+    }
+    out.push_str(
+        "\n## Operator and test settings\n\n\
+         For the operators of infrastructure nodes (the public bootstrap node), and \
+         for tests. `wats config list` shows them only with `--all`. Their flags \
+         (`--report-accept`, `--halt-serve`), like the test flags `--hermetic` and \
+         `--loopback`, work but are hidden from `wats --help`.\n\n\
+         | Key | Default | |\n|---|---|---|\n",
+    );
+    for key in KEYS.iter().filter(|k| is_operator_key(k.name)) {
+        out.push_str(&format!(
+            "| `{}` | {} | {} |\n",
+            key.name, key.default, key.help
         ));
     }
     out
