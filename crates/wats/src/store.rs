@@ -22,7 +22,7 @@ use crate::event::{Event, Kind};
 pub const INDEXED_TAGS: usize = 16;
 use crate::wire::RawEvent;
 
-const SCHEMA_VERSION: i64 = 6;
+const SCHEMA_VERSION: i64 = 7;
 
 const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS events (
@@ -41,7 +41,9 @@ CREATE TABLE IF NOT EXISTS events (
     v           INTEGER NOT NULL DEFAULT 1,
     -- 1 when this node does not understand the event (ADR 0007): stored
     -- and relayed, not indexed, not returned by search or wait.
-    opaque      INTEGER NOT NULL DEFAULT 0
+    opaque      INTEGER NOT NULL DEFAULT 0,
+    -- The title, for full-text search (schema 7).
+    title       TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS events_net_ts ON events (net, ts, id);
 CREATE INDEX IF NOT EXISTS events_thread ON events (thread);
@@ -78,10 +80,11 @@ CREATE TABLE IF NOT EXISTS sync_state (
 );
 
 CREATE VIRTUAL TABLE IF NOT EXISTS events_fts USING fts5 (
-    text, tags, content = 'events', content_rowid = 'seq'
+    title, text, tags, content = 'events', content_rowid = 'seq'
 );
 CREATE TRIGGER IF NOT EXISTS events_fts_insert AFTER INSERT ON events BEGIN
-    INSERT INTO events_fts (rowid, text, tags) VALUES (new.seq, new.text, new.tags);
+    INSERT INTO events_fts (rowid, title, text, tags)
+        VALUES (new.seq, new.title, new.text, new.tags);
 END;
 
 -- Local drop records (ADR 0020, schema 5): bodies this node dropped, or
@@ -201,9 +204,10 @@ fn retraction_citing(conn: &Connection, target: &str, author: &str) -> Result<Op
 
 /// Remove an opaque row and its (empty) full-text entry.
 fn delete_opaque_row(tx: &rusqlite::Transaction<'_>, seq: i64) -> Result<()> {
-    // Opaque rows are indexed with empty text and tags.
+    // Opaque rows are indexed with empty title, text and tags.
     tx.execute(
-        "INSERT INTO events_fts (events_fts, rowid, text, tags) VALUES ('delete', ?, '', '')",
+        "INSERT INTO events_fts (events_fts, rowid, title, text, tags)
+         VALUES ('delete', ?, '', '', '')",
         [seq],
     )?;
     tx.execute("DELETE FROM event_refs WHERE seq = ?", [seq])?;
@@ -520,6 +524,25 @@ impl Store {
                  ALTER TABLE events ADD COLUMN opaque INTEGER NOT NULL DEFAULT 0;",
             )?;
         }
+        if (1..7).contains(&version) {
+            // v6 -> v7: titles are searched too (ADR 0019 §5.1). The
+            // full-text table gets a column: it is made again by SCHEMA,
+            // then filled from the events kept.
+            let titled: bool = conn.query_row(
+                "SELECT EXISTS (SELECT 1 FROM pragma_table_info('events') WHERE name = 'title')",
+                [],
+                |r| r.get(0),
+            )?;
+            if !titled {
+                conn.execute_batch(
+                    "ALTER TABLE events ADD COLUMN title TEXT NOT NULL DEFAULT '';",
+                )?;
+            }
+            conn.execute_batch(
+                "DROP TRIGGER IF EXISTS events_fts_insert;
+                 DROP TABLE IF EXISTS events_fts;",
+            )?;
+        }
         conn.execute_batch(SCHEMA)?;
         if (1..4).contains(&version) {
             // v2 -> v3: the event format was hardened before the freeze (ADR
@@ -541,6 +564,13 @@ impl Store {
                 "INSERT OR IGNORE INTO event_refs (ref, seq)
                  SELECT r.value, e.seq FROM events e, json_each(e.json, '$.refs') r
                  WHERE e.opaque = 0",
+            )?;
+        }
+        if (1..7).contains(&version) {
+            conn.execute_batch(
+                "UPDATE events SET title = COALESCE(json_extract(json, '$.title'), '')
+                     WHERE opaque = 0;
+                 INSERT INTO events_fts (events_fts) VALUES ('rebuild');",
             )?;
         }
         conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
@@ -667,8 +697,8 @@ impl Store {
                 }
             }
             tx.execute(
-                "INSERT INTO events (id, author, ts, net, thread, parent, kind, text, tags, json, received_at)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "INSERT INTO events (id, author, ts, net, thread, parent, kind, title, text, tags, json, received_at)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 params![
                     event.id,
                     event.author,
@@ -677,6 +707,7 @@ impl Store {
                     event.thread,
                     event.parent,
                     event.kind.as_str(),
+                    event.title.as_deref().unwrap_or_default(),
                     event.text,
                     event.tags[..event.tags.len().min(INDEXED_TAGS)].join(" "),
                     String::from_utf8(event.to_json())?,
@@ -775,11 +806,20 @@ impl Store {
     ) -> Result<DropOutcome> {
         let mut conn = self.conn();
         let tx = conn.transaction()?;
-        let row: Option<(i64, bool, String, String, String)> = tx
+        let row: Option<(i64, bool, String, String, String, String)> = tx
             .query_row(
-                "SELECT seq, opaque, text, tags, json FROM events WHERE id = ?",
+                "SELECT seq, opaque, title, text, tags, json FROM events WHERE id = ?",
                 [id],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+                |r| {
+                    Ok((
+                        r.get(0)?,
+                        r.get(1)?,
+                        r.get(2)?,
+                        r.get(3)?,
+                        r.get(4)?,
+                        r.get(5)?,
+                    ))
+                },
             )
             .optional()?;
         let mut outcome = DropOutcome {
@@ -787,18 +827,19 @@ impl Store {
             ..DropOutcome::default()
         };
         let mut added = 0;
-        if let Some((seq, false, text, tags, json)) = row {
+        if let Some((seq, false, title, text, tags, json)) = row {
             let full: Value = serde_json::from_str(&json).context("corrupt stored event")?;
             let tombstone = crate::wire::tombstone(&full)?;
             let tombstone = serde_json::to_string(&tombstone.wire)?;
             // FTS5 removes an entry given the exact values it indexed; an
             // opaque row keeps an empty entry, as `insert_raw` gives it.
             tx.execute(
-                "INSERT INTO events_fts (events_fts, rowid, text, tags) VALUES ('delete', ?, ?, ?)",
-                params![seq, text, tags],
+                "INSERT INTO events_fts (events_fts, rowid, title, text, tags)
+                 VALUES ('delete', ?, ?, ?, ?)",
+                params![seq, title, text, tags],
             )?;
             tx.execute(
-                "INSERT INTO events_fts (rowid, text, tags) VALUES (?, '', '')",
+                "INSERT INTO events_fts (rowid, title, text, tags) VALUES (?, '', '', '')",
                 [seq],
             )?;
             tx.execute("DELETE FROM event_tags WHERE seq = ?", [seq])?;
@@ -806,7 +847,7 @@ impl Store {
             // Which of the human's clients posted it goes with the body.
             tx.execute("DELETE FROM ask_notify WHERE ask = ?", [id])?;
             tx.execute(
-                "UPDATE events SET json = ?, opaque = 1, text = '', tags = '' WHERE seq = ?",
+                "UPDATE events SET json = ?, opaque = 1, title = '', text = '', tags = '' WHERE seq = ?",
                 params![tombstone, seq],
             )?;
             added = tombstone.len() as u64;
@@ -1498,6 +1539,87 @@ impl Store {
         let mut stmt = conn.prepare_cached(&sql)?;
         let rows = stmt.query_map(params_from_iter(ids.iter()), |r| {
             Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    }
+
+    /// What the knowledge entries of these threads are chosen from (ADR
+    /// 0019 §5.2): their `answer` replies, and the digests that may cover
+    /// them (rooted in or replying in one, or citing a post of one in
+    /// `refs`). Grafted replies (B9) are left out. Newest first, at most
+    /// `limit`.
+    pub fn knowledge_candidates(&self, threads: &[String], limit: usize) -> Result<Vec<Stored>> {
+        if threads.is_empty() {
+            return Ok(Vec::new());
+        }
+        let n = threads.len();
+        let marks = (1..=n)
+            .map(|i| format!("?{i}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        let (kind, limit_mark) = (n + 1, n + 2);
+        // A row `e` sits in the thread it claims (see [`NOT_GRAFTED`]).
+        let in_place = "NOT EXISTS (SELECT 1 FROM events r WHERE r.id = e.thread
+                 AND r.opaque = 0 AND r.net <> e.net)
+             AND NOT EXISTS (SELECT 1 FROM events p WHERE p.id = e.parent AND p.opaque = 0
+                 AND (p.net <> e.net OR COALESCE(p.thread, p.id) <> e.thread))";
+        let sql = format!(
+            "SELECT e.seq, e.json, e.ts FROM events e
+                 WHERE e.thread IN ({marks}) AND e.kind IN ('answer', ?{kind})
+                     AND e.opaque = 0 AND {in_place}
+             UNION
+             SELECT e.seq, e.json, e.ts FROM events e
+                 WHERE e.id IN ({marks}) AND e.kind = ?{kind} AND e.opaque = 0
+             UNION
+             SELECT e.seq, e.json, e.ts FROM events t
+                 JOIN event_refs r ON r.ref = t.id JOIN events e ON e.seq = r.seq
+                 WHERE t.id IN ({marks}) AND t.opaque = 0
+                     AND e.kind = ?{kind} AND e.opaque = 0 AND {in_place}
+             UNION
+             SELECT e.seq, e.json, e.ts FROM events t
+                 JOIN event_refs r ON r.ref = t.id JOIN events e ON e.seq = r.seq
+                 WHERE t.thread IN ({marks}) AND t.opaque = 0
+                     AND e.kind = ?{kind} AND e.opaque = 0 AND {in_place}
+             ORDER BY 3 DESC, 1 DESC LIMIT ?{limit_mark}"
+        );
+        let mut args: Vec<SqlValue> = threads.iter().map(|t| t.clone().into()).collect();
+        args.push(crate::knowledge::DIGEST_KIND.to_string().into());
+        args.push((limit as i64).into());
+        self.query(&sql, args)
+    }
+
+    /// The digests whose `data.supersedes` names one of `ids` (ADR 0019
+    /// §5.1), at most `limit`.
+    pub fn superseding(&self, ids: &[String], limit: usize) -> Result<Vec<Stored>> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let sql = format!(
+            "SELECT seq, json FROM events WHERE kind = ? AND opaque = 0
+                 AND json_extract(json, '$.data.supersedes') IN ({}) LIMIT ?",
+            vec!["?"; ids.len()].join(",")
+        );
+        let mut args: Vec<SqlValue> = vec![crate::knowledge::DIGEST_KIND.to_string().into()];
+        args.extend(ids.iter().map(|id| SqlValue::from(id.clone())));
+        args.push((limit as i64).into());
+        self.query(&sql, args)
+    }
+
+    /// `(id, thread root, net)` of each of these events held here and
+    /// understood.
+    pub fn roots(&self, ids: &[String]) -> Result<Vec<(String, String, String)>> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let sql = format!(
+            "SELECT id, COALESCE(thread, id), net FROM events WHERE id IN ({}) AND opaque = 0",
+            vec!["?"; ids.len()].join(",")
+        );
+        let conn = self.conn();
+        let mut stmt = conn.prepare_cached(&sql)?;
+        let rows = stmt.query_map(params_from_iter(ids.iter()), |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?))
         })?;
         rows.collect::<rusqlite::Result<Vec<_>>>()
             .map_err(Into::into)
@@ -2574,6 +2696,54 @@ mod tests {
             (rows[0].id.as_str(), rows[0].reply),
             (citing.id.as_str(), false)
         );
+    }
+
+    #[test]
+    fn titles_are_searched_and_migrated_from_schema_v6() {
+        let titled = |key: u8, title: &str, text: &str| {
+            Draft {
+                net: "public".into(),
+                kind: Some(Kind::Note),
+                title: Some(title.into()),
+                text: text.into(),
+                ..Draft::default()
+            }
+            .sign(&SigningKey::from_bytes(&[key; 32]), 10, 0)
+            .unwrap()
+        };
+        let store = Store::open_in_memory().unwrap();
+        let kept = titled(1, "musl needs musl-tools", "install the package");
+        let dropped = titled(2, "a leaked phrase", "and its text");
+        store.insert(&kept, 10).unwrap();
+        store.insert(&dropped, 10).unwrap();
+        assert_eq!(found(&store, "musl"), 1);
+        // A dropped body leaves no title behind.
+        store
+            .drop_body(&dropped.id, DropReason::Own, None, None, 20)
+            .unwrap();
+        assert_eq!(found(&store, "leaked"), 0);
+        // A schema 6 store: no title column, the old full-text table.
+        let conn = store.conn.into_inner().unwrap();
+        conn.execute_batch(
+            "DROP TRIGGER events_fts_insert; DROP TABLE events_fts;
+             ALTER TABLE events DROP COLUMN title;
+             CREATE VIRTUAL TABLE events_fts USING fts5 (
+                 text, tags, content = 'events', content_rowid = 'seq');
+             INSERT INTO events_fts (events_fts) VALUES ('rebuild');
+             PRAGMA user_version = 6;",
+        )
+        .unwrap();
+        let store = Store::init(conn).unwrap();
+        assert_eq!(found(&store, "musl"), 1, "titles indexed on migration");
+        assert_eq!(found(&store, "package"), 1);
+        assert_eq!(found(&store, "leaked"), 0);
+        store
+            .conn()
+            .execute(
+                "INSERT INTO events_fts (events_fts) VALUES ('integrity-check')",
+                [],
+            )
+            .unwrap();
     }
 
     #[test]

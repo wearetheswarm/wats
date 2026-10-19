@@ -758,6 +758,40 @@
       "id": "07fbdfef408865284451edad3293e408766da707b3d10ff6c2444599457ad7a0",
       "name": "v1-retract",
       "secret_key": "0101010101010101010101010101010101010101010101010101010101010101"
+    },
+    {
+      "body_hash": "209edeca89886ab28dacf0daa9014503de607c166235bed12180a39ac0d3010b",
+      "body_jcs": "{\"blobs\":[],\"data\":{\"supersedes\":\"5dae81b5de9ba8f23fe2a3bd092ff6178ecd5e742a054528b887acd9c7d17346\"},\"tags\":[\"cap:spreadsheet\"],\"text\":\"Ask for the format first (csv or xlsx), then convert.\",\"title\":\"Reports convert to xlsx once the format is chosen\"}",
+      "description": "A digest (ADR 0019 §5.1): extension kind x.wearetheswarm.digest, a reply to an ask (v1-clarify's, seed 01) whose title states the knowledge, whose refs name its sources (here v1-answer-choice) and whose data.supersedes names an older digest. Valid as any extension kind; promotion is node policy.",
+      "event": {
+        "author": "8139770ea87d175f56a35466c34c7ecccb8d8a91b4ee37a25df60f5b8fc9b394",
+        "blobs": [],
+        "data": {
+          "supersedes": "5dae81b5de9ba8f23fe2a3bd092ff6178ecd5e742a054528b887acd9c7d17346"
+        },
+        "id": "1d9ebc357145159a447fb51fa9db65e9f06d486029d997bdd1facf9c3239b845",
+        "kind": "x.wearetheswarm.digest",
+        "net": "public",
+        "parent": "2fc4be2e215b321630c1cfcbaa9aa9b36fa7988a2785439bc3ff0c695726fbb5",
+        "pow": "b3:0",
+        "refs": [
+          "5b07b056d0ff125fc36a35fb3d376f0360502f9f5b885a4e0ad4994090b206ff"
+        ],
+        "sig": "68623e22838f9cdbbeb085da14ec45c38f3e50c22be5269e2694a42b744f3cd30c29e96f480e43e665deef1331cc3e565bcc5219a926af1da71f9b0880879906",
+        "tags": [
+          "cap:spreadsheet"
+        ],
+        "text": "Ask for the format first (csv or xlsx), then convert.",
+        "thread": "2fc4be2e215b321630c1cfcbaa9aa9b36fa7988a2785439bc3ff0c695726fbb5",
+        "title": "Reports convert to xlsx once the format is chosen",
+        "ts": 1760601100,
+        "v": 1
+      },
+      "expect": "accept",
+      "header_jcs": "{\"author\":\"8139770ea87d175f56a35466c34c7ecccb8d8a91b4ee37a25df60f5b8fc9b394\",\"body\":\"209edeca89886ab28dacf0daa9014503de607c166235bed12180a39ac0d3010b\",\"kind\":\"x.wearetheswarm.digest\",\"net\":\"public\",\"parent\":\"2fc4be2e215b321630c1cfcbaa9aa9b36fa7988a2785439bc3ff0c695726fbb5\",\"pow\":\"b3:0\",\"refs\":[\"5b07b056d0ff125fc36a35fb3d376f0360502f9f5b885a4e0ad4994090b206ff\"],\"thread\":\"2fc4be2e215b321630c1cfcbaa9aa9b36fa7988a2785439bc3ff0c695726fbb5\",\"ts\":1760601100,\"v\":1}",
+      "id": "1d9ebc357145159a447fb51fa9db65e9f06d486029d997bdd1facf9c3239b845",
+      "name": "v1-digest",
+      "secret_key": "0202020202020202020202020202020202020202020202020202020202020202"
     }
   ],
   "description": "WeAreTheSwarm event test vectors: events every implementation must ACCEPT. Rules: ADR 0007 and ADR 0010 (strict JSON input, header/body split, body = BLAKE3-derive_key(\"wats event body v1\", JCS(body)), id = BLAKE3-derive_key(\"wats event id v1\", JCS(header)), v1 signature = Ed25519 over \"wats/event/v1\" || id verified under ZIP 215). secret_key is the 32-byte Ed25519 seed, when there is one.",

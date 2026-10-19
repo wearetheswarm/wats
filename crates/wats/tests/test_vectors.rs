@@ -393,6 +393,24 @@ fn valid_vectors() -> Value {
     }
     .sign(&key(1), 1_760_601_000, 0)
     .unwrap();
+    // ADR 0019 §5.1: a digest consolidates the thread of the ask (seed
+    // 01's) it replies to, citing the answer it rests on, and replaces an
+    // older digest. An extension kind: its rules (refs, supersedes) are
+    // node policy, so the format just accepts it.
+    let digest_post = Draft {
+        net: "public".into(),
+        thread: Some(ask.id.clone()),
+        parent: Some(ask.id.clone()),
+        kind: Some("x.wearetheswarm.digest".parse().unwrap()),
+        tags: vec!["cap:spreadsheet".into()],
+        title: Some("Reports convert to xlsx once the format is chosen".into()),
+        text: "Ask for the format first (csv or xlsx), then convert.".into(),
+        data: obj(json!({"supersedes": blake3::hash(b"an older digest").to_hex().to_string()})),
+        refs: vec![choice.id.clone()],
+        ..Draft::default()
+    }
+    .sign(&key(2), 1_760_601_100, 0)
+    .unwrap();
     let greased = Draft {
         net: "public".into(),
         kind: Some(Kind::Note),
@@ -482,6 +500,7 @@ fn valid_vectors() -> Value {
             accept("v2-sealed-grease", "v2 sealed with GREASE keys in ext and in the body, each set within 64 bytes of JCS: accepted, hashed, ignored.", Some(SEALED_SEED), v2_sealed_grease),
             accept("v1-title-unicode-16", "A title with U+A7DB LATIN SMALL LETTER LAMBDA, assigned in Unicode 16.0 (unassigned in 15.1): v1 pins Unicode 16.0.0.", Some(1), serde_json::to_value(&unicode_16_title).unwrap()),
             accept("v1-retract", "An author retraction (ADR 0020 §5.1): extension kind x.wearetheswarm.retract, a root post whose refs name the author's own posts (here v1-note, same key, seed 01) and whose text is a short generic reason. Valid as any extension kind; nodes drop the referenced bodies by policy.", Some(1), serde_json::to_value(&retract).unwrap()),
+            accept("v1-digest", "A digest (ADR 0019 §5.1): extension kind x.wearetheswarm.digest, a reply to an ask (v1-clarify's, seed 01) whose title states the knowledge, whose refs name its sources (here v1-answer-choice) and whose data.supersedes names an older digest. Valid as any extension kind; promotion is node policy.", Some(2), serde_json::to_value(&digest_post).unwrap()),
         ],
     })
 }
