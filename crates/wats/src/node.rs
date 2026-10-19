@@ -202,6 +202,9 @@ pub struct NodeConfig {
     /// The human's OpenClaw, told when its swarm asks get replies (ADR
     /// 0018 §7); set when the hook token exists.
     pub openclaw_notify: Option<crate::openclaw::Notify>,
+    /// A desktop notification when someone answers or clarifies an ask of
+    /// the human's (`notify.desktop`); `None`: off (headless, loopback).
+    pub desktop_notify: Option<crate::desktop::Notifier>,
 }
 
 impl NodeConfig {
@@ -223,6 +226,15 @@ impl NodeConfig {
     /// Whether `profile` is one an agent runner posts as.
     pub fn is_runner_profile(&self, profile: &str) -> bool {
         self.runner_profiles().contains(&profile)
+    }
+
+    /// Whether `profile` is an agent's, not the human's: an agent runner's,
+    /// a profile held for review, or the profile of an agent of
+    /// config.toml (running or not).
+    pub fn is_agent_profile(&self, profile: &str) -> bool {
+        self.is_runner_profile(profile)
+            || self.review_profiles.iter().any(|p| p == profile)
+            || self.agents.iter().any(|a| a.profile == profile)
     }
 
     pub fn new(data_dir: impl Into<PathBuf>) -> Self {
@@ -262,6 +274,7 @@ impl NodeConfig {
             unanswered_after: Some(crate::unanswered::DEFAULT_AFTER),
             erasure_labelers: Vec::new(),
             openclaw_notify: None,
+            desktop_notify: None,
             bootstrap: Vec::new(),
             default_bootstrap: Vec::new(),
             resolver: Default::default(),
@@ -1100,8 +1113,9 @@ pub struct Node {
     /// Tokens of the agent runs in progress: an MCP session presenting one
     /// is a runner session.
     runner_tokens: std::sync::Mutex<HashMap<String, RunnerRun>>,
-    /// Author ids of the profiles used on this node (see `author_key`).
-    local_authors: std::sync::Mutex<HashSet<String>>,
+    /// Author ids of the profiles used on this node, with their profile
+    /// names (see `author_key`).
+    local_authors: std::sync::Mutex<HashMap<String, String>>,
     /// Exclusive lock on the data directory, released by `shutdown`.
     lock: std::sync::Mutex<Option<std::fs::File>>,
     /// This node's view of the infrastructure (see [`crate::health`]).
@@ -1551,6 +1565,7 @@ impl Node {
             node.apply_held_erasures().await;
         }
         node.spawn_asker_notify();
+        node.spawn_desktop_notify();
         node.spawn_health_checks();
         if !node.config.halt.accept {
             warn!("this node ignores guardian halts (halt.accept = false)");
@@ -1836,6 +1851,70 @@ impl Node {
         });
     }
 
+    /// A desktop notification for the human (`notify.desktop`): for an
+    /// `answer` or a `clarify` by someone else in the thread of an ask of
+    /// the human's ([`Node::is_human_ask`]), never an agent's. Asks posted
+    /// from OpenClaw are left to its chat when that is set up. At most
+    /// [`crate::desktop::PER_HOUR`] per hour.
+    fn spawn_desktop_notify(self: &Arc<Self>) {
+        let Some(notifier) = self.config.desktop_notify.clone() else {
+            return;
+        };
+        let mut events = self.store.subscribe();
+        let weak = Arc::downgrade(self);
+        tokio::spawn(async move {
+            let mut limit = crate::desktop::RateLimit::default();
+            loop {
+                let stored = match events.recv().await {
+                    Ok(stored) => stored,
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                };
+                let Some(node) = weak.upgrade() else { break };
+                let reply = stored.event;
+                if !matches!(reply.kind, Kind::Answer | Kind::Clarify) {
+                    continue;
+                }
+                let root = reply.thread_root().to_string();
+                if root == reply.id
+                    // An old reply caught up after a restart is not news.
+                    || reply.ts.saturating_add(crate::unanswered::WINDOW.as_secs()) < now_secs()
+                {
+                    continue;
+                }
+                let Some(ask) = node.store.get(&root).ok().flatten() else {
+                    continue;
+                };
+                if ask.event.author == reply.author || !node.is_human_ask(&ask.event) {
+                    continue;
+                }
+                if node.config.openclaw_notify.is_some()
+                    && node.store.ask_notify(&root).ok().flatten().as_deref() == Some("openclaw")
+                {
+                    continue;
+                }
+                if !limit.allow(std::time::Instant::now()) {
+                    continue;
+                }
+                let title = ask
+                    .event
+                    .title
+                    .clone()
+                    .unwrap_or_else(|| crate::event::title_from_text(&ask.event.text));
+                let text = crate::desktop::reply_text(&title, &reply);
+                let notifier = notifier.clone();
+                tokio::spawn(async move {
+                    match notifier.send(crate::desktop::TITLE, &text).await {
+                        Ok(()) => {
+                            info!(ask = %root, reply = %reply.id, "desktop notification sent")
+                        }
+                        Err(e) => debug!(ask = %root, "desktop notification failed: {e:#}"),
+                    }
+                });
+            }
+        });
+    }
+
     /// The reconnect loop ([`crate::reconnect`]) and the network watchers
     /// that start its backoff over.
     fn spawn_reconnect(self: &Arc<Self>) {
@@ -2006,7 +2085,7 @@ impl Node {
         }
         let key = self.root.profile_key(profile);
         if let Ok(mut local) = self.local_authors.lock() {
-            local.insert(crate::identity::author_id(&key));
+            local.insert(crate::identity::author_id(&key), profile.to_string());
         }
         Ok(key)
     }
@@ -2018,7 +2097,36 @@ impl Node {
             || self
                 .local_authors
                 .lock()
-                .is_ok_and(|local| local.contains(author))
+                .is_ok_and(|local| local.contains_key(author))
+    }
+
+    /// The profile of a local author id: the default profile's, or one used
+    /// since the node started.
+    pub fn local_profile(&self, author: &str) -> Option<String> {
+        if author == self.author_id() {
+            return Some(self.config.profile.clone());
+        }
+        self.local_authors
+            .lock()
+            .ok()
+            .and_then(|local| local.get(author).cloned())
+    }
+
+    /// Whether `ask` is the human's (`notify.desktop`): asked from a human
+    /// MCP session (its `ask_notify` row, kept across restarts), or by a
+    /// local profile that is not an agent's ([`NodeConfig::is_agent_profile`]).
+    pub fn is_human_ask(&self, ask: &Event) -> bool {
+        if ask.kind != Kind::Ask || ask.thread.is_some() {
+            return false;
+        }
+        let profile = self.local_profile(&ask.author);
+        if profile
+            .as_deref()
+            .is_some_and(|p| self.config.is_agent_profile(p))
+        {
+            return false;
+        }
+        profile.is_some() || self.store.ask_notify(&ask.id).ok().flatten().is_some()
     }
 
     /// Whether `author` is the key of one of this node's agents (a runner

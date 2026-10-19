@@ -315,6 +315,25 @@ enum Command {
         #[arg(long)]
         in_process: bool,
     },
+    /// What is new for a profile: the clarify questions waiting for its
+    /// answer, and the answers to its asks it has not seen. With --hook,
+    /// the session hook of Claude Code or Codex (`wats setup claude|codex
+    /// --mcp` installs it): fast, read-only, silent when nothing is new,
+    /// never failing the prompt; each item is shown once (a pending clarify
+    /// again at the next burst of prompts).
+    Notify {
+        /// Run as the host's hook: its output format, and the items shown
+        /// are recorded as seen.
+        #[arg(long)]
+        hook: bool,
+        /// The MCP host running the hook: claude (JSON with
+        /// additionalContext) or codex (plain text).
+        #[arg(long, default_value = "claude", value_parser = ["claude", "codex"])]
+        host: String,
+        /// The host event the hook runs on.
+        #[arg(long, default_value = "user-prompt-submit", value_parser = ["user-prompt-submit", "session-start"])]
+        event: String,
+    },
     /// Show the node: running or not, networks, peers, storage, version
     /// and the update notice (what the MCP `status` tool returns).
     Status {
@@ -712,6 +731,20 @@ enum SetupTool {
         /// (default_tools_approval_mode = "approve" on the wats server).
         #[arg(long)]
         no_approval: bool,
+        /// With --mcp: no session hook. By default (asked on a terminal),
+        /// when this Codex has hooks (`codex features list`), a SessionStart
+        /// hook in config.toml runs `wats notify --hook` so that each
+        /// session starts with the clarifies and answers waiting for you.
+        #[arg(long)]
+        no_hooks: bool,
+        /// Remove wats from Codex: the session hook, then the MCP server
+        /// (`codex mcp remove wats`). --remove-hooks removes the hook only.
+        #[arg(long, conflicts_with_all = ["mcp", "agent", "no_hooks", "no_approval"])]
+        remove: bool,
+        /// Remove the session hook only and keep the MCP server (--remove
+        /// removes both).
+        #[arg(long, conflicts_with_all = ["mcp", "agent", "no_hooks", "no_approval", "remove"])]
+        remove_hooks: bool,
         /// The Codex CLI.
         #[arg(long, env = "WATS_CODEX", default_value = "codex")]
         codex: PathBuf,
@@ -731,9 +764,25 @@ enum SetupTool {
         #[command(flatten)]
         keys: SetupKeys,
         /// Claude Code scope of the MCP server: user (every project) or
-        /// project (.mcp.json in the current directory).
+        /// project (.mcp.json in the current directory). The session hook
+        /// goes to the same scope's settings.json.
         #[arg(long, default_value = "user", value_parser = ["user", "project"])]
         scope: String,
+        /// With --mcp: no session hook. By default (asked on a terminal),
+        /// UserPromptSubmit and SessionStart hooks in settings.json run
+        /// `wats notify --hook`, which adds the clarifies and answers
+        /// waiting for you to the session's context.
+        #[arg(long)]
+        no_hooks: bool,
+        /// Remove wats from Claude Code: the session hooks, then the MCP
+        /// server (`claude mcp remove --scope <scope> wats`). --remove-hooks
+        /// removes the hooks only.
+        #[arg(long, conflicts_with_all = ["mcp", "agent", "no_hooks"])]
+        remove: bool,
+        /// Remove the session hooks only and keep the MCP server (--remove
+        /// removes both).
+        #[arg(long, conflicts_with_all = ["mcp", "agent", "no_hooks", "remove"])]
+        remove_hooks: bool,
         /// The Claude Code CLI.
         #[arg(long, env = "WATS_CLAUDE", default_value = "claude")]
         claude: PathBuf,
@@ -1638,8 +1687,232 @@ fn set_codex_approval() -> Result<bool> {
     Ok(true)
 }
 
+/// The session hook command for `host` and `event`: this binary, `notify
+/// --hook`, the profile, and the data directory when given.
+fn hook_command(
+    args: &NodeArgs,
+    host: wats::hook::Host,
+    event: wats::hook::HookEvent,
+    profile: &str,
+) -> Result<String> {
+    let exe = std::env::current_exe()?.canonicalize()?;
+    let dir = match &args.dir {
+        Some(dir) => Some(std::path::absolute(dir)?.to_string_lossy().into_owned()),
+        None => None,
+    };
+    Ok(wats::hook::command_line(
+        &exe.to_string_lossy(),
+        host,
+        event,
+        profile,
+        dir.as_deref(),
+    ))
+}
+
+/// Whether to add the session hook: asked on a terminal (default yes),
+/// yes otherwise.
+fn want_hook(args: &NodeArgs, name: &str) -> Result<bool> {
+    use std::io::IsTerminal;
+    if args.hermetic || !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
+        return Ok(true);
+    }
+    wats::firstrun::ask_yes_no(
+        &mut std::io::stdin().lock(),
+        &mut std::io::stdout(),
+        &format!(
+            "Add a session hook, so that {name} hears of the answers and clarifies to your asks \
+             at each prompt (`wats notify --hook`, read-only, silent when nothing is new)?"
+        ),
+        true,
+    )
+}
+
+/// Read a settings file, empty when it does not exist.
+fn read_or_empty(path: &std::path::Path) -> Result<String> {
+    match std::fs::read_to_string(path) {
+        Ok(text) => Ok(text),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(String::new()),
+        Err(e) => Err(e).with_context(|| format!("read {}", path.display())),
+    }
+}
+
+/// Write `new` to `path` after a backup copy; prints where.
+fn write_settings(path: &std::path::Path, new: &str) -> Result<()> {
+    match wats::vibe::write_with_backup(path, new, unix_now())? {
+        Some(backup) => println!("  backup: {}", backup.display()),
+        None => println!("  (new file)"),
+    }
+    Ok(())
+}
+
+/// Claude Code's settings.json for the MCP server's scope.
+fn claude_settings(scope: &str) -> Result<PathBuf> {
+    wats::hook::claude_settings_path(
+        scope,
+        std::env::var_os("CLAUDE_CONFIG_DIR"),
+        std::env::home_dir(),
+        &std::env::current_dir()?,
+    )
+    .context("no home directory: set CLAUDE_CONFIG_DIR")
+}
+
+/// Codex's config.toml.
+fn codex_config() -> Result<PathBuf> {
+    wats::hook::codex_config_path(std::env::var_os("CODEX_HOME"), std::env::home_dir())
+        .context("no home directory: set CODEX_HOME")
+}
+
+/// Add (or update) the session hooks in Claude Code's settings.json.
+fn install_claude_hooks(args: &NodeArgs, profile: &str, scope: &str) -> Result<()> {
+    use wats::hook::{CLAUDE_EVENTS, Host};
+    if !want_hook(args, "Claude Code")? {
+        println!("Claude Code: no session hook (add it later: wats setup claude --mcp)");
+        return Ok(());
+    }
+    let path = claude_settings(scope)?;
+    let entries = CLAUDE_EVENTS
+        .iter()
+        .map(|e| Ok((*e, hook_command(args, Host::Claude, *e, profile)?)))
+        .collect::<Result<Vec<_>>>()?;
+    let text = read_or_empty(&path)?;
+    match wats::hook::claude_upsert(&text, &entries)
+        .with_context(|| format!("{}: left as it is", path.display()))?
+    {
+        None => println!("Claude Code: session hook already in {}", path.display()),
+        Some(new) => {
+            println!(
+                "Claude Code: session hook (UserPromptSubmit, SessionStart) in {}: your sessions \
+                 hear of the answers and clarifies to your asks",
+                path.display()
+            );
+            write_settings(&path, &new)?;
+        }
+    }
+    Ok(())
+}
+
+/// Add (or update) the SessionStart hook in Codex's config.toml, when
+/// this Codex has hooks.
+fn install_codex_hooks(args: &NodeArgs, profile: &str, codex: &std::path::Path) -> Result<()> {
+    use wats::hook::{HookEvent, Host};
+    let Some(feature) = wats::hook::codex_hook_feature(&wats::hook::codex_features(codex)) else {
+        println!(
+            "Codex: no session hook: `{} features list` shows no hooks feature (Codex has hooks \
+             since 0.114.0; update it, then run wats setup codex --mcp again)",
+            codex.display()
+        );
+        return Ok(());
+    };
+    if !want_hook(args, "Codex")? {
+        println!("Codex: no session hook (add it later: wats setup codex --mcp)");
+        return Ok(());
+    }
+    let path = codex_config()?;
+    let command = hook_command(args, Host::Codex, HookEvent::SessionStart, profile)?;
+    let text = read_or_empty(&path)?;
+    match wats::hook::codex_upsert(&text, feature, &command)
+        .with_context(|| format!("{}: left as it is", path.display()))?
+    {
+        None => println!("Codex: session hook already in {}", path.display()),
+        Some(new) => {
+            println!(
+                "Codex: session hook ([[hooks.SessionStart]], features.{feature} = true) in {}: \
+                 each session starts with the answers and clarifies to your asks",
+                path.display()
+            );
+            write_settings(&path, &new)?;
+        }
+    }
+    Ok(())
+}
+
+/// `wats setup claude --remove`: our session hooks, then the MCP server.
+fn remove_from_claude(scope: &str, claude: &std::path::Path) -> Result<()> {
+    remove_claude_hooks(scope)?;
+    let status = std::process::Command::new(claude)
+        .args(["mcp", "remove", "--scope", scope, "wats"])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .with_context(|| format!("run {}", claude.display()))?;
+    println!(
+        "Claude Code: wats MCP server {}",
+        if status.success() {
+            "removed"
+        } else {
+            "not registered (or `claude mcp remove` failed)"
+        }
+    );
+    Ok(())
+}
+
+/// `wats setup claude --remove-hooks` (and the first step of --remove):
+/// our session hooks out of the scope's settings.json.
+fn remove_claude_hooks(scope: &str) -> Result<()> {
+    let path = claude_settings(scope)?;
+    let text = read_or_empty(&path)?;
+    match wats::hook::claude_remove(&text)
+        .with_context(|| format!("{}: left as it is", path.display()))?
+    {
+        None => println!("Claude Code: no wats session hook in {}", path.display()),
+        Some(new) => {
+            println!(
+                "Claude Code: wats session hook removed from {}",
+                path.display()
+            );
+            write_settings(&path, &new)?;
+        }
+    }
+    Ok(())
+}
+
+/// `wats setup codex --remove`: our session hook, then the MCP server.
+fn remove_from_codex(codex: &std::path::Path) -> Result<()> {
+    remove_codex_hooks()?;
+    let status = std::process::Command::new(codex)
+        .args(["mcp", "remove", "wats"])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .with_context(|| format!("run {}", codex.display()))?;
+    println!(
+        "Codex: wats MCP server {}",
+        if status.success() {
+            "removed"
+        } else {
+            "not registered (or `codex mcp remove` failed)"
+        }
+    );
+    Ok(())
+}
+
+/// `wats setup codex --remove-hooks` (and the first step of --remove):
+/// our SessionStart hook out of config.toml (the feature flag stays:
+/// other hooks may need it).
+fn remove_codex_hooks() -> Result<()> {
+    let path = codex_config()?;
+    let text = read_or_empty(&path)?;
+    match wats::hook::codex_remove(&text)
+        .with_context(|| format!("{}: left as it is", path.display()))?
+    {
+        None => println!("Codex: no wats session hook in {}", path.display()),
+        Some(new) => {
+            println!("Codex: wats session hook removed from {}", path.display());
+            write_settings(&path, &new)?;
+        }
+    }
+    Ok(())
+}
+
+/// The session hook step of `wats setup claude | codex --mcp`: called with
+/// the profile; `None` with --no-hooks.
+type HookStep<'a> = Option<Box<dyn FnOnce(&str) -> Result<()> + 'a>>;
+
 /// `wats setup claude | codex`: register wats as the tool's MCP server
-/// and/or enable its agent runner in config.toml (both by default).
+/// and/or enable its agent runner in config.toml (both by default); with
+/// the MCP server, the session hook too.
 fn setup_tool(
     args: &NodeArgs,
     data_dir: &std::path::Path,
@@ -1647,6 +1920,7 @@ fn setup_tool(
     (mcp, agent): (bool, bool),
     keys: &SetupKeys,
     register: impl FnOnce(&str) -> Result<bool>,
+    hooks: HookStep<'_>,
 ) -> Result<()> {
     let (mcp, agent) = if mcp || agent {
         (mcp, agent)
@@ -1693,6 +1967,11 @@ fn setup_tool(
                 "already registered"
             }
         );
+        if let Some(hooks) = hooks
+            && let Err(e) = hooks(&profile)
+        {
+            eprintln!("warning: {e:#}: session hook not added");
+        }
     }
     let workdir = match &keys.workdir {
         Some(dir) => Some(std::path::absolute(dir)?),
@@ -2502,6 +2781,14 @@ impl NodeArgs {
                 .map_err(|e| anyhow::anyhow!("config.toml submit.retention: {e}"))?;
         }
         config.review_notify = file.agent.notify.unwrap_or(false);
+        // Desktop notifications of replies to the human's asks: never in
+        // loopback or hermetic mode, but for a test's fake notifier.
+        config.desktop_notify = wats::desktop::configured(
+            file.notify.desktop,
+            self.loopback || self.hermetic,
+            self.hermetic,
+            std::env::var_os(wats::desktop::TEST_COMMAND_ENV),
+        );
         config.report_accept = self.report_accept || file.report.accept.unwrap_or(false);
         // halt.accept: config.toml only, never a flag (ADR 0016 §3).
         config.halt.accept = file.halt.accept.unwrap_or(true);
@@ -3787,8 +4074,87 @@ fn log_filter() -> EnvFilter {
     filter
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+/// Whether this process is a session hook (`wats notify --hook`): it must
+/// exit 0, even on a command line it does not understand.
+fn hook_invocation() -> bool {
+    let args: Vec<std::ffi::OsString> = std::env::args_os().collect();
+    args.iter().any(|a| a == "notify") && args.iter().any(|a| a == "--hook")
+}
+
+/// `wats notify [--hook]`, before any runtime, log or panic hook is set
+/// up: the session hook must be fast and silent. With --hook, it prints
+/// the host's format or nothing, and always exits 0.
+fn notify_command(node: &NodeArgs, hook: bool, host: &str, event: &str) -> Result<()> {
+    use std::io::Write;
+    if hook {
+        // Nothing on stderr, whatever happens.
+        std::panic::set_hook(Box::new(|_| {}));
+    }
+    let output = std::panic::catch_unwind(|| -> Option<String> {
+        let data_dir = node.data_dir().ok()?;
+        let profile = node
+            .profile
+            .clone()
+            .or_else(|| {
+                Settings::load(&data_dir)
+                    .ok()
+                    .and_then(|settings| settings.profile)
+            })
+            .unwrap_or_else(os_user_profile);
+        let request = wats::hook::Request {
+            data_dir,
+            secret_file: node.secret_file.as_ref().map(PathBuf::from),
+            profile,
+            host: wats::hook::Host::parse(host)?,
+            event: wats::hook::HookEvent::parse(event)?,
+            now: wats::node::now_secs(),
+            mark_seen: hook,
+        };
+        if hook {
+            wats::hook::run(&request)
+        } else {
+            // A peek: plain text, nothing recorded.
+            wats::hook::run(&wats::hook::Request {
+                host: wats::hook::Host::Codex,
+                ..request
+            })
+        }
+    })
+    .ok()
+    .flatten();
+    let mut stdout = std::io::stdout().lock();
+    match output {
+        Some(text) => {
+            let _ = writeln!(stdout, "{text}");
+        }
+        None if !hook => {
+            let _ = writeln!(stdout, "nothing new");
+        }
+        None => {}
+    }
+    let _ = stdout.flush();
+    Ok(())
+}
+
+fn main() -> Result<()> {
+    let mut cli = match Cli::try_parse() {
+        Ok(cli) => cli,
+        // A session hook never fails the prompt, not even on a flag an
+        // older wats does not know.
+        Err(_) if hook_invocation() => return Ok(()),
+        Err(e) => e.exit(),
+    };
+    cli.node.normalize();
+    if let Some(Command::Notify { hook, host, event }) = &cli.command {
+        return notify_command(&cli.node, *hook, host, event);
+    }
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?
+        .block_on(async_main(cli))
+}
+
+async fn async_main(cli: Cli) -> Result<()> {
     // Logs go to stderr: stdout is the protocol channel in `wats mcp`.
     tracing_subscriber::fmt()
         .with_writer(wats::crash::Tee)
@@ -3798,8 +4164,6 @@ async fn main() -> Result<()> {
 
     wats::crash::install_panic_hook();
     let shutdown = shutdown_signal();
-    let mut cli = Cli::parse();
-    cli.node.normalize();
     let data_dir = cli.node.data_dir()?;
     // Commands that work even when config.toml does not load.
     match cli.command {
@@ -3860,16 +4224,31 @@ async fn main() -> Result<()> {
                     agent,
                     keys,
                     scope,
+                    no_hooks,
+                    remove,
+                    remove_hooks,
                     claude,
                 }),
         }) => {
+            if remove_hooks {
+                return remove_claude_hooks(&scope);
+            }
+            if remove {
+                return remove_from_claude(&scope, &claude);
+            }
+            let node = &cli.node;
+            let scope = scope.as_str();
+            let hooks: HookStep = (!no_hooks).then(|| {
+                Box::new(move |profile: &str| install_claude_hooks(node, profile, scope)) as _
+            });
             return setup_tool(
-                &cli.node,
+                node,
                 &data_dir,
                 "claude",
                 (mcp, agent),
                 &keys,
-                |profile| register_in_claude(&cli.node, profile, &scope, &claude),
+                |profile| register_in_claude(node, profile, scope, &claude),
+                hooks,
             );
         }
         Some(Command::Setup {
@@ -3879,17 +4258,31 @@ async fn main() -> Result<()> {
                     agent,
                     keys,
                     no_approval,
+                    no_hooks,
+                    remove,
+                    remove_hooks,
                     codex,
                 }),
         }) => {
+            if remove_hooks {
+                return remove_codex_hooks();
+            }
+            if remove {
+                return remove_from_codex(&codex);
+            }
+            let node = &cli.node;
+            let codex = codex.as_path();
+            let hooks: HookStep = (!no_hooks).then(|| {
+                Box::new(move |profile: &str| install_codex_hooks(node, profile, codex)) as _
+            });
             return setup_tool(
-                &cli.node,
+                node,
                 &data_dir,
                 "codex",
                 (mcp, agent),
                 &keys,
                 |profile| {
-                    let changed = register_in_codex(&cli.node, profile, &codex)?;
+                    let changed = register_in_codex(node, profile, codex)?;
                     let approval = if no_approval {
                         set_codex_approval()?
                     } else {
@@ -3897,6 +4290,7 @@ async fn main() -> Result<()> {
                     };
                     Ok(changed || approval)
                 },
+                hooks,
             );
         }
         Some(Command::Setup {
@@ -4004,6 +4398,7 @@ async fn main() -> Result<()> {
             | Command::Report { .. }
             | Command::Guardian { .. }
             | Command::Resume
+            | Command::Notify { .. }
             | Command::Inbox { .. },
         ) => {
             unreachable!("handled above")
