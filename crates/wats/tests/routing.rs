@@ -115,7 +115,7 @@ fn agent(root: &Path, data: &Path, caps: &[&str], every: Duration) -> AgentConfi
         wakes: wats::wake::WakeLimits::unlimited(),
         codex_disable: vec![],
         codex_enable: vec![],
-        access: wats::access::Access::Locked,
+        access: wats::access::Access::SwarmOnly,
         workdir: PathBuf::from("/nonexistent"),
         tools: vec![],
         model: None,

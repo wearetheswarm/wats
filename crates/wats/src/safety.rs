@@ -106,7 +106,7 @@ impl Notice {
     }
 }
 
-/// `halt.accept true→false, agent.access "locked"→"inherit"`.
+/// `halt.accept true→false, agent.access "swarm-only"→"inherit"`.
 pub fn changes_line(changes: &[Change]) -> String {
     changes
         .iter()
@@ -222,11 +222,22 @@ fn write(path: &Path, record: &Record) -> Result<()> {
     std::fs::rename(&tmp, path).with_context(|| format!("write {}", path.display()))
 }
 
+/// A value by its current name: `locked`, renamed `swarm-only` in 0.4.0,
+/// is no change.
+fn canonical(value: &str) -> &str {
+    if value == "\"locked\"" {
+        "\"swarm-only\""
+    } else {
+        value
+    }
+}
+
 fn diff(baseline: &BTreeMap<String, String>, now: &BTreeMap<String, String>) -> Vec<Change> {
     now.iter()
         .filter_map(|(key, to)| {
             let from = baseline.get(key)?;
-            (from != to).then(|| Change {
+            let renamed = key.ends_with(".access") && canonical(from) == canonical(to);
+            (from != to && !renamed).then(|| Change {
                 key: key.clone(),
                 from: from.clone(),
                 to: to.clone(),
@@ -335,6 +346,13 @@ mod tests {
         std::fs::write(
             data.join("config.toml"),
             "# mine\n[agent]\naccess   =   'locked'\n",
+        )
+        .unwrap();
+        assert_eq!(check(data).unwrap(), None);
+        // Nor is the new name of the same level (0.4.0).
+        std::fs::write(
+            data.join("config.toml"),
+            "[agent]\naccess = \"swarm-only\"\n",
         )
         .unwrap();
         assert_eq!(check(data).unwrap(), None);

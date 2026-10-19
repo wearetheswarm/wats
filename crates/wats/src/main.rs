@@ -101,10 +101,11 @@ struct AgentArgs {
     /// Do not run the agents enabled in config.toml.
     #[arg(long, conflicts_with = "agents")]
     no_agent: bool,
-    /// What the agent may use besides the wats tools: locked (only them,
-    /// the default), workspace (agent.workdir's instructions, skills, MCP
-    /// servers, and agent.tools) or inherit (your whole environment).
-    #[arg(long, value_parser = wats::access::LEVELS)]
+    /// What the agent may use besides the wats tools: workspace (the
+    /// default: its own directory, with its instructions, skills and MCP
+    /// servers, and agent.tools), swarm-only (the wats tools only;
+    /// formerly locked) or inherit (your whole environment).
+    #[arg(long, value_parser = wats::access::value_parser())]
     access: Option<String>,
     /// Whether posts by other profiles of this node (yours) leave the
     /// agent asleep [default: true; false for solo tests].
@@ -705,8 +706,8 @@ struct SetupKeys {
     #[arg(long)]
     about: Option<String>,
     /// What the agent may use besides the wats tools (agent.access):
-    /// locked, workspace or inherit.
-    #[arg(long, value_parser = wats::access::LEVELS)]
+    /// workspace (the default), swarm-only or inherit.
+    #[arg(long, value_parser = wats::access::value_parser())]
     access: Option<String>,
     /// The agent's directory with workspace access (agent.workdir).
     #[arg(long)]
@@ -1447,7 +1448,7 @@ fn setup_openclaw(
     // The agent half: everything is checked and confirmed before anything
     // is written.
     let gateway = if agent {
-        let access: wats::access::Access = own.access.as_deref().unwrap_or("locked").parse()?;
+        let access = wats::access::level(own.access.as_deref())?;
         oc::check_access(access, &own.allow, own.review == Some(true))?;
         println!("Budget: {}", oc::SPEND_CAPS);
         if !asked.yes {
@@ -2042,6 +2043,9 @@ fn setup_tool(
             file.set(&key(leaf), value)?;
         }
         file.save()?;
+        if let Some(note) = keys.access.as_deref().and_then(wats::access::deprecation) {
+            eprintln!("note: {note}");
+        }
         if pairs
             .iter()
             .any(|(leaf, _)| *leaf == "tools" || *leaf == "access")
@@ -2055,7 +2059,8 @@ fn setup_tool(
             .into_iter()
             .find(|m| m.name == agent_name);
         if let Some(member) = &member
-            && member.settings.access.as_deref() == Some("workspace")
+            && wats::access::level(member.settings.access.as_deref()).ok()
+                == Some(wats::access::Access::Workspace)
         {
             let dir = member.workspace();
             wats::access::ensure_workspace(&dir)?;
@@ -2202,6 +2207,11 @@ fn config_command(data_dir: &std::path::Path, action: ConfigAction) -> Result<()
             let before = safety_before(data_dir, &key);
             file.set(&key, &value)?;
             file.save()?;
+            if key.ends_with(".access")
+                && let Some(note) = wats::access::deprecation(&value)
+            {
+                eprintln!("note: {note}");
+            }
             for warning in file.tools_warnings(&key) {
                 eprintln!("warning: {warning}");
             }
@@ -3537,12 +3547,11 @@ fn agent_config(
         .clone()
         .or(file.command.clone())
         .unwrap_or_else(|| runtime_default_command(&runtime));
-    let access: wats::access::Access = args
-        .access
-        .as_deref()
-        .or(file.access.as_deref())
-        .unwrap_or("locked")
-        .parse()?;
+    let access = args.access.as_deref().or(file.access.as_deref());
+    if let Some(note) = access.and_then(wats::access::deprecation) {
+        tracing::warn!("{note}");
+    }
+    let access = wats::access::level(access)?;
     if access == wats::access::Access::Workspace
         && let Some(workdir) = &file.workdir
     {
@@ -3933,20 +3942,20 @@ async fn agent_watch(
             } else {
                 let mut result = writeln!(
                     out,
-                    "{:<32} {:<20} {:<9} {:<18} {:<10} {:>8} {:>6} {:>9}",
+                    "{:<32} {:<20} {:<10} {:<18} {:<10} {:>8} {:>6} {:>9}",
                     "RUN", "STARTED", "ACCESS", "MODEL", "STATUS", "SECONDS", "TURNS", "COST"
                 );
                 for r in shown {
                     result = result.and_then(|()| {
                         writeln!(
                             out,
-                            "{:<32} {:<20} {:<9} {:<18} {:<10} {:>8} {:>6} {:>9}",
+                            "{:<32} {:<20} {:<10} {:<18} {:<10} {:>8} {:>6} {:>9}",
                             r.id,
                             runs::format_time(r.started),
-                            if r.access.is_empty() {
-                                "locked"
-                            } else {
-                                &r.access
+                            // Runs before 0.4.0 say `locked`, or nothing.
+                            match r.access.as_str() {
+                                "" | wats::access::LOCKED => "swarm-only",
+                                access => access,
                             },
                             if r.model.is_empty() { "-" } else { &r.model },
                             r.status,

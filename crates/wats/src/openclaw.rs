@@ -227,7 +227,7 @@ pub fn check_access(access: crate::access::Access, allow: &[String], review: boo
         bail!(
             "agent.access = inherit with OpenClaw hands swarm posts to your own OpenClaw \
              agent: set agent.allow (the authors who may wake it) and agent.review = true \
-             first, or use the dedicated agent (agent.access = locked)"
+             first, or use the dedicated agent (agent.access = swarm-only or workspace)"
         );
     }
     Ok(())

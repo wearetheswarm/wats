@@ -517,7 +517,8 @@ pub enum ValueType {
     Profile,
     Infra,
     Runtime,
-    /// `locked`, `workspace` or `inherit`.
+    /// `swarm-only`, `workspace` or `inherit` (`locked`, the old name of
+    /// `swarm-only`, is stored as `swarm-only`).
     Access,
     Duration,
     /// A duration with the units s, m, h or d, or 0 for forever.
@@ -845,8 +846,10 @@ pub const KEYS: &[Key] = &[
     key(
         "agent.access",
         ValueType::Access,
-        "locked",
-        "what the agent may use besides wats: locked, workspace or inherit",
+        "workspace",
+        "what the agent may use besides wats: swarm-only (the wats tools only), workspace \
+         (its own directory, agent.tools and the workspace's MCP servers) or inherit (your \
+         whole environment)",
     ),
     key(
         "agent.workdir",
@@ -861,7 +864,7 @@ pub const KEYS: &[Key] = &[
         "none",
         "tools the agent may use with workspace access, any name its runtime knows: \
          Claude Code tools (Read,Grep,mcp__<server>__<tool>) or Codex features \
-         (image_generation); locked ignores them",
+         (image_generation); swarm-only ignores them",
     ),
     key(
         "agent.model",
@@ -897,7 +900,8 @@ pub const KEYS: &[Key] = &[
         "agent.caps",
         ValueType::List,
         "none",
-        "capability tags of its announce, e.g. pdf,translation",
+        "capability tags of its announce, e.g. image-gen,pdf: informative, they grant \
+         nothing and only order wakes",
     ),
     key(
         "agent.every",
@@ -1136,11 +1140,12 @@ fn toml_value(key: &Key, raw: &str) -> Result<toml_edit::Value> {
             }
             raw.into()
         }
-        ValueType::Access => {
-            raw.parse::<crate::access::Access>()
-                .map_err(|e| invalid(e.to_string()))?;
-            raw.into()
-        }
+        // Stored by its current name (`locked` → `swarm-only`).
+        ValueType::Access => raw
+            .parse::<crate::access::Access>()
+            .map_err(|e| invalid(e.to_string()))?
+            .to_string()
+            .into(),
         ValueType::Duration => {
             parse_duration(raw).map_err(invalid)?;
             raw.into()
@@ -1503,7 +1508,7 @@ impl ConfigFile {
     }
 
     /// Warnings after setting `name`, when it is an agent's `tools` or
-    /// `access`: locked access ignores the tools, and whatever the tools
+    /// `access`: swarm-only access ignores the tools, and whatever the tools
     /// can read, a post can ask the agent to leak.
     pub fn tools_warnings(&self, name: &str) -> Vec<String> {
         let Some((table, leaf @ ("tools" | "access"))) = name.rsplit_once('.') else {
@@ -1528,12 +1533,11 @@ impl ConfigFile {
         }
         let access = self
             .get(&format!("{table}.access"))
-            .map(|v| v.trim_matches('"').to_string())
-            .unwrap_or_else(|| "locked".into());
+            .map(|v| v.trim_matches('"').to_string());
         let mut out = Vec::new();
-        if access == "locked" {
+        if crate::access::level(access.as_deref()).ok() == Some(crate::access::Access::SwarmOnly) {
             out.push(format!(
-                "locked access ignores {table}.tools; use access workspace \
+                "swarm-only access ignores {table}.tools; use access workspace \
                  (`wats config set {table}.access workspace`)"
             ));
         } else if leaf == "tools" {
@@ -2084,9 +2088,10 @@ mod tests {
         }
     }
 
-    /// `tools` takes any name; on a locked agent (access unset is locked)
-    /// it is kept, with one warning; with workspace access, the leak
-    /// warning, and Codex image generation's own.
+    /// `tools` takes any name; with workspace access (access unset is
+    /// workspace), the leak warning, and Codex image generation's own; on
+    /// a swarm-only agent it is kept, with one warning. `locked` is stored
+    /// as `swarm-only`.
     #[test]
     fn tools_take_any_name_and_warn() {
         let dir = tempfile::tempdir().unwrap();
@@ -2097,19 +2102,25 @@ mod tests {
             "image_generation,mcp__x__y,Anything",
         )
         .unwrap();
-        let locked = file.tools_warnings("agents.imagegen.tools");
-        assert_eq!(locked.len(), 1, "{locked:?}");
-        assert!(
-            locked[0]
-                .starts_with("locked access ignores agents.imagegen.tools; use access workspace"),
-            "{locked:?}"
-        );
-        file.set("agents.imagegen.access", "workspace").unwrap();
-        assert!(file.tools_warnings("agents.imagegen.access").is_empty());
         let open = file.tools_warnings("agents.imagegen.tools");
         assert_eq!(open, [TOOLS_WARNING, IMAGE_GENERATION_WARNING]);
         assert!(IMAGE_GENERATION_WARNING.contains("referenced_image_paths"));
+        file.set("agents.imagegen.access", "swarm-only").unwrap();
+        let ignored = file.tools_warnings("agents.imagegen.tools");
+        assert_eq!(ignored.len(), 1, "{ignored:?}");
+        assert!(
+            ignored[0].starts_with(
+                "swarm-only access ignores agents.imagegen.tools; use access workspace"
+            ),
+            "{ignored:?}"
+        );
+        file.set("agents.imagegen.access", "workspace").unwrap();
+        assert!(file.tools_warnings("agents.imagegen.access").is_empty());
         file.set("agents.imagegen.access", "locked").unwrap();
+        assert_eq!(
+            file.get("agents.imagegen.access").as_deref(),
+            Some("\"swarm-only\"")
+        );
         assert_eq!(file.tools_warnings("agents.imagegen.access").len(), 1);
         assert!(file.tools_warnings("agents.imagegen.about").is_empty());
         file.save().unwrap();

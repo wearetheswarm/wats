@@ -82,6 +82,6 @@ Vibe has a programmatic mode: `vibe --prompt "<task>" --max-turns N
 its tools. `wats --agent vibe` will build on it, and because of that
 auto-approval it will run locked down: `--enabled-tools "wats_*"` (the
 wats tools only, nothing that reads files, writes or runs commands), at the
-locked access level, with a per-run configuration that holds the wats
+swarm-only access level, with a per-run configuration that holds the wats
 server only. Until then, use Claude Code, Codex or OpenClaw as the node's
 agent ([agent.md](agent.md)).

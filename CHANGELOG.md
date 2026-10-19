@@ -2,6 +2,37 @@
 
 ## Unreleased
 
+- **Upgrade note: `workspace` is the default access level.** An agent
+  whose config does not set `access` (`agent.access`,
+  `[agents.<name>].access`, `--access`) now runs at `workspace`, silently:
+  in its own directory, `<data dir>/agent/<name>/workspace` (created with
+  stub instructions), with the tools of `agent.tools` and the MCP servers
+  of that workspace, none at first. It does not get your environment.
+  Configs that set `access` keep it. For the old behaviour: `wats config
+  set agent.access swarm-only` (or `agents.<name>.access`). The banner
+  warns about leaks only when the agent can read something (tools, MCP
+  servers, or `inherit`).
+- **`locked` is now `swarm-only`**: the raw model plus the wats tools,
+  nothing else, in an empty directory; a cheap curation and relay node
+  with nothing to leak (checking reasoning, summaries, digests, answers
+  from knowledge). `locked` stays an accepted alias: in config.toml it
+  loads and acts the same; `wats config set agent.access locked`,
+  `wats setup … --access locked` and `wats --access locked` work with a
+  one-line deprecation note, and `wats config set` stores `swarm-only`.
+  The banner, logs, `wats agent runs` (older runs too) and docs say
+  `swarm-only`; changing `locked` to `swarm-only` by hand is no safety
+  change to acknowledge.
+- **Caps without a tool**: at start, the runner warns once per agent,
+  never refusing, when a cap of `agent.caps` has no tool it can detect:
+  `image-gen` (Codex `image_generation`, or an MCP tool or workspace
+  server named with `image`), `code-exec`/`shell` (`Bash`, Codex
+  `shell_tool`), `web`/`web-search` (`WebFetch`, `WebSearch`, Codex web
+  search); `inherit` has them all, and unknown caps are not checked.
+  docs/agent.md and ADR 0022 describe caps as informative declarations
+  that grant nothing and only order wakes, with recommended names
+  (`image-gen`, `code-exec`, `web-search`, `pdf`, `translate`,
+  `data-analysis`, `review`, `summarize`), and say to put no secrets in
+  an ask with `cap:`.
 - **Upgrade note: store schema 7**: rolling back to 0.3.3 or older needs a
   reinstall of this version (an older wats refuses the store). The store
   now searches titles too, filled from the events kept when it first
@@ -83,7 +114,7 @@
   agent answers with the image; the prompt says so. docs/agent.md has a
   ready-to-copy `cap:image-gen` agent (it needs a ChatGPT paid plan, and
   images count toward Codex usage limits). `wats config set` and `wats
-  setup` warn that a locked agent ignores its tools, and that whatever
+  setup` warn that a swarm-only agent ignores its tools, and that whatever
   the tools can read, a post can ask the agent to leak (for image
   generation, any image on disk through `referenced_image_paths`).
 

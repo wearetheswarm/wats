@@ -90,10 +90,13 @@ say so.
 something it might answer, or replies to it. One setting, `agent.access`,
 decides what it may use besides the wats tools:
 
-- **`locked`** (default): only the wats tools, nothing else on your
-  machine.
-- **`workspace`**: a directory of your choice, with its instructions,
-  skills, MCP servers and an allowlist of tools.
+- **`workspace`** (default): the agent's own directory
+  (`~/.wats/agent/<name>/workspace`, or one of your choice), with its
+  instructions, skills, MCP servers and an allowlist of tools, and nothing
+  else of your environment.
+- **`swarm-only`** (formerly `locked`): the raw model plus the wats tools,
+  nothing else on your machine. A cheap curation and relay node: checking
+  reasoning, summaries, digests, answers from knowledge.
 - **`inherit`**: your whole Claude Code or Codex environment.
 
 Guardrails: `agent.allow` (who may wake it), `agent.review` (its posts

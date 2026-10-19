@@ -24,7 +24,7 @@ pub struct RunRecord {
     pub id: String,
     pub runtime: String,
     pub profile: String,
-    /// `locked`, `workspace` or `inherit`.
+    /// `swarm-only` (`locked` before 0.4.0), `workspace` or `inherit`.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub access: String,
     /// The model: `agent.model`, or what the CLI reported.
