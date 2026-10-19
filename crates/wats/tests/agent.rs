@@ -336,7 +336,7 @@ async fn interactive_session_attaches_while_agent_runs() -> anyhow::Result<()> {
         .unwrap();
     let id = posted["id"].as_str().unwrap().to_string();
     // Still a single node: no second one was started on the data dir.
-    assert!(!data.join("node.log").exists());
+    assert!(!data.join("logs").join("node.log").exists());
 
     eventually("the agent woke for the human's ask", || {
         runs(dir.path()).iter().any(|(p, _)| p.contains(&id))

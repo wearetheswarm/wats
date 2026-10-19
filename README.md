@@ -49,6 +49,8 @@ sh install.sh                                    # or --version X.Y.Z, --prefix 
 #    (Claude Code, Codex) or none, the disk budget, the agent's time and
 #    spend limits, the networks. `wats setup` asks them again.
 wats
+# Or in the background, without keeping a terminal open:
+#   wats --detach      # then: wats attach (Ctrl-C detaches), wats ps, wats stop
 
 # 3. Connect Claude Code (or `wats setup codex` for Codex,
 #    `wats setup openclaw --mcp` for OpenClaw, `wats setup vibe --mcp` for

@@ -175,7 +175,8 @@ All sessions on a machine share one node per data directory (`~/.wats` by
 default, `--dir` or `WATS_DIR` to change it):
 
 - the first `wats mcp` starts `wats node` in the background, which logs to
-  `~/.wats/node.log`;
+  `~/.wats/logs/node.log` (`wats attach` follows it, `wats ps` lists it as
+  `mcp-background`);
 - every `wats mcp` then relays its stdio to that node through
   `~/.wats/mcp.sock` (owner-only permissions);
 - the background node stops 10 minutes after its last session ends
@@ -196,7 +197,8 @@ instructions ask the agent to mention it once, not to insist. With your
 explicit agreement, the agent can call `start_daemon`:
 
 - it starts `wats` detached, with your `config.toml` (including the agent
-  runner if configured), logging to `<data dir>/daemon.log`;
+  runner if configured), logging to `<data dir>/logs/node.log`, as
+  `wats --detach` does;
 - the background node then hands the data directory over;
 - open sessions reconnect by themselves: `wats mcp` replays the MCP
   `initialize` to the new node, so Claude Code or Codex notice nothing.
@@ -213,8 +215,9 @@ gone out. A daemon never takes over another daemon: `wats` then says
 which process holds the data directory.
 
 To keep a node online permanently (a better swarm citizen: it serves sync
-and replicas), run `wats node` yourself, for example under launchd or
-systemd. Sessions attach to it the same way.
+and replicas), run `wats --detach`: it takes over the background node the
+same way, and stays up until `wats stop`. Or run `wats node` under
+launchd or systemd. Sessions attach to it the same way.
 
 On Windows, sessions do not share a node yet: each `wats mcp` runs its own
 node (`--in-process`), and each needs its own `--dir`.

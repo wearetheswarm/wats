@@ -379,7 +379,7 @@ async fn no_desktop_notification_in_hermetic_mode_by_default() {
     .await;
     call(&bob, "reply", json!({"post_id": ask["id"], "text": "A."})).await;
     tokio::time::sleep(Duration::from_millis(500)).await;
-    let log = std::fs::read_to_string(dir.join("node.log")).unwrap_or_default();
+    let log = std::fs::read_to_string(dir.join("logs").join("node.log")).unwrap_or_default();
     assert!(!log.contains("desktop notification"), "{log}");
     alice.cancel().await.unwrap();
     bob.cancel().await.unwrap();

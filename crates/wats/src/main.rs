@@ -78,6 +78,23 @@ struct DaemonArgs {
     /// taking over from a background node).
     #[arg(long, hide = true)]
     wait_lock: Option<u64>,
+    /// Run in the background, detached from this terminal (like `wats &`,
+    /// but it survives closing it): returns once the node is up, its output
+    /// going to `<data dir>/logs/node.log`. Watch it with `wats attach`,
+    /// list with `wats ps`, stop with `wats stop`. Takes over a background
+    /// node started by `wats mcp`, as `wats` does.
+    #[arg(short = 'd', long, conflicts_with = "idle_exit")]
+    detach: bool,
+    /// This process's stderr is this file (a detached node): rotate it by
+    /// size.
+    #[arg(long, hide = true)]
+    log_file: Option<PathBuf>,
+    /// Size at which a detached node rotates its log [default: 10M].
+    #[arg(long, hide = true, value_parser = parse_size)]
+    log_max_size: Option<u64>,
+    /// Rotated log files a detached node keeps [default: 3].
+    #[arg(long, hide = true)]
+    log_keep: Option<usize>,
     #[command(flatten)]
     agent: AgentArgs,
 }
@@ -333,6 +350,40 @@ enum Command {
         /// The host event the hook runs on.
         #[arg(long, default_value = "user-prompt-submit", value_parser = ["user-prompt-submit", "session-start"])]
         event: String,
+    },
+    /// Follow the node running in the background (`wats --detach`, or the
+    /// one `wats mcp` started): its banner and last log lines, then what it
+    /// logs, live. Ctrl-C detaches; the node keeps running.
+    Attach {
+        /// How many of the last log lines to show first.
+        #[arg(short = 'n', long, default_value_t = 20)]
+        lines: usize,
+    },
+    /// List the wats nodes running on this machine: pid, mode (detached,
+    /// foreground, or started by `wats mcp`), version, uptime, profile,
+    /// agents, network, MCP sessions and data directory. Finds the nodes of
+    /// `~/.wats`, of --dir, and of every data directory a node ran in
+    /// (`~/.wats/run`).
+    Ps {
+        /// Also list the known data directories where no node runs.
+        #[arg(long)]
+        all: bool,
+        /// Print JSON instead of a table.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Stop the node of the data directory (--dir, default ~/.wats), or the
+    /// one running as --profile: asks it to stop gracefully, then kills it
+    /// after --timeout. MCP sessions using it wait 30 s for a node to come
+    /// back, then end.
+    Stop {
+        /// Stop every wats node running on this machine (see `wats ps`).
+        #[arg(long)]
+        all: bool,
+        /// How long to wait for a graceful stop before killing it (e.g. 10s,
+        /// 1m).
+        #[arg(long, default_value = "10s", value_parser = parse_duration)]
+        timeout: Duration,
     },
     /// Show the node: running or not, networks, peers, storage, version
     /// and the update notice (what the MCP `status` tool returns).
@@ -2700,6 +2751,695 @@ async fn status_command(config: &NodeConfig, json: bool) -> Result<()> {
     Ok(())
 }
 
+/// `dir` with `~` for the home directory, for display.
+fn tilde(dir: &std::path::Path) -> String {
+    match std::env::home_dir()
+        .as_deref()
+        .and_then(|h| dir.strip_prefix(h).ok())
+    {
+        Some(rest) if rest.as_os_str().is_empty() => "~".to_string(),
+        Some(rest) => format!("~/{}", rest.display()),
+        None => dir.display().to_string(),
+    }
+}
+
+/// A data directory `wats ps`, `attach` and `stop` look at (ADR 0023),
+/// and the node running there.
+struct NodeEntry {
+    dir: PathBuf,
+    /// Its lock is held: a node runs there.
+    running: bool,
+    /// What the lock file records about the holder (or the last one).
+    holder: Option<wats::node::LockHolder>,
+    /// The node's own answer to `Control::Info`, through its socket.
+    info: Option<serde_json::Value>,
+}
+
+impl NodeEntry {
+    async fn look(dir: PathBuf) -> Self {
+        let running = wats::node::node_running(&dir);
+        let holder = wats::node::lock_holder(&dir);
+        let mut info = None;
+        if running {
+            info = attach::control_within(&dir, attach::Control::Info, Duration::from_secs(3))
+                .await
+                .ok()
+                .flatten();
+            // Another node's socket (WATS_MCP_SOCKET): not this one's.
+            if let (Some(answer), Some(holder)) = (&info, &holder)
+                && answer["pid"].as_u64() != Some(u64::from(holder.pid))
+            {
+                info = None;
+            }
+        }
+        NodeEntry {
+            dir,
+            running,
+            holder,
+            info,
+        }
+    }
+
+    fn pid(&self) -> Option<u32> {
+        self.info
+            .as_ref()
+            .and_then(|i| i["pid"].as_u64())
+            .and_then(|p| u32::try_from(p).ok())
+            .or(self.holder.as_ref().map(|h| h.pid))
+    }
+
+    fn info_str(&self, key: &str) -> Option<String> {
+        self.info
+            .as_ref()
+            .and_then(|i| i[key].as_str())
+            .map(str::to_string)
+    }
+
+    fn role(&self) -> String {
+        self.info_str("role")
+            .or_else(|| self.holder.as_ref().map(|h| h.role.clone()))
+            .unwrap_or_default()
+    }
+
+    fn log(&self) -> Option<PathBuf> {
+        self.info_str("log")
+            .map(PathBuf::from)
+            .or_else(|| self.holder.as_ref().and_then(|h| h.log.clone()))
+    }
+
+    fn profile(&self) -> Option<String> {
+        self.info_str("profile")
+            .or_else(|| self.holder.as_ref().and_then(|h| h.profile.clone()))
+    }
+
+    fn version(&self) -> Option<String> {
+        self.info_str("version")
+            .or_else(|| self.holder.as_ref().map(|h| h.version.clone()))
+    }
+
+    fn started(&self) -> Option<u64> {
+        self.info
+            .as_ref()
+            .and_then(|i| i["started"].as_u64())
+            .or(self.holder.as_ref().map(|h| h.started_secs))
+            .filter(|s| *s > 0)
+    }
+
+    fn sessions(&self) -> Option<u64> {
+        self.info.as_ref().and_then(|i| i["sessions"].as_u64())
+    }
+
+    fn agents(&self) -> Vec<String> {
+        self.info
+            .as_ref()
+            .and_then(|i| i["agents"].as_array())
+            .into_iter()
+            .flatten()
+            .filter_map(|a| a.as_str().map(str::to_string))
+            .collect()
+    }
+
+    /// How it runs: `detached` (`wats --detach`, or the daemon an MCP
+    /// session started), `foreground` (`wats` in a terminal or a service),
+    /// `mcp-background` (started by `wats mcp`), `mcp-in-process`, `cli`.
+    fn mode(&self) -> &'static str {
+        if !self.running {
+            return "stopped";
+        }
+        match self.role().as_str() {
+            "daemon" if self.log().is_some() => "detached",
+            "daemon" => "foreground",
+            "background" => "mcp-background",
+            "in-process" => "mcp-in-process",
+            "cli" => "cli",
+            _ => "unknown",
+        }
+    }
+
+    fn online(&self) -> bool {
+        self.info
+            .as_ref()
+            .is_some_and(|i| i["health"]["connectivity"]["state"] == "online")
+    }
+
+    /// `online (2 peers)`, `relay only`, `offline`, `connecting`, or `-`.
+    fn network(&self) -> String {
+        let Some(info) = &self.info else {
+            return "-".to_string();
+        };
+        let connectivity = &info["health"]["connectivity"];
+        match connectivity["state"].as_str() {
+            Some("online") => wats::reconnect::summary(connectivity),
+            _ if info["health"]["checks"]["relay"] == "ok" => "relay only".to_string(),
+            Some(state) => state.to_string(),
+            None => "-".to_string(),
+        }
+    }
+
+    fn json(&self, now: u64) -> serde_json::Value {
+        json!({
+            "data_dir": self.dir,
+            "running": self.running,
+            "mode": self.mode(),
+            "pid": self.running.then(|| self.pid()).flatten(),
+            "version": self.running.then(|| self.version()).flatten(),
+            "started": self.running.then(|| self.started().map(wats::runs::format_time)).flatten(),
+            "uptime_secs": self.running.then(|| self.started().map(|s| now.saturating_sub(s))).flatten(),
+            "profile": self.running.then(|| self.profile()).flatten(),
+            "agents": self.agents(),
+            "online": self.online(),
+            "network": self.network(),
+            "sessions": self.sessions(),
+            "log": self.log(),
+        })
+    }
+
+    /// `--dir <dir>` to name it in a command, unless it is the default.
+    fn dir_flag(&self) -> String {
+        if default_dir().is_ok_and(|d| same_dir(&d, &self.dir)) {
+            String::new()
+        } else {
+            format!(" --dir {}", tilde(&self.dir))
+        }
+    }
+}
+
+fn same_dir(a: &std::path::Path, b: &std::path::Path) -> bool {
+    let key = |p: &std::path::Path| {
+        std::fs::canonicalize(p)
+            .or_else(|_| std::path::absolute(p))
+            .unwrap_or_else(|_| p.to_path_buf())
+    };
+    key(a) == key(b)
+}
+
+/// The data directories to look at: --dir, `~/.wats`, and those of the
+/// registry (ADR 0023), once each.
+fn known_dirs(node: &NodeArgs) -> Vec<PathBuf> {
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    dirs.extend(node.dir.clone());
+    dirs.extend(default_dir().ok());
+    if let Some(registry) = wats::background::registry_dir(node.hermetic) {
+        dirs.extend(wats::background::registered(&registry));
+    }
+    let mut unique: Vec<PathBuf> = Vec::new();
+    for dir in dirs {
+        let dir = std::path::absolute(&dir).unwrap_or(dir);
+        if !unique.iter().any(|d| same_dir(d, &dir)) {
+            unique.push(dir);
+        }
+    }
+    unique
+}
+
+/// Every known data directory and its node. A registry entry where no
+/// node runs is stale: removed.
+async fn node_entries(node: &NodeArgs) -> Vec<NodeEntry> {
+    let registry = wats::background::registry_dir(node.hermetic);
+    let mut entries = Vec::new();
+    for dir in known_dirs(node) {
+        let entry = NodeEntry::look(dir).await;
+        if !entry.running
+            && let Some(registry) = &registry
+        {
+            wats::background::unregister(registry, &entry.dir);
+        }
+        entries.push(entry);
+    }
+    entries
+}
+
+/// The node `wats attach` or `wats stop` is about: --dir's (or WATS_DIR);
+/// without one, the running node whose profile is --profile; else
+/// `~/.wats`'s.
+async fn chosen_node(node: &NodeArgs) -> Result<NodeEntry> {
+    let profile = node.profile.as_deref();
+    if node.dir.is_none()
+        && let Some(profile) = profile
+    {
+        let mut matching: Vec<NodeEntry> = node_entries(node)
+            .await
+            .into_iter()
+            .filter(|e| e.running && e.profile().as_deref() == Some(profile))
+            .collect();
+        return match matching.len() {
+            0 => anyhow::bail!("no wats node runs with profile {profile} (wats ps lists them)"),
+            1 => Ok(matching.remove(0)),
+            _ => anyhow::bail!(
+                "several wats nodes run with profile {profile}: choose one with --dir ({})",
+                matching
+                    .iter()
+                    .map(|e| tilde(&e.dir))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        };
+    }
+    let dir = node.data_dir()?;
+    let dir = std::path::absolute(&dir).unwrap_or(dir);
+    let entry = NodeEntry::look(dir).await;
+    if let (Some(wanted), Some(actual)) = (profile, entry.profile())
+        && entry.running
+        && wanted != actual
+    {
+        anyhow::bail!(
+            "the node in {} runs with profile {actual}, not {wanted}",
+            tilde(&entry.dir)
+        );
+    }
+    Ok(entry)
+}
+
+/// `wats ps` (ADR 0023).
+async fn ps_command(node: &NodeArgs, all: bool, json: bool) -> Result<()> {
+    let now = unix_now();
+    let entries: Vec<NodeEntry> = node_entries(node)
+        .await
+        .into_iter()
+        .filter(|e| all || e.running)
+        .collect();
+    if json {
+        let list: Vec<serde_json::Value> = entries.iter().map(|e| e.json(now)).collect();
+        println!("{}", serde_json::to_string_pretty(&list)?);
+        return Ok(());
+    }
+    if entries.is_empty() {
+        println!("no wats node running · start one in the background: wats --detach");
+        return Ok(());
+    }
+    let rows: Vec<[String; 9]> = entries
+        .iter()
+        .map(|e| {
+            let dash = || "-".to_string();
+            if !e.running {
+                return [
+                    dash(),
+                    e.mode().to_string(),
+                    dash(),
+                    dash(),
+                    dash(),
+                    dash(),
+                    dash(),
+                    dash(),
+                    tilde(&e.dir),
+                ];
+            }
+            let agents = e.agents();
+            [
+                e.pid().map_or_else(dash, |p| p.to_string()),
+                e.mode().to_string(),
+                e.version().unwrap_or_else(dash),
+                e.started().map_or_else(dash, |s| {
+                    wats::background::format_uptime(now.saturating_sub(s))
+                }),
+                e.profile().unwrap_or_else(dash),
+                if agents.is_empty() {
+                    dash()
+                } else {
+                    agents.join(",")
+                },
+                e.network(),
+                e.sessions().map_or_else(dash, |s| s.to_string()),
+                tilde(&e.dir),
+            ]
+        })
+        .collect();
+    let header = [
+        "PID", "MODE", "VERSION", "UPTIME", "PROFILE", "AGENTS", "NETWORK", "SESSIONS", "DATA DIR",
+    ];
+    let mut widths: Vec<usize> = header.iter().map(|h| h.chars().count()).collect();
+    for row in &rows {
+        for (width, cell) in widths.iter_mut().zip(row) {
+            *width = (*width).max(cell.chars().count());
+        }
+    }
+    let line = |cells: Vec<&str>| {
+        let mut text = String::new();
+        for (i, (cell, width)) in cells.iter().zip(&widths).enumerate() {
+            if i + 1 == cells.len() {
+                text.push_str(cell);
+            } else {
+                let pad = width.saturating_sub(cell.chars().count());
+                text.push_str(cell);
+                text.push_str(&" ".repeat(pad + 2));
+            }
+        }
+        text
+    };
+    println!("{}", line(header.to_vec()));
+    for row in &rows {
+        println!("{}", line(row.iter().map(String::as_str).collect()));
+    }
+    Ok(())
+}
+
+/// `wats --detach` (ADR 0023): start this same command line again as a
+/// detached process logging to `<data dir>/logs/node.log`, and return once
+/// its node is up (it took the data directory and serves its socket), or
+/// print what it said before it died.
+#[cfg(unix)]
+async fn detach_command(config: &NodeConfig, settings: &Settings, quiet: bool) -> Result<()> {
+    let dir = std::path::absolute(&config.data_dir)?;
+    let before = NodeEntry::look(dir.clone()).await;
+    let takeover = before.running && before.role() == "background";
+    if before.running && !takeover {
+        anyhow::bail!(
+            "a wats node already runs in {}: pid {}, {}, started {}. Watch it: wats attach{flag} · \
+             stop it: wats stop{flag}",
+            tilde(&dir),
+            before.pid().map_or_else(|| "?".into(), |p| p.to_string()),
+            before.mode(),
+            before
+                .holder
+                .as_ref()
+                .map_or_else(|| "?".into(), |h| h.started.clone()),
+            flag = before.dir_flag(),
+        );
+    }
+    let log = wats::background::log_path(&dir);
+    let offset = std::fs::metadata(&log).map_or(0, |m| m.len());
+    // The child: the same command line, which `--log-file` tells that it
+    // is the detached one.
+    let mut args: Vec<std::ffi::OsString> = vec!["--log-file".into(), log.clone().into()];
+    args.extend(std::env::args_os().skip(1));
+    let mut child = wats::background::spawn_detached(&args, &log, &[])
+        .context("start the node in the background")?;
+    let pid = child.id();
+    // A takeover waits up to 30 s for the background node to hand over.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    loop {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        if let Some(status) = child.try_wait()? {
+            let said = std::fs::read(&log)
+                .ok()
+                .and_then(|bytes| {
+                    bytes
+                        .get(usize::try_from(offset).ok()?..)
+                        .map(<[u8]>::to_vec)
+                })
+                .unwrap_or_default();
+            eprint!("{}", String::from_utf8_lossy(&said));
+            if status.success() {
+                eprintln!(
+                    "the node stopped at once ({status}); log: {}",
+                    log.display()
+                );
+                return Ok(());
+            }
+            anyhow::bail!("the node did not start ({status}); log: {}", tilde(&log));
+        }
+        // Up: it holds the lock and its node started (it says so in the
+        // lock file).
+        let up = wats::node::lock_holder(&dir).is_some_and(|h| h.pid == pid && h.up)
+            && wats::node::node_running(&dir);
+        if up {
+            break;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            anyhow::bail!(
+                "the node (pid {pid}) is not up after 60 s; it may still be starting: wats ps, \
+                 wats attach · log: {}",
+                tilde(&log)
+            );
+        }
+    }
+    let entry = NodeEntry::look(dir.clone()).await;
+    let flag = entry.dir_flag();
+    if !quiet {
+        print_art(settings, false);
+        if let Ok(banner) = std::fs::read_to_string(wats::background::banner_path(&dir)) {
+            eprint!("{banner}");
+        }
+    }
+    if takeover {
+        eprintln!(
+            "took over from the background node of your MCP sessions (pid {}): they reconnect by \
+             themselves",
+            before.pid().map_or_else(|| "?".into(), |p| p.to_string())
+        );
+    }
+    eprintln!(
+        "running in the background · pid {pid} · log {}\nwatch it: wats attach{flag} · list: wats \
+         ps · stop it: wats stop{flag}",
+        tilde(&log)
+    );
+    Ok(())
+}
+
+#[cfg(not(unix))]
+async fn detach_command(_: &NodeConfig, _: &Settings, _: bool) -> Result<()> {
+    anyhow::bail!(
+        "`wats --detach` is not supported on native Windows yet: run wats under WSL, or keep \
+         `wats` running in a terminal"
+    )
+}
+
+/// The art above the banner, for a person at a terminal (`stdout`: on
+/// stdout, else stderr).
+fn print_art(settings: &Settings, stdout: bool) {
+    use std::io::IsTerminal;
+    let (out_tty, err_tty) = (
+        std::io::stdout().is_terminal(),
+        std::io::stderr().is_terminal(),
+    );
+    if !wats::banner::should_show(settings.ui.banner.unwrap_or(true), out_tty, err_tty) {
+        return;
+    }
+    let color = wats::banner::color_ok(
+        if stdout { out_tty } else { err_tty },
+        std::env::var_os("NO_COLOR").as_deref(),
+        std::env::var("TERM").ok().as_deref(),
+    );
+    let art = wats::banner::render(env!("CARGO_PKG_VERSION"), color);
+    if stdout {
+        println!("{art}");
+    } else {
+        eprintln!("{art}");
+    }
+}
+
+/// `wats attach` (ADR 0023): the banner of the node running in the
+/// background, its last log lines, then what it logs until Ctrl-C (which
+/// only ends this command) or until it stops.
+async fn attach_command(node: &NodeArgs, lines: usize, mut shutdown: Shutdown) -> Result<()> {
+    let entry = chosen_node(node).await?;
+    let flag = entry.dir_flag();
+    if !entry.running {
+        anyhow::bail!(
+            "no wats node runs in {}: start one in the background with `wats --detach{flag}`",
+            tilde(&entry.dir)
+        );
+    }
+    let pid = entry.pid().context("the node's lock file names no pid")?;
+    let Some(log) = entry.log() else {
+        match entry.mode() {
+            "foreground" => anyhow::bail!(
+                "the node in {} (pid {pid}) runs in the foreground: its output is in the terminal \
+                 or service that started it. `wats --detach` runs one you can attach to",
+                tilde(&entry.dir)
+            ),
+            mode => anyhow::bail!(
+                "the node in {} (pid {pid}, {mode}) keeps no log to attach to",
+                tilde(&entry.dir)
+            ),
+        }
+    };
+    let settings = Settings::load(&entry.dir).unwrap_or_default();
+    let mut out = std::io::stdout().lock();
+    let mut banner: Vec<String> = Vec::new();
+    if entry.mode() == "detached" {
+        print_art(&settings, true);
+        banner = std::fs::read_to_string(wats::background::banner_path(&entry.dir))
+            .map(|text| text.lines().map(str::to_string).collect())
+            .unwrap_or_default();
+        for line in &banner {
+            writeln!(out, "{line}")?;
+        }
+    } else {
+        writeln!(
+            out,
+            "wats {} · data {} · the background node of your MCP sessions (wats mcp): it exits \
+             once they are gone",
+            entry.version().unwrap_or_default(),
+            tilde(&entry.dir)
+        )?;
+    }
+    let up = entry
+        .started()
+        .map(|s| {
+            format!(
+                ", up {}",
+                wats::background::format_uptime(unix_now().saturating_sub(s))
+            )
+        })
+        .unwrap_or_default();
+    writeln!(
+        out,
+        "attached to pid {pid} ({}{up}) · Ctrl-C detaches, the node keeps running · stop it: wats \
+         stop{flag}",
+        entry.mode()
+    )?;
+    // Follow from here; first the last lines, without the banner shown
+    // above.
+    let mut follower = wats::background::Follower::at_end(&log);
+    for line in wats::background::tail(&log, lines + banner.len())
+        .into_iter()
+        .filter(|l| !banner.contains(l))
+        .collect::<Vec<_>>()
+        .iter()
+        .rev()
+        .take(lines)
+        .rev()
+    {
+        writeln!(out, "{line}")?;
+    }
+    out.flush()?;
+    let mut checked = tokio::time::Instant::now();
+    loop {
+        tokio::select! {
+            _ = &mut shutdown => {
+                eprintln!("detached; the node keeps running (pid {pid})");
+                return Ok(());
+            }
+            _ = tokio::time::sleep(Duration::from_millis(200)) => {}
+        }
+        let new = follower.read_new()?;
+        if !new.is_empty() {
+            match out.write_all(&new).and_then(|()| out.flush()) {
+                // `wats attach | head`
+                Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => return Ok(()),
+                other => other?,
+            }
+        }
+        if checked.elapsed() >= Duration::from_secs(1) {
+            checked = tokio::time::Instant::now();
+            #[cfg(unix)]
+            let gone = !wats::background::alive(pid);
+            #[cfg(not(unix))]
+            let gone = !wats::node::node_running(&entry.dir);
+            if gone {
+                out.write_all(&follower.read_new()?)?;
+                writeln!(out, "the node stopped (pid {pid})")?;
+                return Ok(());
+            }
+        }
+    }
+}
+
+/// `wats stop` (ADR 0023): ask each chosen node to stop through its
+/// socket (SIGTERM when it does not answer), wait up to `timeout` for its
+/// lock to be free, then SIGKILL it.
+#[cfg(unix)]
+async fn stop_command(node: &NodeArgs, all: bool, timeout: Duration) -> Result<()> {
+    let targets: Vec<NodeEntry> = if all {
+        let profile = node.profile.as_deref();
+        node_entries(node)
+            .await
+            .into_iter()
+            .filter(|e| e.running)
+            .filter(|e| profile.is_none() || e.profile().as_deref() == profile)
+            .collect()
+    } else {
+        let entry = chosen_node(node).await?;
+        if !entry.running {
+            if let Some(registry) = wats::background::registry_dir(node.hermetic) {
+                wats::background::unregister(&registry, &entry.dir);
+            }
+            anyhow::bail!("no wats node runs in {}", tilde(&entry.dir));
+        }
+        vec![entry]
+    };
+    if targets.is_empty() {
+        println!("no wats node running");
+        return Ok(());
+    }
+    let mut failed = 0;
+    for entry in targets {
+        if let Err(e) = stop_node(&entry, timeout).await {
+            eprintln!("{}: {e:#}", tilde(&entry.dir));
+            failed += 1;
+        }
+    }
+    if failed > 0 {
+        anyhow::bail!("{failed} node(s) not stopped");
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+async fn stop_command(_: &NodeArgs, _: bool, _: Duration) -> Result<()> {
+    anyhow::bail!(
+        "`wats stop` is not supported on native Windows yet: stop the node with Ctrl-C in its \
+         terminal, or run wats under WSL"
+    )
+}
+
+#[cfg(unix)]
+async fn stop_node(entry: &NodeEntry, timeout: Duration) -> Result<()> {
+    let dir = &entry.dir;
+    let started = std::time::Instant::now();
+    let mode = entry.mode();
+    if let Some(sessions) = entry.sessions().filter(|s| *s > 0) {
+        eprintln!(
+            "warning: {sessions} MCP session(s) use the node in {}: each waits 30 s for a node \
+             to come back (`wats --detach`), then ends; their host starts a background node \
+             again when it restarts them",
+            tilde(dir)
+        );
+    }
+    // Graceful: through the socket, else SIGTERM to the lock holder.
+    let asked = attach::control_within(dir, attach::Control::Stop, Duration::from_secs(5))
+        .await
+        .ok()
+        .flatten();
+    let pid = match asked
+        .as_ref()
+        .and_then(|a| a["pid"].as_u64())
+        .and_then(|p| u32::try_from(p).ok())
+    {
+        Some(pid) => pid,
+        None => {
+            let pid = entry.pid().context("the lock file names no pid")?;
+            // The lock is held and names it: that process is the node.
+            if wats::node::node_running(dir)
+                && wats::node::lock_holder(dir).is_some_and(|h| h.pid == pid)
+            {
+                wats::background::signal(pid, "TERM")?;
+            }
+            pid
+        }
+    };
+    let what = format!("wats pid {pid} ({mode}, data {})", tilde(dir));
+    // Gone: the lock is free, or another process took it since.
+    let gone = || {
+        !wats::node::node_running(dir) || wats::node::lock_holder(dir).is_some_and(|h| h.pid != pid)
+    };
+    let deadline = std::time::Instant::now() + timeout;
+    while std::time::Instant::now() < deadline {
+        if gone() {
+            println!("stopped {what} in {:.1} s", started.elapsed().as_secs_f64());
+            return Ok(());
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    // Still holding the lock after `timeout`: the same process, since the
+    // lock names it.
+    if wats::node::lock_holder(dir).is_some_and(|h| h.pid == pid) {
+        wats::background::signal(pid, "KILL")?;
+    }
+    for _ in 0..50 {
+        if gone() {
+            println!(
+                "{what} did not stop within {} s: killed (SIGKILL)",
+                timeout.as_secs_f64()
+            );
+            return Ok(());
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    anyhow::bail!("{what} still runs after SIGKILL")
+}
+
 /// `key: value` lines, nested keys joined with dots, `node` first.
 fn status_lines(prefix: &str, value: &serde_json::Value) -> Vec<String> {
     use serde_json::Value;
@@ -2808,6 +3548,7 @@ impl NodeArgs {
     /// config.toml, then defaults.
     fn config(&self, file: &Settings) -> Result<NodeConfig> {
         let mut config = NodeConfig::new(self.data_dir()?);
+        config.registry = wats::background::registry_dir(self.hermetic);
         let no_default_bootstrap =
             self.no_default_bootstrap || file.no_default_bootstrap.unwrap_or(false);
         if self.loopback || self.hermetic {
@@ -3091,29 +3832,23 @@ impl NodeArgs {
 }
 
 /// Start `wats node` for `dir` as a detached background process, logging
-/// to `<dir>/node.log`.
+/// to `<dir>/logs/node.log` (the path `wats --detach` shares, ADR 0023).
 #[cfg(unix)]
 fn spawn_background_node(args: &NodeArgs, dir: &std::path::Path, idle_exit: u64) -> Result<()> {
-    use std::os::unix::process::CommandExt;
     std::fs::create_dir_all(dir)?;
-    let log = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(dir.join("node.log"))?;
+    let log = wats::background::log_path(dir);
     // A node started for a session runs no agent of config.toml, unless
     // agent.with_mcp (ADR 0021 §3).
     let with_mcp = Settings::load(dir).is_ok_and(|s| s.agent.with_mcp == Some(true));
-    let child = std::process::Command::new(std::env::current_exe()?)
-        .args(args.to_args(dir))
-        .args(["node", "--quiet"])
-        .args((!with_mcp).then_some("--no-agent"))
-        .args(["--idle-exit", &idle_exit.to_string()])
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(log)
-        // Own process group: the node survives the session that started it.
-        .process_group(0)
-        .spawn()
+    let mut child_args = args.to_args(dir);
+    child_args.extend(["node".into(), "--quiet".into(), "--log-file".into()]);
+    child_args.push(log.clone().into());
+    if !with_mcp {
+        child_args.push("--no-agent".into());
+    }
+    child_args.extend(["--idle-exit".into(), idle_exit.to_string().into()]);
+    // Own process group: the node survives the session that started it.
+    let child = wats::background::spawn_detached(&child_args, &log, &[])
         .context("start background node")?;
     tracing::info!(pid = child.id(), "started background node");
     // Not waited for on purpose: it outlives this process.
@@ -3178,7 +3913,7 @@ async fn mcp_attached(args: &NodeArgs, config: &NodeConfig, idle_exit: u64) -> R
     }
     anyhow::bail!(
         "the background node did not start; see {}",
-        dir.join("node.log").display()
+        wats::background::log_path(dir).display()
     )
 }
 
@@ -3237,6 +3972,10 @@ async fn run_node(node: Arc<Node>, run: NodeRun, mut shutdown: Shutdown) -> Resu
         agents,
     } = run;
     let quiet = !json_lines;
+    // For tests of `wats stop --timeout` only: a node that ignores SIGTERM
+    // and stop requests.
+    let ignore_stop = node.config().mode == NetworkMode::Loopback
+        && std::env::var("WATS_TEST_IGNORE_STOP").as_deref() == Ok("1");
     let print_line = move |value: serde_json::Value| {
         if !quiet {
             print_line(value);
@@ -3380,9 +4119,9 @@ async fn run_node(node: Arc<Node>, run: NodeRun, mut shutdown: Shutdown) -> Resu
                     break;
                 }
             },
-            _ = &mut shutdown => break,
-            _ = node.stop_requested() => {
-                tracing::info!("handing the data directory over");
+            _ = &mut shutdown, if !ignore_stop => break,
+            _ = node.stop_requested(), if !ignore_stop => {
+                tracing::info!("stopping on request");
                 break;
             }
             Ok(()) = halt_outcome.changed() => {
@@ -3660,17 +4399,12 @@ fn unix_now() -> u64 {
         .map_or(0, |d| d.as_secs())
 }
 
-/// What a foreground node prints on start (stderr: stdout may carry JSON).
-fn print_banner(config: &NodeConfig, agents: &[(String, wats::agent::AgentConfig)]) {
-    let home = std::env::home_dir();
-    let dir = match home
-        .as_deref()
-        .and_then(|h| config.data_dir.strip_prefix(h).ok())
-    {
-        Some(rest) => format!("~/{}", rest.display()),
-        None => config.data_dir.display().to_string(),
-    };
-    eprintln!(
+/// What a node prints on start, below the art (on stderr: stdout may
+/// carry JSON). A detached node also keeps it for `wats attach`.
+fn banner_lines(config: &NodeConfig, agents: &[(String, wats::agent::AgentConfig)]) -> Vec<String> {
+    let mut lines = Vec::new();
+    let dir = tilde(&config.data_dir);
+    lines.push(format!(
         "wats {} · data {dir} · infra {} · profile {}{}",
         env!("CARGO_PKG_VERSION"),
         config.infra,
@@ -3680,10 +4414,10 @@ fn print_banner(config: &NodeConfig, agents: &[(String, wats::agent::AgentConfig
         } else {
             ""
         }
-    );
+    ));
     let used = wats::node::dir_size(&config.data_dir);
     let max = config.storage_max.unwrap_or(u64::MAX);
-    eprintln!(
+    lines.push(format!(
         "storage: {} of {}{}",
         wats::node::format_bytes(used),
         wats::node::format_bytes(max),
@@ -3693,13 +4427,13 @@ fn print_banner(config: &NodeConfig, agents: &[(String, wats::agent::AgentConfig
             wats::node::StorageState::OverCeiling =>
                 " · FULL: refusing blobs and events from others",
         }
-    );
+    ));
     let waiting: Vec<_> = wats::crash::list(&config.data_dir)
         .into_iter()
         .filter(|r| r.state != "sent")
         .collect();
     if let Some(last) = waiting.last() {
-        eprintln!(
+        lines.push(format!(
             "crash report waiting ({}, {}): wats report show | send | discard{}",
             last.id,
             last.message.chars().take(80).collect::<String>(),
@@ -3708,20 +4442,20 @@ fn print_banner(config: &NodeConfig, agents: &[(String, wats::agent::AgentConfig
             } else {
                 ""
             }
-        );
+        ));
     }
     if agents.is_empty() {
-        eprintln!("agent: off · {}", wats::firstrun::NO_AGENT_NOTICE);
+        lines.push(format!("agent: off · {}", wats::firstrun::NO_AGENT_NOTICE));
     }
     if agents.len() > 1 {
-        eprintln!(
+        lines.push(format!(
             "agents: {} · watch one: wats agent logs -f --name <name>",
             agents
                 .iter()
                 .map(|(name, a)| format!("{name} ({} as {})", a.runtime, a.profile))
                 .collect::<Vec<_>>()
                 .join(", ")
-        );
+        ));
     }
     for (name, agent) in agents {
         // `agent claude (sonnet)`, or `agent reviewer (claude, sonnet)`.
@@ -3742,12 +4476,12 @@ fn print_banner(config: &NodeConfig, agents: &[(String, wats::agent::AgentConfig
         } else {
             "wats agent logs -f".to_string()
         };
-        eprintln!(
+        lines.push(format!(
             "{title}: on, posts as {} · wakes on asks and replies (every {} at most), heartbeat {} · watch it: {watch}",
             agent.profile,
             short_duration(agent.every),
             short_duration(agent.heartbeat),
-        );
+        ));
         let review = config.review_profiles.contains(&agent.profile);
         let summary = wats::access::describe(&wats::access::Describe {
             runtime: &agent.runtime,
@@ -3757,7 +4491,7 @@ fn print_banner(config: &NodeConfig, agents: &[(String, wats::agent::AgentConfig
             allow: &agent.allow,
             review,
         });
-        eprintln!(
+        lines.push(format!(
             "{who} access: {}{}",
             summary.line,
             if review {
@@ -3765,54 +4499,54 @@ fn print_banner(config: &NodeConfig, agents: &[(String, wats::agent::AgentConfig
             } else {
                 ""
             }
-        );
+        ));
         for warning in summary.warnings {
-            eprintln!("warning: {warning}");
+            lines.push(format!("warning: {warning}"));
         }
         if !agent.ignore_local {
-            eprintln!(
+            lines.push(format!(
                 "{who} wakes on posts by this node's other profiles too (agent.ignore_local = false)"
-            );
+            ));
         }
         let spend = wats::budget::spend(&agent.work_dir, unix_now());
         if agent.runtime == "openclaw" {
-            eprintln!(
+            lines.push(format!(
                 "{who} forwards to OpenClaw {} (agent {}) · budget: {}: spend caps belong on the \
                  OpenClaw side · {} of {} runs today · {} per run",
-                agent.openclaw.url,
+                wats::openclaw::redacted_url(&agent.openclaw.url),
                 agent.openclaw.agent,
                 wats::openclaw::BUDGET,
                 spend.uncosted_today,
                 agent.budget.max_runs_per_day,
                 short_duration(agent.run_timeout)
-            );
+            ));
         } else if agent.runtime == "codex" {
             // Codex reports tokens, not dollars: runs are what is counted.
-            eprintln!(
+            lines.push(format!(
                 "{who} budget: {} of {} runs today (Codex reports no cost) · {} per run",
                 spend.uncosted_today,
                 agent.budget.max_runs_per_day,
                 short_duration(agent.run_timeout)
-            );
+            ));
         } else {
-            eprintln!(
+            lines.push(format!(
                 "{who} budget: {} · {} turns and {} per run",
                 wats::budget::describe(&agent.budget, &spend),
                 agent.max_turns,
                 short_duration(agent.run_timeout)
-            );
+            ));
         }
     }
     if !agents.is_empty() {
         let pending = pending_lines(&config.data_dir);
         if !pending.is_empty() {
-            eprintln!("review: {} posts pending", pending.len());
+            lines.push(format!("review: {} posts pending", pending.len()));
             for line in pending.iter().take(5) {
-                eprintln!("  {line}");
+                lines.push(format!("  {line}"));
             }
         }
     }
-    eprintln!("Ctrl-C to stop · wats --help");
+    lines
 }
 
 /// `wats agent logs | runs | attach`.
@@ -4206,6 +4940,8 @@ async fn run_mcp(node: Arc<Node>, mut shutdown: Shutdown) -> Result<()> {
         tokio::select! {
             result = &mut waiting => { result?; break; }
             _ = &mut shutdown => return node.shutdown().await,
+            // `wats stop` (ADR 0023).
+            _ = node.stop_requested() => return node.shutdown().await,
             Ok(()) = halt_outcome.changed() => {
                 if let wats::node::HaltOutcome::Exit(halt) = halt_outcome.borrow_and_update().clone() {
                     // The node stops; this session stays, every tool
@@ -4382,6 +5118,13 @@ async fn async_main(cli: Cli) -> Result<()> {
             return guardian_command(&cli.node, &data_dir, action).await;
         }
         Some(Command::Resume) => return resume_command(&data_dir),
+        Some(Command::Attach { lines }) => {
+            return attach_command(&cli.node, lines, shutdown).await;
+        }
+        Some(Command::Ps { all, json }) => return ps_command(&cli.node, all, json).await,
+        Some(Command::Stop { all, timeout }) => {
+            return stop_command(&cli.node, all, timeout).await;
+        }
         Some(Command::Agent { name, action }) => {
             return tokio::select! {
                 result = agent_watch(&data_dir, name.as_deref(), action) => result,
@@ -4586,11 +5329,48 @@ async fn async_main(cli: Cli) -> Result<()> {
             | Command::Guardian { .. }
             | Command::Resume
             | Command::Notify { .. }
-            | Command::Inbox { .. },
+            | Command::Inbox { .. }
+            | Command::Attach { .. }
+            | Command::Ps { .. }
+            | Command::Stop { .. },
         ) => {
             unreachable!("handled above")
         }
     };
+    // `wats --detach` (ADR 0023): start this same command in the
+    // background, and return once it is up. The child is the process with
+    // `--log-file`.
+    if daemon.detach && daemon.log_file.is_none() {
+        if json_lines {
+            anyhow::bail!(
+                "`wats node` prints JSON lines for a script: run `wats --detach` instead"
+            );
+        }
+        return detach_command(&config, &settings, daemon.quiet).await;
+    }
+    if let Some(log) = &daemon.log_file {
+        wats::background::rotate_stderr(
+            log,
+            daemon
+                .log_max_size
+                .unwrap_or(wats::background::DEFAULT_LOG_MAX),
+            daemon
+                .log_keep
+                .unwrap_or(wats::background::DEFAULT_LOG_KEEP),
+        );
+        config.log_file = Some(std::path::absolute(log)?);
+        // Closing the terminal that started it does not stop it.
+        #[cfg(unix)]
+        if let Ok(mut hangup) =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())
+        {
+            tokio::spawn(async move {
+                while hangup.recv().await.is_some() {
+                    tracing::debug!("SIGHUP ignored: this node runs detached");
+                }
+            });
+        }
+    }
     // The agents of this run (ADR 0021), one runner each.
     let members = agent_members(
         &daemon.agent,
@@ -4698,9 +5478,25 @@ async fn async_main(cli: Cli) -> Result<()> {
             );
             eprintln!("{}", wats::banner::render(env!("CARGO_PKG_VERSION"), color));
         }
-        print_banner(&config, &agents);
+        let lines = banner_lines(&config, &agents);
+        for line in &lines {
+            eprintln!("{line}");
+        }
+        if config.log_file.is_some() {
+            // For `wats attach`, which shows it first.
+            let banner = wats::background::banner_path(&config.data_dir);
+            if let Err(e) = wats::background::write_file(&banner, &(lines.join("\n") + "\n")) {
+                tracing::warn!("could not write {}: {e}", banner.display());
+            }
+        } else {
+            eprintln!("Ctrl-C to stop · in the background instead: wats --detach · wats --help");
+        }
     } else if agents.is_empty() && daemon.idle_exit.is_none() {
         tracing::info!("{}", wats::firstrun::NO_AGENT_NOTICE);
+    }
+    if daemon.quiet && config.log_file.is_some() {
+        // No banner: none from an earlier run either.
+        let _ = std::fs::remove_file(wats::background::banner_path(&config.data_dir));
     }
     crash_context(&config);
     let check_marker = config.halt.accept

@@ -2,6 +2,27 @@
 
 ## Unreleased
 
+- **The node in the background** (ADR 0023): `wats --detach` (`-d`) runs
+  `wats`, with the same flags, in the background and returns once its node
+  is up, printing the banner, the log path and the commands below; a bare
+  `wats` still runs in the foreground. It logs to
+  `<data dir>/logs/node.log`, rotated at 10 MiB (3 files kept), and takes
+  over a background node of `wats mcp` sessions as `wats` does.
+  `wats attach` shows its banner and last log lines, then follows the log
+  live, across rotations; Ctrl-C detaches and the node keeps running.
+  `wats ps` lists the nodes running on this machine (pid, mode, version,
+  uptime, profile, agents, network, MCP sessions, data directory),
+  including those `wats mcp` started, found through the data directory
+  lock and a per-user registry (`~/.wats/run`); a stale entry shows as
+  stopped and is removed. `wats stop` stops the node of `--dir` or
+  `--profile`, or `--all`: gracefully through its socket, then SIGKILL
+  after `--timeout` (10 s), saying which; MCP sessions using it get a
+  warning. The background node of `wats mcp` and the daemon of the
+  `start_daemon` tool now log to the same rotated file (`node.log` and
+  `daemon.log` at the root of the data directory can be deleted). The
+  OpenClaw gateway URL loses any user name and password in the banner and
+  the logs, which now land on disk. Native Windows: `--detach` and `stop`
+  say they are not supported yet; WSL works like Linux.
 - **Upgrade note: store schema 7**: rolling back to 0.3.3 or older needs a
   reinstall of this version (an older wats refuses the store). The store
   now searches titles too, filled from the events kept when it first

@@ -1,0 +1,449 @@
+//! Running a node in the background (ADR 0023): `wats --detach`, and the
+//! node `wats mcp` starts for its sessions.
+//!
+//! - **The log.** A detached node's stdout goes to `/dev/null` and its
+//!   stderr to `<data dir>/logs/node.log`, opened in append mode. The node
+//!   itself rotates that file by size: it copies it to `node.log.1` (the
+//!   older ones shift to `.2`, `.3`, …) and truncates it, so its stderr
+//!   keeps writing to the same file without reopening it (Rust has no safe
+//!   `dup2`). [`Follower`] reads it across a rotation, for `wats attach`.
+//! - **The registry.** Every node records its data directory in a per-user
+//!   directory (`~/.wats/run`), one small file per data directory, so that
+//!   `wats ps` and `wats stop --all` find nodes outside `~/.wats`. An entry
+//!   says where to look, never whether a node runs: the data directory
+//!   lock does (a stale entry is removed by `wats ps`).
+//! - **Signals.** `wats stop` asks the node through its socket first, and
+//!   signals it with `kill(1)` only when it does not answer or stop in
+//!   time (the crate forbids `unsafe`, so no `libc::kill`).
+
+use std::io::{Read, Seek, Write};
+use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
+
+/// The directory of a data directory's log files.
+pub const LOG_DIR: &str = "logs";
+/// The log of the node running in the background.
+pub const LOG_NAME: &str = "node.log";
+/// What a detached node printed on start (its banner), for `wats attach`.
+pub const BANNER_NAME: &str = "banner.txt";
+/// The size at which `node.log` is rotated.
+pub const DEFAULT_LOG_MAX: u64 = 10 * 1024 * 1024;
+/// Rotated files kept: `node.log.1` to `node.log.3`.
+pub const DEFAULT_LOG_KEEP: usize = 3;
+/// Names the registry directory instead of `~/.wats/run` (tests).
+pub const RUN_DIR_ENV: &str = "WATS_RUN_DIR";
+
+/// `<data dir>/logs/node.log`.
+pub fn log_path(data_dir: &Path) -> PathBuf {
+    data_dir.join(LOG_DIR).join(LOG_NAME)
+}
+
+/// `<data dir>/logs/banner.txt`.
+pub fn banner_path(data_dir: &Path) -> PathBuf {
+    data_dir.join(LOG_DIR).join(BANNER_NAME)
+}
+
+/// The `n`-th rotated file of `path`: `node.log.1`, `node.log.2`, …
+pub fn rotated_path(path: &Path, n: usize) -> PathBuf {
+    let mut name = path.as_os_str().to_os_string();
+    name.push(format!(".{n}"));
+    PathBuf::from(name)
+}
+
+/// Create the directory of `path` (owner-only on Unix).
+fn create_parent(path: &Path) -> std::io::Result<()> {
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
+        }
+    }
+    Ok(())
+}
+
+/// Open a log file for appending, creating it (and its directory)
+/// owner-only.
+pub fn open_log(path: &Path) -> std::io::Result<std::fs::File> {
+    create_parent(path)?;
+    let mut options = std::fs::OpenOptions::new();
+    options.create(true).append(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    options.open(path)
+}
+
+/// Write `text` to `path` (the banner), replacing it, owner-only.
+pub fn write_file(path: &Path, text: &str) -> std::io::Result<()> {
+    create_parent(path)?;
+    let mut options = std::fs::OpenOptions::new();
+    options.create(true).write(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    options.open(path)?.write_all(text.as_bytes())
+}
+
+/// Rotate `path`: drop `.keep`, shift `.1`… up by one, copy `path` to
+/// `.1` and truncate `path`. Writers that opened `path` in append mode
+/// carry on at its new end. With `keep` 0, only truncate.
+pub fn rotate(path: &Path, keep: usize) -> std::io::Result<()> {
+    if keep > 0 {
+        let _ = std::fs::remove_file(rotated_path(path, keep));
+        for n in (1..keep).rev() {
+            let from = rotated_path(path, n);
+            if from.exists() {
+                std::fs::rename(&from, rotated_path(path, n + 1))?;
+            }
+        }
+        std::fs::copy(path, rotated_path(path, 1))?;
+    }
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(path)?
+        .set_len(0)
+}
+
+/// Rotation of this process's stderr, set by [`rotate_stderr`].
+struct Rotation {
+    path: PathBuf,
+    max: u64,
+    keep: usize,
+    /// Bytes in the file, as far as this process knows; the lock also
+    /// keeps a write from landing between the copy and the truncation.
+    size: Mutex<u64>,
+}
+
+static ROTATION: OnceLock<Rotation> = OnceLock::new();
+
+/// This process's stderr is `path` (a detached node): rotate it at `max`
+/// bytes, keeping `keep` older files. Log lines go through
+/// [`write_stderr`].
+pub fn rotate_stderr(path: &Path, max: u64, keep: usize) {
+    let size = std::fs::metadata(path).map_or(0, |m| m.len());
+    let _ = ROTATION.set(Rotation {
+        path: path.to_path_buf(),
+        max: max.max(1),
+        keep,
+        size: Mutex::new(size),
+    });
+}
+
+/// Write log bytes to stderr, rotating its file when it is full (see
+/// [`rotate_stderr`]).
+pub fn write_stderr(buf: &[u8]) -> std::io::Result<usize> {
+    let Some(rotation) = ROTATION.get() else {
+        return std::io::stderr().write(buf);
+    };
+    let mut size = rotation
+        .size
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let written = std::io::stderr().write(buf)?;
+    *size = size.saturating_add(written as u64);
+    if *size >= rotation.max {
+        // Other writes (a panic message) may have grown it too: the file
+        // says how big it is.
+        let actual = std::fs::metadata(&rotation.path).map_or(*size, |m| m.len());
+        if actual >= rotation.max {
+            *size = 0;
+            if let Err(e) = rotate(&rotation.path, rotation.keep) {
+                let _ = writeln!(
+                    std::io::stderr(),
+                    "could not rotate {}: {e}",
+                    rotation.path.display()
+                );
+            }
+        } else {
+            *size = actual;
+        }
+    }
+    Ok(written)
+}
+
+/// An identity for the file at `path` that changes when the file is
+/// replaced: its inode and change time on Unix (an inode can be reused
+/// once the oldest file is deleted).
+fn file_id(path: &Path) -> Option<(u64, u64)> {
+    let meta = std::fs::metadata(path).ok()?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let changed = (meta.ctime() as u64)
+            .wrapping_mul(1_000_000_000)
+            .wrapping_add(meta.ctime_nsec() as u64);
+        Some((meta.ino(), changed))
+    }
+    #[cfg(not(unix))]
+    {
+        let modified = meta
+            .modified()
+            .ok()?
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()?;
+        Some((modified.as_secs(), u64::from(modified.subsec_nanos())))
+    }
+}
+
+/// The bytes of `path` from `offset` to its end.
+fn read_from(path: &Path, offset: u64) -> std::io::Result<Vec<u8>> {
+    let mut file = match std::fs::File::open(path) {
+        Ok(file) => file,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(e),
+    };
+    file.seek(std::io::SeekFrom::Start(offset))?;
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)?;
+    Ok(bytes)
+}
+
+/// Follows a log file written by [`write_stderr`], across rotations.
+#[derive(Debug)]
+pub struct Follower {
+    path: PathBuf,
+    offset: u64,
+    /// The identity of `.1`: a new one means a rotation happened.
+    rotated: Option<(u64, u64)>,
+}
+
+impl Follower {
+    /// From the current end of `path`.
+    pub fn at_end(path: &Path) -> Self {
+        Follower {
+            path: path.to_path_buf(),
+            offset: std::fs::metadata(path).map_or(0, |m| m.len()),
+            rotated: file_id(&rotated_path(path, 1)),
+        }
+    }
+
+    /// What was written since the last call. After a rotation, the end of
+    /// the old file is in `.1` at the same offsets: that first, then the
+    /// new file from its start.
+    pub fn read_new(&mut self) -> std::io::Result<Vec<u8>> {
+        let mut out = Vec::new();
+        let rotated = file_id(&rotated_path(&self.path, 1));
+        let len = std::fs::metadata(&self.path).map_or(0, |m| m.len());
+        if rotated != self.rotated || len < self.offset {
+            if rotated != self.rotated {
+                out = read_from(&rotated_path(&self.path, 1), self.offset)?;
+            }
+            self.rotated = rotated;
+            self.offset = 0;
+        }
+        let new = read_from(&self.path, self.offset)?;
+        self.offset = self.offset.saturating_add(new.len() as u64);
+        out.extend(new);
+        Ok(out)
+    }
+}
+
+/// The last `n` lines of `path` (at most its last 256 KiB).
+pub fn tail(path: &Path, n: usize) -> Vec<String> {
+    const WINDOW: u64 = 256 * 1024;
+    let len = std::fs::metadata(path).map_or(0, |m| m.len());
+    let start = len.saturating_sub(WINDOW);
+    let Ok(bytes) = read_from(path, start) else {
+        return Vec::new();
+    };
+    let text = String::from_utf8_lossy(&bytes);
+    let mut lines: Vec<&str> = text.lines().collect();
+    // A partial first line when the window cut it.
+    if start > 0 && !lines.is_empty() {
+        lines.remove(0);
+    }
+    lines[lines.len().saturating_sub(n)..]
+        .iter()
+        .map(|l| l.to_string())
+        .collect()
+}
+
+/// The registry of the data directories nodes run in: [`RUN_DIR_ENV`],
+/// else `~/.wats/run`. A hermetic process (tests) uses one only when
+/// [`RUN_DIR_ENV`] names it: it never writes to the real home.
+pub fn registry_dir(hermetic: bool) -> Option<PathBuf> {
+    if let Some(dir) = std::env::var_os(RUN_DIR_ENV).filter(|d| !d.is_empty()) {
+        return Some(PathBuf::from(dir));
+    }
+    if hermetic {
+        return None;
+    }
+    std::env::home_dir().map(|home| home.join(".wats").join("run"))
+}
+
+/// The registry entry of `data_dir`.
+fn entry_path(registry: &Path, data_dir: &Path) -> PathBuf {
+    let absolute = std::path::absolute(data_dir).unwrap_or_else(|_| data_dir.to_path_buf());
+    let hash = blake3::hash(absolute.as_os_str().as_encoded_bytes()).to_hex();
+    registry.join(format!("{}.json", &hash[..16]))
+}
+
+/// Record that a node runs in `data_dir` (best effort).
+pub fn register(registry: &Path, data_dir: &Path) -> std::io::Result<()> {
+    let absolute = std::path::absolute(data_dir)?;
+    let path = entry_path(registry, &absolute);
+    create_parent(&path)?;
+    let entry = serde_json::json!({ "data_dir": absolute });
+    std::fs::write(path, entry.to_string())
+}
+
+/// Remove the entry of `data_dir`.
+pub fn unregister(registry: &Path, data_dir: &Path) {
+    let _ = std::fs::remove_file(entry_path(registry, data_dir));
+}
+
+/// The data directories in the registry.
+pub fn registered(registry: &Path) -> Vec<PathBuf> {
+    let Ok(entries) = std::fs::read_dir(registry) else {
+        return Vec::new();
+    };
+    let mut dirs: Vec<PathBuf> = entries
+        .flatten()
+        .filter(|e| e.path().extension().is_some_and(|x| x == "json"))
+        .filter_map(|e| std::fs::read_to_string(e.path()).ok())
+        .filter_map(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
+        .filter_map(|v| v["data_dir"].as_str().map(PathBuf::from))
+        .collect();
+    dirs.sort();
+    dirs.dedup();
+    dirs
+}
+
+/// Start `wats` with `args` as a detached process: its own process group
+/// (no Ctrl-C or terminal hangup from the shell that started it), stdin
+/// and stdout to `/dev/null`, stderr appended to `log`. Not waited for.
+#[cfg(unix)]
+pub fn spawn_detached(
+    args: &[std::ffi::OsString],
+    log: &Path,
+    env_remove: &[&str],
+) -> std::io::Result<std::process::Child> {
+    use std::os::unix::process::CommandExt;
+    let stderr = open_log(log)?;
+    let mut command = std::process::Command::new(std::env::current_exe()?);
+    command
+        .args(args)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(stderr)
+        .process_group(0);
+    for name in env_remove {
+        command.env_remove(name);
+    }
+    command.spawn()
+}
+
+/// Send `signal` (`TERM`, `KILL`, or `0` to probe) to `pid` with
+/// `kill(1)`. `Ok(false)`: no such process (or not ours).
+#[cfg(unix)]
+pub fn signal(pid: u32, signal: &str) -> std::io::Result<bool> {
+    let status = std::process::Command::new("kill")
+        .arg(format!("-{signal}"))
+        .arg(pid.to_string())
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()?;
+    Ok(status.success())
+}
+
+/// Whether process `pid` exists.
+#[cfg(unix)]
+pub fn alive(pid: u32) -> bool {
+    signal(pid, "0").unwrap_or(false)
+}
+
+/// `3s`, `4m`, `2h 5m`, `3d 4h`.
+pub fn format_uptime(secs: u64) -> String {
+    match secs {
+        s if s < 60 => format!("{s}s"),
+        s if s < 3600 => format!("{}m", s / 60),
+        s if s < 86_400 => format!("{}h {}m", s / 3600, s % 3600 / 60),
+        s => format!("{}d {}h", s / 86_400, s % 86_400 / 3600),
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::indexing_slicing)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rotation_keeps_n_files_and_the_follower_reads_across_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("logs").join(LOG_NAME);
+        let mut file = open_log(&path).unwrap();
+        writeln!(file, "one").unwrap();
+        let mut follower = Follower::at_end(&path);
+        writeln!(file, "two").unwrap();
+        assert_eq!(follower.read_new().unwrap(), b"two\n");
+        // Written, then rotated before the follower looked: "three" is in
+        // `.1`, "four" in the new file.
+        writeln!(file, "three").unwrap();
+        rotate(&path, 2).unwrap();
+        writeln!(file, "four").unwrap();
+        assert_eq!(follower.read_new().unwrap(), b"three\nfour\n");
+        assert_eq!(
+            std::fs::read(rotated_path(&path, 1)).unwrap(),
+            b"one\ntwo\nthree\n"
+        );
+        // The writer kept its file: appends land at the new end.
+        assert_eq!(std::fs::read(&path).unwrap(), b"four\n");
+        // A rotation the follower missed, with the new file already
+        // longer than its offset: still detected.
+        writeln!(file, "five").unwrap();
+        rotate(&path, 2).unwrap();
+        writeln!(file, "six six six six six six").unwrap();
+        assert_eq!(
+            follower.read_new().unwrap(),
+            b"five\nsix six six six six six\n"
+        );
+        rotate(&path, 2).unwrap();
+        rotate(&path, 2).unwrap();
+        // Two rotated files at most.
+        assert!(rotated_path(&path, 2).exists());
+        assert!(!rotated_path(&path, 3).exists());
+        assert_eq!(follower.read_new().unwrap(), b"");
+        assert_eq!(tail(&path, 5), Vec::<String>::new());
+        writeln!(file, "a\nb\nc").unwrap();
+        assert_eq!(tail(&path, 2), ["b", "c"]);
+    }
+
+    #[test]
+    fn keep_zero_only_truncates() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(LOG_NAME);
+        std::fs::write(&path, "x\n").unwrap();
+        rotate(&path, 0).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"");
+        assert!(!rotated_path(&path, 1).exists());
+    }
+
+    #[test]
+    fn the_registry_lists_absolute_data_dirs_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let registry = dir.path().join("run");
+        let a = dir.path().join("a");
+        let b = dir.path().join("b");
+        register(&registry, &a).unwrap();
+        register(&registry, &b).unwrap();
+        register(&registry, &a).unwrap();
+        assert_eq!(registered(&registry), [a.clone(), b.clone()]);
+        unregister(&registry, &a);
+        assert_eq!(registered(&registry), [b]);
+    }
+
+    #[test]
+    fn uptime_is_short() {
+        assert_eq!(format_uptime(5), "5s");
+        assert_eq!(format_uptime(125), "2m");
+        assert_eq!(format_uptime(3 * 3600 + 120), "3h 2m");
+        assert_eq!(format_uptime(2 * 86_400 + 3600), "2d 1h");
+    }
+}

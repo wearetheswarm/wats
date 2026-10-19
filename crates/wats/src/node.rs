@@ -177,6 +177,13 @@ pub struct NodeConfig {
     pub report_auto: bool,
     /// Network arguments that start the same node again (`start_daemon`).
     pub relaunch_args: Vec<std::ffi::OsString>,
+    /// The log file this node's stderr goes to, when it runs detached
+    /// (ADR 0023): recorded in the lock file for `wats ps` and `wats
+    /// attach`.
+    pub log_file: Option<PathBuf>,
+    /// The per-user registry of running nodes (ADR 0023), if any: this
+    /// node records its data directory there while it holds the lock.
+    pub registry: Option<PathBuf>,
     /// Replication factor k for blobs: how many peers are asked to hold a
     /// blob at publish time (SPEC §2.5, §7).
     pub replication: usize,
@@ -275,6 +282,8 @@ impl NodeConfig {
             agents: Vec::new(),
             lock_wait: Duration::ZERO,
             relaunch_args: Vec::new(),
+            log_file: None,
+            registry: None,
             report_accept: false,
             limits: Default::default(),
             report_collector: None,
@@ -890,7 +899,7 @@ pub async fn drop_body_offline(
     if !path.exists() {
         bail!("no event store in {}", data_dir.display());
     }
-    let lock = lock_data_dir(data_dir, "cli")?;
+    let lock = lock_data_dir(data_dir, &Holder::role("cli"))?;
     let store = Store::open(&path)?;
     let outcome = store.drop_body(id, reason, None, detail, now_secs())?;
     if !outcome.freed_blobs.is_empty() {
@@ -1084,6 +1093,8 @@ pub fn topic_for(net: &str) -> TopicId {
 
 pub struct Node {
     config: NodeConfig,
+    /// When this node started (Unix seconds).
+    started_at: u64,
     router: Router,
     gossip: Gossip,
     blobs: FsStore,
@@ -1188,11 +1199,11 @@ const TAKEOVER_WAIT: Duration = Duration::from_secs(30);
 
 /// Lock the data directory, waiting up to `wait` for another node to let
 /// go of it. `role` is recorded for the next process that finds it held.
-fn lock_data_dir_waiting(dir: &Path, wait: Duration, role: &str) -> Result<std::fs::File> {
+fn lock_data_dir_waiting(dir: &Path, wait: Duration, who: &Holder) -> Result<std::fs::File> {
     // No deadline when `wait` does not fit in an `Instant`: wait forever.
     let deadline = std::time::Instant::now().checked_add(wait);
     loop {
-        match lock_data_dir(dir, role) {
+        match lock_data_dir(dir, who) {
             Ok(file) => return Ok(file),
             Err(e) if deadline.is_some_and(|d| std::time::Instant::now() >= d) => return Err(e),
             Err(_) => std::thread::sleep(Duration::from_millis(200)),
@@ -1215,14 +1226,34 @@ pub fn node_running(dir: &Path) -> bool {
 /// The role recorded by the process holding the lock of `dir`
 /// (`daemon`, `background`, `in-process`, `cli`), if it wrote one.
 fn lock_holder_role(dir: &Path) -> Option<String> {
-    let text = std::fs::read_to_string(dir.join("lock")).ok()?;
-    serde_json::from_str::<LockHolder>(&text)
-        .ok()
-        .map(|h| h.role)
-        .filter(|r| !r.is_empty())
+    lock_holder(dir).map(|h| h.role).filter(|r| !r.is_empty())
 }
 
-fn lock_data_dir(dir: &Path, role: &str) -> Result<std::fs::File> {
+/// What the lock file of `dir` records about its holder, or about the
+/// last one: only [`node_running`] says whether it still holds it.
+pub fn lock_holder(dir: &Path) -> Option<LockHolder> {
+    let text = std::fs::read_to_string(dir.join("lock")).ok()?;
+    serde_json::from_str::<LockHolder>(&text).ok()
+}
+
+/// How the process taking a data directory lock describes itself.
+#[derive(Debug, Default)]
+struct Holder {
+    role: String,
+    profile: Option<String>,
+    log: Option<PathBuf>,
+}
+
+impl Holder {
+    fn role(role: &str) -> Self {
+        Holder {
+            role: role.to_string(),
+            ..Holder::default()
+        }
+    }
+}
+
+fn lock_data_dir(dir: &Path, who: &Holder) -> Result<std::fs::File> {
     std::fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
     #[cfg(unix)]
     {
@@ -1239,7 +1270,7 @@ fn lock_data_dir(dir: &Path, role: &str) -> Result<std::fs::File> {
         .with_context(|| format!("open {}", path.display()))?;
     match file.try_lock() {
         Ok(()) => {
-            write_lock_holder(&file, role);
+            write_lock_holder(&file, who);
             Ok(file)
         }
         Err(std::fs::TryLockError::WouldBlock) => {
@@ -1269,32 +1300,56 @@ fn lock_data_dir(dir: &Path, role: &str) -> Result<std::fs::File> {
 }
 
 /// Who holds the data directory lock, written into the lock file by the
-/// holder so that a second `wats` can say which process to stop.
-#[derive(Debug, Serialize, Deserialize)]
-struct LockHolder {
-    pid: u32,
-    version: String,
-    exe: String,
-    started: String,
+/// holder so that a second `wats` can say which process to stop, and
+/// `wats ps` what runs.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LockHolder {
+    pub pid: u32,
+    pub version: String,
+    pub exe: String,
+    pub started: String,
     /// `daemon`, `background` (started by `wats mcp`), `in-process` or
     /// `cli`; empty when written by an older release.
     #[serde(default)]
-    role: String,
+    pub role: String,
+    /// When it took the lock (Unix seconds); 0 from an older release.
+    #[serde(default)]
+    pub started_secs: u64,
+    /// The node's profile (ADR 0023).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile: Option<String>,
+    /// Its log file, when it runs detached (ADR 0023).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub log: Option<PathBuf>,
+    /// The node is up: [`Node::start`] returned (`wats --detach` waits
+    /// for it).
+    #[serde(default)]
+    pub up: bool,
 }
 
 /// Record this process in the lock file it holds (best effort).
-fn write_lock_holder(mut file: &std::fs::File, role: &str) {
-    use std::io::{Seek, Write};
+fn write_lock_holder(file: &std::fs::File, who: &Holder) {
+    let now = now_secs();
     let holder = LockHolder {
-        role: role.to_string(),
+        role: who.role.clone(),
         pid: std::process::id(),
         version: env!("CARGO_PKG_VERSION").to_string(),
         exe: std::env::current_exe()
             .map(|p| p.display().to_string())
             .unwrap_or_else(|_| "unknown path".into()),
-        started: crate::runs::format_time(now_secs()),
+        started: crate::runs::format_time(now),
+        started_secs: now,
+        profile: who.profile.clone(),
+        log: who.log.clone(),
+        up: false,
     };
-    if let Ok(json) = serde_json::to_vec(&holder) {
+    rewrite_lock_holder(file, &holder);
+}
+
+/// Replace the holder record in the lock file this process holds.
+fn rewrite_lock_holder(mut file: &std::fs::File, holder: &LockHolder) {
+    use std::io::{Seek, Write};
+    if let Ok(json) = serde_json::to_vec(holder) {
         let _ = file
             .set_len(0)
             .and_then(|()| file.seek(std::io::SeekFrom::Start(0)))
@@ -1307,11 +1362,14 @@ impl Node {
     pub async fn start(config: NodeConfig) -> Result<Arc<Self>> {
         let lock = {
             let (dir, wait) = (config.data_dir.clone(), config.lock_wait);
-            let role = config.role.to_string();
+            let who = Arc::new(Holder {
+                role: config.role.to_string(),
+                profile: Some(config.profile.clone()),
+                log: config.log_file.clone(),
+            });
             let first = {
-                let (dir, role) = (dir.clone(), role.clone());
-                tokio::task::spawn_blocking(move || lock_data_dir_waiting(&dir, wait, &role))
-                    .await?
+                let (dir, who) = (dir.clone(), Arc::clone(&who));
+                tokio::task::spawn_blocking(move || lock_data_dir_waiting(&dir, wait, &who)).await?
             };
             match first {
                 Ok(lock) => lock,
@@ -1330,13 +1388,19 @@ impl Node {
                         return Err(e);
                     }
                     tokio::task::spawn_blocking(move || {
-                        lock_data_dir_waiting(&dir, TAKEOVER_WAIT, &role)
+                        lock_data_dir_waiting(&dir, TAKEOVER_WAIT, &who)
                     })
                     .await??
                 }
                 Err(e) => return Err(e),
             }
         };
+        // For `wats ps` (ADR 0023): where to look for this node.
+        if let Some(registry) = &config.registry
+            && let Err(e) = crate::background::register(registry, &config.data_dir)
+        {
+            debug!("could not record this node in {}: {e}", registry.display());
+        }
         let root = match &config.secret_file {
             Some(path) => RootSecret::load(path)?,
             None => RootSecret::load_or_create(&config.data_dir.join("secret.key"))?,
@@ -1502,6 +1566,7 @@ impl Node {
             local_authors: Default::default(),
             reputation: Default::default(),
             lock: std::sync::Mutex::new(Some(lock)),
+            started_at: now_secs(),
             health: std::sync::Mutex::new(health),
             seed_ids,
             connectivity: std::sync::Mutex::new(crate::reconnect::Connectivity::new(now_secs())),
@@ -1630,6 +1695,15 @@ impl Node {
             infra = %node.config.infra,
             "node started"
         );
+        // Up: what `wats --detach` waits for (ADR 0023).
+        if let Some(mut holder) = lock_holder(&node.config.data_dir)
+            && holder.pid == std::process::id()
+            && let Ok(lock) = node.lock.lock()
+            && let Some(file) = lock.as_ref()
+        {
+            holder.up = true;
+            rewrite_lock_holder(file, &holder);
+        }
         Ok(node)
     }
 
@@ -2211,6 +2285,11 @@ impl Node {
 
     pub fn store(&self) -> &Arc<Store> {
         &self.store
+    }
+
+    /// When this node started (Unix seconds).
+    pub fn started_at(&self) -> u64 {
+        self.started_at
     }
 
     pub fn config(&self) -> &NodeConfig {
@@ -4352,8 +4431,12 @@ impl Node {
         // The router shuts the blob protocol down, which also closes the store.
         self.blobs.shutdown().await.ok();
         // Background tasks may still hold the node; release the data
-        // directory explicitly.
+        // directory explicitly, after its registry entry (the next holder
+        // writes its own).
         if let Some(lock) = self.lock.lock().ok().and_then(|mut l| l.take()) {
+            if let Some(registry) = &self.config.registry {
+                crate::background::unregister(registry, &self.config.data_dir);
+            }
             lock.unlock().ok();
         }
         Ok(())
