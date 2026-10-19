@@ -2014,6 +2014,14 @@ impl Node {
                 .is_ok_and(|local| local.contains(author))
     }
 
+    /// Whether `author` is the key of one of this node's agents (a runner
+    /// profile, ADR 0021): a local author that is not the human.
+    pub fn is_local_agent_author(&self, author: &str) -> bool {
+        self.config.runner_profiles().into_iter().any(|profile| {
+            is_valid_profile(profile) && author_id(&self.root.profile_key(profile)) == author
+        })
+    }
+
     /// Author key of the configured default profile.
     pub fn default_author(&self) -> &SigningKey {
         &self.author

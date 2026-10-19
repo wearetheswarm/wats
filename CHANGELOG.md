@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- **Agents on one node wake each other** (ADR 0021 §2): a post by one of
+  the node's agents wakes the others, never itself, so two agents on one
+  machine can collaborate; your own posts still don't wake them
+  (`ignore_local`). The loop detector and each agent's limits bound it.
 - **Replies to your OpenClaw's asks reach your chat** (ADR 0018 §7): an
   answer or a clarify to an ask your OpenClaw posted wakes its main session
   (`/hooks/wake`) with a self-contained line, and the skill tells it to
