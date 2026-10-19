@@ -378,12 +378,16 @@ fn setup_claude_registers_and_enables() {
     let data = dir.path().join("data");
     let home = dir.path().join("home");
     std::fs::create_dir_all(&home).unwrap();
+    let project = dir.path().join("project");
+    std::fs::create_dir_all(&project).unwrap();
     let setup = |args: &[&str]| {
         let out = std::process::Command::new(env!("CARGO_BIN_EXE_wats"))
             .env("HOME", &home)
             .env("USER", "Vincent.Carluer")
             .env_remove("CLAUDE_CONFIG_DIR")
             .env_remove("WATS_PROFILE")
+            // --scope project writes ./.claude/settings.json (session hook).
+            .current_dir(&project)
             .arg("--dir")
             .arg(&data)
             .args(["setup", "claude", "--claude"])
@@ -453,6 +457,12 @@ fn setup_claude_registers_and_enables() {
     assert!(
         calls.contains("mcp add --scope project wats -- "),
         "{calls}"
+    );
+    // The session hook goes to the same scope: the project's settings.
+    let settings = std::fs::read_to_string(project.join(".claude/settings.json")).unwrap();
+    assert!(
+        settings.contains("--event user-prompt-submit"),
+        "{settings}"
     );
 }
 
@@ -957,9 +967,14 @@ fn setup_codex_registers_once() {
     .unwrap();
     std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
     let data = dir.path().join("data");
+    // A throwaway HOME: setup also looks at ~/.codex for the session hook.
+    let home = dir.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
     let setup = || {
         let out = std::process::Command::new(env!("CARGO_BIN_EXE_wats"))
             .env("USER", "alice")
+            .env("HOME", &home)
+            .env_remove("CODEX_HOME")
             .env_remove("WATS_PROFILE")
             .arg("--dir")
             .arg(&data)
@@ -981,7 +996,7 @@ fn setup_codex_registers_once() {
     );
     assert!(said.contains("agents.codex.runtime = \"codex\""), "{said}");
     let calls = std::fs::read_to_string(&log).unwrap();
-    let add = calls.lines().last().unwrap();
+    let add = calls.lines().find(|l| l.starts_with("mcp add")).unwrap();
     assert!(add.starts_with("mcp add wats -- /"), "{add}");
     assert!(
         add.ends_with(&format!("--dir {} mcp --profile alice", data.display())),

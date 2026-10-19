@@ -1000,9 +1000,15 @@ impl Store {
     /// Open the store of a data directory read-only, next to a running
     /// node (WAL), e.g. for `wats inbox read`.
     pub fn open_read_only(path: &Path) -> Result<Self> {
+        Self::open_read_only_with(path, std::time::Duration::from_secs(5))
+    }
+
+    /// [`Store::open_read_only`], waiting at most `busy` for the writer
+    /// (the session hook must not hold up a prompt).
+    pub fn open_read_only_with(path: &Path, busy: std::time::Duration) -> Result<Self> {
         let conn = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
             .with_context(|| format!("open {}", path.display()))?;
-        conn.busy_timeout(std::time::Duration::from_secs(5))?;
+        conn.busy_timeout(busy)?;
         let version: i64 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
         if version != SCHEMA_VERSION {
             bail!(

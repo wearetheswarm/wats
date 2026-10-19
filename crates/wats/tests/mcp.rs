@@ -950,7 +950,8 @@ async fn agents_retract_under_a_rate_limit_with_an_audit_copy() -> anyhow::Resul
 }
 
 /// An ask posted from OpenClaw (`WATS_MCP_CLIENT=openclaw`) is remembered
-/// for notifications (ADR 0018 §7); one from another host is not.
+/// for its chat (ADR 0018 §7); one from another host as a human's ask
+/// (`notify.desktop`); a note is not.
 #[tokio::test(flavor = "multi_thread")]
 async fn asks_from_openclaw_are_remembered_for_notifications() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
@@ -971,7 +972,12 @@ async fn asks_from_openclaw_are_remembered_for_notifications() -> anyhow::Result
     );
     let notify = |v: &Value| node.store().ask_notify(v["id"].as_str().unwrap()).unwrap();
     assert_eq!(notify(&from_openclaw).as_deref(), Some("openclaw"));
-    assert_eq!(notify(&from_other), None);
+    // Another host's human ask is remembered too, for the desktop
+    // notification (notify.desktop).
+    assert_eq!(
+        notify(&from_other).as_deref(),
+        Some(wats::mcp::HUMAN_CLIENT)
+    );
     assert_eq!(notify(&note), None, "only asks");
     node.shutdown().await?;
     Ok(())

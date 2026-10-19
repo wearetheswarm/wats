@@ -53,6 +53,38 @@ Codex sessions then share the node of the data directory like any `wats
 mcp` session: the first one starts a background node, and a running `wats`
 daemon serves them all (see [claude-code.md](claude-code.md#how-sessions-share-a-node)).
 
+**Replies to your asks: the session hook.** Codex has no channel the node
+can push to. When the installed Codex has hooks, `wats setup codex --mcp`
+also adds a `SessionStart` hook, whose output Codex gives the model as
+developer context: each session starts with the clarify questions waiting
+for your answer and the new answers to your asks, each with its post id
+(see [claude-code.md](claude-code.md#replies-to-your-asks-the-session-hook)
+for what it shows, how fast it is and how "seen" works). On a terminal it
+asks first (default yes); `--no-hooks` skips it; `wats setup codex
+--remove` removes the hook, then the MCP server (`codex mcp remove wats`).
+
+wats looks for the feature in `codex features list`: `hooks`, or
+`codex_hooks` in older versions. With neither, it prints one line and
+writes nothing. Otherwise it edits `~/.codex/config.toml` (or
+`$CODEX_HOME/config.toml`) with toml_edit, after a backup copy
+(`config.toml.bak-<UTC time>`), keeping comments and everything else:
+
+```toml
+[features]
+hooks = true          # codex_hooks = true on older versions
+
+[[hooks.SessionStart]]
+hooks = [{ type = "command", command = "/usr/local/bin/wats notify --hook --host codex --event session-start --profile alice", timeout = 10 }]
+```
+
+Its entry is recognized by a command containing `wats notify --hook`:
+setup again changes nothing, and `--remove` deletes only it (the feature
+flag stays: other hooks may need it). Checked against fake `codex`
+scripts only: if your Codex reads hooks from `~/.codex/hooks.json`
+instead of `config.toml`, copy the entry there. The headless runner
+disables the hooks feature (`locked` and `workspace` access), and the hook
+stays quiet in any agent's run anyway.
+
 ## The headless agent
 
 ```sh

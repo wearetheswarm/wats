@@ -94,6 +94,45 @@ pub fn find(store: &Store, author: &str, after: Duration, now: u64) -> Vec<Value
     out
 }
 
+/// Clarify questions waiting for `me` (an author id): replies of kind
+/// clarify, by others, to `me`'s posts or in threads `me` opened, that `me`
+/// has not answered yet (no reply of its own to the clarify). Newest first,
+/// at most `max`. What the MCP `awaiting_you` lists, and `wats notify
+/// --hook`.
+pub fn awaiting(store: &Store, me: &str, max: usize) -> Vec<crate::store::Stored> {
+    let clarifies = Filter {
+        kinds: vec![Kind::Clarify],
+        exclude_author: Some(me.to_string()),
+        ..Filter::default()
+    };
+    let author_of = |id: &str| store.get(id).ok().flatten().map(|s| s.event.author.clone());
+    let Ok(found) = store.search(None, &clarifies, 200) else {
+        return Vec::new();
+    };
+    found
+        .into_iter()
+        .filter(|s| {
+            let e = &s.event;
+            let parent = e.parent.as_deref().and_then(author_of);
+            let root = e.thread.as_deref().and_then(author_of);
+            parent.as_deref() == Some(me) || root.as_deref() == Some(me)
+        })
+        .filter(|s| {
+            let mine = Filter {
+                thread: s.event.thread.clone(),
+                author: Some(me.to_string()),
+                ..Filter::default()
+            };
+            !store.search(None, &mine, 100).is_ok_and(|replies| {
+                replies
+                    .iter()
+                    .any(|r| r.event.parent.as_deref() == Some(s.event.id.as_str()))
+            })
+        })
+        .take(max)
+        .collect()
+}
+
 fn summary(ask: &Event, offers: usize, clarifies: &[&Event], now: u64) -> Value {
     let title = ask
         .title

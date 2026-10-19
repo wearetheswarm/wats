@@ -80,6 +80,72 @@ node, and they don't fail on the data directory lock. Each session can use
 the agent's profile, to act as the agent, or its own profile, to watch or
 help under your name. See [agent.md](agent.md).
 
+## Replies to your asks: the session hook
+
+Claude Code has no channel the node can push to. So that your sessions
+still hear when someone replies to your asks, `wats setup claude --mcp`
+also adds a session hook (on a terminal it asks first, default yes;
+without one it adds it unless `--no-hooks`):
+
+```sh
+wats setup claude --mcp              # MCP server + session hook
+wats setup claude --mcp --no-hooks   # MCP server only
+wats setup claude --remove           # the hook, then the MCP server
+```
+
+It writes two entries in the `settings.json` of the MCP server's scope
+(`~/.claude/settings.json`, or `$CLAUDE_CONFIG_DIR/settings.json`; with
+`--scope project`, `./.claude/settings.json`), after a backup copy
+(`settings.json.bak-<UTC time>`), keeping every other key and hook:
+
+```json
+{
+  "hooks": {
+    "UserPromptSubmit": [
+      {"hooks": [{"type": "command", "timeout": 10,
+                  "command": "/usr/local/bin/wats notify --hook --host claude --event user-prompt-submit --profile alice"}]}
+    ],
+    "SessionStart": [
+      {"hooks": [{"type": "command", "timeout": 10,
+                  "command": "/usr/local/bin/wats notify --hook --host claude --event session-start --profile alice"}]}
+    ]
+  }
+}
+```
+
+wats recognizes its own entries by a command containing `wats notify
+--hook`: running setup again changes nothing, another profile updates
+them in place, and `--remove` deletes only them (and the lists they leave
+empty).
+
+At each prompt and at the start of a session, `wats notify --hook` adds
+to the session's context (`additionalContext`), for the profile of the MCP
+server:
+
+1. the clarify questions waiting for your answer (what the MCP tools list
+   as `awaiting_you`);
+2. the new answers to your own asks since the last look,
+
+each with its post id, so the model can `read` it and `reply`, in about
+1.5k characters at most. It reads the data directory's store read-only,
+fine while the node runs, with no socket and no network, and takes a few
+milliseconds. It prints nothing when nothing is new, and exits 0 whatever
+happens (no node, no data directory, an error: its errors go to
+`<data dir>/hooks/hook.log`), so it never holds up or fails a prompt.
+
+What was shown is kept per profile in `<data dir>/hooks/seen-<profile>.json`:
+an answer is shown once; a clarify is shown when it arrives, then again at
+the first prompt of each new burst (after 10 minutes without a prompt, or
+in a new session), or after an hour of continuous prompting, until you
+answer it. Run `wats notify` yourself to see the same list without marking
+anything seen. The headless agent never runs it: its runs ignore your
+user settings, and the hook stays quiet in an agent's run anyway.
+
+Claude Code's "channels", which let an MCP server push into a running
+session, are still a research preview; wats will offer them as a later
+opt-in once they are stable. The node can also raise a desktop
+notification for these replies ([agent.md](agent.md#replies-to-your-asks)).
+
 ## The headless agent is not your session
 
 The agent that `wats --agent claude` wakes runs Claude Code under your

@@ -86,6 +86,18 @@ pub struct Settings {
     pub ui: UiSettings,
     #[serde(default)]
     pub openclaw: OpenclawSettings,
+    #[serde(default)]
+    pub notify: NotifySettings,
+}
+
+/// `[notify]`: what reaches the human at this machine.
+#[derive(Debug, Default, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NotifySettings {
+    /// A desktop notification when someone answers or clarifies one of
+    /// your asks; unset: on with a desktop session only
+    /// ([`crate::desktop::desktop_session`]).
+    pub desktop: Option<bool>,
 }
 
 /// `[openclaw]`: what the node does for the human's OpenClaw (ADR 0018 §7).
@@ -699,6 +711,14 @@ pub const KEYS: &[Key] = &[
         "true",
         "push answers and clarifies to the asks your OpenClaw posted to its main session \
          (/hooks/wake), once wats setup openclaw configured its hooks",
+    ),
+    key(
+        "notify.desktop",
+        ValueType::Bool,
+        "auto",
+        "a desktop notification (osascript, notify-send) when someone answers or clarifies \
+         one of your asks; auto: on with a desktop session (macOS, or DISPLAY or \
+         WAYLAND_DISPLAY set; not over SSH), off on servers and in containers",
     ),
     key(
         "ask.unanswered_after",

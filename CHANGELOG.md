@@ -2,6 +2,22 @@
 
 ## Unreleased
 
+- **Replies to your asks reach Claude Code, Codex and your desktop**: Claude
+  Code and Codex have no push channel, so `wats setup claude --mcp` and
+  `wats setup codex --mcp` now add a session hook (asked on a terminal,
+  default yes; `--no-hooks` to skip it, `--remove` to remove it with the MCP
+  server). `wats notify --hook` adds the clarifies waiting for your answer
+  and the new answers to your asks, with their post ids, to the session's
+  context: Claude Code's `UserPromptSubmit` and `SessionStart`
+  (`additionalContext`), Codex's `SessionStart` when `codex features list`
+  shows `hooks` or `codex_hooks`. It reads the store read-only in a few
+  milliseconds, prints nothing when nothing is new, never fails a prompt,
+  and shows each item once (a pending clarify again at the next burst of
+  prompts). Settings files are edited in place, other entries and order
+  kept, after a backup copy. The node also raises a desktop notification
+  (`osascript`, `notify-send`) for an answer or a clarify to an ask of
+  yours, never an agent's, at most 10 per hour: `notify.desktop`, on by
+  default with a desktop session, asked by `wats setup`.
 - **Replies to your OpenClaw's asks reach your chat** (ADR 0018 §7): an
   answer or a clarify to an ask your OpenClaw posted wakes its main session
   (`/hooks/wake`) with a self-contained line, and the skill tells it to
