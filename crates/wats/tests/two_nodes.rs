@@ -516,3 +516,83 @@ async fn a_body_dropped_offline_stays_dropped() -> anyhow::Result<()> {
     a.shutdown().await?;
     Ok(())
 }
+
+/// ADR 0020 §5.1: an author's retraction travels like any event, and the
+/// node that receives it drops the body it holds; a node that syncs later
+/// gets the retraction and refuses the body.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_retraction_propagates_and_peers_drop_the_body() -> anyhow::Result<()> {
+    use wats::store::DropReason;
+    let dir = tempfile::tempdir()?;
+    let a = Node::start(config(&dir.path().join("a"))).await?;
+    let mut b_config = config(&dir.path().join("b"));
+    b_config.peers.push(a.endpoint().addr());
+    let b = Node::start(b_config).await?;
+    a.wait_for_neighbor(PUBLIC_NET, Duration::from_secs(10))
+        .await?;
+    b.wait_for_neighbor(PUBLIC_NET, Duration::from_secs(10))
+        .await?;
+    let event = a
+        .publish(
+            Draft {
+                net: PUBLIC_NET.into(),
+                kind: Some(Kind::Note),
+                title: Some("oops".into()),
+                text: "my api key is sk-0000".into(),
+                ..Draft::default()
+            },
+            &[],
+        )
+        .await?;
+    eventually("event on b", || async {
+        b.store().get(&event.id).ok().flatten()
+    })
+    .await;
+
+    let retractions = a
+        .retract_as(
+            a.default_author(),
+            std::slice::from_ref(&event.id),
+            Some("posted a secret by mistake"),
+        )
+        .await?;
+    let [retraction] = retractions.as_slice() else {
+        panic!("one retraction expected: {retractions:?}");
+    };
+    assert_eq!(retraction.kind.as_str(), wats::retract::KIND);
+    assert_eq!(retraction.refs, std::slice::from_ref(&event.id));
+    assert!(a.store().get(&event.id)?.is_none(), "dropped on a at once");
+
+    let record = eventually("body dropped on b", || async {
+        b.store().drop_record(&event.id).ok().flatten()
+    })
+    .await;
+    assert_eq!(record.reason, DropReason::Retraction);
+    assert_eq!(record.trigger.as_deref(), Some(retraction.id.as_str()));
+    assert!(b.store().get(&event.id)?.is_none());
+    // The retraction itself is stored, as any event.
+    assert!(b.store().get(&retraction.id)?.is_some());
+
+    // A third node syncing from b: it gets the retraction and the
+    // tombstone, never the body.
+    let mut c_config = config(&dir.path().join("c"));
+    c_config.peers.push(b.endpoint().addr());
+    let c = Node::start(c_config).await?;
+    c.wait_for_neighbor(PUBLIC_NET, Duration::from_secs(10))
+        .await?;
+    c.sync_from(b.endpoint_id(), PUBLIC_NET).await?;
+    assert!(c.store().get(&retraction.id)?.is_some());
+    assert!(c.store().get(&event.id)?.is_none());
+    // Offered the full post by a, which no longer has it either: still
+    // refused by c (its record came with the retraction).
+    assert!(
+        c.publish_signed(serde_json::to_value(&event)?)
+            .await
+            .is_err()
+    );
+    assert!(c.store().get(&event.id)?.is_none());
+    c.shutdown().await?;
+    b.shutdown().await?;
+    a.shutdown().await?;
+    Ok(())
+}

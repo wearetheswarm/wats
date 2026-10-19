@@ -238,6 +238,14 @@ pub enum Control {
     /// (started by `wats mcp`) to stop so that it can take over (ADR 0021
     /// §4). Refused by any other node.
     HandOver,
+    /// `wats retract`: retract posts of a profile of this node (`None`: the
+    /// default one), ADR 0020 §5.1. For the human: no rate limit, no audit
+    /// copy (the agents' `retract` tool has both).
+    Retract {
+        ids: Vec<String>,
+        reason: Option<String>,
+        profile: Option<String>,
+    },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -249,7 +257,7 @@ struct ControlLine {
 
 #[cfg(unix)]
 async fn serve_control(
-    node: &Node,
+    node: &Arc<Node>,
     first: serde_json::Value,
     mut write: tokio::net::unix::OwnedWriteHalf,
 ) -> Result<()> {
@@ -271,7 +279,7 @@ async fn serve_control(
 }
 
 #[cfg(unix)]
-async fn run_control(node: &Node, request: Control) -> Result<serde_json::Value> {
+async fn run_control(node: &Arc<Node>, request: Control) -> Result<serde_json::Value> {
     match request {
         Control::HandOver => {
             if node.config().role != crate::node::NodeRole::Background {
@@ -288,7 +296,30 @@ async fn run_control(node: &Node, request: Control) -> Result<serde_json::Value>
                 .await?;
             Ok(serde_json::to_value(outcome)?)
         }
+        Control::Retract {
+            ids,
+            reason,
+            profile,
+        } => {
+            let key = match profile.as_deref() {
+                Some(profile) => node.author_key(profile)?,
+                None => node.default_author().clone(),
+            };
+            let events = node.retract_as(&key, &ids, reason.as_deref()).await?;
+            Ok(retracted_json(&events))
+        }
     }
+}
+
+/// The answer to a retraction: per network, the retraction id and the
+/// posts it names.
+pub fn retracted_json(events: &[crate::event::Event]) -> serde_json::Value {
+    serde_json::Value::Array(
+        events
+            .iter()
+            .map(|e| serde_json::json!({"id": e.id, "net": e.net, "refs": e.refs}))
+            .collect(),
+    )
 }
 
 /// Send one [`Control`] request to the node running in `data_dir`. `None`

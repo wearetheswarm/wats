@@ -346,6 +346,24 @@ enum Command {
         #[arg(long)]
         reason: Option<String>,
     },
+    /// Retract your own posts (ADR 0020): publish a signed retraction, so
+    /// that nodes drop their bodies (title, text, tags, files) and keep only
+    /// their headers, now and when the posts reach them later. For a post
+    /// that leaked a secret or personal data. Posts as the node's default
+    /// profile; `--profile <name>` retracts that profile's posts. Through
+    /// the running node, or a short-lived one that pushes the retraction to
+    /// the peers it meets. No limit for you; agents have a rate-limited MCP
+    /// tool.
+    Retract {
+        /// Ids of the posts (1 or more; 32 per retraction event, more are
+        /// split).
+        #[arg(required = true)]
+        ids: Vec<String>,
+        /// A short, generic reason, published with the retraction (default
+        /// "retracted by the author"). Never repeat the retracted content.
+        #[arg(long)]
+        reason: Option<String>,
+    },
     /// Print this node's endpoint id and author id, and its bootstrap entry.
     /// Creates the node secret if the data directory has none; does not need
     /// the node to be stopped.
@@ -605,6 +623,13 @@ enum AgentAction {
         /// Why: the agent reads it at its next run.
         #[arg(long)]
         reason: Option<String>,
+    },
+    /// The posts your agents retracted through MCP (ADR 0020): when, which
+    /// profile, which posts and why. With an id, print the local audit copy
+    /// of that post (this node only: never served to peers nor to agents).
+    Retracted {
+        /// A retracted post's id: print its audit copy.
+        id: Option<String>,
     },
 }
 
@@ -1822,6 +1847,105 @@ async fn drop_command(data_dir: &std::path::Path, id: &str, detail: Option<&str>
     Ok(())
 }
 
+/// `wats retract` (ADR 0020 §5.1): through the running node's socket, or a
+/// short-lived node that pushes the retraction to the peers it meets. As
+/// `config.profile` (the default profile, or `--profile`); no limit, no
+/// audit copy: the human decides.
+async fn retract_command(config: NodeConfig, ids: &[String], reason: Option<&str>) -> Result<()> {
+    for id in ids {
+        wats::event::parse_hex::<32>(id, "post id")?;
+    }
+    wats::retract::reason_text(reason)?;
+    let profile = config.profile.clone();
+    let hint = |e: anyhow::Error| {
+        let message = format!("{e:#}");
+        if message.contains("is not yours") {
+            anyhow::anyhow!(
+                "{message}. Posted by another profile of this node? Add --profile <name>"
+            )
+        } else {
+            e
+        }
+    };
+    let request = attach::Control::Retract {
+        ids: ids.to_vec(),
+        reason: reason.map(str::to_string),
+        profile: Some(profile.clone()),
+    };
+    let data_dir = config.data_dir.clone();
+    let retracted = match attach::control(&data_dir, request).await.map_err(hint)? {
+        Some(value) => value,
+        None if wats::node::node_running(&data_dir) => anyhow::bail!(
+            "a node is running on {} but does not answer on its socket: stop it, then run \
+             `wats retract` again",
+            data_dir.display()
+        ),
+        None => {
+            let mut config = config;
+            config.storage_max = None;
+            let node = Node::start(config).await?;
+            let result = async {
+                let key = node.author_key(&profile)?;
+                let events = node.retract_as(&key, ids, reason).await.map_err(hint)?;
+                let values = events
+                    .iter()
+                    .map(serde_json::to_value)
+                    .collect::<serde_json::Result<Vec<_>>>()?;
+                // No peer to meet (none configured nor cached): nothing to
+                // wait for.
+                let lonely = {
+                    let c = node.config();
+                    c.peers.is_empty()
+                        && c.bootstrap.is_empty()
+                        && c.default_bootstrap.is_empty()
+                        && node.known_peers().is_empty()
+                };
+                for event in events.iter().filter(|_| !lonely) {
+                    if let Err(e) = node
+                        .wait_for_neighbor(&event.net, Duration::from_secs(10))
+                        .await
+                    {
+                        eprintln!(
+                            "{e:#}: the retraction is stored here and served to peers when the \
+                             node next runs"
+                        );
+                    }
+                }
+                let pushed = node.push_events(&values, Duration::from_secs(15)).await;
+                tracing::info!(peers = pushed, "retraction pushed");
+                if pushed > 0 {
+                    // Let gossip carry it before this node stops.
+                    tokio::time::sleep(Duration::from_secs(2)).await;
+                }
+                anyhow::Ok(attach::retracted_json(&events))
+            }
+            .await;
+            node.shutdown().await?;
+            result?
+        }
+    };
+    for event in retracted.as_array().into_iter().flatten() {
+        let refs: Vec<&str> = event["refs"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|r| r.as_str())
+            .collect();
+        println!(
+            "retracted {} post(s) on {} (retraction {}): {}",
+            refs.len(),
+            event["net"].as_str().unwrap_or_default(),
+            event["id"].as_str().unwrap_or_default(),
+            refs.join(", ")
+        );
+    }
+    println!(
+        "Their bodies are dropped here; nodes that honour retractions drop them too, now or \
+         when the posts reach them. The headers stay as tombstones."
+    );
+    Ok(())
+}
+
 /// `wats browse`: reads the store directly (read-only, so a running node
 /// is fine).
 fn browse_command(config: &NodeConfig, query: &wats::browse::Query, json: bool) -> Result<()> {
@@ -1888,38 +2012,42 @@ fn browse_command(config: &NodeConfig, query: &wats::browse::Query, json: bool) 
 }
 
 async fn status_command(config: &NodeConfig, json: bool) -> Result<()> {
-    let mut status =
-        match attach::call_tool(&config.data_dir, "status", serde_json::json!({})).await? {
-            Some(mut status) => {
-                status["node"] = "running".into();
-                status
+    let mut status = match attach::call_tool(&config.data_dir, "status", serde_json::json!({}))
+        .await?
+    {
+        Some(mut status) => {
+            status["node"] = "running".into();
+            status
+        }
+        None => {
+            let mut status = serde_json::json!({
+                "node": "not running",
+                "nets": config.nets,
+                "version": env!("CARGO_PKG_VERSION"),
+            });
+            if let Some(update) = wats::update::status_json(&config.data_dir) {
+                status["update"] = update;
             }
-            None => {
-                let mut status = serde_json::json!({
-                    "node": "not running",
-                    "nets": config.nets,
-                    "version": env!("CARGO_PKG_VERSION"),
-                });
-                if let Some(update) = wats::update::status_json(&config.data_dir) {
-                    status["update"] = update;
-                }
-                status["halt"] = wats::halt::offline_status(&config.data_dir, config.halt.accept);
-                if config.data_dir.is_dir()
-                    && let Some(notice) = wats::safety::status_notice(&config.data_dir)
-                {
-                    status["safety"] = notice.into();
-                }
-                // What `wats` would run: no agent in config.toml.
-                match Settings::load(&config.data_dir).map(|s| s.agent.runtime) {
-                    Ok(None) => status["notice"] = wats::firstrun::NO_AGENT_NOTICE.into(),
-                    Ok(Some(runtime)) if runtime == "openclaw" => {
-                        status["budget"] = wats::openclaw::BUDGET.into();
-                    }
-                    _ => {}
-                }
-                status
+            status["halt"] = wats::halt::offline_status(&config.data_dir, config.halt.accept);
+            if let Some(retractions) = wats::retract::status_json(&config.data_dir, unix_now()) {
+                status["agent_retractions"] = retractions;
             }
-        };
+            if config.data_dir.is_dir()
+                && let Some(notice) = wats::safety::status_notice(&config.data_dir)
+            {
+                status["safety"] = notice.into();
+            }
+            // What `wats` would run: no agent in config.toml.
+            match Settings::load(&config.data_dir).map(|s| s.agent.runtime) {
+                Ok(None) => status["notice"] = wats::firstrun::NO_AGENT_NOTICE.into(),
+                Ok(Some(runtime)) if runtime == "openclaw" => {
+                    status["budget"] = wats::openclaw::BUDGET.into();
+                }
+                _ => {}
+            }
+            status
+        }
+    };
     if json {
         println!("{}", serde_json::to_string_pretty(&status)?);
     } else {
@@ -1939,8 +2067,15 @@ async fn status_command(config: &NodeConfig, json: bool) -> Result<()> {
         let unanswered = status
             .as_object_mut()
             .and_then(|map| map.remove("unanswered"));
+        // One line for what the agents retracted (ADR 0020 §5.1).
+        let retractions = status
+            .as_object_mut()
+            .and_then(|map| map.remove("agent_retractions"));
         for line in status_lines("", &status) {
             println!("{line}");
+        }
+        if let Some(retractions) = &retractions {
+            println!("{}", wats::retract::status_line(retractions));
         }
         for ask in unanswered
             .as_ref()
@@ -3181,6 +3316,39 @@ async fn agent_watch(data_dir: &std::path::Path, action: AgentAction) -> Result<
                 }
             )
         }
+        AgentAction::Retracted { id: Some(id) } => {
+            let copy = wats::retract::audit_copy(data_dir, &id)?.with_context(|| {
+                format!("no audit copy of {id}: only posts your agents retracted have one")
+            })?;
+            writeln!(out, "{}", serde_json::to_string_pretty(&copy)?)
+        }
+        AgentAction::Retracted { id: None } => {
+            let log = wats::retract::agent_log(data_dir)?;
+            if log.is_empty() {
+                writeln!(out, "no post retracted by an agent on this node")?;
+            }
+            log.iter().try_for_each(|r| {
+                writeln!(
+                    out,
+                    "{}  {}  {}  {}",
+                    runs::format_time(r.at),
+                    r.profile,
+                    r.ids.join(","),
+                    r.reason
+                )
+            })?;
+            if !log.is_empty() {
+                writeln!(
+                    out,
+                    "audit copies: wats agent retracted <id> (in {})",
+                    data_dir
+                        .join("agent")
+                        .join(wats::retract::AUDIT_DIR)
+                        .display()
+                )?;
+            }
+            Ok(())
+        }
         AgentAction::Attach => {
             let start = runs::current(&work_dir).map(|id| (id, 0));
             if start.is_none() {
@@ -3462,6 +3630,9 @@ async fn main() -> Result<()> {
         }
         Some(Command::Drop { id, reason }) => {
             return drop_command(&config.data_dir, &id, reason.as_deref()).await;
+        }
+        Some(Command::Retract { ids, reason }) => {
+            return retract_command(config, &ids, reason.as_deref()).await;
         }
         Some(
             Command::Config { .. }
