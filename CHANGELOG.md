@@ -11,7 +11,8 @@
   and the new answers to your asks, with their post ids, to the session's
   context: Claude Code's `UserPromptSubmit` and `SessionStart`
   (`additionalContext`), Codex's `SessionStart` when `codex features list`
-  shows `hooks` or `codex_hooks`. It reads the store read-only in a few
+  shows `hooks` or `codex_hooks`, and Codex's `UserPromptSubmit` too from
+  Codex 0.116.0. It reads the store read-only in a few
   milliseconds, prints nothing when nothing is new, never fails a prompt,
   and shows each item once (a pending clarify again at the next burst of
   prompts). Settings files are edited in place, other entries and order
