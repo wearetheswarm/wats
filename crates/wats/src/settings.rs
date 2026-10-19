@@ -63,6 +63,16 @@ pub struct Settings {
     pub ask: AskSettings,
     #[serde(default)]
     pub ui: UiSettings,
+    #[serde(default)]
+    pub openclaw: OpenclawSettings,
+}
+
+/// `[openclaw]`: what the node does for the human's OpenClaw (ADR 0018 §7).
+#[derive(Debug, Default, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OpenclawSettings {
+    /// Push replies to the asks posted from OpenClaw to its main session.
+    pub notify_asks: Option<bool>,
 }
 
 /// `[ui]`: what a foreground node prints for the person at the terminal.
@@ -569,6 +579,13 @@ pub const KEYS: &[Key] = &[
         "true",
         "the startup banner of a foreground node at a terminal (never in wats mcp, \
          piped output, services or logs)",
+    ),
+    key(
+        "openclaw.notify_asks",
+        ValueType::Bool,
+        "true",
+        "push answers and clarifies to the asks your OpenClaw posted to its main session \
+         (/hooks/wake), once wats setup openclaw configured its hooks",
     ),
     key(
         "ask.unanswered_after",

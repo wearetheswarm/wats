@@ -2380,3 +2380,107 @@ async fn a_clarify_past_its_deadline_wakes_the_agent_for_its_default() -> anyhow
     b.shutdown().await?;
     Ok(())
 }
+
+/// ADR 0018 §7: an answer or a clarify to an ask the human posted from
+/// OpenClaw wakes OpenClaw's main session (`/hooks/wake`, mode now) with a
+/// self-contained line; replies to other asks, and the asker's own posts in
+/// the thread, do not.
+#[tokio::test(flavor = "multi_thread")]
+async fn replies_to_an_openclaw_ask_wake_its_main_session() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let ok = r#"{"ok":true,"eventOutcome":"queued"}"#;
+    let (url, seen) = gateway_stub(vec![(200, ok, Duration::ZERO); 4]);
+    let data = dir.path().join("a");
+    let token_file = wats::openclaw::hooks_token_path(&data);
+    std::fs::create_dir_all(token_file.parent().unwrap())?;
+    std::fs::write(&token_file, "s3cret-hook-token\n")?;
+    let mut config = NodeConfig::new(&data);
+    config.mode = NetworkMode::Loopback;
+    config.pow_bits = Some(0);
+    config.min_pow_bits = Some(0);
+    config.openclaw_notify = Some(wats::openclaw::Notify {
+        url,
+        token_file: token_file.clone(),
+    });
+    let a = Node::start(config).await?;
+    let b = node(&dir.path().join("b"), &[&a]).await?;
+    a.wait_for_neighbor(PUBLIC_NET, Duration::from_secs(10))
+        .await?;
+
+    // The human's ask, from OpenClaw (what the MCP `post` tool records).
+    let human = a.author_key("human")?;
+    let asked = a.publish_as(&human, ask("Draw a bee logo"), &[]).await?;
+    a.store()
+        .set_ask_notify(&asked.id, "openclaw", wats::node::now_secs())?;
+    // Another ask, not from OpenClaw.
+    let other = a.publish_as(&human, ask("Another question"), &[]).await?;
+    let reply = |to: &wats::event::Event, kind: Kind, text: &str, data: serde_json::Value| Draft {
+        net: PUBLIC_NET.into(),
+        thread: Some(to.id.clone()),
+        parent: Some(to.id.clone()),
+        kind: Some(kind),
+        text: text.into(),
+        data: data.as_object().cloned().unwrap_or_default(),
+        ..Draft::default()
+    };
+    for id in [&asked.id, &other.id] {
+        let b = Arc::clone(&b);
+        let id = id.clone();
+        eventually("ask on b", move || b.store().get(&id).unwrap().is_some()).await;
+    }
+    let clarify = b
+        .publish(
+            reply(
+                &asked,
+                Kind::Clarify,
+                "To the asker: I can't render a PNG in this run. Reply with your choice.",
+                serde_json::json!({"options": ["SVG instead", "no thanks"], "default": "SVG instead"}),
+            ),
+            &[],
+        )
+        .await?;
+    b.publish(
+        reply(
+            &other,
+            Kind::Answer,
+            "Not for OpenClaw.",
+            serde_json::json!({}),
+        ),
+        &[],
+    )
+    .await?;
+    // The asker's own reply in its thread: no wake.
+    a.publish_as(
+        &human,
+        reply(&asked, Kind::Answer, "Never mind.", serde_json::json!({})),
+        &[],
+    )
+    .await?;
+
+    let requests = || seen.lock().unwrap().clone();
+    eventually("a wake", || !requests().is_empty()).await;
+    tokio::time::sleep(Duration::from_millis(800)).await;
+    let all = requests();
+    assert_eq!(
+        all.len(),
+        1,
+        "only the clarify to the OpenClaw ask: {all:?}"
+    );
+    let wake = &all[0];
+    assert!(wake.line.starts_with("POST /hooks/wake "), "{}", wake.line);
+    assert_eq!(
+        wake.header("authorization"),
+        Some("Bearer s3cret-hook-token")
+    );
+    assert_eq!(wake.body["mode"], "now");
+    let text = wake.body["text"].as_str().unwrap();
+    assert!(
+        text.contains("Your swarm ask 'Draw a bee logo' got a clarify"),
+        "{text}"
+    );
+    assert!(text.contains("Options: SVG instead / no thanks"), "{text}");
+    assert!(text.contains(&clarify.id), "{text}");
+    a.shutdown().await?;
+    b.shutdown().await?;
+    Ok(())
+}

@@ -193,6 +193,9 @@ pub struct NodeConfig {
     /// is listed as unanswered for its author (`ask.unanswered_after`,
     /// ADR 0018 §4); `None` never.
     pub unanswered_after: Option<Duration>,
+    /// The human's OpenClaw, told when its swarm asks get replies (ADR
+    /// 0018 §7); set when the hook token exists.
+    pub openclaw_notify: Option<crate::openclaw::Notify>,
 }
 
 impl NodeConfig {
@@ -239,6 +242,7 @@ impl NodeConfig {
             halt: Default::default(),
             no_peers_after: Some(crate::health::DEFAULT_NO_PEERS_AFTER),
             unanswered_after: Some(crate::unanswered::DEFAULT_AFTER),
+            openclaw_notify: None,
             bootstrap: Vec::new(),
             default_bootstrap: Vec::new(),
             resolver: Default::default(),
@@ -1522,6 +1526,7 @@ impl Node {
             }));
         }
         node.spawn_reconnect();
+        node.spawn_asker_notify();
         node.spawn_health_checks();
         if !node.config.halt.accept {
             warn!("this node ignores guardian halts (halt.accept = false)");
@@ -1729,6 +1734,82 @@ impl Node {
                 });
             }
         }
+    }
+
+    /// Push replies to the human's asks to its MCP host (ADR 0018 §7):
+    /// for an `answer` or a `clarify` by someone else in the thread of an
+    /// ask posted from OpenClaw, wake OpenClaw's main session with one line.
+    fn spawn_asker_notify(self: &Arc<Self>) {
+        let Some(notify) = self.config.openclaw_notify.clone() else {
+            return;
+        };
+        let mut events = self.store.subscribe();
+        let weak = Arc::downgrade(self);
+        tokio::spawn(async move {
+            // At most this many wakes per hour, so a busy thread cannot
+            // flood the human's chat.
+            const PER_HOUR: usize = 20;
+            let mut sent: std::collections::VecDeque<std::time::Instant> = Default::default();
+            let mut dropped_logged = false;
+            loop {
+                let stored = match events.recv().await {
+                    Ok(stored) => stored,
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                };
+                let Some(node) = weak.upgrade() else { break };
+                let reply = stored.event;
+                if !matches!(reply.kind, Kind::Answer | Kind::Clarify) {
+                    continue;
+                }
+                let root = reply.thread_root().to_string();
+                if root == reply.id
+                    || node.store.ask_notify(&root).ok().flatten().as_deref() != Some("openclaw")
+                {
+                    continue;
+                }
+                let Some(ask) = node.store.get(&root).ok().flatten() else {
+                    continue;
+                };
+                if ask.event.author == reply.author {
+                    continue;
+                }
+                let title = ask
+                    .event
+                    .title
+                    .clone()
+                    .unwrap_or_else(|| crate::event::title_from_text(&ask.event.text));
+                let from = format!("agent {}", reply.author.get(..12).unwrap_or(&reply.author));
+                let text = crate::openclaw::notify_text(&title, &reply, &from);
+                let now = std::time::Instant::now();
+                while sent
+                    .front()
+                    .is_some_and(|t| now.duration_since(*t) > Duration::from_secs(3600))
+                {
+                    sent.pop_front();
+                }
+                if sent.len() >= PER_HOUR {
+                    if !dropped_logged {
+                        warn!("OpenClaw notifications paused: {PER_HOUR} in the last hour");
+                        dropped_logged = true;
+                    }
+                    continue;
+                }
+                dropped_logged = false;
+                sent.push_back(now);
+                let notify = notify.clone();
+                tokio::spawn(async move {
+                    match crate::openclaw::wake(&notify, &text).await {
+                        Ok(()) => {
+                            info!(ask = %root, reply = %reply.id, "told OpenClaw about a reply to its ask")
+                        }
+                        Err(e) => {
+                            warn!(ask = %root, "could not tell OpenClaw about a reply: {e:#}")
+                        }
+                    }
+                });
+            }
+        });
     }
 
     /// The reconnect loop ([`crate::reconnect`]) and the network watchers

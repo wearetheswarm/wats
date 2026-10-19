@@ -49,6 +49,13 @@ CREATE INDEX IF NOT EXISTS events_author_kind ON events (author, kind);
 -- Rotations and retractions are looked up by kind (ADR 0020 §5.1).
 CREATE INDEX IF NOT EXISTS events_kind ON events (kind);
 
+-- Asks a human posted from an MCP host the node can notify (ADR 0018 §7).
+CREATE TABLE IF NOT EXISTS ask_notify (
+    ask    TEXT PRIMARY KEY,
+    client TEXT NOT NULL,
+    at     INTEGER NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS event_tags (
     seq INTEGER NOT NULL REFERENCES events (seq),
     tag TEXT NOT NULL,
@@ -1254,6 +1261,25 @@ impl Store {
             });
         }
         Ok(out)
+    }
+
+    /// Remember that replies to `ask` go to the human's MCP host `client`.
+    pub fn set_ask_notify(&self, ask: &str, client: &str, at: u64) -> Result<()> {
+        self.conn().execute(
+            "INSERT OR REPLACE INTO ask_notify (ask, client, at) VALUES (?, ?, ?)",
+            params![ask, client, at as i64],
+        )?;
+        Ok(())
+    }
+
+    /// The MCP host to notify of replies to `ask`, if any.
+    pub fn ask_notify(&self, ask: &str) -> Result<Option<String>> {
+        Ok(self
+            .conn()
+            .query_row("SELECT client FROM ask_notify WHERE ask = ?", [ask], |r| {
+                r.get(0)
+            })
+            .optional()?)
     }
 
     /// Full-text search (BM25), newest first among equal ranks. Without

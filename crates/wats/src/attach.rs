@@ -36,6 +36,21 @@ pub struct Handshake {
     /// in the MCP config it starts the agent with.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub runner_token: Option<String>,
+    /// The MCP host (`WATS_MCP_CLIENT`), e.g. `openclaw`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client: Option<String>,
+}
+
+/// Names the MCP host a `wats mcp` session runs under, e.g. `openclaw`
+/// (set by `wats setup openclaw --mcp` in its MCP entry): the node then
+/// pushes replies to the asks posted from there (ADR 0018 §7).
+pub const CLIENT_ENV: &str = "WATS_MCP_CLIENT";
+
+/// [`CLIENT_ENV`], when set and not empty.
+pub fn client_from_env() -> Option<String> {
+    std::env::var(CLIENT_ENV)
+        .ok()
+        .filter(|c| !c.trim().is_empty())
 }
 
 /// Longest Unix socket path we use (`sun_path` is 104 bytes on macOS,
@@ -194,7 +209,8 @@ async fn serve_session(node: Arc<Node>, stream: tokio::net::UnixStream) -> Resul
     if handshake.wats_attach != 1 {
         bail!("unsupported attach version {}", handshake.wats_attach);
     }
-    let mut server = WatsMcp::new(Arc::clone(&node), handshake.file_roots);
+    let mut server =
+        WatsMcp::new(Arc::clone(&node), handshake.file_roots).with_client(handshake.client);
     if let Some(profile) = &handshake.profile {
         server = server.with_profile(profile)?;
     }
@@ -458,6 +474,7 @@ pub async fn attach(
         runner_token: std::env::var("WATS_RUNNER_TOKEN")
             .ok()
             .filter(|t| !t.is_empty()),
+        client: client_from_env(),
     })?;
     handshake.push(b'\n');
     let mut stdin = BufReader::new(tokio::io::stdin()).lines();
@@ -582,6 +599,7 @@ pub async fn call_tool(
         profile: None,
         file_roots: Vec::new(),
         runner_token: None,
+        client: None,
     };
     let initialize = json!({"jsonrpc": "2.0", "id": 1, "method": "initialize",
         "params": {"protocolVersion": "2025-06-18", "capabilities": {},

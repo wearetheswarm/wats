@@ -1362,9 +1362,14 @@ fn setup_openclaw(
     // Only `command` and `args`: wats needs no `env`, except a named node
     // socket (WATS_MCP_SOCKET, OpenClaw in its own container), passed on
     // in case OpenClaw does not pass its environment to MCP servers.
-    let mut entry = json!({"command": command, "args": server_args});
+    // `command` and `args`, and in `env` the host's name, so that the node
+    // pushes replies to this OpenClaw's asks to it (ADR 0018 §7), plus a
+    // named node socket (WATS_MCP_SOCKET, OpenClaw in its own container),
+    // in case OpenClaw does not pass its environment to MCP servers.
+    let mut entry = json!({"command": command, "args": server_args,
+                           "env": {attach::CLIENT_ENV: "openclaw"}});
     if let Some(socket) = attach::socket_override() {
-        entry["env"] = json!({ attach::SOCKET_ENV: socket.to_string_lossy() });
+        entry["env"][attach::SOCKET_ENV] = json!(socket.to_string_lossy());
     }
     openclaw_mcp_set(openclaw, "wats", &entry, &command, None)?;
     println!("OpenClaw: wats MCP server set (profile {profile})");
@@ -2313,6 +2318,19 @@ impl NodeArgs {
         if let Some(ttl) = &file.agent.review_ttl {
             config.review_ttl = parse_duration(ttl)
                 .map_err(|e| anyhow::anyhow!("config.toml agent.review_ttl: {e}"))?;
+        }
+        // The human's OpenClaw hears of replies to its asks (ADR 0018 §7),
+        // once its hooks are set up (`wats setup openclaw --agent`).
+        let hooks_token = wats::openclaw::hooks_token_path(&config.data_dir);
+        if hooks_token.exists() && file.openclaw.notify_asks != Some(false) {
+            config.openclaw_notify = Some(wats::openclaw::Notify {
+                url: file
+                    .agent
+                    .openclaw_url
+                    .clone()
+                    .unwrap_or_else(|| wats::openclaw::DEFAULT_URL.to_string()),
+                token_file: hooks_token,
+            });
         }
         if let Some(after) = &file.ask.unanswered_after {
             config.unanswered_after = wats::settings::parse_retention(after)
@@ -3392,7 +3410,8 @@ async fn run_mcp(node: Arc<Node>, mut shutdown: Shutdown) -> Result<()> {
     });
     node.enforce_halts();
     let mut halt_outcome = node.halt_outcome();
-    let server = WatsMcp::new(Arc::clone(&node), default_file_roots());
+    let server = WatsMcp::new(Arc::clone(&node), default_file_roots())
+        .with_client(attach::client_from_env());
     let service = server.serve(rmcp::transport::stdio()).await?;
     let waiting = service.waiting();
     tokio::pin!(waiting);
