@@ -131,3 +131,102 @@ async fn background_session_hands_over_to_a_daemon() -> anyhow::Result<()> {
         .status()?;
     Ok(())
 }
+
+/// `wats` started by hand while an MCP session holds a background node
+/// takes over (ADR 0021 §4): the background node hands over, the daemon
+/// takes the lock, and the session carries on, served by the daemon.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_daemon_started_by_hand_takes_over_a_background_node() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let data = dir.path().join("d");
+    let mut cmd = tokio::process::Command::new(env!("CARGO_BIN_EXE_wats"));
+    cmd.env("WATS_HERMETIC", "1")
+        .env_remove("WATS_RUNNER_TOKEN")
+        .args(["--pow-bits=0", "--min-pow-bits=0", "--dir"])
+        .arg(&data)
+        .args(["mcp", "--idle-exit", "30"]);
+    let client = ().serve(TokioChildProcess::new(cmd)?).await?;
+    let status = call(&client, "status", json!({})).await.unwrap();
+    assert_eq!(status["mode"], "background", "{status}");
+
+    let log = std::fs::File::create(dir.path().join("daemon.log"))?;
+    let mut daemon = std::process::Command::new(env!("CARGO_BIN_EXE_wats"))
+        .env("WATS_HERMETIC", "1")
+        .args(["--pow-bits=0", "--min-pow-bits=0", "--dir"])
+        .arg(&data)
+        .args(["--no-agent", "--quiet"])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(log)
+        .spawn()?;
+
+    // The same session, now served by the daemon, with no error on the way.
+    let mut mode = Value::Null;
+    for _ in 0..150 {
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        match call(&client, "status", json!({})).await {
+            Ok(status) => {
+                mode = status["mode"].clone();
+                if mode == "daemon" {
+                    break;
+                }
+            }
+            Err(e) => panic!("a read call failed during the takeover: {e}"),
+        }
+    }
+    let log = std::fs::read_to_string(dir.path().join("daemon.log")).unwrap_or_default();
+    assert_eq!(mode, "daemon", "daemon log:\n{log}");
+    assert!(log.contains("asking it to hand over"), "{log}");
+    assert!(daemon.try_wait()?.is_none(), "the daemon runs: {log}");
+    let found = call(&client, "search", json!({})).await.unwrap();
+    assert!(found.get("posts").is_some(), "{found}");
+
+    client.cancel().await?;
+    let _ = daemon.kill();
+    let _ = daemon.wait();
+    Ok(())
+}
+
+/// A daemon does not take over from another daemon: today's error, naming
+/// the holder.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_daemon_does_not_take_over_another_daemon() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let data = dir.path().join("d");
+    let run = || {
+        std::process::Command::new(env!("CARGO_BIN_EXE_wats"))
+            .env("WATS_HERMETIC", "1")
+            .args(["--pow-bits=0", "--min-pow-bits=0", "--dir"])
+            .arg(&data)
+            .args(["--no-agent", "--quiet"])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+    };
+    let mut first = run()?;
+    // Wait for its socket.
+    for _ in 0..100 {
+        if std::process::Command::new(env!("CARGO_BIN_EXE_wats"))
+            .env("WATS_HERMETIC", "1")
+            .arg("--dir")
+            .arg(&data)
+            .args(["status", "--json"])
+            .output()?
+            .stdout
+            .starts_with(b"{")
+            && std::fs::read_to_string(data.join("lock")).is_ok_and(|l| l.contains("daemon"))
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let second = run()?.wait_with_output()?;
+    let err = String::from_utf8_lossy(&second.stderr);
+    assert!(!second.status.success());
+    assert!(err.contains("another wats node is using"), "{err}");
+    assert!(first.try_wait()?.is_none(), "the first daemon still runs");
+    let _ = first.kill();
+    let _ = first.wait();
+    Ok(())
+}

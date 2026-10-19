@@ -234,6 +234,10 @@ async fn serve_session(node: Arc<Node>, stream: tokio::net::UnixStream) -> Resul
 pub enum Control {
     /// `wats drop`: drop a body on this node, reason `own`.
     Drop { id: String, detail: Option<String> },
+    /// A daemon starting on this data directory asks a background node
+    /// (started by `wats mcp`) to stop so that it can take over (ADR 0021
+    /// §4). Refused by any other node.
+    HandOver,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -269,6 +273,14 @@ async fn serve_control(
 #[cfg(unix)]
 async fn run_control(node: &Node, request: Control) -> Result<serde_json::Value> {
     match request {
+        Control::HandOver => {
+            if node.config().role != crate::node::NodeRole::Background {
+                bail!("this node is not a background node: it does not hand over");
+            }
+            tracing::info!("a daemon is taking over this data directory: stopping");
+            node.request_stop();
+            Ok(serde_json::json!("handing over"))
+        }
         Control::Drop { id, detail } => {
             crate::event::parse_hex::<32>(&id, "id")?;
             let outcome = node
@@ -335,6 +347,53 @@ fn is_setup(line: &str) -> bool {
     })
 }
 
+/// MCP tools that only read: a call in flight when the node goes away is
+/// sent again to the next node (ADR 0021 §4). A call that publishes is
+/// not, since the first node may have published it already: the client
+/// gets an error saying so instead.
+const RETRIED_TOOLS: [&str; 7] = [
+    "read", "search", "browse", "who", "wait", "status", "pending",
+];
+
+/// A request sent to the node and not answered yet.
+#[derive(Debug, Clone)]
+struct InFlight {
+    id: serde_json::Value,
+    line: String,
+    /// It may be sent again to the next node.
+    retry: bool,
+}
+
+/// The request a client line carries, if it expects an answer.
+fn in_flight(line: &str) -> Option<InFlight> {
+    let v: serde_json::Value = serde_json::from_str(line).ok()?;
+    let id = v.get("id").filter(|id| !id.is_null())?.clone();
+    let method = v.get("method")?.as_str()?;
+    let retry = match method {
+        "tools/call" => v["params"]["name"]
+            .as_str()
+            .is_some_and(|name| RETRIED_TOOLS.contains(&name)),
+        // Listing tools, resources or prompts, pings: harmless to repeat.
+        "initialize" => false,
+        _ => !method.starts_with("notifications/"),
+    };
+    Some(InFlight {
+        id,
+        line: line.to_string(),
+        retry,
+    })
+}
+
+/// The JSON-RPC error a client gets for a call lost in a node change.
+fn lost_call(id: &serde_json::Value) -> String {
+    serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "error": {"code": -32000, "message": "the wats node restarted during this call,             which may or may not have taken effect: check (e.g. with search) before trying again"},
+    })
+    .to_string()
+}
+
 /// Attach this process's stdio to the node owning `data_dir`, if one is
 /// running. Returns `Ok(false)` when no node is listening.
 ///
@@ -342,6 +401,9 @@ fn is_setup(line: &str) -> bool {
 /// daemon), the session waits up to 30 s for a node to listen again,
 /// replays the client's `initialize` and `initialized` to it, swallows the
 /// new `initialize` answer, and carries on: the MCP client sees nothing.
+/// A call in flight at that moment is sent once more to the new node if it
+/// only reads; otherwise the client gets an error for it (see
+/// [`RETRIED_TOOLS`]).
 #[cfg(unix)]
 pub async fn attach(
     data_dir: &Path,
@@ -372,12 +434,25 @@ pub async fn attach(
     let mut setup: Vec<String> = Vec::new();
     // The id of a replayed `initialize` whose answer the client must not see.
     let mut swallow: Option<serde_json::Value> = None;
+    // Requests sent and not answered yet, and those to send again to the
+    // next node after a change.
+    let mut pending: Vec<InFlight> = Vec::new();
+    let mut resend: Vec<InFlight> = Vec::new();
     loop {
         let (from_node, mut to_node) = stream.into_split();
         to_node.write_all(&handshake).await?;
         for line in &setup {
             to_node.write_all(line.as_bytes()).await?;
             to_node.write_all(b"\n").await?;
+        }
+        for call in std::mem::take(&mut resend) {
+            to_node.write_all(call.line.as_bytes()).await?;
+            to_node.write_all(b"\n").await?;
+            // Once only: lost again, the client gets an error.
+            pending.push(InFlight {
+                retry: false,
+                ..call
+            });
         }
         let mut from_node = BufReader::new(from_node).lines();
         loop {
@@ -387,17 +462,29 @@ pub async fn attach(
                     if setup.len() < 2 && is_setup(&line) {
                         setup.push(line.clone());
                     }
+                    if let Some(call) = in_flight(&line).filter(|c| {
+                        // The client's own initialize is replayed as setup.
+                        !is_setup(&c.line)
+                    }) {
+                        pending.push(call);
+                    }
                     to_node.write_all(line.as_bytes()).await?;
                     to_node.write_all(b"\n").await?;
                 }
                 line = from_node.next_line() => {
                     let Some(line) = line? else { break };
+                    let answer = serde_json::from_str::<serde_json::Value>(&line)
+                        .ok()
+                        .filter(|v| v.get("method").is_none())
+                        .and_then(|v| v.get("id").cloned());
                     if let Some(id) = &swallow
-                        && serde_json::from_str::<serde_json::Value>(&line)
-                            .is_ok_and(|v| &v["id"] == id && v.get("method").is_none())
+                        && answer.as_ref() == Some(id)
                     {
                         swallow = None;
                         continue;
+                    }
+                    if let Some(id) = &answer {
+                        pending.retain(|c| &c.id != id);
                     }
                     stdout.write_all(line.as_bytes()).await?;
                     stdout.write_all(b"\n").await?;
@@ -422,6 +509,15 @@ pub async fn attach(
         }
         let Some(s) = next else { return Ok(true) };
         stream = s;
+        for call in std::mem::take(&mut pending) {
+            if call.retry {
+                resend.push(call);
+            } else {
+                stdout.write_all(lost_call(&call.id).as_bytes()).await?;
+                stdout.write_all(b"\n").await?;
+                stdout.flush().await?;
+            }
+        }
         swallow = setup
             .iter()
             .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
@@ -522,6 +618,35 @@ pub async fn call_tool(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_reading_calls_are_sent_again_after_a_node_change() {
+        let call = |tool: &str| {
+            format!(
+                r#"{{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{{"name":"{tool}"}}}}"#
+            )
+        };
+        assert!(in_flight(&call("search")).unwrap().retry);
+        assert!(in_flight(&call("read")).unwrap().retry);
+        assert!(
+            !in_flight(&call("post")).unwrap().retry,
+            "may have published"
+        );
+        assert!(!in_flight(&call("reply")).unwrap().retry);
+        let list = r#"{"jsonrpc":"2.0","id":"a","method":"tools/list"}"#;
+        assert!(in_flight(list).unwrap().retry);
+        let note = r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#;
+        assert!(in_flight(note).is_none(), "no answer expected");
+        let lost: serde_json::Value =
+            serde_json::from_str(&lost_call(&serde_json::json!(7))).unwrap();
+        assert_eq!(lost["id"], 7);
+        assert!(
+            lost["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("restarted")
+        );
+    }
 
     #[test]
     fn long_data_dirs_get_a_short_socket_path() {

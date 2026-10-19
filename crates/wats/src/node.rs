@@ -508,7 +508,7 @@ pub async fn drop_body_offline(
     if !path.exists() {
         bail!("no event store in {}", data_dir.display());
     }
-    let lock = lock_data_dir(data_dir)?;
+    let lock = lock_data_dir(data_dir, "cli")?;
     let store = Store::open(&path)?;
     let outcome = store.drop_body(id, reason, None, detail, now_secs())?;
     if !outcome.freed_blobs.is_empty() {
@@ -795,13 +795,17 @@ impl Drop for InFlight<'_> {
     }
 }
 
+/// How long a daemon waits for a background node to hand the data
+/// directory over (ADR 0021 §4).
+const TAKEOVER_WAIT: Duration = Duration::from_secs(30);
+
 /// Lock the data directory, waiting up to `wait` for another node to let
-/// go of it.
-fn lock_data_dir_waiting(dir: &Path, wait: Duration) -> Result<std::fs::File> {
+/// go of it. `role` is recorded for the next process that finds it held.
+fn lock_data_dir_waiting(dir: &Path, wait: Duration, role: &str) -> Result<std::fs::File> {
     // No deadline when `wait` does not fit in an `Instant`: wait forever.
     let deadline = std::time::Instant::now().checked_add(wait);
     loop {
-        match lock_data_dir(dir) {
+        match lock_data_dir(dir, role) {
             Ok(file) => return Ok(file),
             Err(e) if deadline.is_some_and(|d| std::time::Instant::now() >= d) => return Err(e),
             Err(_) => std::thread::sleep(Duration::from_millis(200)),
@@ -821,7 +825,17 @@ pub fn node_running(dir: &Path) -> bool {
     matches!(file.try_lock(), Err(std::fs::TryLockError::WouldBlock))
 }
 
-fn lock_data_dir(dir: &Path) -> Result<std::fs::File> {
+/// The role recorded by the process holding the lock of `dir`
+/// (`daemon`, `background`, `in-process`, `cli`), if it wrote one.
+fn lock_holder_role(dir: &Path) -> Option<String> {
+    let text = std::fs::read_to_string(dir.join("lock")).ok()?;
+    serde_json::from_str::<LockHolder>(&text)
+        .ok()
+        .map(|h| h.role)
+        .filter(|r| !r.is_empty())
+}
+
+fn lock_data_dir(dir: &Path, role: &str) -> Result<std::fs::File> {
     std::fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
     #[cfg(unix)]
     {
@@ -838,7 +852,7 @@ fn lock_data_dir(dir: &Path) -> Result<std::fs::File> {
         .with_context(|| format!("open {}", path.display()))?;
     match file.try_lock() {
         Ok(()) => {
-            write_lock_holder(&file);
+            write_lock_holder(&file, role);
             Ok(file)
         }
         Err(std::fs::TryLockError::WouldBlock) => {
@@ -875,12 +889,17 @@ struct LockHolder {
     version: String,
     exe: String,
     started: String,
+    /// `daemon`, `background` (started by `wats mcp`), `in-process` or
+    /// `cli`; empty when written by an older release.
+    #[serde(default)]
+    role: String,
 }
 
 /// Record this process in the lock file it holds (best effort).
-fn write_lock_holder(mut file: &std::fs::File) {
+fn write_lock_holder(mut file: &std::fs::File, role: &str) {
     use std::io::{Seek, Write};
     let holder = LockHolder {
+        role: role.to_string(),
         pid: std::process::id(),
         version: env!("CARGO_PKG_VERSION").to_string(),
         exe: std::env::current_exe()
@@ -901,7 +920,35 @@ impl Node {
     pub async fn start(config: NodeConfig) -> Result<Arc<Self>> {
         let lock = {
             let (dir, wait) = (config.data_dir.clone(), config.lock_wait);
-            tokio::task::spawn_blocking(move || lock_data_dir_waiting(&dir, wait)).await??
+            let role = config.role.to_string();
+            let first = {
+                let (dir, role) = (dir.clone(), role.clone());
+                tokio::task::spawn_blocking(move || lock_data_dir_waiting(&dir, wait, &role))
+                    .await?
+            };
+            match first {
+                Ok(lock) => lock,
+                // A daemon takes over from a background node started by
+                // `wats mcp` (ADR 0021 §4): it asks it to hand over, then
+                // waits for the lock. Its sessions reconnect by themselves.
+                Err(e)
+                    if config.role == NodeRole::Daemon
+                        && lock_holder_role(&dir).as_deref() == Some("background") =>
+                {
+                    info!("a background node holds the data directory: asking it to hand over");
+                    if let Err(asked) =
+                        crate::attach::control(&dir, crate::attach::Control::HandOver).await
+                    {
+                        warn!("the background node did not take the hand-over request: {asked:#}");
+                        return Err(e);
+                    }
+                    tokio::task::spawn_blocking(move || {
+                        lock_data_dir_waiting(&dir, TAKEOVER_WAIT, &role)
+                    })
+                    .await??
+                }
+                Err(e) => return Err(e),
+            }
         };
         let root = match &config.secret_file {
             Some(path) => RootSecret::load(path)?,
