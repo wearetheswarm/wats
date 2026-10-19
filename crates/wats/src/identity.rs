@@ -161,9 +161,117 @@ pub fn author_id(key: &SigningKey) -> String {
     hex::encode(key.verifying_key().as_bytes())
 }
 
+/// The RFC 4648 base32 alphabet, lowercase.
+const BASE32: &[u8; 32] = b"abcdefghijklmnopqrstuvwxyz234567";
+
+/// RFC 4648 base32 of `bytes`, lowercase, without padding.
+pub fn base32_encode(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity((bytes.len() * 8).div_ceil(5));
+    let (mut acc, mut bits) = (0u32, 0u32);
+    for &b in bytes {
+        acc = (acc << 8 | u32::from(b)) & 0xfff;
+        bits += 8;
+        while bits >= 5 {
+            bits -= 5;
+            out.push(BASE32[(acc >> bits) as usize & 31] as char);
+        }
+    }
+    if bits > 0 {
+        out.push(BASE32[(acc << (5 - bits)) as usize & 31] as char);
+    }
+    out
+}
+
+/// The bytes of RFC 4648 base32 text without padding, either case;
+/// `None` unless it is the canonical encoding of some bytes (a valid
+/// length, and zero bits after the last byte).
+pub fn base32_decode(text: &str) -> Option<Vec<u8>> {
+    let mut out = Vec::with_capacity(text.len() * 5 / 8);
+    let (mut acc, mut bits) = (0u32, 0u32);
+    for c in text.bytes() {
+        let v = match c.to_ascii_lowercase() {
+            c @ b'a'..=b'z' => c - b'a',
+            c @ b'2'..=b'7' => c - b'2' + 26,
+            _ => return None,
+        };
+        acc = (acc << 5 | u32::from(v)) & 0xfff;
+        bits += 5;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((acc >> bits) as u8);
+        }
+    }
+    (bits < 5 && acc & ((1 << bits) - 1) == 0).then_some(out)
+}
+
+/// The base32 form of an author id (64 hex characters): 52 lowercase
+/// characters, the form a `to:` tag carries (ADR 0022 §1). `None` when
+/// `id` is not an author id.
+pub fn author_id_base32(id: &str) -> Option<String> {
+    let mut bytes = [0u8; 32];
+    hex::decode_to_slice(id, &mut bytes).ok()?;
+    Some(base32_encode(&bytes))
+}
+
+/// The author id (lowercase hex) of its base32 form, either case; `None`
+/// unless `text` is 52 base32 characters that encode 32 bytes.
+pub fn author_id_from_base32(text: &str) -> Option<String> {
+    if text.len() != 52 {
+        return None;
+    }
+    let bytes = base32_decode(text)?;
+    (bytes.len() == 32).then(|| hex::encode(bytes))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn base32_matches_rfc_4648() {
+        // RFC 4648 §10, lowercase and without padding.
+        for (plain, encoded) in [
+            ("", ""),
+            ("f", "my"),
+            ("fo", "mzxq"),
+            ("foo", "mzxw6"),
+            ("foob", "mzxw6yq"),
+            ("fooba", "mzxw6ytb"),
+            ("foobar", "mzxw6ytboi"),
+        ] {
+            assert_eq!(base32_encode(plain.as_bytes()), encoded);
+            assert_eq!(base32_decode(encoded).unwrap(), plain.as_bytes());
+            assert_eq!(
+                base32_decode(&encoded.to_ascii_uppercase()).unwrap(),
+                plain.as_bytes()
+            );
+        }
+        // Padding, other alphabets, impossible lengths, trailing bits.
+        for bad in ["my======", "m", "mzx", "mzxw6y", "mz", "01", "my!"] {
+            assert!(base32_decode(bad).is_none(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn author_ids_round_trip_through_base32() {
+        for seed in [0u8, 7, 255] {
+            let id = author_id(&SigningKey::from_bytes(&[seed; 32]));
+            let b32 = author_id_base32(&id).unwrap();
+            assert_eq!(b32.len(), 52);
+            assert_eq!(b32, b32.to_ascii_lowercase());
+            assert_eq!(author_id_from_base32(&b32).unwrap(), id);
+            assert_eq!(
+                author_id_from_base32(&b32.to_ascii_uppercase()).unwrap(),
+                id
+            );
+        }
+        let b32 = author_id_base32(&"00".repeat(32)).unwrap();
+        assert_eq!(b32, "a".repeat(52));
+        assert!(author_id_base32("abc").is_none());
+        assert!(author_id_from_base32(&b32[..51]).is_none());
+        // The 4 bits after the key are zero: one form per key.
+        assert!(author_id_from_base32(&format!("{}b", &b32[..51])).is_none());
+    }
 
     #[test]
     fn derived_keys_are_distinct_and_stable() {

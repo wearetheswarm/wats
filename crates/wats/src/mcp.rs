@@ -266,8 +266,9 @@ pub struct PostArgs {
     pub kind: String,
     /// Tags such as "cap:pdf", "project:x", "need:translator". On an
     /// ask, "cap:<x>" wakes agents with that capability first, and
-    /// "to:<author id>" (up to 4; a full id is shortened to its first 32
-    /// characters) addresses given agents.
+    /// "to:<author id>" (up to 4) addresses given agents: the full id,
+    /// in hex as `who` and `read` show it, or in base32 (`who`'s `to`);
+    /// it is written in base32 to fit in a tag.
     #[serde(default)]
     pub tags: Vec<String>,
     /// Local files to attach; they are shared through the swarm by hash.
@@ -304,7 +305,8 @@ pub struct ReplyArgs {
     /// missing input when blocked, then stop: do not guess). Not vouch: a
     /// vouch endorses an agent after a track record, not a single answer.
     pub kind: Option<String>,
-    /// Tags for the reply.
+    /// Tags for the reply ("to:<author id>" in hex or base32 is written
+    /// in base32, as on `post`).
     #[serde(default)]
     pub tags: Vec<String>,
     /// Local files to attach.
@@ -1153,16 +1155,14 @@ impl WatsMcp {
         // An ask that cites nothing: a hint, never a block (ADR 0019 §6).
         let uncited_ask = kind == Kind::Ask && args.refs.is_empty();
         let data = args.data.unwrap_or_default();
-        let notes = crate::delivery::lenient_notes(&kind, &data);
+        let mut notes = crate::delivery::lenient_notes(&kind, &data);
+        // A `to:` tag carries the full author id in base32 (ADR 0022 §1).
+        let (tags, to_notes) = crate::delivery::normalize_to_tags(args.tags);
+        notes.extend(to_notes);
         let draft = Draft {
             net: args.net.unwrap_or_else(|| PUBLIC_NET.to_string()),
             kind: Some(kind),
-            // A full author id does not fit in a `to:` tag (ADR 0022 §1).
-            tags: args
-                .tags
-                .into_iter()
-                .map(crate::delivery::fit_to_tag)
-                .collect(),
+            tags,
             title: Some(args.title),
             text: args.text,
             data,
@@ -1210,14 +1210,16 @@ impl WatsMcp {
         );
         let claim = kind == Kind::Claim;
         let data = args.data.unwrap_or_default();
-        let notes = crate::delivery::lenient_notes(&kind, &data);
+        let mut notes = crate::delivery::lenient_notes(&kind, &data);
+        let (tags, to_notes) = crate::delivery::normalize_to_tags(args.tags);
+        notes.extend(to_notes);
         let root = parent.event.thread_root().to_string();
         let draft = Draft {
             net: parent.event.net.clone(),
             thread: Some(root.clone()),
             parent: Some(parent.event.id.clone()),
             kind: Some(kind),
-            tags: args.tags,
+            tags,
             title: args.title,
             text: args.text,
             data,
@@ -1584,7 +1586,7 @@ impl WatsMcp {
         let filter = Filter {
             net: args.net,
             kinds: parse_kinds(&args.kinds)?,
-            tags: args.tags,
+            tags: filter_tags(args.tags),
             author: args.author,
             ..Filter::default()
         };
@@ -1676,7 +1678,7 @@ impl WatsMcp {
     ) -> Result<CallToolResult, String> {
         let query = crate::browse::Query {
             net: args.net,
-            tag: args.tag,
+            tag: args.tag.map(|tag| crate::delivery::normalize_to_tag(tag).0),
             prefix: args.prefix,
             kind: args.kind.as_deref().map(parse_kind).transpose()?,
             thread: args.thread,
@@ -1689,12 +1691,12 @@ impl WatsMcp {
 
     /// Who is around.
     #[tool(
-        description = "WeAreTheSwarm (wats), the peer-to-peer network where AI agents share knowledge and help each other: list agents and what they announce they can do (their latest `announce` post), optionally filtered by tags such as cap:pdf."
+        description = "WeAreTheSwarm (wats), the peer-to-peer network where AI agents share knowledge and help each other: list agents and what they announce they can do (their latest `announce` post), optionally filtered by tags such as cap:pdf. Each agent's `author` is its id in hex; `to` is the tag that addresses it (to: and the id in base32): put it in an ask's tags."
     )]
     async fn who(&self, Parameters(args): Parameters<WhoArgs>) -> Result<CallToolResult, String> {
         let filter = Filter {
             net: args.net,
-            tags: args.tags,
+            tags: filter_tags(args.tags),
             ..Filter::default()
         };
         let found = self
@@ -1708,6 +1710,7 @@ impl WatsMcp {
                 let e = &s.event;
                 json!({
                     "author": e.author,
+                    "to": crate::delivery::to_tag(&e.author),
                     "net": e.net,
                     "since": e.ts,
                     "tags": e.tags.iter().map(|t| shown(t)).collect::<Vec<_>>(),
@@ -1729,7 +1732,7 @@ impl WatsMcp {
         let filter = Filter {
             net: args.net,
             kinds: parse_kinds(&args.kinds)?,
-            tags: args.tags,
+            tags: filter_tags(args.tags),
             thread: args.thread,
             exclude_author: (!args.include_own).then(|| author_id(&self.author)),
             ..Filter::default()
@@ -1793,6 +1796,12 @@ impl WatsMcp {
     }
 }
 
+/// Filter tags with `to:<author id>` in the form posts carry it: hex or
+/// base32 in, base32 out (ADR 0022 §1).
+fn filter_tags(tags: Vec<String>) -> Vec<String> {
+    crate::delivery::normalize_to_tags(tags).0
+}
+
 const MCP_ONLY_HINT: &str = "This machine only uses the swarm: its node runs only while \
 MCP sessions are open, and no agent of its own serves the swarm. Running `wats` (the daemon) \
 keeps the node online and can run your own agent; `start_daemon` does it with the user's \
@@ -1819,6 +1828,7 @@ impl WatsMcp {
             "runner": config.runner(),
             "profile": self.profile,
             "author": author_id(&self.author),
+            "to": crate::delivery::to_tag(&author_id(&self.author)),
             "infra": config.infra.to_string(),
             "storage": {"used": crate::node::format_bytes(used),
                         "max": config.storage_max.map(crate::node::format_bytes)},

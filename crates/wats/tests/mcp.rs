@@ -169,6 +169,11 @@ async fn two_agents_converse() -> anyhow::Result<()> {
         tokio::time::sleep(Duration::from_millis(100)).await;
     };
     assert_eq!(who["agents"][0]["author"], b.author_id());
+    // And the `to:` tag that addresses him: his id in base32.
+    assert_eq!(
+        who["agents"][0]["to"],
+        wats::delivery::to_tag(&b.author_id()).unwrap()
+    );
 
     // Bob waits for asks; Alice asks.
     let bob_cursor = structured(&call(&bob, "wait", json!({"timeout": 1})).await)["cursor"].clone();
@@ -1498,8 +1503,8 @@ async fn digests_become_knowledge_entries() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// ADR 0022 for sessions: `post` fits a full author id in a `to:` tag and
-/// says what nodes read differently; a `claim` that loses the tie-break
+/// ADR 0022 for sessions: `post` writes a full author id in a `to:` tag
+/// in base32 and says what nodes read differently; a `claim` that loses the tie-break
 /// says so; `read` of an ask shows its delivery state.
 #[tokio::test(flavor = "multi_thread")]
 async fn sessions_see_how_an_ask_wants_to_be_served() -> anyhow::Result<()> {
@@ -1528,8 +1533,38 @@ async fn sessions_see_how_an_ask_wants_to_be_served() -> anyhow::Result<()> {
         )
         .await,
     );
-    assert_eq!(posted["post"]["tags"][0], format!("to:{}", &to[..32]));
+    // Hex in, base32 out: the full id, in a tag's 64 bytes.
+    let tag = wats::delivery::to_tag(&to).unwrap();
+    assert_eq!(posted["post"]["tags"][0], tag);
     assert!(posted.get("note").is_none(), "{posted}");
+    // `wait` finds it by either form.
+    for filter in [format!("to:{to}"), tag.clone()] {
+        let waited = structured(
+            &call(
+                &worker,
+                "wait",
+                json!({"since": 0, "tags": [filter], "timeout": 1}),
+            )
+            .await,
+        );
+        assert_eq!(waited["posts"][0]["id"], posted["id"], "{waited}");
+    }
+    // A prefix of an id addresses nobody: kept as is, with a note, and
+    // the other notes stay.
+    let prefix = structured(
+        &call(
+            &asker,
+            "post",
+            json!({"title": "Prefix", "text": "?", "kind": "ask",
+                   "tags": [format!("to:{}", &to[..32]), "cap:pdf"],
+                   "data": {"mode": "split"}}),
+        )
+        .await,
+    );
+    assert_eq!(prefix["post"]["tags"][0], format!("to:{}", &to[..32]));
+    let note = prefix["note"].as_str().unwrap();
+    assert!(note.contains("addresses nobody"), "{prefix}");
+    assert!(note.contains("read it as any"), "{prefix}");
     let odd = structured(
         &call(
             &asker,

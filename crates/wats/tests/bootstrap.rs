@@ -91,6 +91,18 @@ fn wats_id_is_stable_and_matches_the_node() {
         .parse()
         .unwrap();
     assert_eq!(entry.id.to_string(), endpoint);
+    // The author id, and the `to:` tag that addresses it (ADR 0022 §1).
+    let author = first
+        .lines()
+        .find_map(|l| l.strip_prefix("author_id: "))
+        .and_then(|l| l.split(' ').next())
+        .unwrap();
+    let to = first
+        .lines()
+        .find_map(|l| l.strip_prefix("author_to: "))
+        .and_then(|l| l.split(' ').next())
+        .unwrap();
+    assert_eq!(Some(to.to_string()), wats::delivery::to_tag(author));
 }
 
 #[test]

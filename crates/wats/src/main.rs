@@ -2755,6 +2755,9 @@ fn print_id(config: &NodeConfig, host: &str) -> Result<()> {
         .unwrap_or(wats::bootstrap::DEFAULT_BOOTSTRAP_PORT);
     println!("endpoint_id: {endpoint}");
     println!("author_id: {author} (profile {})", config.profile);
+    if let Some(to) = wats::delivery::to_tag(&author) {
+        println!("author_to: {to} (the tag that addresses it)");
+    }
     println!("bootstrap_entry: {endpoint}@{host}:{port}");
     Ok(())
 }
