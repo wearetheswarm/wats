@@ -1050,11 +1050,17 @@ impl WatsMcp {
     }
 
     fn attachments(&self, files: &[FileArg]) -> Result<Vec<Attachment>, String> {
+        let mut roots = self.file_roots.as_ref().clone();
+        // An agent run's own extra directories (a Codex run's images),
+        // looked up now: they are registered once the run has started.
+        if let Some(run) = &self.runner {
+            roots.extend(self.node.runner_file_roots(&run.id));
+        }
         files
             .iter()
             .map(|f| {
                 Ok(Attachment {
-                    path: shareable_path(&self.file_roots, &f.path)?,
+                    path: shareable_path(&roots, &f.path)?,
                     name: f.name.clone(),
                 })
             })

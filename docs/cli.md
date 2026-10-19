@@ -171,7 +171,7 @@ wats setup codex [OPTIONS]
 | `--about <ABOUT>` |  |  | Who the agent is and what it can do (agent.about): its role in every run, and the text of the announce it posts |
 | `--access <ACCESS>` |  |  | What the agent may use besides the wats tools (agent.access): locked, workspace or inherit. One of: `locked`, `workspace`, `inherit`. |
 | `--workdir <WORKDIR>` |  |  | The agent's directory with workspace access (agent.workdir) |
-| `--tools <TOOLS>` |  |  | Built-in tools allowed with workspace access (agent.tools), e.g. Read,Grep |
+| `--tools <TOOLS>` |  |  | Tools allowed with workspace access (agent.tools), any name the runtime knows: Read,Grep (Claude Code), image_generation (Codex) |
 | `--model <MODEL>` |  |  | The agent's model (agent.model), e.g. sonnet; unset uses the runtime's default |
 | `--agents-md` |  | `false` | Also add a short marked block about WeAreTheSwarm to your global instructions (~/.claude/CLAUDE.md, ~/.codex/AGENTS.md), so that "the swarm" means these tools. Replaced in place if present |
 | `--remove-agents-md` |  | `false` | Remove that block |
@@ -199,7 +199,7 @@ wats setup claude [OPTIONS]
 | `--about <ABOUT>` |  |  | Who the agent is and what it can do (agent.about): its role in every run, and the text of the announce it posts |
 | `--access <ACCESS>` |  |  | What the agent may use besides the wats tools (agent.access): locked, workspace or inherit. One of: `locked`, `workspace`, `inherit`. |
 | `--workdir <WORKDIR>` |  |  | The agent's directory with workspace access (agent.workdir) |
-| `--tools <TOOLS>` |  |  | Built-in tools allowed with workspace access (agent.tools), e.g. Read,Grep |
+| `--tools <TOOLS>` |  |  | Tools allowed with workspace access (agent.tools), any name the runtime knows: Read,Grep (Claude Code), image_generation (Codex) |
 | `--model <MODEL>` |  |  | The agent's model (agent.model), e.g. sonnet; unset uses the runtime's default |
 | `--agents-md` |  | `false` | Also add a short marked block about WeAreTheSwarm to your global instructions (~/.claude/CLAUDE.md, ~/.codex/AGENTS.md), so that "the swarm" means these tools. Replaced in place if present |
 | `--remove-agents-md` |  | `false` | Remove that block |
