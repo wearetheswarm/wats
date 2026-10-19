@@ -269,6 +269,31 @@ fn ask(
     }
 }
 
+/// A yes/no question; Enter (or the end of the input) keeps `default`.
+pub fn ask_yes_no(
+    input: &mut impl BufRead,
+    out: &mut impl Write,
+    question: &str,
+    default: bool,
+) -> Result<bool> {
+    loop {
+        write!(
+            out,
+            "{question} [{}]: ",
+            if default { "Y/n" } else { "y/N" }
+        )?;
+        let answer = match read_answer(input, out)? {
+            Some(answer) if !answer.is_empty() => answer.to_lowercase(),
+            _ => return Ok(default),
+        };
+        match answer.as_str() {
+            "y" | "yes" | "true" | "on" | "1" => return Ok(true),
+            "n" | "no" | "false" | "off" | "0" => return Ok(false),
+            _ => writeln!(out, "  answer yes or no")?,
+        }
+    }
+}
+
 /// Ask the main choices, with the current settings (or the defaults) as
 /// defaults. `found`: [`detect_agents`].
 pub fn prompt(
@@ -379,6 +404,13 @@ pub fn render(choices: &Choices) -> Result<String> {
             }
         }
     }
+    if let Some(on) = chosen("notify.desktop") {
+        text.push_str(&format!(
+            "\n[notify]\n# {}\ndesktop = {}\n",
+            settings::find_key("notify.desktop")?.help,
+            settings::check_value("notify.desktop", on)?
+        ));
+    }
     toml::from_str::<Settings>(&text).context("the generated config.toml does not load")?;
     Ok(text)
 }
@@ -477,9 +509,38 @@ pub fn setup(
     out: &mut impl Write,
     path: Option<&OsStr>,
 ) -> Result<Choices> {
+    setup_with(
+        data_dir,
+        input,
+        out,
+        path,
+        crate::desktop::this_desktop_session(),
+    )
+}
+
+/// [`setup`], `desktop` telling whether this machine has a desktop session
+/// ([`crate::desktop::desktop_session`]): only then is `notify.desktop`
+/// asked (default yes).
+pub fn setup_with(
+    data_dir: &Path,
+    input: &mut impl BufRead,
+    out: &mut impl Write,
+    path: Option<&OsStr>,
+    desktop: bool,
+) -> Result<Choices> {
     let settings = Settings::load(data_dir)?;
     let found = detect_agents(path);
-    let choices = prompt(input, out, &found, &settings)?;
+    let mut choices = prompt(input, out, &found, &settings)?;
+    if desktop {
+        let on = ask_yes_no(
+            input,
+            out,
+            "Desktop notification when someone answers or clarifies one of your asks \
+             (notify.desktop)",
+            settings.notify.desktop.unwrap_or(true),
+        )?;
+        choices.values.push(("notify.desktop", on.to_string()));
+    }
     let file = apply(data_dir, &choices)?;
     writeln!(out, "Wrote {}", file.display())?;
     match &choices.runtime {
@@ -579,6 +640,35 @@ mod tests {
         setup(data.path(), &mut "".as_bytes(), &mut out, Some(&path)).unwrap();
         let said = String::from_utf8(out).unwrap();
         assert!(!said.contains("openclaw"), "{said}");
+    }
+
+    /// On a desktop session, setup asks notify.desktop (default yes) and
+    /// writes the answer; elsewhere it does not ask.
+    #[test]
+    fn setup_asks_desktop_notifications_on_a_desktop() {
+        let data = tempfile::tempdir().unwrap();
+        let mut out = Vec::new();
+        let choices = setup_with(data.path(), &mut "".as_bytes(), &mut out, None, true).unwrap();
+        let said = String::from_utf8(out).unwrap();
+        assert!(said.contains("(notify.desktop) [Y/n]"), "{said}");
+        assert!(choices.values.contains(&("notify.desktop", "true".into())));
+        let settings = Settings::load(data.path()).unwrap();
+        assert_eq!(settings.notify.desktop, Some(true));
+        // Asked again (no agent CLI: storage and networks first): "n"
+        // turns it off.
+        let mut out = Vec::new();
+        setup_with(data.path(), &mut "\n\nn\n".as_bytes(), &mut out, None, true).unwrap();
+        assert_eq!(
+            Settings::load(data.path()).unwrap().notify.desktop,
+            Some(false)
+        );
+        // Headless: not asked, not written.
+        let other = tempfile::tempdir().unwrap();
+        let mut out = Vec::new();
+        let choices = setup_with(other.path(), &mut "".as_bytes(), &mut out, None, false).unwrap();
+        assert!(!String::from_utf8(out).unwrap().contains("notify.desktop"));
+        assert!(choices.values.iter().all(|(k, _)| *k != "notify.desktop"));
+        assert_eq!(Settings::load(other.path()).unwrap().notify.desktop, None);
     }
 
     /// Mistral Vibe on PATH: listed, not offered as the agent, its MCP
