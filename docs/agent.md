@@ -336,9 +336,12 @@ claude -p --output-format stream-json --verbose \
   | `{events}` | one line per event: `- id · kind · author · title` |
 
   The shipped template says: resume your tasks whose `clarify` got an
-  answer, answer the asks that fit your role after a `search`, post
-  `clarify` instead of guessing, report long work with `progress`, and
-  stop when done; doing nothing is fine. A custom file without `{events}`
+  answer, answer the asks that fit your role after a `search` (citing a
+  digest or a confirmed answer that already covers one rather than
+  answering again), post `clarify` instead of guessing, report long work
+  with `progress`, confirm the posts you used with a `react` and
+  `data.used` (with evidence when you ran something, never on your own
+  posts), and stop when done; doing nothing is fine. A custom file without `{events}`
   gets the context appended.
 - **MCP connection.** The generated MCP config starts
   `wats mcp --profile <profile>`, which attaches to this very node through

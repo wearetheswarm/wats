@@ -976,3 +976,192 @@ async fn asks_from_openclaw_are_remembered_for_notifications() -> anyhow::Result
     node.shutdown().await?;
     Ok(())
 }
+
+/// A reply by another node's key, stored as if it had arrived.
+fn remote(node: &Node, seed: u8, parent: &str, kind: &str, text: &str, data: Value) -> String {
+    let parent = node.store().get(parent).unwrap().unwrap().event;
+    let event = wats::event::Draft {
+        net: parent.net.clone(),
+        thread: Some(parent.thread_root().to_string()),
+        parent: Some(parent.id.clone()),
+        kind: Some(kind.parse().unwrap()),
+        text: text.into(),
+        data: data.as_object().unwrap().clone(),
+        ..Default::default()
+    }
+    .sign(
+        &ed25519_dalek::SigningKey::from_bytes(&[seed; 32]),
+        wats::node::now_secs(),
+        0,
+    )
+    .unwrap();
+    node.store().insert(&event, wats::node::now_secs()).unwrap();
+    event.id
+}
+
+/// ADR 0019 v1a: statuses and counts in search, wait and read, search
+/// order within comparable relevance, `min_status`, self-signals counting
+/// zero, and the next-step hints.
+#[tokio::test(flavor = "multi_thread")]
+async fn statuses_order_search_filter_wait_and_hint_the_next_step() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let node = loopback_node(&dir.path().join("n"), None).await?;
+    let me = client_for(WatsMcp::new(node.clone(), vec![])).await?;
+    let my_agent = client_for(WatsMcp::new(node.clone(), vec![]).with_profile("my-agent")?).await?;
+
+    // An ask that cites nothing gets a hint; one with refs does not.
+    let ask = structured(
+        &call(
+            &me,
+            "post",
+            json!({"title": "Rust on musl fails to link", "text": "How?", "kind": "ask"}),
+        )
+        .await,
+    );
+    assert!(ask["next_step"].as_str().unwrap().contains("refs"), "{ask}");
+    let ask = ask["id"].as_str().unwrap().to_string();
+    let cited = structured(
+        &call(
+            &me,
+            "post",
+            json!({"title": "Again", "text": "Still?", "kind": "ask", "refs": [ask]}),
+        )
+        .await,
+    );
+    assert!(cited.get("next_step").is_none(), "{cited}");
+
+    // Three answers alike, by other nodes' keys, and one of mine.
+    let text = "Install musl-tools to link on musl.";
+    let a1 = remote(&node, 11, &ask, "answer", text, json!({}));
+    let a2 = remote(&node, 12, &ask, "answer", text, json!({}));
+    let a3 = remote(&node, 13, &ask, "answer", text, json!({}));
+    let mine = structured(
+        &call(
+            &me,
+            "reply",
+            json!({"post_id": ask, "text": "Use the gnu target instead."}),
+        )
+        .await,
+    )["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    // a1 is contradicted with evidence; I used a2; my other profile uses
+    // my own answer, which counts zero.
+    remote(
+        &node,
+        14,
+        &a1,
+        "react",
+        "fails",
+        json!({"value": -1, "evidence": {"type": "test", "detail": "still fails on alpine 3.20"}}),
+    );
+    structured(
+        &call(
+            &me,
+            "reply",
+            json!({"post_id": a2, "kind": "react", "text": "worked", "data": {"used": true}}),
+        )
+        .await,
+    );
+    structured(
+        &call(
+            &my_agent,
+            "reply",
+            json!({"post_id": mine, "kind": "react", "text": "worked",
+                   "data": {"used": true, "value": 1, "evidence": "ran it"}}),
+        )
+        .await,
+    );
+
+    // Confirmed first, contested last but shown, with why; a hint to read.
+    let found = structured(
+        &call(
+            &me,
+            "search",
+            json!({"text": "musl-tools", "kinds": ["answer"]}),
+        )
+        .await,
+    );
+    let posts = found["posts"].as_array().unwrap();
+    let ids: Vec<&str> = posts.iter().map(|p| p["id"].as_str().unwrap()).collect();
+    assert_eq!(ids, [a2.as_str(), a3.as_str(), a1.as_str()], "{found}");
+    let statuses: Vec<&str> = posts
+        .iter()
+        .map(|p| p["status"].as_str().unwrap())
+        .collect();
+    assert_eq!(statuses, ["confirmed", "unverified", "contested"]);
+    assert_eq!(posts[0]["counts"]["uses"], 1);
+    assert_eq!(posts[2]["counts"]["contradicts"], 1);
+    assert_eq!(
+        posts[2]["why"],
+        "contradicted by 1 key: still fails on alpine 3.20"
+    );
+    assert!(posts[1].get("why").is_none());
+    assert!(found["next_step"].as_str().unwrap().contains("data.used"));
+
+    // wait stays chronological, and filters on status.
+    let wait = |extra: Value| {
+        let mut args = json!({"since": 0, "timeout": 1, "kinds": ["answer"]});
+        args.as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        args
+    };
+    let ids_of = |v: &Value| -> Vec<String> {
+        v["posts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|p| p["id"].as_str().unwrap().to_string())
+            .collect()
+    };
+    let all = structured(&call(&me, "wait", wait(json!({}))).await);
+    assert_eq!(
+        ids_of(&all),
+        [a1.as_str(), a2.as_str(), a3.as_str()],
+        "{all}"
+    );
+    let confirmed = structured(&call(&me, "wait", wait(json!({"min_status": "confirmed"}))).await);
+    assert_eq!(ids_of(&confirmed), [a2.as_str()], "{confirmed}");
+    let unverified =
+        structured(&call(&me, "wait", wait(json!({"min_status": "unverified"}))).await);
+    assert_eq!(
+        ids_of(&unverified),
+        [a2.as_str(), a3.as_str()],
+        "{unverified}"
+    );
+    // Nothing more matches: it times out past what it left out.
+    let cursor = unverified["cursor"].as_i64().unwrap();
+    let none = structured(
+        &call(
+            &me,
+            "wait",
+            wait(json!({"since": cursor, "min_status": "confirmed"})),
+        )
+        .await,
+    );
+    assert_eq!(none["timed_out"], true, "{none}");
+    let bad = call(&me, "wait", json!({"timeout": 1, "min_status": "great"})).await;
+    assert_eq!(bad.is_error, Some(true));
+
+    // read shows the status, the counts and a reminder; not on my posts.
+    let read = structured(&call(&me, "read", json!({"id": a2})).await);
+    assert_eq!(read["post"]["status"], "confirmed", "{read}");
+    assert_eq!(read["post"]["counts"]["uses"], 1);
+    assert!(read["next_step"].as_str().unwrap().contains("data.used"));
+    let in_thread: Vec<&str> = read["thread"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|p| p["status"].as_str())
+        .collect();
+    assert!(in_thread.contains(&"contested"), "{read}");
+    let own = structured(&call(&me, "read", json!({"id": mine})).await);
+    assert_eq!(own["post"]["status"], "unverified", "{own}");
+    assert!(own["post"].get("counts").is_none());
+    assert!(own.get("next_step").is_none());
+
+    node.shutdown().await?;
+    Ok(())
+}

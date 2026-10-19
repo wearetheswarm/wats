@@ -22,7 +22,7 @@ use crate::event::{Event, Kind};
 pub const INDEXED_TAGS: usize = 16;
 use crate::wire::RawEvent;
 
-const SCHEMA_VERSION: i64 = 5;
+const SCHEMA_VERSION: i64 = 6;
 
 const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS events (
@@ -48,6 +48,8 @@ CREATE INDEX IF NOT EXISTS events_thread ON events (thread);
 CREATE INDEX IF NOT EXISTS events_author_kind ON events (author, kind);
 -- Rotations and retractions are looked up by kind (ADR 0020 §5.1).
 CREATE INDEX IF NOT EXISTS events_kind ON events (kind);
+-- Replies of a post, for its signals (ADR 0019 §1).
+CREATE INDEX IF NOT EXISTS events_parent ON events (parent);
 
 -- Asks a human posted from an MCP host the node can notify (ADR 0018 §7).
 CREATE TABLE IF NOT EXISTS ask_notify (
@@ -60,6 +62,14 @@ CREATE TABLE IF NOT EXISTS event_tags (
     seq INTEGER NOT NULL REFERENCES events (seq),
     tag TEXT NOT NULL,
     PRIMARY KEY (tag, seq)
+);
+
+-- The posts each understood event cites in `refs` (ADR 0019 §1, schema
+-- 6): its citations, found without reading every event.
+CREATE TABLE IF NOT EXISTS event_refs (
+    ref TEXT NOT NULL,
+    seq INTEGER NOT NULL REFERENCES events (seq),
+    PRIMARY KEY (ref, seq)
 );
 
 CREATE TABLE IF NOT EXISTS sync_state (
@@ -196,6 +206,7 @@ fn delete_opaque_row(tx: &rusqlite::Transaction<'_>, seq: i64) -> Result<()> {
         "INSERT INTO events_fts (events_fts, rowid, text, tags) VALUES ('delete', ?, '', '')",
         [seq],
     )?;
+    tx.execute("DELETE FROM event_refs WHERE seq = ?", [seq])?;
     tx.execute("DELETE FROM events WHERE seq = ?", [seq])?;
     Ok(())
 }
@@ -206,6 +217,38 @@ pub struct Stored {
     /// Local sequence number: increases with arrival order on this node.
     pub seq: i64,
     pub event: Arc<Event>,
+}
+
+/// An event that replies to a post or cites it, as [`Store::signal_rows`]
+/// returns it: what the post's signals are computed from.
+#[derive(Debug, Clone)]
+pub struct SignalRow {
+    /// The post it points to.
+    pub target: String,
+    /// It replies to the target (`parent`), rather than citing it (`refs`).
+    pub reply: bool,
+    pub id: String,
+    pub author: String,
+    pub ts: u64,
+    pub net: String,
+    /// Its kind, as stored.
+    pub kind: String,
+    pub data: serde_json::Map<String, Value>,
+    /// Its title, or the start of its text.
+    pub title: String,
+}
+
+/// A `react` reply carrying `data.accept`, as [`Store::accept_reacts`]
+/// returns it.
+#[derive(Debug, Clone)]
+pub struct AcceptRow {
+    pub thread: String,
+    pub id: String,
+    pub author: String,
+    pub ts: u64,
+    /// The post accepted (or no longer).
+    pub parent: String,
+    pub accept: bool,
 }
 
 /// A tag and what carries it (`browse`).
@@ -462,12 +505,21 @@ impl Store {
             // ("b3:<nonce>"), and the bare decimal nonce is invalid. The store
             // is a cache of the swarm: drop them, the node syncs again.
             conn.execute_batch(
-                "DELETE FROM event_tags; DELETE FROM events; DELETE FROM sync_state;
-                 INSERT INTO events_fts (events_fts) VALUES ('rebuild');",
+                "DELETE FROM event_tags; DELETE FROM event_refs; DELETE FROM events;
+                 DELETE FROM sync_state; INSERT INTO events_fts (events_fts) VALUES ('rebuild');",
             )?;
         }
         // v4 -> v5: the drop records table (ADR 0020), created by SCHEMA
         // above. Events are kept.
+        if (4..6).contains(&version) {
+            // v5 -> v6: the citations table (ADR 0019), filled from the
+            // events kept.
+            conn.execute_batch(
+                "INSERT OR IGNORE INTO event_refs (ref, seq)
+                 SELECT r.value, e.seq FROM events e, json_each(e.json, '$.refs') r
+                 WHERE e.opaque = 0",
+            )?;
+        }
         conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         let opaque_bytes: i64 = conn.query_row(
             "SELECT COALESCE(SUM(LENGTH(json)), 0) FROM events WHERE opaque = 1",
@@ -615,6 +667,12 @@ impl Store {
                     params![seq, tag],
                 )?;
             }
+            for cited in &event.refs {
+                tx.execute(
+                    "INSERT OR IGNORE INTO event_refs (ref, seq) VALUES (?, ?)",
+                    params![cited, seq],
+                )?;
+            }
             tx.commit()?;
             self.opaque_bytes.fetch_sub(
                 freed.min(self.opaque_bytes.load(Ordering::Relaxed)),
@@ -721,6 +779,7 @@ impl Store {
                 [seq],
             )?;
             tx.execute("DELETE FROM event_tags WHERE seq = ?", [seq])?;
+            tx.execute("DELETE FROM event_refs WHERE seq = ?", [seq])?;
             tx.execute(
                 "UPDATE events SET json = ?, opaque = 1, text = '', tags = '' WHERE seq = ?",
                 params![tombstone, seq],
@@ -1285,18 +1344,34 @@ impl Store {
     /// Full-text search (BM25), newest first among equal ranks. Without
     /// text, the newest matching events.
     pub fn search(&self, text: Option<&str>, filter: &Filter, limit: usize) -> Result<Vec<Stored>> {
+        Ok(self
+            .search_scored(text, filter, limit)?
+            .into_iter()
+            .map(|(stored, _)| stored)
+            .collect())
+    }
+
+    /// [`Store::search`], with each event's BM25 score: negative, lower is
+    /// more relevant; `None` without text.
+    pub fn search_scored(
+        &self,
+        text: Option<&str>,
+        filter: &Filter,
+        limit: usize,
+    ) -> Result<Vec<(Stored, Option<f64>)>> {
         let mut conds = Vec::new();
         let mut args = Vec::new();
         let fts = text.and_then(fts_query);
-        let (from, order) = if let Some(q) = fts {
+        let (score, from, order) = if let Some(q) = fts {
             conds.push("events_fts MATCH ?".to_string());
             args.push(q.into());
             (
+                "bm25(events_fts)",
                 "events_fts JOIN events e ON e.seq = events_fts.rowid",
                 "bm25(events_fts), e.ts DESC",
             )
         } else {
-            ("events e", "e.ts DESC, e.seq DESC")
+            ("NULL", "events e", "e.ts DESC, e.seq DESC")
         };
         filter.to_sql(&mut conds, &mut args);
         let filter_sql = if conds.is_empty() {
@@ -1305,10 +1380,136 @@ impl Store {
             format!("WHERE {}", conds.join(" AND "))
         };
         args.push((limit as i64).into());
-        self.query(
-            &format!("SELECT e.seq, e.json FROM {from} {filter_sql} ORDER BY {order} LIMIT ?"),
-            args,
-        )
+        let sql = format!(
+            "SELECT e.seq, e.json, {score} FROM {from} {filter_sql} ORDER BY {order} LIMIT ?"
+        );
+        let conn = self.conn();
+        let mut stmt = conn.prepare_cached(&sql)?;
+        let rows = stmt.query_map(params_from_iter(args), |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, Option<f64>>(2)?,
+            ))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (seq, json, score) = row?;
+            let event: Event = serde_json::from_str(&json).context("corrupt stored event")?;
+            out.push((
+                Stored {
+                    seq,
+                    event: Arc::new(event),
+                },
+                score,
+            ));
+        }
+        Ok(out)
+    }
+
+    /// The understood events that reply to one of `targets` (`parent`) or
+    /// cite it (`refs`), each with the target it points to: what the
+    /// signals of those posts are computed from (ADR 0019 §1). At most
+    /// `limit` rows.
+    pub fn signal_rows(&self, targets: &[String], limit: usize) -> Result<Vec<SignalRow>> {
+        if targets.is_empty() {
+            return Ok(Vec::new());
+        }
+        let marks = vec!["?"; targets.len()].join(",");
+        let columns = "e.id, e.author, e.ts, e.net, e.kind, json_extract(e.json, '$.data'),
+             coalesce(json_extract(e.json, '$.title'), substr(e.text, 1, 200))";
+        let sql = format!(
+            "SELECT e.parent, 1, {columns} FROM events e
+                 WHERE e.parent IN ({marks}) AND e.opaque = 0
+             UNION ALL
+             SELECT r.ref, 0, {columns} FROM event_refs r JOIN events e ON e.seq = r.seq
+                 WHERE r.ref IN ({marks}) AND e.opaque = 0
+             LIMIT ?"
+        );
+        let mut args: Vec<SqlValue> = Vec::new();
+        for _ in 0..2 {
+            args.extend(targets.iter().map(|t| SqlValue::from(t.clone())));
+        }
+        args.push((limit as i64).into());
+        let conn = self.conn();
+        let mut stmt = conn.prepare_cached(&sql)?;
+        let rows = stmt.query_map(params_from_iter(args), |r| {
+            Ok(SignalRow {
+                target: r.get(0)?,
+                reply: r.get(1)?,
+                id: r.get(2)?,
+                author: r.get(3)?,
+                ts: r.get::<_, i64>(4)?.max(0) as u64,
+                net: r.get(5)?,
+                kind: r.get(6)?,
+                data: r
+                    .get::<_, Option<String>>(7)?
+                    .and_then(|d| serde_json::from_str(&d).ok())
+                    .unwrap_or_default(),
+                title: r.get::<_, Option<String>>(8)?.unwrap_or_default(),
+            })
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    }
+
+    /// `(id, author, kind, net)` of each of these events held here and
+    /// understood: thread roots, for their asker.
+    pub fn heads(&self, ids: &[String]) -> Result<Vec<(String, String, String, String)>> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let sql = format!(
+            "SELECT id, author, kind, net FROM events WHERE id IN ({}) AND opaque = 0",
+            vec!["?"; ids.len()].join(",")
+        );
+        let conn = self.conn();
+        let mut stmt = conn.prepare_cached(&sql)?;
+        let rows = stmt.query_map(params_from_iter(ids.iter()), |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    }
+
+    /// The `react` replies of these threads that carry a boolean
+    /// `data.accept`.
+    pub fn accept_reacts(&self, threads: &[String]) -> Result<Vec<AcceptRow>> {
+        if threads.is_empty() {
+            return Ok(Vec::new());
+        }
+        let sql = format!(
+            "SELECT thread, id, author, ts, parent, json_extract(json, '$.data.accept')
+             FROM events WHERE thread IN ({}) AND kind = 'react' AND opaque = 0
+                 AND parent IS NOT NULL
+                 AND json_type(json, '$.data.accept') IN ('true', 'false')
+             LIMIT 10000",
+            vec!["?"; threads.len()].join(",")
+        );
+        let conn = self.conn();
+        let mut stmt = conn.prepare_cached(&sql)?;
+        let rows = stmt.query_map(params_from_iter(threads.iter()), |r| {
+            Ok(AcceptRow {
+                thread: r.get(0)?,
+                id: r.get(1)?,
+                author: r.get(2)?,
+                ts: r.get::<_, i64>(3)?.max(0) as u64,
+                parent: r.get(4)?,
+                accept: r.get(5)?,
+            })
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    }
+
+    /// Whether any key succession (`rotate`) is held: without one, no two
+    /// keys are the same author's.
+    pub fn has_rotations(&self) -> Result<bool> {
+        Ok(self.conn().query_row(
+            "SELECT EXISTS (SELECT 1 FROM events WHERE kind = 'rotate' AND opaque = 0)",
+            [],
+            |r| r.get(0),
+        )?)
     }
 
     /// Events stored after cursor `seq`, oldest first.
@@ -2134,11 +2335,41 @@ mod tests {
         let version: i64 = conn
             .pragma_query_value(None, "user_version", |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 5);
+        assert_eq!(version, SCHEMA_VERSION);
     }
 
     #[test]
-    fn read_only_opens_schema_5() {
+    fn migrates_schema_v5_indexing_the_citations_kept() {
+        let store = Store::open_in_memory().unwrap();
+        let cited = post(1, 10, Kind::Note, &[], "cited");
+        let citing = Draft {
+            net: "public".into(),
+            kind: Some(Kind::Note),
+            title: Some("citing".into()),
+            text: "builds on it".into(),
+            refs: vec![cited.id.clone()],
+            ..Draft::default()
+        }
+        .sign(&SigningKey::from_bytes(&[2; 32]), 11, 0)
+        .unwrap();
+        store.insert(&cited, 10).unwrap();
+        store.insert(&citing, 11).unwrap();
+        let conn = store.conn.into_inner().unwrap();
+        conn.execute_batch("DROP TABLE event_refs; PRAGMA user_version = 5;")
+            .unwrap();
+        let store = Store::init(conn).unwrap();
+        let rows = store
+            .signal_rows(std::slice::from_ref(&cited.id), 10)
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            (rows[0].id.as_str(), rows[0].reply),
+            (citing.id.as_str(), false)
+        );
+    }
+
+    #[test]
+    fn read_only_opens_the_current_schema() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("events.sqlite");
         let store = Store::open(&path).unwrap();
