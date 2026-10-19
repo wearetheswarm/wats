@@ -2214,6 +2214,7 @@ impl Node {
     /// Restore every blob found unreadable, from the peers likely to have
     /// it; the ones none had stay noted for the next pass.
     async fn repair_unreadable(&self) {
+        self.forget_unkept_unreadable();
         let hashes: Vec<Hash> = self
             .blob_keep
             .unreadable
@@ -2226,8 +2227,22 @@ impl Node {
         }
     }
 
-    /// Blobs found recorded but unreadable and not repaired yet.
+    /// Forget the unreadable blobs no kept post lists any more (their post
+    /// was dropped or retracted since): nothing to repair.
+    fn forget_unkept_unreadable(&self) {
+        let Ok(kept) = self.store.referenced_blobs() else {
+            return;
+        };
+        let kept: HashSet<Hash> = kept.iter().filter_map(|h| h.parse().ok()).collect();
+        if let Ok(mut unreadable) = self.blob_keep.unreadable.lock() {
+            unreadable.retain(|hash| kept.contains(hash));
+        }
+    }
+
+    /// Blobs found recorded but unreadable and not repaired yet, among
+    /// those a kept post still lists.
     pub fn unreadable_blobs(&self) -> usize {
+        self.forget_unkept_unreadable();
         self.blob_keep.unreadable.lock().map_or(0, |u| u.len())
     }
 
@@ -2999,6 +3014,14 @@ impl Node {
             .store
             .drop_body(id, reason, trigger, detail, now_secs())?;
         unpin_freed(&self.blobs, &outcome).await;
+        // A freed blob no longer needs repairing: no kept post lists it.
+        if let Ok(mut unreadable) = self.blob_keep.unreadable.lock() {
+            for hash in &outcome.freed_blobs {
+                if let Ok(hash) = hash.parse::<Hash>() {
+                    unreadable.remove(&hash);
+                }
+            }
+        }
         info!(%id, %reason, held = outcome.held, body = outcome.body_dropped,
               blobs = outcome.freed_blobs.len(), "body dropped");
         Ok(outcome)
