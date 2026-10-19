@@ -83,6 +83,9 @@ pub struct AgentConfig {
     /// [`access::CODEX_DENIED_FEATURES`], what the installed Codex knows,
     /// and `tools`).
     pub codex_disable: Vec<String>,
+    /// Codex features `tools` lists, enabled (filled at start, workspace
+    /// access only).
+    pub codex_enable: Vec<String>,
     /// What the agent may use besides the wats tools.
     pub access: Access,
     /// Its working directory with `workspace` access.
@@ -740,7 +743,9 @@ struct Running {
 
 /// What a run waits on: the agent CLI, or the forward to OpenClaw.
 enum Work {
-    Child(tokio::process::Child),
+    /// With the task copying its output to the transcript, when the
+    /// runner reads it (Codex).
+    Child(tokio::process::Child, Option<tokio::task::JoinHandle<()>>),
     Forward(tokio::task::JoinHandle<crate::openclaw::Reply>),
 }
 
@@ -903,7 +908,7 @@ fn run_dir(config: &AgentConfig) -> Result<PathBuf> {
 }
 
 async fn start_run(
-    node: &Node,
+    node: &Arc<Node>,
     config: &AgentConfig,
     trigger: &Trigger,
     prompt: String,
@@ -915,6 +920,7 @@ async fn start_run(
         id: record.id.clone(),
         events: trigger.events(),
         profile: config.profile.clone(),
+        file_roots: Vec::new(),
     });
     let mut command = tokio::process::Command::new(&config.command);
     let dir = run_dir(config)?;
@@ -938,6 +944,7 @@ async fn start_run(
                 wats_args: &config.mcp_args,
                 runner_token: &token,
                 disable: &config.codex_disable,
+                enable: &config.codex_enable,
                 workspace_overrides: &workspace_overrides,
                 extra: &extra,
             }));
@@ -967,9 +974,16 @@ async fn start_run(
                 .args(&config.extra_args);
         }
     };
+    // Codex's events go through the runner, which reads the thread id.
+    let stdout = if config.runtime == "codex" {
+        Stdio::piped()
+    } else {
+        file.try_clone()?.into()
+    };
+    let output_file = file.try_clone()?;
     let spawned = command
         .stdin(Stdio::piped())
-        .stdout(file.try_clone()?)
+        .stdout(stdout)
         .stderr(file)
         .kill_on_drop(true)
         .spawn();
@@ -981,6 +995,13 @@ async fn start_run(
             return Err(e).with_context(|| format!("start {}", config.command.display()));
         }
     };
+    let output = child.stdout.take().map(|stdout| {
+        let images = access::codex_generates_images(&config.runtime, config.access, &config.tools)
+            .then(access::codex_home)
+            .flatten()
+            .map(|home| (Arc::clone(node), token.clone(), home));
+        tokio::spawn(codex_output(stdout, output_file, images))
+    });
     // The prompt goes on stdin: --mcp-config and --allowedTools take several
     // values and would swallow a positional prompt.
     if let Some(mut stdin) = child.stdin.take() {
@@ -989,13 +1010,52 @@ async fn start_run(
     Ok(Running {
         record,
         token: Some(token),
-        work: Work::Child(child),
+        work: Work::Child(child, output),
         started: Instant::now(),
         deadline: tokio::time::Instant::now() + config.run_timeout,
         transcript,
         woke: Vec::new(),
         feedback: Vec::new(),
     })
+}
+
+/// Copy a Codex run's JSON events to its transcript. With image
+/// generation, its `thread.started` event registers the thread's image
+/// directory (`$CODEX_HOME/generated_images/<thread id>`) for the run, so
+/// that its blobs may come from there: only that run's, nothing else of
+/// Codex's home. Codex prints the event before its first turn, so before
+/// any tool call.
+async fn codex_output(
+    stdout: tokio::process::ChildStdout,
+    transcript: std::fs::File,
+    images: Option<(Arc<Node>, String, PathBuf)>,
+) {
+    use tokio::io::AsyncBufReadExt;
+    let mut reader = tokio::io::BufReader::new(stdout);
+    let mut transcript = tokio::fs::File::from_std(transcript);
+    let mut images = images;
+    let mut line = Vec::new();
+    loop {
+        line.clear();
+        match reader.read_until(b'\n', &mut line).await {
+            Ok(0) | Err(_) => break,
+            Ok(_) => {}
+        }
+        if let Some((node, token, home)) = &images
+            && let Ok(event) = serde_json::from_slice::<serde_json::Value>(&line)
+            && event["type"] == "thread.started"
+            && let Some(thread) = event["thread_id"].as_str()
+        {
+            let dir = access::codex_images_dir(home, thread);
+            debug!(dir = %dir.display(), "the run may attach its generated images");
+            node.add_runner_file_root(token, dir);
+            images = None;
+        }
+        if transcript.write_all(&line).await.is_err() {
+            break;
+        }
+    }
+    let _ = transcript.flush().await;
 }
 
 /// How a run ended.
@@ -1038,9 +1098,17 @@ async fn finish_run(
         node.end_runner_token(token);
     }
     match running.work {
-        Work::Child(mut child) => {
+        Work::Child(mut child, output) => {
             if !matches!(outcome, Outcome::Exited(_)) {
                 let _ = child.kill().await;
+            }
+            // The transcript is complete before the footer goes in.
+            if let Some(mut output) = output
+                && tokio::time::timeout(Duration::from_secs(5), &mut output)
+                    .await
+                    .is_err()
+            {
+                output.abort();
             }
         }
         Work::Forward(task) => task.abort(),
@@ -1156,11 +1224,13 @@ async fn wait_running(running: &mut Option<Running>) -> Outcome {
         return std::future::pending().await;
     };
     match &mut running.work {
-        Work::Child(child) => match tokio::time::timeout_at(running.deadline, child.wait()).await {
-            Ok(Ok(status)) => Outcome::Exited(status.code()),
-            Ok(Err(_)) => Outcome::Exited(None),
-            Err(_) => Outcome::TimedOut,
-        },
+        Work::Child(child, _) => {
+            match tokio::time::timeout_at(running.deadline, child.wait()).await {
+                Ok(Ok(status)) => Outcome::Exited(status.code()),
+                Ok(Err(_)) => Outcome::Exited(None),
+                Err(_) => Outcome::TimedOut,
+            }
+        }
         Work::Forward(task) => match tokio::time::timeout_at(running.deadline, task).await {
             Ok(Ok(reply)) => Outcome::Forwarded(reply),
             Ok(Err(e)) => Outcome::Forwarded(crate::openclaw::Reply::Failed {
@@ -1588,20 +1658,31 @@ pub async fn run(
     let me = author_id(&node.author_key(&config.profile)?);
     std::fs::create_dir_all(&config.work_dir)?;
     let mut config = config;
+    if config.access == Access::Locked && !config.tools.is_empty() && config.runtime != "openclaw" {
+        warn!(
+            "locked access ignores agent.tools [{}]; use access workspace",
+            config.tools.join(", ")
+        );
+    }
     if config.runtime == "codex" && config.access != Access::Inherit {
         let known = access::codex_features(&config.command).await;
-        config.codex_disable = access::CODEX_DENIED_FEATURES
-            .iter()
-            .filter(|f| known.iter().any(|k| k == *f))
-            .filter(|f| config.access != Access::Workspace || !config.tools.iter().any(|t| t == *f))
-            .map(|f| f.to_string())
-            .collect();
         // Never run Codex without knowing what to switch off.
         anyhow::ensure!(
             !known.is_empty(),
             "`{} features list` gave nothing: cannot lock the Codex agent down",
             config.command.display()
         );
+        let features = access::codex_features_for(config.access, &config.tools, &known);
+        if !features.unknown.is_empty() {
+            warn!(
+                "agent.tools [{}]: not features of this Codex (`codex features list`), \
+                 ignored; MCP servers go in {}",
+                features.unknown.join(", "),
+                config.workdir.join(".codex").join("config.toml").display()
+            );
+        }
+        config.codex_disable = features.disable;
+        config.codex_enable = features.enable;
     }
     announce_if_changed(&node, &config).await;
     // A marker left by a run that did not finish (crash, kill -9).
