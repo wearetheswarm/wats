@@ -514,8 +514,24 @@ fn setup_claude_adds_the_hook_once_and_removes_it() {
     assert_eq!(std::fs::read_to_string(&settings).unwrap(), text);
     assert_eq!(backups(&settings_dir, "settings.json").len(), 1);
 
-    // --remove: the hook and the MCP server go; the user's settings stay.
+    // --remove-hooks: the hooks go, the MCP server stays.
     std::fs::remove_file(&log).unwrap();
+    let said = setup(
+        &home,
+        &data,
+        &["claude", "--remove-hooks", "--claude", claude],
+    );
+    assert!(said.contains("session hook removed"), "{said}");
+    assert!(!said.contains("MCP server"), "{said}");
+    assert!(!log.exists(), "the claude CLI ran");
+    let removed: Value =
+        serde_json::from_str(&std::fs::read_to_string(&settings).unwrap()).unwrap();
+    assert_eq!(removed, serde_json::from_str::<Value>(original).unwrap());
+    let said = setup(&home, &data, &["claude", "--mcp", "--claude", claude]);
+    assert!(said.contains("session hook (UserPromptSubmit"), "{said}");
+    std::fs::remove_file(&log).unwrap();
+
+    // --remove: the hook and the MCP server go; the user's settings stay.
     let said = setup(&home, &data, &["claude", "--remove", "--claude", claude]);
     assert!(said.contains("session hook removed"), "{said}");
     let removed: Value =
@@ -525,7 +541,7 @@ fn setup_claude_adds_the_hook_once_and_removes_it() {
         std::fs::read_to_string(&log).unwrap().trim(),
         "mcp remove --scope user wats"
     );
-    assert_eq!(backups(&settings_dir, "settings.json").len(), 2);
+    assert_eq!(backups(&settings_dir, "settings.json").len(), 4);
     let said = setup(&home, &data, &["claude", "--remove", "--claude", claude]);
     assert!(said.contains("no wats session hook"), "{said}");
 
@@ -576,8 +592,9 @@ fn setup_codex_hook_follows_detection() {
         &data,
         &["codex", "--mcp", "--codex", codex.to_str().unwrap()],
     );
+    assert!(said.contains("Codex: no session hook"), "{said}");
     assert!(said.contains("no hooks feature"), "{said}");
-    assert!(said.contains("session hook skipped"), "{said}");
+    assert!(said.contains("0.114.0"), "{said}");
     assert_eq!(std::fs::read_to_string(&config).unwrap(), original);
     assert!(backups(&codex_dir, "config.toml").is_empty());
     assert!(
@@ -615,6 +632,14 @@ fn setup_codex_hook_follows_detection() {
         let said = setup(&home, &data, &["codex", "--mcp", "--codex", codex]);
         assert!(said.contains("session hook already in"), "{said}");
         assert_eq!(std::fs::read_to_string(&config).unwrap(), text);
+        // --remove-hooks: the hook only.
+        let said = setup(&home, &data, &["codex", "--remove-hooks", "--codex", codex]);
+        assert!(said.contains("session hook removed"), "{said}");
+        assert!(!said.contains("MCP server"), "{said}");
+        let without = std::fs::read_to_string(&config).unwrap();
+        assert!(!without.contains("notify --hook"), "{without}");
+        let said = setup(&home, &data, &["codex", "--mcp", "--codex", codex]);
+        assert!(said.contains("[[hooks.SessionStart]]"), "{said}");
         // --remove: the hook goes (the feature flag stays), then the MCP
         // server.
         let said = setup(&home, &data, &["codex", "--remove", "--codex", codex]);

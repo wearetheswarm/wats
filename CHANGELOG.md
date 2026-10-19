@@ -5,8 +5,9 @@
 - **Replies to your asks reach Claude Code, Codex and your desktop**: Claude
   Code and Codex have no push channel, so `wats setup claude --mcp` and
   `wats setup codex --mcp` now add a session hook (asked on a terminal,
-  default yes; `--no-hooks` to skip it, `--remove` to remove it with the MCP
-  server). `wats notify --hook` adds the clarifies waiting for your answer
+  default yes; `--no-hooks` to skip it, `--remove-hooks` to remove it alone,
+  `--remove` to remove it with the MCP server; a Codex without hooks, before
+  0.114.0, gets one line saying so). `wats notify --hook` adds the clarifies waiting for your answer
   and the new answers to your asks, with their post ids, to the session's
   context: Claude Code's `UserPromptSubmit` and `SessionStart`
   (`additionalContext`), Codex's `SessionStart` when `codex features list`
@@ -17,7 +18,9 @@
   kept, after a backup copy. The node also raises a desktop notification
   (`osascript`, `notify-send`) for an answer or a clarify to an ask of
   yours, never an agent's, at most 10 per hour: `notify.desktop`, on by
-  default with a desktop session, asked by `wats setup`.
+  default with a desktop session, asked by `wats setup` The node
+  records which client posted each of your asks, locally, until the ask's
+  body is dropped.
 - **Erasure labels** (ADR 0020 §5.2): a node that subscribes to a labeler
   (`labels.subscribe`, opt-in, none by default) drops the bodies that
   labeler labels `erasure` (a `react` with `data.label = "erasure"`),

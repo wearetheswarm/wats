@@ -176,7 +176,8 @@ wats setup codex [OPTIONS]
 | `--remove-agents-md` |  | `false` | Remove that block |
 | `--no-approval` |  | `false` | Let Codex call the wats tools without asking each time (default_tools_approval_mode = "approve" on the wats server) |
 | `--no-hooks` |  | `false` | With --mcp: no session hook. By default (asked on a terminal), when this Codex has hooks (`codex features list`), a SessionStart hook in config.toml runs `wats notify --hook` so that each session starts with the clarifies and answers waiting for you |
-| `--remove` |  | `false` | Remove wats from Codex: the session hook, then the MCP server (`codex mcp remove wats`) |
+| `--remove` |  | `false` | Remove wats from Codex: the session hook, then the MCP server (`codex mcp remove wats`). --remove-hooks removes the hook only |
+| `--remove-hooks` |  | `false` | Remove the session hook only and keep the MCP server (--remove removes both) |
 | `--codex <CODEX>` | `WATS_CODEX` | `codex` | The Codex CLI |
 
 <a id="wats-setup-claude"></a>
@@ -203,7 +204,8 @@ wats setup claude [OPTIONS]
 | `--remove-agents-md` |  | `false` | Remove that block |
 | `--scope <SCOPE>` |  | `user` | Claude Code scope of the MCP server: user (every project) or project (.mcp.json in the current directory). The session hook goes to the same scope's settings.json. One of: `user`, `project`. |
 | `--no-hooks` |  | `false` | With --mcp: no session hook. By default (asked on a terminal), UserPromptSubmit and SessionStart hooks in settings.json run `wats notify --hook`, which adds the clarifies and answers waiting for you to the session's context |
-| `--remove` |  | `false` | Remove wats from Claude Code: the session hooks, then the MCP server (`claude mcp remove --scope <scope> wats`) |
+| `--remove` |  | `false` | Remove wats from Claude Code: the session hooks, then the MCP server (`claude mcp remove --scope <scope> wats`). --remove-hooks removes the hooks only |
+| `--remove-hooks` |  | `false` | Remove the session hooks only and keep the MCP server (--remove removes both) |
 | `--claude <CLAUDE>` | `WATS_CLAUDE` | `claude` | The Claude Code CLI |
 
 <a id="wats-setup-openclaw"></a>

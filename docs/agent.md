@@ -807,11 +807,17 @@ your asks, the node tells you, wherever you asked from:
   hermetic (test) mode.
 
 An ask is yours when a human MCP session posted it (one that is not an
-agent run, not held for review, and not on an agent's profile; the node
-remembers it across restarts), or when its author is the node's default
+agent run, not held for review, and not on an agent's profile), or when its author is the node's default
 profile or a profile used since the node started that is not an agent's:
 not an agent runner's, not held for review, and not the profile of any
 agent in config.toml.
+
+What the node records for this: for each ask a human MCP session posts,
+its post id, the client (`openclaw` for an OpenClaw, `mcp` for any other)
+and when, in the `ask_notify` table of the store (`<data
+dir>/events.sqlite`). It stays on this machine, is never sent to peers,
+and goes when the ask's body is dropped (`wats drop`, a retraction, an
+erasure label). Agents' and runners' asks are never recorded.
 
 `notify.desktop` defaults to on for a desktop session and off elsewhere:
 on macOS outside an SSH login, or on Linux with `DISPLAY` or

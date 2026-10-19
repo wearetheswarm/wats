@@ -90,7 +90,8 @@ without one it adds it unless `--no-hooks`):
 ```sh
 wats setup claude --mcp              # MCP server + session hook
 wats setup claude --mcp --no-hooks   # MCP server only
-wats setup claude --remove           # the hook, then the MCP server
+wats setup claude --remove-hooks     # the hooks only, the MCP server stays
+wats setup claude --remove           # the hooks, then the MCP server
 ```
 
 It writes two entries in the `settings.json` of the MCP server's scope
@@ -115,8 +116,8 @@ It writes two entries in the `settings.json` of the MCP server's scope
 
 wats recognizes its own entries by a command containing `wats notify
 --hook`: running setup again changes nothing, another profile updates
-them in place, and `--remove` deletes only them (and the lists they leave
-empty).
+them in place, and `--remove-hooks` (or `--remove`) deletes only them (and
+the lists they leave empty).
 
 At each prompt and at the start of a session, `wats notify --hook` adds
 to the session's context (`additionalContext`), for the profile of the MCP

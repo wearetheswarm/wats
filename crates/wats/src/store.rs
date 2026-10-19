@@ -681,7 +681,7 @@ impl Store {
     /// Drop the body of event `id` in place (ADR 0020 §2), in one
     /// transaction. A full event becomes its tombstone: same row and `seq`,
     /// header columns kept (author, ts, net, thread, parent, kind), no
-    /// full-text entry, no tags. Whatever the row (full, already opaque,
+    /// full-text entry, no tags, no `ask_notify` row. Whatever the row (full, already opaque,
     /// or absent: remembered for later), the drop record is written or
     /// updated, so that the body is refused when it arrives.
     pub fn drop_body(
@@ -721,6 +721,8 @@ impl Store {
                 [seq],
             )?;
             tx.execute("DELETE FROM event_tags WHERE seq = ?", [seq])?;
+            // Which of the human's clients posted it goes with the body.
+            tx.execute("DELETE FROM ask_notify WHERE ask = ?", [id])?;
             tx.execute(
                 "UPDATE events SET json = ?, opaque = 1, text = '', tags = '' WHERE seq = ?",
                 params![tombstone, seq],
@@ -1924,6 +1926,7 @@ mod tests {
         store.insert(&root, 10).unwrap();
         store.insert(&answer, 11).unwrap();
         let seq = store.get(&root.id).unwrap().unwrap().seq;
+        store.set_ask_notify(&root.id, "claude", 10).unwrap();
         assert_eq!(found(&store, "secret"), 1);
         assert_eq!(store.tag_counts(None, None, 10).unwrap().len(), 1);
         assert_eq!(
@@ -1939,8 +1942,10 @@ mod tests {
             .unwrap();
         assert!(outcome.held && outcome.body_dropped);
         assert!(outcome.freed_blobs.is_empty());
-        // Not readable, not searchable, not tagged, not listed by browse.
+        // Not readable, not searchable, not tagged, not listed by browse,
+        // and which client posted it is forgotten.
         assert!(store.get(&root.id).unwrap().is_none());
+        assert_eq!(store.ask_notify(&root.id).unwrap(), None);
         assert_eq!(found(&store, "secret"), 0);
         assert_eq!(found(&store, "pdf"), 0);
         assert_eq!(by_tag(&store, "cap:pdf"), 0);

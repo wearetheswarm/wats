@@ -738,9 +738,13 @@ enum SetupTool {
         #[arg(long)]
         no_hooks: bool,
         /// Remove wats from Codex: the session hook, then the MCP server
-        /// (`codex mcp remove wats`).
+        /// (`codex mcp remove wats`). --remove-hooks removes the hook only.
         #[arg(long, conflicts_with_all = ["mcp", "agent", "no_hooks", "no_approval"])]
         remove: bool,
+        /// Remove the session hook only and keep the MCP server (--remove
+        /// removes both).
+        #[arg(long, conflicts_with_all = ["mcp", "agent", "no_hooks", "no_approval", "remove"])]
+        remove_hooks: bool,
         /// The Codex CLI.
         #[arg(long, env = "WATS_CODEX", default_value = "codex")]
         codex: PathBuf,
@@ -771,9 +775,14 @@ enum SetupTool {
         #[arg(long)]
         no_hooks: bool,
         /// Remove wats from Claude Code: the session hooks, then the MCP
-        /// server (`claude mcp remove --scope <scope> wats`).
+        /// server (`claude mcp remove --scope <scope> wats`). --remove-hooks
+        /// removes the hooks only.
         #[arg(long, conflicts_with_all = ["mcp", "agent", "no_hooks"])]
         remove: bool,
+        /// Remove the session hooks only and keep the MCP server (--remove
+        /// removes both).
+        #[arg(long, conflicts_with_all = ["mcp", "agent", "no_hooks", "remove"])]
+        remove_hooks: bool,
         /// The Claude Code CLI.
         #[arg(long, env = "WATS_CLAUDE", default_value = "claude")]
         claude: PathBuf,
@@ -1788,7 +1797,9 @@ fn install_codex_hooks(args: &NodeArgs, profile: &str, codex: &std::path::Path) 
     use wats::hook::{HookEvent, Host};
     let Some(feature) = wats::hook::codex_hook_feature(&wats::hook::codex_features(codex)) else {
         println!(
-            "Codex: this codex has no hooks feature (`codex features list`): session hook skipped"
+            "Codex: no session hook: `{} features list` shows no hooks feature (Codex has hooks \
+             since 0.114.0; update it, then run wats setup codex --mcp again)",
+            codex.display()
         );
         return Ok(());
     };
@@ -1817,20 +1828,7 @@ fn install_codex_hooks(args: &NodeArgs, profile: &str, codex: &std::path::Path) 
 
 /// `wats setup claude --remove`: our session hooks, then the MCP server.
 fn remove_from_claude(scope: &str, claude: &std::path::Path) -> Result<()> {
-    let path = claude_settings(scope)?;
-    let text = read_or_empty(&path)?;
-    match wats::hook::claude_remove(&text)
-        .with_context(|| format!("{}: left as it is", path.display()))?
-    {
-        None => println!("Claude Code: no wats session hook in {}", path.display()),
-        Some(new) => {
-            println!(
-                "Claude Code: wats session hook removed from {}",
-                path.display()
-            );
-            write_settings(&path, &new)?;
-        }
-    }
+    remove_claude_hooks(scope)?;
     let status = std::process::Command::new(claude)
         .args(["mcp", "remove", "--scope", scope, "wats"])
         .stdin(std::process::Stdio::null())
@@ -1849,19 +1847,29 @@ fn remove_from_claude(scope: &str, claude: &std::path::Path) -> Result<()> {
     Ok(())
 }
 
-/// `wats setup codex --remove`: our session hook, then the MCP server.
-fn remove_from_codex(codex: &std::path::Path) -> Result<()> {
-    let path = codex_config()?;
+/// `wats setup claude --remove-hooks` (and the first step of --remove):
+/// our session hooks out of the scope's settings.json.
+fn remove_claude_hooks(scope: &str) -> Result<()> {
+    let path = claude_settings(scope)?;
     let text = read_or_empty(&path)?;
-    match wats::hook::codex_remove(&text)
+    match wats::hook::claude_remove(&text)
         .with_context(|| format!("{}: left as it is", path.display()))?
     {
-        None => println!("Codex: no wats session hook in {}", path.display()),
+        None => println!("Claude Code: no wats session hook in {}", path.display()),
         Some(new) => {
-            println!("Codex: wats session hook removed from {}", path.display());
+            println!(
+                "Claude Code: wats session hook removed from {}",
+                path.display()
+            );
             write_settings(&path, &new)?;
         }
     }
+    Ok(())
+}
+
+/// `wats setup codex --remove`: our session hook, then the MCP server.
+fn remove_from_codex(codex: &std::path::Path) -> Result<()> {
+    remove_codex_hooks()?;
     let status = std::process::Command::new(codex)
         .args(["mcp", "remove", "wats"])
         .stdin(std::process::Stdio::null())
@@ -1877,6 +1885,24 @@ fn remove_from_codex(codex: &std::path::Path) -> Result<()> {
             "not registered (or `codex mcp remove` failed)"
         }
     );
+    Ok(())
+}
+
+/// `wats setup codex --remove-hooks` (and the first step of --remove):
+/// our SessionStart hook out of config.toml (the feature flag stays:
+/// other hooks may need it).
+fn remove_codex_hooks() -> Result<()> {
+    let path = codex_config()?;
+    let text = read_or_empty(&path)?;
+    match wats::hook::codex_remove(&text)
+        .with_context(|| format!("{}: left as it is", path.display()))?
+    {
+        None => println!("Codex: no wats session hook in {}", path.display()),
+        Some(new) => {
+            println!("Codex: wats session hook removed from {}", path.display());
+            write_settings(&path, &new)?;
+        }
+    }
     Ok(())
 }
 
@@ -4200,9 +4226,13 @@ async fn async_main(cli: Cli) -> Result<()> {
                     scope,
                     no_hooks,
                     remove,
+                    remove_hooks,
                     claude,
                 }),
         }) => {
+            if remove_hooks {
+                return remove_claude_hooks(&scope);
+            }
             if remove {
                 return remove_from_claude(&scope, &claude);
             }
@@ -4230,9 +4260,13 @@ async fn async_main(cli: Cli) -> Result<()> {
                     no_approval,
                     no_hooks,
                     remove,
+                    remove_hooks,
                     codex,
                 }),
         }) => {
+            if remove_hooks {
+                return remove_codex_hooks();
+            }
             if remove {
                 return remove_from_codex(&codex);
             }
