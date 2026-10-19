@@ -7,17 +7,29 @@
 //! profile = "alice"            # default profile of `wats mcp` sessions
 //! infra = "wats"               # ours only; default: wats+n0
 //!
-//! [agent]
+//! [agents.claude]              # one table per agent (ADR 0021)
 //! runtime = "claude"           # run the Claude agent with the node
-//! profile = "alice-agent"      # default: <OS user>-agent
+//! profile = "alice-claude"     # default: <OS user>-<name>
 //! about = "I review Rust code and explain compiler errors."
 //! caps = ["rust", "code-review"]
 //! every = "30s"
 //! heartbeat = "30m"
+//!
+//! [agents.reviewer]            # a second agent, its own key and budget
+//! runtime = "claude"
+//! enabled = false              # kept, not run
+//!
+//! [agent]                      # node-wide agent keys
+//! with_mcp = false
 //! ```
+//!
+//! The old single `[agent]` table still loads: it is the agent named after
+//! its runtime ([`crate::roster`]). `wats config set` and `wats setup`
+//! rewrite it as `[agents.<runtime>]` ([`ConfigFile`]).
 //!
 //! [`KEYS`] lists every key; unknown keys are errors.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -51,8 +63,17 @@ pub struct Settings {
     pub limits: LimitsSettings,
     #[serde(default)]
     pub submit: SubmitSettings,
+    /// The old single agent's keys, and the node-wide agent keys
+    /// ([`NODE_WIDE_AGENT_KEYS`]).
     #[serde(default)]
     pub agent: AgentSettings,
+    /// `[agents.<name>]`: one table per agent (ADR 0021).
+    #[serde(default)]
+    pub agents: BTreeMap<String, AgentSettings>,
+    /// Whether `[agent]` holds keys of an agent, not only node-wide ones
+    /// (set by [`Settings::parse`]).
+    #[serde(skip)]
+    pub legacy_agent: bool,
     #[serde(default)]
     pub update: UpdateSettings,
     #[serde(default)]
@@ -257,7 +278,24 @@ pub struct AgentSettings {
     pub openclaw_insecure_ok: Option<bool>,
     /// The OpenClaw agent the runs go to (`agentId`).
     pub openclaw_agent: Option<String>,
+    /// `[agents.<name>]` only: `false` keeps the table without running it.
+    pub enabled: Option<bool>,
+    /// `[agents.<name>]` only: the agent keeps `<data dir>/agent` as its
+    /// directory, as the single agent did before ADR 0021 (written by the
+    /// migration of the old `[agent]` table).
+    pub legacy_dir: Option<bool>,
+    /// `[agent]` only (node-wide): a background node started by `wats mcp`
+    /// runs the enabled agents too.
+    pub with_mcp: Option<bool>,
 }
+
+/// Keys of `[agent]` that are node-wide, not one agent's: they stay in
+/// `[agent]` when the file has `[agents.<name>]` tables. The review queue
+/// is the node's (`review_ttl`, `notify`).
+pub const NODE_WIDE_AGENT_KEYS: [&str; 3] = ["with_mcp", "review_ttl", "notify"];
+
+/// Keys of `[agents.<name>]` only.
+pub const AGENT_ONLY_KEYS: [&str; 2] = ["enabled", "legacy_dir"];
 
 impl AgentSettings {
     /// Check `openclaw_url` against `openclaw_insecure_ok`.
@@ -278,55 +316,130 @@ impl Settings {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Settings::default()),
             Err(e) => return Err(e).with_context(|| format!("read {}", path.display())),
         };
-        let mut settings: Settings =
-            toml::from_str(&text).with_context(|| format!("invalid {}", path.display()))?;
-        if let Some(runtime) = &settings.agent.runtime {
-            anyhow::ensure!(
-                RUNTIMES.contains(&runtime.as_str()),
-                "{}: unknown agent runtime {runtime:?} (known: {})",
-                path.display(),
-                RUNTIMES.join(", ")
-            );
-        }
-        if let Some(access) = &settings.agent.access {
-            access
-                .parse::<crate::access::Access>()
-                .with_context(|| format!("{}: agent.access", path.display()))?;
-        }
+        let mut settings =
+            Settings::parse(&text).with_context(|| format!("invalid {}", path.display()))?;
         settings
-            .agent
-            .check_openclaw_url()
-            .with_context(|| format!("{}: agent.openclaw_url", path.display()))?;
-        for cap in &settings.agent.caps {
-            crate::agent::check_cap(cap)
-                .map_err(|why| anyhow::anyhow!("{}: agent.caps: {why}", path.display()))?;
-        }
+            .check()
+            .with_context(|| path.display().to_string())?;
         for name in settings.removed_keys() {
             warn_removed(name);
         }
-        if let Some(dir) = &settings.agent.workdir {
-            settings.agent.workdir = Some(data_dir.join(dir));
-        }
-        settings
-            .update
-            .policy()
-            .with_context(|| format!("{}: [update]", path.display()))?;
-        if let Some(file) = &settings.agent.heartbeat_file {
-            settings.agent.heartbeat_file = Some(data_dir.join(file));
+        let tables = std::iter::once(&mut settings.agent).chain(settings.agents.values_mut());
+        for table in tables {
+            if let Some(dir) = &table.workdir {
+                table.workdir = Some(data_dir.join(dir));
+            }
+            if let Some(file) = &table.heartbeat_file {
+                table.heartbeat_file = Some(data_dir.join(file));
+            }
         }
         Ok(settings)
     }
 
+    /// Parse config.toml's text; [`Settings::check`] checks the values.
+    pub fn parse(text: &str) -> Result<Settings> {
+        let mut settings: Settings = toml::from_str(text)?;
+        let table: toml::Table = toml::from_str(text)?;
+        settings.legacy_agent = table
+            .get("agent")
+            .and_then(|t| t.as_table())
+            .is_some_and(|t| {
+                t.keys()
+                    .any(|k| !NODE_WIDE_AGENT_KEYS.contains(&k.as_str()))
+            });
+        Ok(settings)
+    }
+
+    /// Check what serde cannot: runtimes, access levels, gateway URLs,
+    /// capabilities, which table a key belongs to, agent names.
+    pub fn check(&self) -> Result<()> {
+        let tables = std::iter::once(("agent".to_string(), &self.agent)).chain(
+            self.agents
+                .iter()
+                .map(|(name, table)| (format!("agents.{name}"), table)),
+        );
+        for (prefix, table) in tables {
+            if let Some(runtime) = &table.runtime {
+                anyhow::ensure!(
+                    RUNTIMES.contains(&runtime.as_str()),
+                    "unknown agent runtime {runtime:?} in {prefix}.runtime (known: {})",
+                    RUNTIMES.join(", ")
+                );
+            }
+            if let Some(access) = &table.access {
+                access
+                    .parse::<crate::access::Access>()
+                    .with_context(|| format!("{prefix}.access"))?;
+            }
+            table
+                .check_openclaw_url()
+                .with_context(|| format!("{prefix}.openclaw_url"))?;
+            for cap in &table.caps {
+                crate::agent::check_cap(cap)
+                    .map_err(|why| anyhow::anyhow!("{prefix}.caps: {why}"))?;
+            }
+            let misplaced = if prefix == "agent" {
+                [
+                    ("enabled", table.enabled.is_some()),
+                    ("legacy_dir", table.legacy_dir.is_some()),
+                ]
+                .into_iter()
+                .find(|(_, set)| *set)
+                .map(|(key, _)| format!("agent.{key}: only in [agents.<name>] tables"))
+            } else {
+                [
+                    ("with_mcp", table.with_mcp.is_some()),
+                    ("review_ttl", table.review_ttl.is_some()),
+                    ("notify", table.notify.is_some()),
+                ]
+                .into_iter()
+                .find(|(_, set)| *set)
+                .map(|(key, _)| format!("{prefix}.{key}: node-wide, set agent.{key} instead"))
+            };
+            if let Some(why) = misplaced {
+                bail!("{why}");
+            }
+        }
+        crate::roster::configured(self, Path::new(""), "user")?;
+        self.update.policy().context("[update]")?;
+        Ok(())
+    }
+
     /// The [`REMOVED_KEYS`] set in the file.
     pub fn removed_keys(&self) -> Vec<&'static str> {
+        let tables: Vec<&AgentSettings> = std::iter::once(&self.agent)
+            .chain(self.agents.values())
+            .collect();
         let set = [
-            self.agent.thread_backoff.is_some(),
-            self.agent.thread_backoff_max.is_some(),
+            tables.iter().any(|t| t.thread_backoff.is_some()),
+            tables.iter().any(|t| t.thread_backoff_max.is_some()),
         ];
         REMOVED_KEYS
             .iter()
             .zip(set)
             .filter_map(|(name, set)| set.then_some(*name))
+            .collect()
+    }
+
+    /// The agent `wats setup` (with no tool) asks about: the first one a
+    /// bare `wats` runs, with its name.
+    pub fn primary_agent(&self) -> Option<(String, &AgentSettings)> {
+        if let Some(runtime) = &self.agent.runtime {
+            return Some((runtime.clone(), &self.agent));
+        }
+        self.agents
+            .iter()
+            .find(|(_, t)| t.runtime.is_some() && t.enabled != Some(false))
+            .map(|(name, t)| (name.clone(), t))
+    }
+
+    /// The agents a bare `wats` runs, as `name` → runtime.
+    pub fn enabled_agents(&self) -> Vec<(String, String)> {
+        crate::roster::configured(self, Path::new(""), "user")
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|m| m.enabled)
+            .filter_map(|m| Some((m.name, m.runtime?)))
             .collect()
     }
 }
@@ -601,6 +714,25 @@ pub const KEYS: &[Key] = &[
         "drop sealed-inbox submissions older than this (0: keep them)",
     ),
     key(
+        "agent.with_mcp",
+        ValueType::Bool,
+        "false",
+        "node-wide: a background node started by `wats mcp` runs the enabled agents too, \
+         while MCP sessions keep it up",
+    ),
+    key(
+        "agent.review_ttl",
+        ValueType::Duration,
+        "24h",
+        "node-wide: held posts expire after this",
+    ),
+    key(
+        "agent.notify",
+        ValueType::Bool,
+        "false",
+        "node-wide: a desktop notification when a post is held",
+    ),
+    key(
         "agent.runtime",
         ValueType::Runtime,
         "none",
@@ -635,7 +767,8 @@ pub const KEYS: &[Key] = &[
         "agent.workdir",
         ValueType::Text,
         "<data dir>/agent/workspace",
-        "the agent's directory with workspace access (relative to the data dir)",
+        "the agent's directory with workspace access (relative to the data dir; in \
+         [agents.<name>]: default <data dir>/agent/<name>/workspace)",
     ),
     key(
         "agent.tools",
@@ -662,22 +795,10 @@ pub const KEYS: &[Key] = &[
         "do not wake on posts by other profiles of this node (false: solo tests)",
     ),
     key(
-        "agent.review_ttl",
-        ValueType::Duration,
-        "24h",
-        "held posts expire after this",
-    ),
-    key(
-        "agent.notify",
-        ValueType::Bool,
-        "false",
-        "a desktop notification when a post is held",
-    ),
-    key(
         "agent.profile",
         ValueType::Profile,
         "<OS user>-agent",
-        "profile the agent posts as",
+        "profile the agent posts as (in [agents.<name>]: default <OS user>-<name>)",
     ),
     key(
         "agent.about",
@@ -818,7 +939,64 @@ pub const HIDDEN_KEYS: &[Key] = &[key(
     "false: this node ignores guardian halts of the public network (ADR 0016)",
 )];
 
+/// The keys of `[agents.<name>]` beyond those of `[agent]`.
+pub const AGENTS_KEYS: &[Key] = &[
+    key(
+        "agents.<name>.enabled",
+        ValueType::Bool,
+        "true",
+        "false keeps the table without running it (`--agent <runtime>:<name>` still runs it)",
+    ),
+    key(
+        "agents.<name>.legacy_dir",
+        ValueType::Bool,
+        "false",
+        "the agent keeps <data dir>/agent (runs, budget ledger) as the single agent did \
+         before ADR 0021; written when the old [agent] table is rewritten",
+    ),
+];
+
+/// Whether `leaf` is a key of one agent: in `[agents.<name>]`, and in the
+/// old `[agent]` table.
+pub fn is_agent_leaf(leaf: &str) -> bool {
+    !NODE_WIDE_AGENT_KEYS.contains(&leaf)
+        && KEYS
+            .iter()
+            .any(|k| k.name.strip_prefix("agent.") == Some(leaf))
+}
+
+/// `agents.<name>.<leaf>` → (`<name>`, `<leaf>`).
+pub fn split_agents_key(name: &str) -> Option<(&str, &str)> {
+    name.strip_prefix("agents.")?.split_once('.')
+}
+
+/// The key `name`. `agents.<name>.<leaf>` is checked like `agent.<leaf>`
+/// (the returned key is that one), or is one of [`AGENTS_KEYS`].
 pub fn find_key(name: &str) -> Result<&'static Key> {
+    if let Some((agent, leaf)) = split_agents_key(name) {
+        crate::roster::check_name(agent).map_err(anyhow::Error::msg)?;
+        if NODE_WIDE_AGENT_KEYS.contains(&leaf) {
+            bail!("{name}: node-wide, set agent.{leaf} instead");
+        }
+        if let Some(key) = AGENTS_KEYS
+            .iter()
+            .find(|k| k.name.strip_prefix("agents.<name>.") == Some(leaf))
+        {
+            return Ok(key);
+        }
+        if is_agent_leaf(leaf) {
+            return find_key(&format!("agent.{leaf}"));
+        }
+        bail!(
+            "unknown key {name:?}; an agent's keys: {}",
+            KEYS.iter()
+                .filter_map(|k| k.name.strip_prefix("agent."))
+                .filter(|leaf| is_agent_leaf(leaf))
+                .chain(AGENT_ONLY_KEYS)
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
     KEYS.iter()
         .chain(HIDDEN_KEYS)
         .find(|k| k.name == name)
@@ -936,11 +1114,33 @@ fn toml_value(key: &Key, raw: &str) -> Result<toml_edit::Value> {
     })
 }
 
+/// Where a dotted key lives in the file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Place {
+    Top(String),
+    Table(String, String),
+    /// `[agents.<name>]`, key.
+    Agent(String, String),
+}
+
 /// The editable file, keeping its comments and layout.
+///
+/// `agent.<key>` (a key of one agent) means the only agent: the old
+/// `[agent]` table while the file has one or has no `[agents.<name>]`
+/// table, else its only `[agents.<name>]` table; with several, the name
+/// must be given (`agents.<name>.<key>`). Writing a key of an agent
+/// rewrites the old `[agent]` table as `[agents.<runtime>]` first (ADR
+/// 0021), with `profile` written out and `legacy_dir = true`, so that the
+/// agent keeps its key and its directory.
 pub struct ConfigFile {
     path: PathBuf,
     doc: toml_edit::DocumentMut,
+    /// The agent the old `[agent]` table became, once rewritten.
+    migrated: Option<String>,
 }
+
+/// Files of the single agent's directory that show it has run.
+const OLD_AGENT_STATE: [&str; 3] = ["cursor", "runs.jsonl", "spend.jsonl"];
 
 impl ConfigFile {
     pub fn open(data_dir: &Path) -> Result<ConfigFile> {
@@ -953,50 +1153,254 @@ impl ConfigFile {
         let doc = text
             .parse()
             .with_context(|| format!("invalid {}", path.display()))?;
-        Ok(ConfigFile { path, doc })
+        Ok(ConfigFile {
+            path,
+            doc,
+            migrated: None,
+        })
     }
 
     pub fn path(&self) -> &Path {
         &self.path
     }
 
-    fn split(name: &str) -> (Option<&str>, &str) {
-        match name.split_once('.') {
-            Some((table, leaf)) => (Some(table), leaf),
-            None => (None, name),
+    /// The names of the `[agents.<name>]` tables.
+    pub fn agent_names(&self) -> Vec<String> {
+        self.doc
+            .get("agents")
+            .and_then(|item| item.as_table_like())
+            .map(|t| t.iter().map(|(k, _)| k.to_string()).collect())
+            .unwrap_or_default()
+    }
+
+    /// Whether `[agent]` holds keys of an agent (the old form), not only
+    /// node-wide ones.
+    fn legacy_keys(&self) -> bool {
+        self.doc
+            .get("agent")
+            .and_then(|item| item.as_table_like())
+            .is_some_and(|t| t.iter().any(|(k, _)| !NODE_WIDE_AGENT_KEYS.contains(&k)))
+    }
+
+    /// The agent `wats config` reads or writes as `agent.<key>`, when the
+    /// file is in the new form: its only `[agents.<name>]` table.
+    fn only_agent(&self, leaf: &str) -> Result<Option<String>> {
+        let names = self.agent_names();
+        if names.is_empty() || self.legacy_keys() {
+            return Ok(None);
         }
+        match names.as_slice() {
+            [only] => Ok(Some(only.clone())),
+            _ => bail!(
+                "several agents ({}): name one, e.g. agents.{}.{leaf}",
+                names.join(", "),
+                names[0]
+            ),
+        }
+    }
+
+    fn place(&self, name: &str) -> Result<Place> {
+        if let Some((agent, leaf)) = split_agents_key(name) {
+            return Ok(Place::Agent(agent.into(), leaf.into()));
+        }
+        Ok(match name.split_once('.') {
+            None => Place::Top(name.into()),
+            Some(("agent", leaf)) if is_agent_leaf(leaf) => match self.only_agent(leaf)? {
+                Some(agent) => Place::Agent(agent, leaf.into()),
+                None => Place::Table("agent".into(), leaf.into()),
+            },
+            Some((table, leaf)) => Place::Table(table.into(), leaf.into()),
+        })
+    }
+
+    /// Whether `name` is a key of one agent.
+    fn is_agent_key(name: &str) -> bool {
+        split_agents_key(name).is_some() || name.strip_prefix("agent.").is_some_and(is_agent_leaf)
+    }
+
+    /// Rewrite the old `[agent]` table as `[agents.<name>]`, `<name>` its
+    /// runtime, else `runtime` (a runtime being set). Its keys move with
+    /// their comments, removed keys are dropped, node-wide keys stay in
+    /// `[agent]`; `profile` is written out (the old default
+    /// `<OS user>-agent`) and `legacy_dir = true` keeps the directory.
+    fn migrate(&mut self, runtime: Option<&str>) -> Result<()> {
+        if !self.legacy_keys() {
+            return Ok(());
+        }
+        let own = self
+            .doc
+            .get("agent")
+            .and_then(|t| t.get("runtime"))
+            .and_then(|v| v.as_str())
+            .map(str::to_string);
+        let Some(name) = own.clone().or(runtime.map(str::to_string)) else {
+            return Ok(());
+        };
+        crate::roster::check_name(&name).map_err(anyhow::Error::msg)?;
+        if self.agent_names().contains(&name) {
+            bail!(
+                "{}: [agent] runtime = {name:?} and [agents.{name}] are the same agent: merge \
+                 them by hand",
+                self.path.display()
+            );
+        }
+        let Some(old) = self
+            .doc
+            .get_mut("agent")
+            .and_then(|item| item.as_table_like_mut())
+        else {
+            return Ok(());
+        };
+        let mut table = toml_edit::Table::new();
+        let keys: Vec<String> = old
+            .iter()
+            .map(|(k, _)| k.to_string())
+            .filter(|k| !NODE_WIDE_AGENT_KEYS.contains(&k.as_str()))
+            .collect();
+        for k in keys {
+            let key = old.key(&k).cloned();
+            let Some(item) = old.remove(&k) else { continue };
+            if REMOVED_KEYS.contains(&format!("agent.{k}").as_str()) {
+                continue;
+            }
+            match key {
+                Some(key) => table.insert_formatted(&key, item),
+                None => table.insert(&k, item),
+            };
+        }
+        if own.is_none() {
+            table.insert("runtime", toml_edit::value(name.clone()));
+        }
+        if !table.contains_key("profile") {
+            let user = crate::roster::os_user_profile();
+            table.insert(
+                "profile",
+                toml_edit::value(crate::roster::legacy_profile(&user)),
+            );
+        }
+        table.insert("legacy_dir", toml_edit::value(true));
+        let empty = old.is_empty();
+        if let Some(Some(old)) = self.doc.get_mut("agent").map(|item| item.as_table_mut()) {
+            table.set_position(old.position());
+            *table.decor_mut() = std::mem::take(old.decor_mut());
+        }
+        if empty {
+            self.doc.remove("agent");
+        }
+        self.agents_mut()?
+            .insert(&name, toml_edit::Item::Table(table));
+        self.migrated = Some(name);
+        Ok(())
+    }
+
+    /// The `[agents]` table, created (implicit) if needed.
+    fn agents_mut(&mut self) -> Result<&mut dyn toml_edit::TableLike> {
+        let item = self.doc.entry("agents").or_insert_with(|| {
+            let mut table = toml_edit::Table::new();
+            table.set_implicit(true);
+            toml_edit::Item::Table(table)
+        });
+        item.as_table_like_mut()
+            .with_context(|| format!("{}: agents is not a table", self.path.display()))
+    }
+
+    /// Whether the single agent of before ADR 0021 left state in
+    /// `<data dir>/agent` (it ran through `wats --agent`).
+    fn old_agent_ran(&self) -> bool {
+        self.path.parent().is_some_and(|dir| {
+            OLD_AGENT_STATE
+                .iter()
+                .any(|f| dir.join("agent").join(f).exists())
+        })
+    }
+
+    /// Where `name` is written: the old `[agent]` table is rewritten first.
+    fn place_for_write(&mut self, name: &str, raw: Option<&str>) -> Result<Place> {
+        if !Self::is_agent_key(name) {
+            return self.place(name);
+        }
+        let runtime = raw.filter(|_| name == "agent.runtime");
+        self.migrate(runtime)?;
+        if let Some(runtime) = runtime
+            && self.agent_names().is_empty()
+            && !self.legacy_keys()
+        {
+            // The first agent, named after its runtime.
+            return Ok(Place::Agent(runtime.into(), "runtime".into()));
+        }
+        self.place(name)
+    }
+
+    fn item(&self, place: &Place) -> Option<&toml_edit::Item> {
+        match place {
+            Place::Top(leaf) => self.doc.get(leaf),
+            Place::Table(table, leaf) => self.doc.get(table)?.get(leaf),
+            Place::Agent(agent, leaf) => self.doc.get("agents")?.get(agent)?.get(leaf),
+        }
+    }
+
+    /// The value set in the file, as TOML text; an error when `agent.<key>`
+    /// does not say which of several agents.
+    pub fn lookup(&self, name: &str) -> Result<Option<String>> {
+        let place = self.place(name)?;
+        Ok(self
+            .item(&place)
+            .and_then(|item| item.as_value())
+            .map(|v| v.to_string().trim().to_string()))
     }
 
     /// The value set in the file, as TOML text.
     pub fn get(&self, name: &str) -> Option<String> {
-        let (table, leaf) = Self::split(name);
-        let item = match table {
-            Some(t) => self.doc.get(t)?.get(leaf)?,
-            None => self.doc.get(leaf)?,
-        };
-        item.as_value().map(|v| v.to_string().trim().to_string())
+        self.lookup(name).ok().flatten()
     }
 
     pub fn set(&mut self, name: &str, raw: &str) -> Result<()> {
-        if REMOVED_KEYS.contains(&name) {
-            bail!("{}", removed_key_message(name));
+        let removed =
+            split_agents_key(name).map_or(name.to_string(), |(_, l)| format!("agent.{l}"));
+        if REMOVED_KEYS.contains(&removed.as_str()) {
+            bail!("{}", removed_key_message(&removed));
         }
         let key = find_key(name)?;
         let value = toml_value(key, raw)?;
-        let (table, leaf) = Self::split(name);
-        match table {
-            Some(t) => {
+        let first = self.agent_names().is_empty() && !self.legacy_keys();
+        match self.place_for_write(name, Some(raw))? {
+            Place::Top(leaf) => {
+                self.doc.insert(&leaf, toml_edit::value(value));
+            }
+            Place::Table(t, leaf) => {
                 let entry = self
                     .doc
-                    .entry(t)
+                    .entry(&t)
                     .or_insert_with(|| toml_edit::Item::Table(toml_edit::Table::new()));
                 let Some(table) = entry.as_table_like_mut() else {
                     bail!("{}: [{t}] is not a table", self.path.display());
                 };
-                table.insert(leaf, toml_edit::value(value));
+                table.insert(&leaf, toml_edit::value(value));
             }
-            None => {
-                self.doc.insert(leaf, toml_edit::value(value));
+            Place::Agent(agent, leaf) => {
+                crate::roster::check_name(&agent).map_err(anyhow::Error::msg)?;
+                // The first agent written after the single agent ran
+                // through `wats --agent` takes over its key and directory.
+                let adopt = first && self.old_agent_ran();
+                let path = self.path.clone();
+                let agents = self.agents_mut()?;
+                if !agents.contains_key(&agent) {
+                    agents.insert(&agent, toml_edit::Item::Table(toml_edit::Table::new()));
+                }
+                let Some(table) = agents.get_mut(&agent).and_then(|t| t.as_table_like_mut()) else {
+                    bail!("{}: [agents.{agent}] is not a table", path.display());
+                };
+                table.insert(&leaf, toml_edit::value(value));
+                if adopt {
+                    if !table.contains_key("profile") {
+                        let user = crate::roster::os_user_profile();
+                        table.insert(
+                            "profile",
+                            toml_edit::value(crate::roster::legacy_profile(&user)),
+                        );
+                    }
+                    table.insert("legacy_dir", toml_edit::value(true));
+                }
             }
         }
         Ok(())
@@ -1007,35 +1411,60 @@ impl ConfigFile {
         if !REMOVED_KEYS.contains(&name) {
             find_key(name)?;
         }
-        let (table, leaf) = Self::split(name);
-        Ok(match table {
-            Some(t) => self
+        let was_migrated = self.migrated.is_some();
+        let place = self.place_for_write(name, None)?;
+        let migrated = !was_migrated && self.migrated.is_some();
+        let removed = match place {
+            Place::Top(leaf) => self.doc.remove(&leaf).is_some(),
+            Place::Table(t, leaf) => self
                 .doc
-                .get_mut(t)
+                .get_mut(&t)
                 .and_then(|item| item.as_table_like_mut())
-                .and_then(|table| table.remove(leaf))
+                .and_then(|table| table.remove(&leaf))
                 .is_some(),
-            None => self.doc.remove(leaf).is_some(),
-        })
+            Place::Agent(agent, leaf) => self
+                .doc
+                .get_mut("agents")
+                .and_then(|item| item.get_mut(&agent))
+                .and_then(|item| item.as_table_like_mut())
+                .and_then(|table| table.remove(&leaf))
+                .is_some(),
+        };
+        // A rewritten [agent] table must be saved too.
+        Ok(removed || migrated)
+    }
+
+    /// The settings as the file would load once saved (paths not resolved
+    /// against the data directory).
+    pub fn preview(&self) -> Result<Settings> {
+        let settings = Settings::parse(&self.doc.to_string())
+            .with_context(|| format!("invalid {}", self.path.display()))?;
+        settings
+            .check()
+            .with_context(|| self.path.display().to_string())?;
+        Ok(settings)
     }
 
     /// Write the file, after checking that it still loads.
     pub fn save(&self) -> Result<()> {
         let text = self.doc.to_string();
-        let settings = toml::from_str::<Settings>(&text)
+        let settings = Settings::parse(&text)
             .with_context(|| format!("refusing to write an invalid {}", self.path.display()))?;
-        settings.agent.check_openclaw_url().with_context(|| {
-            format!(
-                "refusing to write {}: agent.openclaw_url",
-                self.path.display()
-            )
-        })?;
+        settings
+            .check()
+            .with_context(|| format!("refusing to write {}", self.path.display()))?;
         if let Some(dir) = self.path.parent() {
             std::fs::create_dir_all(dir)?;
         }
         let tmp = self.path.with_extension("toml.tmp");
         std::fs::write(&tmp, text)?;
         std::fs::rename(&tmp, &self.path)?;
+        // The safety settings follow the agent to its new table.
+        if let (Some(name), Some(dir)) = (&self.migrated, self.path.parent())
+            && let Err(e) = crate::safety::migrate_baseline(dir, name)
+        {
+            tracing::warn!("safety settings after rewriting [agent]: {e:#}");
+        }
         Ok(())
     }
 }
@@ -1113,6 +1542,20 @@ pub fn reference_markdown() -> String {
          Command-line flags and `WATS_*` variables, where they exist (`wats --help`), \
          take precedence over the file.\n",
     );
+    // Markdown table cells: no `|`, and `<…>` must not read as HTML.
+    let cell = |s: &str| {
+        s.replace('|', "\\|")
+            .replace('<', "&lt;")
+            .replace('>', "&gt;")
+    };
+    let row = |key: &Key| {
+        format!(
+            "| `{}` | {} | {} |\n",
+            key.name,
+            cell(key.default),
+            cell(key.help)
+        )
+    };
     let mut section = None;
     for key in KEYS.iter().filter(|k| !is_operator_key(k.name)) {
         let this = key.name.split_once('.').map_or("node", |(s, _)| s);
@@ -1122,22 +1565,36 @@ pub fn reference_markdown() -> String {
                 "node" => "Node (top level)".to_string(),
                 s => format!("`[{s}]`"),
             };
-            out.push_str(&format!(
-                "\n## {title}\n\n| Key | Default | |\n|---|---|---|\n"
-            ));
+            out.push_str(&format!("\n## {title}\n\n"));
+            if this == "agent" {
+                out.push_str(&format!(
+                    "The node-wide keys ({}) stay in `[agent]`. The others are one agent's: \
+                     in the old single `[agent]` table, which still loads as the agent named \
+                     after its runtime, or in `[agents.<name>]` (below). With one agent, \
+                     `wats config set agent.<key>` sets it; with several, name it: \
+                     `agents.<name>.<key>`.\n\n",
+                    NODE_WIDE_AGENT_KEYS
+                        .map(|k| format!("`agent.{k}`"))
+                        .join(", ")
+                ));
+            }
+            out.push_str("| Key | Default | |\n|---|---|---|\n");
         }
-        // Markdown table cells: no `|`, and `<…>` must not read as HTML.
-        let cell = |s: &str| {
-            s.replace('|', "\\|")
-                .replace('<', "&lt;")
-                .replace('>', "&gt;")
-        };
-        out.push_str(&format!(
-            "| `{}` | {} | {} |\n",
-            key.name,
-            cell(key.default),
-            cell(key.help)
-        ));
+        out.push_str(&row(key));
+    }
+    out.push_str(
+        "\n## `[agents.<name>]`\n\n\
+         One table per agent (ADR 0021); `<name>` is 1-32 chars of `[a-z0-9_-]`, by default \
+         the runtime. Each takes every key of `[agent]` but the node-wide ones, as \
+         `agents.<name>.<key>` (e.g. `agents.reviewer.about`), with two differences: \
+         `profile` defaults to `<OS user>-<name>`, and the agent keeps its runs, budget \
+         ledger and cursor in `<data dir>/agent/<name>/` (its workspace in \
+         `<data dir>/agent/<name>/workspace`). A table with no `runtime` only runs through \
+         `wats --agent <runtime>:<name>`. Two more keys:\n\n\
+         | Key | Default | |\n|---|---|---|\n",
+    );
+    for key in AGENTS_KEYS {
+        out.push_str(&row(key));
     }
     out.push_str(
         "\n## Operator and test settings\n\n\
@@ -1347,10 +1804,12 @@ mod tests {
         let text = std::fs::read_to_string(dir.path().join(FILE_NAME)).unwrap();
         assert!(text.contains("# mine") && text.contains("# keep"), "{text}");
         let settings = Settings::load(dir.path()).unwrap();
-        assert_eq!(settings.agent.allow, ["aa", "bb"]);
-        assert_eq!(settings.agent.max_runs_per_hour, Some(6));
-        assert_eq!(settings.agent.wakes_per_author_per_hour, Some(0));
-        assert_eq!(settings.agent.loop_max_exchanges, Some(0));
+        // `agent.runtime` made [agents.claude]; `agent.<key>` is its.
+        let claude = &settings.agents["claude"];
+        assert_eq!(claude.allow, ["aa", "bb"]);
+        assert_eq!(claude.max_runs_per_hour, Some(6));
+        assert_eq!(claude.wakes_per_author_per_hour, Some(0));
+        assert_eq!(claude.loop_max_exchanges, Some(0));
         assert_eq!(settings.no_default_bootstrap, Some(true));
         let mut file = ConfigFile::open(dir.path()).unwrap();
         assert_eq!(file.get("agent.runtime").as_deref(), Some("\"claude\""));
@@ -1358,6 +1817,172 @@ mod tests {
         assert!(!file.unset("agent.runtime").unwrap());
         file.save().unwrap();
         assert!(Settings::load(dir.path()).unwrap().agent.runtime.is_none());
+    }
+
+    /// ADR 0021: writing an agent key into a file with the old `[agent]`
+    /// table rewrites it as `[agents.<runtime>]`, in place, with its
+    /// comments, the old profile written out and `legacy_dir`; node-wide
+    /// keys stay in `[agent]`.
+    #[test]
+    fn old_agent_table_is_rewritten_on_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(FILE_NAME);
+        std::fs::write(
+            &path,
+            "# mine\ninfra = \"n0\"\n\n# my agent\n[agent]\nruntime = \"claude\" # the CLI\n\
+             # its role\nabout = \"I review.\"\nthread_backoff = \"1m\"\nreview_ttl = \"2h\"\n\n\
+             [ui]\nbanner = false\n",
+        )
+        .unwrap();
+        // Loads as before: the agent `claude`, old profile and directory.
+        let before = Settings::load(dir.path()).unwrap();
+        let old = crate::roster::select(&before, dir.path(), "vincent", &[]).unwrap();
+        assert_eq!(
+            (old[0].name.as_str(), old[0].profile.as_str()),
+            ("claude", "vincent-agent")
+        );
+        assert_eq!(old[0].work_dir, dir.path().join("agent"));
+
+        let mut file = ConfigFile::open(dir.path()).unwrap();
+        file.set("agent.heartbeat", "2h").unwrap();
+        file.save().unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        let user = crate::roster::os_user_profile();
+        assert!(
+            text.contains("# mine") && text.contains("# my agent"),
+            "{text}"
+        );
+        assert!(text.contains("[agents.claude]"), "{text}");
+        assert!(text.contains("runtime = \"claude\" # the CLI"), "{text}");
+        assert!(text.contains("# its role\nabout = \"I review.\""), "{text}");
+        assert!(
+            text.contains(&format!("profile = \"{user}-agent\"")),
+            "{text}"
+        );
+        assert!(text.contains("legacy_dir = true"), "{text}");
+        assert!(!text.contains("thread_backoff"), "removed keys go: {text}");
+        assert!(text.contains("[agent]\nreview_ttl = \"2h\""), "{text}");
+        // Its place in the file: before [ui].
+        assert!(
+            text.find("[agents.claude]").unwrap() < text.find("[ui]").unwrap(),
+            "{text}"
+        );
+        let after = Settings::load(dir.path()).unwrap();
+        assert!(!after.legacy_agent);
+        let new = crate::roster::select(&after, dir.path(), "someone-else", &[]).unwrap();
+        assert_eq!(new.len(), 1);
+        assert_eq!(new[0].name, "claude");
+        assert_eq!(new[0].profile, format!("{user}-agent"), "same key");
+        assert_eq!(new[0].work_dir, dir.path().join("agent"), "same runs");
+        assert_eq!(new[0].settings.heartbeat.as_deref(), Some("2h"));
+        assert_eq!(after.agent.review_ttl.as_deref(), Some("2h"));
+    }
+
+    /// `agents.<name>.<key>` in `wats config`, and `agent.<key>` for the
+    /// only agent.
+    #[test]
+    fn dotted_agent_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut file = ConfigFile::open(dir.path()).unwrap();
+        file.set("agents.reviewer.runtime", "claude").unwrap();
+        file.set("agents.reviewer.about", "I review.").unwrap();
+        assert_eq!(file.get("agent.about").as_deref(), Some("\"I review.\""));
+        file.set("agent.max_turns", "3").unwrap();
+        file.set("agent.with_mcp", "true").unwrap();
+        file.set("agents.helper.runtime", "codex").unwrap();
+        file.set("agents.helper.enabled", "false").unwrap();
+        assert!(file.lookup("agent.about").is_err(), "which agent?");
+        assert!(file.set("agent.about", "x").is_err());
+        assert!(file.set("agents.Bad.about", "x").is_err());
+        assert!(file.set("agents.reviewer.with_mcp", "true").is_err());
+        assert!(file.set("agents.reviewer.colour", "red").is_err());
+        assert!(file.set("agent.enabled", "true").is_err());
+        assert!(file.set("agents.reviewer.caps", "c++").is_err());
+        file.save().unwrap();
+        let settings = Settings::load(dir.path()).unwrap();
+        assert_eq!(settings.agents["reviewer"].max_turns, Some(3));
+        assert_eq!(settings.agent.with_mcp, Some(true));
+        assert_eq!(
+            settings.enabled_agents(),
+            [("reviewer".to_string(), "claude".to_string())]
+        );
+        let mut file = ConfigFile::open(dir.path()).unwrap();
+        assert!(file.unset("agents.helper.enabled").unwrap());
+        file.save().unwrap();
+        assert_eq!(
+            Settings::load(dir.path()).unwrap().enabled_agents().len(),
+            2
+        );
+        // Misplaced keys in the file are errors.
+        let path = dir.path().join(FILE_NAME);
+        for bad in [
+            "[agent]\nenabled = false\n",
+            "[agents.a]\nnotify = true\n",
+            "[agents.runs]\nruntime = \"claude\"\n",
+            "[agents.a]\nruntime = \"gpt\"\n",
+        ] {
+            std::fs::write(&path, bad).unwrap();
+            assert!(Settings::load(dir.path()).is_err(), "{bad}");
+        }
+    }
+
+    /// The first agent written after the single agent ran through `wats
+    /// --agent` takes over its profile and directory.
+    #[test]
+    fn first_agent_adopts_the_old_agent_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let user = crate::roster::os_user_profile();
+        let mut file = ConfigFile::open(dir.path()).unwrap();
+        file.set("agents.claude.runtime", "claude").unwrap();
+        file.save().unwrap();
+        let fresh = Settings::load(dir.path()).unwrap();
+        assert_eq!(
+            fresh.agents["claude"].profile, None,
+            "a new node: <user>-claude"
+        );
+        std::fs::remove_file(dir.path().join(FILE_NAME)).unwrap();
+        std::fs::create_dir_all(dir.path().join("agent")).unwrap();
+        std::fs::write(dir.path().join("agent").join("cursor"), "12").unwrap();
+        let mut file = ConfigFile::open(dir.path()).unwrap();
+        file.set("agents.claude.runtime", "claude").unwrap();
+        file.set("agents.reviewer.runtime", "claude").unwrap();
+        file.save().unwrap();
+        let settings = Settings::load(dir.path()).unwrap();
+        assert_eq!(
+            settings.agents["claude"].profile,
+            Some(format!("{user}-agent"))
+        );
+        assert_eq!(settings.agents["claude"].legacy_dir, Some(true));
+        assert_eq!(settings.agents["reviewer"].legacy_dir, None);
+    }
+
+    /// The rewrite carries the acknowledged safety values over: no change
+    /// to acknowledge, and one not yet acknowledged still shows. A new
+    /// agent shows.
+    #[test]
+    fn rewrite_keeps_the_safety_baseline() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(FILE_NAME);
+        std::fs::write(
+            &path,
+            "[agent]\nruntime = \"claude\"\naccess = \"locked\"\n",
+        )
+        .unwrap();
+        assert_eq!(crate::safety::check(dir.path()).unwrap(), None);
+        let mut file = ConfigFile::open(dir.path()).unwrap();
+        file.set("agent.about", "hi").unwrap();
+        file.save().unwrap();
+        assert_eq!(crate::safety::check(dir.path()).unwrap(), None);
+        let mut file = ConfigFile::open(dir.path()).unwrap();
+        file.set("agents.claude.access", "inherit").unwrap();
+        file.set("agents.second.runtime", "codex").unwrap();
+        file.save().unwrap();
+        let notice = crate::safety::check(dir.path()).unwrap().unwrap();
+        let keys: Vec<&str> = notice.changes.iter().map(|c| c.key.as_str()).collect();
+        assert!(keys.contains(&"agents.claude.access"), "{keys:?}");
+        assert!(keys.contains(&"agents.second.runtime"), "{keys:?}");
+        assert!(crate::safety::is_key("agents.second.access"));
+        assert!(!crate::safety::is_key("agents.second.about"));
     }
 
     #[test]

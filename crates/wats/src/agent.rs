@@ -93,9 +93,13 @@ pub struct AgentConfig {
     /// The model, when set (`agent.model`); otherwise the runtime's own
     /// default.
     pub model: Option<String>,
-    /// Where transcripts, the runs index and the generated MCP config go
-    /// (`<data dir>/agent`).
+    /// Where transcripts, the runs index, the budget ledger and the
+    /// generated MCP config go: `<data dir>/agent/<name>`, or
+    /// `<data dir>/agent` for the single agent of before ADR 0021.
     pub work_dir: PathBuf,
+    /// The node's data directory (the review queue, and what a run must
+    /// not touch).
+    pub data_dir: PathBuf,
     /// Retention: transcripts beyond the newest `keep_runs`, or older than
     /// `keep_days`, are deleted.
     pub keep_runs: usize,
@@ -111,6 +115,66 @@ pub struct AgentConfig {
 
 /// Default of `agent.catchup`.
 pub const DEFAULT_CATCHUP: Duration = Duration::from_secs(24 * 3600);
+
+/// One agent of the node as `status` shows it (ADR 0021 §1).
+#[derive(Debug, Clone, Default)]
+pub struct AgentInfo {
+    pub name: String,
+    /// `None`: its table names no runtime.
+    pub runtime: Option<String>,
+    pub profile: String,
+    /// A bare `wats` runs it.
+    pub enabled: bool,
+    /// This node runs it now.
+    pub running: bool,
+    pub work_dir: PathBuf,
+    /// Its budget (USD caps unset for OpenClaw: its own).
+    pub budget: budget::Budget,
+}
+
+impl AgentInfo {
+    /// `running`, `enabled` (not run by this node) or `disabled`.
+    pub fn state(&self) -> &'static str {
+        if self.running {
+            "running"
+        } else if self.enabled {
+            "enabled"
+        } else {
+            "disabled"
+        }
+    }
+
+    /// Today's budget: `$0.23 of $2.00 today, …`, or the runs for
+    /// runtimes that report no cost.
+    pub fn budget_line(&self, now: u64) -> String {
+        let spend = budget::spend(&self.work_dir, now);
+        match self.runtime.as_deref() {
+            Some("openclaw") => format!(
+                "{} ({} of {} runs today)",
+                crate::openclaw::BUDGET,
+                spend.uncosted_today,
+                self.budget.max_runs_per_day
+            ),
+            Some("codex") => format!(
+                "{} of {} runs today (Codex reports no cost)",
+                spend.uncosted_today, self.budget.max_runs_per_day
+            ),
+            _ => budget::describe(&self.budget, &spend),
+        }
+    }
+
+    /// For `status`: name, runtime, profile, state, last run, budget.
+    pub fn status(&self, now: u64) -> serde_json::Value {
+        json!({
+            "name": self.name,
+            "runtime": self.runtime,
+            "profile": self.profile,
+            "state": self.state(),
+            "last_run": runs::list(&self.work_dir).last().map(|r| runs::format_time(r.started)),
+            "budget": self.budget_line(now),
+        })
+    }
+}
 
 /// The runner's cursor in `work_dir`: the store sequence number up to
 /// which events were handed to a run (or found of no interest).
@@ -843,6 +907,7 @@ async fn start_run(
     let token = node.new_runner_token(crate::node::RunnerRun {
         id: record.id.clone(),
         events: trigger.events(),
+        profile: config.profile.clone(),
     });
     let mut command = tokio::process::Command::new(&config.command);
     let dir = run_dir(config)?;
@@ -884,7 +949,7 @@ async fn start_run(
                     workspace_servers: &workspace_servers,
                     tools: &config.tools,
                     extra: &config.extra_args,
-                    data_dir: config.work_dir.parent().unwrap_or(&config.work_dir),
+                    data_dir: &config.data_dir,
                     run_dir: &dir,
                 }))
                 .args(limit_args(config, remaining_usd))
@@ -1503,13 +1568,11 @@ pub async fn run(
                 let taken = std::mem::take(&mut feedback);
                 text.push_str(&feedback_section(&node, &taken));
                 // What the human said about the posts they rejected.
-                if let Some(data_dir) = config.work_dir.parent() {
-                    let feedback = crate::review::take_feedback(data_dir);
-                    if !feedback.is_empty() {
-                        text.push_str("\n\nFeedback from your human on your held posts:\n");
-                        text.push_str(&feedback.join("\n"));
-                        text.push('\n');
-                    }
+                let feedback = crate::review::take_feedback(&config.data_dir, &config.profile);
+                if !feedback.is_empty() {
+                    text.push_str("\n\nFeedback from your human on your held posts:\n");
+                    text.push_str(&feedback.join("\n"));
+                    text.push('\n');
                 }
                 // Everything up to now is covered by this run.
                 since = node.store().last_seq()?;

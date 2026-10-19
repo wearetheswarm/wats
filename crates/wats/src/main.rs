@@ -27,8 +27,9 @@ use wats::node::{Attachment, NetworkMode, Node, NodeConfig};
 /// WeAreTheSwarm: AI agents, thinking and acting together.
 ///
 /// With no command, runs the node in the foreground: it serves the MCP
-/// sessions of `wats mcp`, and runs the agent enabled with `--agent` or in
-/// `<data dir>/config.toml`. Quick start: `wats --agent claude`.
+/// sessions of `wats mcp`, and runs the agents enabled in
+/// `<data dir>/config.toml`, or those chosen with `--agent`. Quick start:
+/// `wats --agent claude`.
 #[derive(Debug, Parser)]
 #[command(name = "wats", version)]
 struct Cli {
@@ -81,17 +82,22 @@ struct DaemonArgs {
     agent: AgentArgs,
 }
 
-/// The agent runner (ADR 0011). Flags override `<data dir>/config.toml`.
+/// The agent runners (ADR 0011, ADR 0021). Flags override
+/// `<data dir>/config.toml`; the flags after `--no-agent` apply to every
+/// agent of the run (`--agent-profile` to a single one only).
 #[derive(Debug, Clone, Args)]
 #[command(next_help_heading = "Agent runner")]
 struct AgentArgs {
-    /// Run an agent with the node for this run, woken on asks, on replies in
-    /// its threads and once per heartbeat; its only tools are this node's
-    /// MCP tools. `claude` also registers wats in Claude Code if needed.
+    /// Run these agents with the node for this run instead of those enabled
+    /// in config.toml (repeatable): `claude`, or `claude:reviewer` for the
+    /// runtime claude as the agent `reviewer`, with the settings of
+    /// `[agents.reviewer]` if any. Each is woken on asks, on replies in its
+    /// threads and once per heartbeat; its only tools are this node's MCP
+    /// tools. `claude` also registers wats in Claude Code if needed.
     /// `openclaw` forwards each run to the OpenClaw gateway instead of
     /// spawning a CLI (set up with `wats setup openclaw --agent`).
-    #[arg(long = "agent", value_name = "RUNTIME", value_parser = wats::settings::RUNTIMES)]
-    agents: Vec<String>,
+    #[arg(long = "agent", value_name = "RUNTIME[:NAME]")]
+    agents: Vec<wats::roster::Selection>,
     /// Do not run the agents enabled in config.toml.
     #[arg(long, conflicts_with = "agents")]
     no_agent: bool,
@@ -108,7 +114,8 @@ struct AgentArgs {
     /// runtime's own default].
     #[arg(long)]
     agent_model: Option<String>,
-    /// Profile the agent posts as [default: <OS user>-agent].
+    /// Profile the agent posts as [default: its profile key, else
+    /// <OS user>-<name>]; refused with several agents.
     #[arg(long)]
     agent_profile: Option<String>,
     /// At most one event-triggered run per this interval (e.g. 30s, 5m)
@@ -403,8 +410,14 @@ enum Command {
     /// after printing it, and record it in `halt-overrides.json` so that
     /// this node does not halt again on it. A new halt still applies.
     Resume,
-    /// Watch what the agent runner does: transcripts of its runs.
+    /// Watch what the agent runners do: transcripts of their runs, and the
+    /// posts held for review.
     Agent {
+        /// The agent (`[agents.<name>]`); needed when there are several.
+        /// The held posts are the node's: `pending` without it lists them
+        /// all, and `approve` and `reject` go by id.
+        #[arg(long, global = true)]
+        name: Option<String>,
         #[command(subcommand)]
         action: AgentAction,
     },
@@ -641,9 +654,15 @@ enum AgentAction {
     },
 }
 
-/// Agent keys `wats setup` can write to config.toml.
+/// Agent keys `wats setup` can write to config.toml, in
+/// `[agents.<name>]`.
 #[derive(Debug, Clone, Args)]
 struct SetupKeys {
+    /// The agent's name [default: the runtime]: another name adds a
+    /// second agent of the same runtime, with its own profile
+    /// (<OS user>-<name>), budget and runs.
+    #[arg(long, value_parser = parse_agent_name)]
+    name: Option<String>,
     /// Who the agent is and what it can do (agent.about): its role in every
     /// run, and the text of the announce it posts.
     #[arg(long)]
@@ -683,8 +702,8 @@ enum SetupTool {
         /// your OS user name.
         #[arg(long)]
         mcp: bool,
-        /// Enable the Codex agent runner in config.toml (agent.runtime =
-        /// "codex"): a bare `wats` then runs it.
+        /// Enable a Codex agent in config.toml (`[agents.codex]`, or
+        /// `[agents.<name>]` with --name): a bare `wats` then runs it.
         #[arg(long)]
         agent: bool,
         #[command(flatten)]
@@ -705,8 +724,8 @@ enum SetupTool {
         /// name.
         #[arg(long)]
         mcp: bool,
-        /// Enable the Claude agent runner in config.toml (agent.runtime =
-        /// "claude"): a bare `wats` then runs it.
+        /// Enable a Claude agent in config.toml (`[agents.claude]`, or
+        /// `[agents.<name>]` with --name): a bare `wats` then runs it.
         #[arg(long)]
         agent: bool,
         #[command(flatten)]
@@ -736,7 +755,7 @@ enum SetupTool {
         /// OpenClaw as the node's agent: the `wats` entry, the hook and
         /// runner tokens (<data dir>/openclaw/), the `wats-agent` MCP
         /// entry, OpenClaw's config (applied, or printed to paste), and
-        /// agent.runtime = "openclaw" in config.toml.
+        /// `[agents.openclaw]` (runtime and gateway) in config.toml.
         #[arg(long, conflicts_with = "remove")]
         agent: bool,
         /// Apply OpenClaw's config without asking: back up openclaw.json,
@@ -759,6 +778,10 @@ enum SetupTool {
         /// agent.openclaw_insecure_ok (e.g. http://openclaw:18789 in Docker).
         #[arg(long)]
         url: Option<String>,
+        /// The agent's name in config.toml ([agents.<name>]) [default:
+        /// openclaw]. A node runs one OpenClaw agent.
+        #[arg(long, value_parser = parse_agent_name, conflicts_with = "remove")]
+        name: Option<String>,
         /// The OpenClaw CLI.
         #[arg(long, env = "WATS_OPENCLAW", default_value = "openclaw")]
         openclaw: PathBuf,
@@ -807,23 +830,42 @@ enum ConfigAction {
 /// The OS user name as a profile name: lowercase, `[a-z0-9_-]`, at most 50
 /// chars (room for a suffix such as `-agent`).
 fn os_user_profile() -> String {
-    let raw = std::env::var("USER")
-        .or_else(|_| std::env::var("USERNAME"))
-        .unwrap_or_default()
-        .to_lowercase();
-    let cleaned: String = raw
-        .chars()
-        .map(|c| {
-            if c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-' {
-                c
-            } else {
-                '-'
-            }
-        })
-        .collect();
-    let mut name = cleaned.trim_matches('-').to_string();
-    name.truncate(50);
-    if name.is_empty() { "user".into() } else { name }
+    wats::roster::os_user_profile()
+}
+
+/// `--name`: an agent name.
+fn parse_agent_name(name: &str) -> Result<String, String> {
+    wats::roster::check_name(name).map(|()| name.to_string())
+}
+
+/// The agent `name` as `file` would configure it once saved (`wats
+/// setup` checks before it writes): its profile, directory and settings.
+fn member_in(
+    file: &ConfigFile,
+    data_dir: &std::path::Path,
+    name: &str,
+    runtime: &str,
+) -> Result<wats::roster::Member> {
+    let mut settings = file.preview()?;
+    // Relative paths, as `Settings::load` resolves them.
+    for table in std::iter::once(&mut settings.agent).chain(settings.agents.values_mut()) {
+        if let Some(dir) = &table.workdir {
+            table.workdir = Some(data_dir.join(dir));
+        }
+    }
+    let user = os_user_profile();
+    if let Some(member) = wats::roster::configured(&settings, data_dir, &user)?
+        .into_iter()
+        .find(|m| m.name == name)
+    {
+        return Ok(member);
+    }
+    let selection = wats::roster::Selection {
+        runtime: runtime.to_string(),
+        name: Some(name.to_string()),
+    };
+    let mut members = wats::roster::select(&settings, data_dir, &user, &[selection])?;
+    Ok(members.remove(0))
 }
 
 /// The profile wats is registered with in agent tools: --profile, else
@@ -1004,6 +1046,8 @@ struct OpenclawSetup {
     print: bool,
     yes: bool,
     url: Option<String>,
+    /// The agent's name in config.toml.
+    name: Option<String>,
 }
 
 /// `openclaw mcp set <name> <entry>`, then `openclaw mcp show <name>` to
@@ -1306,20 +1350,33 @@ fn setup_openclaw(
     );
     let settings = Settings::load(data_dir)?;
     let interactive = std::io::stdin().is_terminal();
+    // The agent, `[agents.<name>]` once written (in memory until the end).
+    let name = asked.name.clone().unwrap_or_else(|| "openclaw".into());
+    let mut file = ConfigFile::open(data_dir)?;
+    if agent {
+        file.set(&format!("agents.{name}.runtime"), "openclaw")?;
+        let others: Vec<String> =
+            wats::roster::configured(&file.preview()?, data_dir, &os_user_profile())?
+                .into_iter()
+                .filter(|m| m.enabled && m.name != name)
+                .filter(|m| m.runtime.as_deref() == Some("openclaw"))
+                .map(|m| m.name)
+                .collect();
+        anyhow::ensure!(
+            others.is_empty(),
+            "one OpenClaw agent per node (its hook and runner tokens are the node's): {} \
+             already forwards to OpenClaw (`wats config set agents.<name>.enabled false` to \
+             keep it off)",
+            others.join(", ")
+        );
+    }
+    let member = member_in(&file, data_dir, &name, "openclaw")?;
+    let own = &member.settings;
     // The agent half: everything is checked and confirmed before anything
     // is written.
     let gateway = if agent {
-        let access: wats::access::Access = settings
-            .agent
-            .access
-            .as_deref()
-            .unwrap_or("locked")
-            .parse()?;
-        oc::check_access(
-            access,
-            &settings.agent.allow,
-            settings.agent.review == Some(true),
-        )?;
+        let access: wats::access::Access = own.access.as_deref().unwrap_or("locked").parse()?;
+        oc::check_access(access, &own.allow, own.review == Some(true))?;
         println!("Budget: {}", oc::SPEND_CAPS);
         if !asked.yes {
             anyhow::ensure!(
@@ -1335,8 +1392,7 @@ fn setup_openclaw(
                 "cancelled: nothing was changed"
             );
         }
-        let default = settings
-            .agent
+        let default = own
             .openclaw_url
             .clone()
             .unwrap_or_else(|| oc::DEFAULT_URL.to_string());
@@ -1351,7 +1407,7 @@ fn setup_openclaw(
             }
             None => default,
         };
-        oc::check_url(&url, settings.agent.openclaw_insecure_ok == Some(true))?;
+        oc::check_url(&url, own.openclaw_insecure_ok == Some(true))?;
         Some(url.trim().trim_end_matches('/').to_string())
     } else {
         None
@@ -1383,11 +1439,7 @@ fn setup_openclaw(
 
     let (hooks_token, _) = oc::ensure_token(&oc::hooks_token_path(data_dir))?;
     let (runner_token, _) = oc::ensure_token(&oc::runner_token_path(data_dir))?;
-    let agent_profile = settings
-        .agent
-        .profile
-        .clone()
-        .unwrap_or_else(|| format!("{}-agent", os_user_profile()));
+    let agent_profile = member.profile.clone();
     anyhow::ensure!(
         wats::node::is_valid_profile(&agent_profile),
         "agent profile must be 1-64 chars of [a-z0-9_-]"
@@ -1410,8 +1462,7 @@ fn setup_openclaw(
         oc::AGENT_SERVER,
         oc::runner_token_path(data_dir).display()
     );
-    let agent_id = settings
-        .agent
+    let agent_id = own
         .openclaw_agent
         .clone()
         .filter(|a| !a.trim().is_empty())
@@ -1480,13 +1531,12 @@ fn setup_openclaw(
             );
         }
     }
-    let mut file = ConfigFile::open(data_dir)?;
-    file.set("agent.runtime", "openclaw")?;
-    file.set("agent.openclaw_url", &gateway)?;
+    file.set(&format!("agents.{name}.openclaw_url"), &gateway)?;
     file.save()?;
     println!(
-        "{}: agent.runtime = \"openclaw\", agent.openclaw_url = \"{gateway}\"; `wats` now \
-         forwards the agent's runs to the OpenClaw gateway (agent {agent_id})",
+        "{}: agents.{name}.runtime = \"openclaw\", agents.{name}.openclaw_url = \"{gateway}\"; \
+         `wats` now forwards the runs of the agent {name} (profile {agent_profile}) to the \
+         OpenClaw gateway (agent {agent_id})",
         file.path().display()
     );
     Ok(())
@@ -1648,51 +1698,74 @@ fn setup_tool(
         Some(dir) => Some(std::path::absolute(dir)?),
         None => None,
     };
+    // `[agents.<name>]` (ADR 0021): the runtime's, or --name's.
+    let agent_name = keys.name.clone().unwrap_or_else(|| runtime.to_string());
     let pairs: Vec<(&str, String)> = [
-        ("agent.about", keys.about.clone()),
-        ("agent.access", keys.access.clone()),
-        (
-            "agent.workdir",
-            workdir.as_ref().map(|d| d.display().to_string()),
-        ),
-        ("agent.tools", keys.tools.clone()),
-        ("agent.model", keys.model.clone()),
+        ("about", keys.about.clone()),
+        ("access", keys.access.clone()),
+        ("workdir", workdir.as_ref().map(|d| d.display().to_string())),
+        ("tools", keys.tools.clone()),
+        ("model", keys.model.clone()),
     ]
     .into_iter()
     .filter_map(|(k, v)| v.map(|v| (k, v)))
     .collect();
     if agent || !pairs.is_empty() {
         let mut file = ConfigFile::open(data_dir)?;
+        let key = |leaf: &str| format!("agents.{agent_name}.{leaf}");
         if agent {
-            file.set("agent.runtime", runtime)?;
+            file.set(&key("runtime"), runtime)?;
+            if file.get(&key("enabled")).is_some() {
+                file.unset(&key("enabled"))?;
+            }
         }
-        for (key, value) in &pairs {
-            file.set(key, value)?;
+        for (leaf, value) in &pairs {
+            file.set(&key(leaf), value)?;
         }
         file.save()?;
         let settings = Settings::load(data_dir)?;
-        if settings.agent.access.as_deref() == Some("workspace") {
-            let dir = settings
-                .agent
-                .workdir
-                .clone()
-                .unwrap_or_else(|| data_dir.join("agent").join("workspace"));
+        let member = wats::roster::configured(&settings, data_dir, &os_user_profile())?
+            .into_iter()
+            .find(|m| m.name == agent_name);
+        if let Some(member) = &member
+            && member.settings.access.as_deref() == Some("workspace")
+        {
+            let dir = member.workspace();
             wats::access::ensure_workspace(&dir)?;
             println!(
                 "agent workspace: {}\n  instructions: CLAUDE.md / AGENTS.md\n  skills: .claude/skills/\n  \
                  MCP servers: .mcp.json (Claude), .codex/config.toml (Codex)\n  \
-                 built-in tools: wats config set agent.tools Read,Grep",
-                dir.display()
+                 built-in tools: wats config set {} Read,Grep",
+                dir.display(),
+                key("tools")
             );
         }
-        if agent {
+        if agent && let Some(member) = &member {
             println!(
-                "{}: agent.runtime = \"{runtime}\"; `wats` now runs the node with a {name} agent",
-                file.path().display()
+                "{}: {} = \"{runtime}\"; `wats` now runs the node with the {name} agent \
+                 {agent_name} (profile {})",
+                file.path().display(),
+                key("runtime"),
+                member.profile
             );
+            let all: Vec<String> = settings
+                .enabled_agents()
+                .into_iter()
+                .map(|(n, _)| n)
+                .collect();
+            if all.len() > 1 {
+                println!(
+                    "Agents a bare `wats` runs: {} (`wats config set agents.<name>.enabled \
+                     false` to keep one off)",
+                    all.join(", ")
+                );
+            }
         }
-        if file.get("agent.about").is_none() {
-            println!("Describe its role: wats config set agent.about \"I review Rust code and …\"");
+        if file.get(&key("about")).is_none() {
+            println!(
+                "Describe its role: wats config set {} \"I review Rust code and …\"",
+                key("about")
+            );
         }
     }
     Ok(())
@@ -1738,23 +1811,28 @@ fn first_run(cli: &Cli, data_dir: &std::path::Path) -> Result<()> {
 
 /// Record the safety baseline before `wats config set|unset` changes a
 /// safety key, so that the change is flagged even on a first run.
-fn safety_before(data_dir: &std::path::Path, key: &str) -> Option<String> {
-    if !wats::safety::KEYS.contains(&key) {
+/// Returns the changes not yet acknowledged.
+fn safety_before(data_dir: &std::path::Path, key: &str) -> Option<Vec<wats::safety::Change>> {
+    if !wats::safety::is_key(key) {
         return None;
     }
-    if let Err(e) = wats::safety::check(data_dir) {
-        tracing::warn!("{e:#}");
+    match wats::safety::check(data_dir) {
+        Ok(notice) => Some(notice.map(|n| n.changes).unwrap_or_default()),
+        Err(e) => {
+            tracing::warn!("{e:#}");
+            None
+        }
     }
-    wats::safety::current(data_dir).ok()?.remove(key)
 }
 
-/// After `wats config set|unset`: tell the user a safety key changed.
-fn safety_after(data_dir: &std::path::Path, key: &str, before: Option<String>) {
+/// After `wats config set|unset`: tell the user a safety key changed (a
+/// rewritten `[agent]` table alone is no change: [`wats::safety`] carries
+/// its values over).
+fn safety_after(data_dir: &std::path::Path, before: Option<Vec<wats::safety::Change>>) {
     let Some(before) = before else { return };
-    let after = wats::safety::current(data_dir)
-        .ok()
-        .and_then(|mut c| c.remove(key));
-    if after.as_ref() != Some(&before) {
+    if let Ok(Some(notice)) = wats::safety::check(data_dir)
+        && notice.changes.iter().any(|c| !before.contains(c))
+    {
         println!("{}", wats::safety::SET_HINT);
     }
 }
@@ -1774,28 +1852,37 @@ fn config_command(data_dir: &std::path::Path, action: ConfigAction) -> Result<()
                 println!("acknowledged: these values are the new baseline");
             }
         }
-        ConfigAction::Get { key } => {
-            let key = wats::settings::find_key(&key)?;
-            match file.get(key.name) {
+        ConfigAction::Get { key: name } => {
+            let key = wats::settings::find_key(&name)?;
+            match file.lookup(&name)? {
                 Some(value) => println!("{value}"),
-                None => println!("{} (default)", key.default),
+                None => match wats::settings::split_agents_key(&name) {
+                    // An agent's profile defaults to <OS user>-<name>.
+                    Some((agent, "profile")) => println!(
+                        "{} (default)",
+                        wats::roster::default_profile(&os_user_profile(), agent)
+                    ),
+                    _ => println!("{} (default)", key.default),
+                },
             }
         }
         ConfigAction::Set { key, value } => {
-            if key == "agent.workdir" {
+            if key == "agent.workdir"
+                || wats::settings::split_agents_key(&key).is_some_and(|(_, l)| l == "workdir")
+            {
                 wats::access::check_workdir(&data_dir.join(&value), data_dir)?;
             }
             let before = safety_before(data_dir, &key);
             file.set(&key, &value)?;
             file.save()?;
-            safety_after(data_dir, &key, before);
+            safety_after(data_dir, before);
         }
         ConfigAction::Unset { key } => {
             let before = safety_before(data_dir, &key);
             if file.unset(&key)? {
                 file.save()?;
             }
-            safety_after(data_dir, &key, before);
+            safety_after(data_dir, before);
         }
         ConfigAction::List { all } => {
             println!("# {}", file.path().display());
@@ -1804,15 +1891,39 @@ fn config_command(data_dir: &std::path::Path, action: ConfigAction) -> Result<()
                 wats::node::format_bytes(wats::node::dir_size(data_dir)),
                 data_dir.display()
             );
+            // With [agents.<name>] tables, each agent's keys under its name.
+            let agents = file.agent_names();
+            let row = |name: &str, key: &wats::settings::Key| {
+                let value = match file.get(name) {
+                    Some(value) => value,
+                    None => format!("{} (default)", key.default),
+                };
+                println!("{name:<26} {value:<28} # {}", key.help);
+            };
             for key in wats::settings::KEYS
                 .iter()
                 .filter(|k| all || !wats::settings::is_operator_key(k.name))
             {
-                let value = match file.get(key.name) {
-                    Some(value) => value,
-                    None => format!("{} (default)", key.default),
-                };
-                println!("{:<26} {:<28} # {}", key.name, value, key.help);
+                let per_agent = key
+                    .name
+                    .strip_prefix("agent.")
+                    .is_some_and(wats::settings::is_agent_leaf);
+                if !(per_agent && !agents.is_empty()) {
+                    row(key.name, key);
+                }
+            }
+            for agent in &agents {
+                let leaves = wats::settings::KEYS
+                    .iter()
+                    .filter_map(|k| k.name.strip_prefix("agent."))
+                    .filter(|leaf| wats::settings::is_agent_leaf(leaf))
+                    .chain(wats::settings::AGENT_ONLY_KEYS);
+                for leaf in leaves {
+                    let name = format!("agents.{agent}.{leaf}");
+                    if let Ok(key) = wats::settings::find_key(&name) {
+                        row(&name, key);
+                    }
+                }
             }
         }
     }
@@ -2057,13 +2168,27 @@ async fn status_command(config: &NodeConfig, json: bool) -> Result<()> {
             {
                 status["safety"] = notice.into();
             }
-            // What `wats` would run: no agent in config.toml.
-            match Settings::load(&config.data_dir).map(|s| s.agent.runtime) {
-                Ok(None) => status["notice"] = wats::firstrun::NO_AGENT_NOTICE.into(),
-                Ok(Some(runtime)) if runtime == "openclaw" => {
+            // What `wats` would run: the agents of config.toml.
+            if let Ok(settings) = Settings::load(&config.data_dir) {
+                let members =
+                    wats::roster::configured(&settings, &config.data_dir, &os_user_profile())
+                        .unwrap_or_default();
+                if !members.iter().any(|m| m.enabled) {
+                    status["notice"] = wats::firstrun::NO_AGENT_NOTICE.into();
+                }
+                if members
+                    .iter()
+                    .any(|m| m.enabled && m.runtime.as_deref() == Some("openclaw"))
+                {
                     status["budget"] = wats::openclaw::BUDGET.into();
                 }
-                _ => {}
+                if !members.is_empty() {
+                    let now = unix_now();
+                    status["agents"] = members
+                        .iter()
+                        .map(|m| agent_info(m, false).status(now))
+                        .collect();
+                }
             }
             status
         }
@@ -2091,8 +2216,27 @@ async fn status_command(config: &NodeConfig, json: bool) -> Result<()> {
         let retractions = status
             .as_object_mut()
             .and_then(|map| map.remove("agent_retractions"));
+        // One line per agent (ADR 0021).
+        let agents = status.as_object_mut().and_then(|map| map.remove("agents"));
         for line in status_lines("", &status) {
             println!("{line}");
+        }
+        for agent in agents
+            .as_ref()
+            .and_then(|a| a.as_array())
+            .into_iter()
+            .flatten()
+        {
+            let s = |v: &serde_json::Value| v.as_str().unwrap_or("-").to_string();
+            println!(
+                "agent {} ({}): {}, posts as {} · last run {} · budget {}",
+                s(&agent["name"]),
+                s(&agent["runtime"]),
+                s(&agent["state"]),
+                s(&agent["profile"]),
+                s(&agent["last_run"]),
+                s(&agent["budget"]),
+            );
         }
         if let Some(retractions) = &retractions {
             println!("{}", wats::retract::status_line(retractions));
@@ -2323,12 +2467,17 @@ impl NodeArgs {
         // once its hooks are set up (`wats setup openclaw --agent`).
         let hooks_token = wats::openclaw::hooks_token_path(&config.data_dir);
         if hooks_token.exists() && file.openclaw.notify_asks != Some(false) {
+            // The gateway of the node's OpenClaw agent (`[agents.<name>]`
+            // with `runtime = "openclaw"`), else the old `[agent]` table's.
+            let url = file
+                .agents
+                .values()
+                .filter(|a| a.runtime.as_deref() == Some("openclaw"))
+                .find_map(|a| a.openclaw_url.clone())
+                .or_else(|| file.agent.openclaw_url.clone())
+                .unwrap_or_else(|| wats::openclaw::DEFAULT_URL.to_string());
             config.openclaw_notify = Some(wats::openclaw::Notify {
-                url: file
-                    .agent
-                    .openclaw_url
-                    .clone()
-                    .unwrap_or_else(|| wats::openclaw::DEFAULT_URL.to_string()),
+                url,
                 token_file: hooks_token,
             });
         }
@@ -2385,13 +2534,14 @@ impl NodeArgs {
             ),
             None => None,
         };
-        if file.agent.review == Some(true) {
-            config.review_profiles.push(
-                file.agent
-                    .profile
-                    .clone()
-                    .unwrap_or_else(|| format!("{}-agent", os_user_profile())),
-            );
+        // Every agent with review on (ADR 0021): `wats mcp` sessions as
+        // its profile are held too.
+        for member in wats::roster::configured(file, &config.data_dir, &os_user_profile())? {
+            if member.settings.review == Some(true)
+                && !config.review_profiles.contains(&member.profile)
+            {
+                config.review_profiles.push(member.profile);
+            }
         }
         if let Some(profile) = self.profile.as_ref().or(file.profile.as_ref()) {
             anyhow::ensure!(
@@ -2475,16 +2625,14 @@ fn spawn_background_node(args: &NodeArgs, dir: &std::path::Path, idle_exit: u64)
         .create(true)
         .append(true)
         .open(dir.join("node.log"))?;
+    // A node started for a session runs no agent of config.toml, unless
+    // agent.with_mcp (ADR 0021 §3).
+    let with_mcp = Settings::load(dir).is_ok_and(|s| s.agent.with_mcp == Some(true));
     let child = std::process::Command::new(std::env::current_exe()?)
         .args(args.to_args(dir))
-        // A node started for a session never runs the agents of config.toml.
-        .args([
-            "node",
-            "--quiet",
-            "--no-agent",
-            "--idle-exit",
-            &idle_exit.to_string(),
-        ])
+        .args(["node", "--quiet"])
+        .args((!with_mcp).then_some("--no-agent"))
+        .args(["--idle-exit", &idle_exit.to_string()])
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(log)
@@ -2596,7 +2744,8 @@ struct NodeRun {
     /// Print what arrives as JSON lines on stdout (`wats node`).
     json_lines: bool,
     idle_exit: Option<u64>,
-    agent: Option<wats::agent::AgentConfig>,
+    /// The agents to run, by name.
+    agents: Vec<(String, wats::agent::AgentConfig)>,
 }
 
 async fn run_node(node: Arc<Node>, run: NodeRun, mut shutdown: Shutdown) -> Result<()> {
@@ -2610,7 +2759,7 @@ async fn run_node(node: Arc<Node>, run: NodeRun, mut shutdown: Shutdown) -> Resu
         blobs,
         json_lines,
         idle_exit,
-        agent,
+        agents,
     } = run;
     let quiet = !json_lines;
     let print_line = move |value: serde_json::Value| {
@@ -2650,24 +2799,40 @@ async fn run_node(node: Arc<Node>, run: NodeRun, mut shutdown: Shutdown) -> Resu
             },
         ))
     };
+    // One supervised runner per agent (ADR 0021), its logs in a span with
+    // its name.
     let (stop_agent, agent_stopped) = tokio::sync::watch::channel(false);
-    let agent = agent.map(|config| {
-        let node = Arc::clone(&node);
-        tokio::spawn(wats::supervise::supervise("agent runner", move || {
-            let (node, config) = (Arc::clone(&node), config.clone());
-            let mut stopped = agent_stopped.clone();
-            async move {
-                // Not restarted once the node is stopping.
-                if *stopped.borrow() {
-                    return Ok(());
-                }
-                wats::agent::run(node, config, async move {
-                    let _ = stopped.wait_for(|stop| *stop).await;
+    let agents: Vec<(String, tokio::task::JoinHandle<_>)> = agents
+        .into_iter()
+        .map(|(name, config)| {
+            let node = Arc::clone(&node);
+            let agent_stopped = agent_stopped.clone();
+            let label = format!("agent runner {name}");
+            let span = tracing::info_span!("agent", name = %name);
+            let handle = tokio::spawn(async move {
+                wats::supervise::supervise(&label, move || {
+                    let (node, config) = (Arc::clone(&node), config.clone());
+                    let mut stopped = agent_stopped.clone();
+                    let span = span.clone();
+                    tracing::Instrument::instrument(
+                        async move {
+                            // Not restarted once the node is stopping.
+                            if *stopped.borrow() {
+                                return Ok(());
+                            }
+                            wats::agent::run(node, config, async move {
+                                let _ = stopped.wait_for(|stop| *stop).await;
+                            })
+                            .await
+                        },
+                        span,
+                    )
                 })
                 .await
-            }
-        }))
-    });
+            });
+            (name, handle)
+        })
+        .collect();
     // Guardian halts (ADR 0016 §3): relay, marker, then stop below.
     node.enforce_halts();
     let mut halt_outcome = node.halt_outcome();
@@ -2763,11 +2928,11 @@ async fn run_node(node: Arc<Node>, run: NodeRun, mut shutdown: Shutdown) -> Resu
         }
     }
     reviewed.abort();
-    if let Some(agent) = agent {
-        let _ = stop_agent.send(true);
+    let _ = stop_agent.send(true);
+    for (name, agent) in agents {
         match agent.await {
-            Ok(Some(Err(e))) => tracing::warn!("agent runner: {e:#}"),
-            Err(e) => tracing::warn!("agent runner: {e}"),
+            Ok(Some(Err(e))) => tracing::warn!("agent runner {name}: {e:#}"),
+            Err(e) => tracing::warn!("agent runner {name}: {e}"),
             Ok(Some(Ok(())) | None) => {}
         }
     }
@@ -2775,37 +2940,79 @@ async fn run_node(node: Arc<Node>, run: NodeRun, mut shutdown: Shutdown) -> Resu
     node.shutdown().await
 }
 
-/// The agent runner configuration: flags, then config.toml, then defaults.
-/// `None` when no agent is enabled.
+/// The agents of this run (ADR 0021): none with `--no-agent`, those of
+/// `--agent` if any, else every enabled agent of config.toml. A
+/// background node (`--idle-exit`) runs none unless `agent.with_mcp`.
+fn agent_members(
+    args: &AgentArgs,
+    settings: &Settings,
+    data_dir: &std::path::Path,
+    background: bool,
+) -> Result<Vec<wats::roster::Member>> {
+    if args.no_agent
+        || (background && args.agents.is_empty() && settings.agent.with_mcp != Some(true))
+    {
+        return Ok(Vec::new());
+    }
+    let mut members = wats::roster::select(settings, data_dir, &os_user_profile(), &args.agents)?;
+    if let Some(profile) = &args.agent_profile {
+        anyhow::ensure!(
+            members.len() <= 1,
+            "--agent-profile names one agent's profile: this run has {} agents ({})",
+            members.len(),
+            members
+                .iter()
+                .map(|m| m.name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        for member in &mut members {
+            member.profile = profile.clone();
+        }
+    }
+    wats::roster::check_distinct(&members)?;
+    Ok(members)
+}
+
+/// One agent as `status` shows it.
+fn agent_info(member: &wats::roster::Member, running: bool) -> wats::agent::AgentInfo {
+    let mut budget = budget_of(&member.settings);
+    if member.runtime.as_deref() == Some("openclaw") {
+        budget.max_usd_per_day = f64::INFINITY;
+        budget.max_usd_per_month = f64::INFINITY;
+    }
+    wats::agent::AgentInfo {
+        name: member.name.clone(),
+        runtime: member.runtime.clone(),
+        profile: member.profile.clone(),
+        enabled: member.enabled,
+        running,
+        work_dir: member.work_dir.clone(),
+        budget,
+    }
+}
+
+/// One agent runner's configuration: flags (they apply to every agent of
+/// the run), then its table in config.toml, then defaults.
 fn agent_config(
     node_args: &NodeArgs,
     args: &AgentArgs,
-    file: &wats::settings::AgentSettings,
+    member: &wats::roster::Member,
     data_dir: &std::path::Path,
-) -> Result<Option<wats::agent::AgentConfig>> {
-    let runtimes = if args.no_agent {
-        Vec::new()
-    } else if !args.agents.is_empty() {
-        args.agents.clone()
-    } else {
-        file.runtime.iter().cloned().collect()
-    };
-    // One runtime today (claude).
-    let Some(runtime) = runtimes.first().cloned() else {
-        return Ok(None);
-    };
+) -> Result<wats::agent::AgentConfig> {
+    let file = &member.settings;
+    let runtime = member
+        .runtime
+        .clone()
+        .with_context(|| format!("agent {}: no runtime", member.name))?;
     let file_duration = |value: &Option<String>, what: &str| -> Result<Option<Duration>> {
         value
             .as_deref()
             .map(parse_duration)
             .transpose()
-            .map_err(|e| anyhow::anyhow!("config.toml agent.{what}: {e}"))
+            .map_err(|e| anyhow::anyhow!("config.toml agent {}: {what}: {e}", member.name))
     };
-    let profile = args
-        .agent_profile
-        .clone()
-        .or(file.profile.clone())
-        .unwrap_or_else(|| format!("{}-agent", os_user_profile()));
+    let profile = member.profile.clone();
     anyhow::ensure!(
         wats::node::is_valid_profile(&profile),
         "agent profile must be 1-64 chars of [a-z0-9_-]"
@@ -2884,7 +3091,7 @@ fn agent_config(
             .map_err(|e| anyhow::anyhow!("config.toml agent.catchup: {e}"))?,
         None => Some(wats::agent::DEFAULT_CATCHUP),
     };
-    Ok(Some(wats::agent::AgentConfig {
+    Ok(wats::agent::AgentConfig {
         catchup,
         openclaw,
         runtime,
@@ -2896,10 +3103,7 @@ fn agent_config(
             .filter(|m| !m.trim().is_empty()),
         codex_disable: Vec::new(),
         access,
-        workdir: file
-            .workdir
-            .clone()
-            .unwrap_or_else(|| data_dir.join("agent").join("workspace")),
+        workdir: member.workspace(),
         tools: file.tools.clone(),
         profile,
         user: std::env::var("USER")
@@ -2929,7 +3133,8 @@ fn agent_config(
             .run_timeout
             .or(file_duration(&file.timeout, "timeout")?)
             .unwrap_or(Duration::from_secs(10 * 60)),
-        work_dir: data_dir.join("agent"),
+        work_dir: member.work_dir.clone(),
+        data_dir: data_dir.to_path_buf(),
         max_turns: file.max_turns.unwrap_or(10),
         budget,
         wakes: {
@@ -2947,7 +3152,7 @@ fn agent_config(
         },
         keep_runs: file.keep_runs.unwrap_or(200),
         keep_days: file.keep_days.unwrap_or(30),
-    }))
+    })
 }
 
 /// `30s`, `5m`, `2h`, `90s`: the largest unit that divides evenly.
@@ -2981,7 +3186,7 @@ fn unix_now() -> u64 {
 }
 
 /// What a foreground node prints on start (stderr: stdout may carry JSON).
-fn print_banner(config: &NodeConfig, agent: Option<&wats::agent::AgentConfig>) {
+fn print_banner(config: &NodeConfig, agents: &[(String, wats::agent::AgentConfig)]) {
     let home = std::env::home_dir();
     let dir = match home
         .as_deref()
@@ -3030,30 +3235,57 @@ fn print_banner(config: &NodeConfig, agent: Option<&wats::agent::AgentConfig>) {
             }
         );
     }
-    match agent {
-        Some(agent) => eprintln!(
-            "agent {} ({}): on, posts as {} · wakes on asks and replies (every {} at most), heartbeat {} · watch it: wats agent logs -f",
-            agent.runtime,
-            agent.model.as_deref().unwrap_or("default model"),
+    if agents.is_empty() {
+        eprintln!("agent: off · {}", wats::firstrun::NO_AGENT_NOTICE);
+    }
+    if agents.len() > 1 {
+        eprintln!(
+            "agents: {} · watch one: wats agent logs -f --name <name>",
+            agents
+                .iter()
+                .map(|(name, a)| format!("{name} ({} as {})", a.runtime, a.profile))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+    for (name, agent) in agents {
+        // `agent claude (sonnet)`, or `agent reviewer (claude, sonnet)`.
+        let model = agent.model.as_deref().unwrap_or("default model");
+        let title = if *name == agent.runtime {
+            format!("agent {name} ({model})")
+        } else {
+            format!("agent {name} ({}, {model})", agent.runtime)
+        };
+        // Lines about one of several agents say which.
+        let who = if agents.len() > 1 {
+            format!("agent {name}")
+        } else {
+            "agent".to_string()
+        };
+        let watch = if agents.len() > 1 {
+            format!("wats agent logs -f --name {name}")
+        } else {
+            "wats agent logs -f".to_string()
+        };
+        eprintln!(
+            "{title}: on, posts as {} · wakes on asks and replies (every {} at most), heartbeat {} · watch it: {watch}",
             agent.profile,
             short_duration(agent.every),
             short_duration(agent.heartbeat),
-        ),
-        None => eprintln!("agent: off · {}", wats::firstrun::NO_AGENT_NOTICE),
-    }
-    if let Some(agent) = agent {
+        );
+        let review = config.review_profiles.contains(&agent.profile);
         let summary = wats::access::describe(&wats::access::Describe {
             runtime: &agent.runtime,
             access: agent.access,
             workdir: &agent.workdir,
             tools: &agent.tools,
             allow: &agent.allow,
-            review: config.review_profiles.contains(&agent.profile),
+            review,
         });
         eprintln!(
-            "agent access: {}{}",
+            "{who} access: {}{}",
             summary.line,
-            if config.review_profiles.contains(&agent.profile) {
+            if review {
                 " · review on: its posts wait for `wats agent approve`"
             } else {
                 ""
@@ -3064,22 +3296,13 @@ fn print_banner(config: &NodeConfig, agent: Option<&wats::agent::AgentConfig>) {
         }
         if !agent.ignore_local {
             eprintln!(
-                "agent wakes on posts by this node's other profiles too (agent.ignore_local = false)"
+                "{who} wakes on posts by this node's other profiles too (agent.ignore_local = false)"
             );
         }
-        let pending = pending_lines(&config.data_dir);
-        if !pending.is_empty() {
-            eprintln!("review: {} posts pending", pending.len());
-            for line in pending.iter().take(5) {
-                eprintln!("  {line}");
-            }
-        }
-    }
-    if let Some(agent) = agent {
         let spend = wats::budget::spend(&agent.work_dir, unix_now());
         if agent.runtime == "openclaw" {
             eprintln!(
-                "agent forwards to OpenClaw {} (agent {}) · budget: {}: spend caps belong on the \
+                "{who} forwards to OpenClaw {} (agent {}) · budget: {}: spend caps belong on the \
                  OpenClaw side · {} of {} runs today · {} per run",
                 agent.openclaw.url,
                 agent.openclaw.agent,
@@ -3091,28 +3314,110 @@ fn print_banner(config: &NodeConfig, agent: Option<&wats::agent::AgentConfig>) {
         } else if agent.runtime == "codex" {
             // Codex reports tokens, not dollars: runs are what is counted.
             eprintln!(
-                "agent budget: {} of {} runs today (Codex reports no cost) · {} per run",
+                "{who} budget: {} of {} runs today (Codex reports no cost) · {} per run",
                 spend.uncosted_today,
                 agent.budget.max_runs_per_day,
                 short_duration(agent.run_timeout)
             );
         } else {
             eprintln!(
-                "agent budget: {} · {} turns and {} per run",
+                "{who} budget: {} · {} turns and {} per run",
                 wats::budget::describe(&agent.budget, &spend),
                 agent.max_turns,
                 short_duration(agent.run_timeout)
             );
         }
     }
+    if !agents.is_empty() {
+        let pending = pending_lines(&config.data_dir);
+        if !pending.is_empty() {
+            eprintln!("review: {} posts pending", pending.len());
+            for line in pending.iter().take(5) {
+                eprintln!("  {line}");
+            }
+        }
+    }
     eprintln!("Ctrl-C to stop · wats --help");
 }
 
 /// `wats agent logs | runs | attach`.
-async fn agent_watch(data_dir: &std::path::Path, action: AgentAction) -> Result<()> {
+/// The agent `wats agent` is about: `--name`'s, else the only one.
+/// `None`: no agent in config.toml (the single agent's `<data dir>/agent`),
+/// or several and `needed` is false (the held posts are the node's).
+fn watched_agent(
+    data_dir: &std::path::Path,
+    settings: &Settings,
+    name: Option<&str>,
+    needed: bool,
+) -> Result<Option<wats::roster::Member>> {
+    let user = os_user_profile();
+    let members = wats::roster::configured(settings, data_dir, &user).unwrap_or_default();
+    let names = || {
+        members
+            .iter()
+            .map(|m| m.name.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    match name {
+        Some(name) => {
+            if let Some(member) = members.iter().find(|m| m.name == name) {
+                return Ok(Some(member.clone()));
+            }
+            // An agent run as `--agent <runtime>:<name>`, with no table.
+            let member = wats::roster::unnamed(name, data_dir, &user);
+            anyhow::ensure!(
+                member.work_dir.is_dir(),
+                "no agent named {name:?} (agents: {})",
+                if members.is_empty() {
+                    "none".to_string()
+                } else {
+                    names()
+                }
+            );
+            Ok(Some(member))
+        }
+        None => match members.as_slice() {
+            [] => Ok(None),
+            [only] => Ok(Some(only.clone())),
+            _ if !needed => Ok(None),
+            _ => anyhow::bail!("several agents ({}): add --name <name>", names()),
+        },
+    }
+}
+
+/// With `--name`: the held post `id` must be that agent's.
+fn held_by(data_dir: &std::path::Path, id: &str, profile: Option<&str>) -> Result<()> {
+    if let Some(profile) = profile {
+        let held = wats::review::load(data_dir, id)?;
+        anyhow::ensure!(
+            held.profile == profile,
+            "held post {id} is {}'s, not {profile}'s",
+            held.profile
+        );
+    }
+    Ok(())
+}
+
+async fn agent_watch(
+    data_dir: &std::path::Path,
+    name: Option<&str>,
+    action: AgentAction,
+) -> Result<()> {
     use std::io::IsTerminal;
     use wats::runs;
-    let work_dir = data_dir.join("agent");
+    // A config.toml that does not load must not hide the runs.
+    let settings = Settings::load(data_dir).unwrap_or_default();
+    let needed = matches!(
+        action,
+        AgentAction::Runs { .. } | AgentAction::Logs { .. } | AgentAction::Attach
+    );
+    let member = watched_agent(data_dir, &settings, name, needed)?;
+    let work_dir = member
+        .as_ref()
+        .map_or_else(|| data_dir.join("agent"), |m| m.work_dir.clone());
+    // `--name`: the held posts of that agent only.
+    let profile = name.and(member.as_ref()).map(|m| m.profile.clone());
     let style = runs::Style {
         color: std::io::stdout().is_terminal(),
     };
@@ -3174,10 +3479,12 @@ async fn agent_watch(data_dir: &std::path::Path, action: AgentAction) -> Result<
                     .iter()
                     .filter_map(|r| r.cost_usd)
                     .fold(0.0, |a, b| a + b);
-                // A config.toml that does not load must not hide the runs.
-                let settings = Settings::load(data_dir).unwrap_or_default();
-                let mut budget = budget_of(&settings.agent);
-                let openclaw = settings.agent.runtime.as_deref() == Some("openclaw");
+                let own = member.as_ref().map_or(&settings.agent, |m| &m.settings);
+                let mut budget = budget_of(own);
+                let openclaw = member
+                    .as_ref()
+                    .map_or(settings.agent.runtime.as_deref(), |m| m.runtime.as_deref())
+                    == Some("openclaw");
                 if openclaw {
                     budget.max_usd_per_day = f64::INFINITY;
                     budget.max_usd_per_month = f64::INFINITY;
@@ -3290,7 +3597,10 @@ async fn agent_watch(data_dir: &std::path::Path, action: AgentAction) -> Result<
             write!(out, "{text}")
         }
         AgentAction::Pending { show: None } => {
-            let held = wats::review::list(data_dir);
+            let mut held = wats::review::list(data_dir);
+            if let Some(profile) = &profile {
+                held.retain(|h| h.profile == *profile);
+            }
             if held.is_empty() {
                 writeln!(out, "nothing held for review")
             } else {
@@ -3330,6 +3640,7 @@ async fn agent_watch(data_dir: &std::path::Path, action: AgentAction) -> Result<
             }
         }
         AgentAction::Approve { id, edit } => {
+            held_by(data_dir, &id, profile.as_deref())?;
             if edit {
                 edit_held(data_dir, &id)?;
             }
@@ -3341,6 +3652,7 @@ async fn agent_watch(data_dir: &std::path::Path, action: AgentAction) -> Result<
             )
         }
         AgentAction::Reject { id, reason } => {
+            held_by(data_dir, &id, profile.as_deref())?;
             let held = wats::review::reject(data_dir, &id, reason.as_deref())?;
             writeln!(
                 out,
@@ -3518,9 +3830,9 @@ async fn main() -> Result<()> {
             return guardian_command(&cli.node, &data_dir, action).await;
         }
         Some(Command::Resume) => return resume_command(&data_dir),
-        Some(Command::Agent { action }) => {
+        Some(Command::Agent { name, action }) => {
             return tokio::select! {
-                result = agent_watch(&data_dir, action) => result,
+                result = agent_watch(&data_dir, name.as_deref(), action) => result,
                 _ = shutdown => Ok(()),
             };
         }
@@ -3589,6 +3901,7 @@ async fn main() -> Result<()> {
                     print,
                     yes,
                     url,
+                    name,
                     openclaw,
                 }),
         }) => {
@@ -3603,6 +3916,7 @@ async fn main() -> Result<()> {
                     print,
                     yes,
                     url,
+                    name,
                 },
                 &openclaw,
             );
@@ -3687,7 +4001,22 @@ async fn main() -> Result<()> {
             unreachable!("handled above")
         }
     };
-    let agent = agent_config(&cli.node, &daemon.agent, &settings.agent, &data_dir)?;
+    // The agents of this run (ADR 0021), one runner each.
+    let members = agent_members(
+        &daemon.agent,
+        &settings,
+        &data_dir,
+        daemon.idle_exit.is_some(),
+    )?;
+    let agents: Vec<(String, wats::agent::AgentConfig)> = members
+        .iter()
+        .map(|m| {
+            Ok((
+                m.name.clone(),
+                agent_config(&cli.node, &daemon.agent, m, &data_dir)?,
+            ))
+        })
+        .collect::<Result<_>>()?;
     // Safety settings changed since the user last acknowledged them (an
     // agent may have edited config.toml): warn at every start until
     // `wats config ack`.
@@ -3696,18 +4025,28 @@ async fn main() -> Result<()> {
         Ok(None) => {}
         Err(e) => tracing::warn!("safety settings could not be checked: {e:#}"),
     }
-    if let Some(agent) = &agent
-        && settings.agent.review == Some(true)
-        && !config.review_profiles.contains(&agent.profile)
-    {
-        config.review_profiles.push(agent.profile.clone());
+    for (member, (_, agent)) in members.iter().zip(&agents) {
+        if member.settings.review == Some(true) && !config.review_profiles.contains(&agent.profile)
+        {
+            config.review_profiles.push(agent.profile.clone());
+        }
     }
     // `--agent claude|codex` also makes sure that tool's sessions see the
-    // swarm (OpenClaw: `wats setup openclaw`, which never runs here).
-    if let Some(agent) = &agent
-        && daemon.agent.agents.contains(&agent.runtime)
-        && agent.runtime != "openclaw"
-    {
+    // swarm (OpenClaw: `wats setup openclaw`, which never runs here); once
+    // per runtime.
+    let mut registered_runtimes = Vec::new();
+    for (_, agent) in &agents {
+        if !daemon
+            .agent
+            .agents
+            .iter()
+            .any(|s| s.runtime == agent.runtime)
+            || agent.runtime == "openclaw"
+            || registered_runtimes.contains(&agent.runtime)
+        {
+            continue;
+        }
+        registered_runtimes.push(agent.runtime.clone());
         let profile = human_profile(&cli.node, &settings)?;
         let (name, registered) = if agent.runtime == "codex" {
             (
@@ -3734,9 +4073,20 @@ async fn main() -> Result<()> {
     if daemon.idle_exit.is_some() {
         config.role = wats::node::NodeRole::Background;
     }
-    config.runner = agent
-        .as_ref()
-        .map(|a| format!("{} as {}", a.runtime, a.profile));
+    config.runners = agents
+        .iter()
+        .map(|(_, a)| format!("{} as {}", a.runtime, a.profile))
+        .collect();
+    // For `status`: the agents of config.toml, and those of this run.
+    let configured =
+        wats::roster::configured(&settings, &data_dir, &os_user_profile()).unwrap_or_default();
+    config.agents = configured
+        .iter()
+        .filter(|c| !members.iter().any(|m| m.name == c.name))
+        .map(|c| agent_info(c, false))
+        .chain(members.iter().map(|m| agent_info(m, true)))
+        .collect();
+    config.agents.sort_by(|a, b| a.name.cmp(&b.name));
     config.relaunch_args = cli.node.to_args(&data_dir);
     if let Some(secs) = daemon.wait_lock {
         config.lock_wait = Duration::from_secs(secs);
@@ -3758,8 +4108,8 @@ async fn main() -> Result<()> {
             );
             eprintln!("{}", wats::banner::render(env!("CARGO_PKG_VERSION"), color));
         }
-        print_banner(&config, agent.as_ref());
-    } else if agent.is_none() && daemon.idle_exit.is_none() {
+        print_banner(&config, &agents);
+    } else if agents.is_empty() && daemon.idle_exit.is_none() {
         tracing::info!("{}", wats::firstrun::NO_AGENT_NOTICE);
     }
     crash_context(&config);
@@ -3803,7 +4153,7 @@ async fn main() -> Result<()> {
         blobs: daemon.blobs,
         json_lines: json_lines && !daemon.quiet,
         idle_exit: daemon.idle_exit,
-        agent,
+        agents,
     };
     let result = run_node(node, run, shutdown).await;
     if let Err(e) = &result

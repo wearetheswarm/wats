@@ -93,10 +93,10 @@ pub fn runner_token_path(data_dir: &Path) -> PathBuf {
     dir(data_dir).join("runner.token")
 }
 
-/// Whether a node's runner (`NodeConfig::runner`, "openclaw as …") is
-/// OpenClaw.
-pub fn is_runner(runner: Option<&str>) -> bool {
-    runner.is_some_and(|r| r.starts_with("openclaw "))
+/// Whether one of a node's runners (`NodeConfig::runners`, "openclaw as
+/// …") is OpenClaw.
+pub fn is_runner(runners: &[String]) -> bool {
+    runners.iter().any(|r| r.starts_with("openclaw "))
 }
 
 /// Whether `host` is loopback (127.0.0.0/8, ::1, `localhost`).

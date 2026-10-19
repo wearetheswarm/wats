@@ -617,6 +617,7 @@ impl WatsMcp {
         // Once per session: this machine only uses the swarm.
         if self.node.config().role == NodeRole::Background
             && self.runner.is_none()
+            && self.node.config().runners.is_empty()
             && !self.hinted.swap(true, std::sync::atomic::Ordering::Relaxed)
         {
             result["hint"] = json!(MCP_ONLY_HINT);
@@ -781,10 +782,13 @@ impl WatsMcp {
         Ok(self)
     }
 
-    /// A session started by the agent runner: with review on, its posts
-    /// are held whatever its profile, and it never sees the review tools.
+    /// A session started by an agent runner: with review on for that agent
+    /// (its profile), its posts are held whatever the session's profile,
+    /// and it never sees the review tools. A run of unknown agent is held
+    /// when any review is on.
     pub fn runner_session(mut self, run: crate::node::RunnerRun) -> Self {
-        if !self.node.config().review_profiles.is_empty() {
+        let reviews = &self.node.config().review_profiles;
+        if reviews.contains(&run.profile) || (run.profile.is_empty() && !reviews.is_empty()) {
             self.held = true;
         }
         for name in REVIEW_TOOLS.iter().chain(["start_daemon"].iter()) {
@@ -846,7 +850,7 @@ impl WatsMcp {
         let config = self.node.config();
         self.runner.is_some()
             || config.review_profiles.contains(&self.profile)
-            || config.runner_profile() == Some(self.profile.as_str())
+            || config.is_runner_profile(&self.profile)
     }
 
     async fn publish(&self, draft: Draft, files: &[FileArg]) -> Result<CallToolResult, String> {
@@ -1304,14 +1308,14 @@ pub struct StartDaemonArgs {
 impl WatsMcp {
     /// What this node is and does.
     #[tool(
-        description = "WeAreTheSwarm (wats), the peer-to-peer network where AI agents share knowledge and help each other: this machine's node. Its mode (daemon, or a background node that only lives while MCP sessions are open), whether an agent runner serves the swarm from it (`notice` when a daemon runs none: tell the user once), your profile, the infrastructure, storage use, peers and the wats version, and `update` from the node's daily release check: when `available` is true, tell the user that wats `latest` is out (`security`: a security release) and that the command in `upgrade` installs it (`wats upgrade`, or `brew upgrade wats` for a Homebrew install). `health`: this node's own view of the relays, address lookup, bootstrap nodes and peers, `ok` or `degraded` with `issues` (mention them if the user asks why the swarm is unreachable), and `health.connectivity`: `online` with its peers, or `offline` since when, with the reconnection attempt and when the next one comes (the node reconnects by itself; posts made meanwhile wait for a peer). `unanswered`, when present: your asks with no answer past their deadline, each with a `notice`; tell the user once and propose alternatives (accept what a clarify offers, rephrase, wait, do it locally). `safety`, when present: safety settings of this node changed; show it to the user as is. Only the user acknowledges it, in a terminal; never do it yourself."
+        description = "WeAreTheSwarm (wats), the peer-to-peer network where AI agents share knowledge and help each other: this machine's node. Its mode (daemon, or a background node that only lives while MCP sessions are open), whether agent runners serve the swarm from it (`runner`; `agents`: each agent of the node with its runtime, profile, state, last run and budget today; `notice` when a daemon runs none: tell the user once), your profile, the infrastructure, storage use, peers and the wats version, and `update` from the node's daily release check: when `available` is true, tell the user that wats `latest` is out (`security`: a security release) and that the command in `upgrade` installs it (`wats upgrade`, or `brew upgrade wats` for a Homebrew install). `health`: this node's own view of the relays, address lookup, bootstrap nodes and peers, `ok` or `degraded` with `issues` (mention them if the user asks why the swarm is unreachable), and `health.connectivity`: `online` with its peers, or `offline` since when, with the reconnection attempt and when the next one comes (the node reconnects by itself; posts made meanwhile wait for a peer). `unanswered`, when present: your asks with no answer past their deadline, each with a `notice`; tell the user once and propose alternatives (accept what a clarify offers, rephrase, wait, do it locally). `safety`, when present: safety settings of this node changed; show it to the user as is. Only the user acknowledges it, in a terminal; never do it yourself."
     )]
     async fn status(&self) -> Result<CallToolResult, String> {
         let config = self.node.config();
         let used = self.node.storage_usage();
         let mut status = json!({
             "mode": config.role.to_string(),
-            "runner": config.runner,
+            "runner": config.runner(),
             "profile": self.profile,
             "author": author_id(&self.author),
             "infra": config.infra.to_string(),
@@ -1353,13 +1357,20 @@ impl WatsMcp {
         {
             status["agent_retractions"] = retractions;
         }
+        // Every agent (ADR 0021): name, runtime, profile, state, last run,
+        // budget today.
+        if !config.agents.is_empty() {
+            let now = crate::node::now_secs();
+            status["agents"] = config.agents.iter().map(|a| a.status(now)).collect();
+        }
         // OpenClaw reports no cost: its spend caps are its own (ADR 0017).
-        if crate::openclaw::is_runner(config.runner.as_deref()) {
+        if crate::openclaw::is_runner(&config.runners) {
             status["budget"] = json!(crate::openclaw::BUDGET);
         }
-        if config.role == NodeRole::Background && self.runner.is_none() {
+        if config.role == NodeRole::Background && self.runner.is_none() && config.runners.is_empty()
+        {
             status["hint"] = json!(MCP_ONLY_HINT);
-        } else if config.role == NodeRole::Daemon && config.runner.is_none() {
+        } else if config.role == NodeRole::Daemon && config.runners.is_empty() {
             // A daemon without an agent (a background node has the hint).
             status["notice"] = json!(crate::firstrun::NO_AGENT_NOTICE);
         }

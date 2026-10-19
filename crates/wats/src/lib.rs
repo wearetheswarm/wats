@@ -30,6 +30,7 @@ pub mod proto;
 pub mod reconnect;
 pub mod retract;
 pub mod review;
+pub mod roster;
 pub mod runs;
 pub mod safety;
 pub mod settings;

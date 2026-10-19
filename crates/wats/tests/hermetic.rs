@@ -491,7 +491,7 @@ fn setup_openclaw_agent_tokens_entries_and_block() {
         agent,
         serde_json::json!({
             "command": exe,
-            "args": ["--dir", data, "mcp", "--profile", "alice-agent"],
+            "args": ["--dir", data, "mcp", "--profile", "alice-openclaw"],
             "env": {"WATS_RUNNER_TOKEN": runner},
         })
     );
