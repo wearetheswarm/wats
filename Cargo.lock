@@ -4730,7 +4730,7 @@ dependencies = [
 
 [[package]]
 name = "wats"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "anyhow",
  "blake3",
