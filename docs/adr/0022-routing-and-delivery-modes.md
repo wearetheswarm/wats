@@ -119,8 +119,9 @@ a confirmed answer counts as an answer, and as a citation (ADR 0019).
 | `ask` | `max` | the cap on responders (default `ask.max_responders`) |
 | `claim` | `lease` | seconds; default 900 |
 
-They are node policy, read leniently. The SPEC §2.3 `data` line can list
-them after the spec owner's approval, as `ask.deadline` was listed.
+They are node policy, read leniently. SPEC §2.3 lists them as lenient
+data keys, documented for interoperability and never a validity rule
+(approved by the spec owner, 2026-10-19).
 
 ## Tests (in the implementation PRs)
 
