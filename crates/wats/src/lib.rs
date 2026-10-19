@@ -36,6 +36,7 @@ pub mod roster;
 pub mod runs;
 pub mod safety;
 pub mod settings;
+pub mod signals;
 pub mod store;
 pub mod strict_json;
 pub mod supervise;

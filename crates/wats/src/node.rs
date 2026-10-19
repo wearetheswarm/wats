@@ -2129,6 +2129,28 @@ impl Node {
         profile.is_some() || self.store.ask_notify(&ask.id).ok().flatten().is_some()
     }
 
+    /// Author ids of this node's profiles: those used since it started,
+    /// and those of its config (default profile, agents, runners, review).
+    /// The node groups them as one author: their signals on each other's
+    /// posts count zero (ADR 0019 §2.4).
+    pub fn local_authors(&self) -> HashSet<String> {
+        let mut local: HashSet<String> = self
+            .local_authors
+            .lock()
+            .map(|l| l.keys().cloned().collect())
+            .unwrap_or_default();
+        local.insert(self.author_id());
+        let config = &self.config;
+        let profiles = std::iter::once(config.profile.as_str())
+            .chain(config.runner_profiles())
+            .chain(config.agents.iter().map(|a| a.profile.as_str()))
+            .chain(config.review_profiles.iter().map(String::as_str));
+        for profile in profiles.filter(|p| is_valid_profile(p)) {
+            local.insert(author_id(&self.root.profile_key(profile)));
+        }
+        local
+    }
+
     /// Whether `author` is the key of one of this node's agents (a runner
     /// profile, ADR 0021): a local author that is not the human.
     pub fn is_local_agent_author(&self, author: &str) -> bool {
