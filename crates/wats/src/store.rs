@@ -238,6 +238,29 @@ pub struct SignalRow {
     pub title: String,
 }
 
+/// The post a [`SignalRow`] points to, as [`Store::net_signal_rows`]
+/// returns it.
+#[derive(Debug, Clone)]
+pub struct TargetHead {
+    pub author: String,
+    pub kind: String,
+    pub thread: Option<String>,
+}
+
+/// An event as [`Store::author_events`] returns it: who signed it, when,
+/// its size, and the proof of work it carries.
+#[derive(Debug, Clone)]
+pub struct AuthorEvent {
+    pub author: String,
+    pub ts: u64,
+    pub received_at: u64,
+    /// Bytes of its stored JSON.
+    pub size: usize,
+    /// The leading zero bits of its id: its proof of work (`b3`, the
+    /// algorithm of every stored event).
+    pub pow_bits: u32,
+}
+
 /// A `react` reply carrying `data.accept`, as [`Store::accept_reacts`]
 /// returns it.
 #[derive(Debug, Clone)]
@@ -1505,6 +1528,154 @@ impl Store {
                 parent: r.get(4)?,
                 accept: r.get(5)?,
             })
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    }
+
+    /// Every event of network `net` held here (understood or not): what a
+    /// key's age and proof of work are read from (ADR 0019 §2.3).
+    pub fn author_events(&self, net: &str) -> Result<Vec<AuthorEvent>> {
+        let conn = self.conn();
+        // The leading zero bits of the id: four per leading '0', then those
+        // of the first other hex digit.
+        let mut stmt = conn.prepare_cached(
+            "SELECT author, ts, received_at, LENGTH(json),
+                 (LENGTH(id) - LENGTH(LTRIM(id, '0'))) * 4
+                 + CASE SUBSTR(LTRIM(id, '0'), 1, 1)
+                     WHEN '1' THEN 3 WHEN '2' THEN 2 WHEN '3' THEN 2
+                     WHEN '4' THEN 1 WHEN '5' THEN 1 WHEN '6' THEN 1 WHEN '7' THEN 1
+                     ELSE 0 END
+             FROM events WHERE net = ?",
+        )?;
+        let rows = stmt.query_map([net], |r| {
+            Ok(AuthorEvent {
+                author: r.get(0)?,
+                ts: r.get::<_, i64>(1)?.max(0) as u64,
+                received_at: r.get::<_, i64>(2)?.max(0) as u64,
+                size: r.get::<_, i64>(3)?.max(0) as usize,
+                pow_bits: r.get::<_, i64>(4)?.clamp(0, 256) as u32,
+            })
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    }
+
+    /// `(key, new key)` of every key succession (`rotate`) held here.
+    pub fn rotations(&self) -> Result<Vec<(String, String)>> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare_cached(
+            "SELECT author, json_extract(json, '$.data.new_key') FROM events
+                 WHERE kind = 'rotate' AND opaque = 0 AND v = 1
+                 AND json_type(json, '$.data.new_key') = 'text'",
+        )?;
+        let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    }
+
+    /// `(author, ts, data.owner)` of every `announce` of network `net`,
+    /// the owner when it is a string (ADR 0019 §2.4).
+    pub fn announce_owners(&self, net: &str) -> Result<Vec<(String, u64, Option<String>)>> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare_cached(
+            "SELECT author, ts, CASE WHEN json_type(json, '$.data.owner') = 'text'
+                 THEN json_extract(json, '$.data.owner') END
+             FROM events WHERE net = ? AND kind = 'announce' AND opaque = 0",
+        )?;
+        let rows = stmt.query_map([net], |r| {
+            Ok((r.get(0)?, r.get::<_, i64>(1)?.max(0) as u64, r.get(2)?))
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    }
+
+    /// `(thread, asker)` of every thread of network `net` whose root is an
+    /// `ask`.
+    pub fn ask_roots(&self, net: &str) -> Result<Vec<(String, String)>> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare_cached(
+            "SELECT id, author FROM events
+                 WHERE net = ? AND kind = 'ask' AND thread IS NULL AND opaque = 0",
+        )?;
+        let rows = stmt.query_map([net], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    }
+
+    /// [`Store::accept_reacts`] for every thread of network `net`, newest
+    /// first, at most `limit`.
+    pub fn accept_reacts_in(&self, net: &str, limit: usize) -> Result<Vec<AcceptRow>> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare_cached(
+            "SELECT thread, id, author, ts, parent, json_extract(json, '$.data.accept')
+             FROM events WHERE net = ? AND kind = 'react' AND opaque = 0
+                 AND parent IS NOT NULL AND thread IS NOT NULL
+                 AND json_type(json, '$.data.accept') IN ('true', 'false')
+             ORDER BY ts DESC LIMIT ?",
+        )?;
+        let rows = stmt.query_map(params![net, limit as i64], |r| {
+            Ok(AcceptRow {
+                thread: r.get(0)?,
+                id: r.get(1)?,
+                author: r.get(2)?,
+                ts: r.get::<_, i64>(3)?.max(0) as u64,
+                parent: r.get(4)?,
+                accept: r.get(5)?,
+            })
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    }
+
+    /// [`Store::signal_rows`] for every post of network `net` at once
+    /// (without titles), newest first, at most `limit`, each with the post
+    /// it points to when held here: the reputation table's input (ADR 0019
+    /// §2).
+    pub fn net_signal_rows(
+        &self,
+        net: &str,
+        limit: usize,
+    ) -> Result<Vec<(SignalRow, Option<TargetHead>)>> {
+        let columns = "e.id, e.author, e.ts AS ts, e.net, e.kind,
+             CASE WHEN e.kind = 'react' THEN json_extract(e.json, '$.data') END,
+             t.author, t.kind, t.thread";
+        let sql = format!(
+            "SELECT e.parent, 1, {columns} FROM events e
+                 LEFT JOIN events t ON t.id = e.parent AND t.opaque = 0
+                 WHERE e.net = ?1 AND e.parent IS NOT NULL AND e.opaque = 0
+             UNION ALL
+             SELECT r.ref, 0, {columns} FROM event_refs r JOIN events e ON e.seq = r.seq
+                 LEFT JOIN events t ON t.id = r.ref AND t.opaque = 0
+                 WHERE e.net = ?1 AND e.opaque = 0
+             ORDER BY ts DESC LIMIT ?2"
+        );
+        let conn = self.conn();
+        let mut stmt = conn.prepare_cached(&sql)?;
+        let rows = stmt.query_map(params![net, limit as i64], |r| {
+            let row = SignalRow {
+                target: r.get(0)?,
+                reply: r.get(1)?,
+                id: r.get(2)?,
+                author: r.get(3)?,
+                ts: r.get::<_, i64>(4)?.max(0) as u64,
+                net: r.get(5)?,
+                kind: r.get(6)?,
+                data: r
+                    .get::<_, Option<String>>(7)?
+                    .and_then(|d| serde_json::from_str(&d).ok())
+                    .unwrap_or_default(),
+                title: String::new(),
+            };
+            let head = match r.get::<_, Option<String>>(8)? {
+                Some(author) => Some(TargetHead {
+                    author,
+                    kind: r.get(9)?,
+                    thread: r.get(10)?,
+                }),
+                None => None,
+            };
+            Ok((row, head))
         })?;
         rows.collect::<rusqlite::Result<Vec<_>>>()
             .map_err(Into::into)

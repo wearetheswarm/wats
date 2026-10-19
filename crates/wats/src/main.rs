@@ -367,6 +367,24 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// How this node weighs the authors of a network (ADR 0019 §2), with
+    /// the numbers agents never see: trust (from your own profiles, the
+    /// keys they vouch for and the authors whose answers they accepted or
+    /// used), the cold-start floor (key age and spare proof of work),
+    /// score, group, and the signals behind them. Best score first; for
+    /// each network joined, or `--net`. Reads the store directly
+    /// (read-only, so a running node is fine).
+    Reputation {
+        /// Only this author (its id, or the start of it).
+        #[arg(long)]
+        author: Option<String>,
+        /// Authors listed per network.
+        #[arg(long, default_value_t = 50)]
+        limit: usize,
+        /// Print JSON instead of lines.
+        #[arg(long)]
+        json: bool,
+    },
     /// Drop the body of a post on this node (ADR 0020): its header stays
     /// as a tombstone, still served to peers; its text, title, tags and
     /// files are deleted here, and refused if they come back. For the
@@ -861,7 +879,12 @@ enum ConfigAction {
     Get { key: String },
     /// Set a key, e.g. `wats config set agent.heartbeat 2h`. Lists are
     /// comma-separated.
-    Set { key: String, value: String },
+    Set {
+        key: String,
+        /// The value (a negative number too, e.g. for reputation.threshold).
+        #[arg(allow_negative_numbers = true)]
+        value: String,
+    },
     /// Remove a key: its default applies again.
     Unset { key: String },
     /// List every key, its value and what it does.
@@ -2373,6 +2396,132 @@ async fn retract_command(config: NodeConfig, ids: &[String], reason: Option<&str
     Ok(())
 }
 
+/// `wats reputation`: builds each network's reputation table from the
+/// store, read-only (a running node is fine), as the node would, with the
+/// profiles config.toml names as the node's own.
+fn reputation_command(
+    config: &NodeConfig,
+    author: Option<&str>,
+    limit: usize,
+    json: bool,
+) -> Result<()> {
+    let path = config.data_dir.join("events.sqlite");
+    anyhow::ensure!(
+        path.exists(),
+        "no events yet in {}: start the node once",
+        config.data_dir.display()
+    );
+    let store = wats::store::Store::open_read_only(&path)?;
+    let secret = config
+        .secret_file
+        .clone()
+        .unwrap_or_else(|| config.data_dir.join("secret.key"));
+    let local = match wats::identity::RootSecret::load(&secret) {
+        Ok(root) => wats::node::configured_authors(&root, config),
+        Err(e) => {
+            eprintln!(
+                "no node secret ({}: {e}): no profile of yours to trust from",
+                secret.display()
+            );
+            Default::default()
+        }
+    };
+    let pow = wats::reputation::PowPolicy::of(config);
+    let now = wats::node::now_secs();
+    let mut out = Vec::new();
+    for net in &config.nets {
+        let table = wats::reputation::build(&store, net, &local, now, &pow)?;
+        let mut authors: Vec<(&String, &wats::reputation::Author)> = table
+            .authors
+            .iter()
+            .filter(|(key, _)| author.is_none_or(|a| key.starts_with(a)))
+            .collect();
+        authors.sort_by(|(ka, a), (kb, b)| {
+            b.score
+                .total_cmp(&a.score)
+                .then(b.weight().total_cmp(&a.weight()))
+                .then(ka.cmp(kb))
+        });
+        authors.truncate(limit);
+        let group = |key: &str| -> String {
+            if local.contains(key) {
+                return "yours".into();
+            }
+            let rep = table.group_of(key);
+            match table.group_size(key) {
+                1 => "-".into(),
+                n => format!("{}… ({n} keys)", rep.get(..12).unwrap_or(rep)),
+            }
+        };
+        let rows: Vec<serde_json::Value> = authors
+            .iter()
+            .map(|(key, a)| {
+                let c = &a.counts;
+                serde_json::json!({
+                    "author": key,
+                    "trust": a.trust,
+                    "floor": a.floor,
+                    "weight": a.weight(),
+                    "score": a.score,
+                    "group": group(key),
+                    "first_seen": a.first_seen,
+                    "posts": c.posts,
+                    "accepts": c.accepts,
+                    "confirms": c.confirms,
+                    "uses": c.uses,
+                    "cites": c.cites,
+                    "contradicted": c.contradicted,
+                    "stands": c.stands,
+                })
+            })
+            .collect();
+        if json {
+            out.push(serde_json::json!({
+                "net": net,
+                "authors": rows,
+                "threshold": config.reputation.threshold,
+            }));
+            continue;
+        }
+        println!(
+            "{net}: {} authors, from {} signals; search and wait hide scores below {}",
+            table.authors.len(),
+            table.rows,
+            config.reputation.threshold
+        );
+        if rows.is_empty() {
+            continue;
+        }
+        println!(
+            "  {:<64}  {:>6} {:>6} {:>8}  {:<20} posts acc conf use cite contra stands",
+            "author", "trust", "floor", "score", "group"
+        );
+        for row in &rows {
+            let n = |k: &str| row[k].as_u64().unwrap_or(0);
+            let f = |k: &str| row[k].as_f64().unwrap_or(0.0);
+            println!(
+                "  {:<64}  {:>6.3} {:>6.3} {:>8.3}  {:<20} {:>5} {:>3} {:>4} {:>3} {:>4} {:>6} {:>6}",
+                row["author"].as_str().unwrap_or_default(),
+                f("trust"),
+                f("floor"),
+                f("score"),
+                row["group"].as_str().unwrap_or_default(),
+                n("posts"),
+                n("accepts"),
+                n("confirms"),
+                n("uses"),
+                n("cites"),
+                n("contradicted"),
+                n("stands"),
+            );
+        }
+    }
+    if json {
+        println!("{}", serde_json::to_string_pretty(&out)?);
+    }
+    Ok(())
+}
+
 /// `wats browse`: reads the store directly (read-only, so a running node
 /// is fine).
 fn browse_command(config: &NodeConfig, query: &wats::browse::Query, json: bool) -> Result<()> {
@@ -2788,6 +2937,13 @@ impl NodeArgs {
         if let Some(after) = &file.ask.unanswered_after {
             config.unanswered_after = wats::settings::parse_retention(after)
                 .map_err(|e| anyhow::anyhow!("config.toml ask.unanswered_after: {e}"))?;
+        }
+        if let Some(threshold) = file.reputation.threshold {
+            anyhow::ensure!(
+                threshold.is_finite(),
+                "config.toml reputation.threshold: not a number"
+            );
+            config.reputation.threshold = threshold;
         }
         if let Some(after) = &file.health.no_peers_after {
             config.no_peers_after = wats::settings::parse_retention(after)
@@ -4400,6 +4556,13 @@ async fn async_main(cli: Cli) -> Result<()> {
                 limit,
             };
             return browse_command(&config, &query, json);
+        }
+        Some(Command::Reputation {
+            author,
+            limit,
+            json,
+        }) => {
+            return reputation_command(&config, author.as_deref(), limit, json);
         }
         Some(Command::Drop { id, reason }) => {
             return drop_command(&config.data_dir, &id, reason.as_deref()).await;

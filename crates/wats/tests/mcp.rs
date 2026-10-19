@@ -1171,3 +1171,134 @@ async fn statuses_order_search_filter_wait_and_hint_the_next_step() -> anyhow::R
     node.shutdown().await?;
     Ok(())
 }
+
+/// ADR 0019 v1b: an author whose standing contradictions outweigh the rest
+/// (contradicted with evidence by this node, which weighs) is left out of
+/// `search` and `wait` unless `include_low`; `read` still opens it. Then
+/// `wats reputation` shows the numbers behind it, for the human.
+#[tokio::test(flavor = "multi_thread")]
+async fn low_authors_are_hidden_unless_asked_and_humans_see_the_numbers() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let data = dir.path().join("n");
+    let mut config = NodeConfig::new(&data);
+    config.mode = NetworkMode::Loopback;
+    config.pow_bits = Some(4);
+    config.min_pow_bits = Some(4);
+    // Rebuild the reputation table whenever the store changed.
+    config.reputation.ttl = Duration::ZERO;
+    let node = Node::start(config).await?;
+    let me = client_for(WatsMcp::new(node.clone(), vec![])).await?;
+
+    let ask = structured(
+        &call(
+            &me,
+            "post",
+            json!({"title": "Rust on musl fails to link", "text": "How?", "kind": "ask"}),
+        )
+        .await,
+    )["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let text = "Install musl-tools to link on musl.";
+    let wrong = remote(&node, 11, &ask, "answer", text, json!({}));
+    let right = remote(&node, 12, &ask, "answer", text, json!({}));
+    let ids_of = |v: &Value| -> Vec<String> {
+        v["posts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|p| p["id"].as_str().unwrap().to_string())
+            .collect()
+    };
+    // A fresh network hides nobody.
+    let search = json!({"text": "musl-tools", "kinds": ["answer"]});
+    let found = structured(&call(&me, "search", search.clone()).await);
+    assert_eq!(ids_of(&found).len(), 2, "{found}");
+    assert!(found.get("hidden_low").is_none());
+
+    // This node contradicts 11 with evidence: 11's score goes negative.
+    structured(
+        &call(
+            &me,
+            "reply",
+            json!({"post_id": wrong, "kind": "react", "text": "fails",
+                   "data": {"value": -1, "evidence": "still fails on alpine 3.20"}}),
+        )
+        .await,
+    );
+    let found = structured(&call(&me, "search", search.clone()).await);
+    assert_eq!(ids_of(&found), std::slice::from_ref(&right), "{found}");
+    assert_eq!(found["hidden_low"], 1);
+    let mut low = search.clone();
+    low["include_low"] = json!(true);
+    let found = structured(&call(&me, "search", low).await);
+    assert_eq!(ids_of(&found), [right.clone(), wrong.clone()], "{found}");
+    assert_eq!(found["posts"][1]["status"], "contested");
+    // No number reaches the agent.
+    let shown = found.to_string();
+    for word in ["score", "trust", "weight", "floor"] {
+        assert!(!shown.contains(word), "{word} in {shown}");
+    }
+
+    let wait = |extra: Value| {
+        let mut args = json!({"since": 0, "timeout": 1, "kinds": ["answer"]});
+        args.as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        args
+    };
+    let waited = structured(&call(&me, "wait", wait(json!({}))).await);
+    assert_eq!(ids_of(&waited), std::slice::from_ref(&right), "{waited}");
+    let waited = structured(&call(&me, "wait", wait(json!({"include_low": true}))).await);
+    assert_eq!(ids_of(&waited), [wrong.clone(), right.clone()], "{waited}");
+    // Asked by id, it is shown.
+    let read = structured(&call(&me, "read", json!({"id": wrong})).await);
+    assert_eq!(read["post"]["status"], "contested", "{read}");
+
+    let mine = node.author_id();
+    let theirs = wats::identity::author_id(&ed25519_dalek::SigningKey::from_bytes(&[11; 32]));
+    me.cancel().await?;
+    node.shutdown().await?;
+
+    // `wats reputation`, hermetic, reading the store the node left.
+    let home = dir.path().join("home");
+    std::fs::create_dir_all(&home)?;
+    let reputation = |extra: &[&str]| {
+        let out = std::process::Command::new(env!("CARGO_BIN_EXE_wats"))
+            .env("WATS_HERMETIC", "1")
+            .env("HOME", &home)
+            .env_remove("WATS_PROFILE")
+            .args(["--infra", "none", "--dir"])
+            .arg(&data)
+            .arg("reputation")
+            .args(extra)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{out:?}");
+        String::from_utf8(out.stdout).unwrap()
+    };
+    let lines = reputation(&[]);
+    assert!(lines.starts_with("public: "), "{lines}");
+    let line_of = |author: &str| {
+        lines
+            .lines()
+            .find(|l| l.trim_start().starts_with(author))
+            .unwrap_or_else(|| panic!("{author} in {lines}"))
+            .to_string()
+    };
+    let my_line = line_of(&mine);
+    assert!(my_line.contains("1.000"), "trust: {my_line}");
+    assert!(my_line.contains("yours"), "{my_line}");
+    let their_line = line_of(&theirs);
+    assert!(their_line.contains("-2.000"), "score: {their_line}");
+
+    let json: Value = serde_json::from_str(&reputation(&["--json", "--author", &theirs[..16]]))?;
+    let authors = json[0]["authors"].as_array().unwrap();
+    assert_eq!(authors.len(), 1, "{json}");
+    assert_eq!(authors[0]["author"], theirs);
+    assert!(authors[0]["score"].as_f64().unwrap() < 0.0, "{json}");
+    assert_eq!(authors[0]["contradicted"], 1);
+    assert_eq!(authors[0]["trust"], 0.0);
+    Ok(())
+}

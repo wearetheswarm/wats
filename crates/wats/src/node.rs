@@ -205,6 +205,9 @@ pub struct NodeConfig {
     /// A desktop notification when someone answers or clarifies an ask of
     /// the human's (`notify.desktop`); `None`: off (headless, loopback).
     pub desktop_notify: Option<crate::desktop::Notifier>,
+    /// Reputation (ADR 0019 §2): `reputation.threshold`, and how long a
+    /// network's table is reused once the store changed.
+    pub reputation: crate::reputation::Policy,
 }
 
 impl NodeConfig {
@@ -275,6 +278,7 @@ impl NodeConfig {
             erasure_labelers: Vec::new(),
             openclaw_notify: None,
             desktop_notify: None,
+            reputation: Default::default(),
             bootstrap: Vec::new(),
             default_bootstrap: Vec::new(),
             resolver: Default::default(),
@@ -331,6 +335,20 @@ pub fn is_valid_profile(name: &str) -> bool {
         && name
             .bytes()
             .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_' || b == b'-')
+}
+
+/// Author ids of the profiles a node's config names (default profile,
+/// agents, runners, review), from its secret: its own profiles, as far as
+/// a command without the running node can tell (`wats reputation`).
+pub fn configured_authors(root: &RootSecret, config: &NodeConfig) -> HashSet<String> {
+    let profiles = std::iter::once(config.profile.as_str())
+        .chain(config.runner_profiles())
+        .chain(config.agents.iter().map(|a| a.profile.as_str()))
+        .chain(config.review_profiles.iter().map(String::as_str));
+    profiles
+        .filter(|p| is_valid_profile(p))
+        .map(|profile| author_id(&root.profile_key(profile)))
+        .collect()
 }
 
 /// How a node runs.
@@ -1116,6 +1134,8 @@ pub struct Node {
     /// Author ids of the profiles used on this node, with their profile
     /// names (see `author_key`).
     local_authors: std::sync::Mutex<HashMap<String, String>>,
+    /// Reputation tables per network (ADR 0019 §2).
+    reputation: crate::reputation::Cache,
     /// Exclusive lock on the data directory, released by `shutdown`.
     lock: std::sync::Mutex<Option<std::fs::File>>,
     /// This node's view of the infrastructure (see [`crate::health`]).
@@ -1466,6 +1486,7 @@ impl Node {
             blob_keep,
             runner_tokens: Default::default(),
             local_authors: Default::default(),
+            reputation: Default::default(),
             lock: std::sync::Mutex::new(Some(lock)),
             health: std::sync::Mutex::new(health),
             seed_ids,
@@ -2140,15 +2161,21 @@ impl Node {
             .map(|l| l.keys().cloned().collect())
             .unwrap_or_default();
         local.insert(self.author_id());
-        let config = &self.config;
-        let profiles = std::iter::once(config.profile.as_str())
-            .chain(config.runner_profiles())
-            .chain(config.agents.iter().map(|a| a.profile.as_str()))
-            .chain(config.review_profiles.iter().map(String::as_str));
-        for profile in profiles.filter(|p| is_valid_profile(p)) {
-            local.insert(author_id(&self.root.profile_key(profile)));
-        }
+        local.extend(configured_authors(&self.root, &self.config));
         local
+    }
+
+    /// The reputation table of network `net`, as this node sees it (ADR
+    /// 0019 §2): cached, rebuilt when the store changed and the table is
+    /// older than `reputation.ttl`.
+    pub fn reputation(&self, net: &str) -> Result<Arc<crate::reputation::Table>> {
+        self.reputation.get(
+            &self.store,
+            net,
+            &self.local_authors(),
+            &crate::reputation::PowPolicy::of(&self.config),
+            self.config.reputation.ttl,
+        )
     }
 
     /// Whether `author` is the key of one of this node's agents (a runner

@@ -30,6 +30,7 @@ pub mod openclaw;
 pub mod peer_cache;
 pub mod proto;
 pub mod reconnect;
+pub mod reputation;
 pub mod retract;
 pub mod review;
 pub mod roster;
