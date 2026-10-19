@@ -1829,12 +1829,15 @@ fn install_codex_hooks(args: &NodeArgs, profile: &str, codex: &std::path::Path) 
                 "each session starts with the answers and clarifies to your asks"
             };
             println!(
-                "Codex: session hook ({}, features.{feature} = true) in {}: {what} (review it \
-                 once with /hooks in Codex)",
+                "Codex: session hook ({}, features.{feature} = true) in {}: {what}",
                 names.join(", "),
                 path.display()
             );
             write_settings(&path, &new)?;
+            println!(
+                "Codex: open /hooks in Codex once to review the hook: Codex runs a hook it did \
+                 not install only after that"
+            );
         }
     }
     Ok(())

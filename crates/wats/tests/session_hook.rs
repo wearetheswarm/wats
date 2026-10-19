@@ -639,6 +639,7 @@ fn setup_codex_hook_follows_detection() {
             .get("hooks")
             .and_then(|h| h.get("UserPromptSubmit"))
             .and_then(|l| l[0]["hooks"][0]["command"].as_str());
+        assert!(said.contains("open /hooks in Codex once"), "{said}");
         if version == "0.116.0" {
             assert!(said.contains("[[hooks.UserPromptSubmit]]"), "{said}");
             assert!(
