@@ -1561,6 +1561,23 @@ impl Store {
             .map_err(Into::into)
     }
 
+    /// `(voucher, vouched, received_at)` of every `vouch` of network `net`
+    /// held here: the vouched key is the author of the post it replies to
+    /// (by convention, its `announce`).
+    pub fn vouches(&self, net: &str) -> Result<Vec<(String, String, u64)>> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare_cached(
+            "SELECT e.author, t.author, e.received_at FROM events e
+                 JOIN events t ON t.id = e.parent AND t.opaque = 0
+             WHERE e.net = ? AND e.kind = 'vouch' AND e.opaque = 0",
+        )?;
+        let rows = stmt.query_map([net], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get::<_, i64>(2)?.max(0) as u64))
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    }
+
     /// `(key, new key)` of every key succession (`rotate`) held here.
     pub fn rotations(&self) -> Result<Vec<(String, String)>> {
         let conn = self.conn();
@@ -1650,35 +1667,44 @@ impl Store {
                  WHERE e.net = ?1 AND e.opaque = 0
              ORDER BY ts DESC LIMIT ?2"
         );
-        let conn = self.conn();
-        let mut stmt = conn.prepare_cached(&sql)?;
-        let rows = stmt.query_map(params![net, limit as i64], |r| {
-            let row = SignalRow {
-                target: r.get(0)?,
-                reply: r.get(1)?,
-                id: r.get(2)?,
-                author: r.get(3)?,
-                ts: r.get::<_, i64>(4)?.max(0) as u64,
-                net: r.get(5)?,
-                kind: r.get(6)?,
-                data: r
-                    .get::<_, Option<String>>(7)?
+        // The JSON of `data` is parsed after the lock is released: inserts
+        // wait for the query only.
+        let raw: Vec<(SignalRow, Option<String>, Option<TargetHead>)> = {
+            let conn = self.conn();
+            let mut stmt = conn.prepare_cached(&sql)?;
+            let rows = stmt.query_map(params![net, limit as i64], |r| {
+                let row = SignalRow {
+                    target: r.get(0)?,
+                    reply: r.get(1)?,
+                    id: r.get(2)?,
+                    author: r.get(3)?,
+                    ts: r.get::<_, i64>(4)?.max(0) as u64,
+                    net: r.get(5)?,
+                    kind: r.get(6)?,
+                    data: Default::default(),
+                    title: String::new(),
+                };
+                let head = match r.get::<_, Option<String>>(8)? {
+                    Some(author) => Some(TargetHead {
+                        author,
+                        kind: r.get(9)?,
+                        thread: r.get(10)?,
+                    }),
+                    None => None,
+                };
+                Ok((row, r.get::<_, Option<String>>(7)?, head))
+            })?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        Ok(raw
+            .into_iter()
+            .map(|(mut row, data, head)| {
+                row.data = data
                     .and_then(|d| serde_json::from_str(&d).ok())
-                    .unwrap_or_default(),
-                title: String::new(),
-            };
-            let head = match r.get::<_, Option<String>>(8)? {
-                Some(author) => Some(TargetHead {
-                    author,
-                    kind: r.get(9)?,
-                    thread: r.get(10)?,
-                }),
-                None => None,
-            };
-            Ok((row, head))
-        })?;
-        rows.collect::<rusqlite::Result<Vec<_>>>()
-            .map_err(Into::into)
+                    .unwrap_or_default();
+                (row, head)
+            })
+            .collect())
     }
 
     /// Whether any key succession (`rotate`) is held: without one, no two

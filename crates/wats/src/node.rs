@@ -2174,7 +2174,7 @@ impl Node {
             net,
             &self.local_authors(),
             &crate::reputation::PowPolicy::of(&self.config),
-            self.config.reputation.ttl,
+            &self.config.reputation,
         )
     }
 

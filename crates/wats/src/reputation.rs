@@ -73,6 +73,10 @@ pub const W_STANDS: f64 = 1.0;
 /// Votes order posts in `search`; they do not make an author's score.
 pub const W_VOTE: f64 = 0.5;
 
+/// A table is rebuilt once this old even if the store did not change: it
+/// depends on time too (decay, the stale cut, the floor's 7 to 30 days).
+pub const MAX_AGE: Duration = Duration::from_secs(3600);
+
 /// Default `reputation.threshold`: authors scoring below it are left out
 /// of `search` and `wait` unless `include_low`. 0 hides only authors whose
 /// standing contradictions outweigh everything else (pending Vincent).
@@ -91,6 +95,8 @@ pub struct Policy {
     pub threshold: f64,
     /// How long a table is reused once the store changed.
     pub ttl: Duration,
+    /// How long a table is reused at most, changed store or not.
+    pub max_age: Duration,
 }
 
 impl Default for Policy {
@@ -98,6 +104,7 @@ impl Default for Policy {
         Self {
             threshold: DEFAULT_THRESHOLD,
             ttl: DEFAULT_TTL,
+            max_age: MAX_AGE,
         }
     }
 }
@@ -240,6 +247,11 @@ impl Table {
         self.group.values().filter(|g| *g == rep).count().max(1)
     }
 
+    /// The first key of `key`'s `rotate` chain (itself when in none).
+    pub fn key_of<'a>(&'a self, key: &'a str) -> &'a str {
+        self.key.get(key).map_or(key, String::as_str)
+    }
+
     /// Whether `a` and `b` are one key: linked by `rotate` events.
     pub fn same_key(&self, a: &str, b: &str) -> bool {
         a == b || matches!((self.key.get(a), self.key.get(b)), (Some(x), Some(y)) if x == y)
@@ -358,6 +370,25 @@ pub fn build(
     let seq = store.last_seq()?;
     let mut table = Table::empty(net, seq, now, local);
 
+    // When this node first stored an event of each key.
+    let events = store.author_events(net)?;
+    let mut authors: HashMap<String, Author> = HashMap::new();
+    for event in &events {
+        match authors.get_mut(&event.author) {
+            Some(author) => {
+                let first = author.first_seen.get_or_insert(event.received_at);
+                *first = (*first).min(event.received_at);
+            }
+            None => {
+                let author = Author {
+                    first_seen: Some(event.received_at),
+                    ..Author::default()
+                };
+                authors.insert(event.author.clone(), author);
+            }
+        }
+    }
+
     // Groups (§2.4): rotations and this node's profiles (hard), declared
     // owners and vouch clusters (soft).
     let mut keys = Groups::default();
@@ -394,17 +425,8 @@ pub fn build(
     let rows = store.net_signal_rows(net, MAX_ROWS)?;
     table.rows = rows.len();
     let mut heads: HashMap<String, PostRef> = HashMap::new();
-    let mut vouchers: HashMap<String, HashSet<String>> = HashMap::new();
-    let mut vouches: Vec<(String, String)> = Vec::new();
     for (row, head) in &rows {
         let Some(head) = head else { continue };
-        if row.kind == "vouch" && row.reply && row.author != head.author {
-            vouchers
-                .entry(head.author.clone())
-                .or_default()
-                .insert(row.author.clone());
-            vouches.push((row.author.clone(), head.author.clone()));
-        }
         if !heads.contains_key(&row.target) {
             heads.insert(
                 row.target.clone(),
@@ -419,26 +441,44 @@ pub fn build(
         }
     }
     // Keys vouched only by one key, or only by keys of one group, join
-    // that group, until nothing changes (bounded). Not this node's own
-    // profiles: their group is known.
-    let mut vouched: Vec<(&String, &HashSet<String>)> = vouchers
+    // that group, until nothing changes (bounded); only keys vouched for
+    // within [`FLOOR_FROM`] of their first sighting, as keys minted by
+    // their voucher are, so that a stranger's vouch cannot pull an
+    // established key into its group. Not this node's own profiles: their
+    // group is known.
+    let vouches: Vec<(String, String, u64)> = store
+        .vouches(net)?
+        .into_iter()
+        .filter(|(giver, to, _)| giver != to)
+        .collect();
+    let mut vouchers: HashMap<&String, (HashSet<&String>, bool)> = HashMap::new();
+    for (giver, to, received_at) in &vouches {
+        let first = authors.get(to).and_then(|a| a.first_seen);
+        let young = first.is_some_and(|f| *received_at < f.saturating_add(FLOOR_FROM));
+        let entry = vouchers.entry(to).or_default();
+        entry.0.insert(giver);
+        entry.1 |= young;
+    }
+    let mut vouched: Vec<(&String, &HashSet<&String>)> = vouchers
         .iter()
-        .filter(|(key, _)| !local.contains(*key))
+        .filter(|(key, (_, young))| *young && !local.contains(**key))
+        .map(|(key, (by, _))| (*key, by))
         .collect();
     vouched.sort_by_key(|(key, _)| *key);
     for _ in 0..4 {
         let mut changed = false;
         for (key, by) in &vouched {
             let mut roots = HashSet::new();
-            for voucher in *by {
+            for voucher in by.iter() {
                 roots.insert(groups.root(voucher));
             }
             if roots.len() == 1
                 && let Some(&root) = roots.iter().next()
                 && root != groups.root(key)
             {
-                let voucher = by.iter().next().cloned().unwrap_or_default();
-                groups.union(key, &voucher);
+                if let Some(voucher) = by.iter().next() {
+                    groups.union(key, voucher);
+                }
                 changed = true;
             }
         }
@@ -472,7 +512,7 @@ pub fn build(
     // the seed already holds that trust.
     let mut seeds: HashMap<String, f64> = local.iter().map(|k| (k.clone(), SEED_TRUST)).collect();
     let mut edges: HashMap<String, HashMap<String, f64>> = HashMap::new();
-    for (giver, to) in &vouches {
+    for (giver, to, _) in &vouches {
         if grouping.same_key(net, giver, to) {
             continue;
         }
@@ -504,23 +544,6 @@ pub fn build(
     let trust = personalised_pagerank(&seeds, &edges);
 
     // The floor (§2.3): age and spare proof of work.
-    let events = store.author_events(net)?;
-    let mut authors: HashMap<String, Author> = HashMap::new();
-    for event in &events {
-        match authors.get_mut(&event.author) {
-            Some(author) => {
-                let first = author.first_seen.get_or_insert(event.received_at);
-                *first = (*first).min(event.received_at);
-            }
-            None => {
-                let author = Author {
-                    first_seen: Some(event.received_at),
-                    ..Author::default()
-                };
-                authors.insert(event.author.clone(), author);
-            }
-        }
-    }
     for event in &events {
         let Some(author) = authors.get_mut(&event.author) else {
             continue;
@@ -616,11 +639,12 @@ fn personalised_pagerank(
 }
 
 /// The tables of a node, per network. A table is rebuilt when the store
-/// changed and it is older than the policy's TTL: in the background, while
-/// readers keep the previous one, so that no query waits for a rebuild
-/// (about 0.2 s at 50,000 events). Only the first table of a network, a
-/// change of the node's profiles, or a zero TTL (tests) rebuild before
-/// answering.
+/// changed and it is older than the policy's TTL, or when it is older than
+/// its max age (time alone moves decay and floors): in the background,
+/// while readers keep the previous one, so that no query waits for a
+/// rebuild (about 0.2 s at 50,000 events). Only the first table of a
+/// network, a change of the node's profiles, or a zero TTL (tests) rebuild
+/// before answering.
 #[derive(Debug, Default)]
 pub struct Cache {
     tables: Arc<Mutex<HashMap<String, Entry>>>,
@@ -639,8 +663,9 @@ impl Cache {
         net: &str,
         local: &HashSet<String>,
         pow: &PowPolicy,
-        ttl: Duration,
+        policy: &Policy,
     ) -> Result<Arc<Table>> {
+        let ttl = policy.ttl;
         let seq = store.last_seq()?;
         {
             let mut tables = self.tables.lock().unwrap_or_else(|e| e.into_inner());
@@ -648,7 +673,8 @@ impl Cache {
                 && entry.table.local == *local
             {
                 let table = entry.table.clone();
-                if table.seq == seq || table.built.elapsed() < ttl {
+                let age = table.built.elapsed();
+                if age < policy.max_age && (table.seq == seq || age < ttl) {
                     return Ok(table);
                 }
                 if !ttl.is_zero() {
@@ -765,7 +791,7 @@ mod tests {
     }
 
     #[test]
-    fn the_cache_rebuilds_a_changed_store_without_making_readers_wait() {
+    fn the_cache_rebuilds_without_making_readers_wait() {
         let store = Arc::new(Store::open_in_memory().unwrap());
         let note = |i: u64| {
             crate::event::Draft {
@@ -785,41 +811,110 @@ mod tests {
             min_pow_bits: None,
             schedule: crate::event::POW_SCHEDULE.to_vec(),
         };
+        let policy = |ttl: Duration, max_age: Duration| Policy {
+            threshold: DEFAULT_THRESHOLD,
+            ttl,
+            max_age,
+        };
         let hour = Duration::from_secs(3600);
-        let first = cache.get(&store, "public", &local, &pow, hour).unwrap();
-        // Unchanged: the same table.
+        let first = cache
+            .get(&store, "public", &local, &pow, &policy(hour, hour))
+            .unwrap();
+        // Unchanged and younger than its max age: the same table.
         let again = cache
-            .get(&store, "public", &local, &pow, Duration::ZERO)
+            .get(
+                &store,
+                "public",
+                &local,
+                &pow,
+                &policy(Duration::ZERO, hour),
+            )
             .unwrap();
         assert!(Arc::ptr_eq(&first, &again));
         // Changed, but younger than the TTL: still the same.
         store.insert(&note(2), 2).unwrap();
-        let young = cache.get(&store, "public", &local, &pow, hour).unwrap();
+        let young = cache
+            .get(&store, "public", &local, &pow, &policy(hour, hour))
+            .unwrap();
         assert!(Arc::ptr_eq(&first, &young));
         // Older than the TTL: the stale table now, a new one soon after.
         std::thread::sleep(Duration::from_millis(5));
-        let ttl = Duration::from_millis(1);
-        let stale = cache.get(&store, "public", &local, &pow, ttl).unwrap();
+        let ms = Duration::from_millis(1);
+        let stale = cache
+            .get(&store, "public", &local, &pow, &policy(ms, hour))
+            .unwrap();
         assert!(Arc::ptr_eq(&first, &stale));
-        let deadline = Instant::now() + Duration::from_secs(10);
-        loop {
-            let table = cache.get(&store, "public", &local, &pow, hour).unwrap();
-            if table.seq == store.last_seq().unwrap() {
-                break;
+        let rebuilt = |cache: &Cache, than: &Arc<Table>| {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            loop {
+                let table = cache
+                    .get(&store, "public", &local, &pow, &policy(hour, hour))
+                    .unwrap();
+                if !Arc::ptr_eq(&table, than) {
+                    return table;
+                }
+                assert!(Instant::now() < deadline, "never rebuilt");
+                std::thread::sleep(Duration::from_millis(5));
             }
-            assert!(Instant::now() < deadline, "never rebuilt");
-            std::thread::sleep(Duration::from_millis(5));
-        }
-        // A zero TTL rebuilds before answering.
+        };
+        let second = rebuilt(&cache, &first);
+        assert_eq!(second.seq, store.last_seq().unwrap());
+        // Unchanged store, but older than its max age: time moves decay
+        // and floors, so it is rebuilt too, in the background.
+        std::thread::sleep(Duration::from_millis(5));
+        let old = cache
+            .get(&store, "public", &local, &pow, &policy(hour, ms))
+            .unwrap();
+        assert!(Arc::ptr_eq(&second, &old));
+        let third = rebuilt(&cache, &second);
+        assert_eq!(third.seq, second.seq);
+        assert!(third.now >= second.now);
+        // A zero TTL rebuilds a changed store before answering.
         store.insert(&note(3), 3).unwrap();
         let now = cache
-            .get(&store, "public", &local, &pow, Duration::ZERO)
+            .get(
+                &store,
+                "public",
+                &local,
+                &pow,
+                &policy(Duration::ZERO, hour),
+            )
             .unwrap();
         assert_eq!(now.seq, store.last_seq().unwrap());
         // So does a change of the node's profiles.
         let mine: HashSet<String> = ["me".to_string()].into();
-        let theirs = cache.get(&store, "public", &mine, &pow, hour).unwrap();
+        let theirs = cache
+            .get(&store, "public", &mine, &pow, &policy(hour, hour))
+            .unwrap();
         assert!(theirs.local.contains("me"));
+    }
+
+    #[test]
+    fn a_table_built_later_ages_keys_and_decays_signals() {
+        // The same store, read at two times: time alone lifts a key's
+        // floor (what the max age of the cache is for).
+        let store = Store::open_in_memory().unwrap();
+        let t0 = 1_700_000_000;
+        let event = crate::event::Draft {
+            net: "public".into(),
+            kind: Some(crate::event::Kind::Note),
+            title: Some("hi".into()),
+            text: "hi".into(),
+            ..Default::default()
+        }
+        .sign(&ed25519_dalek::SigningKey::from_bytes(&[9; 32]), t0, 0)
+        .unwrap();
+        store.insert(&event, t0).unwrap();
+        let pow = PowPolicy {
+            min_pow_bits: Some(256),
+            schedule: Vec::new(),
+        };
+        let local = HashSet::new();
+        let floor_at = |now: u64| {
+            build(&store, "public", &local, now, &pow).unwrap().authors[&event.author].floor
+        };
+        assert_eq!(floor_at(t0 + DAY), 0.0);
+        assert_eq!(floor_at(t0 + 30 * DAY), AGE_FLOOR_CAP);
     }
 
     #[test]

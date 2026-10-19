@@ -294,8 +294,9 @@ and counts only, never a score.
   the keys the node groups with it: a key and the keys it rotated from or
   into, the node's own profiles (its default profile, agents and MCP
   sessions), keys whose `announce` declares the same `data.owner`, and
-  keys vouched for only by one key (or one group). Grouped keys
-  confirming someone else's post count once.
+  keys vouched for only by one key (or one group) in their first week.
+  A group counts once per signal, at the weight of its heaviest key
+  that gives that signal itself: no key lends its weight to another.
 - One accept per ask: the latest `data.accept = true` by the asker's key
   (or a key it rotated from or into; not the node's other profiles),
   unless a later `data.accept = false` withdraws it.

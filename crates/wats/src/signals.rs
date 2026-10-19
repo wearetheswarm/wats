@@ -191,6 +191,12 @@ impl Grouping {
         }
     }
 
+    /// The identity of `key` in `net`: the first key of its `rotate`
+    /// chain, or itself.
+    fn identity<'a>(&'a self, net: &str, key: &'a str) -> &'a str {
+        self.table(net).map_or(key, |t| t.key_of(key))
+    }
+
     /// Whether `a` and `b` are grouped, hard or soft.
     pub fn same(&self, net: &str, a: &str, b: &str) -> bool {
         a == b || self.group(net, a) == self.group(net, b)
@@ -419,24 +425,25 @@ fn renewed(start: u64, renewals: &[u64]) -> u64 {
     clock
 }
 
-/// One group of keys on a post: its latest position, and a post of the
-/// group that replies to or cites the post (its reasoning, for a
-/// contradiction).
-struct Position<'r> {
-    group: String,
-    /// The keys of the group with rows on the post.
-    members: Vec<&'r str>,
+/// One key's position on a post (a key with the keys it rotated from or
+/// into: one identity): its latest vote or use, and a post of it that
+/// replies to or cites the post (its reasoning, for a contradiction).
+struct Stance<'r> {
+    /// The identity (the first key of its `rotate` chain).
+    key: &'r str,
     react: Option<&'r SignalRow>,
     /// When the position's clock started: its react, or a renewal.
     clock: u64,
-    /// Every `still_valid` renewal of the group, oldest first.
+    /// Every `still_valid` renewal, oldest first.
     renewals: Vec<u64>,
     post: Option<&'r SignalRow>,
-    /// The group's posts that may count as citations of the post.
+    /// Its posts that may count as citations of the post.
     cites: Vec<&'r SignalRow>,
+    /// The keys it signed with on the post.
+    authors: Vec<&'r str>,
 }
 
-impl Position<'_> {
+impl<'r> Stance<'r> {
     fn value(&self) -> Option<i64> {
         self.react?.data.get("value").and_then(Value::as_i64)
     }
@@ -460,12 +467,12 @@ impl Position<'_> {
     }
 
     /// A `react` -1 with evidence, or with a reasoned post of the same
-    /// group. A bare -1 is only a vote.
+    /// key. A bare -1 is only a vote.
     fn contradicts(&self) -> bool {
         self.value() == Some(-1) && !self.used() && (self.evidence() || self.post.is_some())
     }
 
-    /// The latest post of the group citing the post, other than the
+    /// The latest post of the key citing the post, other than the
     /// reasoning of its contradiction, if it contradicts.
     fn cited(&self) -> Option<u64> {
         let reasoning = self.post.filter(|_| self.contradicts()).map(|p| &p.id);
@@ -476,12 +483,81 @@ impl Position<'_> {
             .max()
     }
 
-    /// The group's weight on the post: its best member's.
+    /// What the key weighs: its best signing key's weight.
     fn weight(&self, grouping: &Grouping, net: &str) -> f64 {
+        self.authors
+            .iter()
+            .map(|a| grouping.weight(net, a))
+            .fold(0.0, f64::max)
+    }
+
+    /// Apply one of its rows, oldest first: the latest vote or use wins, a
+    /// renewal restarts its clock, the first post stays.
+    fn apply(&mut self, row: &'r SignalRow, root_ask: bool) {
+        if !self.authors.contains(&row.author.as_str()) {
+            self.authors.push(&row.author);
+        }
+        if row.kind == "react" {
+            let votes = row.data.get("value").and_then(Value::as_i64).is_some()
+                || row.data.get("used").is_some_and(Value::is_boolean);
+            if votes {
+                self.react = Some(row);
+                self.clock = row.ts;
+            } else {
+                self.renewals.push(row.ts);
+                if self.positive() {
+                    self.clock = renewed(self.clock, &[row.ts]);
+                } else {
+                    // On no position, or a negative one: "still valid"
+                    // replaces it (it withdraws a contradiction).
+                    self.react = Some(row);
+                    self.clock = row.ts;
+                }
+            }
+            return;
+        }
+        if self.post.is_none() {
+            self.post = Some(row);
+        }
+        if !(root_ask && row.reply) {
+            self.cites.push(row);
+        }
+    }
+}
+
+/// One group of keys on a post, and each key's own position in it.
+///
+/// A group counts once per signal, at the weight of the heaviest of its
+/// keys whose own position gives that signal: no key lends its weight to
+/// another's signal. So a key that joins a group by declaring its owner,
+/// or by being vouched for, can only lose weight, never borrow it.
+struct Position<'r> {
+    group: String,
+    members: Vec<Stance<'r>>,
+}
+
+impl<'r> Position<'r> {
+    /// The heaviest member whose own position satisfies `signal`, with its
+    /// weight.
+    fn best(
+        &self,
+        grouping: &Grouping,
+        net: &str,
+        signal: impl Fn(&Stance<'r>) -> bool,
+    ) -> Option<(f64, &Stance<'r>)> {
         self.members
             .iter()
-            .map(|m| grouping.weight(net, m))
-            .fold(0.0, f64::max)
+            .filter(|m| signal(m))
+            .map(|m| (m.weight(grouping, net), m))
+            .max_by(|a, b| a.0.total_cmp(&b.0))
+    }
+
+    /// Whether the group is grouped with `author`.
+    fn with(&self, grouping: &Grouping, net: &str, author: &str) -> bool {
+        self.members
+            .iter()
+            .flat_map(|m| &m.authors)
+            .any(|a| grouping.same(net, author, a))
     }
 }
 
@@ -492,7 +568,7 @@ impl Position<'_> {
 fn positions<'r>(
     rows: &'r [SignalRow],
     target: &PostRef,
-    grouping: &Grouping,
+    grouping: &'r Grouping,
 ) -> Vec<Position<'r>> {
     let net = target.net.as_str();
     let mut groups: Vec<Position<'r>> = Vec::new();
@@ -500,8 +576,7 @@ fn positions<'r>(
         if row.net != net || grouping.same_hard(net, &target.author, &row.author) {
             continue;
         }
-        let react = row.kind == "react";
-        if react && !(row.reply && takes_position(&row.data)) {
+        if row.kind == "react" && !(row.reply && takes_position(&row.data)) {
             continue;
         }
         let group = grouping.group(net, &row.author);
@@ -511,46 +586,28 @@ fn positions<'r>(
                 groups.push(Position {
                     group: group.to_string(),
                     members: Vec::new(),
+                });
+                groups.len() - 1
+            }
+        };
+        let members = &mut groups[index].members;
+        let key = grouping.identity(net, &row.author);
+        let member = match members.iter().position(|m| m.key == key) {
+            Some(member) => member,
+            None => {
+                members.push(Stance {
+                    key,
                     react: None,
                     clock: 0,
                     renewals: Vec::new(),
                     post: None,
                     cites: Vec::new(),
+                    authors: Vec::new(),
                 });
-                groups.len() - 1
+                members.len() - 1
             }
         };
-        let position = &mut groups[index];
-        if !position.members.contains(&row.author.as_str()) {
-            position.members.push(&row.author);
-        }
-        // Rows come oldest first: the latest vote or use wins, a renewal
-        // restarts its clock, the first post stays.
-        if react {
-            let votes = row.data.get("value").and_then(Value::as_i64).is_some()
-                || row.data.get("used").is_some_and(Value::is_boolean);
-            if votes {
-                position.react = Some(row);
-                position.clock = row.ts;
-            } else {
-                position.renewals.push(row.ts);
-                if position.positive() {
-                    position.clock = renewed(position.clock, &[row.ts]);
-                } else {
-                    // On no position, or a negative one: "still valid"
-                    // replaces it (it withdraws a contradiction).
-                    position.react = Some(row);
-                    position.clock = row.ts;
-                }
-            }
-            continue;
-        }
-        if position.post.is_none() {
-            position.post = Some(row);
-        }
-        if !(target.root_ask && row.reply) {
-            position.cites.push(row);
-        }
+        members[member].apply(row, target.root_ask);
     }
     groups
 }
@@ -565,7 +622,8 @@ pub struct Endorsement {
     pub seeds: bool,
 }
 
-/// The endorsements of a post by keys not grouped with its author.
+/// The endorsements of a post by keys not grouped with its author, each
+/// from the key that gave it: a key passes on its own trust only.
 pub fn endorsements(
     post: &PostRef,
     rows: &Rows,
@@ -577,21 +635,20 @@ pub fn endorsements(
     let mine = rows.get(&post.id).unwrap_or(&[]);
     let groups = positions(mine, post, grouping);
     let mut out = Vec::new();
-    for g in &groups {
-        if g.members
-            .iter()
-            .any(|m| grouping.same(net, &post.author, m))
-        {
-            continue;
-        }
-        if let Some(react) = g.react
-            && (g.confirms() || g.used())
-        {
-            out.push(Endorsement {
-                giver: react.author.clone(),
-                weight: decay(now.saturating_sub(g.clock), HALF_LIFE),
-                seeds: g.used(),
-            });
+    for g in groups
+        .iter()
+        .filter(|g| !g.with(grouping, net, &post.author))
+    {
+        for m in &g.members {
+            if let Some(react) = m.react
+                && (m.confirms() || m.used())
+            {
+                out.push(Endorsement {
+                    giver: react.author.clone(),
+                    weight: decay(now.saturating_sub(m.clock), HALF_LIFE),
+                    seeds: m.used(),
+                });
+            }
         }
     }
     if let Some((accepted, clock)) = accept_of(post, &groups, threads, grouping) {
@@ -605,7 +662,7 @@ pub fn endorsements(
 }
 
 /// The accept of a post by its thread's asker, if it counts, with its
-/// clock (restarted by the asker's renewals).
+/// clock (restarted by the asker's own renewals).
 fn accept_of<'t>(
     post: &PostRef,
     groups: &[Position<'_>],
@@ -617,16 +674,16 @@ fn accept_of<'t>(
     if accepted.answer != post.id || grouping.same(net, &accepted.asker, &post.author) {
         return None;
     }
-    let renewals = groups
+    let renewals: Vec<u64> = groups
         .iter()
-        .find(|g| {
-            g.members
+        .flat_map(|g| &g.members)
+        .find(|m| {
+            m.authors
                 .iter()
-                .any(|m| grouping.same_key(net, &accepted.asker, m))
+                .any(|a| grouping.same_key(net, &accepted.asker, a))
         })
-        .map(|g| g.renewals.as_slice())
-        .unwrap_or_default();
-    let renewals: Vec<u64> = renewals
+        .map(|m| m.renewals.as_slice())
+        .unwrap_or_default()
         .iter()
         .copied()
         .filter(|&t| t > accepted.ts)
@@ -664,6 +721,9 @@ pub fn evaluate(
         .and_then(|t| threads.askers.get(t))
         .filter(|asker| !grouping.same(net, asker, &post.author));
     let age = |ts: u64| now.saturating_sub(ts);
+    let by_asker = |m: &Stance<'_>| {
+        asker.is_some_and(|a| m.authors.iter().any(|k| grouping.same_key(net, a, k)))
+    };
 
     let mut s = Signals::default();
     let mut credit = 0.0;
@@ -678,42 +738,44 @@ pub fn evaluate(
         latest = latest.max(Some(clock));
     };
     for g in &groups {
-        let w = g.weight(grouping, net);
-        let by_asker = asker.is_some_and(|a| {
-            g.react
-                .is_some_and(|r| grouping.same_key(net, a, &r.author))
-        });
-        let positive = !g
-            .members
-            .iter()
-            .any(|m| grouping.same(net, &post.author, m));
-        if positive {
-            if w > 0.0
-                && let Some(ts) = g.cited()
+        if !g.with(grouping, net, &post.author) {
+            if let Some((w, m)) = g.best(grouping, net, |m| m.cited().is_some())
+                && w > 0.0
             {
                 s.cites += 1;
+                let ts = m.cited().unwrap_or_default();
                 credit += W_CITE * w * decay(age(ts), HALF_LIFE);
             }
-            if w > 0.0 && g.value() == Some(1) {
+            if let Some((w, m)) = g.best(grouping, net, |m| m.value() == Some(1))
+                && w > 0.0
+            {
                 s.up += 1;
-                s.score += W_VOTE * w * decay(age(g.clock), VOTE_HALF_LIFE);
+                s.score += W_VOTE * w * decay(age(m.clock), VOTE_HALF_LIFE);
             }
-            // The asker's use is its own call, as its accept is.
-            if (g.confirms() || g.used()) && (w > 0.0 || (g.used() && by_asker)) {
-                s.confirms += u64::from(g.confirms());
-                s.uses += u64::from(g.used());
-                confirmed_at(g.clock, &mut fresh);
-                let earned = if g.confirms() { W_CONFIRM } else { 0.0 }.max(if g.used() {
-                    W_USE
-                } else {
-                    0.0
-                });
-                credit += earned * w * decay(age(g.clock), HALF_LIFE);
+            // Each key's confirmation or use at its own weight; the asker's
+            // use is its own call, as its accept is.
+            let mut earned: f64 = 0.0;
+            let (mut confirms, mut uses) = (false, false);
+            for m in &g.members {
+                let w = m.weight(grouping, net);
+                if !(m.confirms() || m.used()) || !(w > 0.0 || (m.used() && by_asker(m))) {
+                    continue;
+                }
+                confirms |= m.confirms();
+                uses |= m.used();
+                confirmed_at(m.clock, &mut fresh);
+                let kind = if m.confirms() { W_CONFIRM } else { W_USE };
+                earned = earned.max(kind * w * decay(age(m.clock), HALF_LIFE));
             }
+            s.confirms += u64::from(confirms);
+            s.uses += u64::from(uses);
+            credit += earned;
         }
-        if w > 0.0 && g.value() == Some(-1) {
+        if let Some((w, m)) = g.best(grouping, net, |m| m.value() == Some(-1))
+            && w > 0.0
+        {
             s.down += 1;
-            s.score -= W_VOTE * w * decay(age(g.clock), VOTE_HALF_LIFE);
+            s.score -= W_VOTE * w * decay(age(m.clock), VOTE_HALF_LIFE);
         }
     }
     if let Some((accepted, clock)) = accept_of(post, &groups, threads, grouping) {
@@ -798,15 +860,13 @@ enum Label {
     Undecided,
 }
 
-/// One argument of a dispute: the post, or a group of keys' contradiction
-/// of arguments in it.
-struct Argument<'r> {
+/// One attack in a dispute: the heaviest key of the attacking group whose
+/// own position contradicts the attacked argument, and what it weighs.
+#[derive(Clone, Copy)]
+struct Attack<'r> {
     weight: f64,
-    /// Its react (the first, for a group's contradiction).
-    react: Option<&'r SignalRow>,
+    react: &'r SignalRow,
     post: Option<&'r SignalRow>,
-    events: HashSet<&'r str>,
-    evidence: bool,
 }
 
 /// The dispute of a post: Dung's grounded extension over its
@@ -814,23 +874,19 @@ struct Argument<'r> {
 ///
 /// Each group of keys contradicting something in it is one argument, so
 /// two groups contradicting each other form a cycle, which stays
-/// undecided. An attack counts only from a group weighing at least
-/// [`ATTACK_FACTOR`] of the attacked argument's author; never from the
-/// attacked author's own key (or the node's own profiles on the node's
+/// undecided. Each attack weighs what the heaviest key of the group whose
+/// own position contradicts that event weighs, and counts only if that is
+/// at least [`ATTACK_FACTOR`] of the attacked event's author; never from
+/// the attacked author's own key (or the node's own profiles on the node's
 /// post), and, below the first level, never from a key grouped with the
 /// post's author (no self-rebuttal). Posts whose rows are not read yet go
 /// to `missing`.
 fn dispute(post: &PostRef, rows: &Rows, grouping: &Grouping, missing: &mut Vec<String>) -> Dispute {
     let net = post.net.as_str();
-    let mut args = vec![Argument {
-        weight: grouping.weight(net, &post.author),
-        react: None,
-        post: None,
-        events: HashSet::new(),
-        evidence: false,
-    }];
+    // The events of each argument: 0 is the post.
+    let mut args: Vec<HashSet<String>> = vec![HashSet::new()];
     let mut index: HashMap<String, usize> = HashMap::new();
-    let mut edges: HashSet<(usize, usize)> = HashSet::new();
+    let mut attacks: HashMap<(usize, usize), Attack<'_>> = HashMap::new();
     // (argument, event, its author): what attacks may target next.
     let mut frontier: Vec<(usize, String, String)> =
         vec![(0, post.id.clone(), post.author.clone())];
@@ -841,6 +897,7 @@ fn dispute(post: &PostRef, rows: &Rows, grouping: &Grouping, missing: &mut Vec<S
                 missing.push(id);
                 continue;
             };
+            let attacked_weight = grouping.weight(net, &author);
             let attacked = PostRef {
                 id,
                 author,
@@ -849,36 +906,42 @@ fn dispute(post: &PostRef, rows: &Rows, grouping: &Grouping, missing: &mut Vec<S
                 root_ask: false,
             };
             for g in positions(theirs, &attacked, grouping) {
-                let Some(react) = g.react.filter(|_| g.contradicts()) else {
+                let Some((weight, best)) = g.best(grouping, net, Stance::contradicts) else {
                     continue;
                 };
-                if depth > 1
-                    && g.members
-                        .iter()
-                        .any(|m| grouping.same(net, &post.author, m))
-                {
+                if depth > 1 && g.with(grouping, net, &post.author) {
                     continue;
                 }
                 let i = *index.entry(g.group.clone()).or_insert_with(|| {
-                    args.push(Argument {
-                        weight: 0.0,
-                        react: Some(react),
-                        post: g.post,
-                        events: HashSet::new(),
-                        evidence: false,
-                    });
+                    args.push(HashSet::new());
                     args.len() - 1
                 });
                 if i == target {
                     continue;
                 }
-                let arg = &mut args[i];
-                arg.weight = arg.weight.max(g.weight(grouping, net));
-                arg.evidence |= g.evidence();
-                edges.insert((i, target));
-                for event in [Some(react), g.post].into_iter().flatten() {
-                    if arg.events.insert(&event.id) && depth < DISPUTE_DEPTH {
-                        next.push((i, event.id.clone(), event.author.clone()));
+                let Some(react) = best.react else { continue };
+                // Weighted: attacks much lighter than the attacked author
+                // are ignored.
+                if weight >= ATTACK_FACTOR * attacked_weight {
+                    let attack = Attack {
+                        weight,
+                        react,
+                        post: best.post,
+                    };
+                    attacks
+                        .entry((i, target))
+                        .and_modify(|a| {
+                            if weight > a.weight {
+                                *a = attack;
+                            }
+                        })
+                        .or_insert(attack);
+                }
+                for m in g.members.iter().filter(|m| m.contradicts()) {
+                    for event in [m.react, m.post].into_iter().flatten() {
+                        if args[i].insert(event.id.clone()) && depth < DISPUTE_DEPTH {
+                            next.push((i, event.id.clone(), event.author.clone()));
+                        }
                     }
                 }
             }
@@ -886,48 +949,44 @@ fn dispute(post: &PostRef, rows: &Rows, grouping: &Grouping, missing: &mut Vec<S
         frontier = next;
     }
 
-    // Weighted: attacks by groups much lighter than the attacked author
-    // are ignored.
     let mut attackers: Vec<Vec<usize>> = vec![Vec::new(); args.len()];
-    for &(from, to) in &edges {
-        if args[from].weight >= ATTACK_FACTOR * args[to].weight {
-            attackers[to].push(from);
-        }
+    for &(from, to) in attacks.keys() {
+        attackers[to].push(from);
     }
     let labels = grounded(&attackers);
 
-    let contradiction = |i: usize| {
-        let arg = &args[i];
-        let detail = arg
-            .react
-            .and_then(|r| evidence_line(&r.data))
-            .or_else(|| arg.post.map(|p| p.title.clone()))
+    let contradiction = |a: &Attack<'_>| {
+        let detail = evidence_line(&a.react.data)
+            .or_else(|| a.post.map(|p| p.title.clone()))
             .unwrap_or_default();
         Contradiction {
-            author: arg.react.map(|r| r.author.clone()).unwrap_or_default(),
-            weight: arg.weight,
-            ts: arg.react.map_or(0, |r| r.ts),
+            author: a.react.author.clone(),
+            weight: a.weight,
+            ts: a.react.ts,
             detail,
         }
     };
-    let mut first: Vec<usize> = attackers[0].clone();
+    let mut first: Vec<(usize, Attack<'_>)> = attackers[0]
+        .iter()
+        .map(|&i| (i, attacks[&(i, 0)]))
+        .collect();
     // Oldest first, as the rows are.
-    first.sort_by_key(|&i| (args[i].react.map_or(0, |r| r.ts), i));
+    first.sort_by_key(|(i, a)| (a.react.ts, *i));
     let mut out = Dispute {
         standing: Vec::new(),
         undecided: Vec::new(),
         rebutted: 0,
         rebutted_with_evidence: true,
     };
-    for i in first {
+    for (i, attack) in first {
         match labels[i] {
-            Label::In => out.standing.push(contradiction(i)),
-            Label::Undecided => out.undecided.push(contradiction(i)),
+            Label::In => out.standing.push(contradiction(&attack)),
+            Label::Undecided => out.undecided.push(contradiction(&attack)),
             Label::Out => {
                 out.rebutted += 1;
                 let with_evidence = attackers[i]
                     .iter()
-                    .any(|&a| labels[a] == Label::In && args[a].evidence);
+                    .any(|&a| labels[a] == Label::In && has_evidence(&attacks[&(a, i)].react.data));
                 out.rebutted_with_evidence &= with_evidence;
             }
         }
@@ -1231,6 +1290,12 @@ mod tests {
                 Kind::React,
                 json!({"value": -1, "evidence": why}),
             )
+        }
+
+        /// `seed` announces itself now.
+        fn announce(&mut self, seed: u8) {
+            let announce = self.root(seed, Kind::Announce, "hello");
+            self.announces.insert(seed, announce);
         }
 
         /// `voucher` vouches for `seed` (on its announce).
@@ -1708,25 +1773,104 @@ mod tests {
         let fives = g.reply(5, &ask, Kind::Answer, json!({}));
         g.confirm(6, &fives);
         assert_eq!(g.signals(&fives).status, Status::Unverified);
-        // 7 alone vouches for 8 and 9: one group.
-        g.vouch(7, 8);
-        g.vouch(7, 9);
-        let other = g.reply(3, &ask, Kind::Answer, json!({}));
-        g.confirm(8, &other);
-        g.confirm(9, &other);
-        g.confirm(7, &other);
-        assert_eq!(g.signals(&other).confirms, 1);
+        // 1 is this node and used 7's answer. 7 alone vouches for the new
+        // keys 108 and 109, which so weigh a little: one group with 7.
         let sevens = g.reply(7, &ask, Kind::Answer, json!({}));
-        g.confirm(8, &sevens);
-        assert_eq!(g.signals(&sevens).status, Status::Unverified);
-        // Vouched by a second, independent key: on its own again.
-        g.vouch(10, 9);
-        assert_eq!(g.signals(&other).confirms, 2);
+        g.reply(1, &sevens, Kind::React, json!({"used": true}));
+        g.announce(108);
+        g.announce(109);
+        g.vouch(7, 108);
+        g.vouch(7, 109);
+        assert!(g.weight(&[1], 108) > 0.0);
+        let other = g.reply(3, &ask, Kind::Answer, json!({}));
+        g.confirm(108, &other);
+        g.confirm(109, &other);
+        g.confirm(7, &other);
+        assert_eq!(g.signals_with(&[1], &other).confirms, 1);
+        g.confirm(108, &sevens);
+        assert_eq!(
+            g.signals_with(&[1], &sevens).confirms,
+            0,
+            "within the group"
+        );
+        // Vouched for by a second, independent key: on its own again.
+        g.vouch(10, 109);
+        assert_eq!(g.signals_with(&[1], &other).confirms, 2);
+        // A stranger's vouch never pulls established keys into its group.
+        g.vouch(110, 12);
+        g.vouch(110, 13);
+        let table = g.table(&[1]);
+        assert_ne!(table.group_of(&id_of(12)), table.group_of(&id_of(13)));
+        assert_ne!(table.group_of(&id_of(12)), table.group_of(&id_of(110)));
         // A declared owner never silences a contradiction of the owner's
         // posts: it only takes positive weight away.
         g.root_with(11, Kind::Announce, "me", json!({"owner": "acme"}));
         g.contradict(11, &fives, "wrong");
         assert_eq!(g.signals(&fives).status, Status::Contested);
+    }
+
+    /// A post by 2, whom this node (1) trusts, confirmed with evidence and
+    /// cited by 3, whom this node trusts too.
+    fn trusted_and_confirmed(g: &mut Graph) -> Event {
+        let ask = g.root(1, Kind::Ask, "how?");
+        let post = g.reply(2, &ask, Kind::Answer, json!({}));
+        g.reply(1, &post, Kind::React, json!({"used": true}));
+        let threes = g.reply(3, &ask, Kind::Answer, json!({}));
+        g.reply(1, &threes, Kind::React, json!({"used": true}));
+        g.confirm(3, &post);
+        g.reply_citing(3, &ask, Kind::Note, json!({}), &[&post]);
+        post
+    }
+
+    /// 101, grouped with 3, votes -1 then contradicts 2's post: the group's
+    /// latest react. 101's signals count at 101's own weight, below what
+    /// contests 2; 3's confirmation and citation still count at 3's.
+    fn assert_no_weight_borrowed(g: &mut Graph, post: &Event) {
+        let table = g.table(&[1]);
+        assert_eq!(
+            table.group_of(&id_of(3)),
+            table.group_of(&id_of(101)),
+            "grouped"
+        );
+        assert!(table.weight(&id_of(101)) < ATTACK_FACTOR * table.weight(&id_of(2)));
+        g.reply(101, post, Kind::React, json!({"value": -1}));
+        g.contradict(101, post, "wrong");
+        let s = g.signals_with(&[1], post);
+        assert_eq!(
+            (s.status, s.confirms, s.cites, s.contradicts),
+            (Status::Confirmed, 1, 1, 0),
+            "{s:?}"
+        );
+        assert!(s.score > 0.0);
+    }
+
+    #[test]
+    fn a_declared_owner_lends_no_weight_to_a_fresh_key() {
+        let mut g = Graph::new();
+        g.root_with(3, Kind::Announce, "me", json!({"owner": "acme"}));
+        let post = trusted_and_confirmed(&mut g);
+        g.root_with(101, Kind::Announce, "me too", json!({"owner": "acme"}));
+        assert_eq!(g.weight(&[1], 101), 0.0);
+        assert_no_weight_borrowed(&mut g, &post);
+        assert_eq!(g.signals_with(&[1], &post).down, 0, "a vote of no weight");
+        // Nor does 101's confirmation borrow 3's weight elsewhere.
+        let ask = g.root(4, Kind::Ask, "else?");
+        let other = g.reply(5, &ask, Kind::Answer, json!({}));
+        g.confirm(101, &other);
+        assert_eq!(g.signals_with(&[1], &other).status, Status::Unverified);
+        assert_eq!(g.table(&[1]).score(&id_of(101)), 0.0);
+    }
+
+    #[test]
+    fn a_vouch_cluster_lends_no_weight_to_a_fresh_key() {
+        let mut g = Graph::new();
+        let post = trusted_and_confirmed(&mut g);
+        // 3 alone vouches for the new key 101: one group, and 101 weighs
+        // only the share of trust 3's vouch passes on.
+        g.announce(101);
+        g.vouch(3, 101);
+        assert!(g.weight(&[1], 101) > 0.0);
+        assert_no_weight_borrowed(&mut g, &post);
     }
 
     #[test]
@@ -2078,6 +2222,21 @@ mod tests {
             }
         }
         let events = g.store.count().unwrap();
+        // How long each query of a build holds the store's lock (inserts
+        // wait meanwhile).
+        let timed = |name: &str, run: &dyn Fn()| {
+            let start = std::time::Instant::now();
+            run();
+            eprintln!("{name}: {:?}", start.elapsed());
+        };
+        timed("author_events", &|| drop(g.store.author_events("public")));
+        timed("net_signal_rows", &|| {
+            drop(g.store.net_signal_rows("public", 200_000))
+        });
+        timed("accept_reacts_in", &|| {
+            drop(g.store.accept_reacts_in("public", 200_000))
+        });
+        timed("vouches", &|| drop(g.store.vouches("public")));
         let start = std::time::Instant::now();
         let table = g.table(&[1, 2]);
         let built = start.elapsed();
