@@ -90,8 +90,10 @@ pieces), wait longer (helpers' nodes may be offline), or do it locally without \
 the swarm. Never repost the same ask on your own.
 
 When you can do only part of a request (for example, write code that you cannot \
-build or test where you run), do not stay silent: `reply` with a `clarify` that \
-says what you can deliver and what is missing, with `data.options` (the partial \
+build or test where you run), do not stay silent: `reply` with a `clarify` written \
+to the asker, so that it reads on its own even when relayed to a person: \
+\"To the asker: I can't X here because Y. I can Z instead. Reply with your choice: \
+[a] … [b] …\", with the same choices in `data.options` (the partial \
 deliverable first, a way out last, e.g. [\"untested code\", \"no thanks\"]) and a \
 `data.default`: always the safest, minimal option (the partial deliverable \
 clearly marked, or the way out). If they take it, deliver it and say plainly in \
@@ -696,6 +698,9 @@ pub struct WatsMcp {
     hinted: Arc<std::sync::atomic::AtomicBool>,
     /// Directories the agent may share files from.
     file_roots: Arc<Vec<PathBuf>>,
+    /// The MCP host, when it says (`WATS_MCP_CLIENT`, e.g. `openclaw`):
+    /// replies to the asks it posts are pushed to it (ADR 0018 §7).
+    client: Option<String>,
     tool_router: ToolRouter<Self>,
 }
 
@@ -748,12 +753,19 @@ impl WatsMcp {
             runner: None,
             hinted: Default::default(),
             file_roots: Arc::new(file_roots),
+            client: None,
             tool_router: if node_reviews {
                 Self::tool_router() + Self::node_router() + Self::review_router()
             } else {
                 Self::tool_router() + Self::node_router()
             },
         }
+    }
+
+    /// The MCP host this session comes from (see [`crate::attach::CLIENT_ENV`]).
+    pub fn with_client(mut self, client: Option<String>) -> Self {
+        self.client = client.filter(|c| !c.is_empty());
+        self
     }
 
     /// Post as another profile of the same node (SPEC §2.2).
@@ -884,6 +896,20 @@ impl WatsMcp {
             .publish_as(&self.author, draft, &attachments)
             .await
             .map_err(|e| format!("{e:#}"))?;
+        // A human's ask from a host the node can notify: remember it, so
+        // that replies reach the human there (ADR 0018 §7).
+        if let Some(client) = self.client.as_deref().filter(|c| *c == "openclaw")
+            && event.kind == Kind::Ask
+            && event.thread.is_none()
+            && self.runner.is_none()
+            && !self.held
+            && let Err(e) =
+                self.node
+                    .store()
+                    .set_ask_notify(&event.id, client, crate::node::now_secs())
+        {
+            tracing::warn!(ask = %event.id, "cannot remember where to notify replies: {e:#}");
+        }
         ok(json!({"id": event.id, "post": PostView::new(&event, false)}))
     }
 }

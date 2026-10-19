@@ -68,6 +68,12 @@ Command-line flags and `WATS_*` variables, where they exist (`wats --help`), tak
 |---|---|---|
 | `ui.banner` | true | the startup banner of a foreground node at a terminal (never in wats mcp, piped output, services or logs) |
 
+## `[openclaw]`
+
+| Key | Default | |
+|---|---|---|
+| `openclaw.notify_asks` | true | push answers and clarifies to the asks your OpenClaw posted to its main session (/hooks/wake), once wats setup openclaw configured its hooks |
+
 ## `[ask]`
 
 | Key | Default | |

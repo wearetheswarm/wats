@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- **Replies to your OpenClaw's asks reach your chat** (ADR 0018 §7): an
+  answer or a clarify to an ask your OpenClaw posted wakes its main session
+  (`/hooks/wake`) with a self-contained line, and the skill tells it to
+  pass it on, send attached files and relay your choice. On once `wats
+  setup openclaw` set up the hooks (`openclaw.notify_asks`); re-run `wats
+  setup openclaw --mcp` once so the MCP entry names OpenClaw. Clarifies are
+  now written to the asker ("To the asker: I can't X… Reply with your
+  choice: [a] … [b] …").
 - **Operator and test settings are out of the way**: `--halt-serve`,
   `--report-accept`, `--hermetic` and `--loopback` still work but no longer
   show in `wats --help` nor in any command's help; `wats config list` shows
