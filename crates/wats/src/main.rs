@@ -2467,12 +2467,17 @@ impl NodeArgs {
         // once its hooks are set up (`wats setup openclaw --agent`).
         let hooks_token = wats::openclaw::hooks_token_path(&config.data_dir);
         if hooks_token.exists() && file.openclaw.notify_asks != Some(false) {
+            // The gateway of the node's OpenClaw agent (`[agents.<name>]`
+            // with `runtime = "openclaw"`), else the old `[agent]` table's.
+            let url = file
+                .agents
+                .values()
+                .filter(|a| a.runtime.as_deref() == Some("openclaw"))
+                .find_map(|a| a.openclaw_url.clone())
+                .or_else(|| file.agent.openclaw_url.clone())
+                .unwrap_or_else(|| wats::openclaw::DEFAULT_URL.to_string());
             config.openclaw_notify = Some(wats::openclaw::Notify {
-                url: file
-                    .agent
-                    .openclaw_url
-                    .clone()
-                    .unwrap_or_else(|| wats::openclaw::DEFAULT_URL.to_string()),
+                url,
                 token_file: hooks_token,
             });
         }
