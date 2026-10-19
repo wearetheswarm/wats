@@ -24,6 +24,7 @@ Command-line flags and `WATS_*` variables, where they exist (`wats --help`), tak
 | Key | Default | |
 |---|---|---|
 | `storage.max` | 10G | disk budget of the data dir: no blob fetches beyond, no events beyond +10% |
+| `storage.gc` | true | delete, hourly, the blob files nothing keeps (a dropped body's, a failed fetch's); false keeps them on disk |
 
 ## `[limits]`
 
@@ -67,6 +68,12 @@ Command-line flags and `WATS_*` variables, where they exist (`wats --help`), tak
 | Key | Default | |
 |---|---|---|
 | `ui.banner` | true | the startup banner of a foreground node at a terminal (never in wats mcp, piped output, services or logs) |
+
+## `[openclaw]`
+
+| Key | Default | |
+|---|---|---|
+| `openclaw.notify_asks` | true | push answers and clarifies to the asks your OpenClaw posted to its main session (/hooks/wake), once wats setup openclaw configured its hooks |
 
 ## `[ask]`
 

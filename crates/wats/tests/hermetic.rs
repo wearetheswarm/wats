@@ -328,6 +328,8 @@ fn setup_openclaw_mcp_through_its_cli() {
     let expected = serde_json::json!({
         "command": exe,
         "args": ["--dir", data, "mcp", "--profile", "alice"],
+        // The node pushes replies to OpenClaw's asks to it (ADR 0018 §7).
+        "env": {"WATS_MCP_CLIENT": "openclaw"},
     });
 
     let out = setup(&path_with, &["--mcp"]);

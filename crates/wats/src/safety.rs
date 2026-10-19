@@ -54,6 +54,7 @@ pub const KEYS: &[&str] = &[
     "update.security_delay",
     "update.url",
     "limits.challenge",
+    "storage.gc",
 ];
 
 pub const FILE_NAME: &str = "safety.json";

@@ -84,6 +84,16 @@ pub struct Settings {
     pub ask: AskSettings,
     #[serde(default)]
     pub ui: UiSettings,
+    #[serde(default)]
+    pub openclaw: OpenclawSettings,
+}
+
+/// `[openclaw]`: what the node does for the human's OpenClaw (ADR 0018 §7).
+#[derive(Debug, Default, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OpenclawSettings {
+    /// Push replies to the asks posted from OpenClaw to its main session.
+    pub notify_asks: Option<bool>,
 }
 
 /// `[ui]`: what a foreground node prints for the person at the terminal.
@@ -212,6 +222,8 @@ pub struct SubmitSettings {
 #[serde(deny_unknown_fields)]
 pub struct StorageSettings {
     pub max: Option<String>,
+    /// Collect the blobs nothing keeps, hourly (default: true).
+    pub gc: Option<bool>,
 }
 
 /// Default disk budget of the data directory (`storage.max`).
@@ -555,6 +567,12 @@ pub const KEYS: &[Key] = &[
         "disk budget of the data dir: no blob fetches beyond, no events beyond +10%",
     ),
     key(
+        "storage.gc",
+        ValueType::Bool,
+        "true",
+        "delete, hourly, the blob files nothing keeps (a dropped body's, a failed fetch's); false keeps them on disk",
+    ),
+    key(
         "limits.hello_per_min",
         ValueType::Integer,
         "60",
@@ -674,6 +692,13 @@ pub const KEYS: &[Key] = &[
         "true",
         "the startup banner of a foreground node at a terminal (never in wats mcp, \
          piped output, services or logs)",
+    ),
+    key(
+        "openclaw.notify_asks",
+        ValueType::Bool,
+        "true",
+        "push answers and clarifies to the asks your OpenClaw posted to its main session \
+         (/hooks/wake), once wats setup openclaw configured its hooks",
     ),
     key(
         "ask.unanswered_after",
