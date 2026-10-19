@@ -137,6 +137,13 @@ pub struct NodeConfig {
     /// [`HARD_CEILING_PERCENT`] of it, it also refuses events from others.
     /// Unlimited if unset. Eviction comes in Phase 2.
     pub storage_max: Option<u64>,
+    /// Delete the blobs nothing keeps, every `blob_gc_interval`
+    /// (`storage.gc`): no tag and listed by no kept event, e.g. the files
+    /// of a dropped body (ADR 0020 §2) or of a fetch that failed half-way.
+    pub blob_gc: bool,
+    /// How often the blob collection runs: [`BLOB_GC_INTERVAL`]; tests
+    /// shorten it.
+    pub blob_gc_interval: Duration,
     /// Profiles whose posts through MCP are held for review instead of
     /// published (`agent.review`: the agent's profile). Non-empty also
     /// holds the posts of every runner session.
@@ -203,6 +210,8 @@ impl NodeConfig {
             max_blob_bytes: 256 * 1024 * 1024,
             blob_quota: None,
             storage_max: None,
+            blob_gc: true,
+            blob_gc_interval: BLOB_GC_INTERVAL,
             review_profiles: Vec::new(),
             review_ttl: Duration::from_secs(24 * 3600),
             review_notify: false,
@@ -464,9 +473,248 @@ const MAX_PROVIDER_ATTEMPTS: usize = 4;
 const PROVIDER_BACKOFF: Duration = Duration::from_secs(30);
 const PROVIDER_BACKOFF_MAX: Duration = Duration::from_secs(3600);
 
+/// How often the blob store collects the blobs nothing keeps
+/// (`storage.gc`).
+pub const BLOB_GC_INTERVAL: Duration = Duration::from_secs(3600);
+
+/// What the blob collection keeps besides the blob store's own tags and
+/// temporary tags: the blobs a kept event lists, and those being brought
+/// in ([`BlobHold`]).
+///
+/// The collection of iroh-blobs runs in three steps, each reading what to
+/// keep at its own time: our callback ([`protect_blobs`]), then it clears
+/// its set of blobs written since the last run and lists the tags and the
+/// temporary tags (the mark), then it deletes what is in none of them and
+/// was not written meanwhile (the sweep). It does not keep a download in
+/// progress by itself: a partial blob is written to disk without telling
+/// its database, so one that started before the run is deleted under the
+/// download. [`BlobHold`] keeps it.
+#[derive(Debug, Default)]
+struct BlobKeep {
+    /// Hashes being fetched, with how many hold each.
+    held: std::sync::Mutex<HashMap<Hash, usize>>,
+    /// The blob store, for the callback (set once it is open).
+    blobs: std::sync::OnceLock<iroh_blobs::api::Store>,
+    /// Collections begun (callbacks run), for tests.
+    runs: std::sync::atomic::AtomicU64,
+}
+
+/// Keeps a blob from the collection while it is brought in (a fetch for an
+/// event, a replica), until it is pinned: in [`BlobKeep::held`], which the
+/// callback of every run reads, and under a temporary tag, which the mark
+/// of a run already past its callback reads.
+struct BlobHold {
+    keep: Arc<BlobKeep>,
+    hash: Hash,
+    _tag: Option<iroh_blobs::api::TempTag>,
+}
+
+impl Drop for BlobHold {
+    fn drop(&mut self) {
+        if let Ok(mut held) = self.keep.held.lock()
+            && let std::collections::hash_map::Entry::Occupied(mut entry) = held.entry(self.hash)
+        {
+            *entry.get_mut() = entry.get().saturating_sub(1);
+            if *entry.get() == 0 {
+                entry.remove();
+            }
+        }
+    }
+}
+
+/// The blobs one collection must keep, beyond the tags and the temporary
+/// tags its own mark reads later: the temporary tags, the held blobs, and
+/// the blobs every kept full event lists (tombstones and opaque events
+/// list none), so a fetched blob between its event and its tag too. Read
+/// in the order the hand-offs happen (an import's temporary tag before its
+/// tag, a hold before its tag), so a blob handed from one to the next
+/// meanwhile is seen in one of them. Logs, at INFO, what the run deletes.
+async fn blobs_to_keep(keep: &BlobKeep, store: &Store) -> Result<HashSet<Hash>> {
+    let blobs = keep.blobs.get().context("blob store not open yet")?;
+    let mut live = HashSet::new();
+    let mut temp = blobs.tags().list_temp_tags().await?;
+    while let Some(tag) = temp.next().await {
+        live.insert(tag.hash);
+    }
+    match keep.held.lock() {
+        Ok(held) => live.extend(held.keys().copied()),
+        Err(_) => bail!("held blobs unreadable"),
+    }
+    live.extend(
+        store
+            .referenced_blobs()?
+            .iter()
+            .filter_map(|h| h.parse::<Hash>().ok()),
+    );
+    // What the sweep deletes, for the log: every blob in no tag and not
+    // kept above (at most: a blob written during the run is spared).
+    let mut tagged = HashSet::new();
+    let mut tags = blobs.tags().list().await?;
+    while let Some(tag) = tags.next().await {
+        tagged.insert(tag?.hash);
+    }
+    let mut doomed = Vec::new();
+    let mut all = blobs.blobs().list().stream().await?;
+    while let Some(hash) = all.next().await {
+        let hash = hash?;
+        if !live.contains(&hash) && !tagged.contains(&hash) {
+            doomed.push(hash);
+        }
+    }
+    if !doomed.is_empty() {
+        let mut bytes: u64 = 0;
+        for hash in &doomed {
+            bytes = bytes.saturating_add(match blobs.blobs().status(*hash).await? {
+                BlobStatus::Complete { size } => size,
+                BlobStatus::Partial { size } => size.unwrap_or(0),
+                BlobStatus::NotFound => 0,
+            });
+        }
+        info!(
+            blobs = doomed.len(),
+            bytes,
+            "blob collection: deleting {} nothing keeps",
+            format_bytes(bytes)
+        );
+    }
+    Ok(live)
+}
+
+/// The protect callback of the blob collection: adds [`blobs_to_keep`] to
+/// `live`. Any error aborts this run (logged at WARN), so that nothing a
+/// failed read would have kept is deleted; the next run tries again.
+fn protect_blobs<'a>(
+    keep: &Arc<BlobKeep>,
+    store: &Arc<Store>,
+    live: &'a mut HashSet<Hash>,
+) -> std::pin::Pin<
+    Box<dyn std::future::Future<Output = iroh_blobs::store::ProtectOutcome> + Send + Sync + 'a>,
+> {
+    use iroh_blobs::store::ProtectOutcome;
+    keep.runs.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let (keep, store) = (Arc::clone(keep), Arc::clone(store));
+    // On its own task: the callback's future must be Sync, a join handle is.
+    let task = tokio::spawn(async move { blobs_to_keep(&keep, &store).await });
+    Box::pin(async move {
+        match task.await {
+            Ok(Ok(kept)) => {
+                live.extend(kept);
+                ProtectOutcome::Continue
+            }
+            Ok(Err(e)) => {
+                warn!("blob collection skipped: {e:#}");
+                ProtectOutcome::Abort
+            }
+            Err(e) => {
+                warn!("blob collection skipped: {e}");
+                ProtectOutcome::Abort
+            }
+        }
+    })
+}
+
+/// Constrain a closure to the signature of a collection callback.
+fn gc_callback<F>(f: F) -> iroh_blobs::store::ProtectCb
+where
+    F: for<'a> Fn(
+            &'a mut HashSet<Hash>,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<Output = iroh_blobs::store::ProtectOutcome>
+                    + Send
+                    + Sync
+                    + 'a,
+            >,
+        > + Send
+        + Sync
+        + 'static,
+{
+    Arc::new(f)
+}
+
+/// Open the blob store of `dir`, collecting what nothing keeps every
+/// `interval` unless `gc` is off.
+async fn load_blobs(
+    dir: &Path,
+    gc: bool,
+    interval: Duration,
+    keep: &Arc<BlobKeep>,
+    store: &Arc<Store>,
+) -> Result<FsStore> {
+    if gc {
+        // On a store no collection runs on yet: a collection's pending
+        // deletion already hides a blob from `status`, its file must stay
+        // until the deletion commits.
+        let blobs = FsStore::load(dir).await?;
+        match remove_leftovers(dir, &blobs).await {
+            Ok(0) => {}
+            Ok(files) => info!(
+                files,
+                "blob collection: removed the files a crash left behind"
+            ),
+            Err(e) => warn!("blob files a crash left behind not removed: {e:#}"),
+        }
+        blobs.shutdown().await?;
+    }
+    let mut options = iroh_blobs::store::fs::options::Options::new(dir);
+    if gc {
+        let (keep, store) = (Arc::clone(keep), Arc::clone(store));
+        options.gc = Some(iroh_blobs::store::GcConfig {
+            interval,
+            add_protected: Some(gc_callback(move |live| protect_blobs(&keep, &store, live))),
+        });
+    }
+    let blobs = FsStore::load_with_opts(dir.join("blobs.db"), options).await?;
+    keep.blobs.set(std::ops::Deref::deref(&blobs).clone()).ok();
+    Ok(blobs)
+}
+
+/// Remove what a crash left in the blob store of `dir`, before anything
+/// else uses it (nothing writes, nothing collects): the files of blobs
+/// its database no longer has (a collection commits the deletion, then
+/// removes the files: a crash in between leaves them, and no later run
+/// sees them), and the temporary files of imports. Returns how many
+/// files went.
+async fn remove_leftovers(dir: &Path, blobs: &FsStore) -> Result<usize> {
+    let mut removed: usize = 0;
+    let mut files: HashMap<Hash, Vec<PathBuf>> = HashMap::new();
+    let mut entries = tokio::fs::read_dir(dir.join("data")).await?;
+    while let Some(entry) = entries.next_entry().await? {
+        if !entry.file_type().await?.is_file() {
+            continue;
+        }
+        let name = entry.file_name();
+        let Some((hex, ext)) = name.to_str().and_then(|n| n.split_once('.')) else {
+            continue;
+        };
+        if !matches!(ext, "data" | "obao4" | "sizes4" | "bitfield") || hex.len() != 64 {
+            continue;
+        }
+        if let Ok(hash) = hex.parse::<Hash>() {
+            files.entry(hash).or_default().push(entry.path());
+        }
+    }
+    for (hash, paths) in files {
+        if matches!(blobs.blobs().status(hash).await?, BlobStatus::NotFound) {
+            for path in paths {
+                tokio::fs::remove_file(&path).await?;
+                removed = removed.saturating_add(1);
+            }
+        }
+    }
+    let mut temp = tokio::fs::read_dir(dir.join("temp")).await?;
+    while let Some(entry) = temp.next_entry().await? {
+        if entry.file_type().await?.is_file() {
+            tokio::fs::remove_file(entry.path()).await?;
+            removed = removed.saturating_add(1);
+        }
+    }
+    Ok(removed)
+}
+
 /// Delete every tag of blob `hash` (`wats/blob/<hash>`, and the automatic
-/// tag of an import by an older release). Nothing deletes the file yet:
-/// the blob store's collection comes in its own change.
+/// tag of an import by an older release): the next collection deletes
+/// it, unless a kept event lists it.
 async fn unpin_blob(blobs: &FsStore, hash: Hash) -> Result<()> {
     let mut names = Vec::new();
     let mut tags = blobs.tags().list().await?;
@@ -758,6 +1006,8 @@ pub struct Node {
     challenger: crate::challenge::Challenger,
     /// `/wats` requests being served.
     in_flight: std::sync::atomic::AtomicUsize,
+    /// What the blob collection keeps besides tags (see [`BlobKeep`]).
+    blob_keep: Arc<BlobKeep>,
     /// Tokens of the agent runs in progress: an MCP session presenting one
     /// is a runner session.
     runner_tokens: std::sync::Mutex<HashMap<String, RunnerRun>>,
@@ -994,7 +1244,15 @@ impl Node {
 
         let store = Arc::new(Store::open(&config.data_dir.join("events.sqlite"))?);
         revalidate_opaque(&store)?;
-        let blobs = FsStore::load(config.data_dir.join("blobs")).await?;
+        let blob_keep = Arc::new(BlobKeep::default());
+        let blobs = load_blobs(
+            &config.data_dir.join("blobs"),
+            config.blob_gc,
+            config.blob_gc_interval,
+            &blob_keep,
+            &store,
+        )
+        .await?;
         let gossip = Gossip::builder()
             .max_message_size(GOSSIP_MAX_MESSAGE_BYTES)
             .spawn(endpoint.clone());
@@ -1055,6 +1313,7 @@ impl Node {
                 reputable,
             ),
             in_flight: Default::default(),
+            blob_keep,
             runner_tokens: Default::default(),
             local_authors: Default::default(),
             lock: std::sync::Mutex::new(Some(lock)),
@@ -1631,7 +1890,10 @@ impl Node {
                 bail!("blob name {name:?} is not allowed");
             }
             // Held by a temporary tag until pinned under our own name: no
-            // automatic tag, so that dropping the post frees the blob.
+            // automatic tag, so that dropping the post frees the blob. The
+            // collection keeps it meanwhile: the store creates that tag
+            // before it records the blob, and our callback reads temporary
+            // tags before the mark reads tags (see `blobs_to_keep`).
             let added = self.blobs.add_path(&path).temp_tag().await?;
             let hash = added.hash();
             self.pin(hash).await?;
@@ -1644,6 +1906,39 @@ impl Node {
             });
         }
         Ok(refs)
+    }
+
+    /// Keep blob `hash` from the collection while it is brought in, until
+    /// the returned hold is dropped (after [`Node::pin`]). Taken before
+    /// the first byte is written.
+    async fn hold_blob(&self, hash: Hash) -> BlobHold {
+        if let Ok(mut held) = self.blob_keep.held.lock() {
+            let count = held.entry(hash).or_insert(0);
+            *count = count.saturating_add(1);
+        }
+        let tag = match self.blobs.tags().temp_tag(hash).await {
+            Ok(tag) => Some(tag),
+            Err(e) => {
+                // Still held in memory: only a run whose callback came
+                // before this point could miss it.
+                debug!(%hash, "no temporary tag for a blob in flight: {e:#}");
+                None
+            }
+        };
+        BlobHold {
+            keep: Arc::clone(&self.blob_keep),
+            hash,
+            _tag: tag,
+        }
+    }
+
+    /// Blob collections begun since the node started, aborted ones
+    /// included (0 with `storage.gc = false`). Runs follow one another:
+    /// once this grew by 2, a whole run started and ended in between.
+    pub fn blob_collections(&self) -> u64 {
+        self.blob_keep
+            .runs
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Keep a blob from garbage collection.
@@ -2712,6 +3007,9 @@ impl Node {
             debug!(hash = %blob.hash, "no provider to fetch from (all backing off)");
             return false;
         }
+        // Kept from the collection from before the first byte until pinned:
+        // a partial blob is not, by itself.
+        let _hold = self.hold_blob(hash).await;
         // B10: ask for the declared size only, so a blob larger than its
         // event says never costs more than what was declared and checked
         // against the limits.
@@ -3304,5 +3602,255 @@ mod tests {
         );
         crate::grease::set_rate(crate::grease::DEFAULT_RATE);
         assert!(e.extra.keys().all(|k| crate::wire::is_grease(k)) && e.extra.len() == 1);
+    }
+}
+
+/// The blob collection (`storage.gc`): what it deletes and what it keeps.
+#[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::arithmetic_side_effects
+)]
+mod blob_gc_tests {
+    use super::*;
+    use crate::event::Kind;
+
+    /// Above the 16 KiB the blob store inlines in its database: files.
+    const SIZE: usize = 40 * 1024;
+
+    async fn start(dir: &Path, gc: bool) -> Arc<Node> {
+        let mut config = NodeConfig::new(dir);
+        config.mode = NetworkMode::Loopback;
+        config.infra = crate::infra::Infra::None;
+        config.pow_bits = Some(8);
+        config.min_pow_bits = Some(8);
+        config.blob_gc = gc;
+        config.blob_gc_interval = Duration::from_millis(10);
+        Node::start(config).await.unwrap()
+    }
+
+    /// Wait until a whole collection ran after this call.
+    async fn collected(node: &Node) {
+        let from = node.blob_collections();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+        while node.blob_collections() < from + 2 {
+            assert!(tokio::time::Instant::now() < deadline, "no collection ran");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
+    fn content(seed: u8) -> Vec<u8> {
+        (0..SIZE).map(|i| (i % 251) as u8 ^ seed).collect()
+    }
+
+    /// A post with one file of `content(seed)`: a new post each time.
+    async fn publish(node: &Arc<Node>, dir: &Path, seed: u8) -> Event {
+        static POSTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = POSTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let path = dir.join(format!("file-{seed}.bin"));
+        std::fs::write(&path, content(seed)).unwrap();
+        node.publish(
+            Draft {
+                net: PUBLIC_NET.into(),
+                kind: Some(Kind::Note),
+                title: Some(format!("post {n}")),
+                text: format!("with a file, {seed}"),
+                ..Draft::default()
+            },
+            &[Attachment { path, name: None }],
+        )
+        .await
+        .unwrap()
+    }
+
+    fn hash_of(event: &Event) -> Hash {
+        event.blobs[0].hash.parse().unwrap()
+    }
+
+    /// The blob is complete in the store and its file is on disk.
+    async fn present(node: &Node, hash: Hash) -> bool {
+        let file = node
+            .config
+            .data_dir
+            .join("blobs/data")
+            .join(format!("{}.data", hash.to_hex()));
+        let complete = matches!(
+            node.blobs.status(hash).await.unwrap(),
+            BlobStatus::Complete { .. }
+        );
+        assert_eq!(complete, file.exists(), "store and disk disagree");
+        complete
+    }
+
+    /// A blob in the store under no tag, kept by nothing.
+    async fn loose(node: &Node, seed: u8) -> Hash {
+        let tag = node
+            .blobs
+            .add_bytes(content(seed))
+            .temp_tag()
+            .await
+            .unwrap();
+        tag.hash()
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_dropped_body_s_blob_is_deleted() {
+        let dir = tempfile::tempdir().unwrap();
+        let node = start(&dir.path().join("n"), true).await;
+        let event = publish(&node, dir.path(), 1).await;
+        let hash = hash_of(&event);
+        collected(&node).await;
+        assert!(present(&node, hash).await, "kept while the post is");
+        let outcome = node
+            .drop_body(&event.id, DropReason::Own, None, None)
+            .await
+            .unwrap();
+        assert_eq!(outcome.freed_blobs, [hash.to_hex().to_string()]);
+        collected(&node).await;
+        assert!(!present(&node, hash).await, "deleted with the body");
+        node.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_blob_a_kept_event_lists_survives_untagged() {
+        let dir = tempfile::tempdir().unwrap();
+        let node = start(&dir.path().join("n"), true).await;
+        let event = publish(&node, dir.path(), 2).await;
+        let hash = hash_of(&event);
+        // As after a crash between storing a fetched event and its tag.
+        unpin_blob(&node.blobs, hash).await.unwrap();
+        assert!(!node.blob_pinned(&hash.to_hex()).await.unwrap());
+        collected(&node).await;
+        assert!(present(&node, hash).await);
+        node.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_blob_shared_by_a_dropped_and_a_kept_event_survives() {
+        let dir = tempfile::tempdir().unwrap();
+        let node = start(&dir.path().join("n"), true).await;
+        let dropped = publish(&node, dir.path(), 3).await;
+        let kept = publish(&node, dir.path(), 3).await;
+        let hash = hash_of(&dropped);
+        assert_eq!(hash, hash_of(&kept));
+        let outcome = node
+            .drop_body(&dropped.id, DropReason::Own, None, None)
+            .await
+            .unwrap();
+        assert!(outcome.body_dropped && outcome.freed_blobs.is_empty());
+        // Even untagged: the kept post lists it.
+        unpin_blob(&node.blobs, hash).await.unwrap();
+        collected(&node).await;
+        assert!(present(&node, hash).await);
+        node.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_pinned_blob_survives_and_a_loose_one_does_not() {
+        let dir = tempfile::tempdir().unwrap();
+        let node = start(&dir.path().join("n"), true).await;
+        let pinned = loose(&node, 4).await;
+        node.pin(pinned).await.unwrap();
+        let unpinned = loose(&node, 5).await;
+        assert!(present(&node, unpinned).await);
+        collected(&node).await;
+        assert!(present(&node, pinned).await);
+        assert!(!present(&node, unpinned).await);
+        node.shutdown().await.unwrap();
+    }
+
+    /// An import in progress (`publish` between the import and the tag)
+    /// and a fetch in progress (between its first byte and its tag) are
+    /// kept, and collected once nothing keeps them.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn blobs_in_flight_survive() {
+        let dir = tempfile::tempdir().unwrap();
+        let node = start(&dir.path().join("n"), true).await;
+        // What `import` holds until it pins.
+        let import = node.blobs.add_bytes(content(6)).temp_tag().await.unwrap();
+        let imported = import.hash();
+        // What `fetch_blob` holds until it pins.
+        let fetched = loose(&node, 7).await;
+        let hold = node.hold_blob(fetched).await;
+        let twice = node.hold_blob(fetched).await;
+        collected(&node).await;
+        collected(&node).await;
+        assert!(present(&node, imported).await, "import in progress kept");
+        assert!(present(&node, fetched).await, "fetch in progress kept");
+        drop(import);
+        drop(hold);
+        collected(&node).await;
+        assert!(
+            !present(&node, imported).await,
+            "import abandoned: collected"
+        );
+        assert!(present(&node, fetched).await, "still held once");
+        drop(twice);
+        collected(&node).await;
+        assert!(!present(&node, fetched).await, "fetch abandoned: collected");
+        node.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn storage_gc_false_deletes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let node = start(&dir.path().join("n"), false).await;
+        let event = publish(&node, dir.path(), 8).await;
+        let hash = hash_of(&event);
+        let unpinned = loose(&node, 9).await;
+        node.drop_body(&event.id, DropReason::Own, None, None)
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(node.blob_collections(), 0);
+        assert!(present(&node, hash).await);
+        assert!(present(&node, unpinned).await);
+        node.shutdown().await.unwrap();
+    }
+
+    /// A blob fetched from a peer while collections run back to back is
+    /// kept from its first byte (a partial blob is not, by itself).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_blob_fetched_during_collections_survives() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = start(&dir.path().join("a"), false).await;
+        let mut config = NodeConfig::new(dir.path().join("b"));
+        config.mode = NetworkMode::Loopback;
+        config.infra = crate::infra::Infra::None;
+        config.pow_bits = Some(8);
+        config.min_pow_bits = Some(8);
+        config.blob_gc_interval = Duration::from_millis(1);
+        // Another network: B never stores A's post, only fetches its blob.
+        config.nets = vec!["gc-test".into()];
+        config.peers.push(a.endpoint().addr());
+        let b = Node::start(config).await.unwrap();
+        // Large enough to arrive over many writes.
+        let path = dir.path().join("big.bin");
+        let big: Vec<u8> = (0..8 * 1024 * 1024u32).map(|i| (i % 253) as u8).collect();
+        std::fs::write(&path, &big).unwrap();
+        let event = a
+            .publish(
+                Draft {
+                    net: PUBLIC_NET.into(),
+                    kind: Some(Kind::Note),
+                    title: Some("big".into()),
+                    text: "a big file".into(),
+                    ..Draft::default()
+                },
+                &[Attachment { path, name: None }],
+            )
+            .await
+            .unwrap();
+        let blob = event.blobs[0].clone();
+        // Not through an event B stores: only the hold keeps it.
+        assert!(b.store().get(&event.id).unwrap().is_none());
+        assert!(b.fetch_blob(&blob, vec![a.endpoint_id()]).await);
+        collected(&b).await;
+        assert!(present(&b, hash_of(&event)).await);
+        assert_eq!(b.blob_bytes(&blob.hash).await.unwrap().unwrap(), big);
+        b.shutdown().await.unwrap();
+        a.shutdown().await.unwrap();
     }
 }

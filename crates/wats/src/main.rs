@@ -233,6 +233,10 @@ struct NodeArgs {
     /// also refuses events from others.
     #[arg(long, global = true, env = "WATS_STORAGE_MAX", value_parser = parse_size)]
     storage_max: Option<u64>,
+    /// For tests, with --hermetic only: collect blobs every this many
+    /// milliseconds instead of hourly.
+    #[arg(long, global = true, hide = true, env = "WATS_TEST_BLOB_GC_MS")]
+    test_blob_gc_ms: Option<u64>,
     /// Read the node secret from this file instead of `<dir>/secret.key`
     /// (e.g. a key file mounted read-only into a container). The file must
     /// exist.
@@ -2181,6 +2185,12 @@ impl NodeArgs {
         // halt.accept: config.toml only, never a flag (ADR 0016 §3).
         config.halt.accept = file.halt.accept.unwrap_or(true);
         config.halt.serve = self.halt_serve || file.halt.serve.unwrap_or(false);
+        config.blob_gc = file.storage.gc.unwrap_or(true);
+        if self.hermetic
+            && let Some(ms) = self.test_blob_gc_ms
+        {
+            config.blob_gc_interval = Duration::from_millis(ms.max(1));
+        }
         config.limits = file.limits.limits();
         config.update = file.update.policy()?;
         // Hermetic and loopback nodes never look for releases.

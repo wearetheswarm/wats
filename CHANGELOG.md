@@ -17,9 +17,15 @@
   tombstone. For the person running the node, not for agents: no MCP
   tool. See [Security and compliance](docs/security-and-compliance.md).
 - The store moves to schema 5 (a table of local drop records), migrated in
-  place at the first start: no resync. A dropped body's files are untagged;
-  deleting them from disk comes with the blob collection, in its own
-  change.
+  place at the first start: no resync.
+- **Blob collection** (`storage.gc`, default `true`): every hour the node
+  deletes the blob files nothing keeps, in no tag and listed by no post it
+  keeps: a dropped body's files, a fetch abandoned half-way. A blob a kept
+  post lists, a pinned one, and an import or a download in progress are
+  kept. A collection that deletes something logs one line with the count
+  and the bytes. A crash in the middle loses nothing kept; the files it
+  leaves behind go at the next start. `storage.gc = false` keeps every
+  file.
 
 ## 0.3.2 (2026-10-19)
 

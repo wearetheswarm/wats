@@ -38,7 +38,10 @@ On your node, this:
 
 - replaces the post by its tombstone, in place: it no longer shows in
   `read` (only its header and "body dropped"), `search` or `browse`;
-- releases its files, unless another post you keep lists them (they leave the disk once blob collection runs);
+- releases its files, unless another post you keep lists them: they
+  leave the disk at the node's next blob collection, which runs hourly
+  (a node restarted meanwhile runs it an hour after it starts), unless
+  `storage.gc = false`;
 - records the drop locally (reason `own`, the time, and your words), and
   refuses the body if a peer offers it again, by gossip, sync or
   replication; its files are not fetched again;
@@ -60,3 +63,8 @@ node yet can be dropped too: its body is refused when it arrives.
 - A message already in flight on gossip may still be passed on by the
   gossip layer for a short while; this node never pushes the body again
   itself.
+- **Files, until the next collection.** A dropped body's files stay in
+  `<data dir>/blobs` until the hourly blob collection deletes them; with
+  `storage.gc = false`, until you turn it back on. Deleted files are
+  unlinked, not overwritten: recovering them from the disk itself takes
+  forensic means, which full-disk encryption defeats.
