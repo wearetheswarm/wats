@@ -4399,6 +4399,10 @@ mod blob_gc_tests {
         let node = start(&dir.path().join("n"), true).await;
         let event = publish(&node, dir.path(), 2).await;
         let hash = hash_of(&event);
+        // A run that read what to keep before the post was stored would
+        // delete the blob once untagged: let every such run end first. A
+        // crash leaves no run in flight.
+        collected(&node).await;
         // As after a crash between storing a fetched event and its tag.
         unpin_blob(&node.blobs, hash).await.unwrap();
         assert!(!node.blob_pinned(&hash.to_hex()).await.unwrap());
@@ -4420,7 +4424,9 @@ mod blob_gc_tests {
             .await
             .unwrap();
         assert!(outcome.body_dropped && outcome.freed_blobs.is_empty());
-        // Even untagged: the kept post lists it.
+        // Even untagged: the kept post lists it (once no run that started
+        // before it was stored is left).
+        collected(&node).await;
         unpin_blob(&node.blobs, hash).await.unwrap();
         collected(&node).await;
         assert!(present(&node, hash).await);
