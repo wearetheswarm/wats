@@ -191,6 +191,8 @@ pub struct SubmitSettings {
 #[serde(deny_unknown_fields)]
 pub struct StorageSettings {
     pub max: Option<String>,
+    /// Collect the blobs nothing keeps, hourly (default: true).
+    pub gc: Option<bool>,
 }
 
 /// Default disk budget of the data directory (`storage.max`).
@@ -440,6 +442,12 @@ pub const KEYS: &[Key] = &[
         ValueType::Size,
         "10G",
         "disk budget of the data dir: no blob fetches beyond, no events beyond +10%",
+    ),
+    key(
+        "storage.gc",
+        ValueType::Bool,
+        "true",
+        "delete, hourly, the blob files nothing keeps (a dropped body's, a failed fetch's); false keeps them on disk",
     ),
     key(
         "limits.hello_per_min",

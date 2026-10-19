@@ -24,6 +24,7 @@ Command-line flags and `WATS_*` variables, where they exist (`wats --help`), tak
 | Key | Default | |
 |---|---|---|
 | `storage.max` | 10G | disk budget of the data dir: no blob fetches beyond, no events beyond +10% |
+| `storage.gc` | true | delete, hourly, the blob files nothing keeps (a dropped body's, a failed fetch's); false keeps them on disk |
 
 ## `[limits]`
 
