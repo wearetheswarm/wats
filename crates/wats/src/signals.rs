@@ -124,6 +124,22 @@ pub struct Signals {
     pub score: f64,
     /// Its author's score in the reputation table.
     pub author_score: f64,
+    /// The asker's accept counts and has not decayed past [`STALE_CUT`].
+    pub accepted: bool,
+    /// The groups of keys, other than the author's, whose confirmation
+    /// with evidence or use comes from a key that weighs and has not
+    /// decayed past [`STALE_CUT`]: what promotes a post to a knowledge
+    /// entry ([`crate::knowledge`], ADR 0019 §5.2).
+    pub backers: Vec<Backer>,
+}
+
+/// One group of keys behind a post (see [`Signals::backers`]).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Backer {
+    /// A confirmation with evidence, not only a use.
+    pub evidence: bool,
+    /// The group holds the asker of the post's thread.
+    pub asker: bool,
 }
 
 impl Signals {
@@ -756,6 +772,7 @@ pub fn evaluate(
             // use is its own call, as its accept is.
             let mut earned: f64 = 0.0;
             let (mut confirms, mut uses) = (false, false);
+            let mut backer: Option<Backer> = None;
             for m in &g.members {
                 let w = m.weight(grouping, net);
                 if !(m.confirms() || m.used()) || !(w > 0.0 || (m.used() && by_asker(m))) {
@@ -766,9 +783,17 @@ pub fn evaluate(
                 confirmed_at(m.clock, &mut fresh);
                 let kind = if m.confirms() { W_CONFIRM } else { W_USE };
                 earned = earned.max(kind * w * decay(age(m.clock), HALF_LIFE));
+                if w > 0.0 && decay(age(m.clock), HALF_LIFE) >= STALE_CUT {
+                    let b = backer.get_or_insert_with(|| Backer {
+                        evidence: false,
+                        asker: asker.is_some_and(|a| g.with(grouping, net, a)),
+                    });
+                    b.evidence |= m.confirms();
+                }
             }
             s.confirms += u64::from(confirms);
             s.uses += u64::from(uses);
+            s.backers.extend(backer);
             credit += earned;
         }
         if let Some((w, m)) = g.best(grouping, net, |m| m.value() == Some(-1))
@@ -781,6 +806,7 @@ pub fn evaluate(
     if let Some((accepted, clock)) = accept_of(post, &groups, threads, grouping) {
         // The asker's call: it counts whatever the asker weighs.
         s.accepts = 1;
+        s.accepted = decay(age(clock), HALF_LIFE) >= STALE_CUT;
         confirmed_at(clock, &mut fresh);
         credit += W_ACCEPT * grouping.weight(net, &accepted.asker) * decay(age(clock), HALF_LIFE);
     }
@@ -1131,6 +1157,16 @@ pub fn compute_at(
 /// without a score (no search text: the newest posts) keep the store's
 /// order.
 pub fn rank(found: Vec<(Stored, Option<f64>)>, signals: &HashMap<String, Signals>) -> Vec<Stored> {
+    rank_with(found, signals, &HashSet::new())
+}
+
+/// [`rank`], with knowledge entries (ADR 0019 §5.2) first within a band,
+/// before the status.
+pub fn rank_with(
+    found: Vec<(Stored, Option<f64>)>,
+    signals: &HashMap<String, Signals>,
+    knowledge: &HashSet<String>,
+) -> Vec<Stored> {
     let best = found
         .iter()
         .filter_map(|(_, score)| *score)
@@ -1147,57 +1183,59 @@ pub fn rank(found: Vec<(Stored, Option<f64>)>, signals: &HashMap<String, Signals
         }
     };
     let none = Signals::default();
-    let mut keyed: Vec<(i64, &Signals, Stored)> = found
+    let mut keyed: Vec<(i64, bool, &Signals, Stored)> = found
         .into_iter()
         .enumerate()
         .map(|(i, (stored, score))| {
             let s = signals.get(&stored.event.id).unwrap_or(&none);
-            (band(i, score), s, stored)
+            let entry = knowledge.contains(&stored.event.id);
+            (band(i, score), entry, s, stored)
         })
         .collect();
     // Stable: equal keys keep the store's order.
-    keyed.sort_by(|(band_a, a, _), (band_b, b, _)| {
+    keyed.sort_by(|(band_a, entry_a, a, _), (band_b, entry_b, b, _)| {
         band_a
             .cmp(band_b)
+            .then(entry_b.cmp(entry_a))
             .then(b.status.rank().cmp(&a.status.rank()))
             .then(b.score.total_cmp(&a.score))
             .then(b.author_score.total_cmp(&a.author_score))
     });
-    keyed.into_iter().map(|(_, _, stored)| stored).collect()
+    keyed.into_iter().map(|(_, _, _, stored)| stored).collect()
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::event::{Draft, Kind};
     use crate::reputation::{DAY, PowPolicy};
     use ed25519_dalek::SigningKey;
 
-    fn key(seed: u8) -> SigningKey {
+    pub(crate) fn key(seed: u8) -> SigningKey {
         SigningKey::from_bytes(&[seed; 32])
     }
 
-    fn id_of(seed: u8) -> String {
+    pub(crate) fn id_of(seed: u8) -> String {
         crate::identity::author_id(&key(seed))
     }
 
     /// When the graphs start.
-    const T0: u64 = 1_700_000_000;
+    pub(crate) const T0: u64 = 1_700_000_000;
 
     /// Keys an established network has known for 40 days: past the age
     /// floor's start, so their signals weigh. Others are fresh.
-    const KNOWN: std::ops::RangeInclusive<u8> = 1..=40;
+    pub(crate) const KNOWN: std::ops::RangeInclusive<u8> = 1..=40;
 
-    struct Graph {
-        store: Store,
-        ts: u64,
+    pub(crate) struct Graph {
+        pub(crate) store: Store,
+        pub(crate) ts: u64,
         announces: HashMap<u8, Event>,
     }
 
     impl Graph {
         /// An established network: keys [`KNOWN`] announced themselves
         /// 40 days ago.
-        fn new() -> Self {
+        pub(crate) fn new() -> Self {
             let mut g = Self::fresh();
             for seed in KNOWN {
                 let announce = g.root(seed, Kind::Announce, "hello");
@@ -1208,7 +1246,7 @@ mod tests {
         }
 
         /// A network nobody has known for long.
-        fn fresh() -> Self {
+        pub(crate) fn fresh() -> Self {
             Self {
                 store: Store::open_in_memory().unwrap(),
                 ts: T0,
@@ -1216,22 +1254,22 @@ mod tests {
             }
         }
 
-        fn later(&mut self, secs: u64) {
+        pub(crate) fn later(&mut self, secs: u64) {
             self.ts += secs;
         }
 
-        fn add(&mut self, seed: u8, draft: Draft) -> Event {
+        pub(crate) fn add(&mut self, seed: u8, draft: Draft) -> Event {
             self.ts += 1;
             let event = draft.sign(&key(seed), self.ts, 0).unwrap();
             self.store.insert(&event, self.ts).unwrap();
             event
         }
 
-        fn root(&mut self, seed: u8, kind: Kind, text: &str) -> Event {
+        pub(crate) fn root(&mut self, seed: u8, kind: Kind, text: &str) -> Event {
             self.root_with(seed, kind, text, json!({}))
         }
 
-        fn root_with(&mut self, seed: u8, kind: Kind, text: &str, data: Value) -> Event {
+        pub(crate) fn root_with(&mut self, seed: u8, kind: Kind, text: &str, data: Value) -> Event {
             self.add(
                 seed,
                 Draft {
@@ -1245,11 +1283,11 @@ mod tests {
             )
         }
 
-        fn reply(&mut self, seed: u8, to: &Event, kind: Kind, data: Value) -> Event {
+        pub(crate) fn reply(&mut self, seed: u8, to: &Event, kind: Kind, data: Value) -> Event {
             self.reply_citing(seed, to, kind, data, &[])
         }
 
-        fn reply_citing(
+        pub(crate) fn reply_citing(
             &mut self,
             seed: u8,
             to: &Event,
@@ -1274,7 +1312,7 @@ mod tests {
             )
         }
 
-        fn confirm(&mut self, seed: u8, post: &Event) -> Event {
+        pub(crate) fn confirm(&mut self, seed: u8, post: &Event) -> Event {
             self.reply(
                 seed,
                 post,
@@ -1283,7 +1321,7 @@ mod tests {
             )
         }
 
-        fn contradict(&mut self, seed: u8, post: &Event, why: &str) -> Event {
+        pub(crate) fn contradict(&mut self, seed: u8, post: &Event, why: &str) -> Event {
             self.reply(
                 seed,
                 post,
@@ -1293,19 +1331,19 @@ mod tests {
         }
 
         /// `seed` announces itself now.
-        fn announce(&mut self, seed: u8) {
+        pub(crate) fn announce(&mut self, seed: u8) {
             let announce = self.root(seed, Kind::Announce, "hello");
             self.announces.insert(seed, announce);
         }
 
         /// `voucher` vouches for `seed` (on its announce).
-        fn vouch(&mut self, voucher: u8, seed: u8) {
+        pub(crate) fn vouch(&mut self, voucher: u8, seed: u8) {
             let announce = self.announces[&seed].clone();
             self.reply(voucher, &announce, Kind::Vouch, json!({}));
         }
 
         /// Key `old` hands over to key `new`.
-        fn rotate(&mut self, old: u8, new: u8) {
+        pub(crate) fn rotate(&mut self, old: u8, new: u8) {
             let next = key(new).verifying_key();
             self.add(
                 old,
@@ -1331,7 +1369,7 @@ mod tests {
 
         /// The table this node builds, `local` being its profiles. No
         /// spare proof of work: every event needs more than it has.
-        fn table(&self, local: &[u8]) -> Arc<Table> {
+        pub(crate) fn table(&self, local: &[u8]) -> Arc<Table> {
             let local = local.iter().map(|s| id_of(*s)).collect();
             let pow = PowPolicy {
                 min_pow_bits: Some(256),
@@ -1342,7 +1380,7 @@ mod tests {
             )
         }
 
-        fn signals_with(&self, local: &[u8], post: &Event) -> Signals {
+        pub(crate) fn signals_with(&self, local: &[u8], post: &Event) -> Signals {
             let table = self.table(local);
             let grouping = Grouping::new(table.local.clone()).with_table(table);
             compute_at(&self.store, &grouping, &[post], self.ts)
@@ -1351,16 +1389,16 @@ mod tests {
                 .unwrap()
         }
 
-        fn signals(&self, post: &Event) -> Signals {
+        pub(crate) fn signals(&self, post: &Event) -> Signals {
             self.signals_with(&[], post)
         }
 
-        fn weight(&self, local: &[u8], seed: u8) -> f64 {
+        pub(crate) fn weight(&self, local: &[u8], seed: u8) -> f64 {
             self.table(local).weight(&id_of(seed))
         }
     }
 
-    const EVIDENCE: &str = "cargo test: 41 passed";
+    pub(crate) const EVIDENCE: &str = "cargo test: 41 passed";
 
     #[test]
     fn a_post_with_nothing_is_unverified() {

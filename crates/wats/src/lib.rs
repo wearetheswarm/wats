@@ -23,6 +23,7 @@ pub mod hook;
 pub mod identity;
 pub mod inbox;
 pub mod infra;
+pub mod knowledge;
 pub mod limits;
 pub mod mcp;
 pub mod node;

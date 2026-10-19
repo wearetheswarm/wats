@@ -1302,3 +1302,198 @@ async fn low_authors_are_hidden_unless_asked_and_humans_see_the_numbers() -> any
     assert_eq!(authors[0]["trust"], 0.0);
     Ok(())
 }
+
+/// ADR 0019 step 3: a digest through the MCP `digest` tool, its checks,
+/// search by its title, and its promotion to a knowledge entry once two
+/// independent keys that weigh back it: `search` shows it first, marked,
+/// and `read` of its thread shows it as `knowledge`. A received digest
+/// without refs stays valid and is never promoted.
+#[tokio::test(flavor = "multi_thread")]
+async fn digests_become_knowledge_entries() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let mut config = NodeConfig::new(dir.path().join("n"));
+    config.mode = NetworkMode::Loopback;
+    config.pow_bits = Some(4);
+    config.min_pow_bits = Some(4);
+    // Rebuild the reputation table whenever the store changed.
+    config.reputation.ttl = Duration::ZERO;
+    let node = Node::start(config).await?;
+    let me = client_for(WatsMcp::new(node.clone(), vec![])).await?;
+    let id_of = |v: Value| v["id"].as_str().unwrap().to_string();
+
+    // This node used answers by 11 and 14: their keys weigh.
+    let warmup = id_of(structured(
+        &call(
+            &me,
+            "post",
+            json!({"title": "Which linker for static builds?", "text": "?", "kind": "ask"}),
+        )
+        .await,
+    ));
+    for seed in [11, 14] {
+        let answer = remote(&node, seed, &warmup, "answer", "use lld", json!({}));
+        structured(
+            &call(
+                &me,
+                "reply",
+                json!({"post_id": answer, "kind": "react", "text": "worked", "data": {"used": true}}),
+            )
+            .await,
+        );
+    }
+
+    let ask = id_of(structured(
+        &call(
+            &me,
+            "post",
+            json!({"title": "Rust on musl fails to link", "text": "How?", "kind": "ask"}),
+        )
+        .await,
+    ));
+    let answer = remote(
+        &node,
+        12,
+        &ask,
+        "answer",
+        "Install musl-tools to link on musl.",
+        json!({}),
+    );
+
+    // The tool's checks: sources required and known; digests only
+    // through `digest`.
+    let digest_args = |refs: Value| {
+        json!({
+            "title": "Rust: linking on musl needs musl-tools",
+            "text": "On musl targets, install musl-tools before cargo build.",
+            "refs": refs,
+            "reply_to": ask,
+            "tags": ["cap:rust"],
+        })
+    };
+    for refs in [json!([]), json!([ask]), json!(["ab".repeat(32)])] {
+        let refused = call(&me, "digest", digest_args(refs)).await;
+        let text = error_text(&refused);
+        assert!(
+            text.contains("refs") || text.contains("not known"),
+            "{text}"
+        );
+    }
+    let refused = call(
+        &me,
+        "post",
+        json!({"title": "t", "text": "x", "kind": "x.wearetheswarm.digest", "refs": [answer]}),
+    )
+    .await;
+    assert!(error_text(&refused).contains("`digest` tool"));
+
+    // Round trip: posted, read, found by a word of its title only.
+    let digest = id_of(structured(
+        &call(&me, "digest", digest_args(json!([answer]))).await,
+    ));
+    let read = structured(&call(&me, "read", json!({"id": digest})).await);
+    let post = &read["post"];
+    assert_eq!(post["kind"], "note", "{read}");
+    assert_eq!(post["ext_kind"], "x.wearetheswarm.digest");
+    assert_eq!(post["refs"], json!([answer]));
+    assert_eq!(post["parent"], json!(ask));
+    assert_eq!(post["status"], "unverified");
+    assert!(post.get("knowledge").is_none() && read.get("knowledge").is_none());
+    let found = structured(&call(&me, "search", json!({"text": "linking"})).await);
+    assert_eq!(found["posts"][0]["id"], json!(digest), "{found}");
+    assert!(found["posts"][0].get("knowledge").is_none());
+
+    // 11 confirms it with evidence: one key is not enough.
+    remote(
+        &node,
+        11,
+        &digest,
+        "react",
+        "checked",
+        json!({"value": 1, "evidence": {"type": "test", "detail": "cargo build --target x86_64-unknown-linux-musl: ok"}}),
+    );
+    let read = structured(&call(&me, "read", json!({"id": ask})).await);
+    assert!(read.get("knowledge").is_none(), "{read}");
+    // 14 used it: a knowledge entry.
+    remote(&node, 14, &digest, "react", "worked", json!({"used": true}));
+
+    // `search` brings it first among comparable matches, marked, even
+    // when only its thread matched; never against the filter.
+    let found = structured(&call(&me, "search", json!({"text": "fails to link"})).await);
+    let posts = found["posts"].as_array().unwrap();
+    assert_eq!(posts[0]["id"], json!(digest), "{found}");
+    assert_eq!(posts[0]["knowledge"], true);
+    assert_eq!(posts[0]["sources"], json!([answer]));
+    assert_eq!(posts[0]["status"], "confirmed");
+    assert_eq!(posts[0]["title"], "Rust: linking on musl needs musl-tools");
+    assert_eq!(posts[1]["id"], json!(ask));
+    assert!(posts[1].get("knowledge").is_none());
+    let asks = structured(
+        &call(
+            &me,
+            "search",
+            json!({"text": "fails to link", "kinds": ["ask"]}),
+        )
+        .await,
+    );
+    assert_eq!(asks["posts"].as_array().unwrap().len(), 1, "{asks}");
+    let found = structured(&call(&me, "search", json!({"text": "musl-tools"})).await);
+    assert_eq!(found["posts"][0]["id"], json!(digest), "{found}");
+    assert_eq!(found["posts"][0]["knowledge"], true);
+
+    // `read` of its thread shows it first; the digest itself is marked.
+    for id in [&ask, &answer] {
+        let read = structured(&call(&me, "read", json!({"id": id})).await);
+        assert_eq!(read["knowledge"]["id"], json!(digest), "{read}");
+        assert_eq!(read["knowledge"]["knowledge"], true);
+        assert_eq!(read["knowledge"]["sources"], json!([answer]));
+        assert_eq!(read["knowledge"]["status"], "confirmed");
+        assert_eq!(read["post"]["id"], json!(id), "the post is unchanged");
+        assert!(read["post"].get("knowledge").is_none());
+    }
+    let read = structured(&call(&me, "read", json!({"id": digest})).await);
+    assert_eq!(read["post"]["knowledge"], true, "{read}");
+    assert_eq!(read["post"]["sources"], json!([answer]));
+    assert!(read.get("knowledge").is_none());
+
+    // A received digest without refs: valid, confirmed, never an entry.
+    let bare = remote(
+        &node,
+        13,
+        &ask,
+        "x.wearetheswarm.digest",
+        "musl needs nothing",
+        json!({}),
+    );
+    for seed in [11, 14] {
+        remote(&node, seed, &bare, "react", "ok", json!({"used": true}));
+    }
+    let read = structured(&call(&me, "read", json!({"id": bare})).await);
+    assert_eq!(read["post"]["status"], "confirmed", "{read}");
+    assert!(read["post"].get("knowledge").is_none());
+    assert_eq!(read["knowledge"]["id"], json!(digest));
+
+    // `supersedes`: only one's own digests.
+    let mut replacing = digest_args(json!([answer]));
+    replacing["supersedes"] = json!(bare);
+    let refused = call(&me, "digest", replacing.clone()).await;
+    assert!(error_text(&refused).contains("another key's digest"));
+    replacing["supersedes"] = json!(digest);
+    let newer = id_of(structured(&call(&me, "digest", replacing).await));
+    let read = structured(&call(&me, "read", json!({"id": newer})).await);
+    assert_eq!(read["post"]["data"]["supersedes"], json!(digest), "{read}");
+    // Not promoted yet: the older one stays the entry.
+    assert_eq!(read["knowledge"]["id"], json!(digest));
+
+    // No number reaches the agent.
+    let shown = format!(
+        "{} {}",
+        structured(&call(&me, "search", json!({"text": "musl"})).await),
+        structured(&call(&me, "read", json!({"id": ask})).await)
+    );
+    for word in ["score", "trust", "weight", "floor"] {
+        assert!(!shown.contains(word), "{word} in {shown}");
+    }
+
+    node.shutdown().await?;
+    Ok(())
+}
