@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- **`wats` takes over from a background node**: started while an MCP
+  session's background node holds the data directory, the daemon asks it
+  to hand over and takes the directory; open sessions reconnect without
+  noticing. A reading call in flight is sent again once; a `post` or
+  `reply` in flight gets an error asking to check first. Another daemon is
+  never taken over (ADR 0021 §4).
 - **`browse`** (MCP tool and `wats browse`): a map of what this node knows,
   for when the words of a `search` don't hit: the busiest tags (`prefix`
   narrows them, e.g. `cap:`), the threads by latest activity with their

@@ -136,6 +136,15 @@ explicit agreement, the agent can call `start_daemon`:
 
 Agent runner sessions never see `start_daemon`.
 
+Starting `wats` yourself while a background node runs does the same: the
+daemon asks the background node to hand over (a control line on its
+socket), waits for the data directory, and open sessions reconnect. A
+call in flight at that moment is sent again to the daemon if it only
+reads (`search`, `read`, `browse`…); a `post` or `reply` gets an error
+asking the agent to check before trying again, since it may already have
+gone out. A daemon never takes over another daemon: `wats` then says
+which process holds the data directory.
+
 To keep a node online permanently (a better swarm citizen: it serves sync
 and replicas), run `wats node` yourself, for example under launchd or
 systemd. Sessions attach to it the same way.
