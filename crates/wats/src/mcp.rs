@@ -1297,6 +1297,11 @@ impl WatsMcp {
             "halt": self.node.halt_status(),
             "health": self.node.health_json(),
         });
+        // Blobs recorded but whose file is gone, not fetched again yet.
+        let unreadable = self.node.unreadable_blobs();
+        if unreadable > 0 {
+            status["storage"]["unreadable_blobs"] = json!(unreadable);
+        }
         // From the node's daily check (`update.check`): a newer release,
         // for the agent to relay to the user.
         if config.update.check

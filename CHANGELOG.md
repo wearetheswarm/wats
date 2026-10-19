@@ -40,9 +40,21 @@
   node as a local audit copy that is never served. A new test vector,
   `v1-retract`; no format change.
 - The store moves to schema 5 (a table of local drop records), migrated in
-  place at the first start: no resync. A dropped body's files are untagged;
-  deleting them from disk comes with the blob collection, in its own
-  change.
+  place at the first start: no resync.
+- **Blob collection** (`storage.gc`, default `true`): every hour the node
+  deletes the blob files nothing keeps, in no tag and listed by no post it
+  keeps: a dropped body's files, a fetch abandoned half-way. A blob a kept
+  post lists, a pinned one, and an import or a download in progress are
+  kept. A collection that deletes something logs one line with the count
+  and the bytes. A crash in the middle loses nothing kept; the files it
+  leaves behind go at the next start. `storage.gc = false` keeps every
+  file.
+- **A blob whose file is gone comes back** (a race in iroh-blobs, or a
+  disk fault): the node finds it at start or when a read fails, logs it
+  once, fetches it again from the peers likely to hold it, verifies it
+  and stores it anew, at the read and every 5 minutes. Meanwhile peers
+  fetching it from this node fail and try another, and the MCP `status`
+  shows `storage.unreadable_blobs`.
 
 ## 0.3.2 (2026-10-19)
 
