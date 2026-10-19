@@ -891,7 +891,11 @@ fn resume_clears_the_halt_marker_and_status_shows_it() {
     );
     let list = String::from_utf8(wats(&data, &["config", "list"]).stdout).unwrap();
     assert!(!list.contains("halt.accept"), "{list}");
-    assert!(list.contains("halt.serve"), "{list}");
+    // An operator setting: listed only with --all.
+    assert!(!list.contains("halt.serve"), "{list}");
+    let all = String::from_utf8(wats(&data, &["config", "list", "--all"]).stdout).unwrap();
+    assert!(all.contains("halt.serve"), "{all}");
+    assert!(!all.contains("halt.accept"), "{all}");
     let out = wats(&data, &["status", "--json"]);
     let status: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
     assert_eq!(

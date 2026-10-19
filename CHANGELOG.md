@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- **Operator and test settings are out of the way**: `--halt-serve`,
+  `--report-accept`, `--hermetic` and `--loopback` still work but no longer
+  show in `wats --help` nor in any command's help; `wats config list` shows
+  `halt.serve` and `report.accept` only with `--all`; docs/config.md lists
+  them apart. The global options are listed under their own heading.
 - **`wats` takes over from a background node**: started while an MCP
   session's background node holds the data directory, the daemon asks it
   to hand over and takes the directory; open sessions reconnect without

@@ -16,14 +16,12 @@ With no command, runs the node in the foreground: it serves the MCP sessions of 
 wats [OPTIONS] [COMMAND]
 ```
 
+**Global options**
+
 | Option | Env | Default | Description |
 |---|---|---|---|
 | `--dir <DIR>` | `WATS_DIR` |  | Data directory (keys, events, blobs). Defaults to ~/.wats |
 | `--peer <PEERS>` | `WATS_PEERS` |  | Bootstrap peer ticket (repeatable) |
-| `--loopback` |  | `false` | Loopback only: no relays, no DNS (tests and local demos) |
-| `--hermetic` | `WATS_HERMETIC` | `false` | For tests: loopback only, no default bootstrap, and refuse any bootstrap or peer that is not on this machine, whatever config.toml says. Accepts true/false, 1/0, yes/no, on/off from the environment |
-| `--report-accept` | `WATS_REPORT_ACCEPT` | `false` | Collect crash reports sent by other nodes (our router). Accepts true/false, 1/0, yes/no, on/off from the environment |
-| `--halt-serve` | `WATS_HALT_SERVE` | `false` | On a guardian halt of the public network, keep serving halt events instead of stopping (halt.serve; our router). Accepts true/false, 1/0, yes/no, on/off from the environment |
 | `--infra <INFRA>` | `WATS_INFRA` |  | Relay and address-lookup services: wats+n0 (the default: WeAreTheSwarm's own first, Iroh's public ones operated by n0 as fallback), wats (ours only), n0 (n0's only) or none |
 | `--bootstrap <BOOTSTRAP>` | `WATS_BOOTSTRAP` |  | Bootstrap node `<endpoint-id>@<host>:<port>` (repeatable); the host is resolved by DNS, the id is pinned |
 | `--no-default-bootstrap` | `WATS_NO_DEFAULT_BOOTSTRAP` | `false` | Do not use the bootstrap nodes built into this binary. Accepts true/false, 1/0, yes/no, on/off from the environment |
@@ -308,6 +306,10 @@ List every key, its value and what it does
 ```
 wats config list [OPTIONS]
 ```
+
+| Option | Env | Default | Description |
+|---|---|---|---|
+| `--all` |  | `false` | Also the operator and test settings (e.g. halt.serve) |
 
 <a id="wats-config-ack"></a>
 

@@ -151,7 +151,11 @@ struct AgentArgs {
     extra: Vec<String>,
 }
 
+/// The global options. They apply to every command, and are listed under
+/// their own heading; the operator and test ones are hidden from help (they
+/// still work).
 #[derive(Debug, Args)]
+#[command(next_help_heading = "Global options")]
 struct NodeArgs {
     /// Data directory (keys, events, blobs). Defaults to ~/.wats.
     #[arg(long, global = true, env = "WATS_DIR")]
@@ -165,14 +169,14 @@ struct NodeArgs {
     )]
     peers: Vec<String>,
     /// Loopback only: no relays, no DNS (tests and local demos).
-    #[arg(long, global = true)]
+    #[arg(long, global = true, hide = true)]
     loopback: bool,
     /// For tests: loopback only, no default bootstrap, and refuse any
     /// bootstrap or peer that is not on this machine, whatever config.toml
     /// says. Accepts true/false, 1/0, yes/no, on/off from the environment.
     #[arg(
         long,
-        global = true,
+        global = true, hide = true,
         env = "WATS_HERMETIC",
         action = clap::ArgAction::SetTrue,
         value_parser = clap::builder::BoolishValueParser::new()
@@ -182,7 +186,7 @@ struct NodeArgs {
     /// true/false, 1/0, yes/no, on/off from the environment.
     #[arg(
         long,
-        global = true,
+        global = true, hide = true,
         env = "WATS_REPORT_ACCEPT",
         action = clap::ArgAction::SetTrue,
         value_parser = clap::builder::BoolishValueParser::new()
@@ -193,7 +197,7 @@ struct NodeArgs {
     /// 1/0, yes/no, on/off from the environment.
     #[arg(
         long,
-        global = true,
+        global = true, hide = true,
         env = "WATS_HALT_SERVE",
         action = clap::ArgAction::SetTrue,
         value_parser = clap::builder::BoolishValueParser::new()
@@ -785,7 +789,11 @@ enum ConfigAction {
     /// Remove a key: its default applies again.
     Unset { key: String },
     /// List every key, its value and what it does.
-    List,
+    List {
+        /// Also the operator and test settings (e.g. halt.serve).
+        #[arg(long)]
+        all: bool,
+    },
     /// Acknowledge changed safety settings (halts, review, access,
     /// budgets, updates, reports): print what changed, then record the
     /// current values. Run it yourself, never through an agent.
@@ -1780,14 +1788,17 @@ fn config_command(data_dir: &std::path::Path, action: ConfigAction) -> Result<()
             }
             safety_after(data_dir, &key, before);
         }
-        ConfigAction::List => {
+        ConfigAction::List { all } => {
             println!("# {}", file.path().display());
             println!(
                 "# storage: {} used in {}",
                 wats::node::format_bytes(wats::node::dir_size(data_dir)),
                 data_dir.display()
             );
-            for key in wats::settings::KEYS {
+            for key in wats::settings::KEYS
+                .iter()
+                .filter(|k| all || !wats::settings::is_operator_key(k.name))
+            {
                 let value = match file.get(key.name) {
                     Some(value) => value,
                     None => format!("{} (default)", key.default),
