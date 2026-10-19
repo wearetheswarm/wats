@@ -196,6 +196,9 @@ pub struct NodeConfig {
     /// is listed as unanswered for its author (`ask.unanswered_after`,
     /// ADR 0018 §4); `None` never.
     pub unanswered_after: Option<Duration>,
+    /// Labelers (author ids) whose `erasure` labels this node applies
+    /// (`labels.subscribe`, ADR 0020 §5.2): opt-in, none by default.
+    pub erasure_labelers: Vec<String>,
     /// The human's OpenClaw, told when its swarm asks get replies (ADR
     /// 0018 §7); set when the hook token exists.
     pub openclaw_notify: Option<crate::openclaw::Notify>,
@@ -257,6 +260,7 @@ impl NodeConfig {
             halt: Default::default(),
             no_peers_after: Some(crate::health::DEFAULT_NO_PEERS_AFTER),
             unanswered_after: Some(crate::unanswered::DEFAULT_AFTER),
+            erasure_labelers: Vec::new(),
             openclaw_notify: None,
             bootstrap: Vec::new(),
             default_bootstrap: Vec::new(),
@@ -1543,6 +1547,9 @@ impl Node {
             }));
         }
         node.spawn_reconnect();
+        if !node.config.erasure_labelers.is_empty() {
+            node.apply_held_erasures().await;
+        }
         node.spawn_asker_notify();
         node.spawn_health_checks();
         if !node.config.halt.accept {
@@ -2215,6 +2222,7 @@ impl Node {
     /// Restore every blob found unreadable, from the peers likely to have
     /// it; the ones none had stay noted for the next pass.
     async fn repair_unreadable(&self) {
+        self.forget_unkept_unreadable();
         let hashes: Vec<Hash> = self
             .blob_keep
             .unreadable
@@ -2227,8 +2235,22 @@ impl Node {
         }
     }
 
-    /// Blobs found recorded but unreadable and not repaired yet.
+    /// Forget the unreadable blobs no kept post lists any more (their post
+    /// was dropped or retracted since): nothing to repair.
+    fn forget_unkept_unreadable(&self) {
+        let Ok(kept) = self.store.referenced_blobs() else {
+            return;
+        };
+        let kept: HashSet<Hash> = kept.iter().filter_map(|h| h.parse().ok()).collect();
+        if let Ok(mut unreadable) = self.blob_keep.unreadable.lock() {
+            unreadable.retain(|hash| kept.contains(hash));
+        }
+    }
+
+    /// Blobs found recorded but unreadable and not repaired yet, among
+    /// those a kept post still lists.
     pub fn unreadable_blobs(&self) -> usize {
+        self.forget_unkept_unreadable();
         self.blob_keep.unreadable.lock().map_or(0, |u| u.len())
     }
 
@@ -3000,6 +3022,14 @@ impl Node {
             .store
             .drop_body(id, reason, trigger, detail, now_secs())?;
         unpin_freed(&self.blobs, &outcome).await;
+        // A freed blob no longer needs repairing: no kept post lists it.
+        if let Ok(mut unreadable) = self.blob_keep.unreadable.lock() {
+            for hash in &outcome.freed_blobs {
+                if let Ok(hash) = hash.parse::<Hash>() {
+                    unreadable.remove(&hash);
+                }
+            }
+        }
         info!(%id, %reason, held = outcome.held, body = outcome.body_dropped,
               blobs = outcome.freed_blobs.len(), "body dropped");
         Ok(outcome)
@@ -3180,6 +3210,12 @@ impl Node {
             self.apply_retraction(&retraction).await;
             return;
         }
+        if let AnyEvent::Known(label) = event
+            && self.is_erasure_label(label)
+        {
+            self.apply_erasure(label).await;
+            return;
+        }
         let AnyEvent::Known(rotate) = event else {
             return;
         };
@@ -3200,6 +3236,67 @@ impl Node {
                 }
             }
             Err(e) => warn!(rotate = %rotate.id, "retractions not re-evaluated: {e:#}"),
+        }
+    }
+
+    /// Whether `event` is an erasure label from a labeler this node
+    /// subscribes to: a `react` with `data.label = "erasure"`.
+    fn is_erasure_label(&self, event: &Event) -> bool {
+        event.kind == Kind::React
+            && event.data.get("label").and_then(|l| l.as_str()) == Some("erasure")
+            && self.config.erasure_labelers.contains(&event.author)
+    }
+
+    /// Apply an erasure label (ADR 0020 §5.2): drop the labelled post's
+    /// body (its parent), reason `erasure`, the label as trigger. A post
+    /// not held yet is remembered: only its tombstone will be stored. Key
+    /// successions and halt events are never dropped.
+    async fn apply_erasure(&self, label: &Event) {
+        let Some(target) = label.parent.as_deref() else {
+            debug!(label = %label.id, "erasure label without a parent: ignored");
+            return;
+        };
+        if let Ok(Some(stored)) = self.store.get(target)
+            && crate::retract::unretractable(stored.event.kind.as_str())
+        {
+            warn!(label = %label.id, %target, "erasure label on a key succession or a halt: ignored");
+            return;
+        }
+        match self
+            .drop_body(target, DropReason::Erasure, Some(&label.id), None)
+            .await
+        {
+            Ok(_) => {
+                info!(label = %label.id, %target, labeler = %label.author, "erasure label applied")
+            }
+            Err(e) => warn!(label = %label.id, %target, "erasure label not applied: {e:#}"),
+        }
+    }
+
+    /// Apply the erasure labels already held from the subscribed labelers
+    /// (a labeler added since they arrived).
+    async fn apply_held_erasures(&self) {
+        for labeler in &self.config.erasure_labelers {
+            let filter = crate::store::Filter {
+                kinds: vec![Kind::React],
+                author: Some(labeler.clone()),
+                ..crate::store::Filter::default()
+            };
+            let Ok(found) = self.store.search(None, &filter, 10_000) else {
+                continue;
+            };
+            for stored in found {
+                if self.is_erasure_label(&stored.event)
+                    && self
+                        .store
+                        .drop_record(stored.event.parent.as_deref().unwrap_or_default())
+                        .ok()
+                        .flatten()
+                        .is_none()
+                {
+                    self.apply_erasure(&stored.event).await;
+                }
+            }
         }
     }
 

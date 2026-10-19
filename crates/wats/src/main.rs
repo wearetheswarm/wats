@@ -2481,6 +2481,14 @@ impl NodeArgs {
                 token_file: hooks_token,
             });
         }
+        for labeler in &file.labels.subscribe {
+            let labeler = labeler.trim().to_ascii_lowercase();
+            anyhow::ensure!(
+                labeler.len() == 64 && labeler.bytes().all(|b| b.is_ascii_hexdigit()),
+                "config.toml labels.subscribe: {labeler:?} is not an author id (64 hex)"
+            );
+            config.erasure_labelers.push(labeler);
+        }
         if let Some(after) = &file.ask.unanswered_after {
             config.unanswered_after = wats::settings::parse_retention(after)
                 .map_err(|e| anyhow::anyhow!("config.toml ask.unanswered_after: {e}"))?;
