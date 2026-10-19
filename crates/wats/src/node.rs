@@ -196,6 +196,17 @@ pub struct NodeConfig {
     /// is listed as unanswered for its author (`ask.unanswered_after`,
     /// ADR 0018 §4); `None` never.
     pub unanswered_after: Option<Duration>,
+    /// Runners without the capability an ask names (`cap:<x>`) wake for it
+    /// only when no agent claimed or answered it within this
+    /// (`ask.cap_grace`, ADR 0022 §1).
+    pub cap_grace: Duration,
+    /// The default cap on an ask's responders, from distinct nodes
+    /// (`ask.max_responders`, ADR 0022 §2.2); `None`: none unless the ask
+    /// sets `data.max`.
+    pub max_responders: Option<usize>,
+    /// The longest random delay before a runner wakes for an ask, then
+    /// counts again (ADR 0022 §2.3). Not a config key: tests shorten it.
+    pub claim_jitter: Duration,
     /// Labelers (author ids) whose `erasure` labels this node applies
     /// (`labels.subscribe`, ADR 0020 §5.2): opt-in, none by default.
     pub erasure_labelers: Vec<String>,
@@ -275,6 +286,9 @@ impl NodeConfig {
             halt: Default::default(),
             no_peers_after: Some(crate::health::DEFAULT_NO_PEERS_AFTER),
             unanswered_after: Some(crate::unanswered::DEFAULT_AFTER),
+            cap_grace: crate::delivery::DEFAULT_CAP_GRACE,
+            max_responders: Some(crate::delivery::DEFAULT_MAX_RESPONDERS),
+            claim_jitter: crate::delivery::CLAIM_JITTER,
             erasure_labelers: Vec::new(),
             openclaw_notify: None,
             desktop_notify: None,

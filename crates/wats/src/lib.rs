@@ -13,6 +13,7 @@ pub mod browse;
 pub mod budget;
 pub mod challenge;
 pub mod crash;
+pub mod delivery;
 pub mod desktop;
 pub mod event;
 pub mod firstrun;

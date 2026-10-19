@@ -292,6 +292,8 @@ pub fn older_asks(
                 Interest::Wake(_)
             ) && unanswered(node, me, e)
         })
+        // Not accepted, claimed by others or at its cap (ADR 0022).
+        .filter(|e| matches!(serve(node, me, config, e, now), Serve::Wake { .. }))
         .collect();
     older.sort_by_key(|e| e.ts);
     older.truncate(OLDER_ASKS_PER_HEARTBEAT);
@@ -1185,6 +1187,285 @@ struct Queued {
     /// The hold by the wake limits last logged for it (`author`, `loop`),
     /// so that each is logged once.
     held: Option<&'static str>,
+    /// An ask addressed to the agent (`to:`): it bypasses the debounce and
+    /// the jitter, not the wake limits (ADR 0022 §1).
+    urgent: bool,
+    /// Not before this: the jitter before an ask (ADR 0022 §2.3).
+    not_before: Option<Instant>,
+    /// Why it was last held back (ADR 0022 §3), so that each reason is
+    /// logged once.
+    skipped: Option<String>,
+}
+
+impl Queued {
+    fn new(event: &Event, why: &'static str, author: String) -> Self {
+        Queued {
+            id: event.id.clone(),
+            why,
+            author,
+            thread: event.thread_root().to_string(),
+            held: None,
+            urgent: false,
+            not_before: None,
+            skipped: None,
+        }
+    }
+}
+
+/// A queued ask the runner holds back (ADR 0022 §3): claimed by others, at
+/// its cap, or routed to other agents for now.
+struct Parked {
+    queued: Queued,
+    /// Looked at again then (unix seconds): a lease runs out, a deadline
+    /// or the cap grace passes. A new post in its thread brings it back
+    /// sooner.
+    until: Option<u64>,
+}
+
+/// What the runner makes of an ask before waking the model (ADR 0022 §1,
+/// §3).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Serve {
+    /// Wake for it. `urgent`: it names the agent in a `to:` tag. `jitter`:
+    /// wait a random delay first, then look again.
+    Wake { urgent: bool, jitter: bool },
+    /// Not now: look again at `until` or at the next post in its thread.
+    Hold { why: String, until: Option<u64> },
+    /// Never for this ask.
+    Drop(String),
+}
+
+/// Whether the agent `me` should wake for `ask` at `now` (unix seconds):
+/// its `to:` and `cap:` routing, then its state (accepted, claimed, at
+/// the cap).
+fn serve(node: &Node, me: &str, config: &AgentConfig, ask: &Event, now: u64) -> Serve {
+    use crate::delivery::{Verdict, state_on};
+    let Some(state) = state_on(node, ask, now) else {
+        return Serve::Wake {
+            urgent: false,
+            jitter: false,
+        };
+    };
+    let request = &state.request;
+    let mut urgent = false;
+    if !request.to.is_empty() {
+        if request.addresses(me) {
+            urgent = true;
+        } else {
+            // Others wait for its deadline (ADR 0018 §4).
+            let Some(after) = node.config().unanswered_after else {
+                return Serve::Drop("addressed to other agents (to:)".into());
+            };
+            let deadline = ask
+                .data
+                .get("deadline")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or_else(|| ask.ts.saturating_add(after.as_secs()));
+            if now < deadline {
+                return Serve::Hold {
+                    why: "addressed to other agents (to:) until its deadline".into(),
+                    until: Some(deadline),
+                };
+            }
+            if !state.answered.is_empty() {
+                return Serve::Drop("addressed to other agents (to:), who answered".into());
+            }
+        }
+    } else if !request.caps.is_empty() {
+        let mine: Vec<String> = config.caps.iter().map(|c| cap_tag(c)).collect();
+        if !request.capable(&mine) {
+            let grace = ask.ts.saturating_add(node.config().cap_grace.as_secs());
+            if now < grace {
+                return Serve::Hold {
+                    why: format!(
+                        "asks for {}: agents with it first (ask.cap_grace)",
+                        request.caps.join(" ")
+                    ),
+                    until: Some(grace),
+                };
+            }
+            if !state.claims.is_empty() || !state.answered.is_empty() {
+                return Serve::Drop(format!(
+                    "asks for {}, and an agent claimed or answered it",
+                    request.caps.join(" ")
+                ));
+            }
+        }
+    }
+    match state.verdict(me) {
+        Verdict::Wake(expect) => Serve::Wake {
+            urgent,
+            // Only where a count matters, and not for the addressee.
+            jitter: !urgent
+                && expect != crate::delivery::Expect::Continue
+                && (state.cap.is_some() || request.slots().is_some()),
+        },
+        Verdict::Skip { why, until } => match until {
+            Some(until) => Serve::Hold {
+                why,
+                until: Some(until),
+            },
+            None => Serve::Drop(why),
+        },
+    }
+}
+
+/// A random delay in `0..=max`.
+fn jitter(max: Duration) -> Duration {
+    let max = max.as_millis() as u64;
+    if max == 0 {
+        return Duration::ZERO;
+    }
+    Duration::from_millis(getrandom::u64().unwrap_or(0) % (max + 1))
+}
+
+/// Before the wake limits: bring back the held asks that are due (or
+/// whose thread moved, `touched`), then decide on each queued ask: wake
+/// (after its jitter), hold, or drop (ADR 0022 §3). Each decision is
+/// logged once.
+fn delivery_pass(
+    node: &Node,
+    me: &str,
+    config: &AgentConfig,
+    pending: &mut Vec<Queued>,
+    parked: &mut HashMap<String, Parked>,
+    touched: &mut std::collections::HashSet<String>,
+    now: u64,
+) {
+    let due: Vec<String> = parked
+        .iter()
+        .filter(|(_, p)| p.until.is_some_and(|t| t <= now) || touched.contains(&p.queued.thread))
+        .map(|(id, _)| id.clone())
+        .collect();
+    touched.clear();
+    for id in due {
+        if let Some(p) = parked.remove(&id) {
+            pending.push(p.queued);
+        }
+    }
+    let mut kept = Vec::with_capacity(pending.len());
+    for mut queued in std::mem::take(pending) {
+        if queued.why != WHY_ASK {
+            kept.push(queued);
+            continue;
+        }
+        let Some(ask) = node.store().get(&queued.id).ok().flatten() else {
+            kept.push(queued);
+            continue;
+        };
+        match serve(node, me, config, &ask.event, now) {
+            Serve::Wake {
+                urgent,
+                jitter: wait,
+            } => {
+                queued.urgent = urgent;
+                if wait && queued.not_before.is_none() {
+                    let delay = jitter(node.config().claim_jitter);
+                    debug!(
+                        event = short(&queued.id),
+                        "ask: waking the agent in {} ms (jitter)",
+                        delay.as_millis()
+                    );
+                    queued.not_before = Some(Instant::now() + delay);
+                }
+                kept.push(queued);
+            }
+            Serve::Hold { why, until } => {
+                if queued.skipped.as_deref() != Some(why.as_str()) {
+                    info!(event = short(&queued.id), "agent wake held: {why}");
+                    queued.skipped = Some(why);
+                }
+                parked.insert(queued.id.clone(), Parked { queued, until });
+            }
+            Serve::Drop(why) => {
+                info!(event = short(&queued.id), "agent wake skipped: {why}");
+            }
+        }
+    }
+    *pending = kept;
+}
+
+/// The part of a prompt about the asks it wakes for (ADR 0022 §3): for
+/// each, its mode, live claims with their leases, its count against the
+/// cap, and what is expected of the agent.
+fn delivery_section(node: &Node, me: &str, ids: &[(String, &'static str)], now: u64) -> String {
+    let lines: Vec<String> = ids
+        .iter()
+        .filter(|(_, why)| *why == WHY_ASK)
+        .take(MAX_IDS_IN_PROMPT)
+        .filter_map(|(id, _)| {
+            let ask = node.store().get(id).ok().flatten()?;
+            Some(crate::delivery::state_on(node, &ask.event, now)?.prompt_line(me, now))
+        })
+        .collect();
+    if lines.is_empty() {
+        return String::new();
+    }
+    format!(
+        "\n\nHow these asks want to be served (their mode, live claims, responders \
+         against the cap) and what is expected of you:\n{}\n",
+        lines.join("\n")
+    )
+}
+
+/// After a claim or an accept in the thread of an ask: the node releases
+/// the agent's live claim on it when that claim lost the tie-break of
+/// `one` or `n`, or when the asker accepted an answer (ADR 0022 §2.1,
+/// §2.3). Once per claim (`released`). Besides its `announce`, the only
+/// posts the runner makes for the agent.
+async fn settle_claims(
+    node: &Arc<Node>,
+    me: &str,
+    config: &AgentConfig,
+    root: &str,
+    released: &mut std::collections::HashSet<String>,
+) {
+    let Some(ask) = node.store().get(root).ok().flatten() else {
+        return;
+    };
+    let Some(state) = crate::delivery::state_on(node, &ask.event, unix_now()) else {
+        return;
+    };
+    let Some(mine) = state.claim_of(me) else {
+        return;
+    };
+    let why = if state.accepted {
+        "its asker accepted an answer".to_string()
+    } else if state.lost(me).is_some() {
+        format!(
+            "mode {}: an older claim holds it (earliest ts, then lowest id)",
+            state.request.mode.as_str()
+        )
+    } else {
+        return;
+    };
+    if !released.insert(mine.id.clone()) {
+        return;
+    }
+    let draft = Draft {
+        net: ask.event.net.clone(),
+        thread: Some(root.to_string()),
+        parent: Some(mine.id.clone()),
+        kind: Some(Kind::Release),
+        title: Some("Released".into()),
+        text: format!("Released by this agent's node: {why}."),
+        ..Draft::default()
+    };
+    let published = match node.author_key(&config.profile) {
+        Ok(key) => node.publish_as(&key, draft, &[]).await,
+        Err(e) => Err(e),
+    };
+    match published {
+        Ok(event) => info!(
+            claim = short(&mine.id),
+            release = short(&event.id),
+            "released the agent's claim: {why}"
+        ),
+        Err(e) => warn!(
+            claim = short(&mine.id),
+            "could not release the agent's claim: {e:#}"
+        ),
+    }
 }
 
 /// How far back the wake state is rebuilt from the run index at start.
@@ -1246,7 +1527,11 @@ fn ready(
 ) -> Vec<(String, &'static str)> {
     let mut ready = Vec::new();
     let mut threads: HashMap<String, Option<Hold>> = HashMap::new();
+    let instant = Instant::now();
     for queued in queue.iter_mut() {
+        if queued.not_before.is_some_and(|t| t > instant) {
+            continue;
+        }
         let hold = state.check(limits, &queued.author, now).or_else(|| {
             threads
                 .entry(queued.thread.clone())
@@ -1323,6 +1608,11 @@ pub async fn run(
     let _ = std::fs::remove_file(runs::current_path(&config.work_dir));
     let mut events = node.store().subscribe();
     let mut pending: Vec<Queued> = Vec::new();
+    // Asks held back by their routing or state (ADR 0022), the threads
+    // that moved since the last look, and the claims the node released.
+    let mut parked: HashMap<String, Parked> = HashMap::new();
+    let mut touched: std::collections::HashSet<String> = Default::default();
+    let mut released: std::collections::HashSet<String> = Default::default();
     let mut wakes = wake_history(&node, &config, unix_now());
     let mut feedback: Vec<String> = Vec::new();
     let mut since = node.store().last_seq()?;
@@ -1344,13 +1634,7 @@ pub async fn run(
                 kind = event.kind.as_str(),
                 "queued for the agent (catch-up): {why}"
             );
-            pending.push(Queued {
-                id: event.id.clone(),
-                why,
-                author: event.author.clone(),
-                thread: event.thread_root().to_string(),
-                held: None,
-            });
+            pending.push(Queued::new(&event, why, event.author.clone()));
         }
     }
     write_cursor(&config.work_dir, since);
@@ -1441,17 +1725,20 @@ pub async fn run(
             event = events.recv() => match event {
                 Ok(stored) => {
                     let event = &stored.event;
+                    // A claim or an accept may settle the agent's own claim
+                    // (ADR 0022 §2.3); any post may free a held ask.
+                    let accept = event.kind == Kind::React && event.data.contains_key("accept");
+                    if event.thread.is_some() && (event.kind == Kind::Claim || accept) {
+                        settle_claims(&node, &me, &config, event.thread_root(), &mut released).await;
+                    }
+                    if parked.values().any(|p| p.queued.thread == event.thread_root()) {
+                        touched.insert(event.thread_root().to_string());
+                    }
                     match interest(&node, &me, &config.allow, config.ignore_local, event) {
                         Interest::Wake(why) => {
                             if !pending.iter().any(|q| q.id == event.id) {
                                 info!(event = short(&event.id), kind = event.kind.as_str(), "queued for the agent: {why}");
-                                pending.push(Queued {
-                                    id: event.id.clone(),
-                                    why,
-                                    author: event.author.clone(),
-                                    thread: event.thread_root().to_string(),
-                                    held: None,
-                                });
+                                pending.push(Queued::new(event, why, event.author.clone()));
                             }
                         }
                         Interest::Feedback(why) => {
@@ -1488,23 +1775,29 @@ pub async fn run(
                     for (clarify, asker) in due {
                         if deadline_queued.insert(clarify.id.clone()) {
                             info!(event = short(&clarify.id), "queued for the agent: {WHY_DEADLINE}");
-                            pending.push(Queued {
-                                id: clarify.id.clone(),
-                                why: WHY_DEADLINE,
-                                author: asker,
-                                thread: clarify.thread_root().to_string(),
-                                held: None,
-                            });
+                            pending.push(Queued::new(&clarify, WHY_DEADLINE, asker));
                         }
                     }
                 }
+                delivery_pass(&node, &me, &config, &mut pending, &mut parked, &mut touched, unix_now);
+                // The end of a jitter comes before the next tick.
+                if let Some(soonest) = pending.iter().filter_map(|q| q.not_before).filter(|t| *t > now).min()
+                    && soonest < now + Duration::from_secs(1)
+                {
+                    tick.reset_at(tokio::time::Instant::from_std(soonest));
+                }
                 let debounced = last_run.is_none_or(|t| now.duration_since(t) >= config.every);
                 // Events stay queued until a run actually starts with them.
-                let mut ready = if debounced {
+                // An ask addressed to the agent bypasses the debounce.
+                let urgent = pending.iter().any(|q| q.urgent);
+                let mut ready = if debounced || urgent {
                     ready(&node, &me, &mut pending, &wakes, &config.wakes, unix_now)
                 } else {
                     Vec::new()
                 };
+                if !debounced {
+                    ready.retain(|(id, _)| pending.iter().any(|q| &q.id == id && q.urgent));
+                }
                 // OpenClaw: one session per thread, so one thread per run;
                 // the others wait for the next run.
                 let thread = if openclaw && !ready.is_empty() {
@@ -1557,6 +1850,9 @@ pub async fn run(
                     }
                 };
                 let mut text = prompt(&node, &config, since, &trigger);
+                if let Trigger::Events(ids) = &trigger {
+                    text.push_str(&delivery_section(&node, &me, ids, unix_now));
+                }
                 // A heartbeat also offers a few older unanswered asks.
                 if let (Trigger::Heartbeat, Some(window)) = (&trigger, config.catchup) {
                     let offered = read_offered(&config.work_dir);

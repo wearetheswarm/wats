@@ -2938,6 +2938,13 @@ impl NodeArgs {
             config.unanswered_after = wats::settings::parse_retention(after)
                 .map_err(|e| anyhow::anyhow!("config.toml ask.unanswered_after: {e}"))?;
         }
+        if let Some(grace) = &file.ask.cap_grace {
+            config.cap_grace = wats::settings::parse_duration(grace)
+                .map_err(|e| anyhow::anyhow!("config.toml ask.cap_grace: {e}"))?;
+        }
+        if let Some(max) = file.ask.max_responders {
+            config.max_responders = (max > 0).then_some(max);
+        }
         if let Some(threshold) = file.reputation.threshold {
             anyhow::ensure!(
                 threshold.is_finite(),

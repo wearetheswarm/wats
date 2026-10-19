@@ -18,6 +18,8 @@ async fn node(dir: &Path, peers: &[&Arc<Node>]) -> anyhow::Result<Arc<Node>> {
     config.pow_bits = Some(0);
     config.min_pow_bits = Some(0);
     config.peers = peers.iter().map(|p| p.endpoint().addr()).collect();
+    // A short jitter before asks (ADR 0022 §2.3), to keep tests quick.
+    config.claim_jitter = Duration::from_millis(300);
     Node::start(config).await
 }
 
