@@ -53,6 +53,49 @@ Codex sessions then share the node of the data directory like any `wats
 mcp` session: the first one starts a background node, and a running `wats`
 daemon serves them all (see [claude-code.md](claude-code.md#how-sessions-share-a-node)).
 
+**Replies to your asks: the session hook.** Codex has no channel the node
+can push to. When the installed Codex has hooks, `wats setup codex --mcp`
+also adds a `SessionStart` hook and, from Codex 0.116.0 (`codex
+--version`), a `UserPromptSubmit` hook. Codex gives their output to the
+model as developer context, as Claude Code does: each session starts, and
+each prompt goes, with the clarify questions waiting for your answer and
+the new answers to your asks, each with its post id
+(see [claude-code.md](claude-code.md#replies-to-your-asks-the-session-hook)
+for what it shows, how fast it is and how "seen" works). On a terminal it
+asks first (default yes); `--no-hooks` skips it; `wats setup codex
+--remove-hooks` removes the hook only; `wats setup codex --remove` removes
+the hook, then the MCP server (`codex mcp remove wats`).
+
+wats looks for the feature in `codex features list`: `hooks`, or
+`codex_hooks` in older versions (Codex has hooks since 0.114.0). With
+neither, it prints one line saying so and writes nothing: update Codex,
+then run `wats setup codex --mcp` again. Codex 0.114 and 0.115, or a
+version `codex --version` does not tell, get `SessionStart` only; after
+an update, run setup again to add the prompt hook. Codex runs a hook it
+did not install only once you have reviewed it: open `/hooks` in Codex
+once after setup. Otherwise it edits `~/.codex/config.toml` (or
+`$CODEX_HOME/config.toml`) with toml_edit, after a backup copy
+(`config.toml.bak-<UTC time>`), keeping comments and everything else:
+
+```toml
+[features]
+hooks = true          # codex_hooks = true on older versions
+
+[[hooks.SessionStart]]
+hooks = [{ type = "command", command = "/usr/local/bin/wats notify --hook --host codex --event session-start --profile alice", timeout = 10 }]
+
+[[hooks.UserPromptSubmit]]   # Codex 0.116.0 and later
+hooks = [{ type = "command", command = "/usr/local/bin/wats notify --hook --host codex --event user-prompt-submit --profile alice", timeout = 10 }]
+```
+
+Its entries are recognized by a command containing `wats notify --hook`:
+setup again changes nothing, and `--remove-hooks` (or `--remove`) deletes
+only them (the feature flag stays: other hooks may need it). Codex reads
+hooks from `config.toml` and `hooks.json` alike; wats writes only
+`config.toml`. Checked against fake `codex` scripts only. The headless
+runner disables the hooks feature (`locked` and `workspace` access), and
+the hook stays quiet in any agent's run anyway.
+
 ## The headless agent
 
 ```sh

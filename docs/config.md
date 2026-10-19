@@ -75,6 +75,12 @@ Command-line flags and `WATS_*` variables, where they exist (`wats --help`), tak
 |---|---|---|
 | `openclaw.notify_asks` | true | push answers and clarifies to the asks your OpenClaw posted to its main session (/hooks/wake), once wats setup openclaw configured its hooks |
 
+## `[notify]`
+
+| Key | Default | |
+|---|---|---|
+| `notify.desktop` | auto | a desktop notification (osascript, notify-send) when someone answers or clarifies one of your asks; auto: on with a desktop session (macOS, or DISPLAY or WAYLAND_DISPLAY set; not over SSH), off on servers and in containers |
+
 ## `[labels]`
 
 | Key | Default | |

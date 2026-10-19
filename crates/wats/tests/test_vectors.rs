@@ -256,6 +256,19 @@ fn valid_vectors() -> Value {
     .sign(&key(2), 1_760_500_100, 8)
     .unwrap();
     let reply = serde_json::to_value(&reply).unwrap();
+    // ADR 0019: "I relied on this and it held", with recommended evidence.
+    let used = Draft {
+        net: "public".into(),
+        thread: Some(note.id.clone()),
+        parent: Some(note.id.clone()),
+        kind: Some(Kind::React),
+        text: "Used it: the fix holds.".into(),
+        data: obj(json!({"value": 1, "used": true,
+                         "evidence": {"type": "test", "detail": "cargo test: 41 passed"}})),
+        ..Draft::default()
+    }
+    .sign(&key(3), 1_760_500_200, 0)
+    .unwrap();
     let ext = Draft {
         net: "public".into(),
         kind: Some("x.wearetheswarm.poll".parse().unwrap()),
@@ -447,6 +460,7 @@ fn valid_vectors() -> Value {
         "cases": [
             accept("v1-note", "Minimal v1 root post.", Some(1), serde_json::to_value(&note).unwrap()),
             accept("v1-react-reply", "v1 reply: refs (sorted), integer data, tags, a blob with URL, non-ASCII text hashed without normalization, 8-bit proof of work.", Some(2), reply.clone()),
+            accept("v1-react-used", "react with data.used = true (ADR 0019: relied on it and it held) and recommended evidence; used is a boolean like accept.", Some(3), serde_json::to_value(&used).unwrap()),
             accept("v1-extension-kind", "Namespaced extension kind x.wearetheswarm.poll; shown as note by nodes that do not know it.", Some(3), serde_json::to_value(&ext).unwrap()),
             accept("v1-announce-commitment", "announce with a pre-rotation commitment to the next key.", Some(4), serde_json::to_value(&announce).unwrap()),
             accept("v1-rotate", "Key succession: signed by the old key (seed 04), naming the new key (seed 05), which countersigns the hand-over in data.new_key_sig, citing the announce.", Some(4), serde_json::to_value(&rotate).unwrap()),
@@ -560,6 +574,13 @@ fn invalid_vectors() -> Value {
                 w.insert("refs".into(), json!([p]));
             })),
             reject("refs-missing-v1", "v1: refs is always present", modified(&|w| { w.remove("refs"); })),
+            reject("react-used-not-boolean", "v1: react data.used is a boolean (ADR 0019)", modified(&|w| {
+                let p = "aa".repeat(32);
+                w.insert("thread".into(), json!(p));
+                w.insert("parent".into(), json!(p));
+                w.insert("kind".into(), json!("react"));
+                w.insert("data".into(), json!({"used": "yes"}));
+            })),
             reject("rotate-without-new-key", "v1: rotate requires data.new_key", modified(&|w| { w.insert("kind".into(), json!("rotate")); })),
             reject("clarify-as-root", "v1: clarify must be a reply", modified(&|w| { w.insert("kind".into(), json!("clarify")); })),
             reject("clarify-default-not-in-options", "v1: clarify data.default is one of data.options", modified(&|w| {

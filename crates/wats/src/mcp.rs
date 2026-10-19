@@ -600,6 +600,11 @@ impl Summary {
     }
 }
 
+/// The `ask_notify` client of a human's ask from an MCP host that does not
+/// name itself (`WATS_MCP_CLIENT`): Claude Code, Codex, … Its replies raise
+/// a desktop notification (`notify.desktop`).
+pub const HUMAN_CLIENT: &str = "mcp";
+
 /// Most clarify questions listed in `awaiting_you`.
 const MAX_AWAITING: usize = 10;
 
@@ -609,38 +614,9 @@ impl WatsMcp {
     /// has not answered yet (no reply of its own to the clarify). Newest
     /// first.
     fn awaiting_me(&self) -> Vec<Value> {
-        let store = self.node.store();
         let me = author_id(&self.author);
-        let clarifies = Filter {
-            kinds: vec![Kind::Clarify],
-            exclude_author: Some(me.clone()),
-            ..Filter::default()
-        };
-        let author_of = |id: &str| store.get(id).ok().flatten().map(|s| s.event.author.clone());
-        let Ok(found) = store.search(None, &clarifies, 200) else {
-            return Vec::new();
-        };
-        found
+        crate::unanswered::awaiting(self.node.store(), &me, MAX_AWAITING)
             .iter()
-            .filter(|s| {
-                let e = &s.event;
-                let parent = e.parent.as_deref().and_then(author_of);
-                let root = e.thread.as_deref().and_then(author_of);
-                parent.as_deref() == Some(me.as_str()) || root.as_deref() == Some(me.as_str())
-            })
-            .filter(|s| {
-                let mine = Filter {
-                    thread: s.event.thread.clone(),
-                    author: Some(me.clone()),
-                    ..Filter::default()
-                };
-                !store.search(None, &mine, MAX_RESULTS).is_ok_and(|replies| {
-                    replies
-                        .iter()
-                        .any(|r| r.event.parent.as_deref() == Some(s.event.id.as_str()))
-                })
-            })
-            .take(MAX_AWAITING)
             .map(|s| {
                 let mut entry = json!(Summary::new(&s.event, None));
                 for key in ["options", "default", "deadline"] {
@@ -986,17 +962,19 @@ impl WatsMcp {
             .publish_as(&self.author, draft, &attachments)
             .await
             .map_err(|e| format!("{e:#}"))?;
-        // A human's ask from a host the node can notify: remember it, so
-        // that replies reach the human there (ADR 0018 §7).
-        if let Some(client) = self.client.as_deref().filter(|c| *c == "openclaw")
-            && event.kind == Kind::Ask
+        // A human's ask: remember it and its MCP host, so that replies
+        // reach the human (ADR 0018 §7): OpenClaw's chat, or a desktop
+        // notification (`notify.desktop`). Never for an agent's session.
+        if event.kind == Kind::Ask
             && event.thread.is_none()
             && self.runner.is_none()
             && !self.held
-            && let Err(e) =
-                self.node
-                    .store()
-                    .set_ask_notify(&event.id, client, crate::node::now_secs())
+            && !self.node.config().is_agent_profile(&self.profile)
+            && let Err(e) = self.node.store().set_ask_notify(
+                &event.id,
+                self.client.as_deref().unwrap_or(HUMAN_CLIENT),
+                crate::node::now_secs(),
+            )
         {
             tracing::warn!(ask = %event.id, "cannot remember where to notify replies: {e:#}");
         }

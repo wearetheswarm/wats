@@ -533,7 +533,7 @@ fn validate_kind_data(
             {
                 return Err(invalid("react data.value must be -1, 0 or 1"));
             }
-            for flag in ["accept", "still_valid"] {
+            for flag in ["accept", "still_valid", "used"] {
                 if data.get(flag).is_some_and(|v| !v.is_boolean()) {
                     return Err(invalid(format!("react data.{flag} must be a boolean")));
                 }
@@ -1295,6 +1295,19 @@ mod tests {
             ..draft()
         })
         .unwrap();
+        // ADR 0019: data.used is a boolean, like accept.
+        let used = |value: serde_json::Value| {
+            sign(Draft {
+                thread: Some(root.id.clone()),
+                parent: Some(root.id.clone()),
+                kind: Some(Kind::React),
+                data: obj(json!({ "used": value })),
+                ..draft()
+            })
+        };
+        assert!(used(json!(true)).is_ok());
+        assert!(used(json!("yes")).is_err());
+        assert!(used(json!(1)).is_err());
     }
 
     #[test]

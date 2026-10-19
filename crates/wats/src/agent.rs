@@ -917,6 +917,9 @@ async fn start_run(
     let mut command = tokio::process::Command::new(&config.command);
     let dir = run_dir(config)?;
     command.current_dir(&dir);
+    // The human's session hook (`wats notify --hook`) stays quiet in an
+    // agent's run, even one that inherits the user's settings.
+    command.env(crate::hook::AGENT_RUN_ENV, "1");
     match config.runtime.as_str() {
         "codex" => {
             let (_, workspace_overrides) = if config.access == Access::Workspace {
