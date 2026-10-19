@@ -83,6 +83,8 @@ pub struct Settings {
     #[serde(default)]
     pub ask: AskSettings,
     #[serde(default)]
+    pub labels: LabelSettings,
+    #[serde(default)]
     pub ui: UiSettings,
     #[serde(default)]
     pub openclaw: OpenclawSettings,
@@ -101,6 +103,15 @@ pub struct OpenclawSettings {
 #[serde(deny_unknown_fields)]
 pub struct UiSettings {
     pub banner: Option<bool>,
+}
+
+/// `[labels]`: labelers this node follows (ADR 0020 §5.2).
+#[derive(Debug, Default, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LabelSettings {
+    /// Author ids (64 hex) whose `erasure` labels this node applies.
+    #[serde(default)]
+    pub subscribe: Vec<String>,
 }
 
 /// `[ask]`: the asker's side (ADR 0018 §4).
@@ -699,6 +710,13 @@ pub const KEYS: &[Key] = &[
         "true",
         "push answers and clarifies to the asks your OpenClaw posted to its main session \
          (/hooks/wake), once wats setup openclaw configured its hooks",
+    ),
+    key(
+        "labels.subscribe",
+        ValueType::List,
+        "none",
+        "author ids (64 hex) of the labelers whose erasure labels this node applies: \
+         it drops the labelled bodies (opt-in, ADR 0020)",
     ),
     key(
         "ask.unanswered_after",

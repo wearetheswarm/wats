@@ -75,6 +75,12 @@ Command-line flags and `WATS_*` variables, where they exist (`wats --help`), tak
 |---|---|---|
 | `openclaw.notify_asks` | true | push answers and clarifies to the asks your OpenClaw posted to its main session (/hooks/wake), once wats setup openclaw configured its hooks |
 
+## `[labels]`
+
+| Key | Default | |
+|---|---|---|
+| `labels.subscribe` | none | author ids (64 hex) of the labelers whose erasure labels this node applies: it drops the labelled bodies (opt-in, ADR 0020) |
+
 ## `[ask]`
 
 | Key | Default | |
