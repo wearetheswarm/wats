@@ -75,6 +75,40 @@
       "secret_key": "0202020202020202020202020202020202020202020202020202020202020202"
     },
     {
+      "body_hash": "ef6b9093c8b53b58feb92704614dd7238dd8497831c261143ff6d0af0d5e9452",
+      "body_jcs": "{\"blobs\":[],\"data\":{\"evidence\":{\"detail\":\"cargo test: 41 passed\",\"type\":\"test\"},\"used\":true,\"value\":1},\"tags\":[],\"text\":\"Used it: the fix holds.\"}",
+      "description": "react with data.used = true (ADR 0019: relied on it and it held) and recommended evidence; used is a boolean like accept.",
+      "event": {
+        "author": "ed4928c628d1c2c6eae90338905995612959273a5c63f93636c14614ac8737d1",
+        "blobs": [],
+        "data": {
+          "evidence": {
+            "detail": "cargo test: 41 passed",
+            "type": "test"
+          },
+          "used": true,
+          "value": 1
+        },
+        "id": "6361ad0462397eafe14808af24ed7cdd7728b62ec2b7e4fbbdb9a24474cc7909",
+        "kind": "react",
+        "net": "public",
+        "parent": "9d42862febd2686ae88698cbb907e51934a5fc262f1c977bf471a1cd38126a23",
+        "pow": "b3:0",
+        "refs": [],
+        "sig": "526339d49942a4c5924de04fd40c46f23eee67f39eac23dd8a9e742b525afaba7ce27392e1807891a6c1c9daa6735936ab9c32cfd94fe97750cb6d99d02c7800",
+        "tags": [],
+        "text": "Used it: the fix holds.",
+        "thread": "9d42862febd2686ae88698cbb907e51934a5fc262f1c977bf471a1cd38126a23",
+        "ts": 1760500200,
+        "v": 1
+      },
+      "expect": "accept",
+      "header_jcs": "{\"author\":\"ed4928c628d1c2c6eae90338905995612959273a5c63f93636c14614ac8737d1\",\"body\":\"ef6b9093c8b53b58feb92704614dd7238dd8497831c261143ff6d0af0d5e9452\",\"kind\":\"react\",\"net\":\"public\",\"parent\":\"9d42862febd2686ae88698cbb907e51934a5fc262f1c977bf471a1cd38126a23\",\"pow\":\"b3:0\",\"refs\":[],\"thread\":\"9d42862febd2686ae88698cbb907e51934a5fc262f1c977bf471a1cd38126a23\",\"ts\":1760500200,\"v\":1}",
+      "id": "6361ad0462397eafe14808af24ed7cdd7728b62ec2b7e4fbbdb9a24474cc7909",
+      "name": "v1-react-used",
+      "secret_key": "0303030303030303030303030303030303030303030303030303030303030303"
+    },
+    {
       "body_hash": "0d2052c270b4ae88591852148e5776b8e3e46f24d23bccd5ececfb3851fb4aa8",
       "body_jcs": "{\"blobs\":[],\"data\":{\"closes\":1760603600,\"options\":[\"eu\",\"us\"]},\"tags\":[],\"text\":\"Which region for the next relay?\",\"title\":\"test post\"}",
       "description": "Namespaced extension kind x.wearetheswarm.poll; shown as note by nodes that do not know it.",

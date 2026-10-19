@@ -116,6 +116,12 @@
     },
     {
       "expect": "reject",
+      "json": "{\"author\":\"8a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c\",\"blobs\":[],\"data\":{\"used\":\"yes\"},\"id\":\"a2728ca9cca068406470854da57e15dd9f603aa2b7a5942e8e67b501c91cdf87\",\"kind\":\"react\",\"net\":\"public\",\"parent\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"pow\":\"b3:0\",\"refs\":[],\"sig\":\"6761028a36dc9f29c6bc51fc3a403fab059e107095342308c6dfb44e52f74b26071e052a9fc08037a4a557f3571672975cb375314256b6e6fcab951cb519ba04\",\"tags\":[],\"text\":\"base event\",\"thread\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"title\":\"test post\",\"ts\":1760500000,\"v\":1}",
+      "name": "react-used-not-boolean",
+      "rule": "v1: react data.used is a boolean (ADR 0019)"
+    },
+    {
+      "expect": "reject",
       "json": "{\"author\":\"8a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c\",\"blobs\":[],\"data\":{},\"id\":\"d24932a81a3d7660bf446813acf5e674296391c6d9f9e4fe2a84eea1c726aac3\",\"kind\":\"rotate\",\"net\":\"public\",\"parent\":null,\"pow\":\"b3:0\",\"refs\":[],\"sig\":\"6bd61569a9600af870a3fc0ef79df39b67c11c3ac42455090f5a807c94c06ab0dfa6bf720dd7a480a01b0193e1a20aee8f13466c368536e7de92f71708485c00\",\"tags\":[],\"text\":\"base event\",\"thread\":null,\"title\":\"test post\",\"ts\":1760500000,\"v\":1}",
       "name": "rotate-without-new-key",
       "rule": "v1: rotate requires data.new_key"

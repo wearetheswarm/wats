@@ -10,7 +10,7 @@ event v2, [ADR 0015](../adr/0015-private-networks.md) §8.
   **accept**. Each case gives the Ed25519 seed (when there is one), the
   canonical body and header bytes (RFC 8785 JCS after the strict input
   profile), the body hash, the event id and the wire event. The cases are:
-  - v1 posts: a reply with `refs`, an extension kind, an announce with a
+  - v1 posts: a reply with `refs`, a `react` with `data.used`, an extension kind, an announce with a
     pre-rotation commitment, a `rotate`, a GREASE body key, and an author
     retraction (`x.wearetheswarm.retract`, ADR 0020 §5.1: valid as any
     extension kind, its rules are node policy);
@@ -30,7 +30,7 @@ event v2, [ADR 0015](../adr/0015-private-networks.md) §8.
   names the rule it breaks: signature, malleated `s`, bare-id signature, id
   mismatch, duplicate key, float, exponent, unsafe integer, lone surrogate,
   depth bombs, unknown kind, unknown field, `ext` in v1, the `refs` rules,
-  `rotate` without a new key, uppercase hex, a v1 author that is not hex,
+  `rotate` without a new key, a `react` `data.used` that is not a boolean, uppercase hex, a v1 author that is not hex,
   `pow` syntax (a bare decimal
   nonce, empty or malformed `alg` and payload, a payload over 2048 chars),
   and the v2 rules, one per case: an unknown kind, `thread` set, `refs` not
