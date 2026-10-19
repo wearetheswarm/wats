@@ -44,6 +44,12 @@
   and the bytes. A crash in the middle loses nothing kept; the files it
   leaves behind go at the next start. `storage.gc = false` keeps every
   file.
+- **A blob whose file is gone comes back** (a race in iroh-blobs, or a
+  disk fault): the node finds it at start or when a read fails, logs it
+  once, fetches it again from the peers likely to hold it, verifies it
+  and stores it anew, at the read and every 5 minutes. Meanwhile peers
+  fetching it from this node fail and try another, and the MCP `status`
+  shows `storage.unreadable_blobs`.
 
 ## 0.3.2 (2026-10-19)
 

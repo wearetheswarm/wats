@@ -486,6 +486,9 @@ const PROVIDER_BACKOFF_MAX: Duration = Duration::from_secs(3600);
 /// (`storage.gc`).
 pub const BLOB_GC_INTERVAL: Duration = Duration::from_secs(3600);
 
+/// How often blobs found unreadable are fetched again from peers.
+const BLOB_REPAIR_SECS: u64 = 300;
+
 /// What the blob collection keeps besides the blob store's own tags and
 /// temporary tags: the blobs a kept event lists, and those being brought
 /// in ([`BlobHold`]).
@@ -506,6 +509,17 @@ struct BlobKeep {
     blobs: std::sync::OnceLock<iroh_blobs::api::Store>,
     /// Collections begun (callbacks run), for tests.
     runs: std::sync::atomic::AtomicU64,
+    /// Blobs recorded complete whose content cannot be read (the file is
+    /// gone), to fetch again ([`Node::repair_blob`]).
+    unreadable: std::sync::Mutex<HashSet<Hash>>,
+}
+
+impl BlobKeep {
+    /// Note `hash` as unreadable; true the first time (until repaired),
+    /// for one WARN per blob.
+    fn note_unreadable(&self, hash: Hash) -> bool {
+        self.unreadable.lock().is_ok_and(|mut u| u.insert(hash))
+    }
 }
 
 /// Keeps a blob from the collection while it is brought in (a fetch for an
@@ -650,18 +664,26 @@ async fn load_blobs(
     keep: &Arc<BlobKeep>,
     store: &Arc<Store>,
 ) -> Result<FsStore> {
-    if gc {
-        // On a store no collection runs on yet: a collection's pending
-        // deletion already hides a blob from `status`, its file must stay
-        // until the deletion commits.
+    {
+        // Before anything writes, and on a store no collection runs on yet:
+        // a collection's pending deletion already hides a blob from
+        // `status`, its file must stay until the deletion commits.
         let blobs = FsStore::load(dir).await?;
-        match remove_leftovers(dir, &blobs).await {
-            Ok(0) => {}
-            Ok(files) => info!(
-                files,
-                "blob collection: removed the files a crash left behind"
-            ),
-            Err(e) => warn!("blob files a crash left behind not removed: {e:#}"),
+        match check_files(dir, &blobs, gc).await {
+            Ok(check) => {
+                if check.removed > 0 {
+                    info!(
+                        files = check.removed,
+                        "blob collection: removed the files a crash left behind"
+                    );
+                }
+                for hash in check.unreadable {
+                    if keep.note_unreadable(hash) {
+                        warn!(%hash, "blob recorded but its file is gone: it will be fetched again from peers");
+                    }
+                }
+            }
+            Err(e) => warn!("blob files not checked: {e:#}"),
         }
         blobs.shutdown().await?;
     }
@@ -678,15 +700,26 @@ async fn load_blobs(
     Ok(blobs)
 }
 
-/// Remove what a crash left in the blob store of `dir`, before anything
-/// else uses it (nothing writes, nothing collects): the files of blobs
-/// its database no longer has (a collection commits the deletion, then
-/// removes the files: a crash in between leaves them, and no later run
-/// sees them), and the temporary files of imports. Returns how many
-/// files went.
-async fn remove_leftovers(dir: &Path, blobs: &FsStore) -> Result<usize> {
-    let mut removed: usize = 0;
+/// What [`check_files`] found.
+#[derive(Debug, Default)]
+struct FileCheck {
+    /// Files removed.
+    removed: usize,
+    /// Blobs recorded complete whose data file is gone.
+    unreadable: Vec<Hash>,
+}
+
+/// Check the files of the blob store of `dir`, before anything else uses
+/// it (nothing writes, nothing collects). With `remove`, remove what a
+/// crash left: the files of blobs its database no longer has (a
+/// collection commits the deletion, then removes the files: a crash in
+/// between leaves them, and no later run sees them), and the temporary
+/// files of imports. Also lists the blobs recorded complete whose data
+/// file is gone (a race in the blob store, a disk fault).
+async fn check_files(dir: &Path, blobs: &FsStore, remove: bool) -> Result<FileCheck> {
+    let mut check = FileCheck::default();
     let mut files: HashMap<Hash, Vec<PathBuf>> = HashMap::new();
+    let mut has_data: HashSet<Hash> = HashSet::new();
     let mut entries = tokio::fs::read_dir(dir.join("data")).await?;
     while let Some(entry) = entries.next_entry().await? {
         if !entry.file_type().await?.is_file() {
@@ -700,25 +733,47 @@ async fn remove_leftovers(dir: &Path, blobs: &FsStore) -> Result<usize> {
             continue;
         }
         if let Ok(hash) = hex.parse::<Hash>() {
+            if ext == "data" {
+                has_data.insert(hash);
+            }
             files.entry(hash).or_default().push(entry.path());
         }
     }
-    for (hash, paths) in files {
-        if matches!(blobs.blobs().status(hash).await?, BlobStatus::NotFound) {
-            for path in paths {
-                tokio::fs::remove_file(&path).await?;
-                removed = removed.saturating_add(1);
+    if remove {
+        for (hash, paths) in &files {
+            if matches!(blobs.blobs().status(*hash).await?, BlobStatus::NotFound) {
+                for path in paths {
+                    tokio::fs::remove_file(path).await?;
+                    check.removed = check.removed.saturating_add(1);
+                }
+            }
+        }
+        let mut temp = tokio::fs::read_dir(dir.join("temp")).await?;
+        while let Some(entry) = temp.next_entry().await? {
+            if entry.file_type().await?.is_file() {
+                tokio::fs::remove_file(entry.path()).await?;
+                check.removed = check.removed.saturating_add(1);
             }
         }
     }
-    let mut temp = tokio::fs::read_dir(dir.join("temp")).await?;
-    while let Some(entry) = temp.next_entry().await? {
-        if entry.file_type().await?.is_file() {
-            tokio::fs::remove_file(entry.path()).await?;
-            removed = removed.saturating_add(1);
+    // Above this size the store keeps the data in a file, not inline.
+    let inlined = iroh_blobs::store::fs::options::InlineOptions::default().max_data_inlined;
+    let mut recorded = blobs.blobs().list().stream().await?;
+    let mut without_file = Vec::new();
+    while let Some(hash) = recorded.next().await {
+        let hash = hash?;
+        if !has_data.contains(&hash) {
+            without_file.push(hash);
         }
     }
-    Ok(removed)
+    for hash in without_file {
+        if let BlobStatus::Complete { size } = blobs.blobs().status(hash).await?
+            && size > inlined
+        {
+            check.unreadable.push(hash);
+        }
+    }
+    Ok(check)
 }
 
 /// Delete every tag of blob `hash` (`wats/blob/<hash>`, and the automatic
@@ -1395,6 +1450,21 @@ impl Node {
             }));
         }
         {
+            // Blobs found recorded but unreadable (at start, or by a read
+            // that could not restore them yet), restored from peers.
+            let weak = Arc::downgrade(&node);
+            tokio::spawn(supervise("blob repair", move || {
+                let weak = weak.clone();
+                async move {
+                    loop {
+                        tokio::time::sleep(Duration::from_secs(BLOB_REPAIR_SECS)).await;
+                        let Some(node) = weak.upgrade() else { break };
+                        node.repair_unreadable().await;
+                    }
+                }
+            }));
+        }
+        {
             // Store tidying: expired submissions (ADR 0015 §5) and expired
             // `evicted` drop records (ADR 0020 §2).
             let weak = Arc::downgrade(&node);
@@ -1953,6 +2023,21 @@ impl Node {
             let added = self.blobs.add_path(&path).temp_tag().await?;
             let hash = added.hash();
             self.pin(hash).await?;
+            // A collection deleting the same content (a dropped post's file
+            // published again) can leave the entry without its file: import
+            // it again, from the file we still have.
+            let mut tries: u32 = 0;
+            while self.blob_unreadable(hash).await {
+                tries = tries.saturating_add(1);
+                if tries > 3 {
+                    bail!("{} could not be stored, try again", path.display());
+                }
+                let again = self.blobs.add_path(&path).temp_tag().await?;
+                if !self.blob_unreadable(hash).await {
+                    self.blob_restored(hash);
+                }
+                drop(again);
+            }
             drop(added);
             refs.push(BlobRef {
                 hash: hash.to_hex().to_string(),
@@ -1986,6 +2071,155 @@ impl Node {
             hash,
             _tag: tag,
         }
+    }
+
+    /// Whether blob `hash` is recorded complete but cannot be read: its
+    /// file is gone (a race in the blob store's collection, a disk fault).
+    /// Notes it for [`Node::repair_blob`], with one WARN per blob.
+    async fn blob_unreadable(&self, hash: Hash) -> bool {
+        if !matches!(
+            self.blobs.status(hash).await,
+            Ok(BlobStatus::Complete { size }) if size > 0
+        ) {
+            return false;
+        }
+        if self
+            .blobs
+            .export_ranges(hash, 0..1u64)
+            .concatenate()
+            .await
+            .is_ok()
+        {
+            return false;
+        }
+        if self.blob_keep.note_unreadable(hash) {
+            warn!(%hash, "blob recorded but unreadable (its file is gone): fetching it again from peers");
+        }
+        true
+    }
+
+    /// Blob `hash`, found unreadable, reads again.
+    fn blob_restored(&self, hash: Hash) {
+        if let Ok(mut u) = self.blob_keep.unreadable.lock() {
+            u.remove(&hash);
+        }
+        info!(%hash, "unreadable blob restored");
+    }
+
+    /// Restore every blob found unreadable, from the peers likely to have
+    /// it; the ones none had stay noted for the next pass.
+    async fn repair_unreadable(&self) {
+        let hashes: Vec<Hash> = self
+            .blob_keep
+            .unreadable
+            .lock()
+            .map(|u| u.iter().copied().collect())
+            .unwrap_or_default();
+        for hash in hashes {
+            let providers = self.providers_for_hash(&hash.to_hex());
+            self.repair_blob(hash, None, providers).await;
+        }
+    }
+
+    /// Blobs found recorded but unreadable and not repaired yet.
+    pub fn unreadable_blobs(&self) -> usize {
+        self.blob_keep.unreadable.lock().map_or(0, |u| u.len())
+    }
+
+    /// Put an unreadable blob back (see [`Node::blob_unreadable`]): fetch it
+    /// from `providers` into a scratch store, BLAKE3-verified, then import
+    /// it again. The blob store has no way to reset an entry, but an
+    /// import writes the file and the entry anew, even over a complete
+    /// entry whose file is gone. With `size`, only that many bytes are
+    /// accepted (B10).
+    async fn repair_blob(&self, hash: Hash, size: Option<u64>, providers: Vec<EndpointId>) -> bool {
+        let _hold = self.hold_blob(hash).await;
+        let me = self.endpoint_id();
+        let candidates: Vec<EndpointId> = providers
+            .into_iter()
+            .filter(|p| *p != me && !self.provider_backing_off(p))
+            .take(MAX_PROVIDER_ATTEMPTS)
+            .collect();
+        if candidates.is_empty() {
+            debug!(%hash, "no provider to repair the blob from");
+            return false;
+        }
+        static REPAIRS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = REPAIRS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir = self.config.data_dir.join("blobs-repair").join(format!(
+            "{}.{}.{n}",
+            hash.to_hex(),
+            std::process::id()
+        ));
+        let repaired = self.repair_into(hash, size, candidates, &dir).await;
+        if let Err(e) = tokio::fs::remove_dir_all(&dir).await
+            && e.kind() != std::io::ErrorKind::NotFound
+        {
+            warn!(dir = %dir.display(), "scratch store of a repair not removed: {e:#}");
+        }
+        match repaired {
+            Ok(true) => {
+                self.blob_restored(hash);
+                true
+            }
+            Ok(false) => false,
+            Err(e) => {
+                warn!(%hash, "unreadable blob not restored: {e:#}");
+                false
+            }
+        }
+    }
+
+    async fn repair_into(
+        &self,
+        hash: Hash,
+        size: Option<u64>,
+        candidates: Vec<EndpointId>,
+        dir: &Path,
+    ) -> Result<bool> {
+        let scratch = FsStore::load(dir).await?;
+        let downloader = scratch.downloader(self.endpoint());
+        let request = match size {
+            Some(size) => GetRequest::builder()
+                .root(ChunkRanges::chunks(..size.div_ceil(1024).max(1)))
+                .build(hash),
+            None => GetRequest::builder().root(ChunkRanges::all()).build(hash),
+        };
+        let mut fetched = false;
+        for provider in candidates {
+            let attempt = downloader.download(request.clone(), vec![provider]);
+            match tokio::time::timeout(Duration::from_secs(60), attempt).await {
+                Ok(Ok(_)) => {}
+                Ok(Err(e)) => {
+                    debug!(%hash, %provider, "repair fetch failed: {e:#}");
+                    self.provider_failed(provider);
+                    continue;
+                }
+                Err(_) => {
+                    debug!(%hash, %provider, "repair fetch timed out");
+                    self.provider_failed(provider);
+                    continue;
+                }
+            }
+            match scratch.blobs().status(hash).await? {
+                BlobStatus::Complete { size: got } if size.is_none_or(|s| s == got) => {
+                    self.provider_ok(provider);
+                    fetched = true;
+                    break;
+                }
+                _ => continue,
+            }
+        }
+        if !fetched {
+            scratch.shutdown().await.ok();
+            return Ok(false);
+        }
+        let file = dir.join("content");
+        scratch.blobs().export(hash, &file).finish().await?;
+        scratch.shutdown().await.ok();
+        let added = self.blobs.add_path(&file).temp_tag().await?;
+        anyhow::ensure!(added.hash() == hash, "restored content has another hash");
+        Ok(!self.blob_unreadable(hash).await)
     }
 
     /// Blob collections begun since the node started, aborted ones
@@ -2355,12 +2589,26 @@ impl Node {
     }
 
     /// Read a blob from the local store, if complete.
-    pub async fn blob_bytes(&self, hash: &str) -> Result<Option<bytes::Bytes>> {
-        let hash: Hash = hash.parse()?;
+    /// A blob recorded but unreadable is fetched again from peers first
+    /// ([`Node::repair_blob`]).
+    pub async fn blob_bytes(&self, hex: &str) -> Result<Option<bytes::Bytes>> {
+        let hash: Hash = hex.parse()?;
         if !self.blobs.has(hash).await? {
             return Ok(None);
         }
-        Ok(Some(self.blobs.get_bytes(hash).await?))
+        match self.blobs.get_bytes(hash).await {
+            Ok(bytes) => Ok(Some(bytes)),
+            Err(e) => {
+                if self.blob_unreadable(hash).await
+                    && self
+                        .repair_blob(hash, None, self.providers_for_hash(hex))
+                        .await
+                {
+                    return Ok(Some(self.blobs.get_bytes(hash).await?));
+                }
+                Err(e.into())
+            }
+        }
     }
 
     /// Current gossip neighbors, across networks.
@@ -2417,13 +2665,18 @@ impl Node {
     /// Where a blob probably is: announced providers first, then the known
     /// peers closest to its hash (where replication put it), then neighbors.
     fn providers_for(&self, blob: &BlobRef) -> Vec<EndpointId> {
+        self.providers_for_hash(&blob.hash)
+    }
+
+    /// [`Node::providers_for`] a blob known by its hash only.
+    fn providers_for_hash(&self, hex: &str) -> Vec<EndpointId> {
         let mut out: Vec<EndpointId> = self
             .hints
             .lock()
             .ok()
-            .and_then(|h| h.get(&blob.hash).cloned())
+            .and_then(|h| h.get(hex).cloned())
             .unwrap_or_default();
-        if let Ok(hash) = crate::event::parse_hex::<32>(&blob.hash, "hash") {
+        if let Ok(hash) = crate::event::parse_hex::<32>(hex, "hash") {
             out.extend(proto::closest(
                 &hash,
                 &self.known_peers(),
@@ -2447,7 +2700,7 @@ impl Node {
             );
         }
         let hash: Hash = blob.hash.parse()?;
-        if !self.blobs.has(hash).await? {
+        if !self.blobs.has(hash).await? || self.blob_unreadable(hash).await {
             let providers = self.providers_for(blob);
             if providers.is_empty() || !self.fetch_blob(blob, providers).await {
                 return Ok(None);
@@ -3219,6 +3472,22 @@ impl Node {
         // Kept from the collection from before the first byte until pinned:
         // a partial blob is not, by itself.
         let _hold = self.hold_blob(hash).await;
+        // Recorded but unreadable: fetched again into a scratch store (the
+        // downloader would trust the entry).
+        if self.blob_unreadable(hash).await {
+            if !self
+                .repair_blob(hash, Some(blob.size), candidates.clone())
+                .await
+            {
+                return false;
+            }
+            if let Err(e) = self.pin(hash).await {
+                warn!(hash = %blob.hash, "blob not pinned: {e:#}");
+                return false;
+            }
+            let _ = self.fetched.send(blob.clone());
+            return true;
+        }
         // B10: ask for the declared size only, so a blob larger than its
         // event says never costs more than what was declared and checked
         // against the limits.
@@ -3999,6 +4268,31 @@ mod blob_gc_tests {
         drop(twice);
         collected(&node).await;
         assert!(!present(&node, fetched).await, "fetch abandoned: collected");
+        node.shutdown().await.unwrap();
+    }
+
+    /// The same file published again while a collection deletes its
+    /// previous copy (a dropped post's): the blob store can record it with
+    /// no file; the import notices and imports it again.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_file_published_again_during_its_collection_is_readable() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = NodeConfig::new(dir.path().join("n"));
+        config.mode = NetworkMode::Loopback;
+        config.infra = crate::infra::Infra::None;
+        config.pow_bits = Some(8);
+        config.min_pow_bits = Some(8);
+        config.blob_gc_interval = Duration::from_millis(1);
+        let node = Node::start(config).await.unwrap();
+        for round in 0..80 {
+            let event = publish(&node, dir.path(), 10).await;
+            let bytes = node.blob_bytes(&event.blobs[0].hash).await.unwrap();
+            assert_eq!(bytes.as_deref(), Some(&content(10)[..]), "round {round}");
+            node.drop_body(&event.id, DropReason::Own, None, None)
+                .await
+                .unwrap();
+        }
+        assert_eq!(node.unreadable_blobs(), 0);
         node.shutdown().await.unwrap();
     }
 
