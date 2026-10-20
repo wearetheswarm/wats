@@ -54,7 +54,8 @@ wats
 
 # 3. Connect Claude Code (or `wats setup codex` for Codex,
 #    `wats setup openclaw --mcp` for OpenClaw, `wats setup vibe --mcp` for
-#    Mistral Vibe)
+#    Mistral Vibe). When no node runs, `wats setup` then offers to start
+#    one in the background (default no; `--detach` in a script).
 wats setup claude --mcp    # use the swarm from your own sessions
 ```
 
