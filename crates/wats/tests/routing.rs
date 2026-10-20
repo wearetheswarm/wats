@@ -24,7 +24,7 @@ async fn node(
     config.pow_bits = Some(0);
     config.min_pow_bits = Some(0);
     config.peers = peers.iter().map(|p| p.endpoint().addr()).collect();
-    config.claim_jitter = Duration::ZERO;
+    config.claim_jitter = Duration::ZERO..=Duration::ZERO;
     tune(&mut config);
     Node::start(config).await
 }
@@ -200,6 +200,30 @@ async fn everywhere(nodes: &[&Arc<Node>], id: &str) {
     }
 }
 
+/// How many times a timed scenario is tried before its test fails.
+const ATTEMPTS: usize = 3;
+
+/// Runs `once` until an attempt proves something, [`ATTEMPTS`] times at
+/// most. An attempt proves nothing when the machine was too slow for its
+/// set-up (a post that had to reach a node before a timer ran out there
+/// reached it later): its `Err` says so, and the scenario runs again.
+async fn attempts<T, F>(mut once: impl FnMut() -> F) -> anyhow::Result<T>
+where
+    F: std::future::Future<Output = anyhow::Result<Result<T, String>>>,
+{
+    let mut slow = Vec::new();
+    for _ in 0..ATTEMPTS {
+        match once().await? {
+            Ok(outcome) => return Ok(outcome),
+            Err(why) => {
+                eprintln!("too slow for the set-up, tried again: {why}");
+                slow.push(why);
+            }
+        }
+    }
+    anyhow::bail!("too slow for the set-up {ATTEMPTS} times: {slow:#?}")
+}
+
 /// A race on a `one` ask: two agents on two nodes woke at the same time
 /// and both claimed. The earliest claim (then the lowest id) wins on both
 /// nodes; the loser's node posts a `release` and the loser is not woken
@@ -286,22 +310,36 @@ async fn a_race_on_a_one_ask_is_settled_by_the_tie_break() -> anyhow::Result<()>
     Ok(())
 }
 
-/// `any` with a cap of 3 and 5 capable agents on 5 nodes: each fake agent
-/// answers directly when the prompt says so. At most 3 answer, plus one
-/// for a race the jitter did not prevent (ADR 0022 §2.2).
-#[tokio::test(flavor = "multi_thread")]
-async fn any_with_a_cap_of_three_and_five_agents() -> anyhow::Result<()> {
+/// `any` with a cap of 3 and 5 capable agents on 5 nodes, the claim
+/// jitter of node `i` fixed at `jitters[i]` seconds (counted from the
+/// runner's next tick, so up to 1 s more). Each fake agent answers
+/// directly when the prompt says so, at once, except those in
+/// `together`: they answer only once all of them have woken, as if their
+/// runs overlapped. Which agents were woken, and their prompts.
+///
+/// The set-up: each node has the answers of the agents with shorter
+/// jitters before its own jitter ends (see [`attempts`]).
+async fn any_with_a_cap(
+    jitters: [u64; 5],
+    together: &[usize],
+) -> anyhow::Result<([bool; 5], Vec<String>)> {
+    attempts(|| any_with_a_cap_once(jitters, together)).await
+}
+
+/// One attempt of [`any_with_a_cap`]: why it proves nothing, if so.
+async fn any_with_a_cap_once(
+    jitters: [u64; 5],
+    together: &[usize],
+) -> anyhow::Result<Result<([bool; 5], Vec<String>), String>> {
     let dir = tempfile::tempdir()?;
     let hub = node(&dir.path().join("hub"), &[], |_| {}).await?;
     let mut nodes = Vec::new();
     let mut runners = Vec::new();
     let mut roots = Vec::new();
-    for i in 0..5 {
+    for (i, jitter) in jitters.iter().enumerate() {
         let data = dir.path().join(format!("n{i}"));
-        let n = node(&data, &[&hub], |c| {
-            c.claim_jitter = Duration::from_secs(4);
-        })
-        .await?;
+        let jitter = Duration::from_secs(*jitter);
+        let n = node(&data, &[&hub], |c| c.claim_jitter = jitter..=jitter).await?;
         n.wait_for_neighbor(PUBLIC_NET, Duration::from_secs(10))
             .await?;
         let root = dir.path().join(format!("r{i}"));
@@ -314,6 +352,8 @@ async fn any_with_a_cap_of_three_and_five_agents() -> anyhow::Result<()> {
     }
     tokio::time::sleep(Duration::from_millis(500)).await;
 
+    // No jitter ends before `started` plus its length.
+    let started = tokio::time::Instant::now();
     let ask = hub
         .publish(
             ask_with(
@@ -324,19 +364,31 @@ async fn any_with_a_cap_of_three_and_five_agents() -> anyhow::Result<()> {
             &[],
         )
         .await?;
-    // The fake agents: a light answer, at once, when told to answer.
+    // The answers each node must have before its jitter ends, and when
+    // it had them.
+    let needed: [usize; 5] =
+        std::array::from_fn(|i| jitters.iter().filter(|j| **j < jitters[i]).count());
+    let mut had: [Option<Duration>; 5] = [None; 5];
+    // The fake agents: a light answer when told to answer. Until the
+    // last jitter, its tick, and a margin for a wake that should not be.
+    let mut prompts = vec![String::new(); 5];
     let mut answered = [false; 5];
-    let started = tokio::time::Instant::now();
-    while started.elapsed() < Duration::from_secs(8) {
+    let until = Duration::from_secs(jitters.iter().max().unwrap_or(&0) + 3);
+    while started.elapsed() < until {
         for i in 0..5 {
-            if answered[i] {
+            if had[i].is_none() && in_thread(&nodes[i], &ask, Kind::Answer).len() >= needed[i] {
+                had[i] = Some(started.elapsed());
+            }
+            if prompts[i].is_empty()
+                && let Some((prompt, _)) = runs_for(&roots[i], &ask).pop()
+            {
+                prompts[i] = prompt;
+            }
+            let woken = |j: &usize| !prompts[*j].is_empty();
+            let ready = !together.contains(&i) || together.iter().all(woken);
+            if answered[i] || !woken(&i) || !ready {
                 continue;
             }
-            let Some((prompt, _)) = runs_for(&roots[i], &ask).pop() else {
-                continue;
-            };
-            let expected = expected(&prompt, &ask).unwrap_or_default();
-            assert!(expected.contains("a light answer"), "{prompt}");
             nodes[i]
                 .publish_as(
                     &nodes[i].author_key("agent")?,
@@ -348,13 +400,35 @@ async fn any_with_a_cap_of_three_and_five_agents() -> anyhow::Result<()> {
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
-    let worked = answered.iter().filter(|a| **a).count();
-    assert!((3..=4).contains(&worked), "{worked} agents answered");
-    let woken = roots
-        .iter()
-        .filter(|r| !runs_for(r, &ask).is_empty())
-        .count();
-    assert_eq!(woken, worked, "the others were not woken");
+    let woken: [bool; 5] = std::array::from_fn(|i| !prompts[i].is_empty());
+    let late: Vec<String> = (0..5)
+        .filter(|i| {
+            needed[*i] > 0 && !had[*i].is_some_and(|t| t < Duration::from_secs(jitters[*i]))
+        })
+        .map(|i| {
+            format!(
+                "node {i} had {} answers at {:?}, its jitter ended after {} s (woken: {woken:?})",
+                needed[i], had[i], jitters[i]
+            )
+        })
+        .collect();
+    let outcome = if late.is_empty() {
+        for (i, root) in roots.iter().enumerate() {
+            assert_eq!(
+                runs_for(root, &ask).len(),
+                usize::from(woken[i]),
+                "agent {i}: one wake at most"
+            );
+        }
+        for prompt in prompts.iter().filter(|p| !p.is_empty()) {
+            let expected = expected(prompt, &ask).unwrap_or_default();
+            assert!(expected.contains("a light answer"), "{prompt}");
+        }
+        assert_eq!(answered, woken, "every woken agent answered");
+        Ok((woken, prompts))
+    } else {
+        Err(late.join("; "))
+    };
 
     for r in runners {
         r.stop().await?;
@@ -363,6 +437,35 @@ async fn any_with_a_cap_of_three_and_five_agents() -> anyhow::Result<()> {
         n.shutdown().await?;
     }
     hub.shutdown().await?;
+    Ok(outcome)
+}
+
+/// The seconds between two waves of wakes in the `any` tests: more than
+/// a wake and its answer take (a tick of 1 s, the run, the test's poll),
+/// even on a loaded machine. When a stall makes it less, the attempt is
+/// tried again (see [`attempts`]).
+const WAVE: u64 = 4;
+
+/// `any` with a cap of 3 and 5 capable agents on 5 nodes: three wake at
+/// once and answer; the other two count later, find the cap reached, and
+/// are not woken (ADR 0022 §2.2).
+#[tokio::test(flavor = "multi_thread")]
+async fn any_with_a_cap_of_three_and_five_agents() -> anyhow::Result<()> {
+    let (woken, _) = any_with_a_cap([0, 0, 0, WAVE, WAVE], &[]).await?;
+    assert_eq!(woken, [true, true, true, false, false]);
+    Ok(())
+}
+
+/// The race ADR 0022 §2.2 accepts: two agents count the responders while
+/// neither has answered yet, and both answer, one over the cap. An agent
+/// whose jitter ends after their answers abstains.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_race_exceeds_the_cap_by_one() -> anyhow::Result<()> {
+    let (woken, prompts) = any_with_a_cap([0, 0, WAVE, WAVE, 2 * WAVE], &[2, 3]).await?;
+    assert_eq!(woken, [true, true, true, true, false]);
+    for prompt in &prompts[2..4] {
+        assert!(prompt.contains("; 2 of 3 responders."), "{prompt}");
+    }
     Ok(())
 }
 
@@ -599,9 +702,16 @@ async fn to_wakes_the_addressee_at_once() -> anyhow::Result<()> {
 /// after `ask.cap_grace` only if none of them claimed or answered.
 #[tokio::test(flavor = "multi_thread")]
 async fn cap_wakes_capable_agents_first() -> anyhow::Result<()> {
+    attempts(cap_wakes_capable_agents_first_once).await
+}
+
+/// One attempt of [`cap_wakes_capable_agents_first`]: why it proves
+/// nothing, if so.
+async fn cap_wakes_capable_agents_first_once() -> anyhow::Result<Result<(), String>> {
+    const GRACE: u64 = 3;
     let dir = tempfile::tempdir()?;
     let hub = node(&dir.path().join("hub"), &[], |_| {}).await?;
-    let grace = |c: &mut NodeConfig| c.cap_grace = Duration::from_secs(3);
+    let grace = |c: &mut NodeConfig| c.cap_grace = Duration::from_secs(GRACE);
     let a = node(&dir.path().join("a"), &[&hub], grace).await?;
     let b = node(&dir.path().join("b"), &[&hub], grace).await?;
     for n in [&a, &b] {
@@ -614,47 +724,61 @@ async fn cap_wakes_capable_agents_first() -> anyhow::Result<()> {
     let runner_b = start(&b, agent(&rb, &dir.path().join("b"), &[], every));
     tokio::time::sleep(Duration::from_millis(500)).await;
 
-    // a can do PDFs and answers the first ask: b never wakes for it.
-    let answered = hub
-        .publish(
-            ask_with("Merge these PDFs", json!({}), &["cap:pdf".into()]),
-            &[],
-        )
-        .await?;
-    eventually("a woke", 5, || !runs_for(&ra, &answered).is_empty()).await;
-    a.publish_as(
-        &a.author_key("agent")?,
-        reply(&answered, Kind::Answer, json!({})),
-        &[],
-    )
-    .await?;
-    // a leaves the second one alone: b wakes after the grace.
-    let ignored = hub
-        .publish(
-            ask_with("Split this PDF", json!({}), &["cap:pdf".into()]),
-            &[],
-        )
-        .await?;
-    eventually("a woke for the second", 5, || {
-        !runs_for(&ra, &ignored).is_empty()
-    })
-    .await;
-    eventually("b woke after the grace", 10, || {
-        !runs_for(&rb, &ignored).is_empty()
-    })
-    .await;
-    let (_, at) = runs_for(&rb, &ignored).remove(0);
-    assert!(at.duration_since(SystemTime::UNIX_EPOCH)?.as_secs() >= ignored.ts + 3);
-    tokio::time::sleep(Duration::from_secs(1)).await;
-    assert!(
-        runs_for(&rb, &answered).is_empty(),
-        "a capable agent answered"
-    );
+    let outcome = 'attempt: {
+        // a can do PDFs and answers the first ask: b never wakes for it.
+        let answered = hub
+            .publish(
+                ask_with("Merge these PDFs", json!({}), &["cap:pdf".into()]),
+                &[],
+            )
+            .await?;
+        eventually("a woke", 5, || !runs_for(&ra, &answered).is_empty()).await;
+        let answer = a
+            .publish_as(
+                &a.author_key("agent")?,
+                reply(&answered, Kind::Answer, json!({})),
+                &[],
+            )
+            .await?;
+        // The set-up: a's answer reaches b before the grace runs out
+        // there, so that b finds it then.
+        everywhere(&[&b], &answer.id).await;
+        let now = wats::node::now_secs();
+        if now >= answered.ts + GRACE {
+            break 'attempt Err(format!(
+                "a's answer reached b at {now}, the grace ran out at {}",
+                answered.ts + GRACE
+            ));
+        }
+        // a leaves the second one alone: b wakes after the grace.
+        let ignored = hub
+            .publish(
+                ask_with("Split this PDF", json!({}), &["cap:pdf".into()]),
+                &[],
+            )
+            .await?;
+        eventually("a woke for the second", 5, || {
+            !runs_for(&ra, &ignored).is_empty()
+        })
+        .await;
+        eventually("b woke after the grace", 10, || {
+            !runs_for(&rb, &ignored).is_empty()
+        })
+        .await;
+        let (_, at) = runs_for(&rb, &ignored).remove(0);
+        assert!(at.duration_since(SystemTime::UNIX_EPOCH)?.as_secs() >= ignored.ts + GRACE);
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert!(
+            runs_for(&rb, &answered).is_empty(),
+            "a capable agent answered"
+        );
+        Ok(())
+    };
 
     runner_a.stop().await?;
     runner_b.stop().await?;
     for n in [a, b, hub] {
         n.shutdown().await?;
     }
-    Ok(())
+    Ok(outcome)
 }
