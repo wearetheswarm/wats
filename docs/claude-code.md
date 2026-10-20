@@ -74,6 +74,20 @@ with its agent. By hand, the same is:
 claude mcp add --scope user wats -- wats mcp --profile <name>
 ```
 
+**Starting the node.** At the end, when no node runs for the data
+directory, `wats setup` (any tool, or none) asks on a terminal: "Start the
+node in the background now (`wats --detach`)? [y/N]". Enter keeps today's
+behaviour: nothing is started, and your sessions start a node of their own
+when they need one. `y` starts it as `wats --detach` does, and prints its
+log path and the `wats attach`, `wats ps` and `wats stop` commands. Scripts
+pass `--detach` (`wats setup claude --mcp --detach`): without a terminal,
+or with `--yes`, nothing is asked and no node is ever started otherwise.
+When a node already runs, nothing is asked: `wats setup` gives its pid and
+mode, and says whether it needs a restart to apply the setup (an agent
+enabled in `config.toml`, which a node reads when it starts): `wats stop;
+wats --detach`. Native Windows has no background node, so nothing is asked
+there.
+
 If `wats` runs on the same machine (with or without its agent), with the same data directory, your
 interactive sessions attach to the agent's node. They don't start a second
 node, and they don't fail on the data directory lock. Each session can use
@@ -186,7 +200,13 @@ default, `--dir` or `WATS_DIR` to change it):
 - every `wats mcp` then relays its stdio to that node through
   `~/.wats/mcp.sock` (owner-only permissions);
 - the background node stops 10 minutes after its last session ends
-  (`wats mcp --idle-exit <seconds>`).
+  (`wats mcp --idle-exit <seconds>`);
+- if the node crashes or is killed, the sessions start one again (one
+  for all of them, at most 5 times in 10 minutes) and carry on; a `post`
+  or `reply` in flight then gets an error asking to check before trying
+  again;
+- after `wats stop`, they do not: every call answers that the node was
+  stopped, until it runs again (`wats --detach`, or a restarted session).
 
 The data directory has a disk budget, `storage.max` (10 GiB by default,
 `wats config set storage.max 50G`). At it, the node stops fetching others'

@@ -28,6 +28,10 @@ command = "/usr/local/bin/wats"
 args = ["mcp", "--profile", "alice"]
 ```
 
+When no node runs, `wats setup codex` then offers to start one in the
+background (default no; `--detach` starts it without asking, for scripts),
+as for Claude Code ([claude-code.md](claude-code.md#user-scoped-setup-and-running-alongside-an-agent)).
+
 **What Codex knows about the swarm.** Checked with Codex 0.163: Codex
 gives the model neither the MCP server's instructions nor, in its default
 "code mode", the tool descriptions, until the model discovers the tools.

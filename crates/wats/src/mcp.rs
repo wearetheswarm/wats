@@ -1993,7 +1993,14 @@ impl WatsMcp {
         }
         let log = crate::background::log_path(&config.data_dir);
         let started = start_daemon_process(&config.relaunch_args, &log).map_err(fail)?;
-        // Let this answer go out, then hand the data directory over.
+        // Let this answer go out, then hand the data directory over: the
+        // sessions wait for the daemon rather than start a node.
+        crate::background::record_stop(
+            &config.data_dir,
+            crate::background::StopReason::HandOver,
+            "the start_daemon tool",
+            &config.profile,
+        );
         let node = Arc::clone(&self.node);
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(500)).await;

@@ -107,7 +107,12 @@ When `wats` (the daemon) starts and the data-directory lock is held:
   (pid, version, path, start time) with the `kill` command.
 
 In reverse, when the daemon stops while adapters are connected, they
-respawn a background node, as today.
+respawn a background node, unless it was stopped with `wats stop`: then
+they do not, and answer every call saying so until a node runs again
+(ADR 0023 §6). Decided by Vincent (2026-10-20): "MCP sessions: respawn
+the node after a crash; after an explicit `wats stop`, don't respawn, and
+the session says clearly that the node was stopped." In 0.4.0 the
+adapters only waited 30 s for a node to listen again, then ended.
 
 Writes in flight at the switch (`post`, `reply`) are not re-sent: the
 first node may already have published them, so the client gets an error
