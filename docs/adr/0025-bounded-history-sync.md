@@ -674,61 +674,87 @@ code is in `crates/wats/src/node/history.rs` (the task, serving, `get`),
   start when it is larger. A fill then never pushes into ADR 0012's 110 %
   ceiling.
 
-**When a range is complete (§9, after review)**
+**What a range ends as (§9, after two reviews)**
 
-- **Who is trusted.** A range is complete only when a peer this node
-  trusts has nothing more below the cursor, or when two distinct peers say
-  so at the same cursor. A trusted peer is one of the node's configured
-  peers or bootstrap nodes (`seed_ids`). When a second peer serves more,
-  the first one's word no longer counts.
-- **What never completes a range:**
-  - a `gap`;
-  - a `partial` answer;
-  - one untrusted peer's word.
+A walk over a range ends in one of four ways.
+
+- **Confirmed.** A trusted peer has nothing more below the cursor, or two
+  distinct peers that served events of the range say so at the same
+  cursor.
+  - A trusted peer is one of the node's configured peers or bootstrap
+    nodes (`seed_ids`).
+  - When a second peer serves more, the first one's word no longer counts.
+  - A peer that served nothing confirms nothing, so two fresh ids cannot
+    confirm a range by holding nothing.
+  - A `gap`, a `partial` answer and one untrusted peer's word never
+    confirm.
+- **Unconfirmed.** Walked as far as the peers go, without a confirmation.
+  - The range is held and kept as one `unconfirmed` row per network.
+  - `status` shows it as "unconfirmed since <date>", not as a gap, and the
+    node does not advertise `history_full`.
+  - A 0.4.0 pull is served normally, as a 0.4.0 node serves what it holds.
+  - A descending page from a 0.4.1 peer stops there with a `gap`, so that
+    a trusted node never passes on a confirmation it does not have. The
+    0.4.1 peer still takes the events with `partial`, and ends unconfirmed
+    too.
+  - A later pass with a trusted peer up confirms it with one page below
+    its cursor. If nothing comes, it is confirmed. If events come, it is
+    pending again and walked on from there.
+- **The budget.** The only cut is the one the budget makes:
+  - the fill records it at the cursor actually reached, never above it;
+  - a catch-up larger than the budget leaves a skipped range.
+- **Failed.** No peer answered. The range stays pending and is tried again
+  every 60 s.
+  - Failures never close a range and never record a cut.
+  - There is no bound on passes: a pending range refuses nothing.
+
+**Peers**
+
 - **What happens after a gap.** The cursor never moves past what was
-  received: the next peer goes on from the same cursor. A lying `gap`
-  only sends the requester to another peer, and skips no history.
+  received: the next peer goes on from the same cursor. A lying `gap` only
+  sends the requester to another peer, and skips no history.
 - **Order of peers.** Only the network's current gossip neighbors are
   asked (members, up now), in this order:
   - trusted `history_full` peers;
   - trusted peers;
-  - the others, in a random order (an endpoint id can be ground), with
-    those that claim `history_full` first, as a hint only.
+  - the others, in a random order: an endpoint id can be ground, and
+    their `history_full` claims are ignored.
 - **One failure vetoes nothing.** A peer that fails, or refuses (a
   non-member), is skipped.
-- **A range never stays pending forever.** A pending range is a hole that
-  refuses 0.4.0 pulls. After `max_attempts` passes (5; one a minute)
-  without confirmation, it is closed as what it is:
-  - the fill records a cut at its cursor (at its top before the window
-    phase);
-  - a catch-up becomes a skipped range, with its dates.
+- **The union check.** After each range, the neighbors that did not serve
+  it are asked what they hold that the walk did not bring, so that no single
+  peer's omission sticks.
+  - **A `sync_desc` neighbor** is read newest first, with `partial`, until
+    2 pages in a row bring nothing new.
+  - **An older neighbor** is read ascending from the range's floor, up to 5 %
+    of the budget in what it sends.
+  - **Both** stop at the range's budget.
 
-  Neither is ever counted as held, and a node that holds such a span
-  never advertises `history_full`.
-- **New networks.** A network whose nodes are all new records a cut at its
-  oldest event: no node can confirm that nothing older exists.
+  This shortcut trades exhaustiveness for bandwidth, the same trade as
+  0.4.0's catch-up from each neighbor: an event a peer holds below a run of
+  pages already held is not fetched. Without it, a newcomer with 5
+  neighbors and the default 2.5 GiB budget would download the window about
+  5 times.
+- **New networks.** A network whose nodes are all new ends unconfirmed: no
+  node can confirm that nothing older exists. It serves 0.4.0 pulls all the
+  same.
 
 **Requests and serving**
 
 - **`partial` on `sync`** (new, optional). The server then stops only at
-  its cut and skipped ranges, and serves what it holds in a pending range.
-  - **Why.** Two nodes filling at once otherwise stopped each other with a
-    `gap` forever.
-  - **When it is used.** When the first round confirms nothing, the walk
-    asks the same peers again with `partial`. What comes is stored, but the
-    range stays pending. The cheap ascending check (`sync_from`) asks
-    `partial` too.
-- **What a node with no history yet serves.** A node with watermark 0 and
-  no range holds no history yet, before its first pass: it serves that span
-  as a hole, never as complete.
-- **What a pending catch-up range is to others.** It is a hole in `status`
-  and `history_full`, not in serving. It is recent history, which a node
-  online all along cannot vouch for either (gossip loses messages), and
-  0.4.0 nodes served what they held during their own catch-up. Serving it
-  as a hole made every 0.4.0 pull fail, and two catch-ups stop each other.
-- **Holes for serving.** A descending page stops with a `gap` at a cut, a
-  skipped range or a fill still running. An ascending pull from below one
-  of these is refused.
+  its cut and skipped ranges, and serves what it holds elsewhere. Two nodes
+  filling at once otherwise stopped each other with a `gap` forever. When
+  the first round confirms nothing, the walk asks the same peers again
+  with `partial`; what comes is stored, and the range ends unconfirmed.
+- **Holes for serving.**
+  - A descending page stops with a `gap` at every hole: pending,
+    unconfirmed and skipped ranges, the cut, and no history yet (watermark
+    0 and no range, before the first pass).
+  - A `partial` page stops only at the cut and skipped ranges.
+  - An ascending pull, as 0.4.0 makes, is refused only below the cut or a
+    skipped range, where the budget left history out on purpose. Anything
+    else is served as held, as a 0.4.0 node serves what it holds, the
+    middle of a fill included.
 - **A descending request** carries `after_ts`/`after_id` as its lower
   bound: the range's `lo`, inclusive of that second. It is therefore not
   malformed for an older node, which would serve an ascending page that
@@ -749,14 +775,10 @@ code is in `crates/wats/src/node/history.rs` (the task, serving, `get`),
 
 - **A catch-up range opens only after an offline period:** the first
   neighbor of a network (at start, or after losing them all), or a network
-  change. A neighbor that joins others already up only gets the cheap
-  check, as gossip was live.
-- **The cheap check** asks each neighbor that the pass did not walk
-  ascending, from the watermark *before* the pass, never from one the pass
-  moved. After the fill, it starts from the top of the cut, or not at all
-  when the whole history was confirmed (an ascending pull from 0 would bring
-  the oldest first). It stops at the budget, and moves the watermark only
-  when the peer had nothing more.
+  change.
+- **A neighbor that joins others already up** gets the union check from the
+  watermark the pass started with (5 % of the budget at most), never from
+  one the pass moved. Not after the fill: its own union check ran.
 - **A catch-up range above a pending fill.** A node stopped during its
   fill has watermark 0. At its next start it opens a catch-up range above
   the fill (from the fill's top − 10 min) before resuming the fill, so the
@@ -783,8 +805,8 @@ code is in `crates/wats/src/node/history.rs` (the task, serving, `get`),
   - When the budget runs out inside a window, the cut is the start of the
     last window read in full; what that window brought below it stays as
     islands.
-  - Only windows read to their end from a trusted peer complete the range
-    or move its cursor.
+  - Only windows read to their end from a trusted peer confirm the range;
+    from other peers it ends unconfirmed.
 - **No `kinds` filter.** Older peers have none: with them only, phases 0
   and 1 are skipped. `status` shows `syncing from older peers`.
 
@@ -847,8 +869,13 @@ code is in `crates/wats/src/node/history.rs` (the task, serving, `get`),
 - **`crates/wats/tests/history.rs`** (hermetic) covers:
   - the fill: its phases, its cut, and `0` as a full pull;
   - an interrupted catch-up;
-  - a skipped range, and a catch-up nobody confirms;
+  - a skipped range, and a catch-up nobody confirms (unconfirmed, still
+    served to 0.4.0 nodes);
   - honest serving, including a node with no history yet;
+  - a fill with untrusted peers only: unconfirmed, serving a 0.4.0 node,
+    then confirmed by a trusted peer;
+  - two empty untrusted peers, which confirm nothing, and a rate-limited
+    trusted peer, which never leads to a cut;
   - `read` below the cut;
   - a full node not misled by a cut node;
   - the per-key share, against junk notes and against junk announces;

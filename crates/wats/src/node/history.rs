@@ -15,17 +15,18 @@
 //!   it meets the history the previous one brought, until the budget is
 //!   spent.
 //!
-//! A range is complete only when a peer this node trusts (one of its
+//! A range is confirmed only when a peer this node trusts (one of its
 //! configured peers or bootstrap nodes) has nothing more below the cursor,
-//! or when two distinct peers say so at the same cursor. A `partial`
-//! answer, a `gap` or one untrusted peer's word leaves it pending; after
-//! [`Tuning::max_attempts`] passes it is closed as what it is: a cut (the
-//! fill) or a skipped range (a catch-up), never as held.
+//! or when two distinct peers that served events of the range say so at
+//! the same cursor. Walked to its end without that, it is unconfirmed:
+//! held and served as held, shown as such, until a trusted peer confirms
+//! it. A failed walk stays pending. Then a bounded union check asks the
+//! other neighbors what they hold that the walk did not bring.
 //!
 //! A node serves its history honestly: a descending page stops at the top
-//! of a hole (its cut, a pending or skipped range) with a `gap`, and an
-//! ascending pull from below a hole is refused, so that no peer takes a
-//! partial history for a complete one.
+//! of a hole (its cut, a pending or skipped range) with a `gap`. An
+//! ascending pull, as 0.4.0 makes, is refused only below the cut or a
+//! skipped range, where the budget left history out on purpose.
 
 use std::collections::{HashMap, HashSet};
 use std::hash::BuildHasher;
@@ -86,17 +87,19 @@ const GET_BATCH: usize = proto::MAX_GET_IDS;
 const GET_THREAD_MAX: usize = 500;
 const GET_ROWS_MAX: usize = 2000;
 const GET_MAX_BYTES: usize = 15 * 1024 * 1024;
+/// The union check (ADR 0025 §5): a `sync_desc` peer is read until this
+/// many pages in a row bring nothing new; an older peer up to this share
+/// of the budget (in percent) in what it sends, or this many bytes with no
+/// budget.
+const UNION_HELD_PAGES: usize = 2;
+const UNION_SHARE: u64 = 5;
+const UNION_OLDER_MAX: u64 = 128 << 20;
 /// The first window asked from older peers; each next one doubles.
 const OLDER_WINDOW_SECS: u64 = 7 * 24 * 3600;
 
 /// How the history task behaves (tests shorten or slow it).
 #[derive(Debug, Clone)]
 pub struct Tuning {
-    /// Passes with neighbors up a range may stay unconfirmed (gaps,
-    /// partial answers, one untrusted peer's word) before it is closed: a
-    /// cut for the fill, a skipped range for a catch-up. A pending range
-    /// is a hole that refuses 0.4.0 pulls, so it never stays forever.
-    pub max_attempts: u32,
     /// Events asked per page.
     pub page: u32,
     /// A pause after each page (tests: to stop a walk half-way).
@@ -111,7 +114,6 @@ pub struct Tuning {
 impl Default for Tuning {
     fn default() -> Self {
         Tuning {
-            max_attempts: 5,
             page: proto::MAX_SYNC_PAGE,
             page_pause: Duration::ZERO,
             retry: Duration::from_secs(60),
@@ -134,8 +136,6 @@ struct Progress {
     /// The node came back on the network (its first neighbor, a network
     /// change): the next pass opens a catch-up range.
     catch_up: bool,
-    /// Unconfirmed passes per pending range id.
-    attempts: HashMap<i64, u32>,
     /// Bytes stored per key chain by the fill, across its passes (ADR
     /// 0025 §4: one key's share).
     author_bytes: HashMap<String, u64>,
@@ -153,16 +153,14 @@ pub struct History {
 /// Which holes a request is served around (ADR 0025 §3).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Holes {
-    /// Every one: what `status` and `history_full` count.
+    /// Every one: pending, unconfirmed and skipped ranges, the cut, and no
+    /// history yet. What `history_full` counts, and where a descending
+    /// page stops: a 0.4.1 peer is never told complete what this node does
+    /// not hold for sure.
     All,
-    /// A descending page stops at the first of the cut, the skipped
-    /// ranges and a fill still running, and an ascending pull from below
-    /// one is refused. Not a pending catch-up range: recent history, which
-    /// a node online all along cannot vouch for either (gossip loses
-    /// messages), and which 0.4.0 nodes served during their own catch-up.
-    Serving,
-    /// The cut and the skipped ranges: a `partial` request takes what a
-    /// pending range holds.
+    /// The cut and the skipped ranges, where the budget left history out
+    /// on purpose: a `partial` request stops there, and an ascending pull
+    /// from below one is refused.
     Intentional,
 }
 
@@ -185,15 +183,16 @@ enum End {
     Complete,
     /// The budget is spent.
     Budget,
-    /// Peers answered, but nothing confirms the range is held: gaps,
-    /// `partial` answers, one untrusted peer's word.
-    Open,
+    /// Walked as far as the peers go, but nothing confirms that nothing
+    /// is missing: gaps, `partial` answers, untrusted peers only.
+    Unconfirmed,
     /// No peer answered: try again later.
     Failed,
 }
 
 /// Peers that said they hold nothing below a cursor (ADR 0025 §9): a
-/// trusted one settles it, otherwise two distinct ones at the same cursor.
+/// trusted one settles it, otherwise two distinct ones at the same cursor,
+/// each of which served events of the range (checked by the caller).
 #[derive(Debug, Default)]
 struct Claims {
     at: Option<(u64, String)>,
@@ -276,7 +275,7 @@ fn combine(desc: End, older: End) -> End {
     match (desc, older) {
         (End::Budget, _) | (_, End::Budget) => End::Budget,
         (End::Complete, _) | (_, End::Complete) => End::Complete,
-        (End::Open, _) | (_, End::Open) => End::Open,
+        (End::Unconfirmed, _) | (_, End::Unconfirmed) => End::Unconfirmed,
         _ => End::Failed,
     }
 }
@@ -344,6 +343,14 @@ pub fn line(history: &Value) -> String {
         let why = match range["state"].as_str() {
             Some("pending") => "resuming",
             Some("skipped") => "skipped: budget",
+            Some("unconfirmed") if lo == 0 => {
+                text.push_str(" · unconfirmed: no trusted peer yet");
+                continue;
+            }
+            Some("unconfirmed") => {
+                text.push_str(&format!(" · unconfirmed since {}", date(lo)));
+                continue;
+            }
             _ => continue,
         };
         text.push_str(&format!(" · gap {} – {} ({why})", date(lo), date(hi)));
@@ -363,8 +370,12 @@ pub fn short(history: &Value) -> String {
         (_, Some(back)) => format!("back to {back}"),
         (_, None) => "-".to_string(),
     };
-    if history["ranges"].as_array().is_some_and(|r| !r.is_empty()) {
+    let ranges = history["ranges"].as_array().cloned().unwrap_or_default();
+    if ranges.iter().any(|r| r["state"] != "unconfirmed") {
         text.push_str(" +gaps");
+    }
+    if ranges.iter().any(|r| r["state"] == "unconfirmed") {
+        text.push_str(" +unconfirmed");
     }
     text
 }
@@ -380,7 +391,9 @@ pub fn stored_json(
     let ranges = store.sync_ranges(net)?;
     let watermark = store.sync_watermark(net)?;
     let pending = ranges.iter().any(|r| r.state == RangeState::Pending);
-    let holes = ranges.iter().any(|r| r.hole_top().is_some());
+    let holes = ranges
+        .iter()
+        .any(|r| r.hole_top().is_some() || r.state == RangeState::Unconfirmed);
     let state = if pending {
         "syncing"
     } else if watermark == 0 {
@@ -407,15 +420,18 @@ fn view(
         .max();
     let shown: Vec<Value> = ranges
         .iter()
-        .filter(|r| {
-            matches!(r.state, RangeState::Pending | RangeState::Skipped) && r.phase.is_empty()
-        })
-        .filter_map(|r| {
-            Some(json!({
+        .filter_map(|r| match r.state {
+            RangeState::Pending | RangeState::Skipped if r.phase.is_empty() => Some(json!({
                 "state": r.state.as_str(),
                 "lo_ts": r.hole_lo(),
                 "hi_ts": r.hole_top()?,
-            }))
+            })),
+            RangeState::Unconfirmed => Some(json!({
+                "state": r.state.as_str(),
+                "lo_ts": r.lo_ts,
+                "hi_ts": r.hi_ts,
+            })),
+            _ => None,
         })
         .collect();
     json!({
@@ -472,9 +488,13 @@ impl Node {
             .filter(|r| match which {
                 Holes::All => true,
                 Holes::Intentional => r.state != RangeState::Pending,
-                Holes::Serving => r.state != RangeState::Pending || !r.phase.is_empty(),
             })
-            .filter_map(|r| Some((r.hole_lo(), r.hole_top()?)))
+            .filter_map(|r| match r.state {
+                // Held, but not confirmed: no confirmation for a 0.4.1
+                // peer either, which takes it with `partial`.
+                RangeState::Unconfirmed if which == Holes::All => Some((r.lo_ts, r.hi_ts)),
+                _ => Some((r.hole_lo(), r.hole_top()?)),
+            })
             .collect();
         // No history yet (before the first pass): nothing below now is
         // held, as with a fill still to run.
@@ -488,14 +508,24 @@ impl Node {
     }
 
     /// Whether this node holds the complete history of every network it
-    /// joined (`history_full`): no budget, a fill done, and no hole.
+    /// joined (`history_full`): no budget, a fill done, no hole, and
+    /// nothing unconfirmed.
     pub fn history_full(&self) -> bool {
         self.history_budget().is_none()
             && !self.config.history.legacy
-            && self.joined_nets().iter().all(|net| {
-                self.store.sync_watermark(net).unwrap_or(0) > 0
-                    && self.history_holes(net).is_empty()
-            })
+            && self.joined_nets().iter().all(|net| self.holds_all(net))
+    }
+
+    /// Whether this node holds the confirmed, complete history of `net`.
+    fn holds_all(&self, net: &str) -> bool {
+        self.store.sync_watermark(net).unwrap_or(0) > 0
+            && self.history_holes(net).is_empty()
+            && !self
+                .store
+                .sync_ranges(net)
+                .unwrap_or_default()
+                .iter()
+                .any(|r| r.state == RangeState::Unconfirmed)
     }
 
     /// What this node says about itself in `hello`.
@@ -528,7 +558,7 @@ impl Node {
             "syncing"
         } else if watermark == 0 {
             "none"
-        } else if self.history_budget().is_none() && self.history_holes(net).is_empty() {
+        } else if self.history_budget().is_none() && self.holds_all(net) {
             "full"
         } else {
             "done"
@@ -663,7 +693,8 @@ impl Node {
     }
 
     /// One pass of the history task of `net`: open a range if needed, walk
-    /// the pending ones newest first, then check the new neighbors.
+    /// the pending ones newest first, try to confirm the unconfirmed ones,
+    /// then check the neighbors that came up while online.
     async fn history_pass(&self, net: &str) -> Result<()> {
         let neighbors = self.neighbors_of(net);
         if neighbors.is_empty() {
@@ -680,8 +711,6 @@ impl Node {
             }
         }
         let (peers, older) = self.history_peers(net);
-        // The watermark before this pass: the check below never starts
-        // from one this pass moved.
         let watermark = self.store.sync_watermark(net)?;
         let catch_up = self
             .set_progress(net, |p| std::mem::take(&mut p.catch_up))
@@ -698,7 +727,10 @@ impl Node {
             p.running = true;
             p.older_peers = peers.is_empty();
         });
-        let outcome = self.walk_pending(net, &peers, &mut pass).await;
+        let mut outcome = self.walk_pending(net, &peers, &mut pass).await;
+        if outcome.is_ok() {
+            outcome = self.confirm_unconfirmed(net, &peers, &mut pass).await;
+        }
         let fill_running = self
             .store
             .sync_ranges(net)?
@@ -714,41 +746,38 @@ impl Node {
         if let Some(watermark) = self.store.settle_sync_ranges(net)? {
             info!(%net, watermark, "history: caught up");
         }
-        // The cheap ascending check with the new neighbors (ADR 0025 §5),
-        // once nothing is pending: the union of what peers hold.
-        if self.history_pending(net) {
-            return Ok(());
-        }
+        // Neighbors that came up while this node was online (no range
+        // opened for them): what they hold since the watermark the pass
+        // started with, bounded like the union check (ADR 0025 §5). Not
+        // after the fill (watermark 0): its union check ran.
         let check: Vec<EndpointId> = self
             .set_progress(net, |p| p.check.drain().collect())
             .unwrap_or_default();
-        // From the watermark before this pass; after the fill, from the top
-        // of its cut, or not at all when the whole history was confirmed
-        // (an ascending pull from 0 would bring the oldest first).
-        let from = if watermark > 0 {
-            Some(watermark)
-        } else {
-            self.store
-                .sync_ranges(net)?
-                .iter()
-                .filter(|r| r.state == RangeState::Cut)
-                .filter_map(SyncRange::hole_top)
-                .max()
-        };
-        let Some(from) = from else {
+        if self.history_pending(net) || watermark == 0 {
             return Ok(());
+        }
+        let check: Vec<EndpointId> = check
+            .into_iter()
+            .filter(|p| !pass.served.contains(p) && !pass.behind.contains(p))
+            .collect();
+        if check.is_empty() {
+            return Ok(());
+        }
+        let started = now_secs();
+        let stop_at = self.history_budget().map(|b| {
+            self.store
+                .store_bytes()
+                .saturating_add(percent(b, UNION_SHARE))
+        });
+        let walk = Walk {
+            floor: watermark.saturating_sub(MAX_CLOCK_SKEW_SECS),
+            stop_at,
+            ..Walk::default()
         };
-        let stop_at = self
-            .history_budget()
-            .map(|b| self.store.store_bytes().saturating_add(b));
-        for peer in check {
-            if pass.served.contains(&peer) || pass.behind.contains(&peer) {
-                continue;
-            }
-            match self.sync_from_with(peer, net, from, stop_at).await {
-                Ok(n) => debug!(%net, peer = %peer.fmt_short(), new = n, "checked"),
-                Err(e) => debug!(%net, peer = %peer.fmt_short(), "check failed: {e:#}"),
-            }
+        let top = started.saturating_add(MAX_CLOCK_SKEW_SECS);
+        self.union_check(net, top, &check, &walk, &mut pass).await?;
+        if !self.history_pending(net) {
+            self.store.set_sync_watermark(net, started)?;
         }
         Ok(())
     }
@@ -820,7 +849,8 @@ impl Node {
     }
 
     /// Walk the pending ranges of `net`, newest first: from `peers` (with
-    /// `sync_desc`), then from the older neighbors of the pass.
+    /// `sync_desc`), then from the older neighbors of the pass; then the
+    /// union check of each range with the neighbors that did not serve it.
     async fn walk_pending(&self, net: &str, peers: &[EndpointId], pass: &mut Pass) -> Result<()> {
         let ranges: Vec<SyncRange> = self
             .store
@@ -829,14 +859,43 @@ impl Node {
             .filter(|r| r.state == RangeState::Pending)
             .collect();
         for mut range in ranges {
-            let end = if range.phase.is_empty() {
-                self.walk_catch_up(&mut range, peers, pass).await?
-            } else {
+            let fill = !range.phase.is_empty();
+            let end = if fill {
                 self.walk_fill(&mut range, peers, pass).await?
+            } else {
+                self.walk_catch_up(&mut range, peers, pass).await?
             };
             if end == End::Failed {
                 debug!(%net, "history: no peer could serve the range; kept pending");
                 break;
+            }
+            // The union check (ADR 0025 §5): what the other neighbors hold
+            // that the walk did not bring, down to the range's floor (the
+            // cut, the skipped part) and within the range's budget.
+            let floor = match end {
+                End::Budget => range.cursor_ts,
+                _ => range.lo_ts,
+            };
+            let others: Vec<EndpointId> = self
+                .neighbors_of(net)
+                .into_iter()
+                .filter(|p| *p != self.endpoint_id() && !pass.served.contains(p))
+                .collect();
+            if end != End::Budget && !others.is_empty() {
+                let walk = Walk {
+                    floor,
+                    stop_at: self
+                        .history_budget()
+                        .map(|b| range.base_bytes.saturating_add(b)),
+                    author_cap: if fill {
+                        self.history_budget().map(|b| percent(b, AUTHOR_SHARE))
+                    } else {
+                        None
+                    },
+                    ..Walk::default()
+                };
+                self.union_check(net, range.hi_ts, &others, &walk, pass)
+                    .await?;
             }
         }
         Ok(())
@@ -867,6 +926,205 @@ impl Node {
             end = combine(end, self.walk_older(range, &older, pass, None).await?);
         }
         self.finish(range, end)
+    }
+
+    /// The union check (ADR 0025 §5): what `peers` hold between `walk.floor`
+    /// and `top` that this node does not, so that no single peer's
+    /// omission sticks. Bounded, as 0.4.0's catch-up from each neighbor
+    /// was not: a `sync_desc` peer is read newest first until
+    /// [`UNION_HELD_PAGES`] pages in a row bring nothing new; an older
+    /// peer ascending from the floor, up to [`UNION_SHARE`] % of the budget
+    /// in what it sends. It trades exhaustiveness for bandwidth: an event
+    /// a peer holds below a run of held pages is not fetched.
+    async fn union_check(
+        &self,
+        net: &str,
+        top: u64,
+        peers: &[EndpointId],
+        walk: &Walk,
+        pass: &mut Pass,
+    ) -> Result<()> {
+        let cap = self
+            .history_budget()
+            .or(self.events_share())
+            .map_or(UNION_OLDER_MAX, |b| percent(b, UNION_SHARE))
+            .max(1 << 20);
+        for &peer in peers {
+            if !pass.served.insert(peer) {
+                continue;
+            }
+            let desc = self.has_feature(&peer, proto::FEATURE_SYNC_DESC);
+            let mut scratch = SyncRange {
+                id: 0,
+                net: net.to_string(),
+                lo_ts: walk.floor,
+                hi_ts: top,
+                cursor_ts: top,
+                cursor_id: String::new(),
+                state: RangeState::Pending,
+                phase: String::new(),
+                opened: 0,
+                base_bytes: 0,
+            };
+            if !desc {
+                (scratch.cursor_ts, scratch.cursor_id) = if walk.floor == 0 {
+                    (0, String::new())
+                } else {
+                    (walk.floor.saturating_sub(1), "~".repeat(64))
+                };
+            }
+            let (mut held_pages, mut received) = (0usize, 0u64);
+            loop {
+                self.still_running()?;
+                if walk
+                    .stop_at
+                    .is_some_and(|stop| self.store.store_bytes() >= stop)
+                {
+                    return Ok(());
+                }
+                let request = if desc {
+                    Request::Sync {
+                        net: net.to_string(),
+                        after_ts: walk.floor,
+                        after_id: String::new(),
+                        before_ts: Some(scratch.cursor_ts),
+                        before_id: Some(scratch.cursor_id.clone()),
+                        kinds: Vec::new(),
+                        authors: Vec::new(),
+                        partial: true,
+                        limit: self.config.history.page,
+                    }
+                } else {
+                    Request::sync_after(
+                        net,
+                        scratch.cursor_ts,
+                        &scratch.cursor_id,
+                        self.config.history.page,
+                    )
+                    .partial()
+                };
+                let answer = tokio::time::timeout(
+                    PAGE_TIMEOUT,
+                    proto::call_solving(self.endpoint(), peer, &request),
+                )
+                .await;
+                let (events, more, gap, seen) = match answer {
+                    Ok(Ok(Response::SyncPage {
+                        events,
+                        more,
+                        gap,
+                        seen,
+                    })) => (events, more, gap, seen),
+                    other => {
+                        debug!(peer = %peer.fmt_short(), "union check: {other:?}");
+                        break;
+                    }
+                };
+                let new = events
+                    .iter()
+                    .filter_map(head)
+                    .filter(|h| self.store.get_raw(h.id).ok().flatten().is_none())
+                    .count();
+                received = events.iter().fold(received, |n, v| {
+                    n.saturating_add(serde_json::to_vec(v).map_or(0, |b| b.len() as u64))
+                });
+                let floor_walk = Walk {
+                    floor: if desc { walk.floor } else { 0 },
+                    author_cap: walk.author_cap,
+                    ..Walk::default()
+                };
+                if let Err(e) = self
+                    .take_page(&mut scratch, peer, &events, &seen, &floor_walk, pass, desc)
+                    .await
+                {
+                    debug!(peer = %peer.fmt_short(), "union check page refused: {e:#}");
+                    break;
+                }
+                held_pages = if new == 0 {
+                    held_pages.saturating_add(1)
+                } else {
+                    0
+                };
+                if events.is_empty()
+                    || !more
+                    || gap.is_some()
+                    || (desc && held_pages >= UNION_HELD_PAGES)
+                    || (!desc && received >= cap)
+                {
+                    break;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Unconfirmed ranges, when a trusted peer is up: one page below the
+    /// range's cursor. Nothing there (and no gap) confirms the range; events
+    /// make it pending again, to be walked on from there.
+    async fn confirm_unconfirmed(
+        &self,
+        net: &str,
+        peers: &[EndpointId],
+        pass: &mut Pass,
+    ) -> Result<()> {
+        let trusted: Vec<EndpointId> = peers.iter().copied().filter(|p| self.trusted(p)).collect();
+        if trusted.is_empty() {
+            return Ok(());
+        }
+        let ranges: Vec<SyncRange> = self
+            .store
+            .sync_ranges(net)?
+            .into_iter()
+            .filter(|r| r.state == RangeState::Unconfirmed)
+            .collect();
+        for mut range in ranges {
+            for &peer in &trusted {
+                self.still_running()?;
+                let request = Request::Sync {
+                    net: net.to_string(),
+                    after_ts: range.lo_ts,
+                    after_id: String::new(),
+                    before_ts: Some(range.cursor_ts),
+                    before_id: Some(range.cursor_id.clone()),
+                    kinds: Vec::new(),
+                    authors: Vec::new(),
+                    partial: false,
+                    limit: self.config.history.page,
+                };
+                let answer = tokio::time::timeout(
+                    PAGE_TIMEOUT,
+                    proto::call_solving(self.endpoint(), peer, &request),
+                )
+                .await;
+                let Ok(Ok(Response::SyncPage {
+                    events,
+                    more,
+                    gap,
+                    seen,
+                })) = answer
+                else {
+                    continue;
+                };
+                if gap.is_some() && events.is_empty() {
+                    continue;
+                }
+                if events.is_empty() && !more {
+                    info!(%net, "history: a trusted peer confirmed {} – {}", date(range.lo_ts), date(range.hi_ts));
+                    range.state = RangeState::Done;
+                } else {
+                    let walk = Walk {
+                        floor: range.lo_ts,
+                        ..Walk::default()
+                    };
+                    self.take_page(&mut range, peer, &events, &seen, &walk, pass, true)
+                        .await?;
+                    range.state = RangeState::Pending;
+                }
+                self.store.update_sync_range(&range)?;
+                break;
+            }
+        }
+        Ok(())
     }
 
     /// The initial fill, phase by phase (ADR 0025 §4).
@@ -968,8 +1226,8 @@ impl Node {
                     phase = %range.phase,
                     "history: the phase reached its share of the budget; moving on"
                 ),
-                End::Open => {
-                    debug!(%net, phase = %range.phase, "history: phase not confirmed; moving on")
+                End::Unconfirmed => {
+                    debug!(%net, phase = %range.phase, "history: phase not confirmed; moving on");
                 }
                 End::Complete => {}
             }
@@ -979,89 +1237,84 @@ impl Node {
         }
     }
 
-    /// How many unconfirmed passes `range` has had, this one included.
-    fn bump_attempts(&self, net: &str, range: i64) -> u32 {
-        self.set_progress(net, |p| {
-            let n = p.attempts.entry(range).or_default();
-            *n = n.saturating_add(1);
-            *n
-        })
-        .unwrap_or(u32::MAX)
-    }
-
-    /// The end of a walk over `range`: complete, closed (a cut for the
-    /// fill, a skipped range for a catch-up: the budget, or no peer
-    /// confirmed it after [`Tuning::max_attempts`] passes), or still
-    /// pending.
+    /// The end of a walk over `range`:
+    /// - complete: held;
+    /// - unconfirmed: walked to its end, but no trusted peer confirmed it:
+    ///   held and served as held, shown as unconfirmed;
+    /// - the budget: a cut for the fill, at the cursor reached, or a
+    ///   skipped range for a catch-up;
+    /// - failed: still pending. Failures never close a range.
     fn finish(&self, range: &mut SyncRange, end: End) -> Result<End> {
         let net = range.net.clone();
         let fill = !range.phase.is_empty();
-        let close = match end {
-            End::Complete => false,
-            End::Budget => true,
-            End::Open | End::Failed => {
-                let attempts = self.bump_attempts(&net, range.id);
-                if attempts < self.config.history.max_attempts {
-                    self.store.update_sync_range(range)?;
-                    return Ok(end);
+        match end {
+            End::Failed => {
+                self.store.update_sync_range(range)?;
+                return Ok(end);
+            }
+            End::Complete => {
+                range.state = RangeState::Done;
+                if fill {
+                    info!(%net, "history: initial fill done, confirmed");
                 }
-                warn!(
-                    %net,
-                    "history: no peer confirmed {} – {} after {attempts} passes; not counted as held",
-                    date(range.lo_ts),
-                    date(range.cursor_ts)
-                );
-                true
             }
-        };
-        self.set_progress(&net, |p| {
-            p.attempts.remove(&range.id);
-            if fill {
-                p.author_bytes.clear();
-            }
-        });
-        if fill {
-            // Before its window, nothing below the fill's top is held but
-            // the kinds of its first phases.
-            let top = if range.phase == PHASE_WINDOW {
-                range.cursor_ts
-            } else {
-                range.hi_ts
-            };
-            if close {
+            End::Unconfirmed => {
                 info!(
                     %net,
-                    cut = %date(top),
-                    "history: initial fill done; older history is not held here"
+                    "history: {} – {} fetched; no trusted peer confirmed it yet",
+                    date(range.lo_ts),
+                    date(range.hi_ts)
+                );
+                range.state = RangeState::Unconfirmed;
+                // One unconfirmed span per network.
+                for other in self.store.sync_ranges(&net)? {
+                    if other.id != range.id && other.state == RangeState::Unconfirmed {
+                        range.lo_ts = range.lo_ts.min(other.lo_ts);
+                        range.hi_ts = range.hi_ts.max(other.hi_ts);
+                        if (other.cursor_ts, other.cursor_id.as_str())
+                            < (range.cursor_ts, range.cursor_id.as_str())
+                        {
+                            (range.cursor_ts, range.cursor_id) =
+                                (other.cursor_ts, other.cursor_id.clone());
+                        }
+                        self.store.delete_sync_range(other.id)?;
+                    }
+                }
+            }
+            End::Budget if fill => {
+                info!(
+                    %net,
+                    cut = %date(range.cursor_ts),
+                    "history: initial fill done; older history is not held here (sync.initial_max)"
                 );
                 self.store.add_sync_range(&SyncRange {
                     id: 0,
                     net: net.clone(),
                     lo_ts: 0,
-                    hi_ts: top,
-                    cursor_ts: top,
+                    hi_ts: range.cursor_ts,
+                    cursor_ts: range.cursor_ts,
                     cursor_id: String::new(),
                     state: RangeState::Cut,
                     phase: String::new(),
                     opened: now_secs(),
                     base_bytes: 0,
                 })?;
-            } else {
-                info!(%net, "history: initial fill done, the whole history");
+                range.state = RangeState::Done;
             }
+            End::Budget => {
+                warn!(
+                    %net,
+                    "history: catch-up larger than sync.initial_max; {} – {} skipped",
+                    date(range.lo_ts),
+                    date(range.cursor_ts)
+                );
+                range.state = RangeState::Skipped;
+                range.hi_ts = range.cursor_ts;
+            }
+        }
+        if fill {
             range.phase = PHASE_WINDOW.into();
-            range.state = RangeState::Done;
-        } else if close {
-            warn!(
-                net = %range.net,
-                "history: catch-up not held: {} – {} skipped",
-                date(range.lo_ts),
-                date(range.cursor_ts)
-            );
-            range.state = RangeState::Skipped;
-            range.hi_ts = range.cursor_ts;
-        } else {
-            range.state = RangeState::Done;
+            self.set_progress(&net, |p| p.author_bytes.clear());
         }
         self.store.update_sync_range(range)?;
         Ok(end)
@@ -1071,7 +1324,7 @@ impl Node {
     /// persisting the cursor after each page: first from peers that hold
     /// the range complete, then, when that confirms nothing, what they hold
     /// in ranges of their own still pending (`partial`). A `partial`
-    /// answer never completes the range.
+    /// answer never confirms the range.
     async fn walk(
         &self,
         range: &mut SyncRange,
@@ -1080,9 +1333,9 @@ impl Node {
         pass: &mut Pass,
     ) -> Result<End> {
         match self.walk_round(range, peers, walk, pass, false).await? {
-            End::Open => match self.walk_round(range, peers, walk, pass, true).await? {
+            End::Unconfirmed => match self.walk_round(range, peers, walk, pass, true).await? {
                 End::Budget => Ok(End::Budget),
-                _ => Ok(End::Open),
+                _ => Ok(End::Unconfirmed),
             },
             end => Ok(end),
         }
@@ -1098,6 +1351,9 @@ impl Node {
     ) -> Result<End> {
         let mut answered = false;
         let mut claims = Claims::default();
+        // Peers that served events of this range in this round: only they
+        // (or a trusted peer) can confirm it (ADR 0025 §9).
+        let mut content: HashSet<EndpointId> = HashSet::new();
         for &peer in peers {
             if !partial && pass.behind.contains(&peer) {
                 answered = true;
@@ -1150,6 +1406,9 @@ impl Node {
                 }
                 answered = true;
                 pass.served.insert(peer);
+                if !events.is_empty() {
+                    content.insert(peer);
+                }
                 self.set_progress(&range.net, |p| p.source = Some(peer));
                 if let Some(Gap { hi_ts }) = gap {
                     // The peer holds no more below here. The cursor stays at
@@ -1172,12 +1431,10 @@ impl Node {
                     {
                         return Ok(End::Budget);
                     }
+                    let trusted = self.trusted(&peer);
                     if !partial
-                        && claims.claim(
-                            peer,
-                            self.trusted(&peer),
-                            (range.cursor_ts, &range.cursor_id),
-                        )
+                        && (trusted || content.contains(&peer))
+                        && claims.claim(peer, trusted, (range.cursor_ts, &range.cursor_id))
                     {
                         return Ok(End::Complete);
                     }
@@ -1186,7 +1443,11 @@ impl Node {
                 }
             }
         }
-        Ok(if answered { End::Open } else { End::Failed })
+        Ok(if answered {
+            End::Unconfirmed
+        } else {
+            End::Failed
+        })
     }
 
     /// Check a page from `peer` and store its events: strictly descending
@@ -1367,9 +1628,8 @@ impl Node {
     /// then 14, 28…, each read until it meets the history already held,
     /// until the budget is spent or the range's `lo` is reached. A fill
     /// with no history `held` yet reads the first window to its end
-    /// whatever the budget. The range is complete only if every window was
-    /// read to its end from a trusted peer; the cursor moves down only
-    /// then.
+    /// whatever the budget. Confirmed only if every window was read to its
+    /// end from a trusted peer; otherwise unconfirmed.
     async fn walk_older(
         &self,
         range: &mut SyncRange,
@@ -1408,17 +1668,21 @@ impl Node {
                         (Some(h), Some(o)) => Some(h.min(o)),
                         (h, o) => h.or(o),
                     };
-                    // Held from `start` up, on a trusted peer's word.
-                    if confirmed && start < range.cursor_ts {
+                    // Walked from `start` up.
+                    if start < range.cursor_ts {
                         (range.cursor_ts, range.cursor_id) = (start, String::new());
                     }
                     self.store.update_sync_range(range)?;
                 }
-                (End::Failed, _, _) if answered => break End::Open,
+                (End::Failed, _, _) if answered => break End::Unconfirmed,
                 (end, _, _) => break end,
             }
             if start <= floor {
-                break if confirmed { End::Complete } else { End::Open };
+                break if confirmed {
+                    End::Complete
+                } else {
+                    End::Unconfirmed
+                };
             }
             first = false;
             span = span.saturating_mul(2);
@@ -1553,9 +1817,13 @@ impl Node {
         let limit = limit.clamp(1, proto::MAX_SYNC_PAGE);
         // A `partial` requester takes what is held in a pending range.
         let holes = match (partial, before.is_some()) {
-            (true, _) => self.holes(net, Holes::Intentional),
-            (false, true) => self.holes(net, Holes::Serving),
-            (false, false) => self.holes(net, Holes::Serving),
+            // A descending page stops at every hole, so that a 0.4.1 peer
+            // never takes what is pending here as held.
+            (false, true) => self.holes(net, Holes::All),
+            // A 0.4.0 pull is refused only below what the budget left out
+            // on purpose: anything else is served as held, as a 0.4.0
+            // node serves what it holds.
+            _ => self.holes(net, Holes::Intentional),
         };
         let mut stop = None;
         match &before {
@@ -1850,9 +2118,9 @@ mod tests {
 
     #[test]
     fn walks_combine_with_the_budget_first() {
-        assert_eq!(combine(End::Open, End::Budget), End::Budget);
-        assert_eq!(combine(End::Open, End::Complete), End::Complete);
-        assert_eq!(combine(End::Failed, End::Open), End::Open);
+        assert_eq!(combine(End::Unconfirmed, End::Budget), End::Budget);
+        assert_eq!(combine(End::Unconfirmed, End::Complete), End::Complete);
+        assert_eq!(combine(End::Failed, End::Unconfirmed), End::Unconfirmed);
         assert_eq!(combine(End::Failed, End::Failed), End::Failed);
     }
 

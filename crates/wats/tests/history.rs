@@ -26,7 +26,6 @@ fn config(dir: &std::path::Path, peers: &[&Arc<Node>]) -> NodeConfig {
     config.min_pow_bits = Some(0);
     config.peers = peers.iter().map(|p| p.endpoint().addr()).collect();
     config.history.page = 16;
-    config.history.max_attempts = 3;
     config.history.retry = Duration::from_secs(2);
     config
 }
@@ -541,19 +540,23 @@ async fn a_cut_is_served_honestly_and_read_fetches_below_it() -> anyhow::Result<
     assert!(format!("{missing:?}").contains("nor by the peers asked"));
     client.cancel().await?;
 
-    // A full node whose only peer has a cut is not misled: it records a
-    // cut of its own, and does not say it holds the whole history.
+    // A full node whose only peer has a cut is not misled: what it got is
+    // unconfirmed (its budget cut nothing, so it records no cut), and it
+    // does not say it holds the whole history.
     a.shutdown().await?;
     let mut c_config = config(&dir.path().join("c"), &[&b]);
     c_config.initial_max = InitialMax::Bytes(0);
     let c = Node::start(c_config).await?;
     done(&c).await;
     assert!(seq(&c, &recent.id).is_some());
+    let ranges = c.store().sync_ranges(PUBLIC_NET)?;
     assert!(
-        c.store()
-            .sync_ranges(PUBLIC_NET)?
-            .iter()
-            .any(|r| r.state == RangeState::Cut)
+        ranges.iter().all(|r| r.state != RangeState::Cut),
+        "{ranges:?}"
+    );
+    assert!(
+        ranges.iter().any(|r| r.state == RangeState::Unconfirmed),
+        "{ranges:?}"
     );
     assert!(!c.history_full());
     assert_eq!(state(&c), "done");
@@ -846,7 +849,7 @@ fn acme_notes(now: u64) -> Vec<Event> {
 /// REVIEW (S2): two 0.4.1 nodes on a second network, both new, and a
 /// public-only 0.4.1 node both know. Only the members of `acme` are asked,
 /// one failure vetoes nothing, and two fills that nobody can confirm do
-/// not stay pending: each closes with a cut after `max_attempts` passes.
+/// not stay pending: each ends unconfirmed, with no cut.
 #[tokio::test(flavor = "multi_thread")]
 async fn review_a_non_member_known_peer_blocks_the_partial_round() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
@@ -870,12 +873,14 @@ async fn review_a_non_member_known_peer_blocks_the_partial_round() -> anyhow::Re
             matches!(h["state"].as_str(), Some("done")).then_some(())
         })
         .await;
+        let ranges = node.store().sync_ranges("acme")?;
         assert!(
-            node.store()
-                .sync_ranges("acme")?
-                .iter()
-                .any(|r| r.state == RangeState::Cut),
-            "nobody confirmed older acme history"
+            ranges.iter().any(|r| r.state == RangeState::Unconfirmed),
+            "nobody confirmed the acme history: {ranges:?}"
+        );
+        assert!(
+            ranges.iter().all(|r| r.state != RangeState::Cut),
+            "{ranges:?}"
         );
         assert!(!node.history_full());
     }
@@ -953,11 +958,12 @@ async fn review_keep_kinds_bypass_the_key_share() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// S6: a catch-up whose only peer stops at a hole everywhere is skipped,
-/// with its dates, never counted as held: a full node then does not say
-/// `history_full`, and refuses an ascending pull from below it.
+/// S6, N1: a catch-up whose only peer stops at a hole everywhere ends
+/// unconfirmed, with its dates, never as confirmed: a full node then does
+/// not say `history_full`. It keeps serving a 0.4.0 pull, as a 0.4.0 node
+/// serves what it holds: only the budget makes it refuse one.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_catch_up_nobody_confirms_is_skipped_not_done() -> anyhow::Result<()> {
+async fn a_catch_up_nobody_confirms_is_unconfirmed_and_still_served() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     let now = now_secs();
     let a_dir = dir.path().join("a");
@@ -971,48 +977,47 @@ async fn a_catch_up_nobody_confirms_is_skipped_not_done() -> anyhow::Result<()> 
     let mut a_config = config(&a_dir, &[&b]);
     a_config.initial_max = InitialMax::Bytes(0);
     let a = Node::start(a_config).await?;
-    let skipped = eventually("a skipped range", 60, || {
+    let unconfirmed = eventually("an unconfirmed range", 60, || {
         a.store()
             .sync_ranges(PUBLIC_NET)
             .unwrap()
             .into_iter()
-            .find(|r| r.state == RangeState::Skipped)
+            .find(|r| r.state == RangeState::Unconfirmed)
     })
     .await;
-    assert!(skipped.lo_ts <= now - 2 * DAY);
+    assert!(unconfirmed.lo_ts <= now - 2 * DAY);
+    let ranges = a.store().sync_ranges(PUBLIC_NET)?;
     assert!(
-        !a.store()
-            .sync_ranges(PUBLIC_NET)?
+        ranges
             .iter()
-            .any(|r| r.state == RangeState::Done && r.phase.is_empty()),
-        "never done"
+            .all(|r| !matches!(r.state, RangeState::Skipped | RangeState::Cut)),
+        "{ranges:?}"
     );
     assert!(!a.history_full());
     let line = wats::node::history::line(&a.history_json(PUBLIC_NET));
-    assert!(line.contains("skipped"), "{line}");
+    assert!(line.contains("unconfirmed since"), "{line}");
     let pull = Request::sync_after(PUBLIC_NET, now - 2 * DAY, "", 50);
     assert!(matches!(
         wats::proto::call_solving(b.endpoint(), a.endpoint_id(), &pull).await?,
-        Response::Refused { .. }
+        Response::SyncPage { .. }
     ));
     a.shutdown().await?;
     b.shutdown().await?;
     Ok(())
 }
 
-/// B1: a node with no history yet (watermark 0, no range) serves nothing
-/// as complete: a 0.4.0 pull is refused, a descending page gets a gap, and
-/// only a `partial` request gets what it holds.
+/// B1, N1: a node with no history yet (watermark 0, no range) serves
+/// nothing to a 0.4.1 peer as complete: a descending page gets a gap, and
+/// only a `partial` request gets what it holds. A 0.4.0 pull gets what it
+/// holds, as from a 0.4.0 node.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_node_with_no_history_yet_serves_a_hole() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
-    let mut a_config = config(&dir.path().join("a"), &[]);
-    // Its fill stays pending: as before its first pass.
-    a_config.history.max_attempts = 1000;
-    let a = Node::start(a_config).await?;
+    let a = Node::start(config(&dir.path().join("a"), &[])).await?;
     assert_eq!(a.history_holes(PUBLIC_NET).len(), 1, "before any pass");
+    // Not a member of `public`: no neighbor there, so `a` runs no pass.
     let mut b_config = config(&dir.path().join("b"), &[&a]);
-    b_config.history.legacy = true;
+    b_config.nets = vec!["other".into()];
     let b = Node::start(b_config).await?;
     let held = notes(4, now_secs() - 60);
     hold(&a, &held);
@@ -1020,10 +1025,10 @@ async fn a_node_with_no_history_yet_serves_a_hole() -> anyhow::Result<()> {
         let (b, a) = (Arc::clone(&b), a.endpoint_id());
         async move { wats::proto::call_solving(b.endpoint(), a, &request).await }
     };
-    assert!(matches!(
-        call(Request::sync_after(PUBLIC_NET, 0, "", 50)).await?,
-        Response::Refused { .. }
-    ));
+    match call(Request::sync_after(PUBLIC_NET, 0, "", 50)).await? {
+        Response::SyncPage { events, .. } => assert_eq!(events.len(), held.len()),
+        other => panic!("{other:?}"),
+    }
     let desc = |partial| Request::Sync {
         net: PUBLIC_NET.into(),
         after_ts: 0,
@@ -1084,5 +1089,180 @@ async fn get_answers_each_id_once_and_the_budget_is_clamped() -> anyhow::Result<
     }
     a.shutdown().await?;
     b.shutdown().await?;
+    Ok(())
+}
+
+/// REVIEW2: two untrusted peers that hold nothing (stand-ins for two
+/// colluding endpoint ids: a watermark ahead and no history) confirm a
+/// fill as complete; the honest holder learned the same way is then never
+/// asked (no check after a confirmed fill).
+#[tokio::test(flavor = "multi_thread")]
+async fn review2_two_empty_untrusted_peers_confirm_a_fill() -> anyhow::Result<()> {
+    let mut missed_runs = 0;
+    for _ in 0..4 {
+        let dir = tempfile::tempdir()?;
+        let e1 = reference(&dir.path().join("e1")).await?;
+        let e2 = reference(&dir.path().join("e2")).await?;
+        let h = reference(&dir.path().join("h")).await?;
+        let spread = notes(40, now_secs() - 3600);
+        hold(&h, &spread);
+        let n = Node::start(config(&dir.path().join("n"), &[])).await?;
+        for p in [&e1, &e2, &h] {
+            n.add_peer(p.endpoint().addr()).await?;
+        }
+        done(&n).await;
+        tokio::time::sleep(Duration::from_secs(4)).await;
+        let held = spread.iter().filter(|e| seq(&n, &e.id).is_some()).count();
+        eprintln!(
+            "n holds {held}/40, state {}, ranges {:?}",
+            state(&n),
+            n.store().sync_ranges(PUBLIC_NET)?
+        );
+        if held < spread.len() {
+            missed_runs += 1;
+        }
+        // Peers that served nothing confirm nothing.
+        assert_ne!(state(&n), "full");
+        assert!(!n.history_full());
+        for node in [n, e1, e2, h] {
+            node.shutdown().await?;
+        }
+    }
+    assert_eq!(missed_runs, 0, "the honest holder is always read");
+    Ok(())
+}
+
+/// REVIEW2 (N2): a slow but honest trusted peer (rate-limited, no
+/// challenge): failed passes never close the fill, and no cut is recorded
+/// above what was reached.
+#[tokio::test(flavor = "multi_thread")]
+async fn review2_failures_close_the_fill_at_its_top() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    std::fs::create_dir_all(dir.path().join("a"))?;
+    Store::open(&dir.path().join("a").join("events.sqlite"))?
+        .set_sync_watermark(PUBLIC_NET, now_secs() + DAY)?;
+    let mut a_config = config(&dir.path().join("a"), &[]);
+    a_config.limits.challenge = false;
+    a_config.limits.sync_per_min = 1;
+    let a = Node::start(a_config).await?;
+    let spread = notes(40, now_secs() - 3600);
+    hold(&a, &spread);
+    let n = Node::start(config(&dir.path().join("n"), &[&a])).await?;
+    tokio::time::sleep(Duration::from_secs(25)).await;
+    let ranges = n.store().sync_ranges(PUBLIC_NET)?;
+    assert!(
+        ranges.iter().all(|r| r.state != RangeState::Cut),
+        "no cut without a budget: {ranges:?}"
+    );
+    assert!(
+        ranges.iter().any(|r| r.state == RangeState::Pending) || state(&n) == "full",
+        "still pending, or done: {ranges:?}"
+    );
+    n.shutdown().await?;
+    a.shutdown().await?;
+    Ok(())
+}
+
+/// REVIEW2 (N1): an upgraded node back after a day, whose only neighbor is
+/// an untrusted 0.4.0 node holding the day: the catch-up gets it all, ends
+/// unconfirmed (no skipped range), and the node keeps serving 0.4.0 pulls.
+#[tokio::test(flavor = "multi_thread")]
+async fn review2_catch_up_from_untrusted_older_peers_only() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let mut old_config = config(&dir.path().join("old"), &[]);
+    old_config.history.legacy = true;
+    let old = Node::start(old_config).await?;
+    let now = now_secs();
+    let a_dir = dir.path().join("a");
+    std::fs::create_dir_all(&a_dir)?;
+    Store::open(&a_dir.join("events.sqlite"))?.set_sync_watermark(PUBLIC_NET, now - 2 * DAY)?;
+    let missed: Vec<Event> = (0..30u32)
+        .map(|i| note(i, now - 3600 - u64::from(i) * 1800))
+        .collect();
+    hold(&old, &missed);
+    let a = Node::start(config(&a_dir, &[])).await?;
+    a.add_peer(old.endpoint().addr()).await?;
+    tokio::time::sleep(Duration::from_secs(20)).await;
+    eventually("the catch-up ends", 30, || {
+        (state(&a) == "done").then_some(())
+    })
+    .await;
+    let held = missed.iter().filter(|e| seq(&a, &e.id).is_some()).count();
+    assert_eq!(held, missed.len());
+    let ranges = a.store().sync_ranges(PUBLIC_NET)?;
+    assert!(
+        ranges.iter().all(|r| r.state == RangeState::Unconfirmed),
+        "{ranges:?}"
+    );
+    assert!(a.store().sync_watermark(PUBLIC_NET)? > now - DAY);
+    // A 0.4.0 node whose watermark is an hour old pulls from it.
+    let mut l2 = config(&dir.path().join("l2"), &[&a]);
+    l2.history.legacy = true;
+    let l2 = Node::start(l2).await?;
+    let pull = Request::sync_after(PUBLIC_NET, now - 3600, "", 50);
+    let answer = wats::proto::call_solving(old.endpoint(), a.endpoint_id(), &pull).await?;
+    assert!(matches!(answer, Response::SyncPage { .. }), "{answer:?}");
+    let from_start = Request::sync_after(PUBLIC_NET, now - 2 * DAY, "", 50);
+    match wats::proto::call_solving(l2.endpoint(), a.endpoint_id(), &from_start).await? {
+        Response::SyncPage { events, .. } => assert_eq!(events.len(), missed.len()),
+        other => panic!("{other:?}"),
+    }
+    for node in [a, old, l2] {
+        node.shutdown().await?;
+    }
+    Ok(())
+}
+
+/// N1 interop: a node with no trusted peer (it met its only peer by
+/// address, not by configuration) fills its history unconfirmed, then
+/// keeps answering a 0.4.0 node's pull with all it holds. A trusted peer
+/// met later confirms it.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_untrusted_only_fill_keeps_serving_older_nodes() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let h = reference(&dir.path().join("h")).await?;
+    let spread = notes(30, now_secs() - 3600);
+    hold(&h, &spread);
+    let n = Node::start(config(&dir.path().join("n"), &[])).await?;
+    n.add_peer(h.endpoint().addr()).await?;
+    done(&n).await;
+    assert!(spread.iter().all(|e| seq(&n, &e.id).is_some()));
+    let ranges = n.store().sync_ranges(PUBLIC_NET)?;
+    assert!(
+        ranges.iter().any(|r| r.state == RangeState::Unconfirmed),
+        "{ranges:?}"
+    );
+    assert!(
+        ranges.iter().all(|r| r.state != RangeState::Cut),
+        "{ranges:?}"
+    );
+    // A 0.4.0 node pulls everything from it.
+    let mut legacy = config(&dir.path().join("legacy"), &[&n]);
+    legacy.history.legacy = true;
+    let legacy = Node::start(legacy).await?;
+    eventually("the 0.4.0 node pulls it all", 60, || {
+        spread
+            .iter()
+            .all(|e| seq(&legacy, &e.id).is_some())
+            .then_some(())
+    })
+    .await;
+    legacy.shutdown().await?;
+    n.shutdown().await?;
+    drop(n);
+    // Restarted with `h` as a configured peer: `h` confirms it.
+    let n = Node::start(config(&dir.path().join("n"), &[&h])).await?;
+    eventually("a trusted peer confirms the history", 60, || {
+        (!n.store()
+            .sync_ranges(PUBLIC_NET)
+            .unwrap()
+            .iter()
+            .any(|r| r.state == RangeState::Unconfirmed))
+        .then_some(())
+    })
+    .await;
+    assert_eq!(state(&n), "full");
+    n.shutdown().await?;
+    h.shutdown().await?;
     Ok(())
 }

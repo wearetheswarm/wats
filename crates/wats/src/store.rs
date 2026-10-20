@@ -110,7 +110,7 @@ CREATE TABLE IF NOT EXISTS sync_ranges (
     -- The last event fetched, walking down: held above, a hole below.
     cursor_ts  INTEGER NOT NULL,
     cursor_id  TEXT NOT NULL,
-    -- pending | cut | skipped | done
+    -- pending | cut | skipped | done | unconfirmed
     state      TEXT NOT NULL,
     -- The initial fill's phase (keep, own, knowledge, window); '' for a
     -- catch-up range.
@@ -2335,13 +2335,18 @@ impl Store {
 pub enum RangeState {
     /// Still to fetch, resumable from its cursor.
     Pending,
-    /// Below the initial fill's cut: not held, on purpose.
+    /// Below the initial fill's cut, where the budget stopped it: not
+    /// held, on purpose.
     Cut,
     /// The budget ran out inside a catch-up: not held, on purpose.
     Skipped,
     /// Complete, waiting for older pending ranges before the watermark
     /// moves.
     Done,
+    /// Walked to its end, but no trusted peer confirmed that nothing is
+    /// missing: held and served as held, shown as unconfirmed until a
+    /// trusted peer confirms it (ADR 0025 §9).
+    Unconfirmed,
 }
 
 impl RangeState {
@@ -2351,6 +2356,7 @@ impl RangeState {
             RangeState::Cut => "cut",
             RangeState::Skipped => "skipped",
             RangeState::Done => "done",
+            RangeState::Unconfirmed => "unconfirmed",
         }
     }
 
@@ -2359,6 +2365,7 @@ impl RangeState {
             "cut" => RangeState::Cut,
             "skipped" => RangeState::Skipped,
             "done" => RangeState::Done,
+            "unconfirmed" => RangeState::Unconfirmed,
             _ => RangeState::Pending,
         }
     }
@@ -2394,7 +2401,7 @@ impl SyncRange {
     /// by whole seconds: events at `hole_top` itself may be missing.
     pub fn hole_top(&self) -> Option<u64> {
         match self.state {
-            RangeState::Done => None,
+            RangeState::Done | RangeState::Unconfirmed => None,
             // The initial fill before its window: nothing below its top is
             // held yet but the kinds of its first phases.
             RangeState::Pending if !self.phase.is_empty() && self.phase != PHASE_WINDOW => {
@@ -2704,9 +2711,11 @@ impl Store {
         if pending {
             return Ok(None);
         }
-        // A range skipped for the budget is over too: on purpose.
+        // A range skipped for the budget is over too, on purpose, and an
+        // unconfirmed one was walked to its end.
         let opened: Option<i64> = tx.query_row(
-            "SELECT max(opened) FROM sync_ranges WHERE net = ? AND state IN ('done', 'skipped')",
+            "SELECT max(opened) FROM sync_ranges WHERE net = ?
+             AND state IN ('done', 'skipped', 'unconfirmed')",
             [net],
             |r| r.get(0),
         )?;
