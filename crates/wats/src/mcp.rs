@@ -1912,7 +1912,7 @@ impl WatsMcp {
         if config.role != NodeRole::Background {
             return Err(format!("this node already runs as {}", config.role));
         }
-        let log = config.data_dir.join("daemon.log");
+        let log = crate::background::log_path(&config.data_dir);
         let started = start_daemon_process(&config.relaunch_args, &log).map_err(fail)?;
         // Let this answer go out, then hand the data directory over.
         let node = Arc::clone(&self.node);
@@ -1929,26 +1929,20 @@ impl WatsMcp {
     }
 }
 
-/// Start `wats` (the daemon) detached, waiting for the data directory.
+/// Start `wats` (the daemon) detached, waiting for the data directory: a
+/// detached daemon, as `wats --detach` starts (ADR 0023).
+#[cfg(unix)]
 fn start_daemon_process(args: &[std::ffi::OsString], log: &std::path::Path) -> anyhow::Result<u32> {
-    let log = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(log)?;
-    let mut command = std::process::Command::new(std::env::current_exe()?);
-    command
-        .args(args)
-        .args(["--wait-lock", "30"])
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(log)
-        .env_remove("WATS_RUNNER_TOKEN");
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt;
-        command.process_group(0);
-    }
-    Ok(command.spawn()?.id())
+    let mut child_args: Vec<std::ffi::OsString> = vec!["--log-file".into(), log.into()];
+    child_args.extend(args.iter().cloned());
+    child_args.extend(["--wait-lock".into(), "30".into()]);
+    let child = crate::background::spawn_detached(&child_args, log, &["WATS_RUNNER_TOKEN"])?;
+    Ok(child.id())
+}
+
+#[cfg(not(unix))]
+fn start_daemon_process(_: &[std::ffi::OsString], _: &std::path::Path) -> anyhow::Result<u32> {
+    anyhow::bail!("not supported on native Windows yet: run `wats` in a terminal")
 }
 
 /// Review tools: for the human, in interactive sessions only.

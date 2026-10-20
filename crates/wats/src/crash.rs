@@ -154,7 +154,8 @@ pub struct TeeLine(Vec<u8>);
 impl Write for TeeLine {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         self.0.extend_from_slice(buf);
-        std::io::stderr().write(buf)
+        // A detached node's stderr is its log file, rotated by size.
+        crate::background::write_stderr(buf)
     }
     fn flush(&mut self) -> std::io::Result<()> {
         std::io::stderr().flush()
