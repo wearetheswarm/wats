@@ -239,14 +239,20 @@ async fn sync_requests_are_rate_limited() -> anyhow::Result<()> {
     // Refusals only: challenges instead are in tests/challenge.rs.
     config.limits.challenge = false;
     let server = Node::start(config).await?;
-    let a = node(&dir.path().join("a"), &[&server], 1).await?;
-    let b = node(&dir.path().join("b"), &[&server], 1).await?;
-    let sync = Request::Sync {
-        net: PUBLIC_NET.into(),
-        after_ts: 0,
-        after_id: String::new(),
-        limit: 10,
+    // Clients that pull once at start, ascending, as 0.4.0 did: the
+    // newest-first fill of 0.4.1 asks a page per phase (ADR 0025 §4).
+    let client = |name: &str| {
+        let mut config = NodeConfig::new(dir.path().join(name));
+        config.mode = NetworkMode::Loopback;
+        config.pow_bits = Some(0);
+        config.min_pow_bits = Some(0);
+        config.history.legacy = true;
+        config.peers = vec![server.endpoint().addr()];
+        Node::start(config)
     };
+    let a = client("a").await?;
+    let b = client("b").await?;
+    let sync = Request::sync_after(PUBLIC_NET, 0, "", 10);
     let mut answers = Vec::new();
     for _ in 0..4 {
         answers.push(call(a.endpoint(), server.endpoint_id(), &sync).await?);

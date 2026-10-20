@@ -19,6 +19,8 @@ pub struct Limits {
     pub sync_per_min: u32,
     pub replicate_per_min: u32,
     pub report_per_min: u32,
+    /// `get` requests (ADR 0025 §3): history fetched by id, on demand.
+    pub get_per_min: u32,
     /// Blobs one peer can make us fetch at the same time (replication).
     pub blob_fetches_per_peer: usize,
     /// Answer with a proof-of-work challenge (`crate::challenge`) instead
@@ -44,6 +46,7 @@ impl Default for Limits {
             sync_per_min: 600,
             replicate_per_min: 120,
             report_per_min: 10,
+            get_per_min: 120,
             blob_fetches_per_peer: 4,
             challenge: true,
             challenge_base_bits: 8,
@@ -61,6 +64,7 @@ pub enum Kind {
     Sync,
     Replicate,
     Report,
+    Get,
 }
 
 impl Kind {
@@ -70,6 +74,7 @@ impl Kind {
             Kind::Sync => "sync",
             Kind::Replicate => "replicate",
             Kind::Report => "crash_report",
+            Kind::Get => "get",
         }
     }
 }
@@ -123,6 +128,7 @@ impl RateLimiter {
             Kind::Sync => self.limits.sync_per_min,
             Kind::Replicate => self.limits.replicate_per_min,
             Kind::Report => self.limits.report_per_min,
+            Kind::Get => self.limits.get_per_min,
         }
     }
 

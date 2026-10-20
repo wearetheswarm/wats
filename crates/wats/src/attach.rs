@@ -293,6 +293,7 @@ fn info(node: &Node, sessions: usize) -> serde_json::Value {
         "sessions": sessions,
         "peers": node.known_peers().len(),
         "health": node.health_json(),
+        "history": node.history_status(),
         "agents": config.agents.iter().filter(|a| a.running).map(|a| a.name.clone()).collect::<Vec<_>>(),
     })
 }

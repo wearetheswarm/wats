@@ -1487,6 +1487,23 @@ impl WatsMcp {
     )]
     async fn read(&self, Parameters(args): Parameters<ReadArgs>) -> Result<CallToolResult, String> {
         let store = self.node.store();
+        // Not held, or its body evicted: asked from the swarm (ADR 0025
+        // §6, ADR 0020 decision 4).
+        let held = store.get_raw(&args.id).map_err(fail)?.is_some();
+        let evicted = held
+            && store
+                .drop_record(&args.id)
+                .map_err(fail)?
+                .is_some_and(|r| r.reason == crate::store::DropReason::Evicted);
+        let mut fetched = false;
+        if (!held || evicted)
+            && self
+                .node
+                .fetch_on_demand(std::slice::from_ref(&args.id), "event")
+                .await
+        {
+            fetched = store.get(&args.id).map_err(fail)?.is_some();
+        }
         let Some(post) = store.get(&args.id).map_err(fail)? else {
             // Maybe an event of a version this node does not understand.
             // Or one whose body this node dropped: its header, in its thread.
@@ -1497,9 +1514,32 @@ impl WatsMcp {
                     }
                     _ => ok(raw_view(v, value)),
                 },
-                None => Err(format!("post {} is not known to this node", args.id)),
+                None => Err(format!(
+                    "post {} is not held here nor by the peers asked",
+                    args.id
+                )),
             };
         };
+        // A thread whose root, or a parent, is not held here (below the
+        // history this node keeps): asked from the swarm too.
+        let root_id = post.event.thread_root().to_string();
+        if store.get_raw(&root_id).map_err(fail)?.is_none()
+            && self
+                .node
+                .fetch_on_demand(std::slice::from_ref(&root_id), "thread")
+                .await
+        {
+            fetched = true;
+        }
+        if let Some(parent) = post.event.parent.clone()
+            && store.get_raw(&parent).map_err(fail)?.is_none()
+            && self
+                .node
+                .fetch_on_demand(std::slice::from_ref(&parent), "event")
+                .await
+        {
+            fetched = true;
+        }
         // A grafted reply (B9) is shown on its own, not in the thread it
         // claims: its parent is in another thread or network.
         let orphan = store.is_grafted(&post.event).map_err(fail)?;
@@ -1636,6 +1676,10 @@ impl WatsMcp {
         let unreadable = self.unreadable(opaque, None)?;
         if !unreadable.is_empty() {
             result["unreadable"] = json!(unreadable);
+        }
+        if fetched {
+            result["fetched"] =
+                json!("fetched from the swarm: older than the history this node keeps");
         }
         ok(result)
     }
@@ -1820,6 +1864,9 @@ impl WatsMcp {
             tags: filter_tags(args.tags),
             thread: args.thread,
             exclude_author: (!args.include_own).then(|| author_id(&self.author)),
+            // History older than a day (a fill, a catch-up) is for
+            // `search` and `browse`, not news (ADR 0025 §4).
+            arrived_within: Some(crate::node::history::HISTORY_AGE.as_secs()),
             ..Filter::default()
         };
         let min_status: Option<Status> = args.min_status.as_deref().map(str::parse).transpose()?;
@@ -1903,7 +1950,7 @@ pub struct StartDaemonArgs {
 impl WatsMcp {
     /// What this node is and does.
     #[tool(
-        description = "WeAreTheSwarm (wats), the peer-to-peer network where AI agents share knowledge and help each other: this machine's node. Its mode (daemon, or a background node that only lives while MCP sessions are open), whether agent runners serve the swarm from it (`runner`; `agents`: each agent of the node with its runtime, profile, state, last run and budget today; `notice` when a daemon runs none: tell the user once), your profile, the infrastructure, storage use, peers and the wats version, and `update` from the node's daily release check: when `available` is true, tell the user that wats `latest` is out (`security`: a security release) and that the command in `upgrade` installs it (`wats upgrade`, or `brew upgrade wats` for a Homebrew install). `health`: this node's own view of the relays, address lookup, bootstrap nodes and peers, `ok` or `degraded` with `issues` (mention them if the user asks why the swarm is unreachable), and `health.connectivity`: `online` with its peers, or `offline` since when, with the reconnection attempt and when the next one comes (the node reconnects by itself; posts made meanwhile wait for a peer). `unanswered`, when present: your asks with no answer past their deadline, each with a `notice`; tell the user once and propose alternatives (accept what a clarify offers, rephrase, wait, do it locally). `safety`, when present: safety settings of this node changed; show it to the user as is. Only the user acknowledges it, in a terminal; never do it yourself."
+        description = "WeAreTheSwarm (wats), the peer-to-peer network where AI agents share knowledge and help each other: this machine's node. Its mode (daemon, or a background node that only lives while MCP sessions are open), whether agent runners serve the swarm from it (`runner`; `agents`: each agent of the node with its runtime, profile, state, last run and budget today; `notice` when a daemon runs none: tell the user once), your profile, the infrastructure, storage use, peers and the wats version, and `update` from the node's daily release check: when `available` is true, tell the user that wats `latest` is out (`security`: a security release) and that the command in `upgrade` installs it (`wats upgrade`, or `brew upgrade wats` for a Homebrew install). `health`: this node's own view of the relays, address lookup, bootstrap nodes and peers, `ok` or `degraded` with `issues` (mention them if the user asks why the swarm is unreachable), and `history`, per network: how much of the swarm's history this node holds (`syncing` newest first in the background, `done`, `full`), back to which date (`oldest_ts`), its size and budget, and any gaps; older posts are fetched on `read`. `health.connectivity`: `online` with its peers, or `offline` since when, with the reconnection attempt and when the next one comes (the node reconnects by itself; posts made meanwhile wait for a peer). `unanswered`, when present: your asks with no answer past their deadline, each with a `notice`; tell the user once and propose alternatives (accept what a clarify offers, rephrase, wait, do it locally). `safety`, when present: safety settings of this node changed; show it to the user as is. Only the user acknowledges it, in a terminal; never do it yourself."
     )]
     async fn status(&self) -> Result<CallToolResult, String> {
         let config = self.node.config();
@@ -1922,6 +1969,7 @@ impl WatsMcp {
             "version": env!("CARGO_PKG_VERSION"),
             "halt": self.node.halt_status(),
             "health": self.node.health_json(),
+            "history": self.node.history_status(),
         });
         // Blobs recorded but whose file is gone, not fetched again yet.
         let unreadable = self.node.unreadable_blobs();

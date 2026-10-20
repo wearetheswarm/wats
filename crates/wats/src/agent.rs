@@ -1829,7 +1829,15 @@ pub async fn run(
                     if parked.values().any(|p| p.queued.thread == event.thread_root()) {
                         touched.insert(event.thread_root().to_string());
                     }
+                    // History (a fill, a catch-up, a fetch on read) wakes
+                    // the agent only within `agent.catchup`, by `ts`, as
+                    // what it missed before it listened (ADR 0025 §4).
+                    let window = config.catchup.unwrap_or(DEFAULT_CATCHUP).as_secs();
+                    let history = unix_now().saturating_sub(event.ts) > window;
                     match interest(&node, &me, &config.allow, config.ignore_local, event) {
+                        Interest::Wake(_) if history => {
+                            debug!(event = short(&event.id), kind = event.kind.as_str(), "not for the agent: history older than the catch-up window");
+                        }
                         Interest::Wake(why) => {
                             if !pending.iter().any(|q| q.id == event.id) {
                                 info!(event = short(&event.id), kind = event.kind.as_str(), "queued for the agent: {why}");

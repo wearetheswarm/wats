@@ -36,6 +36,8 @@ use n0_future::StreamExt;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
 
+pub mod history;
+
 use crate::bootstrap::BootstrapEntry;
 use crate::event::{BlobRef, Draft, Event, Kind, is_safe_blob_name};
 use crate::identity::{DEFAULT_PROFILE, RootSecret, author_id};
@@ -137,6 +139,14 @@ pub struct NodeConfig {
     /// [`HARD_CEILING_PERCENT`] of it, it also refuses events from others.
     /// Unlimited if unset. Eviction comes in Phase 2.
     pub storage_max: Option<u64>,
+    /// Share of `storage_max` for the event store, in percent
+    /// (`storage.events_share`, ADR 0025 §2).
+    pub events_share: u64,
+    /// Budget of the initial fill and of each catch-up
+    /// (`sync.initial_max`, ADR 0025 §2).
+    pub initial_max: crate::settings::InitialMax,
+    /// How the history task runs ([`history::Tuning`]); tests shorten it.
+    pub history: history::Tuning,
     /// Delete the blobs nothing keeps, every `blob_gc_interval`
     /// (`storage.gc`): no tag and listed by no kept event, e.g. the files
     /// of a dropped body (ADR 0020 §2) or of a fetch that failed half-way.
@@ -272,6 +282,9 @@ impl NodeConfig {
             max_blob_bytes: 256 * 1024 * 1024,
             blob_quota: None,
             storage_max: None,
+            events_share: crate::settings::DEFAULT_EVENTS_SHARE,
+            initial_max: Default::default(),
+            history: Default::default(),
             blob_gc: true,
             blob_gc_interval: BLOB_GC_INTERVAL,
             review_profiles: Vec::new(),
@@ -1172,6 +1185,8 @@ pub struct Node {
     health: std::sync::Mutex<crate::health::Health>,
     /// Bootstrap nodes and peers configured, for the bootstrap check.
     seed_ids: Vec<EndpointId>,
+    /// The history tasks (ADR 0025).
+    history: history::History,
 }
 
 impl std::fmt::Debug for Node {
@@ -1581,6 +1596,7 @@ impl Node {
             reconnect_kick: Default::default(),
             network_changed: Default::default(),
             redialing: Default::default(),
+            history: Default::default(),
         });
         node.measure_storage().await;
         if node.config.storage_max.is_some() {
@@ -1680,6 +1696,11 @@ impl Node {
         }
         node.evaluate_halt();
         protocol.set_node(&node);
+        // History in the background, one task per network (ADR 0025 §4):
+        // nothing here waits for it.
+        for net in node.config.nets.clone() {
+            node.spawn_history(&net);
+        }
         for (net, receiver) in receivers {
             // The receiver outlives a panic of the loop: the restarted loop
             // picks it up again (a tokio mutex is not poisoned by a panic).
@@ -1867,7 +1888,9 @@ impl Node {
     }
 
     /// Catch up with every neighbor (after a network change while online:
-    /// gossip may have lost messages without losing its neighbors).
+    /// gossip may have lost messages without losing its neighbors): a
+    /// newest-first catch-up range, then a check of each neighbor (ADR
+    /// 0025 §5).
     fn catch_up_all(self: &Arc<Self>) {
         let nets: Vec<(String, Vec<EndpointId>)> = self
             .neighbors
@@ -1879,6 +1902,10 @@ impl Node {
             })
             .unwrap_or_default();
         for (net, peers) in nets {
+            if !self.config.history.legacy {
+                self.kick_history(&net, &peers);
+                continue;
+            }
             for peer in peers {
                 let node = Arc::clone(self);
                 let net = net.clone();
@@ -3219,6 +3246,13 @@ impl Node {
                         {
                             debug!(peer = %id.fmt_short(), "hello failed: {e:#}");
                         }
+                        // The history task walks what is missing, newest
+                        // first (ADR 0025); a 0.4.0 node pulled from every
+                        // new neighbor, ascending.
+                        if !node.config.history.legacy {
+                            node.kick_history(&net, &[id]);
+                            return;
+                        }
                         match node.sync_from(id, &net).await {
                             Ok(n) => debug!(%net, peer = %id.fmt_short(), new = n, "synced"),
                             Err(e) => debug!(%net, peer = %id.fmt_short(), "sync failed: {e:#}"),
@@ -3669,7 +3703,7 @@ impl Node {
             }
         }
         let request = Request::Hello {
-            info: NodeInfo::ours_greased(),
+            info: self.our_info(),
         };
         let mut info = match proto::call_solving(self.endpoint(), peer, &request).await? {
             Response::Hello { info } => info,
@@ -3718,6 +3752,7 @@ impl Node {
         let kind = match &request {
             Request::Hello { .. } => Some(crate::limits::Kind::Hello),
             Request::Sync { .. } => Some(crate::limits::Kind::Sync),
+            Request::Get { .. } => Some(crate::limits::Kind::Get),
             Request::Replicate { .. } => Some(crate::limits::Kind::Replicate),
             Request::CrashReport { .. } => Some(crate::limits::Kind::Report),
             Request::Unsupported => None,
@@ -3736,7 +3771,7 @@ impl Node {
                 }
                 self.challenger.met(peer);
                 Response::Hello {
-                    info: NodeInfo::ours_greased(),
+                    info: self.our_info(),
                 }
             }
             Request::Unsupported => Response::Unsupported,
@@ -3744,6 +3779,11 @@ impl Node {
                 net,
                 after_ts,
                 after_id,
+                before_ts,
+                before_id,
+                kinds,
+                authors,
+                partial,
                 limit,
             } => {
                 if !self.joined(&net) {
@@ -3751,24 +3791,32 @@ impl Node {
                         reason: format!("not a member of network {net:?}"),
                     };
                 }
-                let limit = limit.clamp(1, proto::MAX_SYNC_PAGE);
-                // Serving a halt: halt events only (ADR 0016 §3).
-                let page = if self.halt_serving.load(std::sync::atomic::Ordering::Relaxed) {
-                    self.store
-                        .halt_page_after(&net, after_ts, &after_id, limit as usize)
-                } else {
-                    self.store
-                        .page_after(&net, after_ts, &after_id, limit as usize)
-                };
-                match page {
-                    Ok(page) => Response::SyncPage {
-                        more: page.len() == limit as usize,
-                        events: page,
-                    },
-                    Err(e) => Response::Refused {
-                        reason: format!("{e:#}"),
-                    },
+                if self.config.history.legacy {
+                    return self.serve_sync_legacy(&net, after_ts, &after_id, before_ts, limit);
                 }
+                let before = before_ts.map(|ts| (ts, before_id.unwrap_or_default()));
+                self.serve_sync(
+                    &net,
+                    history::SyncAsk {
+                        after: (after_ts, after_id),
+                        before,
+                        kinds,
+                        authors,
+                        partial,
+                        limit,
+                    },
+                )
+            }
+            Request::Get { net, ids, include } => {
+                if self.config.history.legacy {
+                    return Response::Unsupported;
+                }
+                if !self.joined(&net) {
+                    return Response::Refused {
+                        reason: format!("not a member of network {net:?}"),
+                    };
+                }
+                self.serve_get(&net, &ids, &include)
             }
             Request::CrashReport { report } => {
                 if !self.config.report_accept {
@@ -3882,8 +3930,48 @@ impl Node {
         None
     }
 
-    /// Catch up on a network from a peer: page through its events after our
-    /// sync watermark. Returns how many new events were stored.
+    /// Serve `sync` as 0.4.0 did (tests: `history.legacy`): ascending
+    /// only, the halt kinds only while serving a halt, no `gap`, no `seen`;
+    /// a descending request is malformed there.
+    fn serve_sync_legacy(
+        &self,
+        net: &str,
+        after_ts: u64,
+        after_id: &str,
+        before_ts: Option<u64>,
+        limit: u32,
+    ) -> Response {
+        if before_ts.is_some() {
+            return Response::Refused {
+                reason: "malformed request: missing field `after_ts`".into(),
+            };
+        }
+        let limit = limit.clamp(1, proto::MAX_SYNC_PAGE);
+        let page = if self.halt_serving.load(std::sync::atomic::Ordering::Relaxed) {
+            self.store
+                .halt_page_after(net, after_ts, after_id, limit as usize)
+        } else {
+            self.store
+                .page_after(net, after_ts, after_id, limit as usize)
+        };
+        match page {
+            Ok(page) => Response::SyncPage {
+                more: page.len() == limit as usize,
+                events: page,
+                gap: None,
+                seen: Vec::new(),
+            },
+            Err(e) => Response::Refused {
+                reason: format!("{e:#}"),
+            },
+        }
+    }
+
+    /// Catch up on a network from a peer, ascending: page through its
+    /// events after our sync watermark (ADR 0005). The cheap check of each
+    /// new neighbor once no history range is pending (ADR 0025 §5), and
+    /// what a 0.4.0 node does on every new neighbor. Returns how many new
+    /// events were stored.
     pub async fn sync_from(&self, peer: EndpointId, net: &str) -> Result<usize> {
         let started = now_secs();
         let watermark = self.store.sync_watermark(net)?;
@@ -3891,16 +3979,29 @@ impl Node {
             (watermark.saturating_sub(MAX_CLOCK_SKEW_SECS), String::new());
         let mut new: usize = 0;
         for _ in 0..10_000 {
-            let request = Request::Sync {
-                net: net.to_string(),
-                after_ts,
-                after_id: after_id.clone(),
-                limit: proto::MAX_SYNC_PAGE,
-            };
-            let (events, more) = match proto::call_solving(self.endpoint(), peer, &request).await? {
-                Response::SyncPage { events, more } => (events, more),
-                other => bail!("unexpected sync response: {other:?}"),
-            };
+            let mut request = Request::sync_after(net, after_ts, &after_id, proto::MAX_SYNC_PAGE);
+            // What the peer holds, a range still pending included: a check,
+            // not a claim of complete history.
+            if let Request::Sync { partial, .. } = &mut request {
+                *partial = true;
+            }
+            let (events, more, seen) =
+                match proto::call_solving(self.endpoint(), peer, &request).await? {
+                    Response::SyncPage {
+                        events, more, seen, ..
+                    } => (events, more, seen),
+                    other => bail!("unexpected sync response: {other:?}"),
+                };
+            if seen.len() == events.len() {
+                let reports: Vec<(String, u64)> = events
+                    .iter()
+                    .zip(&seen)
+                    .filter_map(|(v, s)| Some((v.get("author")?.as_str()?.to_string(), *s)))
+                    .collect();
+                if let Err(e) = self.store.record_seen(&peer.to_string(), &reports) {
+                    debug!("seen reports not recorded: {e:#}");
+                }
+            }
             let mut last = None;
             for value in events {
                 let (Some(ts), Some(id)) = (
@@ -3929,7 +4030,16 @@ impl Node {
                 break;
             }
         }
-        self.store.set_sync_watermark(net, started)?;
+        // The watermark moves only once no history range is pending (ADR
+        // 0025 §5).
+        let pending = self
+            .store
+            .sync_ranges(net)?
+            .iter()
+            .any(|r| r.state == crate::store::RangeState::Pending);
+        if !pending {
+            self.store.set_sync_watermark(net, started)?;
+        }
         Ok(new)
     }
 

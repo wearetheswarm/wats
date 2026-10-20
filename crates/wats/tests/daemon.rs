@@ -111,6 +111,9 @@ async fn background_session_hands_over_to_a_daemon() -> anyhow::Result<()> {
     let human = status(&[]);
     assert!(human.starts_with("node: running\n"));
     assert!(human.contains("\nhealth: ok\n"), "{human}");
+    // How much history it holds (ADR 0025 §8); alone, none yet.
+    assert!(human.contains("\nhistory: not synced yet"), "{human}");
+    assert_eq!(shown["history"]["public"]["state"], "none", "{shown}");
     let posted = call(
         &client,
         "post",
