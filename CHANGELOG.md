@@ -62,8 +62,18 @@
   publishes, and imports the file again if it is gone.
 - **The MCP `status` shows `storage.gc: "stopped"`** when blob collection
   has not run for two intervals and ten minutes: iroh-blobs ends it for
-  good at the first error of its database, and only a restart resumes it
-  (also logged once at WARN).
+  good at the first error of its database, and only a restart resumes it.
+  A new health check, `storage`, raises it too: `health.checks.storage`,
+  one WARN, and `wats status` says `blob collection stopped since …,
+  restart the node to resume it`.
+- **A blob store that cannot be opened stops the start with an error, no
+  longer a hang.** iroh-blobs never returns when it fails to open its
+  store (an unreadable directory, a full or failing disk, a damaged
+  `blobs.db`). The node now opens the store's directories and database
+  itself first, and fails with `cannot open the blob store in <dir>: …`
+  and the cause. A failure that check misses ends the start after 30 s
+  with the same error. The same goes for `wats drop` and for the scratch
+  store of a blob repair.
 
 ## 0.4.0 (2026-10-20)
 

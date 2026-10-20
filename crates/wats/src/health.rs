@@ -3,7 +3,7 @@
 //! central monitor; any node notices when our relay, our directory, the
 //! bootstrap node or n0's services go down, from where it stands.
 //!
-//! Four checks:
+//! Five checks:
 //! - `relay`: the home relay. Ours unreachable (with `wats+n0`, the node
 //!   fell back to n0's relays), none of the custom relays reachable, or no
 //!   relay at all. Read from the endpoint's home relay status
@@ -17,12 +17,16 @@
 //!   reachable, and the peer cache is empty or stale, so the node has no
 //!   way back into the swarm.
 //! - `peers`: no connected peer (gossip neighbor) for `health.no_peers_after`.
+//! - `storage`: blob collection (`storage.gc`) stopped. iroh-blobs ends it
+//!   for good at the first error of its database, and only a restart
+//!   resumes it ([`crate::node::Node::blob_gc_stopped`], which waits two
+//!   intervals and ten minutes before it says so).
 //!
 //! A check that cannot apply is `off`: no relay or lookup in loopback
 //! (hermetic) mode or with `infra = none` (and no relay check without a
 //! relay, no lookup check without a directory), no bootstrap check without
 //! bootstrap nodes or peers configured, no peer check without anywhere to
-//! find peers. A problem becomes an issue only once it lasted its check's
+//! find peers, no storage check with `storage.gc = false`. A problem becomes an issue only once it lasted its check's
 //! debounce; each issue is logged once when raised (WARN), once if its
 //! description changes for good (WARN), and once when it clears (INFO).
 //!
@@ -31,7 +35,8 @@
 //!
 //! ```json
 //! {"state": "degraded",
-//!  "checks": {"relay": "degraded", "lookup": "ok", "bootstrap": "off", "peers": "unknown"},
+//!  "checks": {"relay": "degraded", "lookup": "ok", "bootstrap": "off", "peers": "unknown",
+//!             "storage": "ok"},
 //!  "issues": [{"what": "relay",
 //!              "detail": "relay.wearetheswarm.ai unreachable since 2026-10-18T18:00:00Z, using n0",
 //!              "since": "2026-10-18T18:00:00Z"}]}
@@ -88,10 +93,17 @@ pub enum What {
     Lookup,
     Bootstrap,
     Peers,
+    Storage,
 }
 
 impl What {
-    pub const ALL: [What; 4] = [What::Relay, What::Lookup, What::Bootstrap, What::Peers];
+    pub const ALL: [What; 5] = [
+        What::Relay,
+        What::Lookup,
+        What::Bootstrap,
+        What::Peers,
+        What::Storage,
+    ];
 
     pub fn as_str(self) -> &'static str {
         match self {
@@ -99,6 +111,7 @@ impl What {
             What::Lookup => "lookup",
             What::Bootstrap => "bootstrap",
             What::Peers => "peers",
+            What::Storage => "storage",
         }
     }
 }
@@ -274,6 +287,8 @@ pub struct Plan {
     /// The peer check, with its delay: off without anywhere to find peers
     /// or with `health.no_peers_after = 0`.
     pub no_peers_after: Option<Duration>,
+    /// Storage: blob collection on (`storage.gc`). Off unless set.
+    pub storage: bool,
 }
 
 impl Plan {
@@ -292,6 +307,7 @@ impl Plan {
             lookup: !loopback && infra.has_lookup(),
             bootstrap: seeds > 0,
             no_peers_after: no_peers_after.filter(|_| seeds > 0 || cached > 0),
+            storage: false,
         }
     }
 }
@@ -321,6 +337,8 @@ impl Health {
                     plan.no_peers_after.is_some(),
                     plan.no_peers_after.unwrap_or_default(),
                 ),
+                // Blob collection is called stopped only once overdue.
+                check(What::Storage, plan.storage, Duration::ZERO),
             ],
         }
     }
@@ -520,6 +538,16 @@ pub fn peers_problem(connected: usize) -> Option<Problem> {
     (connected == 0).then(|| Problem::new("no connected peer", None))
 }
 
+/// The storage check, from whether blob collection stopped.
+pub fn storage_problem(gc_stopped: bool) -> Option<Problem> {
+    gc_stopped.then(|| {
+        Problem::new(
+            "blob collection stopped",
+            Some("restart the node to resume it"),
+        )
+    })
+}
+
 /// Resolves this node's own record through `directory`: pkarr over HTTPS
 /// (found, and fresh), then DNS when the directory has a DNS origin.
 pub async fn probe(endpoint: &Endpoint, directory: &Directory, now: u64) -> Probe {
@@ -634,7 +662,8 @@ mod tests {
         assert_eq!(
             health.json(),
             json!({"state": "ok", "checks": {
-            "relay": "ok", "lookup": "unknown", "bootstrap": "unknown", "peers": "unknown"}})
+            "relay": "ok", "lookup": "unknown", "bootstrap": "unknown", "peers": "unknown",
+            "storage": "off"}})
         );
     }
 
@@ -726,7 +755,8 @@ mod tests {
             assert_eq!(
                 health.json(),
                 json!({"state": "ok", "checks": {
-                    "relay": "off", "lookup": "off", "bootstrap": "off", "peers": "off"}})
+                    "relay": "off", "lookup": "off", "bootstrap": "off", "peers": "off",
+                    "storage": "off"}})
             );
             assert!(!health.is_degraded());
         }
@@ -860,7 +890,19 @@ mod tests {
 
     #[test]
     fn status_shape_and_summary() {
-        let mut health = all_on();
+        let mut plan = Plan::new(false, &Infra::default(), 1, 0, Some(DEFAULT_NO_PEERS_AFTER));
+        plan.storage = true;
+        let mut health = Health::new(plan);
+        // Blob collection: raised as soon as it is called stopped.
+        assert_eq!(
+            health.observe(What::Storage, storage_problem(false), T0),
+            None
+        );
+        assert!(
+            health
+                .observe(What::Storage, storage_problem(true), T0)
+                .is_some()
+        );
         health.observe(What::Relay, fallback(), T0);
         health.observe(What::Relay, fallback(), T0 + 30);
         health.observe(What::Peers, peers_problem(0), T0);
@@ -872,13 +914,17 @@ mod tests {
             json!({
                 "state": "degraded",
                 "checks": {"relay": "degraded", "lookup": "unknown",
-                           "bootstrap": "ok", "peers": "degraded"},
+                           "bootstrap": "ok", "peers": "degraded", "storage": "degraded"},
                 "issues": [
                     {"what": "relay",
                      "detail": "relay.wearetheswarm.ai unreachable since 2026-10-18T18:00:00Z, using n0",
                      "since": "2026-10-18T18:00:00Z"},
                     {"what": "peers",
                      "detail": "no connected peer since 2026-10-18T18:00:00Z",
+                     "since": "2026-10-18T18:00:00Z"},
+                    {"what": "storage",
+                     "detail": "blob collection stopped since 2026-10-18T18:00:00Z, \
+                                restart the node to resume it",
                      "since": "2026-10-18T18:00:00Z"},
                 ]
             })
@@ -887,7 +933,8 @@ mod tests {
         assert_eq!(
             summary(&value),
             "degraded: relay.wearetheswarm.ai unreachable since 2026-10-18T18:00:00Z, \
-             using n0; no connected peer since 2026-10-18T18:00:00Z"
+             using n0; no connected peer since 2026-10-18T18:00:00Z; \
+             blob collection stopped since 2026-10-18T18:00:00Z, restart the node to resume it"
         );
         assert_eq!(summary(&json!({"state": "ok", "checks": {}})), "ok");
         assert_eq!(format_span(59), "59s");

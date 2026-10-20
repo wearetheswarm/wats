@@ -596,8 +596,6 @@ struct BlobKeep {
     /// When a collection last read what to keep (Unix milliseconds, 0:
     /// none yet): a run our callback aborts does not count.
     last_kept: std::sync::atomic::AtomicU64,
-    /// Whether [`Node::blob_gc_stopped`] logged its WARN.
-    stop_warned: std::sync::atomic::AtomicBool,
     /// Blobs recorded complete whose content cannot be read (the file is
     /// gone), to fetch again ([`Node::repair_blob`]).
     unreadable: std::sync::Mutex<HashSet<Hash>>,
@@ -754,6 +752,70 @@ where
     Arc::new(f)
 }
 
+/// How long iroh-blobs may take to open a blob store whose directories and
+/// database [`check_blob_store`] could open.
+const BLOB_STORE_OPEN_LIMIT: Duration = Duration::from_secs(30);
+
+/// What to check when the blob store in `dir` cannot be opened.
+fn blob_store_error(dir: &Path) -> String {
+    format!(
+        "cannot open the blob store in {}: check that this user can read and write it, \
+         that the disk is not full or failing, and that blobs.db is not damaged",
+        dir.display()
+    )
+}
+
+/// Check that the blob store in `dir` can be opened: its directories, and
+/// its database read and written. iroh-blobs never returns when it cannot
+/// open a store (its runtime, dropped on one of its own threads, waits for
+/// itself), so this comes first, and says why.
+async fn check_blob_store(dir: &Path) -> Result<()> {
+    let root = dir.to_path_buf();
+    tokio::task::spawn_blocking(move || -> Result<()> {
+        for sub in ["data", "temp"] {
+            let path = root.join(sub);
+            std::fs::create_dir_all(&path).with_context(|| format!("{}", path.display()))?;
+        }
+        let path = root.join("blobs.db");
+        let db = redb::Database::create(&path).with_context(|| format!("{}", path.display()))?;
+        db.begin_write()?.commit()?;
+        Ok(())
+    })
+    .await?
+    .with_context(|| blob_store_error(dir))
+}
+
+/// Open the blob store in `dir` with `options`, or fail with an error
+/// that names it: checked first ([`check_blob_store`]), then given
+/// [`BLOB_STORE_OPEN_LIMIT`] for a failure the check missed. A store that
+/// never opens leaves one thread stuck, of the store's own runtime: the
+/// caller's runtime does not wait for it, the node does not start, and the
+/// process exits with the error.
+async fn open_blob_store(
+    dir: &Path,
+    options: iroh_blobs::store::fs::options::Options,
+) -> Result<FsStore> {
+    let open = async { Ok(FsStore::load_with_opts(dir.join("blobs.db"), options).await?) };
+    open_blob_store_within(dir, BLOB_STORE_OPEN_LIMIT, open).await
+}
+
+/// [`open_blob_store`], with `open` as the opening and `limit` its limit.
+async fn open_blob_store_within(
+    dir: &Path,
+    limit: Duration,
+    open: impl Future<Output = Result<FsStore>>,
+) -> Result<FsStore> {
+    check_blob_store(dir).await?;
+    match tokio::time::timeout(limit, open).await {
+        Ok(Ok(blobs)) => Ok(blobs),
+        Ok(Err(e)) => Err(e).with_context(|| blob_store_error(dir)),
+        Err(_) => Err(anyhow::anyhow!(
+            "{}: it did not open within {limit:?}",
+            blob_store_error(dir)
+        )),
+    }
+}
+
 /// Open the blob store of `dir`, collecting what nothing keeps every
 /// `interval` unless `gc` is off.
 async fn load_blobs(
@@ -767,7 +829,8 @@ async fn load_blobs(
         // Before anything writes, and on a store no collection runs on yet:
         // a collection's pending deletion already hides a blob from
         // `status`, its file must stay until the deletion commits.
-        let blobs = FsStore::load(dir).await?;
+        let options = iroh_blobs::store::fs::options::Options::new(dir);
+        let blobs = open_blob_store(dir, options).await?;
         match check_files(dir, &blobs, gc).await {
             Ok(check) => {
                 if check.removed > 0 {
@@ -794,7 +857,7 @@ async fn load_blobs(
             add_protected: Some(gc_callback(move |live| protect_blobs(&keep, &store, live))),
         });
     }
-    let blobs = FsStore::load_with_opts(dir.join("blobs.db"), options).await?;
+    let blobs = open_blob_store(dir, options).await?;
     keep.blobs.set(std::ops::Deref::deref(&blobs).clone()).ok();
     Ok(blobs)
 }
@@ -923,7 +986,9 @@ pub async fn drop_body_offline(
     let store = Store::open(&path)?;
     let outcome = store.drop_body(id, reason, None, detail, now_secs())?;
     if !outcome.freed_blobs.is_empty() {
-        let blobs = FsStore::load(data_dir.join("blobs")).await?;
+        let dir = data_dir.join("blobs");
+        let options = iroh_blobs::store::fs::options::Options::new(&dir);
+        let blobs = open_blob_store(&dir, options).await?;
         unpin_freed(&blobs, &outcome).await;
         blobs.shutdown().await.ok();
     }
@@ -1497,13 +1562,15 @@ impl Node {
             .chain(config.default_bootstrap.iter().map(|b| b.id))
             .filter(|id| *id != endpoint.id())
             .collect();
-        let health = crate::health::Health::new(crate::health::Plan::new(
+        let mut plan = crate::health::Plan::new(
             config.mode.is_local(),
             &config.infra,
             seed_ids.len(),
             cached.len(),
             config.no_peers_after,
-        ));
+        );
+        plan.storage = config.blob_gc;
+        let health = crate::health::Health::new(plan);
         let mut seeds = config.bootstrap.clone();
         if cached.is_empty() {
             seeds.extend(config.default_bootstrap.iter().cloned());
@@ -2158,7 +2225,9 @@ impl Node {
     }
 
     async fn check_health(&self) {
-        use crate::health::{What, bootstrap_problem, peers_problem, relay_problem};
+        use crate::health::{
+            What, bootstrap_problem, peers_problem, relay_problem, storage_problem,
+        };
         use iroh::Watcher as _;
         let mut observed = Vec::new();
         if self.health_applies(What::Relay) {
@@ -2201,6 +2270,12 @@ impl Node {
         }
         if self.health_applies(What::Peers) {
             observed.push((What::Peers, peers_problem(neighbors.len())));
+        }
+        if self.health_applies(What::Storage) {
+            observed.push((
+                What::Storage,
+                storage_problem(self.blob_gc_stopped(now_secs())),
+            ));
         }
         self.observe_health(observed);
     }
@@ -2601,7 +2676,8 @@ impl Node {
         candidates: Vec<EndpointId>,
         dir: &Path,
     ) -> Result<bool> {
-        let scratch = FsStore::load(dir).await?;
+        let options = iroh_blobs::store::fs::options::Options::new(dir);
+        let scratch = open_blob_store(dir, options).await?;
         let downloader = scratch.downloader(self.endpoint());
         let request = match size {
             Some(size) => GetRequest::builder()
@@ -2660,7 +2736,7 @@ impl Node {
     /// intervals and ten minutes. The blob store ends its collection at the
     /// first error of a run, and a store whose database failed fails every
     /// read; either way only a restart resumes it, and nothing is deleted
-    /// until then. Logs a WARN the first time.
+    /// until then. The `storage` health check raises it (one WARN).
     pub fn blob_gc_stopped(&self, now: u64) -> bool {
         if !self.config.blob_gc {
             return false;
@@ -2677,19 +2753,7 @@ impl Node {
             .as_secs()
             .saturating_mul(2)
             .saturating_add(600);
-        let stopped = now.saturating_sub(last) > limit;
-        if stopped
-            && !self
-                .blob_keep
-                .stop_warned
-                .swap(true, std::sync::atomic::Ordering::Relaxed)
-        {
-            warn!(
-                "blob collection stopped after an error of the blob store: \
-                 restart the node to resume it"
-            );
-        }
-        stopped
+        now.saturating_sub(last) > limit
     }
 
     /// Keep a blob from garbage collection.
@@ -4950,6 +5014,63 @@ mod blob_gc_tests {
             assert!(!off.blob_gc_stopped(last_run + 100_000));
             off.shutdown().await.unwrap();
             node.shutdown().await.unwrap();
+        });
+    }
+
+    /// A blob store that cannot be opened (here, unreadable) stops the
+    /// start with an error that names it, instead of a hang.
+    #[cfg(unix)]
+    #[test]
+    fn an_unreadable_blob_store_fails_the_start() {
+        run(async {
+            use std::os::unix::fs::PermissionsExt;
+            let dir = tempfile::tempdir().unwrap();
+            let data = dir.path().join("n");
+            start(&data, true).await.shutdown().await.unwrap();
+            let blobs = data.join("blobs");
+            let mode = |m| std::fs::set_permissions(&blobs, std::fs::Permissions::from_mode(m));
+            mode(0o000).unwrap();
+            if std::fs::read_dir(&blobs).is_ok() {
+                // Root reads it anyway: nothing to test.
+                mode(0o755).unwrap();
+                return;
+            }
+            let mut config = NodeConfig::new(&data);
+            config.mode = NetworkMode::Loopback;
+            config.infra = crate::infra::Infra::NONE;
+            let started = tokio::time::timeout(Duration::from_secs(40), Node::start(config)).await;
+            mode(0o755).unwrap();
+            let Ok(started) = started else {
+                panic!("the start hung on an unreadable blob store");
+            };
+            let Err(e) = started else {
+                panic!("started on an unreadable blob store");
+            };
+            let error = format!("{e:#}");
+            assert!(
+                error.contains(&format!(
+                    "cannot open the blob store in {}",
+                    blobs.display()
+                )),
+                "{error}"
+            );
+        });
+    }
+
+    /// A blob store that never opens (iroh-blobs hangs when it fails to)
+    /// is given up after the limit, with the same error.
+    #[test]
+    fn a_blob_store_that_never_opens_is_given_up() {
+        run(async {
+            let dir = tempfile::tempdir().unwrap();
+            let never = std::future::pending::<Result<FsStore>>();
+            let e = open_blob_store_within(dir.path(), Duration::from_millis(50), never)
+                .await
+                .err()
+                .unwrap();
+            let error = format!("{e:#}");
+            assert!(error.contains("cannot open the blob store in"), "{error}");
+            assert!(error.contains("did not open within 50ms"), "{error}");
         });
     }
 

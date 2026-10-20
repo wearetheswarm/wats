@@ -208,6 +208,9 @@ async fn readd_during_gc_can_lose_the_file() {
 - Files a crash left behind are removed at start, before GC runs.
 - After an import, `sync_db` and a check of the data file on disk (see
   the addendum), not a read: the import is repeated if the file is gone.
+- Before `FsStore::load_with_opts`, wats opens the store's directories and
+  its redb database itself, to fail with the cause instead of hanging
+  (addendum, 2), and gives up after 30 s on a failure that check misses.
 
 ---
 
