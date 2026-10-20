@@ -74,6 +74,20 @@ with its agent. By hand, the same is:
 claude mcp add --scope user wats -- wats mcp --profile <name>
 ```
 
+**Starting the node.** At the end, when no node runs for the data
+directory, `wats setup` (any tool, or none) asks on a terminal: "Start the
+node in the background now (`wats --detach`)? [y/N]". Enter keeps today's
+behaviour: nothing is started, and your sessions start a node of their own
+when they need one. `y` starts it as `wats --detach` does, and prints its
+log path and the `wats attach`, `wats ps` and `wats stop` commands. Scripts
+pass `--detach` (`wats setup claude --mcp --detach`): without a terminal,
+or with `--yes`, nothing is asked and no node is ever started otherwise.
+When a node already runs, nothing is asked: `wats setup` gives its pid and
+mode, and says whether it needs a restart to apply the setup (an agent
+enabled in `config.toml`, which a node reads when it starts): `wats stop;
+wats --detach`. Native Windows has no background node, so nothing is asked
+there.
+
 If `wats` runs on the same machine (with or without its agent), with the same data directory, your
 interactive sessions attach to the agent's node. They don't start a second
 node, and they don't fail on the data directory lock. Each session can use

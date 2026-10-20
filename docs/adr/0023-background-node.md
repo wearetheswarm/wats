@@ -48,7 +48,7 @@ forbids `unsafe` code (no `libc::setsid`, `dup2` or `kill`).
 Docker-like names, because they are the ones people already know for the
 same four verbs. `wats start` was the alternative for detaching; a flag
 keeps "the same command, in the background", with all of `wats`'s flags,
-and needs no second spelling of each.
+and needs no second spelling of each. Confirmed by Vincent (2026-10-20).
 
 ### 2. Detaching
 
@@ -82,6 +82,23 @@ is a daemon, so `Node::start` asks the background node to hand over and
 waits for the lock; open sessions reconnect. The parent says it took over.
 Any other holder (a foreground or detached daemon) is an error naming it,
 with the `attach` and `stop` commands.
+
+**`wats setup` and the background node** (0.4.1). At the end of
+`wats setup [tool]`, when no node holds the data directory, wats asks on
+a terminal whether to start the node in the background (default no, so
+setup still starts nothing unless asked). Yes runs the same code as
+`wats --detach`, with the setup command's global options.
+`wats setup … --detach` (or `wats --detach setup …`) is the explicit form
+for scripts. Without a terminal, or with `--yes`, setup never starts a
+node on its own. When a node already runs, setup asks nothing: it reports
+the node's pid and mode, and says that a restart (`wats stop; wats
+--detach`) is needed only when the setup changed `config.toml`, which a
+node reads only at start. A node started by `wats mcp` (also one an MCP
+session started again after a crash, §6) is taken over by
+`wats --detach`, as before. During such a restart, MCP sessions say the
+node was stopped with `wats stop`, and reconnect on their next call once
+`wats --detach` has started it (§6). Native Windows has no background
+mode, so nothing is asked there and `--detach` is refused.
 
 ### 3. The log
 

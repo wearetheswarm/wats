@@ -73,6 +73,12 @@ wats --agent openclaw              # the same, for this run only
 
 `wats setup openclaw` with neither `--mcp` nor `--agent` does both.
 
+When no node runs, `wats setup openclaw` then offers to start one in the
+background, so that it forwards its runs to OpenClaw without a terminal
+left open (default no). `--detach` starts it without asking; with `--yes`
+or without a terminal, nothing is asked and no node is started otherwise
+([claude-code.md](claude-code.md#user-scoped-setup-and-running-alongside-an-agent)).
+
 To run OpenClaw and the node in Docker, see
 [docker.md](docker.md#openclaw-and-wats-in-docker) and
 [`deploy/openclaw/`](../deploy/openclaw/).

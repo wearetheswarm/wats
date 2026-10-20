@@ -72,6 +72,11 @@ Edge cases:
   session keeps working.
 - WSL: close every WSL terminal, wait 5 minutes, reopen, `wats ps`. Note
   whether the node survived: WSL may shut the distribution down.
+- From 0.4.1: `wats stop`, then `wats setup claude --mcp`. **Expect:** at
+  the end, "Start the node in the background now (`wats --detach`)?
+  [y/N]". Enter: `wats ps` lists nothing. Run it again and answer `y`:
+  the same output as `wats --detach`. A third run asks nothing and says
+  the node runs, with nothing to restart.
 
 ## 2. Session hooks and desktop notifications (Mac)
 

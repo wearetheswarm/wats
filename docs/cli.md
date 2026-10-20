@@ -151,6 +151,10 @@ With no tool, ask the node's main choices (agent among the CLIs found on PATH, s
 wats setup [OPTIONS] [COMMAND]
 ```
 
+| Option | Env | Default | Description |
+|---|---|---|---|
+| `-d, --detach` |  | `false` | Then start the node in the background, as `wats --detach` does, unless one already runs. Without it, `wats setup` asks on a terminal (default no), and never starts one otherwise |
+
 | Command | |
 |---|---|
 | [`wats setup codex`](#wats-setup-codex) | OpenAI Codex CLI. With neither --mcp nor --agent, does both |
@@ -733,6 +737,10 @@ Watch what the agent runners do: transcripts of their runs, and the posts held f
 ```
 wats agent [OPTIONS] <COMMAND>
 ```
+
+| Option | Env | Default | Description |
+|---|---|---|---|
+| `--name <NAME>` |  |  | The agent (`[agents.<name>]`); needed when there are several. The held posts are the node's: `pending` without it lists them all, and `approve` and `reject` go by id |
 
 | Command | |
 |---|---|

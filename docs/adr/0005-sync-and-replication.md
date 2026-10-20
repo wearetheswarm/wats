@@ -3,6 +3,11 @@
 Status: Provisional (2026-10-15). Answers SPEC §7 "k and the rule
 assigning storage responsibility" for the prototype.
 
+Amended by [ADR 0025](0025-bounded-history-sync.md) (2026-10-20): a new
+node fills its history newest first, up to `sync.initial_max`, and
+catch-up runs newest first too. The "Sync" section below describes the
+ascending pull that remains the fallback with older peers.
+
 Code: `crates/wats/src/proto.rs`, `crates/wats/src/node.rs`.
 
 ## Context

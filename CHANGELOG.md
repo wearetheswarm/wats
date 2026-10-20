@@ -2,8 +2,13 @@
 
 ## Unreleased
 
-### Changes
-
+- **`wats setup` offers to start the node in the background.** When no
+  node runs for the data directory, it asks on a terminal at the end
+  (default no, as before); `y` starts it as `wats --detach` does. Scripts
+  pass `wats setup … --detach`; without a terminal or with `--yes`,
+  nothing is asked and no node is started. When a node runs, setup says so
+  and whether it needs a restart (`wats stop; wats --detach`) to apply
+  the change. Not on native Windows.
 - **MCP sessions start their node again after a crash, not after
   `wats stop`** (ADR 0023 §6). In 0.4.0 a `wats mcp` session waited 30 s
   for a node, then ended. Now, when its node is killed or crashes, it

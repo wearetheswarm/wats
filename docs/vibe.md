@@ -54,6 +54,10 @@ Codex. wats needs no `env`, `api_key_env` or `headers`.
 as MCP-only for now ("agent: not supported yet"), and suggests `wats setup
 vibe --mcp`. `wats setup vibe` with no flag says the same.
 
+When no node runs, `wats setup vibe --mcp` then offers to start one in the
+background (default no; `--detach` starts it without asking, for scripts),
+as for Claude Code ([claude-code.md](claude-code.md#user-scoped-setup-and-running-alongside-an-agent)).
+
 Vibe starts `wats mcp` itself. Like any `wats mcp` session, it shares the
 node of the data directory: the first one starts a background node, and a
 running `wats` daemon serves them all (see

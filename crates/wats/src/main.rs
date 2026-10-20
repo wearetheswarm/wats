@@ -317,6 +317,11 @@ enum Command {
     Setup {
         #[command(subcommand)]
         tool: Option<SetupTool>,
+        /// Then start the node in the background, as `wats --detach` does,
+        /// unless one already runs. Without it, `wats setup` asks on a
+        /// terminal (default no), and never starts one otherwise.
+        #[arg(short = 'd', long, global = true)]
+        detach: bool,
     },
     /// Read or change `<data dir>/config.toml`, what a bare `wats` runs
     /// with. Flags and WATS_* variables override it.
@@ -1791,8 +1796,7 @@ fn hook_command(
 /// Whether to add the session hook: asked on a terminal (default yes),
 /// yes otherwise.
 fn want_hook(args: &NodeArgs, name: &str) -> Result<bool> {
-    use std::io::IsTerminal;
-    if args.hermetic || !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
+    if !interactive(args) {
         return Ok(true);
     }
     wats::firstrun::ask_yes_no(
@@ -2155,6 +2159,260 @@ fn setup_tool(
             );
         }
     }
+    Ok(())
+}
+
+impl SetupTool {
+    /// It removes wats, or only says what to run: no node to start after
+    /// it.
+    fn sets_nothing_up(&self) -> bool {
+        match self {
+            SetupTool::Codex {
+                remove,
+                remove_hooks,
+                ..
+            }
+            | SetupTool::Claude {
+                remove,
+                remove_hooks,
+                ..
+            } => *remove || *remove_hooks,
+            SetupTool::Openclaw { remove, .. } => *remove,
+            SetupTool::Vibe { mcp, .. } => !*mcp,
+        }
+    }
+}
+
+/// `wats setup [tool]`, then the node in the background: started with
+/// `--detach`, else offered on a terminal (default no).
+async fn setup_command(
+    node: &NodeArgs,
+    data_dir: &std::path::Path,
+    tool: Option<SetupTool>,
+    detach: bool,
+) -> Result<()> {
+    let offer = !tool.as_ref().is_some_and(SetupTool::sets_nothing_up);
+    anyhow::ensure!(
+        offer || !detach,
+        "--detach starts the node after a setup, not with --remove or --remove-hooks (nor \
+         `setup vibe` without --mcp)"
+    );
+    #[cfg(not(unix))]
+    anyhow::ensure!(
+        !detach,
+        "--detach: running the node in the background is not supported on native Windows yet: \
+         run wats under WSL, or keep `wats` running in a terminal"
+    );
+    // `--yes` (openclaw): a script, which is never asked.
+    let yes = matches!(tool, Some(SetupTool::Openclaw { yes: true, .. }));
+    let config = data_dir.join(wats::settings::FILE_NAME);
+    let before = std::fs::read(&config).ok();
+    setup_tool_command(node, data_dir, tool)?;
+    if !offer {
+        return Ok(());
+    }
+    let changed = std::fs::read(&config).ok() != before;
+    offer_background(node, data_dir, detach, yes, changed).await
+}
+
+/// `wats setup [tool]` itself.
+fn setup_tool_command(
+    node: &NodeArgs,
+    data_dir: &std::path::Path,
+    tool: Option<SetupTool>,
+) -> Result<()> {
+    let Some(tool) = tool else {
+        wats::firstrun::setup(
+            data_dir,
+            &mut std::io::stdin().lock(),
+            &mut std::io::stdout(),
+            std::env::var_os("PATH").as_deref(),
+        )?;
+        return Ok(());
+    };
+    match tool {
+        SetupTool::Claude {
+            mcp,
+            agent,
+            keys,
+            scope,
+            no_hooks,
+            remove,
+            remove_hooks,
+            claude,
+        } => {
+            if remove_hooks {
+                return remove_claude_hooks(&scope);
+            }
+            if remove {
+                return remove_from_claude(&scope, &claude);
+            }
+            let scope = scope.as_str();
+            let hooks: HookStep = (!no_hooks).then(|| {
+                Box::new(move |profile: &str| install_claude_hooks(node, profile, scope)) as _
+            });
+            setup_tool(
+                node,
+                data_dir,
+                "claude",
+                (mcp, agent),
+                &keys,
+                |profile| register_in_claude(node, profile, scope, &claude),
+                hooks,
+            )
+        }
+        SetupTool::Codex {
+            mcp,
+            agent,
+            keys,
+            no_approval,
+            no_hooks,
+            remove,
+            remove_hooks,
+            codex,
+        } => {
+            if remove_hooks {
+                return remove_codex_hooks();
+            }
+            if remove {
+                return remove_from_codex(&codex);
+            }
+            let codex = codex.as_path();
+            let hooks: HookStep = (!no_hooks).then(|| {
+                Box::new(move |profile: &str| install_codex_hooks(node, profile, codex)) as _
+            });
+            setup_tool(
+                node,
+                data_dir,
+                "codex",
+                (mcp, agent),
+                &keys,
+                |profile| {
+                    let changed = register_in_codex(node, profile, codex)?;
+                    let approval = if no_approval {
+                        set_codex_approval()?
+                    } else {
+                        false
+                    };
+                    Ok(changed || approval)
+                },
+                hooks,
+            )
+        }
+        SetupTool::Openclaw {
+            mcp,
+            remove,
+            agent,
+            apply,
+            print,
+            yes,
+            url,
+            name,
+            openclaw,
+        } => setup_openclaw(
+            node,
+            data_dir,
+            OpenclawSetup {
+                mcp,
+                agent,
+                remove,
+                apply,
+                print,
+                yes,
+                url,
+                name,
+            },
+            &openclaw,
+        ),
+        SetupTool::Vibe {
+            mcp,
+            remove,
+            project,
+        } => setup_vibe(node, data_dir, (mcp, remove, project)),
+    }
+}
+
+/// Whether to ask the person running this command: stdin and stdout are a
+/// terminal, never with --hermetic (tests), unless `WATS_TEST_INTERACTIVE`
+/// says to ask on a pipe.
+fn interactive(args: &NodeArgs) -> bool {
+    use std::io::IsTerminal;
+    if args.hermetic {
+        return std::env::var("WATS_TEST_INTERACTIVE").as_deref() == Ok("1");
+    }
+    std::io::stdin().is_terminal() && std::io::stdout().is_terminal()
+}
+
+/// After `wats setup`: when no node runs in the data directory, start one
+/// in the background with `detach` (`wats setup --detach`), else ask on a
+/// terminal (default no; never with `--yes`); when one runs, say whether it
+/// needs a restart for the setup to apply (`changed`: config.toml, which a
+/// node reads when it starts, was changed).
+#[cfg(unix)]
+async fn offer_background(
+    args: &NodeArgs,
+    data_dir: &std::path::Path,
+    detach: bool,
+    yes: bool,
+    changed: bool,
+) -> Result<()> {
+    let dir = std::path::absolute(data_dir)?;
+    let entry = NodeEntry::look(dir.clone()).await;
+    // A node `wats mcp` started for its sessions: `wats --detach` takes
+    // it over, as it does by itself.
+    let takeover = entry.running && entry.role() == "background";
+    if entry.running && !(takeover && detach) {
+        let pid = entry.pid().map_or_else(|| "?".into(), |p| p.to_string());
+        let flag = entry.dir_flag();
+        let what = format!(
+            "a wats node already runs here (pid {pid}, {})",
+            entry.mode()
+        );
+        if !changed {
+            println!("{what}: nothing to restart, new sessions use it");
+        } else if takeover {
+            println!(
+                "{what}, for your MCP sessions: it reads config.toml when it starts. To run it \
+                 with this setup: wats --detach{flag} (it takes over)"
+            );
+        } else {
+            println!(
+                "{what}: it reads config.toml when it starts. To apply this setup, restart it: \
+                 wats stop{flag}; wats --detach{flag}"
+            );
+        }
+        return Ok(());
+    }
+    let start = detach
+        || (!yes
+            && interactive(args)
+            && wats::firstrun::ask_yes_no(
+                &mut std::io::stdin().lock(),
+                &mut std::io::stdout(),
+                "Start the node in the background now (`wats --detach`)?",
+                false,
+            )?);
+    if !start {
+        return Ok(());
+    }
+    // The child is `wats --detach` with this command's global options.
+    let mut child_args = args.to_args(&dir);
+    if let Some(profile) = &args.profile {
+        child_args.push(format!("--profile={profile}").into());
+    }
+    child_args.push("--detach".into());
+    let settings = Settings::load(&dir)?;
+    detach_command(&dir, &settings, false, child_args).await
+}
+
+#[cfg(not(unix))]
+async fn offer_background(
+    _: &NodeArgs,
+    _: &std::path::Path,
+    _: bool,
+    _: bool,
+    _: bool,
+) -> Result<()> {
     Ok(())
 }
 
@@ -3122,9 +3380,17 @@ async fn ps_command(node: &NodeArgs, all: bool, json: bool) -> Result<()> {
 /// detached process logging to `<data dir>/logs/node.log`, and return once
 /// its node is up (it took the data directory and serves its socket), or
 /// print what it said before it died.
+///
+/// `child_args`: the child's command line, without `--log-file` (this
+/// one's for `wats --detach`, the node's for `wats setup --detach`).
 #[cfg(unix)]
-async fn detach_command(config: &NodeConfig, settings: &Settings, quiet: bool) -> Result<()> {
-    let dir = std::path::absolute(&config.data_dir)?;
+async fn detach_command(
+    data_dir: &std::path::Path,
+    settings: &Settings,
+    quiet: bool,
+    child_args: Vec<std::ffi::OsString>,
+) -> Result<()> {
+    let dir = std::path::absolute(data_dir)?;
     let before = NodeEntry::look(dir.clone()).await;
     let takeover = before.running && before.role() == "background";
     if before.running && !takeover {
@@ -3146,7 +3412,7 @@ async fn detach_command(config: &NodeConfig, settings: &Settings, quiet: bool) -
     // The child: the same command line, which `--log-file` tells that it
     // is the detached one.
     let mut args: Vec<std::ffi::OsString> = vec!["--log-file".into(), log.clone().into()];
-    args.extend(std::env::args_os().skip(1));
+    args.extend(child_args);
     let mut child = wats::background::spawn_detached(&args, &log, &[])
         .context("start the node in the background")?;
     let pid = child.id();
@@ -3212,7 +3478,12 @@ async fn detach_command(config: &NodeConfig, settings: &Settings, quiet: bool) -
 }
 
 #[cfg(not(unix))]
-async fn detach_command(_: &NodeConfig, _: &Settings, _: bool) -> Result<()> {
+async fn detach_command(
+    _: &std::path::Path,
+    _: &Settings,
+    _: bool,
+    _: Vec<std::ffi::OsString>,
+) -> Result<()> {
     anyhow::bail!(
         "`wats --detach` is not supported on native Windows yet: run wats under WSL, or keep \
          `wats` running in a terminal"
@@ -5224,129 +5495,10 @@ async fn async_main(cli: Cli) -> Result<()> {
                 _ = shutdown => Ok(()),
             };
         }
-        Some(Command::Setup { tool: None }) => {
-            wats::firstrun::setup(
-                &data_dir,
-                &mut std::io::stdin().lock(),
-                &mut std::io::stdout(),
-                std::env::var_os("PATH").as_deref(),
-            )?;
-            return Ok(());
+        Some(Command::Setup { tool, detach }) => {
+            // `wats --detach setup …` means `wats setup … --detach`.
+            return setup_command(&cli.node, &data_dir, tool, detach || cli.daemon.detach).await;
         }
-        Some(Command::Setup {
-            tool:
-                Some(SetupTool::Claude {
-                    mcp,
-                    agent,
-                    keys,
-                    scope,
-                    no_hooks,
-                    remove,
-                    remove_hooks,
-                    claude,
-                }),
-        }) => {
-            if remove_hooks {
-                return remove_claude_hooks(&scope);
-            }
-            if remove {
-                return remove_from_claude(&scope, &claude);
-            }
-            let node = &cli.node;
-            let scope = scope.as_str();
-            let hooks: HookStep = (!no_hooks).then(|| {
-                Box::new(move |profile: &str| install_claude_hooks(node, profile, scope)) as _
-            });
-            return setup_tool(
-                node,
-                &data_dir,
-                "claude",
-                (mcp, agent),
-                &keys,
-                |profile| register_in_claude(node, profile, scope, &claude),
-                hooks,
-            );
-        }
-        Some(Command::Setup {
-            tool:
-                Some(SetupTool::Codex {
-                    mcp,
-                    agent,
-                    keys,
-                    no_approval,
-                    no_hooks,
-                    remove,
-                    remove_hooks,
-                    codex,
-                }),
-        }) => {
-            if remove_hooks {
-                return remove_codex_hooks();
-            }
-            if remove {
-                return remove_from_codex(&codex);
-            }
-            let node = &cli.node;
-            let codex = codex.as_path();
-            let hooks: HookStep = (!no_hooks).then(|| {
-                Box::new(move |profile: &str| install_codex_hooks(node, profile, codex)) as _
-            });
-            return setup_tool(
-                node,
-                &data_dir,
-                "codex",
-                (mcp, agent),
-                &keys,
-                |profile| {
-                    let changed = register_in_codex(node, profile, codex)?;
-                    let approval = if no_approval {
-                        set_codex_approval()?
-                    } else {
-                        false
-                    };
-                    Ok(changed || approval)
-                },
-                hooks,
-            );
-        }
-        Some(Command::Setup {
-            tool:
-                Some(SetupTool::Openclaw {
-                    mcp,
-                    remove,
-                    agent,
-                    apply,
-                    print,
-                    yes,
-                    url,
-                    name,
-                    openclaw,
-                }),
-        }) => {
-            return setup_openclaw(
-                &cli.node,
-                &data_dir,
-                OpenclawSetup {
-                    mcp,
-                    agent,
-                    remove,
-                    apply,
-                    print,
-                    yes,
-                    url,
-                    name,
-                },
-                &openclaw,
-            );
-        }
-        Some(Command::Setup {
-            tool:
-                Some(SetupTool::Vibe {
-                    mcp,
-                    remove,
-                    project,
-                }),
-        }) => return setup_vibe(&cli.node, &data_dir, (mcp, remove, project)),
         _ => {}
     }
     first_run(&cli, &data_dir)?;
@@ -5439,7 +5591,13 @@ async fn async_main(cli: Cli) -> Result<()> {
                 "`wats node` prints JSON lines for a script: run `wats --detach` instead"
             );
         }
-        return detach_command(&config, &settings, daemon.quiet).await;
+        return detach_command(
+            &config.data_dir,
+            &settings,
+            daemon.quiet,
+            std::env::args_os().skip(1).collect(),
+        )
+        .await;
     }
     if let Some(log) = &daemon.log_file {
         wats::background::rotate_stderr(
@@ -6076,7 +6234,8 @@ mod cli_reference {
         out.push('\n');
     }
 
-    fn section(out: &mut String, cmd: &clap::Command, path: &[String], top: bool) {
+    /// `inherited`: the global options of the commands above, listed there.
+    fn section(out: &mut String, cmd: &clap::Command, path: &[String], inherited: &[String]) {
         let name = path.join(" ");
         out.push_str(&format!(
             "<a id=\"{}\"></a>\n\n## `{name}`\n\n",
@@ -6093,9 +6252,16 @@ mod cli_reference {
             .get_arguments()
             .filter(|a| !a.is_hide_set())
             .filter(|a| !matches!(a.get_id().as_str(), "help" | "version"))
-            // Global options are listed once, under `wats`.
-            .filter(|a| top || !a.is_global_set())
+            // Global options are listed once, under the command that
+            // defines them (`wats`, `wats setup`).
+            .filter(|a| !(a.is_global_set() && inherited.contains(&a.get_id().to_string())))
             .collect();
+        let mut globals = inherited.to_vec();
+        globals.extend(
+            args.iter()
+                .filter(|a| a.is_global_set())
+                .map(|a| a.get_id().to_string()),
+        );
         let mut headings: Vec<Option<&str>> = Vec::new();
         for arg in &args {
             if !headings.contains(&arg.get_help_heading()) {
@@ -6134,7 +6300,7 @@ mod cli_reference {
         for sub in subs {
             let mut sub_path = path.to_vec();
             sub_path.push(sub.get_name().to_string());
-            section(out, sub, &sub_path, false);
+            section(out, sub, &sub_path, &globals);
         }
     }
 
@@ -6152,7 +6318,7 @@ mod cli_reference {
              [configuration reference](config.md); a flag or an environment \
              variable wins over the file.\n\n",
         );
-        section(&mut out, &cmd, &["wats".to_string()], true);
+        section(&mut out, &cmd, &["wats".to_string()], &[]);
         while out.ends_with("\n\n") {
             out.pop();
         }

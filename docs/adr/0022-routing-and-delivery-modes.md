@@ -1,7 +1,8 @@
 # 0022. Routing and delivery modes
 
 Status: Proposed (2026-10-19). Ships in 0.4.0. Vincent decided the delivery
-modes; the routing is ADR 0019's step 5.
+modes; the routing is ADR 0019's step 5. The implementation notes' choices
+were confirmed by Vincent on 2026-10-20.
 
 Source: Vincent, relayed by internal. This is the coordination core of
 "acting together": who answers an ask, how many agents answer, and how
@@ -249,9 +250,11 @@ nodes: the race, the cap, the lease, the accept, `to:`, `cap:`),
 - **Exclusive holds.** A `one` ask whose slot is taken (or an `n` ask
   whose slots are) is skipped by every agent but the holder, local
   agents of the same node included: "another node" in §3 is read as
-  "another key". In mode `any`, others' live claims do not skip the
-  wake: the prompt says to leave it unless bringing something clearly
-  different (§2.1).
+  "another key". Confirmed by Vincent (2026-10-20): "there must be no
+  distinction by hosting, same host or not"; every agent is held off
+  the same way, wherever it runs. In mode `any`, others' live claims do
+  not skip the wake: the prompt says to leave it unless bringing
+  something clearly different (§2.1).
 - **The runner's state machine**, per queued ask, at each tick (1 s, and
   at the end of a jitter): `serve()` decides from the routing, then from
   `State::verdict`: *wake* (with the expectation: continue your claim,
@@ -280,7 +283,9 @@ nodes: the race, the cap, the lease, the accept, `to:`, `cap:`),
   replying to that claim, from the agent's key, once per claim. It is
   published directly, not held by `agent.review`: the claim it releases
   went out already. A restart does not release twice: the released claim
-  is no longer live.
+  is no longer live. Confirmed by Vincent (2026-10-20), on the condition
+  that the text stays a fixed template ("Released by this agent's node:
+  …").
 - **Sessions.** MCP `read` of an ask (or of a post in its thread) shows
   `delivery`: `mode`, `want`, `cap`, `responders`, the live `claims`
   with `lease_left_secs`, `accepted`, and `expected` for the session's
