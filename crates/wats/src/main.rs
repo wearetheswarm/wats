@@ -286,6 +286,15 @@ struct NodeArgs {
     /// also refuses events from others.
     #[arg(long, global = true, env = "WATS_STORAGE_MAX", value_parser = parse_size)]
     storage_max: Option<u64>,
+    /// Share of the storage budget for events and their index, in percent
+    /// (default 50); the rest is for blobs, transcripts and logs.
+    #[arg(long, global = true, env = "WATS_STORAGE_EVENTS_SHARE", value_parser = clap::value_parser!(u64).range(1..=100))]
+    storage_events_share: Option<u64>,
+    /// History a new node fetches, newest first: auto (half the events
+    /// share), a size such as 1G, or 0 for all of it (full nodes: the
+    /// router, bootstrap nodes, indexers).
+    #[arg(long, global = true, env = "WATS_SYNC_INITIAL_MAX", value_parser = wats::settings::parse_initial_max)]
+    sync_initial_max: Option<wats::settings::InitialMax>,
     /// For tests, with --hermetic only: collect blobs every this many
     /// milliseconds instead of hourly.
     #[arg(long, global = true, hide = true, env = "WATS_TEST_BLOB_GC_MS")]
@@ -3193,8 +3202,21 @@ async fn status_command(config: &NodeConfig, json: bool) -> Result<()> {
             .and_then(|map| map.remove("agent_retractions"));
         // One line per agent (ADR 0021).
         let agents = status.as_object_mut().and_then(|map| map.remove("agents"));
+        // One line per network: "history: syncing, back to 2026-09-14,
+        // 812.0 MiB / 2.5 GiB" (ADR 0025 §8).
+        let history = status.as_object_mut().and_then(|map| map.remove("history"));
         for line in status_lines("", &status) {
             println!("{line}");
+        }
+        if let Some(history) = history.as_ref().and_then(|h| h.as_object()) {
+            for (net, value) in history {
+                let line = wats::node::history::line(value);
+                if history.len() > 1 {
+                    println!("history ({net}): {line}");
+                } else {
+                    println!("history: {line}");
+                }
+            }
         }
         for agent in agents
             .as_ref()
@@ -3375,6 +3397,31 @@ impl NodeEntry {
         }
     }
 
+    /// The `history` of `info`, short: `back to 2026-08-02`, `syncing,
+    /// back to …`, `full` (ADR 0025 §8).
+    fn history(&self) -> String {
+        let Some(history) = self.info.as_ref().and_then(|i| i["history"].as_object()) else {
+            return "-".to_string();
+        };
+        let several = history.len() > 1;
+        let parts: Vec<String> = history
+            .iter()
+            .map(|(net, h)| {
+                let short = wats::node::history::short(h);
+                if several {
+                    format!("{net}: {short}")
+                } else {
+                    short
+                }
+            })
+            .collect();
+        if parts.is_empty() {
+            "-".to_string()
+        } else {
+            parts.join(" · ")
+        }
+    }
+
     fn json(&self, now: u64) -> serde_json::Value {
         json!({
             "data_dir": self.dir,
@@ -3390,6 +3437,7 @@ impl NodeEntry {
             "network": self.network(),
             "infra": self.info_str("infra"),
             "sessions": self.sessions(),
+            "history": self.info.as_ref().map(|i| i["history"].clone()),
             "log": self.log(),
         })
     }
@@ -3507,7 +3555,7 @@ async fn ps_command(node: &NodeArgs, all: bool, json: bool) -> Result<()> {
         println!("no wats node running · start one in the background: wats --detach");
         return Ok(());
     }
-    let rows: Vec<[String; 10]> = entries
+    let rows: Vec<[String; 11]> = entries
         .iter()
         .map(|e| {
             let dash = || "-".to_string();
@@ -3515,6 +3563,7 @@ async fn ps_command(node: &NodeArgs, all: bool, json: bool) -> Result<()> {
                 return [
                     dash(),
                     e.mode().to_string(),
+                    dash(),
                     dash(),
                     dash(),
                     dash(),
@@ -3542,13 +3591,14 @@ async fn ps_command(node: &NodeArgs, all: bool, json: bool) -> Result<()> {
                 e.network(),
                 e.info_str("infra").unwrap_or_else(dash),
                 e.sessions().map_or_else(dash, |s| s.to_string()),
+                e.history(),
                 tilde(&e.dir),
             ]
         })
         .collect();
     let header = [
         "PID", "MODE", "VERSION", "UPTIME", "PROFILE", "AGENTS", "NETWORK", "INFRA", "SESSIONS",
-        "DATA DIR",
+        "HISTORY", "DATA DIR",
     ];
     let mut widths: Vec<usize> = header.iter().map(|h| h.chars().count()).collect();
     for row in &rows {
@@ -4141,6 +4191,24 @@ impl NodeArgs {
                 .map_or_else(|| parse_size(wats::settings::DEFAULT_STORAGE_MAX), Ok)
                 .map_err(|e| anyhow::anyhow!(e))?,
         );
+        config.events_share = match self.storage_events_share.or(file.storage.events_share) {
+            Some(share) if (1..=100).contains(&share) => share,
+            Some(share) => {
+                anyhow::bail!("storage.events_share: {share} is not a percentage (1-100)")
+            }
+            None => wats::settings::DEFAULT_EVENTS_SHARE,
+        };
+        config.initial_max = match self.sync_initial_max {
+            Some(max) => max,
+            None => file
+                .sync
+                .initial_max
+                .as_deref()
+                .map(wats::settings::parse_initial_max)
+                .transpose()
+                .map_err(|e| anyhow::anyhow!("config.toml sync.initial_max: {e}"))?
+                .unwrap_or_default(),
+        };
         for addr in &self.external_addrs {
             config.external_addrs.push(
                 addr.parse()
@@ -4370,6 +4438,16 @@ impl NodeArgs {
         }
         if let Some(max) = self.storage_max {
             args.push(format!("--storage-max={max}").into());
+        }
+        if let Some(share) = self.storage_events_share {
+            args.push(format!("--storage-events-share={share}").into());
+        }
+        match self.sync_initial_max {
+            Some(wats::settings::InitialMax::Auto) => args.push("--sync-initial-max=auto".into()),
+            Some(wats::settings::InitialMax::Bytes(n)) => {
+                args.push(format!("--sync-initial-max={n}").into());
+            }
+            None => {}
         }
         if let Some(file) = &self.secret_file {
             let mut arg = std::ffi::OsString::from("--secret-file=");
@@ -5001,6 +5079,29 @@ fn banner_lines(config: &NodeConfig, agents: &[(String, wats::agent::AgentConfig
                 " · FULL: refusing blobs and events from others",
         }
     ));
+    // The history held, as stored when the node starts (ADR 0025 §8):
+    // `wats status` gives the live figures.
+    if let Ok(store) = wats::store::Store::open_read_only_with(
+        &config.data_dir.join("events.sqlite"),
+        Duration::from_millis(200),
+    ) {
+        let full = matches!(config.initial_max, wats::settings::InitialMax::Bytes(0))
+            || (config.initial_max == wats::settings::InitialMax::Auto
+                && config.storage_max.is_none());
+        let share = config
+            .storage_max
+            .map(|m| m.saturating_mul(config.events_share.clamp(1, 100)) / 100);
+        for net in &config.nets {
+            if let Ok(history) = wats::node::history::stored_json(&store, net, full, share) {
+                let line = wats::node::history::line(&history);
+                if config.nets.len() > 1 {
+                    lines.push(format!("history ({net}): {line}"));
+                } else {
+                    lines.push(format!("history: {line}"));
+                }
+            }
+        }
+    }
     let waiting: Vec<_> = wats::crash::list(&config.data_dir)
         .into_iter()
         .filter(|r| r.state != "sent")

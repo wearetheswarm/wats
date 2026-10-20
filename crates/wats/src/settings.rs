@@ -65,6 +65,8 @@ pub struct Settings {
     #[serde(default)]
     pub storage: StorageSettings,
     #[serde(default)]
+    pub sync: SyncSettings,
+    #[serde(default)]
     pub report: ReportSettings,
     #[serde(default)]
     pub limits: LimitsSettings,
@@ -212,6 +214,7 @@ pub struct LimitsSettings {
     pub sync_per_min: Option<u32>,
     pub replicate_per_min: Option<u32>,
     pub report_per_min: Option<u32>,
+    pub get_per_min: Option<u32>,
     pub blob_fetches_per_peer: Option<usize>,
     pub challenge: Option<bool>,
     pub challenge_base_bits: Option<u32>,
@@ -227,6 +230,7 @@ impl LimitsSettings {
             sync_per_min: self.sync_per_min.unwrap_or(d.sync_per_min),
             replicate_per_min: self.replicate_per_min.unwrap_or(d.replicate_per_min),
             report_per_min: self.report_per_min.unwrap_or(d.report_per_min),
+            get_per_min: self.get_per_min.unwrap_or(d.get_per_min),
             blob_fetches_per_peer: self
                 .blob_fetches_per_peer
                 .unwrap_or(d.blob_fetches_per_peer)
@@ -266,7 +270,20 @@ pub struct StorageSettings {
     pub max: Option<String>,
     /// Collect the blobs nothing keeps, hourly (default: true).
     pub gc: Option<bool>,
+    /// Share of `max` for the event store, in percent (ADR 0025 §2).
+    pub events_share: Option<u64>,
 }
+
+/// `[sync]`: how much history a node takes (ADR 0025).
+#[derive(Debug, Default, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SyncSettings {
+    /// Budget of the initial fill: `auto`, a size, or 0 for no limit.
+    pub initial_max: Option<String>,
+}
+
+/// Default share of `storage.max` for the event store, in percent.
+pub const DEFAULT_EVENTS_SHARE: u64 = 50;
 
 /// Default disk budget of the data directory (`storage.max`).
 pub const DEFAULT_STORAGE_MAX: &str = "10G";
@@ -541,6 +558,8 @@ pub enum ValueType {
     /// A duration with the units s, m, h or d, or 0 for forever.
     Retention,
     Size,
+    /// `auto`, or a size (`sync.initial_max`).
+    InitialMax,
     Integer,
     /// A non-negative number, e.g. dollars.
     Float,
@@ -655,6 +674,18 @@ pub const KEYS: &[Key] = &[
         "delete, hourly, the blob files nothing keeps (a dropped body's, a failed fetch's); false keeps them on disk",
     ),
     key(
+        "storage.events_share",
+        ValueType::Integer,
+        "50",
+        "share of storage.max for events and their index, in percent; the rest is for blobs, transcripts and logs",
+    ),
+    key(
+        "sync.initial_max",
+        ValueType::InitialMax,
+        "auto",
+        "history a new node fetches, newest first: auto (half the events share), a size, or 0 for all of it (full nodes)",
+    ),
+    key(
         "limits.hello_per_min",
         ValueType::Integer,
         "60",
@@ -677,6 +708,12 @@ pub const KEYS: &[Key] = &[
         ValueType::Integer,
         "10",
         "crash reports a peer may send per minute (collectors)",
+    ),
+    key(
+        "limits.get_per_min",
+        ValueType::Integer,
+        "120",
+        "get requests (history by id, fetched on read) a peer may make per minute (0: unlimited)",
     ),
     key(
         "limits.blob_fetches_per_peer",
@@ -1195,6 +1232,10 @@ fn toml_value(key: &Key, raw: &str) -> Result<toml_edit::Value> {
         }
         ValueType::Size => {
             parse_size(raw).map_err(invalid)?;
+            raw.into()
+        }
+        ValueType::InitialMax => {
+            parse_initial_max(raw).map_err(invalid)?;
             raw.into()
         }
         ValueType::Integer => {
@@ -1719,6 +1760,24 @@ pub fn parse_size(s: &str) -> Result<u64, String> {
     number
         .checked_mul(1u64 << shift)
         .ok_or_else(|| format!("size {s:?} is too large"))
+}
+
+/// `sync.initial_max` (ADR 0025 §2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum InitialMax {
+    /// Half the events share; no limit without `storage.max`.
+    #[default]
+    Auto,
+    /// This many store bytes; 0: no limit (a full node).
+    Bytes(u64),
+}
+
+/// `auto`, or a size.
+pub fn parse_initial_max(s: &str) -> Result<InitialMax, String> {
+    if s.trim().eq_ignore_ascii_case("auto") {
+        return Ok(InitialMax::Auto);
+    }
+    parse_size(s).map(InitialMax::Bytes)
 }
 
 /// `docs/config.md`: every key of [`KEYS`] with its default, grouped by

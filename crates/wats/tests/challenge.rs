@@ -33,12 +33,8 @@ async fn eventually(what: &str, mut check: impl AsyncFnMut() -> bool) {
 }
 
 fn sync_request() -> Request {
-    Request::Sync {
-        net: PUBLIC_NET.into(),
-        after_ts: 0,
-        after_id: String::new(),
-        limit: 10,
-    }
+    // What the server holds: it never synced, so it vouches for nothing.
+    Request::sync_after(PUBLIC_NET, 0, "", 10).partial()
 }
 
 /// Whether `node` knows that `peer` can solve challenges.

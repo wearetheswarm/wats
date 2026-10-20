@@ -1,8 +1,10 @@
 //! The wats peer protocol (ALPN `/wats/1`), next to gossip and blobs:
 //!
 //! - `sync`: page through a peer's events of a network, to catch up on what
-//!   gossip delivered while this node was offline (SPEC §2.6, full
-//!   replication);
+//!   gossip delivered while this node was offline: ascending after a
+//!   cursor (ADR 0005), or newest first before one (`sync_desc`, ADR 0025);
+//! - `get`: events by id, the threads they root, or the signals on them
+//!   (ADR 0025 §3), for history fetched on demand;
 //! - `replicate`: ask a peer to hold the blobs of an event (SPEC §2.5,
 //!   replication k at publish time).
 //!
@@ -51,7 +53,25 @@ pub const ALPNS: &[&[u8]] = &[b"/wats/1"];
 /// The same, as numbers, for `hello`.
 pub const PROTOCOL_VERSIONS: &[u32] = &[1];
 /// Optional capabilities, for `hello`.
-pub const FEATURES: &[&str] = &["sync", "replicate", crate::challenge::FEATURE];
+pub const FEATURES: &[&str] = &[
+    "sync",
+    "replicate",
+    crate::challenge::FEATURE,
+    FEATURE_SYNC_DESC,
+    FEATURE_GET,
+];
+/// The node answers descending `sync` (`before_ts`, ADR 0025 §3).
+pub const FEATURE_SYNC_DESC: &str = "sync_desc";
+/// The node answers `get` (ADR 0025 §3).
+pub const FEATURE_GET: &str = "get";
+/// The node holds the complete history of every network it joined: its
+/// `sync.initial_max` is 0, with no cut and no pending range. Advertised
+/// only while it is true.
+pub const FEATURE_HISTORY_FULL: &str = "history_full";
+/// Most entries in a `sync` filter (`kinds`, `authors`).
+pub const MAX_SYNC_FILTER: usize = 32;
+/// Most ids in one `get`.
+pub const MAX_GET_IDS: usize = 64;
 
 /// Largest request a node accepts.
 const MAX_REQUEST_BYTES: usize = 1024 * 1024;
@@ -111,12 +131,39 @@ pub enum Request {
         info: NodeInfo,
     },
     /// Events of `net` strictly after `(after_ts, after_id)` in `(ts, id)`
-    /// order.
+    /// order. With `before_ts` (ADR 0025, peers with `sync_desc` only):
+    /// strictly before `(before_ts, before_id)` and still strictly after
+    /// `(after_ts, after_id)`, newest first. `kinds` and `authors` (at most
+    /// [`MAX_SYNC_FILTER`] each) keep only those events. `partial`: serve
+    /// what is held even where a range of the server is still pending (its
+    /// cut and skipped ranges still stop the page); the requester knows the
+    /// page may be incomplete.
     Sync {
         net: String,
+        #[serde(default)]
         after_ts: u64,
+        #[serde(default)]
         after_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        before_ts: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        before_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        kinds: Vec<String>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        authors: Vec<String>,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        partial: bool,
         limit: u32,
+    },
+    /// Events of `net` by id (ADR 0025 §3), answered with a `sync_page`:
+    /// `include` is `event` (the events held among `ids`), `thread` (the
+    /// thread rooted at each id) or `signals` (what replies to or cites
+    /// them). At most [`MAX_GET_IDS`] ids.
+    Get {
+        net: String,
+        ids: Vec<String>,
+        include: String,
     },
     /// Store `event` and fetch the listed blobs of it from the requester.
     Replicate {
@@ -143,6 +190,17 @@ pub enum Response {
     SyncPage {
         events: Vec<Value>,
         more: bool,
+        /// The page stopped because the history below `hi_ts` is not
+        /// complete on this node (its cut, or a range still pending, ADR
+        /// 0025 §3). Older nodes ignore it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        gap: Option<Gap>,
+        /// When the serving node first stored each event (its
+        /// `received_at`, Unix seconds), in the order of `events`. Optional:
+        /// older nodes neither send nor read it. A parallel list rather than
+        /// a field in each event, which is signed wire JSON.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        seen: Vec<u64>,
     },
     Replicated {
         hashes: Vec<String>,
@@ -169,6 +227,38 @@ pub enum Response {
     /// A response type from a newer protocol revision.
     #[serde(other)]
     Unknown,
+}
+
+/// The `gap` of a `sync_page`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Gap {
+    pub hi_ts: u64,
+}
+
+impl Request {
+    /// An ascending `sync` page request, as every version understands it.
+    pub fn sync_after(net: &str, after_ts: u64, after_id: &str, limit: u32) -> Self {
+        Request::Sync {
+            net: net.to_string(),
+            after_ts,
+            after_id: after_id.to_string(),
+            before_ts: None,
+            before_id: None,
+            kinds: Vec::new(),
+            authors: Vec::new(),
+            partial: false,
+            limit,
+        }
+    }
+
+    /// The same `sync`, asking what the peer holds even in ranges of its
+    /// own still pending: a check, not a claim of complete history.
+    pub fn partial(mut self) -> Self {
+        if let Request::Sync { partial, .. } = &mut self {
+            *partial = true;
+        }
+        self
+    }
 }
 
 /// Send one request to a peer and wait for the response.
@@ -428,15 +518,63 @@ mod tests {
     }
 
     #[test]
-    fn requests_roundtrip_as_json() {
+    fn history_fields_are_optional_both_ways() {
+        // A descending, filtered request round-trips.
         let request = Request::Sync {
             net: "public".into(),
-            after_ts: 1,
+            after_ts: 5,
             after_id: String::new(),
-            limit: 10,
+            before_ts: Some(9),
+            before_id: Some("ab".into()),
+            kinds: vec!["vouch".into()],
+            authors: vec![],
+            partial: true,
+            limit: 8,
         };
         let json = serde_json::to_string(&request).unwrap();
+        assert!(json.contains("\"before_ts\":9") && !json.contains("authors"));
+        assert!(matches!(
+            crate::strict_json::from_slice::<Request>(json.as_bytes()).unwrap(),
+            Request::Sync {
+                before_ts: Some(9),
+                partial: true,
+                ..
+            }
+        ));
+        // A 0.4.0 page has neither `gap` nor `seen`; a 0.4.1 page with them
+        // still reads as a page on any node.
+        let old: Response =
+            crate::strict_json::from_slice(br#"{"type":"sync_page","events":[],"more":false}"#)
+                .unwrap();
+        assert!(matches!(old, Response::SyncPage { gap: None, ref seen, .. } if seen.is_empty()));
+        let new: Response = crate::strict_json::from_slice(
+            br#"{"type":"sync_page","events":[],"more":false,"gap":{"hi_ts":7},"seen":[]}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            new,
+            Response::SyncPage {
+                gap: Some(Gap { hi_ts: 7 }),
+                ..
+            }
+        ));
+        let get: Request = crate::strict_json::from_slice(
+            br#"{"type":"get","net":"public","ids":["ab"],"include":"thread"}"#,
+        )
+        .unwrap();
+        assert!(matches!(get, Request::Get { ref include, .. } if include == "thread"));
+        let ours = NodeInfo::ours();
+        assert!(ours.features.iter().any(|f| f == FEATURE_SYNC_DESC));
+        assert!(ours.features.iter().any(|f| f == FEATURE_GET));
+    }
+
+    #[test]
+    fn requests_roundtrip_as_json() {
+        let request = Request::sync_after("public", 1, "", 10);
+        let json = serde_json::to_string(&request).unwrap();
         assert!(json.contains("\"type\":\"sync\""));
+        // An ascending request carries no new field: older nodes read it.
+        assert!(!json.contains("before") && !json.contains("kinds"));
         assert!(matches!(
             serde_json::from_str::<Request>(&json).unwrap(),
             Request::Sync { limit: 10, .. }

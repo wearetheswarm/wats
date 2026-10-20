@@ -277,6 +277,86 @@ async fn agent_wakes_on_asks_and_heartbeats() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// History fetched while the runner listens (ADR 0025 §4): an ask older
+/// than a day wakes no agent, a recent one synced with it does.
+#[tokio::test(flavor = "multi_thread")]
+async fn history_older_than_a_day_wakes_no_runner() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let a = node(&dir.path().join("a"), &[]).await?;
+    let now = wats::node::now_secs();
+    let asker = |seed: u8| ed25519_dalek::SigningKey::from_bytes(&[seed; 32]);
+    let ancient = wats::halt::sign(
+        ask("an ancient question"),
+        &asker(41),
+        now - 3 * 86_400,
+        Some(0),
+    )?;
+    let fresh = wats::halt::sign(ask("a fresh question"), &asker(42), now - 60, Some(0))?;
+    for event in [&ancient, &fresh] {
+        a.store().insert(event, event.ts)?;
+    }
+    // The runner listens before the node meets the peer holding them.
+    let b = node(&dir.path().join("b"), &[]).await?;
+    let config = AgentConfig {
+        runtime: "claude".into(),
+        profile: "agent".into(),
+        user: "alice".into(),
+        about: "I answer questions.".into(),
+        caps: vec![],
+        every: Duration::from_secs(1),
+        heartbeat: Duration::from_secs(3600),
+        max_runs_per_hour: 100,
+        allow: vec![],
+        ignore_local: true,
+        heartbeat_text: DEFAULT_HEARTBEAT.into(),
+        command: fake_agent(dir.path()),
+        mcp_command: "/usr/bin/true".into(),
+        mcp_args: vec!["mcp".into()],
+        extra_args: vec![],
+        run_timeout: Duration::from_secs(10),
+        max_turns: 10,
+        budget: wats::budget::Budget::default(),
+        wakes: wats::wake::WakeLimits::unlimited(),
+        codex_disable: vec![],
+        codex_enable: vec![],
+        access: wats::access::Access::SwarmOnly,
+        workdir: std::path::PathBuf::from("/nonexistent"),
+        tools: vec![],
+        model: None,
+        work_dir: dir.path().join("work"),
+        data_dir: dir.path().to_path_buf(),
+        keep_runs: 10,
+        keep_days: 30,
+        openclaw: Default::default(),
+        catchup: None,
+    };
+    let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+    let runner = tokio::spawn(wats::agent::run(Arc::clone(&b), config, async {
+        let _ = stopped.await;
+    }));
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    b.add_peer(a.endpoint().addr()).await?;
+    eventually("both asks synced", || {
+        b.store().get(&ancient.id).ok().flatten().is_some()
+            && b.store().get(&fresh.id).ok().flatten().is_some()
+    })
+    .await;
+    eventually("a run for the fresh ask", || {
+        runs(dir.path()).iter().any(|(p, _)| p.contains(&fresh.id))
+    })
+    .await;
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    for (prompt, _) in runs(dir.path()) {
+        assert!(!prompt.contains(&ancient.id), "{prompt}");
+    }
+    let _ = stop.send(());
+    runner.await??;
+    for n in [a, b] {
+        n.shutdown().await?;
+    }
+    Ok(())
+}
+
 /// `wats --agent claude` serves mcp.sock: an interactive `wats mcp` session
 /// (another profile) attaches to the same node, and its ask wakes the
 /// agent. `wats agent runs` and `wats agent logs` then show the run.

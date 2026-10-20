@@ -99,6 +99,39 @@ CREATE TABLE IF NOT EXISTS dropped (
     -- The human's own words (`wats drop --reason`), if any.
     detail    TEXT
 );
+
+-- History ranges (ADR 0025 §5): what this node still has to
+-- fetch newest first (pending), or chose not to hold (cut, skipped).
+CREATE TABLE IF NOT EXISTS sync_ranges (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    net        TEXT NOT NULL,
+    lo_ts      INTEGER NOT NULL,
+    hi_ts      INTEGER NOT NULL,
+    -- The last event fetched, walking down: held above, a hole below.
+    cursor_ts  INTEGER NOT NULL,
+    cursor_id  TEXT NOT NULL,
+    -- pending | cut | skipped | done | unconfirmed
+    state      TEXT NOT NULL,
+    -- The initial fill's phase (keep, own, knowledge, window); '' for a
+    -- catch-up range.
+    phase      TEXT NOT NULL DEFAULT '',
+    -- When it was opened: the watermark once it and every older pending
+    -- range are complete.
+    opened     INTEGER NOT NULL,
+    -- Store bytes when it was opened: its budget counts from there.
+    base_bytes INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS sync_ranges_net ON sync_ranges (net, state);
+
+-- When peers say they first stored an event of a key (`seen` in sync pages,
+-- ADR 0025): the earliest reports of at most 8 peers per key. Recorded for a
+-- later age floor; reputation does not read it yet.
+CREATE TABLE IF NOT EXISTS key_seen (
+    author TEXT NOT NULL,
+    peer   TEXT NOT NULL,
+    seen   INTEGER NOT NULL,
+    PRIMARY KEY (author, peer)
+) WITHOUT ROWID;
 "#;
 
 /// SQL condition on a row `e` of the thread rooted at `?1`: not grafted
@@ -548,6 +581,10 @@ pub struct Filter {
     pub author: Option<String>,
     /// Leave out events by this author (e.g. our own posts in `wait`).
     pub exclude_author: Option<String>,
+    /// Leave out history: events this node stored more than this many
+    /// seconds after their `ts` (`wait`, ADR 0025 §4). Not checked by
+    /// [`Filter::matches`], which sees no arrival time.
+    pub arrived_within: Option<u64>,
 }
 
 impl Filter {
@@ -599,6 +636,10 @@ impl Filter {
         if let Some(author) = &self.exclude_author {
             conds.push("e.author != ?".into());
             args.push(author.clone().into());
+        }
+        if let Some(within) = self.arrived_within {
+            conds.push("e.received_at <= e.ts + ?".into());
+            args.push(sql_ts(within).into());
         }
     }
 }
@@ -685,7 +726,10 @@ impl Store {
             )?;
         }
         // v4 -> v5: the drop records table (ADR 0020), created by SCHEMA
-        // above. Events are kept.
+        // above. Events are kept. The history ranges and the peers' first
+        // sightings (ADR 0025) are created by SCHEMA too, on any version:
+        // no schema bump, so 0.4.0 still opens the store, and the
+        // watermark keeps its meaning, so nothing is synced again.
         if (4..6).contains(&version) {
             // v5 -> v6: the citations table (ADR 0019), filled from the
             // events kept.
@@ -2286,6 +2330,506 @@ impl Store {
     }
 }
 
+/// Where a history range stands (ADR 0025 §5).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RangeState {
+    /// Still to fetch, resumable from its cursor.
+    Pending,
+    /// Below the initial fill's cut, where the budget stopped it: not
+    /// held, on purpose.
+    Cut,
+    /// The budget ran out inside a catch-up: not held, on purpose.
+    Skipped,
+    /// Complete, waiting for older pending ranges before the watermark
+    /// moves.
+    Done,
+    /// Walked to its end, but no trusted peer confirmed that nothing is
+    /// missing: held and served as held, shown as unconfirmed until a
+    /// trusted peer confirms it (ADR 0025 §9).
+    Unconfirmed,
+}
+
+impl RangeState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RangeState::Pending => "pending",
+            RangeState::Cut => "cut",
+            RangeState::Skipped => "skipped",
+            RangeState::Done => "done",
+            RangeState::Unconfirmed => "unconfirmed",
+        }
+    }
+
+    fn parse(s: &str) -> Self {
+        match s {
+            "cut" => RangeState::Cut,
+            "skipped" => RangeState::Skipped,
+            "done" => RangeState::Done,
+            "unconfirmed" => RangeState::Unconfirmed,
+            _ => RangeState::Pending,
+        }
+    }
+}
+
+/// A history range of a network (ADR 0025 §5): what this node still has to
+/// fetch newest first, or chose not to hold.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SyncRange {
+    pub id: i64,
+    pub net: String,
+    pub lo_ts: u64,
+    pub hi_ts: u64,
+    /// The last event fetched walking down: the range is held above it.
+    pub cursor_ts: u64,
+    pub cursor_id: String,
+    pub state: RangeState,
+    /// The initial fill's phase; empty for a catch-up range.
+    pub phase: String,
+    /// When it was opened: the watermark once it is complete.
+    pub opened: u64,
+    /// Store bytes when it was opened.
+    pub base_bytes: u64,
+}
+
+/// The initial fill's last phase: everything, newest first, down to the
+/// budget (ADR 0025 §4, phase 2).
+pub const PHASE_WINDOW: &str = "window";
+
+impl SyncRange {
+    /// The highest `ts` of the hole this range leaves, if any: this node
+    /// does not hold the complete history of `[hole_lo, hole_top]`. Counted
+    /// by whole seconds: events at `hole_top` itself may be missing.
+    pub fn hole_top(&self) -> Option<u64> {
+        match self.state {
+            RangeState::Done | RangeState::Unconfirmed => None,
+            // The initial fill before its window: nothing below its top is
+            // held yet but the kinds of its first phases.
+            RangeState::Pending if !self.phase.is_empty() && self.phase != PHASE_WINDOW => {
+                Some(self.hi_ts)
+            }
+            _ => Some(self.cursor_ts),
+        }
+    }
+
+    /// The bottom of that hole: 0 for a cut.
+    pub fn hole_lo(&self) -> u64 {
+        match self.state {
+            RangeState::Cut => 0,
+            _ => self.lo_ts,
+        }
+    }
+}
+
+/// What a `sync` page asks for, served by [`Store::sync_page`].
+#[derive(Debug, Clone, Default)]
+pub struct PageQuery {
+    pub net: String,
+    /// Strictly after this `(ts, id)`.
+    pub after: (u64, String),
+    /// Strictly before this `(ts, id)`, newest first; `None`: ascending.
+    pub before: Option<(u64, String)>,
+    /// Only events with `ts` above this (a descending page stops at a hole).
+    pub above_ts: Option<u64>,
+    /// Only these kinds (empty: all).
+    pub kinds: Vec<String>,
+    /// Only these authors (empty: all).
+    pub authors: Vec<String>,
+    pub limit: usize,
+}
+
+/// The JSON of a row, with when this node stored it.
+pub type SeenRow = (Value, u64);
+
+/// Rows `(seq, json, received_at)` into [`SeenRow`]s.
+fn seen_rows(conn: &Connection, sql: &str, args: Vec<SqlValue>) -> Result<Vec<SeenRow>> {
+    let mut stmt = conn.prepare_cached(sql)?;
+    let rows = stmt.query_map(params_from_iter(args), |r| {
+        Ok((r.get::<_, String>(1)?, r.get::<_, i64>(2)?))
+    })?;
+    let mut out = Vec::new();
+    for row in rows {
+        let (json, received_at) = row?;
+        out.push((
+            serde_json::from_str(&json).context("corrupt stored event")?,
+            received_at.max(0) as u64,
+        ));
+    }
+    Ok(out)
+}
+
+fn marks(n: usize) -> String {
+    vec!["?"; n].join(",")
+}
+
+/// Peers whose first sightings of a key are kept (ADR 0025 §9).
+pub const SEEN_PEERS: i64 = 8;
+
+/// A Unix time as SQLite stores it.
+fn sql_ts(ts: u64) -> i64 {
+    ts.min(i64::MAX as u64) as i64
+}
+
+impl Store {
+    /// The store bytes (ADR 0025 §1): the used pages of the database, the
+    /// full-text index included. With WAL, `page_count` already counts the
+    /// pages committed to the log.
+    pub fn store_bytes(&self) -> u64 {
+        let conn = self.conn();
+        let pragma = |name: &str| -> i64 {
+            conn.pragma_query_value(None, name, |r| r.get(0))
+                .unwrap_or(0)
+        };
+        let used = pragma("page_count").saturating_sub(pragma("freelist_count"));
+        (used.max(0) as u64).saturating_mul(pragma("page_size").max(0) as u64)
+    }
+
+    /// A page of events of a network for `sync`, as wire JSON with when
+    /// this node stored each: ascending after `after`, or newest first
+    /// between `before` and `after`.
+    pub fn sync_page(&self, q: &PageQuery) -> Result<Vec<SeenRow>> {
+        let mut conds = vec![
+            "net = ?".to_string(),
+            "(ts > ? OR (ts = ? AND id > ?))".to_string(),
+        ];
+        let after_ts = sql_ts(q.after.0);
+        let mut args: Vec<SqlValue> = vec![
+            q.net.clone().into(),
+            after_ts.into(),
+            after_ts.into(),
+            q.after.1.clone().into(),
+        ];
+        if let Some((ts, id)) = &q.before {
+            conds.push("(ts < ? OR (ts = ? AND id < ?))".into());
+            args.extend([sql_ts(*ts).into(), sql_ts(*ts).into(), id.clone().into()]);
+        }
+        if let Some(above) = q.above_ts {
+            conds.push("ts > ?".into());
+            args.push(sql_ts(above).into());
+        }
+        if !q.kinds.is_empty() {
+            conds.push(format!("kind IN ({})", marks(q.kinds.len())));
+            args.extend(q.kinds.iter().map(|k| SqlValue::from(k.clone())));
+        }
+        if !q.authors.is_empty() {
+            conds.push(format!("author IN ({})", marks(q.authors.len())));
+            args.extend(q.authors.iter().map(|a| SqlValue::from(a.clone())));
+        }
+        args.push((q.limit as i64).into());
+        let order = if q.before.is_some() {
+            "ts DESC, id DESC"
+        } else {
+            "ts, id"
+        };
+        let sql = format!(
+            "SELECT seq, json, received_at FROM events WHERE {} ORDER BY {order} LIMIT ?",
+            conds.join(" AND ")
+        );
+        seen_rows(&self.conn(), &sql, args)
+    }
+
+    /// The events of `net` held here among `ids`, full or tombstone.
+    pub fn events_by_ids(&self, net: &str, ids: &[String]) -> Result<Vec<SeenRow>> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut args: Vec<SqlValue> = vec![net.to_string().into()];
+        args.extend(ids.iter().map(|i| SqlValue::from(i.clone())));
+        seen_rows(
+            &self.conn(),
+            &format!(
+                "SELECT seq, json, received_at FROM events WHERE net = ? AND id IN ({})",
+                marks(ids.len())
+            ),
+            args,
+        )
+    }
+
+    /// The thread rooted at `root` in `net`, understood or not, oldest
+    /// first, at most `limit` rows.
+    pub fn thread_rows(&self, net: &str, root: &str, limit: usize) -> Result<Vec<SeenRow>> {
+        seen_rows(
+            &self.conn(),
+            "SELECT seq, json, received_at FROM events
+             WHERE net = ?1 AND (id = ?2 OR thread = ?2) ORDER BY ts, seq LIMIT ?3",
+            vec![
+                net.to_string().into(),
+                root.to_string().into(),
+                (limit as i64).into(),
+            ],
+        )
+    }
+
+    /// The events of `net` that reply to one of `ids` or cite it (the rows
+    /// of [`Store::signal_rows`], as wire JSON), at most `limit`.
+    pub fn signal_events(&self, net: &str, ids: &[String], limit: usize) -> Result<Vec<SeenRow>> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let m = marks(ids.len());
+        let mut args: Vec<SqlValue> = vec![net.to_string().into()];
+        for _ in 0..2 {
+            args.extend(ids.iter().map(|i| SqlValue::from(i.clone())));
+        }
+        args.push((limit as i64).into());
+        seen_rows(
+            &self.conn(),
+            &format!(
+                "SELECT seq, json, received_at FROM events WHERE net = ? AND (parent IN ({m})
+                     OR seq IN (SELECT seq FROM event_refs WHERE ref IN ({m})))
+                 ORDER BY ts, seq LIMIT ?"
+            ),
+            args,
+        )
+    }
+
+    /// The roots of the threads of `net` that `authors` posted in.
+    pub fn threads_of(&self, net: &str, authors: &[String], limit: usize) -> Result<Vec<String>> {
+        if authors.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut args: Vec<SqlValue> = vec![net.to_string().into()];
+        args.extend(authors.iter().map(|a| SqlValue::from(a.clone())));
+        args.push((limit as i64).into());
+        let conn = self.conn();
+        let mut stmt = conn.prepare_cached(&format!(
+            "SELECT DISTINCT COALESCE(thread, id) FROM events
+             WHERE net = ? AND author IN ({}) LIMIT ?",
+            marks(authors.len())
+        ))?;
+        let rows = stmt.query_map(params_from_iter(args), |r| r.get::<_, String>(0))?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    }
+
+    /// The ids of the events of `kind` in `net`, newest first.
+    pub fn ids_of_kind(&self, net: &str, kind: &str, limit: usize) -> Result<Vec<String>> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare_cached(
+            "SELECT id FROM events WHERE net = ? AND kind = ? ORDER BY ts DESC LIMIT ?",
+        )?;
+        let rows = stmt.query_map(params![net, kind, limit as i64], |r| r.get::<_, String>(0))?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    }
+
+    /// The oldest event timestamp of a network, if any.
+    pub fn oldest_ts(&self, net: &str) -> Result<Option<u64>> {
+        let ts: Option<i64> =
+            self.conn()
+                .query_row("SELECT min(ts) FROM events WHERE net = ?", [net], |r| {
+                    r.get(0)
+                })?;
+        Ok(ts.map(|t| t.max(0) as u64))
+    }
+
+    /// The history ranges of a network, newest first.
+    pub fn sync_ranges(&self, net: &str) -> Result<Vec<SyncRange>> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare_cached(
+            "SELECT id, net, lo_ts, hi_ts, cursor_ts, cursor_id, state, phase, opened, base_bytes
+             FROM sync_ranges WHERE net = ? ORDER BY hi_ts DESC, id DESC",
+        )?;
+        let rows = stmt.query_map([net], |r| {
+            let n = |i: usize| r.get::<_, i64>(i).map(|v| v.max(0) as u64);
+            Ok(SyncRange {
+                id: r.get(0)?,
+                net: r.get(1)?,
+                lo_ts: n(2)?,
+                hi_ts: n(3)?,
+                cursor_ts: n(4)?,
+                cursor_id: r.get(5)?,
+                state: RangeState::parse(&r.get::<_, String>(6)?),
+                phase: r.get(7)?,
+                opened: n(8)?,
+                base_bytes: n(9)?,
+            })
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    }
+
+    /// Record a range (its `id` is ignored); returns its id.
+    pub fn add_sync_range(&self, range: &SyncRange) -> Result<i64> {
+        let conn = self.conn();
+        conn.execute(
+            "INSERT INTO sync_ranges
+                 (net, lo_ts, hi_ts, cursor_ts, cursor_id, state, phase, opened, base_bytes)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            params![
+                range.net,
+                sql_ts(range.lo_ts),
+                sql_ts(range.hi_ts),
+                sql_ts(range.cursor_ts),
+                range.cursor_id,
+                range.state.as_str(),
+                range.phase,
+                sql_ts(range.opened),
+                sql_ts(range.base_bytes),
+            ],
+        )?;
+        Ok(conn.last_insert_rowid())
+    }
+
+    /// Store a range's bounds, cursor, phase and state.
+    pub fn update_sync_range(&self, range: &SyncRange) -> Result<()> {
+        self.conn().execute(
+            "UPDATE sync_ranges SET lo_ts = ?, hi_ts = ?, cursor_ts = ?, cursor_id = ?,
+                 state = ?, phase = ?, opened = ?, base_bytes = ? WHERE id = ?",
+            params![
+                sql_ts(range.lo_ts),
+                sql_ts(range.hi_ts),
+                sql_ts(range.cursor_ts),
+                range.cursor_id,
+                range.state.as_str(),
+                range.phase,
+                sql_ts(range.opened),
+                sql_ts(range.base_bytes),
+                range.id,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Forget a range.
+    pub fn delete_sync_range(&self, id: i64) -> Result<()> {
+        self.conn()
+            .execute("DELETE FROM sync_ranges WHERE id = ?", [id])?;
+        Ok(())
+    }
+
+    /// Once no range of `net` is pending: the watermark becomes the opening
+    /// time of the newest range completed (or skipped), and the completed
+    /// ones are forgotten (ADR 0025 §5). Returns the new watermark, if it moved.
+    pub fn settle_sync_ranges(&self, net: &str) -> Result<Option<u64>> {
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        let pending: bool = tx.query_row(
+            "SELECT EXISTS (SELECT 1 FROM sync_ranges WHERE net = ? AND state = 'pending')",
+            [net],
+            |r| r.get(0),
+        )?;
+        if pending {
+            return Ok(None);
+        }
+        // A range skipped for the budget is over too, on purpose, and an
+        // unconfirmed one was walked to its end.
+        let opened: Option<i64> = tx.query_row(
+            "SELECT max(opened) FROM sync_ranges WHERE net = ?
+             AND state IN ('done', 'skipped', 'unconfirmed')",
+            [net],
+            |r| r.get(0),
+        )?;
+        let Some(opened) = opened else {
+            return Ok(None);
+        };
+        tx.execute(
+            "DELETE FROM sync_ranges WHERE net = ? AND state = 'done'",
+            [net],
+        )?;
+        let current: Option<i64> = tx
+            .query_row(
+                "SELECT watermark FROM sync_state WHERE net = ?",
+                [net],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let moved = current.is_none_or(|w| opened > w);
+        if moved {
+            tx.execute(
+                "INSERT INTO sync_state (net, watermark) VALUES (?1, ?2)
+                 ON CONFLICT (net) DO UPDATE SET watermark = max(watermark, ?2)",
+                params![net, opened],
+            )?;
+        }
+        tx.commit()?;
+        Ok(moved.then_some(opened.max(0) as u64))
+    }
+
+    /// Record what `peer` says about when it first stored events of these
+    /// authors (`seen` in sync pages): its earliest report per author. The
+    /// callers pass only events they stored, by their verified author. At
+    /// most [`SEEN_PEERS`] peers per key: the earliest reports are kept.
+    pub fn record_seen(&self, peer: &str, reports: &[(String, u64)]) -> Result<()> {
+        if reports.is_empty() {
+            return Ok(());
+        }
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        {
+            let mut known = tx.prepare_cached(
+                "UPDATE key_seen SET seen = min(seen, ?3) WHERE author = ?1 AND peer = ?2",
+            )?;
+            let mut latest = tx.prepare_cached(
+                "SELECT peer, seen, (SELECT count(*) FROM key_seen WHERE author = ?1)
+                 FROM key_seen WHERE author = ?1 ORDER BY seen DESC, peer DESC LIMIT 1",
+            )?;
+            let mut forget =
+                tx.prepare_cached("DELETE FROM key_seen WHERE author = ?1 AND peer = ?2")?;
+            let mut insert =
+                tx.prepare_cached("INSERT INTO key_seen (author, peer, seen) VALUES (?1, ?2, ?3)")?;
+            for (author, seen) in reports {
+                if author.len() > 64 {
+                    continue;
+                }
+                let seen = sql_ts(*seen);
+                if known.execute(params![author, peer, seen])? > 0 {
+                    continue;
+                }
+                let last: Option<(String, i64, i64)> = latest
+                    .query_row([author], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+                    .optional()?;
+                match last {
+                    Some((_, _, count)) if count < SEEN_PEERS => {}
+                    None => {}
+                    // Full: the latest report gives way to an earlier one.
+                    Some((other, latest, _)) if seen < latest => {
+                        forget.execute(params![author, other])?;
+                    }
+                    Some(_) => continue,
+                }
+                insert.execute(params![author, peer, seen])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// When the swarm first saw `author`, from the peers' reports: the
+    /// median of their earliest sightings, with at least three distinct
+    /// peers, no earlier than the oldest `ts` the key claims and no later
+    /// than this node's own first sight. Recorded for a later age floor
+    /// (ADR 0025); reputation does not read it yet.
+    pub fn author_seen_estimate(&self, author: &str) -> Result<Option<u64>> {
+        let mut seen: Vec<u64> = {
+            let conn = self.conn();
+            let mut stmt = conn.prepare_cached("SELECT seen FROM key_seen WHERE author = ?")?;
+            let rows = stmt.query_map([author], |r| r.get::<_, i64>(0))?;
+            rows.map(|r| r.map(|v| v.max(0) as u64))
+                .collect::<rusqlite::Result<_>>()?
+        };
+        if seen.len() < 3 {
+            return Ok(None);
+        }
+        seen.sort_unstable();
+        let Some(&median) = seen.get(seen.len() / 2) else {
+            return Ok(None);
+        };
+        let (oldest, first): (Option<i64>, Option<i64>) = self.conn().query_row(
+            "SELECT min(ts), min(received_at) FROM events WHERE author = ?",
+            [author],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        let mut estimate = median;
+        if let Some(first) = first {
+            estimate = estimate.min(first.max(0) as u64);
+        }
+        if let Some(oldest) = oldest {
+            estimate = estimate.max(oldest.max(0) as u64);
+        }
+        Ok(Some(estimate))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3271,5 +3815,283 @@ mod tests {
 
     fn hex_key(seed: u8) -> String {
         hex::encode(key(seed).verifying_key().as_bytes())
+    }
+    fn range(lo: u64, hi: u64, phase: &str) -> SyncRange {
+        SyncRange {
+            id: 0,
+            net: "public".into(),
+            lo_ts: lo,
+            hi_ts: hi,
+            cursor_ts: hi,
+            cursor_id: String::new(),
+            state: RangeState::Pending,
+            phase: phase.into(),
+            opened: hi.saturating_sub(600),
+            base_bytes: 0,
+        }
+    }
+
+    #[test]
+    fn descending_pages_with_filters() {
+        let store = Store::open_in_memory().unwrap();
+        let events: Vec<Event> = (0..10u8)
+            .map(|i| {
+                let kind = if i % 3 == 0 {
+                    Kind::Announce
+                } else {
+                    Kind::Note
+                };
+                post(i % 2 + 1, 100 + u64::from(i), kind, &[], &format!("e{i}"))
+            })
+            .collect();
+        for (i, e) in events.iter().enumerate() {
+            store.insert(e, 1000 + i as u64).unwrap();
+        }
+        let ts = |rows: &[SeenRow]| -> Vec<u64> {
+            rows.iter()
+                .map(|(v, _)| v["ts"].as_u64().unwrap())
+                .collect()
+        };
+        let mut q = PageQuery {
+            net: "public".into(),
+            before: Some((108, String::new())),
+            limit: 3,
+            ..PageQuery::default()
+        };
+        let page = store.sync_page(&q).unwrap();
+        assert_eq!(ts(&page), [107, 106, 105]);
+        // Each event carries when this node stored it.
+        assert_eq!(page[0].1, 1007);
+        // A lower bound with no id keeps its own second: a range's `lo`.
+        q.after = (104, String::new());
+        q.limit = 10;
+        assert_eq!(ts(&store.sync_page(&q).unwrap()), [107, 106, 105, 104]);
+        q.after = (0, String::new());
+        q.above_ts = Some(102);
+        assert_eq!(ts(&store.sync_page(&q).unwrap()), [107, 106, 105, 104, 103]);
+        q.above_ts = None;
+        q.kinds = vec!["announce".into()];
+        assert_eq!(ts(&store.sync_page(&q).unwrap()), [106, 103, 100]);
+        q.authors = vec![events[0].author.clone()];
+        assert_eq!(ts(&store.sync_page(&q).unwrap()), [106, 100]);
+        // Ascending, as 0.4.0 serves it.
+        let up = PageQuery {
+            net: "public".into(),
+            after: (107, String::new()),
+            limit: 10,
+            ..PageQuery::default()
+        };
+        assert_eq!(ts(&store.sync_page(&up).unwrap()), [107, 108, 109]);
+    }
+
+    #[test]
+    fn ranges_hold_their_holes_and_move_the_watermark_last() {
+        let store = Store::open_in_memory().unwrap();
+        store.set_sync_watermark("public", 1_000).unwrap();
+        // An interrupted catch-up: its cursor half-way down.
+        store.add_sync_range(&range(400, 2_000, "")).unwrap();
+        let mut walked = store.sync_ranges("public").unwrap().remove(0);
+        (walked.cursor_ts, walked.cursor_id) = (1_500, "ab".into());
+        store.update_sync_range(&walked).unwrap();
+        assert_eq!(walked.hole_top(), Some(1_500));
+        assert_eq!(walked.hole_lo(), 400);
+        // A newer one above it, completed first: the watermark waits.
+        store.add_sync_range(&range(1_400, 3_000, "")).unwrap();
+        let mut newer = store.sync_ranges("public").unwrap().remove(0);
+        assert_eq!(newer.hi_ts, 3_000, "newest first");
+        newer.state = RangeState::Done;
+        store.update_sync_range(&newer).unwrap();
+        assert_eq!(newer.hole_top(), None);
+        assert_eq!(store.settle_sync_ranges("public").unwrap(), None);
+        assert_eq!(store.sync_watermark("public").unwrap(), 1_000);
+        // The old one resumes and completes: the newest opening wins.
+        walked.state = RangeState::Done;
+        store.update_sync_range(&walked).unwrap();
+        assert_eq!(store.settle_sync_ranges("public").unwrap(), Some(2_400));
+        assert_eq!(store.sync_watermark("public").unwrap(), 2_400);
+        assert!(store.sync_ranges("public").unwrap().is_empty());
+        // A cut is a hole from 0; a skipped range one of its own; both stay.
+        let mut cut = range(0, 500, "");
+        cut.state = RangeState::Cut;
+        store.add_sync_range(&cut).unwrap();
+        let mut skipped = range(2_000, 2_200, "");
+        skipped.state = RangeState::Skipped;
+        skipped.opened = 2_600;
+        store.add_sync_range(&skipped).unwrap();
+        let holes: Vec<(u64, Option<u64>)> = store
+            .sync_ranges("public")
+            .unwrap()
+            .iter()
+            .map(|r| (r.hole_lo(), r.hole_top()))
+            .collect();
+        assert_eq!(holes, [(2_000, Some(2_200)), (0, Some(500))]);
+        assert_eq!(store.settle_sync_ranges("public").unwrap(), Some(2_600));
+        assert_eq!(store.sync_ranges("public").unwrap().len(), 2);
+        // The initial fill before its window holds nothing below its top.
+        let fill = range(0, 9_000, "keep");
+        assert_eq!(fill.hole_top(), Some(9_000));
+        let mut window = fill.clone();
+        (window.phase, window.cursor_ts) = (PHASE_WINDOW.into(), 7_000);
+        assert_eq!(window.hole_top(), Some(7_000));
+    }
+
+    #[test]
+    fn history_tables_need_no_schema_bump() {
+        let store = Store::open_in_memory().unwrap();
+        let event = post(1, 10, Kind::Note, &[], "kept across the migration");
+        store.insert(&event, 10).unwrap();
+        store.set_sync_watermark("public", 77).unwrap();
+        let conn = store.conn.into_inner().unwrap();
+        conn.execute_batch("DROP TABLE sync_ranges; DROP TABLE key_seen;")
+            .unwrap();
+        let store = Store::init(conn).unwrap();
+        let version: i64 = store
+            .conn()
+            .pragma_query_value(None, "user_version", |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, 7, "a store 0.4.0 still opens");
+        assert_eq!(store.count().unwrap(), 1);
+        assert_eq!(
+            store.sync_watermark("public").unwrap(),
+            77,
+            "its meaning kept"
+        );
+        assert!(store.sync_ranges("public").unwrap().is_empty());
+        store.add_sync_range(&range(0, 100, "keep")).unwrap();
+        assert!(store.store_bytes() > 0);
+    }
+
+    #[test]
+    fn peers_first_sightings_need_three_peers_and_are_clamped() {
+        let store = Store::open_in_memory().unwrap();
+        let event = post(3, 1_000, Kind::Note, &[], "a key's first post");
+        store.insert(&event, 5_000).unwrap();
+        let author = event.author.clone();
+        store.record_seen("p1", &[(author.clone(), 2_000)]).unwrap();
+        store.record_seen("p2", &[(author.clone(), 3_000)]).unwrap();
+        assert_eq!(store.author_seen_estimate(&author).unwrap(), None);
+        // A peer's earliest report counts.
+        store.record_seen("p2", &[(author.clone(), 2_500)]).unwrap();
+        store.record_seen("p2", &[(author.clone(), 9_000)]).unwrap();
+        store.record_seen("p3", &[(author.clone(), 4_000)]).unwrap();
+        assert_eq!(store.author_seen_estimate(&author).unwrap(), Some(2_500));
+        // Never before the oldest ts it claims, never after our own sight.
+        for peer in ["p4", "p5", "p6", "p7"] {
+            store.record_seen(peer, &[(author.clone(), 1)]).unwrap();
+        }
+        assert_eq!(store.author_seen_estimate(&author).unwrap(), Some(1_000));
+        let late = post(4, 1_000, Kind::Note, &[], "seen late by peers");
+        store.insert(&late, 1_200).unwrap();
+        for peer in ["p1", "p2", "p3"] {
+            store
+                .record_seen(peer, &[(late.author.clone(), 9_000)])
+                .unwrap();
+        }
+        assert_eq!(
+            store.author_seen_estimate(&late.author).unwrap(),
+            Some(1_200)
+        );
+    }
+
+    #[test]
+    fn first_sightings_keep_the_earliest_of_eight_peers() {
+        let store = Store::open_in_memory().unwrap();
+        let author = "ab".repeat(32);
+        for i in 0..12u64 {
+            store
+                .record_seen(&format!("p{i}"), &[(author.clone(), 1_000 + i * 10)])
+                .unwrap();
+        }
+        // An earlier report from a new peer replaces the latest one.
+        store
+            .record_seen("early", &[(author.clone(), 500)])
+            .unwrap();
+        let rows: Vec<(String, i64)> = {
+            let conn = store.conn();
+            let mut stmt = conn
+                .prepare("SELECT peer, seen FROM key_seen WHERE author = ? ORDER BY seen")
+                .unwrap();
+            stmt.query_map([&author], |r| Ok((r.get(0)?, r.get(1)?)))
+                .unwrap()
+                .map(Result::unwrap)
+                .collect()
+        };
+        assert_eq!(rows.len(), SEEN_PEERS as usize);
+        assert_eq!(rows[0], ("early".to_string(), 500));
+        assert_eq!(rows[7], ("p6".to_string(), 1_060));
+        // Too long to be a key: not recorded.
+        store.record_seen("p1", &[("x".repeat(65), 1)]).unwrap();
+        let count: i64 = store
+            .conn()
+            .query_row("SELECT count(*) FROM key_seen", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, SEEN_PEERS);
+    }
+
+    /// Store bytes per event at 50k events, for `sync.initial_max`
+    /// (ADR 0025 §2): `cargo test -p wats --lib -- --ignored
+    /// store_bytes_at_50k --nocapture`.
+    #[test]
+    #[ignore]
+    fn store_bytes_at_50k_events() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("events.sqlite")).unwrap();
+        let empty = store.store_bytes();
+        let keys: Vec<SigningKey> = (0..200u16)
+            .map(|i| {
+                let mut bytes = [9u8; 32];
+                bytes[..2].copy_from_slice(&i.to_be_bytes());
+                SigningKey::from_bytes(&bytes)
+            })
+            .collect();
+        let text = "a typical answer, a few lines long, about linking Rust on musl. ";
+        let mut roots: Vec<Event> = Vec::new();
+        for i in 0..50_000usize {
+            let key = &keys[i % keys.len()];
+            let ts = 1_700_000_000 + i as u64;
+            let event = if i % 5 == 0 || roots.is_empty() {
+                Draft {
+                    net: "public".into(),
+                    kind: Some(Kind::Ask),
+                    title: Some(format!("question {i}")),
+                    text: text.repeat(3),
+                    tags: vec!["rust".into(), "musl".into()],
+                    ..Draft::default()
+                }
+                .sign(key, ts, 0)
+                .unwrap()
+            } else {
+                let parent = &roots[roots.len() - 1 - (i % roots.len().min(20))];
+                let (kind, body, data) = match i % 3 {
+                    0 => (
+                        Kind::React,
+                        "+1".to_string(),
+                        serde_json::json!({"value": 1}),
+                    ),
+                    _ => (Kind::Answer, text.repeat(4), serde_json::json!({})),
+                };
+                Draft {
+                    net: "public".into(),
+                    thread: Some(parent.thread_root().to_string()),
+                    parent: Some(parent.id.clone()),
+                    kind: Some(kind),
+                    text: body,
+                    data: data.as_object().unwrap().clone(),
+                    ..Draft::default()
+                }
+                .sign(key, ts, 0)
+                .unwrap()
+            };
+            store.insert(&event, ts).unwrap();
+            if event.kind == Kind::Ask {
+                roots.push(event);
+            }
+        }
+        let bytes = store.store_bytes() - empty;
+        println!(
+            "50k events: {} store bytes, {} per event",
+            bytes,
+            bytes / 50_000
+        );
     }
 }

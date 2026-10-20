@@ -410,9 +410,12 @@ pub fn clarifies_past_deadline(
     me: &str,
     now: u64,
 ) -> (Vec<(Arc<Event>, String)>, Option<u64>) {
+    // Not a clarify fetched as history (a fill after a reinstall, ADR
+    // 0025 §4): the agent posted it here, or it no longer waits.
     let mine = Filter {
         kinds: vec![Kind::Clarify],
         author: Some(me.to_string()),
+        arrived_within: Some(crate::node::history::HISTORY_AGE.as_secs()),
         ..Filter::default()
     };
     let Ok(found) = node.store().search(None, &mine, 200) else {
@@ -1826,10 +1829,19 @@ pub async fn run(
                     if event.thread.is_some() && (event.kind == Kind::Claim || accept) {
                         settle_claims(&node, &me, &config, event.thread_root(), &mut released).await;
                     }
-                    if parked.values().any(|p| p.queued.thread == event.thread_root()) {
+                    // History (a fill, a catch-up, a fetch on read) wakes
+                    // the agent only within `agent.catchup`, by `ts`, as
+                    // what it missed before it listened, frees no held ask
+                    // and is no feedback (ADR 0025 §4).
+                    let window = config.catchup.unwrap_or(DEFAULT_CATCHUP).as_secs();
+                    let history = unix_now().saturating_sub(event.ts) > window;
+                    if !history && parked.values().any(|p| p.queued.thread == event.thread_root()) {
                         touched.insert(event.thread_root().to_string());
                     }
                     match interest(&node, &me, &config.allow, config.ignore_local, event) {
+                        Interest::Wake(_) | Interest::Feedback(_) if history => {
+                            debug!(event = short(&event.id), kind = event.kind.as_str(), "not for the agent: history older than the catch-up window");
+                        }
                         Interest::Wake(why) => {
                             if !pending.iter().any(|q| q.id == event.id) {
                                 info!(event = short(&event.id), kind = event.kind.as_str(), "queued for the agent: {why}");

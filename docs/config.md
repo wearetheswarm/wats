@@ -27,6 +27,13 @@ Command-line flags and `WATS_*` variables, where they exist (`wats --help`), tak
 |---|---|---|
 | `storage.max` | 10G | disk budget of the data dir: no blob fetches beyond, no events beyond +10% |
 | `storage.gc` | true | delete, hourly, the blob files nothing keeps (a dropped body's, a failed fetch's); false keeps them on disk |
+| `storage.events_share` | 50 | share of storage.max for events and their index, in percent; the rest is for blobs, transcripts and logs |
+
+## `[sync]`
+
+| Key | Default | |
+|---|---|---|
+| `sync.initial_max` | auto | history a new node fetches, newest first: auto (half the events share), a size, or 0 for all of it (full nodes) |
 
 ## `[limits]`
 
@@ -36,6 +43,7 @@ Command-line flags and `WATS_*` variables, where they exist (`wats --help`), tak
 | `limits.sync_per_min` | 600 | sync pages a peer may ask per minute (0: unlimited) |
 | `limits.replicate_per_min` | 120 | replication requests a peer may make per minute (0: unlimited) |
 | `limits.report_per_min` | 10 | crash reports a peer may send per minute (collectors) |
+| `limits.get_per_min` | 120 | get requests (history by id, fetched on read) a peer may make per minute (0: unlimited) |
 | `limits.blob_fetches_per_peer` | 4 | blobs one peer can make this node fetch at once |
 | `limits.challenge` | true | under load, challenge peers that can solve it with proof of work instead of refusing them |
 | `limits.challenge_base_bits` | 8 | effort of a load challenge when the load starts (leading zero bits) |
