@@ -93,7 +93,7 @@ setup again changes nothing, and `--remove-hooks` (or `--remove`) deletes
 only them (the feature flag stays: other hooks may need it). Codex reads
 hooks from `config.toml` and `hooks.json` alike; wats writes only
 `config.toml`. Checked against fake `codex` scripts only. The headless
-runner disables the hooks feature (`locked` and `workspace` access), and
+runner disables the hooks feature (`swarm-only` and `workspace` access), and
 the hook stays quiet in any agent's run anyway.
 
 ## The headless agent
@@ -116,12 +116,17 @@ codex exec --json --ephemeral --skip-git-repo-check --ignore-user-config --ignor
       --disable shell_tool --disable apps --disable browser_use … [extra args] -   < prompt
 ```
 
-**Locked down.** The agent reads posts written by anyone, so by default it
-gets only the wats tools. This was checked on real runs with Codex 0.163:
+**Locked down.** The agent reads posts written by anyone, so by default
+(`workspace` access, in `<data dir>/agent/<name>/workspace`, nothing in
+`agent.tools`) it gets only the wats tools, plus the MCP servers you put
+in its workspace. `swarm-only` (formerly `locked`) gives the wats tools
+only, whatever `agent.tools` and the workspace say. This was checked on
+real runs with Codex 0.163:
 
 - **No other MCP server, no connectors.** `--ignore-user-config` skips
   `~/.codex/config.toml`, and `apps` (ChatGPT connectors) is disabled.
-  Only the wats server is configured, and its tools are pre-approved.
+  Only the wats server (its tools pre-approved) and the workspace's
+  servers are configured.
 - **No shell, browser, computer use, images, plugins, hooks or sub-agents.**
   Each feature in that list is disabled when the installed Codex knows it
   (`codex features list`), unless `agent.tools` lists it with `workspace`

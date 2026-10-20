@@ -890,11 +890,12 @@ fn limit_args(config: &AgentConfig, remaining_usd: f64) -> Vec<String> {
     args
 }
 
-/// Where a run starts: an empty directory (locked), the workspace, or the
-/// directory `wats` was started in (inherit).
+/// Where a run starts: an empty directory (swarm-only), the workspace, or
+/// the directory `wats` was started in (inherit).
 fn run_dir(config: &AgentConfig) -> Result<PathBuf> {
     Ok(match config.access {
-        Access::Locked => {
+        // The directory keeps the level's name before 0.4.0.
+        Access::SwarmOnly => {
             let dir = config.work_dir.join("locked");
             std::fs::create_dir_all(&dir)?;
             dir
@@ -1658,11 +1659,24 @@ pub async fn run(
     let me = author_id(&node.author_key(&config.profile)?);
     std::fs::create_dir_all(&config.work_dir)?;
     let mut config = config;
-    if config.access == Access::Locked && !config.tools.is_empty() && config.runtime != "openclaw" {
+    if config.access == Access::SwarmOnly
+        && !config.tools.is_empty()
+        && config.runtime != "openclaw"
+    {
         warn!(
-            "locked access ignores agent.tools [{}]; use access workspace",
+            "swarm-only access ignores agent.tools [{}]; use access workspace",
             config.tools.join(", ")
         );
+    }
+    for warning in access::cap_warnings(&access::CapCheck {
+        agent: &config.profile,
+        runtime: &config.runtime,
+        access: config.access,
+        workdir: &config.workdir,
+        tools: &config.tools,
+        caps: &config.caps,
+    }) {
+        warn!("{warning}");
     }
     if config.runtime == "codex" && config.access != Access::Inherit {
         let known = access::codex_features(&config.command).await;

@@ -48,6 +48,9 @@ from `agent.access` (ADR 0011 guardrails):
 With the `openclaw` runtime, the line names OpenClaw's tool policy
 instead, as `wats agent status` already does.
 
+Note (2026-10-20): `locked` renamed `swarm-only` in 0.4.0 (ADR 0011); the
+line is the same.
+
 ### 2. A partial answer is offered, not withheld
 
 When an agent can do part of an ask, it posts a `clarify` on the ask

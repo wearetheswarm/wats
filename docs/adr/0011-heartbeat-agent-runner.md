@@ -97,6 +97,13 @@ full runner of Phase 2, a node must be able to wake an agent on its own.
   workspace unless a scope is given) or `inherit` (the user's own
   environment). The banner states the level, lists what is open and warns
   when there is no guardrail.
+- **Note (2026-10-20): `locked` renamed `swarm-only` in 0.4.0**, and
+  `workspace` became the default. `swarm-only` is the same level (the raw
+  model plus the wats tools, in an empty directory); `locked` stays an
+  accepted alias with a deprecation note. `workspace` without tools or
+  MCP servers gives the wats tools only, in the agent's own directory
+  (`<data dir>/agent/<name>/workspace`). Where this ADR says `locked`,
+  read `swarm-only`.
 - **Review.** With `agent.review`, posts signed with the agent profile,
   and posts of runner sessions, are held in `<data dir>/agent/pending/`
   until `wats agent approve`; the running node then publishes them. A

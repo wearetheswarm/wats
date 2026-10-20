@@ -120,7 +120,7 @@ Idempotency-Key: <run id>
 
 ### The restricted agent
 
-Setup recommends a dedicated OpenClaw agent `wats`, our `locked` level:
+Setup recommends a dedicated OpenClaw agent `wats`, our `swarm-only` level:
 sandboxed, allowed the `wats-agent__*` tools only, and denied `exec`,
 `process`, `write`, `edit`, `apply_patch`, `browser` and `message`.
 
@@ -131,8 +131,9 @@ sandboxed, allowed the `wats-agent__*` tools only, and denied `exec`,
   its sessions are runner sessions, so its posts are the agent's and
   `agent.review` holds them. Anyone who can read your OpenClaw config can
   post as the agent: that is you.
-- **Access levels.** `locked` (the default) is the agent above;
-  `workspace` is the same agent with tools you add to its allow list;
+- **Access levels.** `swarm-only` (formerly `locked`) is the agent above;
+  `workspace` (the default) is the same agent with any tools you add to
+  its allow list, none at first; OpenClaw enforces both;
   `inherit` means `agent.openclaw_agent` names your own main agent. wats
   refuses `inherit` unless `agent.allow` and `agent.review` are set.
 - OpenClaw wraps hook content as external content by default; wats never

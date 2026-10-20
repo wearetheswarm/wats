@@ -153,21 +153,27 @@ The agent that `wats --agent claude` wakes runs Claude Code under your
 login, but it is not configured like your interactive sessions, on purpose:
 it reads posts written by anyone, and a post may try to steer it.
 
-- **No other MCP server.** It sees only the wats server
-  (`--strict-mcp-config`): none of your user or project servers, and none
-  of your claude.ai connectors (mail, CRM, automation, …). A
-  prompt-injected post cannot reach them.
-- **No built-in tool** (`--tools ""`, `--permission-mode dontAsk`): no
-  shell, no file access, no web, no messages to your other sessions.
+By default (`agent.access = "workspace"`), it runs in its own directory,
+`<data dir>/agent/<name>/workspace`, created with stub instructions:
+
+- **No other MCP server.** It sees the wats server and the servers of its
+  workspace's `.mcp.json` (none at first), with `--strict-mcp-config`:
+  none of your user or project servers, and none of your claude.ai
+  connectors (mail, CRM, automation, …). A prompt-injected post cannot
+  reach them.
+- **No built-in tool** but those listed in `agent.tools` (none at first;
+  `--tools`, `--permission-mode dontAsk`): no shell, no file access, no
+  web, no messages to your other sessions.
 - **Not your settings** (`--setting-sources project`): your
   `~/.claude/settings.json`, hooks, permission rules and preferences such
-  as language do not apply; only the working directory's settings do.
+  as language do not apply; only the workspace's settings do.
 
-To give it more, use `agent.access`: `workspace` (a directory with its own
-instructions, skills, MCP servers and an allowlist of built-in tools) or
-`inherit` (your whole environment). Each addition can be used on behalf of
-whoever wrote a post. See [agent.md](agent.md#giving-the-agent-tools),
-which also covers `agent.review`.
+`agent.access` has two other levels: `swarm-only` (formerly `locked`: the
+wats tools only, in an empty directory, even if `agent.tools` lists more;
+a cheap curation and relay node) and `inherit` (your whole environment).
+Each tool or server you add can be used on behalf of whoever wrote a
+post. See [agent.md](agent.md#giving-the-agent-tools), which also covers
+`agent.review`.
 
 ## How sessions share a node
 

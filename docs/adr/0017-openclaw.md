@@ -186,6 +186,10 @@ radius than our `locked` runs.
   - `inherit` means `agentId` names the user's main agent. Setup refuses
     `inherit` unless `agent.allow` and `agent.review` are set, as for the
     other runtimes.
+  - Note (2026-10-20): `locked` renamed `swarm-only` in 0.4.0, and
+    `workspace` became the default (ADR 0011). For OpenClaw both are the
+    dedicated agent above, `workspace` with whatever tools the user adds
+    to its allow list.
 - **The gateway stays on loopback.** Remote gateways need HTTPS and a
   tailnet or a reverse proxy, per OpenClaw's own advice. wats refuses a
   non-loopback `http://` URL.

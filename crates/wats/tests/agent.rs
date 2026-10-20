@@ -116,7 +116,7 @@ async fn agent_wakes_on_asks_and_heartbeats() -> anyhow::Result<()> {
         wakes: wats::wake::WakeLimits::unlimited(),
         codex_disable: vec![],
         codex_enable: vec![],
-        access: wats::access::Access::Locked,
+        access: wats::access::Access::SwarmOnly,
         workdir: std::path::PathBuf::from("/nonexistent"),
         tools: vec![],
         model: None,
@@ -635,6 +635,105 @@ async fn bare_wats_runs_agents_from_config_toml() {
     assert!(!out.status.success(), "a typo in config.toml is an error");
 }
 
+/// Run `wats` until a stderr line contains `until` (or 20 s), then stop
+/// it; returns stderr.
+async fn stderr_until(cmd: &mut tokio::process::Command, until: &str) -> String {
+    use tokio::io::AsyncBufReadExt;
+    let mut child = cmd
+        .stderr(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    let mut lines = tokio::io::BufReader::new(child.stderr.take().unwrap()).lines();
+    let mut seen = String::new();
+    let read = async {
+        while let Ok(Some(line)) = lines.next_line().await {
+            seen.push_str(&line);
+            seen.push('\n');
+            if line.contains(until) {
+                break;
+            }
+        }
+    };
+    let _ = tokio::time::timeout(Duration::from_secs(20), read).await;
+    child.kill().await.unwrap();
+    seen
+}
+
+/// 0.4.0: an agent without `access` runs with workspace access, in its
+/// own workspace; `locked` (config.toml or `--access`) is the old name of
+/// swarm-only, with a deprecation note. A declared cap that no tool backs
+/// is warned about at start (`image-gen`), an unknown one (`pdf`) never.
+#[tokio::test(flavor = "multi_thread")]
+async fn access_defaults_to_workspace_and_caps_without_tools_warn() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("data");
+    let home = dir.path().join("home");
+    std::fs::create_dir_all(&data).unwrap();
+    std::fs::create_dir_all(&home).unwrap();
+    let agent = "[agents.helper]\nruntime = \"claude\"\ncommand = \"/usr/bin/true\"\n\
+                 heartbeat = \"2h\"\ncaps = [\"image-gen\", \"pdf\"]\n";
+    let wats = env!("CARGO_BIN_EXE_wats");
+    let base = |extra: &[&str]| {
+        let mut cmd = tokio::process::Command::new(wats);
+        cmd.env("HOME", &home)
+            .env("USER", "tester")
+            .env_remove("CLAUDE_CONFIG_DIR")
+            .env_remove("WATS_PROFILE")
+            .args(["--loopback", "--infra", "none", "--dir"])
+            .arg(&data)
+            .args(extra);
+        cmd
+    };
+    // The runner warns about the caps, then about the empty about.
+    let started = "agent.about is empty";
+    std::fs::write(data.join("config.toml"), agent).unwrap();
+    let err = stderr_until(&mut base(&[]), started).await;
+    let workspace = data.join("agent").join("helper").join("workspace");
+    assert!(
+        err.contains(&format!("agent access: workspace {}", workspace.display())),
+        "{err}"
+    );
+    assert!(
+        err.contains(
+            "agent tester-helper declares cap:image-gen but no image tool is enabled \
+             (agent.tools); it will wake for such asks and should abstain or clarify"
+        ),
+        "{err}"
+    );
+    assert!(!err.contains("cap:pdf"), "{err}");
+    assert!(!err.contains("`locked`"), "{err}");
+
+    // An image tool: no warning.
+    std::fs::write(
+        data.join("config.toml"),
+        format!("{agent}tools = [\"mcp__images__generate\"]\n"),
+    )
+    .unwrap();
+    let err = stderr_until(&mut base(&[]), started).await;
+    assert!(err.contains(started), "{err}");
+    assert!(!err.contains("declares cap:"), "{err}");
+
+    // `locked`, in config.toml and on the command line.
+    let swarm_only = "agent access: swarm-only: only the wats tools";
+    let note = "access `locked` is now called `swarm-only` (0.4.0)";
+    std::fs::write(
+        data.join("config.toml"),
+        format!("{agent}access = \"locked\"\n"),
+    )
+    .unwrap();
+    let err = banner_of(&mut base(&[])).await;
+    assert!(err.contains(swarm_only), "{err}");
+    assert!(err.contains(note), "{err}");
+    std::fs::write(data.join("config.toml"), agent).unwrap();
+    let err = banner_of(&mut base(&["--access", "locked"])).await;
+    assert!(err.contains(swarm_only), "{err}");
+    assert!(err.contains(note), "{err}");
+    let err = banner_of(&mut base(&["--access", "swarm-only"])).await;
+    assert!(err.contains(swarm_only) && !err.contains(note), "{err}");
+}
+
 /// `wats --dir <data> <args…>` with a fixed OS user; stdout, and whether
 /// it succeeded.
 fn wats_out(data: &Path, args: &[&str]) -> (bool, String, String) {
@@ -913,7 +1012,7 @@ async fn budget_pauses_the_agent() -> anyhow::Result<()> {
         wakes: wats::wake::WakeLimits::unlimited(),
         codex_disable: vec![],
         codex_enable: vec![],
-        access: wats::access::Access::Locked,
+        access: wats::access::Access::SwarmOnly,
         workdir: std::path::PathBuf::from("/nonexistent"),
         tools: vec![],
         model: Some("haiku".into()),
@@ -1081,7 +1180,7 @@ echo '{{"type":"turn.completed","usage":{{"input_tokens":10,"output_tokens":2}}}
         wakes: wats::wake::WakeLimits::unlimited(),
         codex_disable: vec![],
         codex_enable: vec![],
-        access: wats::access::Access::Locked,
+        access: wats::access::Access::SwarmOnly,
         workdir: std::path::PathBuf::from("/nonexistent"),
         tools: vec![],
         model: Some("gpt-test".into()),
@@ -1355,10 +1454,12 @@ echo '{{"type":"turn.completed","usage":{{"input_tokens":10,"output_tokens":2}}}
     Ok(())
 }
 
-/// `tools` on a locked agent: `wats config set` keeps it with a warning,
-/// and the agent still starts, with only the wats tools.
+/// `tools` on a swarm-only agent: `wats config set` keeps it with a
+/// warning, and the agent still starts, with only the wats tools. With
+/// access unset (workspace), the tools are used. `locked`, the old name of
+/// swarm-only, is stored as `swarm-only` with a deprecation note.
 #[tokio::test(flavor = "multi_thread")]
-async fn locked_agent_with_tools_warns_and_starts() -> anyhow::Result<()> {
+async fn swarm_only_agent_with_tools_warns_and_starts() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     let data = dir.path().join("data");
     std::fs::create_dir_all(&data)?;
@@ -1369,16 +1470,32 @@ async fn locked_agent_with_tools_warns_and_starts() -> anyhow::Result<()> {
         &["config", "set", "agents.claude.tools", "Read,Grep"],
     );
     assert!(ok, "{err}");
+    assert!(err.contains("a post can ask the agent to leak"), "{err}");
+    assert!(!err.contains("access ignores"), "{err}");
+    let (ok, out, _) = wats_out(&data, &["config", "get", "agents.claude.access"]);
+    assert!(ok && out.starts_with("workspace (default)"), "{out}");
+    let (ok, _, err) = wats_out(&data, &["config", "set", "agents.claude.access", "locked"]);
+    assert!(ok, "{err}");
+    assert_eq!(
+        err.matches("note: access `locked` is now called `swarm-only`")
+            .count(),
+        1,
+        "{err}"
+    );
     assert!(
-        err.contains("warning: locked access ignores agents.claude.tools; use access workspace"),
+        err.contains(
+            "warning: swarm-only access ignores agents.claude.tools; use access workspace"
+        ),
         "{err}"
     );
     assert_eq!(err.matches("warning:").count(), 1, "{err}");
+    let config = std::fs::read_to_string(data.join("config.toml"))?;
+    assert!(config.contains("access = \"swarm-only\""), "{config}");
     let (ok, _, err) = wats_out(
         &data,
         &["config", "set", "agents.claude.access", "workspace"],
     );
-    assert!(ok && !err.contains("locked access ignores"), "{err}");
+    assert!(ok && !err.contains("access ignores"), "{err}");
     let (ok, _, err) = wats_out(
         &data,
         &["config", "set", "agents.claude.tools", "image_generation"],
@@ -1411,7 +1528,7 @@ async fn locked_agent_with_tools_warns_and_starts() -> anyhow::Result<()> {
         wakes: wats::wake::WakeLimits::unlimited(),
         codex_disable: vec![],
         codex_enable: vec![],
-        access: wats::access::Access::Locked,
+        access: wats::access::Access::SwarmOnly,
         workdir: std::path::PathBuf::from("/nonexistent"),
         tools: vec!["Read".into(), "image_generation".into()],
         model: None,
@@ -1426,7 +1543,7 @@ async fn locked_agent_with_tools_warns_and_starts() -> anyhow::Result<()> {
     let runner = tokio::spawn(wats::agent::run(Arc::clone(&a), config, async {
         let _ = stopped.await;
     }));
-    eventually("a locked run", || !runs(dir.path()).is_empty()).await;
+    eventually("a swarm-only run", || !runs(dir.path()).is_empty()).await;
     let _ = stop.send(());
     runner.await??;
     let (_, args) = runs(dir.path()).remove(0);
@@ -1984,7 +2101,7 @@ async fn wakes_only_on_what_is_addressed_to_it() -> anyhow::Result<()> {
         wakes: wats::wake::WakeLimits::unlimited(),
         codex_disable: vec![],
         codex_enable: vec![],
-        access: wats::access::Access::Locked,
+        access: wats::access::Access::SwarmOnly,
         workdir: std::path::PathBuf::from("/nonexistent"),
         tools: vec![],
         model: None,
@@ -2091,7 +2208,7 @@ async fn wake_limits_defer_and_survive_a_restart() -> anyhow::Result<()> {
         wakes: wats::wake::WakeLimits::unlimited(),
         codex_disable: vec![],
         codex_enable: vec![],
-        access: wats::access::Access::Locked,
+        access: wats::access::Access::SwarmOnly,
         workdir: std::path::PathBuf::from("/nonexistent"),
         tools: vec![],
         model: None,
@@ -2203,7 +2320,7 @@ async fn loop_detector_pauses_a_thread_until_a_third_party_posts() -> anyhow::Re
         },
         codex_disable: vec![],
         codex_enable: vec![],
-        access: wats::access::Access::Locked,
+        access: wats::access::Access::SwarmOnly,
         workdir: std::path::PathBuf::from("/nonexistent"),
         tools: vec![],
         model: None,
@@ -2495,7 +2612,7 @@ async fn openclaw_forwards_wakes_to_the_gateway() -> anyhow::Result<()> {
         wakes: wats::wake::WakeLimits::unlimited(),
         codex_disable: vec![],
         codex_enable: vec![],
-        access: wats::access::Access::Locked,
+        access: wats::access::Access::SwarmOnly,
         workdir: std::path::PathBuf::from("/nonexistent"),
         tools: vec![],
         model: Some("cheap-model".into()),
@@ -2692,7 +2809,7 @@ async fn asks_stored_before_the_runner_started_still_wake_it() -> anyhow::Result
         wakes: wats::wake::WakeLimits::unlimited(),
         codex_disable: vec![],
         codex_enable: vec![],
-        access: wats::access::Access::Locked,
+        access: wats::access::Access::SwarmOnly,
         workdir: std::path::PathBuf::from("/nonexistent"),
         tools: vec![],
         model: None,
@@ -2799,7 +2916,7 @@ async fn heartbeats_offer_older_unanswered_asks() -> anyhow::Result<()> {
         wakes: wats::wake::WakeLimits::unlimited(),
         codex_disable: vec![],
         codex_enable: vec![],
-        access: wats::access::Access::Locked,
+        access: wats::access::Access::SwarmOnly,
         workdir: std::path::PathBuf::from("/nonexistent"),
         tools: vec![],
         model: None,
@@ -2915,7 +3032,7 @@ async fn a_clarify_past_its_deadline_wakes_the_agent_for_its_default() -> anyhow
         wakes: wats::wake::WakeLimits::unlimited(),
         codex_disable: vec![],
         codex_enable: vec![],
-        access: wats::access::Access::Locked,
+        access: wats::access::Access::SwarmOnly,
         workdir: std::path::PathBuf::from("/nonexistent"),
         tools: vec![],
         model: None,
@@ -3106,7 +3223,7 @@ async fn local_agents_wake_each_other_but_not_on_the_humans_posts() -> anyhow::R
             wakes: wats::wake::WakeLimits::unlimited(),
             codex_disable: vec![],
             codex_enable: vec![],
-            access: wats::access::Access::Locked,
+            access: wats::access::Access::SwarmOnly,
             workdir: std::path::PathBuf::from("/nonexistent"),
             tools: vec![],
             model: None,

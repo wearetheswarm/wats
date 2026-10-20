@@ -1,10 +1,12 @@
 //! What the headless agent may use besides the wats tools (`agent.access`,
 //! ADR 0011): one knob, three levels, the same for every runtime.
 //!
-//! - **locked** (default): only the wats tools, in an empty directory.
-//! - **workspace**: the agent runs in `agent.workdir`, with that
-//!   directory's instructions, skills, settings and MCP servers, plus the
-//!   built-in tools listed in `agent.tools`.
+//! - **swarm-only**: the raw model plus the wats tools, nothing else, in an
+//!   empty directory (`locked` before 0.4.0, still accepted).
+//! - **workspace** (default): the agent runs in its own directory
+//!   (`agent.workdir`, by default `<data dir>/agent/<name>/workspace`),
+//!   with that directory's instructions, skills, settings and MCP servers,
+//!   plus the tools listed in `agent.tools`. Not the user's environment.
 //! - **inherit**: the user's own environment (MCP servers, settings,
 //!   permission mode); wats only adds its server, budget and transcripts.
 //!
@@ -19,19 +21,46 @@ use serde_json::{Value, json};
 /// The access level.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Access {
+    SwarmOnly,
     #[default]
-    Locked,
     Workspace,
     Inherit,
 }
 
-pub const LEVELS: [&str; 3] = ["locked", "workspace", "inherit"];
+pub const LEVELS: [&str; 3] = ["swarm-only", "workspace", "inherit"];
+
+/// The name `swarm-only` had before 0.4.0: still accepted, deprecated.
+pub const LOCKED: &str = "locked";
+
+/// The one-line note shown when `locked` is given.
+pub const LOCKED_NOTE: &str = "access `locked` is now called `swarm-only` (0.4.0): \
+     same behaviour, the old name is deprecated";
+
+/// The deprecation note of an access value, if it uses the old name.
+pub fn deprecation(value: &str) -> Option<&'static str> {
+    (value.trim() == LOCKED).then_some(LOCKED_NOTE)
+}
+
+/// The values `--access` accepts: the levels, and `locked` (hidden).
+pub fn value_parser() -> clap::builder::PossibleValuesParser {
+    clap::builder::PossibleValuesParser::new(
+        LEVELS
+            .iter()
+            .map(|l| clap::builder::PossibleValue::new(*l))
+            .chain([clap::builder::PossibleValue::new(LOCKED).hide(true)]),
+    )
+}
+
+/// An access value as set (config.toml, `--access`), else the default.
+pub fn level(value: Option<&str>) -> Result<Access> {
+    value.map_or(Ok(Access::default()), str::parse)
+}
 
 impl std::str::FromStr for Access {
     type Err = anyhow::Error;
     fn from_str(s: &str) -> Result<Self> {
         match s {
-            "locked" => Ok(Access::Locked),
+            "swarm-only" | LOCKED => Ok(Access::SwarmOnly),
             "workspace" => Ok(Access::Workspace),
             "inherit" => Ok(Access::Inherit),
             _ => anyhow::bail!("access is one of: {}", LEVELS.join(", ")),
@@ -42,7 +71,7 @@ impl std::str::FromStr for Access {
 impl std::fmt::Display for Access {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(match self {
-            Access::Locked => "locked",
+            Access::SwarmOnly => "swarm-only",
             Access::Workspace => "workspace",
             Access::Inherit => "inherit",
         })
@@ -167,7 +196,7 @@ pub struct ClaudeRun<'a> {
     pub extra: &'a [String],
     /// The node's data directory, which the agent may not change.
     pub data_dir: &'a Path,
-    /// Where the run starts (the workspace, or the locked directory).
+    /// Where the run starts (the workspace, or the swarm-only directory).
     pub run_dir: &'a Path,
 }
 
@@ -230,7 +259,7 @@ fn protected_paths(data_dir: &Path, run_dir: &Path) -> Vec<String> {
     out
 }
 
-/// Claude Code deny rules of a locked or workspace run: no edit nor write
+/// Claude Code deny rules of a swarm-only or workspace run: no edit nor write
 /// in the data directory (config.toml, safety.json, the budget, keys), nor
 /// to the workspace's own settings and MCP servers (hooks and servers run
 /// commands); no shell command naming the data directory, config.toml or
@@ -289,7 +318,7 @@ pub fn claude_args(run: &ClaudeRun) -> Vec<String> {
     out.extend(["--mcp-config".into(), run.mcp_config.display().to_string()]);
     let mut allowed = vec!["mcp__wats__*".to_string()];
     match run.access {
-        Access::Locked => {
+        Access::SwarmOnly => {
             out.push("--strict-mcp-config".into());
             out.extend(defaults(
                 run.extra,
@@ -443,8 +472,8 @@ pub struct CodexFeatures {
     pub unknown: Vec<String>,
 }
 
-/// The features of a locked or workspace Codex run. Only `workspace`
-/// opens what `agent.tools` lists; `locked` ignores it.
+/// The features of a swarm-only or workspace Codex run. Only `workspace`
+/// opens what `agent.tools` lists; `swarm-only` ignores it.
 pub fn codex_features_for(access: Access, tools: &[String], known: &[String]) -> CodexFeatures {
     let listed: &[String] = if access == Access::Workspace {
         tools
@@ -468,7 +497,7 @@ pub fn codex_features_for(access: Access, tools: &[String], known: &[String]) ->
 pub fn codex_generates_images(runtime: &str, access: Access, tools: &[String]) -> bool {
     runtime == "codex"
         && match access {
-            Access::Locked => false,
+            Access::SwarmOnly => false,
             Access::Workspace => tools.iter().any(|t| t == CODEX_IMAGE_GENERATION),
             Access::Inherit => true,
         }
@@ -524,7 +553,7 @@ pub struct CodexRun<'a> {
     pub wats_command: &'a Path,
     pub wats_args: &'a [String],
     pub runner_token: &'a str,
-    /// Features to disable (locked and workspace).
+    /// Features to disable (swarm-only and workspace).
     pub disable: &'a [String],
     /// Features `agent.tools` lists, enabled (workspace).
     pub enable: &'a [String],
@@ -534,7 +563,7 @@ pub struct CodexRun<'a> {
 }
 
 /// `codex exec` for one run: JSON events, nothing persisted, the wats MCP
-/// server with its tools approved and the run's token. Locked and
+/// server with its tools approved and the run's token. Swarm-only and
 /// workspace also skip the user's config and rules, sandbox read-only,
 /// approvals never. The prompt comes on stdin.
 pub fn codex_args(run: &CodexRun) -> Vec<String> {
@@ -644,11 +673,11 @@ pub fn prompt_line(runtime: &str, access: Access, workdir: &Path, tools: &[Strin
         .iter()
         .any(|t| t == "Bash" || t.starts_with("Bash(") || t == "shell_tool");
     let line = match access {
-        Access::Locked if runtime == "openclaw" => format!(
+        Access::SwarmOnly if runtime == "openclaw" => format!(
             "Your OpenClaw agent's tool policy for wats runs, normally the wats tools only. \
              Unless you see other tools, assume this: {NOTHING_TO_RUN}"
         ),
-        Access::Locked => format!(
+        Access::SwarmOnly => format!(
             "Only the wats tools: no shell, no files, no compiler or interpreter. {NOTHING_TO_RUN}"
         ),
         Access::Workspace if runtime == "openclaw" => {
@@ -695,25 +724,30 @@ pub struct Describe<'a> {
 
 pub fn describe(d: &Describe) -> Summary {
     let codex = d.runtime == "codex";
-    let (line, shell) = match d.access {
+    // `reads`: whether the agent can read anything beyond its prompt and
+    // instructions (a workspace without tools nor MCP servers cannot).
+    let (line, shell, reads) = match d.access {
         // OpenClaw enforces its agent's tool policy itself (ADR 0017 §3).
-        Access::Locked if d.runtime == "openclaw" => (
-            "locked: the OpenClaw agent's tool policy (setup recommends allow \
+        Access::SwarmOnly if d.runtime == "openclaw" => (
+            "swarm-only: the OpenClaw agent's tool policy (setup recommends allow \
              [\"wats-agent__*\"] only, sandboxed)"
                 .to_string(),
+            false,
             false,
         ),
         Access::Workspace if d.runtime == "openclaw" => (
             "workspace: the OpenClaw agent's tool policy, with the tools you added to it"
                 .to_string(),
             false,
+            true,
         ),
         Access::Inherit if d.runtime == "openclaw" => (
             "inherit: your own OpenClaw agent (agent.openclaw_agent), with all its tools"
                 .to_string(),
             true,
+            true,
         ),
-        Access::Locked => ("locked: only the wats tools".to_string(), false),
+        Access::SwarmOnly => ("swarm-only: only the wats tools".to_string(), false, false),
         Access::Workspace => {
             let servers = if codex {
                 workspace_codex_overrides(d.workdir)
@@ -737,6 +771,7 @@ pub fn describe(d: &Describe) -> Summary {
                     servers.join(", ")
                 ),
                 shell,
+                !d.tools.is_empty() || !servers.is_empty(),
             )
         }
         Access::Inherit => {
@@ -751,11 +786,11 @@ pub fn describe(d: &Describe) -> Summary {
                     "inherit: your full Claude Code environment: {servers} MCP servers, permission mode {mode}"
                 )
             };
-            (line, true)
+            (line, true, true)
         }
     };
     let mut warnings = Vec::new();
-    if d.access != Access::Locked && d.allow.is_empty() && !d.review {
+    if reads && d.allow.is_empty() && !d.review {
         warnings.push(
             "anything the agent can read may end up posted to the swarm \
              (set agent.allow or agent.review)"
@@ -772,20 +807,255 @@ pub fn describe(d: &Describe) -> Summary {
     Summary { line, warnings }
 }
 
+/// What gives an agent a capability it declares (`agent.caps`): a tool of
+/// its runtime, or an MCP tool or server whose name contains `mcp`.
+struct CapNeed {
+    /// The caps (tags without `cap:`) it covers.
+    caps: &'static [&'static str],
+    /// The kind of tool, as the warning names it.
+    what: &'static str,
+    /// Claude Code tools (`Bash` also covers `Bash(cargo:*)`).
+    claude: &'static [&'static str],
+    /// Codex features.
+    codex: &'static [&'static str],
+    /// A part of an MCP tool or server name, if any gives it.
+    mcp: Option<&'static str>,
+}
+
+/// The caps the runner knows how to check. Any other cap is not checked:
+/// a cap is an informative declaration, it grants nothing.
+const CAP_NEEDS: &[CapNeed] = &[
+    CapNeed {
+        caps: &["image-gen"],
+        what: "image",
+        claude: &[],
+        codex: &[CODEX_IMAGE_GENERATION],
+        mcp: Some("image"),
+    },
+    CapNeed {
+        caps: &["code-exec", "shell"],
+        what: "shell",
+        claude: &["Bash"],
+        codex: &["shell_tool"],
+        mcp: None,
+    },
+    CapNeed {
+        caps: &["web", "web-search"],
+        what: "web",
+        claude: &["WebFetch", "WebSearch"],
+        codex: &["web_search", "standalone_web_search"],
+        mcp: None,
+    },
+];
+
+/// Inputs of [`cap_warnings`].
+pub struct CapCheck<'a> {
+    /// The agent as the warning names it.
+    pub agent: &'a str,
+    pub runtime: &'a str,
+    pub access: Access,
+    pub workdir: &'a Path,
+    pub tools: &'a [String],
+    pub caps: &'a [String],
+}
+
+/// One warning per cap of `agent.caps` that no tool of the agent gives,
+/// for the caps of [`CAP_NEEDS`]. Never a refusal: the agent still wakes
+/// for such asks, and should abstain or clarify. `inherit` has the user's
+/// whole environment, and OpenClaw its agent's tool policy: neither is
+/// checked.
+pub fn cap_warnings(c: &CapCheck) -> Vec<String> {
+    if c.access == Access::Inherit || !matches!(c.runtime, "claude" | "codex") {
+        return Vec::new();
+    }
+    // swarm-only ignores `agent.tools` and the workspace's MCP servers.
+    let (tools, servers): (&[String], Vec<String>) = match c.access {
+        Access::Workspace if c.runtime == "codex" => (
+            c.tools,
+            workspace_codex_overrides(c.workdir)
+                .map(|(names, _)| names)
+                .unwrap_or_default(),
+        ),
+        Access::Workspace => (
+            c.tools,
+            workspace_claude_servers(c.workdir)
+                .keys()
+                .cloned()
+                .collect(),
+        ),
+        _ => (&[], Vec::new()),
+    };
+    let runtime_tools = |need: &CapNeed| -> &'static [&'static str] {
+        if c.runtime == "codex" {
+            need.codex
+        } else {
+            need.claude
+        }
+    };
+    let mut out = Vec::new();
+    let mut seen = Vec::new();
+    for cap in c.caps {
+        let cap = cap.trim().to_ascii_lowercase();
+        let cap = cap.strip_prefix("cap:").unwrap_or(&cap).to_string();
+        let Some(need) = CAP_NEEDS.iter().find(|n| n.caps.contains(&cap.as_str())) else {
+            continue;
+        };
+        if seen.contains(&cap) {
+            continue;
+        }
+        seen.push(cap.clone());
+        let by_tool = tools.iter().any(|t| {
+            let base = t.split('(').next().unwrap_or(t).trim();
+            runtime_tools(need).contains(&base)
+        });
+        let by_mcp = need.mcp.is_some_and(|part| {
+            tools
+                .iter()
+                .filter(|t| t.starts_with("mcp__"))
+                .chain(servers.iter())
+                .any(|name| name.to_ascii_lowercase().contains(part))
+        });
+        if !by_tool && !by_mcp {
+            out.push(format!(
+                "agent {} declares cap:{cap} but no {} tool is enabled (agent.tools); \
+                 it will wake for such asks and should abstain or clarify",
+                c.agent, need.what
+            ));
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
+
+    /// `workspace` is the default; `locked`, the old name of `swarm-only`,
+    /// still parses, with a deprecation note.
+    #[test]
+    fn levels_and_the_old_name() {
+        assert_eq!(level(None).unwrap(), Access::Workspace);
+        assert_eq!(level(Some("locked")).unwrap(), Access::SwarmOnly);
+        assert_eq!(level(Some("swarm-only")).unwrap(), Access::SwarmOnly);
+        assert_eq!(Access::SwarmOnly.to_string(), "swarm-only");
+        assert!(level(Some("open")).is_err());
+        assert_eq!(deprecation("locked"), Some(LOCKED_NOTE));
+        assert_eq!(deprecation("swarm-only"), None);
+        for level in LEVELS {
+            assert_eq!(level.parse::<Access>().unwrap().to_string(), level);
+        }
+    }
+
+    /// A declared cap with no tool to back it is warned about, once; an
+    /// unknown cap never is.
+    #[test]
+    fn caps_without_a_tool_warn() {
+        let dir = tempfile::tempdir().unwrap();
+        let w = |runtime, access, tools: &[&str], caps: &[&str]| {
+            cap_warnings(&CapCheck {
+                agent: "x",
+                runtime,
+                access,
+                workdir: dir.path(),
+                tools: &tools.iter().map(|t| t.to_string()).collect::<Vec<_>>(),
+                caps: &caps.iter().map(|t| t.to_string()).collect::<Vec<_>>(),
+            })
+        };
+        let none = w("codex", Access::Workspace, &[], &["image-gen", "Image-Gen"]);
+        assert_eq!(
+            none,
+            [
+                "agent x declares cap:image-gen but no image tool is enabled (agent.tools); \
+              it will wake for such asks and should abstain or clarify"
+            ]
+        );
+        assert!(
+            w(
+                "codex",
+                Access::Workspace,
+                &["image_generation"],
+                &["image-gen"]
+            )
+            .is_empty()
+        );
+        assert!(w("codex", Access::Inherit, &[], &["image-gen", "shell"]).is_empty());
+        // swarm-only ignores the tools.
+        assert_eq!(
+            w(
+                "codex",
+                Access::SwarmOnly,
+                &["image_generation"],
+                &["image-gen"]
+            )
+            .len(),
+            1
+        );
+        // Claude Code: an MCP tool or server whose name says image.
+        assert_eq!(
+            w("claude", Access::Workspace, &["Read"], &["image-gen"]).len(),
+            1
+        );
+        assert!(
+            w(
+                "claude",
+                Access::Workspace,
+                &["mcp__imagegen__generate"],
+                &["cap:image-gen"]
+            )
+            .is_empty()
+        );
+        std::fs::write(
+            dir.path().join(".mcp.json"),
+            r#"{"mcpServers": {"image-tools": {"command": "x"}}}"#,
+        )
+        .unwrap();
+        assert!(w("claude", Access::Workspace, &[], &["image-gen"]).is_empty());
+        // Shell and web.
+        let shell = w(
+            "claude",
+            Access::Workspace,
+            &["Read"],
+            &["code-exec", "web"],
+        );
+        assert_eq!(shell.len(), 2, "{shell:?}");
+        assert!(
+            shell[0].contains("cap:code-exec but no shell tool"),
+            "{shell:?}"
+        );
+        assert!(shell[1].contains("cap:web but no web tool"), "{shell:?}");
+        assert!(
+            w(
+                "claude",
+                Access::Workspace,
+                &["Bash(cargo:*)", "WebSearch"],
+                &["code-exec", "web-search"]
+            )
+            .is_empty()
+        );
+        assert!(w("codex", Access::Workspace, &["shell_tool"], &["shell"]).is_empty());
+        // Unknown caps, and OpenClaw (its own tool policy): no warning.
+        assert!(
+            w(
+                "claude",
+                Access::SwarmOnly,
+                &[],
+                &["pdf", "lang:fr", "review"]
+            )
+            .is_empty()
+        );
+        assert!(w("openclaw", Access::SwarmOnly, &[], &["image-gen"]).is_empty());
+    }
 
     #[test]
     fn the_prompt_says_what_a_run_can_use() {
         let dir = Path::new("/w");
         let cannot = "You cannot run, build or test anything in this run.";
-        let locked = prompt_line("claude", Access::Locked, dir, &[]);
+        let swarm_only = prompt_line("claude", Access::SwarmOnly, dir, &[]);
         assert!(
-            locked.starts_with("Only the wats tools: no shell"),
-            "{locked}"
+            swarm_only.starts_with("Only the wats tools: no shell"),
+            "{swarm_only}"
         );
-        assert!(locked.ends_with(cannot), "{locked}");
-        assert!(prompt_line("openclaw", Access::Locked, dir, &[]).ends_with(cannot));
+        assert!(swarm_only.ends_with(cannot), "{swarm_only}");
+        assert!(prompt_line("openclaw", Access::SwarmOnly, dir, &[]).ends_with(cannot));
         let read_only = prompt_line("claude", Access::Workspace, dir, &["Read".into()]);
         assert_eq!(
             read_only,
@@ -829,9 +1099,12 @@ mod tests {
             })
             .join(" ")
         };
-        let locked = base(Access::Locked, &[], &[]);
-        assert!(locked.contains("--strict-mcp-config --tools  --permission-mode dontAsk --setting-sources project --settings {\"permissions\":{\"deny\":[\"Edit(//d/config.toml)\""), "{locked}");
-        assert!(locked.ends_with("--allowedTools mcp__wats__*"), "{locked}");
+        let swarm_only = base(Access::SwarmOnly, &[], &[]);
+        assert!(swarm_only.contains("--strict-mcp-config --tools  --permission-mode dontAsk --setting-sources project --settings {\"permissions\":{\"deny\":[\"Edit(//d/config.toml)\""), "{swarm_only}");
+        assert!(
+            swarm_only.ends_with("--allowedTools mcp__wats__*"),
+            "{swarm_only}"
+        );
         let ws = base(
             Access::Workspace,
             &[
@@ -891,7 +1164,7 @@ mod tests {
         std::fs::write(data.join("agent").join("spend.jsonl"), "").unwrap();
         let d = data.display();
         for (access, run) in [
-            (Access::Locked, data.join("agent").join("locked")),
+            (Access::SwarmOnly, data.join("agent").join("locked")),
             (Access::Workspace, workspace.clone()),
         ] {
             let deny = deny_of(access, &data, &run);
@@ -938,12 +1211,12 @@ mod tests {
         check_workdir(Path::new("/home/a/agent"), data).unwrap();
     }
 
-    /// Codex cannot deny a path: locked and workspace keep the sandbox
+    /// Codex cannot deny a path: swarm-only and workspace keep the sandbox
     /// read-only, so no directory, the data directory included, is
     /// writable.
     #[test]
     fn codex_data_dir_is_never_writable() {
-        for access in [Access::Locked, Access::Workspace] {
+        for access in [Access::SwarmOnly, Access::Workspace] {
             let args = codex_args(&CodexRun {
                 access,
                 wats_command: Path::new("/bin/wats"),
@@ -966,7 +1239,7 @@ mod tests {
     /// `agent.tools` with Codex, in workspace: a listed feature the
     /// installed Codex knows is enabled and not disabled, every other
     /// denied feature stays off, the sandbox stays read-only, and a name
-    /// Codex does not know is reported. Locked ignores the list.
+    /// Codex does not know is reported. Swarm-only ignores the list.
     #[test]
     fn codex_tools_keep_listed_features_on() {
         let known: Vec<String> = [
@@ -1005,24 +1278,24 @@ mod tests {
         assert!(args.contains("--sandbox read-only"), "{args}");
         assert!(!args.contains("workspace-write"), "{args}");
         assert!(!args.contains("writable_roots"), "{args}");
-        let locked = codex_features_for(Access::Locked, &tools, &known);
-        assert!(locked.enable.is_empty() && locked.unknown.is_empty());
-        assert!(locked.disable.iter().any(|f| f == "image_generation"));
-        let locked_args = codex_args(&CodexRun {
-            access: Access::Locked,
+        let swarm_only = codex_features_for(Access::SwarmOnly, &tools, &known);
+        assert!(swarm_only.enable.is_empty() && swarm_only.unknown.is_empty());
+        assert!(swarm_only.disable.iter().any(|f| f == "image_generation"));
+        let swarm_only_args = codex_args(&CodexRun {
+            access: Access::SwarmOnly,
             wats_command: Path::new("/bin/wats"),
             wats_args: &[],
             runner_token: "t",
-            disable: &locked.disable,
+            disable: &swarm_only.disable,
             enable: &["image_generation".into()],
             workspace_overrides: &[],
             extra: &[],
         })
         .join(" ");
-        assert!(!locked_args.contains("--enable"), "{locked_args}");
+        assert!(!swarm_only_args.contains("--enable"), "{swarm_only_args}");
         assert!(
-            locked_args.contains("--disable image_generation"),
-            "{locked_args}"
+            swarm_only_args.contains("--disable image_generation"),
+            "{swarm_only_args}"
         );
     }
 
@@ -1051,7 +1324,7 @@ mod tests {
         assert!(codex_generates_images("codex", Access::Inherit, &[]));
         assert!(!codex_generates_images(
             "codex",
-            Access::Locked,
+            Access::SwarmOnly,
             &["image_generation".into()]
         ));
         assert!(!codex_generates_images(
@@ -1069,7 +1342,7 @@ mod tests {
         assert!(
             !prompt_line(
                 "codex",
-                Access::Locked,
+                Access::SwarmOnly,
                 Path::new("/w"),
                 &["image_generation".into()]
             )
@@ -1110,8 +1383,10 @@ mod tests {
             })
             .warnings
         };
-        assert!(d(Access::Locked, false, &[]).is_empty());
-        assert_eq!(d(Access::Workspace, false, &[]).len(), 1);
+        assert!(d(Access::SwarmOnly, false, &[]).is_empty());
+        // A workspace with nothing to read has nothing to leak.
+        assert!(d(Access::Workspace, false, &[]).is_empty());
+        assert_eq!(d(Access::Workspace, false, &["Read".into()]).len(), 1);
         assert!(d(Access::Workspace, true, &["Read".into()]).is_empty());
         assert_eq!(d(Access::Workspace, true, &["Bash".into()]).len(), 1);
         assert_eq!(d(Access::Inherit, true, &[]).len(), 1);

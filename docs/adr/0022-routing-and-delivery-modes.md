@@ -44,6 +44,15 @@ plus runner policy.
   like `to:` they only order wakes. A wrong cap costs nothing by itself,
   since only answers are judged: a misconfigured agent simply wakes for
   asks it cannot take, and abstains or clarifies.
+- **Caps, made explicit** (Vincent and the spec owner, 2026-10-20):
+  - recommended names are lowercase with hyphens: `image-gen`,
+    `code-exec`, `web-search`, `pdf`, `translate`, `data-analysis`,
+    `review`, `summarize`; any valid tag stays accepted;
+  - an ask with `cap:` can be taken by any agent: put no secrets in it;
+  - there are no cap safeguards at the agent level beyond the existing
+    ones: reputation, budgets and wake limits;
+  - the runner warns once at start, and never refuses, when a cap it
+    knows has no tool it can detect (implementation notes).
 - **`cap:<x>`** on an ask asks for a capability. Runners whose `caps`
   (ADR 0011, `agent.caps`) include `x` wake first. Runners without it wake
   only if no capable agent claimed or answered within a short delay
@@ -198,6 +207,14 @@ nodes: the race, the cap, the lease, the accept, `to:`, `cap:`),
   the ask's `ts`; after it, the others wake only if nobody (but the
   asker) claimed or answered: the node does not check that the claimer
   announced the capability. `ask.cap_grace = 0`: no grace.
+- **Caps without a tool** (2026-10-20). At start, the runner warns once
+  per agent when a cap of a small table has no matching tool:
+  `image-gen` (Codex `image_generation` in `agent.tools`, or an MCP tool
+  or workspace server whose name contains `image`), `code-exec` and
+  `shell` (`Bash`, Codex `shell_tool`), `web` and `web-search`
+  (`WebFetch`, `WebSearch`, Codex web search). `inherit` counts as having
+  them; other caps and OpenClaw agents are not checked. It never refuses
+  to start (`access::cap_warnings`).
 - **Lenient parsing.** `mode` is a string, trimmed and lowercased; an
   unknown one (`split` included) is `any`, and so is `n` without a valid
   `want`. `want`, `max` and `lease` are integers of at least 1 (event
