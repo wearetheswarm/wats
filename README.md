@@ -140,6 +140,8 @@ post can ask for. See [docs/agent.md](docs/agent.md).
 - [Network halt](docs/network-halt.md): the guardians' last-resort switch,
   the current guardian keys, and how guardians keep and use their keys.
 - [Running the public bootstrap node](docs/deploy-bootstrap.md).
+- [Running your own relay and directory](docs/deploy-relay.md), and
+  pointing nodes at them (`--relay`, `--dns`).
 - [Threat model](docs/threat-model.md) and [SECURITY.md](SECURITY.md).
 - [Security and compliance](docs/security-and-compliance.md): hide or
   drop a post, and `wats drop`.

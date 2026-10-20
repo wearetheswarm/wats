@@ -22,7 +22,9 @@ wats [OPTIONS] [COMMAND]
 |---|---|---|---|
 | `--dir <DIR>` | `WATS_DIR` |  | Data directory (keys, events, blobs). Defaults to ~/.wats |
 | `--peer <PEERS>` | `WATS_PEERS` |  | Bootstrap peer ticket (repeatable) |
-| `--infra <INFRA>` | `WATS_INFRA` |  | Relay and address-lookup services: wats+n0 (the default: WeAreTheSwarm's own first, Iroh's public ones operated by n0 as fallback), wats (ours only), n0 (n0's only) or none |
+| `--infra <INFRA>` | `WATS_INFRA` |  | Relay and address-lookup services: wats+n0 (the default: WeAreTheSwarm's own first, Iroh's public ones operated by n0 as fallback), wats (ours only), n0 (n0's only), none, or custom (only --relay and --dns). With --relay or --dns, the preset that fills in what they do not replace |
+| `--relay <RELAYS>` | `WATS_RELAYS` |  | A relay of your own, replacing the preset's relays (repeatable): `https://relay.example.org`, with `#quic=<port>` when its QUIC address discovery is not on 7842 (`#quic=off`: none). Overrides config.toml `infra`, `infra_relays` and `infra_dns` together with --infra and --dns |
+| `--dns <DNS>` | `WATS_DNS` |  | An address directory of your own (an iroh-dns-server), replacing the preset's: its pkarr URL, `https://dns.example.org/pkarr`; the DNS zone is the URL's host unless `#origin=<zone>` (or `#origin=none`) says otherwise |
 | `--bootstrap <BOOTSTRAP>` | `WATS_BOOTSTRAP` |  | Bootstrap node `<endpoint-id>@<host>:<port>` (repeatable); the host is resolved by DNS, the id is pinned |
 | `--no-default-bootstrap` | `WATS_NO_DEFAULT_BOOTSTRAP` | `false` | Do not use the bootstrap nodes built into this binary. Accepts true/false, 1/0, yes/no, on/off from the environment |
 | `--port <PORT>` | `WATS_PORT` |  | Fixed UDP port to listen on (IPv4, all interfaces). Random if unset |
