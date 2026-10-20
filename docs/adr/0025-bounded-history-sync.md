@@ -674,39 +674,60 @@ code is in `crates/wats/src/node/history.rs` (the task, serving, `get`),
   start when it is larger. A fill then never pushes into ADR 0012's 110 %
   ceiling.
 
-**What a range ends as (§9, after two reviews)**
+**What a range ends as (§9, after three reviews)**
 
 A walk over a range ends in one of four ways.
 
-- **Confirmed.** A trusted peer has nothing more below the cursor, or two
-  distinct peers that served events of the range say so at the same
-  cursor.
-  - A trusted peer is one of the node's configured peers or bootstrap
-    nodes (`seed_ids`).
-  - When a second peer serves more, the first one's word no longer counts.
-  - A peer that served nothing confirms nothing, so two fresh ids cannot
-    confirm a range by holding nothing.
-  - A `gap`, a `partial` answer and one untrusted peer's word never
-    confirm.
+- **Confirmed.** The range is confirmed when either of these holds:
+  - a trusted peer covered the range and has nothing more below its
+    cursor;
+  - two distinct peers that served events of the range did so.
+
+  The rules behind that:
+  - **Trusted.** A trusted peer is one of the node's configured peers or
+    bootstrap nodes (`seed_ids`).
+  - **Covering.** A peer *covers* a range when it is read from the range's
+    top down. It can be the peer the walk asks first, or a later one in the
+    union check, which reads from the top until 2 pages in a row bring
+    nothing new and then asks one page below the walk's cursor.
+  - **What comes after a claim voids it.** Events a later peer serves below
+    an earlier peer's "nothing more", or that the union check finds missing,
+    void every earlier claim.
+  - **No events, no claim.** A peer that served no events confirms nothing,
+    unless it is trusted. Two fresh ids cannot confirm a range by holding
+    nothing.
+  - **Never confirms.** A `gap`, a `partial` answer and one untrusted peer's
+    word never confirm.
+  - **Peers that cover nothing.** A peer asked only from lower down (after
+    another peer) covers nothing and gets the union check from the top.
 - **Unconfirmed.** Walked as far as the peers go, without a confirmation.
-  - The range is held and kept as one `unconfirmed` row per network.
-  - `status` shows it as "unconfirmed since <date>", not as a gap, and the
-    node does not advertise `history_full`.
-  - A 0.4.0 pull is served normally, as a 0.4.0 node serves what it holds.
-  - A descending page from a 0.4.1 peer stops there with a `gap`, so that
-    a trusted node never passes on a confirmation it does not have. The
-    0.4.1 peer still takes the events with `partial`, and ends unconfirmed
-    too.
-  - A later pass with a trusted peer up confirms it with one page below
-    its cursor. If nothing comes, it is confirmed. If events come, it is
-    pending again and walked on from there.
+  - **Storage.** The range is held, as `unconfirmed` rows. Overlapping or
+    adjacent spans merge; disjoint ones stay apart.
+  - **Status.** It shows as "unconfirmed since <date>", not as a gap, and
+    the node does not advertise `history_full`.
+  - **0.4.0 pulls** are served normally, as a 0.4.0 node serves what it
+    holds.
+  - **0.4.1 peers.** A descending page from a 0.4.1 peer stops there with a
+    `gap`, so that a trusted node never passes on a confirmation it does not
+    have. The 0.4.1 peer still takes the events with `partial`.
+  - **Later confirmation.** When a trusted peer is up, a later pass runs the
+    union check of the whole span against it, then one page below the
+    range's cursor.
+    - If neither brings anything new, the range is confirmed.
+    - If they bring events, those are stored, the cursor moves down to
+      them, and the range stays unconfirmed.
+    - These probes back off from 1 min, doubling up to an hour.
+    - A trusted peer that answers with a gap there is not asked about that
+      range again.
 - **The budget.** The only cut is the one the budget makes:
   - the fill records it at the cursor actually reached, never above it;
   - a catch-up larger than the budget leaves a skipped range.
-- **Failed.** No peer answered. The range stays pending and is tried again
-  every 60 s.
-  - Failures never close a range and never record a cut.
-  - There is no bound on passes: a pending range refuses nothing.
+- **Failed.** No peer answered, and the range stays pending.
+  - It is tried again after `history.retry` (60 s), doubling up to 30 min
+    while passes keep failing; a kick (a neighbor up) still runs a pass at
+    once.
+  - Failures never close a range and never record a cut. A pending range
+    refuses nothing.
 
 **Peers**
 
@@ -721,13 +742,13 @@ A walk over a range ends in one of four ways.
     their `history_full` claims are ignored.
 - **One failure vetoes nothing.** A peer that fails, or refuses (a
   non-member), is skipped.
-- **The union check.** After each range, the neighbors that did not serve
-  it are asked what they hold that the walk did not bring, so that no single
-  peer's omission sticks.
-  - **A `sync_desc` neighbor** is read newest first, with `partial`, until
-    2 pages in a row bring nothing new.
-  - **An older neighbor** is read ascending from the range's floor, up to 5 %
-    of the budget in what it sends.
+- **The union check.** After each range, every neighbor that did not cover
+  it from its top is asked what it holds that the walk did not bring, so
+  that no single peer's omission sticks.
+  - **A `sync_desc` neighbor** is read newest first from the range's top,
+    with `partial`, until 2 pages in a row bring nothing new.
+  - **An older neighbor** is read ascending from the range's floor, up to
+    5 % of the budget in what it sends.
   - **Both** stop at the range's budget.
 
   This shortcut trades exhaustiveness for bandwidth, the same trade as
@@ -735,9 +756,9 @@ A walk over a range ends in one of four ways.
   pages already held is not fetched. Without it, a newcomer with 5
   neighbors and the default 2.5 GiB budget would download the window about
   5 times.
-- **New networks.** A network whose nodes are all new ends unconfirmed: no
-  node can confirm that nothing older exists. It serves 0.4.0 pulls all the
-  same.
+- **New networks.** A network whose nodes are all new ends unconfirmed when
+  it holds nothing yet: a peer with no events confirms nothing. It serves
+  0.4.0 pulls all the same.
 
 **Requests and serving**
 
@@ -778,14 +799,15 @@ A walk over a range ends in one of four ways.
   change.
 - **A neighbor that joins others already up** gets the union check from the
   watermark the pass started with (5 % of the budget at most), never from
-  one the pass moved. Not after the fill: its own union check ran.
+  one the pass moved. Not after the fill: its own union check ran. At most
+  12 such checks an hour.
 - **A catch-up range above a pending fill.** A node stopped during its
   fill has watermark 0. At its next start it opens a catch-up range above
   the fill (from the fill's top − 10 min) before resuming the fill, so the
   time it was offline is not lost.
 - **Passes.** A pass runs on every kick (a neighbor up, a network change),
-  every 60 s while a range is pending, and every hour otherwise. With no
-  neighbor, nothing opens.
+  every 60 s while a range is pending (backing off while it fails), and
+  every hour otherwise. With no neighbor, nothing opens.
 
 **Older peers** (decided with internal after this ADR)
 
@@ -876,6 +898,10 @@ A walk over a range ends in one of four ways.
     then confirmed by a trusted peer;
   - two empty untrusted peers, which confirm nothing, and a rate-limited
     trusted peer, which never leads to a cut;
+  - events held only by the second of two untrusted peers, fetched by the
+    union check whichever is walked first;
+  - two honest untrusted peers confirming a seedless node, which a
+    newcomer then trusts;
   - `read` below the cut;
   - a full node not misled by a cut node;
   - the per-key share, against junk notes and against junk announces;
@@ -885,7 +911,7 @@ A walk over a range ends in one of four ways.
   - `get` answering each id once, and the budget clamp;
   - `wait`.
 - **`tests/agent.rs`** covers the runner.
-- **Unit tests** cover the completion rule.
+- **Unit tests** cover how walks combine.
 - **Older nodes.** A test knob, `history.legacy`, makes a node behave as
   0.4.0 on `/wats/1`. A real 0.4.0 binary and this one synced history both
   ways (hermetic, by hand).

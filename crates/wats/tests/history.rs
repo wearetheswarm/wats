@@ -1266,3 +1266,84 @@ async fn an_untrusted_only_fill_keeps_serving_older_nodes() -> anyhow::Result<()
     h.shutdown().await?;
     Ok(())
 }
+
+/// REVIEW3 (S-a): a node with no seed (as the router, whose only default
+/// bootstrap is itself) catches up from two honest untrusted peers holding
+/// the same history: the walk of one and the union check of the other
+/// confirm it, and a newcomer that trusts it is confirmed in turn.
+#[tokio::test(flavor = "multi_thread")]
+async fn review3_two_honest_untrusted_peers_never_confirm() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let now = now_secs();
+    let missed: Vec<Event> = (0..20u32)
+        .map(|i| note(i, now - 600 - u64::from(i) * 60))
+        .collect();
+    let p1 = reference(&dir.path().join("p1")).await?;
+    let p2 = reference(&dir.path().join("p2")).await?;
+    hold(&p1, &missed);
+    hold(&p2, &missed);
+    let r_dir = dir.path().join("r");
+    std::fs::create_dir_all(&r_dir)?;
+    Store::open(&r_dir.join("events.sqlite"))?.set_sync_watermark(PUBLIC_NET, now - 3600)?;
+    let mut r_config = config(&r_dir, &[]);
+    r_config.initial_max = InitialMax::Bytes(0);
+    let r = Node::start(r_config).await?;
+    for p in [&p1, &p2] {
+        r.add_peer(p.endpoint().addr()).await?;
+    }
+    eventually("two peers confirm the catch-up", 30, || {
+        (missed.iter().all(|e| seq(&r, &e.id).is_some())
+            && r.store().sync_ranges(PUBLIC_NET).unwrap().is_empty()
+            && state(&r) == "full")
+            .then_some(())
+    })
+    .await;
+    assert!(r.history_full());
+    // A newcomer that trusts r.
+    let n = Node::start(config(&dir.path().join("n"), &[&r])).await?;
+    eventually("the newcomer is confirmed", 30, || {
+        (state(&n) == "full").then_some(())
+    })
+    .await;
+    assert!(missed.iter().all(|e| seq(&n, &e.id).is_some()));
+    for node in [n, r, p1, p2] {
+        node.shutdown().await?;
+    }
+    Ok(())
+}
+
+/// REVIEW3 (R1): an honest but incomplete untrusted peer (it missed 5
+/// events in the middle, as gossip loses messages) and a complete one.
+/// Whichever is walked first, the other gets the union check from the
+/// range's top, and the newcomer holds all 40.
+#[tokio::test(flavor = "multi_thread")]
+async fn review3_interior_events_held_only_by_the_second_peer() -> anyhow::Result<()> {
+    let mut missed_runs = 0;
+    for _ in 0..6 {
+        let dir = tempfile::tempdir()?;
+        let all = notes(40, now_secs() - 3600);
+        let p = reference(&dir.path().join("p")).await?;
+        let h = reference(&dir.path().join("h")).await?;
+        let interior: Vec<Event> = all[15..20].to_vec();
+        hold(&p, &all[..15]);
+        hold(&p, &all[20..]);
+        hold(&h, &all);
+        let n = Node::start(config(&dir.path().join("n"), &[])).await?;
+        for peer in [&p, &h] {
+            n.add_peer(peer.endpoint().addr()).await?;
+        }
+        done(&n).await;
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        let got = interior.iter().filter(|e| seq(&n, &e.id).is_some()).count();
+        let total = all.iter().filter(|e| seq(&n, &e.id).is_some()).count();
+        assert_eq!(total, all.len(), "interior {got}/5, state {}", state(&n));
+        if got < interior.len() {
+            missed_runs += 1;
+        }
+        for node in [n, p, h] {
+            node.shutdown().await?;
+        }
+    }
+    assert_eq!(missed_runs, 0);
+    Ok(())
+}
