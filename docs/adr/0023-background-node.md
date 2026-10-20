@@ -46,7 +46,7 @@ forbids `unsafe` code (no `libc::setsid`, `dup2` or `kill`).
 Docker-like names, because they are the ones people already know for the
 same four verbs. `wats start` was the alternative for detaching; a flag
 keeps "the same command, in the background", with all of `wats`'s flags,
-and needs no second spelling of each.
+and needs no second spelling of each. Confirmed by Vincent (2026-10-20).
 
 ### 2. Detaching
 
