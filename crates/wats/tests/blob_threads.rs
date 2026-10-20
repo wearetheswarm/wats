@@ -55,12 +55,16 @@ fn threads() -> usize {
     }
 }
 
+/// What only sets the test up (two nodes, their posts and blobs) may take
+/// this long on a loaded CI runner.
+const SETUP_LIMIT: Duration = Duration::from_secs(60);
+
 async fn eventually<F, Fut, T>(what: &str, mut f: F) -> T
 where
     F: FnMut() -> Fut,
     Fut: std::future::Future<Output = Option<T>>,
 {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    let deadline = tokio::time::Instant::now() + SETUP_LIMIT;
     loop {
         if let Some(value) = f().await {
             return value;
@@ -92,7 +96,13 @@ async fn repair(node: &Node, blob: &BlobRef, seed: u8) {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn repairing_blobs_leaks_no_thread() {
-    tokio::time::timeout(Duration::from_secs(120), repairs())
+    // The node's logs, shown when the test fails.
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter("wats=info")
+        .with_ansi(false)
+        .with_test_writer()
+        .try_init();
+    tokio::time::timeout(Duration::from_secs(240), repairs())
         .await
         .expect("the test hung");
 }
@@ -104,10 +114,9 @@ async fn repairs() {
     let mut b_config = config(&data_b);
     b_config.peers.push(a.endpoint().addr());
     let b = Node::start(b_config.clone()).await.unwrap();
-    a.wait_for_neighbor(PUBLIC_NET, Duration::from_secs(10))
-        .await
-        .unwrap();
-    let mut blobs = Vec::new();
+    a.wait_for_neighbor(PUBLIC_NET, SETUP_LIMIT).await.unwrap();
+    b.wait_for_neighbor(PUBLIC_NET, SETUP_LIMIT).await.unwrap();
+    let mut events = Vec::new();
     for seed in 0..BLOBS {
         let path = dir.path().join(format!("file-{seed}.bin"));
         std::fs::write(&path, content(seed)).unwrap();
@@ -124,14 +133,22 @@ async fn repairs() {
             )
             .await
             .unwrap();
-        blobs.push(event.blobs[0].clone());
+        events.push(event);
     }
-    for blob in &blobs {
+    // B fetches each blob itself once it has the post: A's push of a blob
+    // (`replicate`, in the background) goes only to the peers A knows by
+    // then, and B drops pushes past a few at once from one peer.
+    for event in &events {
+        eventually("post on b", || async {
+            b.store().get(&event.id).unwrap().map(|_| ())
+        })
+        .await;
         eventually("blob on b", || async {
-            b.blob_bytes(&blob.hash).await.ok().flatten()
+            b.fetch_and_export(&event.blobs[0]).await.ok().flatten()
         })
         .await;
     }
+    let blobs: Vec<BlobRef> = events.iter().map(|e| e.blobs[0].clone()).collect();
     b.shutdown().await.unwrap();
     drop(b);
     // Every file gone on B: each read repairs one blob from A.
@@ -144,9 +161,7 @@ async fn repairs() {
         .unwrap();
     }
     let b = Node::start(b_config).await.unwrap();
-    b.wait_for_neighbor(PUBLIC_NET, Duration::from_secs(10))
-        .await
-        .unwrap();
+    b.wait_for_neighbor(PUBLIC_NET, SETUP_LIMIT).await.unwrap();
     assert_eq!(b.unreadable_blobs(), usize::from(BLOBS), "found at start");
 
     // The first repair warms up what any fetch starts (a connection, I/O
