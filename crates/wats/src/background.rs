@@ -15,10 +15,17 @@
 //! - **Signals.** `wats stop` asks the node through its socket first, and
 //!   signals it with `kill(1)` only when it does not answer or stop in
 //!   time (the crate forbids `unsafe`, so no `libc::kill`).
+//! - **The stop record.** A node stopped on purpose (`wats stop`, or
+//!   handing over to a daemon) says so in `<data dir>/stopped.json`
+//!   before it lets go of its sessions; the next node to start removes it.
+//!   An MCP session that loses its node reads it to tell an intended stop
+//!   (do not start the node again) from a crash (start it again).
 
 use std::io::{Read, Seek, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
+
+use serde::{Deserialize, Serialize};
 
 /// The directory of a data directory's log files.
 pub const LOG_DIR: &str = "logs";
@@ -315,6 +322,80 @@ pub fn registered(registry: &Path) -> Vec<PathBuf> {
     dirs
 }
 
+/// The stop record of a data directory (see the module documentation).
+pub const STOPPED_NAME: &str = "stopped.json";
+
+/// Why a node stopped on purpose.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StopReason {
+    /// `wats stop`, or a `stop` request on its socket: MCP sessions do not
+    /// start it again, and say so.
+    Stop,
+    /// A daemon takes over (ADR 0021 §4): MCP sessions wait for it.
+    HandOver,
+}
+
+/// What `<data dir>/stopped.json` records.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StopRecord {
+    pub reason: StopReason,
+    /// Who asked, for people: "`wats stop`", "`wats stop --all`", …
+    pub by: String,
+    /// When (Unix seconds).
+    pub at: u64,
+    /// The node that stopped.
+    pub pid: u32,
+    /// Its profile.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile: Option<String>,
+}
+
+/// `<data dir>/stopped.json`.
+pub fn stopped_path(data_dir: &Path) -> PathBuf {
+    data_dir.join(STOPPED_NAME)
+}
+
+/// Record why the node of `data_dir` stops (through a temporary file and
+/// a rename: a session never reads half of it).
+pub fn write_stop_record(data_dir: &Path, record: &StopRecord) -> std::io::Result<()> {
+    let path = stopped_path(data_dir);
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, serde_json::to_vec_pretty(record)?)?;
+    std::fs::rename(&tmp, &path)
+}
+
+/// The stop record of `data_dir`, if any (an unreadable one counts as
+/// none: the node did not stop on purpose as far as this release knows).
+pub fn read_stop_record(data_dir: &Path) -> Option<StopRecord> {
+    let text = std::fs::read_to_string(stopped_path(data_dir)).ok()?;
+    serde_json::from_str(&text).ok()
+}
+
+/// Remove the stop record (a node starts).
+pub fn clear_stop_record(data_dir: &Path) {
+    let _ = std::fs::remove_file(stopped_path(data_dir));
+}
+
+/// Record that the node of `data_dir` (this process) stops for `reason`,
+/// asked by `by`; kept when a stop record of the same reason is there
+/// already (`wats stop` writes its own before asking).
+pub fn record_stop(data_dir: &Path, reason: StopReason, by: &str, profile: &str) {
+    if read_stop_record(data_dir).is_some_and(|r| r.reason == reason) {
+        return;
+    }
+    let record = StopRecord {
+        reason,
+        by: by.to_string(),
+        at: crate::node::now_secs(),
+        pid: std::process::id(),
+        profile: Some(profile.to_string()),
+    };
+    if let Err(e) = write_stop_record(data_dir, &record) {
+        tracing::warn!("could not record the stop in {}: {e}", data_dir.display());
+    }
+}
+
 /// Start `wats` with `args` as a detached process: its own process group
 /// (no Ctrl-C or terminal hangup from the shell that started it), stdin
 /// and stdout to `/dev/null`, stderr appended to `log`. Not waited for.
@@ -337,6 +418,16 @@ pub fn spawn_detached(
         command.env_remove(name);
     }
     command.spawn()
+}
+
+/// Wait for a process this one started, in a thread of its own: it
+/// outlives what started it, and leaves no zombie behind when it exits
+/// first.
+#[cfg(unix)]
+pub fn reap(mut child: std::process::Child) {
+    std::thread::spawn(move || {
+        let _ = child.wait();
+    });
 }
 
 /// Send `signal` (`TERM`, `KILL`, or `0` to probe) to `pid` with
@@ -437,6 +528,35 @@ mod tests {
         assert_eq!(registered(&registry), [a.clone(), b.clone()]);
         unregister(&registry, &a);
         assert_eq!(registered(&registry), [b]);
+    }
+
+    #[test]
+    fn a_stop_record_is_kept_until_a_node_clears_it() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(read_stop_record(dir.path()), None);
+        let by_cli = StopRecord {
+            reason: StopReason::Stop,
+            by: "`wats stop`".into(),
+            at: 1_700_000_000,
+            pid: 42,
+            profile: Some("alice".into()),
+        };
+        write_stop_record(dir.path(), &by_cli).unwrap();
+        // The node, asked next, keeps the record of the command that asked.
+        record_stop(dir.path(), StopReason::Stop, "a stop request", "alice");
+        assert_eq!(read_stop_record(dir.path()), Some(by_cli));
+        // A hand-over replaces it (a new node ran in between, in practice).
+        record_stop(dir.path(), StopReason::HandOver, "a daemon", "alice");
+        let record = read_stop_record(dir.path()).unwrap();
+        assert_eq!(record.reason, StopReason::HandOver);
+        assert_eq!(record.pid, std::process::id());
+        let text = std::fs::read_to_string(stopped_path(dir.path())).unwrap();
+        assert!(text.contains("\"hand_over\""), "{text}");
+        clear_stop_record(dir.path());
+        assert_eq!(read_stop_record(dir.path()), None);
+        // Unreadable: no stop as far as this release knows.
+        std::fs::write(stopped_path(dir.path()), "{\"reason\": \"later\"}").unwrap();
+        assert_eq!(read_stop_record(dir.path()), None);
     }
 
     #[test]

@@ -125,7 +125,7 @@ wats                         # from now on: the node with its agent
 | `wats --detach` (`-d`) | The daemon in the background: returns once it is up, logging to `<data dir>/logs/node.log` (rotated at 10 MiB, 3 kept). Takes over a background node of `wats mcp` sessions ([ADR 0023](adr/0023-background-node.md)). |
 | `wats attach [-n N]` | The banner and last log lines of the node running in the background, then its log live. Ctrl-C detaches; the node keeps running. |
 | `wats ps [--all] [--json]` | The nodes running on this machine: pid, mode (`detached`, `foreground`, `mcp-background`…), version, uptime, profile, agents, network, MCP sessions, data directory. |
-| `wats stop [--all] [--timeout 10s]` | Stops the node of `--dir` (or the one running as `--profile`): gracefully, then killed after the timeout. MCP sessions using it wait 30 s for a node to come back, then end. |
+| `wats stop [--all] [--timeout 10s]` | Stops the node of `--dir` (or the one running as `--profile`): gracefully, then killed after the timeout. MCP sessions using it do not start it again: they answer each call saying it was stopped with `wats stop`, and reconnect once a node runs there again (`wats --detach`). After a crash instead, they start a background node again (at most 5 times in 10 minutes). |
 | `wats setup` | The main choices, asked with defaults ([first run](#first-run-wats-setup)). |
 | `wats setup claude [--mcp] [--agent] [--name NAME] [--scope user\|project]` | Persistent setup, see above; the agent goes to `[agents.claude]`, or `[agents.NAME]`. |
 | `wats setup codex [--mcp] [--agent]` | The same for the Codex CLI; `wats --agent codex` runs a headless Codex ([codex.md](codex.md)). |

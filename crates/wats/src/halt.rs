@@ -656,42 +656,49 @@ where
         let Ok(request) = serde_json::from_str::<Value>(&line) else {
             continue;
         };
-        let Some(id) = request.get("id").cloned() else {
+        let Some(reply) = answer_without_node(&request, message, None) else {
             continue; // a notification
         };
-        let result = match request.get("method").and_then(Value::as_str) {
-            Some("initialize") => json!({
-                "protocolVersion": request
-                    .pointer("/params/protocolVersion")
-                    .cloned()
-                    .unwrap_or_else(|| "2025-06-18".into()),
-                "capabilities": {"tools": {}},
-                "serverInfo": {"name": "wats", "version": env!("CARGO_PKG_VERSION")},
-                "instructions": message,
-            }),
-            Some("ping") => json!({}),
-            Some("tools/list") => json!({"tools": [{
-                "name": "status",
-                "description": "WeAreTheSwarm (wats): why this node is stopped.",
-                "inputSchema": {"type": "object", "properties": {}},
-            }]}),
-            Some("tools/call") => json!({
-                "content": [{"type": "text", "text": message}],
-                "isError": true,
-            }),
-            _ => {
-                let reply = json!({"jsonrpc": "2.0", "id": id,
-                    "error": {"code": -32601, "message": message}});
-                out.write_all(format!("{reply}\n").as_bytes()).await?;
-                out.flush().await?;
-                continue;
-            }
-        };
-        let reply = json!({"jsonrpc": "2.0", "id": id, "result": result});
         out.write_all(format!("{reply}\n").as_bytes()).await?;
         out.flush().await?;
     }
     Ok(())
+}
+
+/// The answer to an MCP request when no node serves it, saying `message`:
+/// `initialize` carries it in its instructions, every tool call fails with
+/// it, and `tools/list` lists `tools` (the node's last list) or a single
+/// `status`. `None` for a notification.
+pub fn answer_without_node(request: &Value, message: &str, tools: Option<&Value>) -> Option<Value> {
+    let id = request.get("id")?.clone();
+    let result = match request.get("method").and_then(Value::as_str) {
+        Some("initialize") => json!({
+            "protocolVersion": request
+                .pointer("/params/protocolVersion")
+                .cloned()
+                .unwrap_or_else(|| "2025-06-18".into()),
+            "capabilities": {"tools": {}},
+            "serverInfo": {"name": "wats", "version": env!("CARGO_PKG_VERSION")},
+            "instructions": message,
+        }),
+        Some("ping") => json!({}),
+        Some("tools/list") => tools.cloned().unwrap_or_else(|| {
+            json!({"tools": [{
+                "name": "status",
+                "description": "WeAreTheSwarm (wats): why this node is stopped.",
+                "inputSchema": {"type": "object", "properties": {}},
+            }]})
+        }),
+        Some("tools/call") => json!({
+            "content": [{"type": "text", "text": message}],
+            "isError": true,
+        }),
+        _ => {
+            return Some(json!({"jsonrpc": "2.0", "id": id,
+                "error": {"code": -32601, "message": message}}));
+        }
+    };
+    Some(json!({"jsonrpc": "2.0", "id": id, "result": result}))
 }
 
 /// What an MCP client is told about a halted node.
