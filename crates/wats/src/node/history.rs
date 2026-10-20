@@ -151,6 +151,9 @@ struct Progress {
     probes: HashMap<(i64, EndpointId), (std::time::Instant, Duration)>,
     /// Claimers of each unconfirmed range so far, across passes.
     claims: HashMap<i64, HashSet<EndpointId>>,
+    /// Neighbors whose read of an unconfirmed range failed partway: it is
+    /// confirmed only once each has read it to its end.
+    blockers: HashMap<i64, HashSet<EndpointId>>,
     /// (range id, trusted peer) pairs that answered a probe with a gap.
     probe_skip: HashSet<(i64, EndpointId)>,
     /// Passes in a row where a range failed: the retry backs off.
@@ -241,6 +244,11 @@ struct Pass {
     claimers: HashSet<EndpointId>,
     /// Peers that answered the union check with a gap.
     gapped: HashSet<EndpointId>,
+    /// Neighbors whose read failed partway: no confirmation until each
+    /// reads the range to its end (ADR 0025 §9).
+    incomplete: HashSet<EndpointId>,
+    /// Neighbors whose union read got to the end of the range.
+    completed: HashSet<EndpointId>,
 }
 
 impl Pass {
@@ -894,6 +902,7 @@ impl Node {
         for mut range in ranges {
             let fill = !range.phase.is_empty();
             pass.claimers.clear();
+            pass.incomplete.clear();
             let mut end = if fill {
                 self.walk_fill(&mut range, peers, pass).await?
             } else {
@@ -930,7 +939,10 @@ impl Node {
                 self.union_check(net, range.hi_ts, &others, &walk, pass, exhaustive)
                     .await?;
             }
-            if end == End::Unconfirmed && self.confirmed_by(&pass.claimers) {
+            if end == End::Unconfirmed
+                && pass.incomplete.is_empty()
+                && self.confirmed_by(&pass.claimers)
+            {
                 end = End::Complete;
             }
             let span = (range.lo_ts, range.hi_ts);
@@ -939,9 +951,13 @@ impl Node {
             // as walked: merged with another span, it starts over.
             if range.state == RangeState::Unconfirmed {
                 let claims = std::mem::take(&mut pass.claimers);
+                let blockers = std::mem::take(&mut pass.incomplete);
                 let kept = (range.lo_ts, range.hi_ts) == span;
                 let id = range.id;
                 self.set_progress(net, |p| {
+                    // A merged span keeps its blockers: its claims start
+                    // over, not what is known missing.
+                    p.blockers.entry(id).or_default().extend(blockers);
                     if kept {
                         p.claims.insert(id, claims);
                     } else {
@@ -1079,6 +1095,10 @@ impl Node {
                     .partial()
                 };
                 let Some((events, more, gap, seen)) = self.page(peer, &request).await else {
+                    // Partway: what it holds further is unknown.
+                    if served > 0 || received > 0 {
+                        pass.incomplete.insert(peer);
+                    }
                     break;
                 };
                 let new = self.unheld(&events);
@@ -1101,6 +1121,7 @@ impl Node {
                     .await
                 {
                     debug!(peer = %peer.fmt_short(), "union check page refused: {e:#}");
+                    pass.incomplete.insert(peer);
                     break;
                 }
                 held_pages = if new == 0 {
@@ -1118,6 +1139,7 @@ impl Node {
                 }
                 if events.is_empty() || !more {
                     to_end = !partial || !desc;
+                    pass.completed.insert(peer);
                     break;
                 }
                 if !exhaustive && desc && held_pages >= UNION_HELD_PAGES {
@@ -1218,6 +1240,13 @@ impl Node {
             .collect();
         let now = std::time::Instant::now();
         for mut range in ranges {
+            // Neighbors whose read failed partway: no confirmation until
+            // each reads the range to its end.
+            let mut blockers = self
+                .set_progress(net, |p| {
+                    p.blockers.get(&range.id).cloned().unwrap_or_default()
+                })
+                .unwrap_or_default();
             let mut claims = self
                 .set_progress(net, |p| {
                     p.claims.get(&range.id).cloned().unwrap_or_default()
@@ -1249,6 +1278,11 @@ impl Node {
                 self.union_check(net, range.hi_ts, &[peer], &walk, &mut pass, true)
                     .await?;
                 claims = pass.claimers;
+                if pass.incomplete.contains(&peer) {
+                    blockers.insert(peer);
+                } else if pass.completed.contains(&peer) {
+                    blockers.remove(&peer);
+                }
                 let gapped = pass.gapped.contains(&peer);
                 let claimed = claims.contains(&peer);
                 self.set_progress(net, |p| {
@@ -1266,7 +1300,7 @@ impl Node {
                         p.probes.insert(key, (at, delay));
                     }
                 });
-                if self.confirmed_by(&claims) {
+                if blockers.is_empty() && self.confirmed_by(&claims) {
                     info!(
                         %net,
                         "history: {} – {} confirmed",
@@ -1281,9 +1315,11 @@ impl Node {
             self.set_progress(net, |p| {
                 if range.state == RangeState::Done {
                     p.claims.remove(&range.id);
+                    p.blockers.remove(&range.id);
                     p.probes.retain(|(id, _), _| *id != range.id);
                 } else {
                     p.claims.insert(range.id, claims);
+                    p.blockers.insert(range.id, blockers);
                 }
             });
         }
@@ -1863,7 +1899,11 @@ impl Node {
                     }
                     self.store.update_sync_range(range)?;
                 }
-                (End::Failed, _, _) if answered => break End::Unconfirmed,
+                (End::Failed, _, _) if answered => {
+                    // Windows still unread: what they hold is unknown.
+                    pass.incomplete.extend(peers.iter().copied());
+                    break End::Unconfirmed;
+                }
                 (end, _, _) => break end,
             }
             if start <= floor {
@@ -1904,6 +1944,7 @@ impl Node {
             window.cursor_id = String::new();
         }
         for &peer in peers {
+            let mut pages = 0usize;
             loop {
                 self.still_running()?;
                 if walk
@@ -1929,9 +1970,14 @@ impl Node {
                     })) => (events, more, seen),
                     other => {
                         debug!(peer = %peer.fmt_short(), "older peer page: {other:?}");
+                        // Partway: what it holds further is unknown.
+                        if pages > 0 {
+                            pass.incomplete.insert(peer);
+                        }
                         break;
                     }
                 };
+                pages = pages.saturating_add(1);
                 // Stop at the history the previous window brought.
                 let reached = held.and_then(|h| {
                     events
@@ -1940,6 +1986,10 @@ impl Node {
                 });
                 if let Some(at) = reached {
                     events.truncate(at);
+                }
+                if self.unheld(&events) > 0 {
+                    // Missed by every earlier "nothing more": void.
+                    pass.claimers.clear();
                 }
                 let seen = if seen.len() >= events.len() {
                     seen.get(..events.len()).unwrap_or_default().to_vec()
@@ -1956,6 +2006,7 @@ impl Node {
                     .await
                 {
                     debug!(peer = %peer.fmt_short(), "older peer page refused: {e:#}");
+                    pass.incomplete.insert(peer);
                     break;
                 }
                 if oldest.is_none() {

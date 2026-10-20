@@ -1426,3 +1426,54 @@ async fn review4_second_peer_later_never_confirms() -> anyhow::Result<()> {
     }
     Ok(())
 }
+
+/// REVIEW5: two 0.4.1 peers that were offline over the span (quiet there,
+/// one event each below the floor: what two colluding fresh ids can fake
+/// cheaply) and a 0.4.0 neighbor that holds the span but stops answering
+/// after one page (rate limit). Its events void the quiet claims, and its
+/// failed read keeps the range unconfirmed: never `full` with the span
+/// missing.
+#[tokio::test(flavor = "multi_thread")]
+async fn review5_quiet_claims_and_an_older_holder_that_fails() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let now = now_secs();
+    let below = note(900, now - 3 * DAY);
+    let c1 = reference(&dir.path().join("c1")).await?;
+    let c2 = reference(&dir.path().join("c2")).await?;
+    hold(&c1, std::slice::from_ref(&below));
+    hold(&c2, std::slice::from_ref(&below));
+    let mut h_config = config(&dir.path().join("h"), &[]);
+    h_config.history.legacy = true;
+    h_config.limits.challenge = false;
+    h_config.limits.sync_per_min = 1;
+    let h = Node::start(h_config).await?;
+    let span: Vec<Event> = (0..40u32)
+        .map(|i| note(i, now - 3600 - u64::from(i) * 600))
+        .collect();
+    hold(&h, &span);
+    let a_dir = dir.path().join("a");
+    std::fs::create_dir_all(&a_dir)?;
+    Store::open(&a_dir.join("events.sqlite"))?.set_sync_watermark(PUBLIC_NET, now - 2 * DAY)?;
+    let a = Node::start(config(&a_dir, &[])).await?;
+    for p in [&c1, &c2, &h] {
+        a.add_peer(p.endpoint().addr()).await?;
+    }
+    tokio::time::sleep(Duration::from_secs(20)).await;
+    let held = span.iter().filter(|e| seq(&a, &e.id).is_some()).count();
+    let ranges = a.store().sync_ranges(PUBLIC_NET)?;
+    assert!(held > 0, "the 0.4.0 holder served a page");
+    if held < span.len() {
+        assert_ne!(state(&a), "full", "{held}/40, ranges {ranges:?}");
+        assert!(!a.history_full());
+        assert!(
+            ranges
+                .iter()
+                .any(|r| matches!(r.state, RangeState::Unconfirmed | RangeState::Pending)),
+            "{held}/40, ranges {ranges:?}"
+        );
+    }
+    for node in [a, c1, c2, h] {
+        node.shutdown().await?;
+    }
+    Ok(())
+}

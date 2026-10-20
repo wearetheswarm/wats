@@ -691,8 +691,12 @@ A walk over a range ends in one of four ways.
     later one in an exhaustive union check (below). A read cut short by the
     2-held-pages shortcut never covers.
   - **What comes after a claim voids it.** Events a later peer serves below
-    an earlier peer's "nothing more", or that the union check finds missing,
-    void every earlier claim.
+    an earlier peer's "nothing more", or that the union check or an older
+    peer's windows find missing, void every earlier claim.
+  - **A read that failed partway blocks.** If a neighbor's read of the range
+    (union check, or an older peer's windows) fails after serving some of
+    it, the range is not confirmed until that neighbor reads it to the end
+    on a later try, under the backoff. What it holds further is unknown.
   - **No events, no claim.** A peer that served no events of the range
     confirms nothing, unless it is trusted or holds an event below the
     range's floor (one page asked): a peer with history can say a quiet
