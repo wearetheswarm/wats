@@ -252,9 +252,9 @@ nodes: the race, the cap, the lease, the accept, `to:`, `cap:`),
   agents of the same node included: "another node" in §3 is read as
   "another key". Confirmed by Vincent (2026-10-20): "there must be no
   distinction by hosting, same host or not"; every agent is held off
-  the same way, wherever it runs. In mode `any`, others' live claims do not skip the
-  wake: the prompt says to leave it unless bringing something clearly
-  different (§2.1).
+  the same way, wherever it runs. In mode `any`, others' live claims do
+  not skip the wake: the prompt says to leave it unless bringing
+  something clearly different (§2.1).
 - **The runner's state machine**, per queued ask, at each tick (1 s, and
   at the end of a jitter): `serve()` decides from the routing, then from
   `State::verdict`: *wake* (with the expectation: continue your claim,

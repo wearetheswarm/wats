@@ -435,8 +435,8 @@ Approved by the product owner as defaults; confirmed by Vincent (2026-10-20):
 ## Implementation notes (v1b)
 
 Choices step v1b had to make, all node policy
-(`crates/wats/src/reputation.rs`, `crates/wats/src/signals.rs`). Confirmed by Vincent (2026-10-20),
-constants included:
+(`crates/wats/src/reputation.rs`, `crates/wats/src/signals.rs`).
+Confirmed by Vincent (2026-10-20), constants included:
 
 - **Weight.** A key's weight is its trust plus its floor. Every signal
   that counts is weighted by the weight of the key that gave it, and
