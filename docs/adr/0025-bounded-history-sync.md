@@ -952,6 +952,10 @@ A walk over a range ends in one of four ways.
   with `kinds`, and the peer's cut stops it like any other page.
 - **Not in PR A:** rotation at the cap and its three fixes (PR B). ADR
   0012's ceiling is unchanged.
+- **Later (Vincent, 2026-10-20):** revisit the confirmation quorum and
+  completeness rules (who may confirm a range, how many peers it takes,
+  what a partial read voids) once 0.4.1 has run on the swarm. 0.4.1
+  ships with the rules above.
 
 ## Consequences
 
