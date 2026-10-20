@@ -1477,3 +1477,77 @@ async fn review5_quiet_claims_and_an_older_holder_that_fails() -> anyhow::Result
     }
     Ok(())
 }
+
+/// Key age from the peers (ADR 0025, "Key age"): a new node holds an old
+/// key's events since a minute, but three peers, one with full history,
+/// saw it 40 days ago. The fill reads one peer; the announces asked of
+/// each neighbor afterwards bring the others' `seen`, and the key's age
+/// floor counts from their median, not from this node's first sight.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_new_node_takes_an_old_keys_age_from_its_peers() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let now = now_secs();
+    let old = now - 40 * DAY;
+    let agent = key(77);
+    let events = vec![
+        root(Kind::Announce, "an old agent", &agent, old),
+        root(Kind::Note, "still posting", &agent, now - 5 * DAY),
+    ];
+    // Newer traffic, more than the union check's two held pages (16 here):
+    // only the walked peer serves the key's events in the fill.
+    let traffic = notes(60, now - 600);
+    // No budget, no hole: p1 advertises full history. p2 and p3 have a
+    // budget, so they do not.
+    let p1 = reference(&dir.path().join("p1")).await?;
+    let partial = |name: &str| {
+        let dir = dir.path().join(name);
+        async move {
+            std::fs::create_dir_all(&dir)?;
+            Store::open(&dir.join("events.sqlite"))?.set_sync_watermark(PUBLIC_NET, now + DAY)?;
+            let mut config = config(&dir, &[]);
+            config.initial_max = InitialMax::Bytes(1 << 30);
+            Node::start(config).await
+        }
+    };
+    let p2 = partial("p2").await?;
+    let p3 = partial("p3").await?;
+    for peer in [&p1, &p2, &p3] {
+        hold(peer, &events);
+        hold(peer, &traffic);
+    }
+    // An announce only p2 holds, older than what the union check reads:
+    // the probe reads it but stores nothing new (the fill's per-key share
+    // and budget would not apply).
+    let only_p2 = root(Kind::Announce, "only p2 has it", &key(78), now - 30 * DAY);
+    hold(&p2, std::slice::from_ref(&only_p2));
+    assert!(p1.history_full(), "the reference with full history");
+    assert!(!p2.history_full());
+    let mut n_config = config(&dir.path().join("n"), &[&p1, &p2, &p3]);
+    n_config.reputation.ttl = Duration::ZERO;
+    n_config.reputation.max_age = Duration::ZERO;
+    let n = Node::start(n_config).await?;
+    done(&n).await;
+    let author = events[0].author.clone();
+    let first = n.store().author_first_seen(&author)?.unwrap_or(0);
+    assert!(first + 600 > now, "stored here just now");
+    let (since, floor) = eventually("the peers' median", 30, || {
+        let table = n.reputation(PUBLIC_NET).ok()?;
+        let a = table.authors.get(&author)?;
+        (a.known_since == Some(old)).then_some((a.known_since, a.floor))
+    })
+    .await;
+    assert_eq!(since, Some(old));
+    assert!(floor >= wats::reputation::AGE_FLOOR_CAP, "{floor}");
+    let reports = n.store().seen_reports()?;
+    let reports = &reports[&author];
+    assert_eq!(reports.len(), 3, "{reports:?}");
+    assert_eq!(reports.iter().filter(|(_, full)| *full).count(), 1);
+    // p2 was probed (its report is there); what it alone holds was not
+    // stored, and no report came for it.
+    assert!(seq(&n, &only_p2.id).is_none(), "the probe stored an event");
+    assert!(!n.store().seen_reports()?.contains_key(&only_p2.author));
+    for node in [n, p1, p2, p3] {
+        node.shutdown().await?;
+    }
+    Ok(())
+}

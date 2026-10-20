@@ -4232,22 +4232,23 @@ impl Node {
                     bail!("peer sent an out-of-order sync page");
                 }
                 match self.accept_value(value, Origin::Pulled).await {
-                    Ok(Some((event, true))) => {
-                        new = new.saturating_add(1);
-                        // Only for what was stored, by its verified author.
+                    Ok(Some((event, stored))) => {
+                        if stored {
+                            new = new.saturating_add(1);
+                        }
+                        // Only for what this node holds, by its verified
+                        // author.
                         if let Some(at) = seen.as_ref().and_then(|s| s.get(i)) {
                             reports.push((event.author().to_string(), *at));
                         }
                     }
-                    Ok(_) => {}
+                    Ok(None) => {}
                     Err(e) => debug!(%id, "sync: rejected event: {e:#}"),
                 }
                 (after_ts, after_id) = (ts, id.clone());
                 last = Some(id);
             }
-            if let Err(e) = self.store.record_seen(&peer.to_string(), &reports) {
-                debug!("seen reports not recorded: {e:#}");
-            }
+            self.record_seen(peer, &reports);
             if last.is_none() || !more {
                 ended = true;
                 break;

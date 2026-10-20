@@ -42,7 +42,7 @@ use tracing::{debug, info, warn};
 use super::{MAX_CLOCK_SKEW_SECS, Node, Origin, now_secs};
 use crate::proto::{self, Gap, Request, Response};
 use crate::settings::InitialMax;
-use crate::store::{PHASE_WINDOW, RangeState, SyncRange};
+use crate::store::{PHASE_WINDOW, RangeState, SEEN_PEERS, SyncRange};
 
 /// The kinds every node keeps whatever its budget (ADR 0025 §4, phase 0):
 /// halts, key successions, retractions, announces and vouches.
@@ -82,6 +82,9 @@ const GET_TIMEOUT: Duration = Duration::from_secs(3);
 const GETS_PER_MIN: usize = 60;
 /// Ids per `get` of the fill (threads, signals).
 const GET_BATCH: usize = proto::MAX_GET_IDS;
+/// Pages of announces each neighbor is asked for, once the fill is done,
+/// for when it first saw each key (ADR 0025, "Key age").
+const SEEN_PROBE_PAGES: usize = 16;
 /// Most events a `get` answers per root (`thread`) and in all, and most
 /// bytes in one answer, under the 16 MiB response.
 const GET_THREAD_MAX: usize = 500;
@@ -160,6 +163,9 @@ struct Progress {
     failed: u32,
     /// Checks of neighbors that came up while online, in the last hour.
     joins: std::collections::VecDeque<std::time::Instant>,
+    /// Neighbors asked for their announces' `seen` since the node started
+    /// (the key age, [`Node::probe_seen`]).
+    seen_asked: HashSet<EndpointId>,
 }
 
 /// The history tasks' shared state.
@@ -768,6 +774,10 @@ impl Node {
         if let Some(watermark) = self.store.settle_sync_ranges(net)? {
             info!(%net, watermark, "history: caught up");
         }
+        if !fill_running {
+            let (desc, _) = self.history_peers(net);
+            self.probe_seen(net, &desc).await;
+        }
         // Neighbors that came up while this node was online (no range
         // opened for them): what they hold since the watermark the pass
         // started with, bounded like the union check (ADR 0025 §5). Not
@@ -1213,6 +1223,13 @@ impl Node {
     }
 
     /// How many of `events` this node does not hold.
+    /// The author of the event `id`, when this node holds it (a tombstone
+    /// included).
+    fn held_author(&self, id: &str) -> Option<String> {
+        let (_, _, stored) = self.store.get_raw(id).ok().flatten()?;
+        stored.get("author")?.as_str().map(str::to_string)
+    }
+
     fn unheld(&self, events: &[Value]) -> usize {
         events
             .iter()
@@ -1717,8 +1734,8 @@ impl Node {
                 continue;
             }
             match self.accept_value(value.clone(), Origin::Pulled).await {
-                Ok(Some((event, true))) => {
-                    if walk.author_cap.is_some() {
+                Ok(Some((event, new))) => {
+                    if new && walk.author_cap.is_some() {
                         let used = pass.author_bytes.entry(chain).or_default();
                         *used = used.saturating_add(size);
                     }
@@ -1726,17 +1743,105 @@ impl Node {
                         reports.push((event.author().to_string(), *at));
                     }
                 }
-                Ok(_) => {}
+                Ok(None) => {}
                 // Stopped half-way: the cursor must not pass what was not
                 // stored.
                 Err(e) if self.endpoint().is_closed() => return Err(e),
                 Err(e) => debug!(%id, "history: rejected event: {e:#}"),
             }
         }
-        if let Err(e) = self.store.record_seen(&peer.to_string(), &reports) {
+        self.record_seen(peer, &reports);
+        Ok(())
+    }
+
+    /// Record what `peer` says about when it first stored these events'
+    /// keys (`seen`), with whether it advertises full history: the key age
+    /// of reputation (ADR 0025, "Key age"). Reports come for events this
+    /// node holds, stored now or already (their signature checked either
+    /// way), so that each peer serving a key counts.
+    pub(super) fn record_seen(&self, peer: EndpointId, reports: &[(String, u64)]) {
+        let full = self.has_feature(&peer, proto::FEATURE_HISTORY_FULL);
+        if let Err(e) = self.store.record_seen(&peer.to_string(), full, reports) {
             debug!("seen reports not recorded: {e:#}");
         }
-        Ok(())
+    }
+
+    /// Ask `peers` (with `sync_desc`) not asked yet since the node started,
+    /// [`SEEN_PEERS`] at most per network, for the announces they hold,
+    /// newest first, [`SEEN_PROBE_PAGES`] pages at most each: their `seen`
+    /// is when each peer first stored a key's announce, usually the key's
+    /// first event. The fill reads most history from one peer, and a key
+    /// needs [`crate::reputation::SEEN_QUORUM`] peers' reports for its age
+    /// (ADR 0025, "Key age"). It stores nothing: announces not held here
+    /// are skipped (the fill's phase 0 fetches them, under the per-key
+    /// share and the budget).
+    async fn probe_seen(&self, net: &str, peers: &[EndpointId]) {
+        for &peer in peers {
+            let ask = self
+                .set_progress(net, |p| {
+                    p.seen_asked.len() < SEEN_PEERS as usize && p.seen_asked.insert(peer)
+                })
+                .unwrap_or(false);
+            if !ask {
+                continue;
+            }
+            let mut before = (
+                now_secs().saturating_add(MAX_CLOCK_SKEW_SECS),
+                String::new(),
+            );
+            for _ in 0..SEEN_PROBE_PAGES {
+                if self.still_running().is_err() {
+                    return;
+                }
+                let request = Request::Sync {
+                    net: net.to_string(),
+                    after_ts: 0,
+                    after_id: String::new(),
+                    before_ts: Some(before.0),
+                    before_id: Some(before.1.clone()),
+                    kinds: vec!["announce".to_string()],
+                    authors: Vec::new(),
+                    partial: true,
+                    limit: self.config.history.page,
+                };
+                let Some((events, more, _, seen)) = self.page(peer, &request).await else {
+                    break;
+                };
+                let seen = (seen.len() == events.len()).then_some(seen);
+                let mut reports: Vec<(String, u64)> = Vec::new();
+                let mut ordered = true;
+                for (i, value) in events.iter().enumerate() {
+                    let Some(h) = head(value) else {
+                        ordered = false;
+                        break;
+                    };
+                    if (h.ts, h.id) >= (before.0, before.1.as_str())
+                        || h.net != net
+                        || h.kind != "announce"
+                    {
+                        ordered = false;
+                        break;
+                    }
+                    before = (h.ts, h.id.to_string());
+                    // Stores nothing: only events held here count, under
+                    // the author this node verified when it stored them.
+                    if let Some(at) = seen.as_ref().and_then(|s| s.get(i))
+                        && let Some(author) = self.held_author(h.id)
+                        && author == h.author
+                    {
+                        reports.push((author, *at));
+                    }
+                }
+                self.record_seen(peer, &reports);
+                if !ordered {
+                    debug!(peer = %peer.fmt_short(), "seen probe: a page out of order");
+                    break;
+                }
+                if events.is_empty() || !more {
+                    break;
+                }
+            }
+        }
     }
 
     /// `get` the threads or signals of `ids`, in batches, until `stop_at`
@@ -1827,17 +1932,19 @@ impl Node {
                 continue;
             }
             match self.accept_value(value, Origin::Pulled).await {
-                Ok(Some((event, true))) => {
-                    new = new.saturating_add(1);
+                Ok(Some((event, stored))) => {
+                    if stored {
+                        new = new.saturating_add(1);
+                    }
                     if let Some(at) = seen.as_ref().and_then(|s| s.get(i)) {
                         reports.push((event.author().to_string(), *at));
                     }
                 }
-                Ok(_) => {}
+                Ok(None) => {}
                 Err(e) => debug!("get: rejected event: {e:#}"),
             }
         }
-        let _ = self.store.record_seen(&peer.to_string(), &reports);
+        self.record_seen(peer, &reports);
         Ok(new)
     }
 

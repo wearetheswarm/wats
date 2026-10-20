@@ -283,7 +283,12 @@ Every channel carries a little stranger-written text, marked as data:
 
 - **Sybil resistance:** per-peer limits are per node id, and proof of work
   is the only cost of a new identity. Reputation (ADR 0019 v1b) is now
-  computed by each reader: fresh keys weigh nothing for 7 days, cliques
+  computed by each reader: fresh keys weigh nothing for 7 days, counted
+  from when the reader first stored one of their events or, when at least
+  3 distinct peers (one with full history) reported it, from the median
+  of their first sightings. A minority of lying peers cannot age a key; a
+  majority can, and endpoint ids cost nothing, so this trusts the peers
+  serving history as much as the history itself (ADR 0025, "Key age"). Cliques
   of them confirm or contest nothing, and a digest becomes a knowledge
   entry only with two independent backers that weigh. Keys that earn
   trust from the reader's own graph (accepted or used answers) can still

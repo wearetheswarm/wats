@@ -124,13 +124,20 @@ CREATE TABLE IF NOT EXISTS sync_ranges (
 CREATE INDEX IF NOT EXISTS sync_ranges_net ON sync_ranges (net, state);
 
 -- When peers say they first stored an event of a key (`seen` in sync pages,
--- ADR 0025): the earliest reports of at most 8 peers per key. Recorded for a
--- later age floor; reputation does not read it yet.
+-- ADR 0025): each peer's earliest report, for at most 8 peers per key. The
+-- age floor of reputation counts from their median (ADR 0019 §2.3).
 CREATE TABLE IF NOT EXISTS key_seen (
     author TEXT NOT NULL,
     peer   TEXT NOT NULL,
     seen   INTEGER NOT NULL,
     PRIMARY KEY (author, peer)
+) WITHOUT ROWID;
+
+-- The peers of `key_seen`: whether each advertised `history_full` in its
+-- hello, as of its last reports (0.4.2).
+CREATE TABLE IF NOT EXISTS seen_peers (
+    peer         TEXT PRIMARY KEY,
+    history_full INTEGER NOT NULL
 ) WITHOUT ROWID;
 "#;
 
@@ -2746,22 +2753,41 @@ impl Store {
     }
 
     /// Record what `peer` says about when it first stored events of these
-    /// authors (`seen` in sync pages): its earliest report per author. The
-    /// callers pass only events they stored, by their verified author. At
-    /// most [`SEEN_PEERS`] peers per key: the earliest reports are kept.
-    pub fn record_seen(&self, peer: &str, reports: &[(String, u64)]) -> Result<()> {
+    /// authors (`seen` in sync pages): its earliest report per author.
+    /// `history_full`: whether the peer advertised it in its hello. The
+    /// callers pass only events this node holds, by their verified author.
+    ///
+    /// At most [`SEEN_PEERS`] peers per key, the first ones to report it:
+    /// which peers count does not depend on what they report, so peers
+    /// reporting early times cannot push the others out (ADR 0025, "Key
+    /// age"). One exception, so that a key can meet the full-history rule:
+    /// a peer with full history takes the place of the latest report of a
+    /// key that has none from such a peer.
+    pub fn record_seen(
+        &self,
+        peer: &str,
+        history_full: bool,
+        reports: &[(String, u64)],
+    ) -> Result<()> {
         if reports.is_empty() {
             return Ok(());
         }
         let mut conn = self.conn();
         let tx = conn.transaction()?;
+        let mut kept = false;
         {
             let mut known = tx.prepare_cached(
                 "UPDATE key_seen SET seen = min(seen, ?3) WHERE author = ?1 AND peer = ?2",
             )?;
+            let mut held = tx.prepare_cached(
+                "SELECT count(*), coalesce(sum(p.history_full), 0)
+                 FROM key_seen k LEFT JOIN seen_peers p ON p.peer = k.peer
+                 WHERE k.author = ?1",
+            )?;
             let mut latest = tx.prepare_cached(
-                "SELECT peer, seen, (SELECT count(*) FROM key_seen WHERE author = ?1)
-                 FROM key_seen WHERE author = ?1 ORDER BY seen DESC, peer DESC LIMIT 1",
+                "SELECT k.peer FROM key_seen k LEFT JOIN seen_peers p ON p.peer = k.peer
+                 WHERE k.author = ?1 AND coalesce(p.history_full, 0) = 0
+                 ORDER BY k.seen DESC, k.peer DESC LIMIT 1",
             )?;
             let mut forget =
                 tx.prepare_cached("DELETE FROM key_seen WHERE author = ?1 AND peer = ?2")?;
@@ -2773,60 +2799,70 @@ impl Store {
                 }
                 let seen = sql_ts(*seen);
                 if known.execute(params![author, peer, seen])? > 0 {
+                    kept = true;
                     continue;
                 }
-                let last: Option<(String, i64, i64)> = latest
-                    .query_row([author], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
-                    .optional()?;
-                match last {
-                    Some((_, _, count)) if count < SEEN_PEERS => {}
-                    None => {}
-                    // Full: the latest report gives way to an earlier one.
-                    Some((other, latest, _)) if seen < latest => {
-                        forget.execute(params![author, other])?;
+                let (count, full): (i64, i64) =
+                    held.query_row([author], |r| Ok((r.get(0)?, r.get(1)?)))?;
+                if count >= SEEN_PEERS {
+                    if !history_full || full > 0 {
+                        continue;
                     }
-                    Some(_) => continue,
+                    let Some(other) = latest
+                        .query_row([author], |r| r.get::<_, String>(0))
+                        .optional()?
+                    else {
+                        continue;
+                    };
+                    forget.execute(params![author, other])?;
                 }
                 insert.execute(params![author, peer, seen])?;
+                kept = true;
             }
+        }
+        if kept {
+            tx.execute(
+                "INSERT INTO seen_peers (peer, history_full) VALUES (?1, ?2)
+                 ON CONFLICT (peer) DO UPDATE SET history_full = ?2",
+                params![peer, history_full],
+            )?;
         }
         tx.commit()?;
         Ok(())
     }
 
-    /// When the swarm first saw `author`, from the peers' reports: the
-    /// median of their earliest sightings, with at least three distinct
-    /// peers, no earlier than the oldest `ts` the key claims and no later
-    /// than this node's own first sight. Recorded for a later age floor
-    /// (ADR 0025); reputation does not read it yet.
-    pub fn author_seen_estimate(&self, author: &str) -> Result<Option<u64>> {
-        let mut seen: Vec<u64> = {
-            let conn = self.conn();
-            let mut stmt = conn.prepare_cached("SELECT seen FROM key_seen WHERE author = ?")?;
-            let rows = stmt.query_map([author], |r| r.get::<_, i64>(0))?;
-            rows.map(|r| r.map(|v| v.max(0) as u64))
-                .collect::<rusqlite::Result<_>>()?
-        };
-        if seen.len() < 3 {
-            return Ok(None);
-        }
-        seen.sort_unstable();
-        let Some(&median) = seen.get(seen.len() / 2) else {
-            return Ok(None);
-        };
-        let (oldest, first): (Option<i64>, Option<i64>) = self.conn().query_row(
-            "SELECT min(ts), min(received_at) FROM events WHERE author = ?",
-            [author],
-            |r| Ok((r.get(0)?, r.get(1)?)),
+    /// Every peer's report of when it first stored an event of each key
+    /// (`key_seen`), with whether that peer has full history: author to
+    /// `(seen, full)`, one per peer. Empty on a store no 0.4.2 node has
+    /// opened yet (read-only).
+    pub fn seen_reports(&self) -> Result<HashMap<String, Vec<(u64, bool)>>> {
+        let conn = self.conn();
+        let tables: i64 = conn.query_row(
+            "SELECT count(*) FROM sqlite_master
+             WHERE type = 'table' AND name IN ('key_seen', 'seen_peers')",
+            [],
+            |r| r.get(0),
         )?;
-        let mut estimate = median;
-        if let Some(first) = first {
-            estimate = estimate.min(first.max(0) as u64);
+        let mut out: HashMap<String, Vec<(u64, bool)>> = HashMap::new();
+        if tables < 2 {
+            return Ok(out);
         }
-        if let Some(oldest) = oldest {
-            estimate = estimate.max(oldest.max(0) as u64);
+        let mut stmt = conn.prepare_cached(
+            "SELECT k.author, k.seen, coalesce(p.history_full, 0)
+             FROM key_seen k LEFT JOIN seen_peers p ON p.peer = k.peer",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, i64>(1)?.max(0) as u64,
+                r.get::<_, i64>(2)? != 0,
+            ))
+        })?;
+        for row in rows {
+            let (author, seen, full) = row?;
+            out.entry(author).or_default().push((seen, full));
         }
-        Ok(Some(estimate))
+        Ok(out)
     }
 }
 
@@ -3942,7 +3978,7 @@ mod tests {
         store.insert(&event, 10).unwrap();
         store.set_sync_watermark("public", 77).unwrap();
         let conn = store.conn.into_inner().unwrap();
-        conn.execute_batch("DROP TABLE sync_ranges; DROP TABLE key_seen;")
+        conn.execute_batch("DROP TABLE sync_ranges; DROP TABLE key_seen; DROP TABLE seen_peers;")
             .unwrap();
         let store = Store::init(conn).unwrap();
         let version: i64 = store
@@ -3962,51 +3998,49 @@ mod tests {
     }
 
     #[test]
-    fn peers_first_sightings_need_three_peers_and_are_clamped() {
+    fn seen_reports_keep_each_peers_earliest_and_whether_it_is_full() {
         let store = Store::open_in_memory().unwrap();
-        let event = post(3, 1_000, Kind::Note, &[], "a key's first post");
-        store.insert(&event, 5_000).unwrap();
-        let author = event.author.clone();
-        store.record_seen("p1", &[(author.clone(), 2_000)]).unwrap();
-        store.record_seen("p2", &[(author.clone(), 3_000)]).unwrap();
-        assert_eq!(store.author_seen_estimate(&author).unwrap(), None);
-        // A peer's earliest report counts.
-        store.record_seen("p2", &[(author.clone(), 2_500)]).unwrap();
-        store.record_seen("p2", &[(author.clone(), 9_000)]).unwrap();
-        store.record_seen("p3", &[(author.clone(), 4_000)]).unwrap();
-        assert_eq!(store.author_seen_estimate(&author).unwrap(), Some(2_500));
-        // Never before the oldest ts it claims, never after our own sight.
-        for peer in ["p4", "p5", "p6", "p7"] {
-            store.record_seen(peer, &[(author.clone(), 1)]).unwrap();
-        }
-        assert_eq!(store.author_seen_estimate(&author).unwrap(), Some(1_000));
-        let late = post(4, 1_000, Kind::Note, &[], "seen late by peers");
-        store.insert(&late, 1_200).unwrap();
-        for peer in ["p1", "p2", "p3"] {
+        let author = "ab".repeat(32);
+        let report = |peer: &str, full: bool, seen: u64| {
             store
-                .record_seen(peer, &[(late.author.clone(), 9_000)])
+                .record_seen(peer, full, &[(author.clone(), seen)])
                 .unwrap();
-        }
-        assert_eq!(
-            store.author_seen_estimate(&late.author).unwrap(),
-            Some(1_200)
-        );
+        };
+        let reports = || {
+            let mut r = store.seen_reports().unwrap().remove(&author).unwrap();
+            r.sort_unstable();
+            r
+        };
+        report("p1", false, 2_000);
+        report("p2", true, 3_000);
+        // A peer's earliest report counts.
+        report("p2", true, 2_500);
+        report("p2", true, 9_000);
+        assert_eq!(reports(), vec![(2_000, false), (2_500, true)]);
+        // As its last hello says: p2 no longer has full history.
+        report("p2", false, 9_000);
+        assert_eq!(reports(), vec![(2_000, false), (2_500, false)]);
+        // A store no 0.4.2 node opened, read-only: no reports.
+        store.conn().execute_batch("DROP TABLE seen_peers").unwrap();
+        assert!(store.seen_reports().unwrap().is_empty());
     }
 
     #[test]
-    fn first_sightings_keep_the_earliest_of_eight_peers() {
+    fn first_sightings_keep_the_first_eight_peers() {
         let store = Store::open_in_memory().unwrap();
         let author = "ab".repeat(32);
-        for i in 0..12u64 {
+        let report = |peer: &str, full: bool, seen: u64| {
             store
-                .record_seen(&format!("p{i}"), &[(author.clone(), 1_000 + i * 10)])
+                .record_seen(peer, full, &[(author.clone(), seen)])
                 .unwrap();
+        };
+        for i in 0..12u64 {
+            report(&format!("p{i}"), false, 1_000 + i * 10);
         }
-        // An earlier report from a new peer replaces the latest one.
-        store
-            .record_seen("early", &[(author.clone(), 500)])
-            .unwrap();
-        let rows: Vec<(String, i64)> = {
+        // An earlier report from a new peer pushes none out: which peers
+        // count does not depend on what they say.
+        report("early", false, 500);
+        let rows = || -> Vec<(String, i64)> {
             let conn = store.conn();
             let mut stmt = conn
                 .prepare("SELECT peer, seen FROM key_seen WHERE author = ? ORDER BY seen")
@@ -4016,11 +4050,21 @@ mod tests {
                 .map(Result::unwrap)
                 .collect()
         };
-        assert_eq!(rows.len(), SEEN_PEERS as usize);
-        assert_eq!(rows[0], ("early".to_string(), 500));
-        assert_eq!(rows[7], ("p6".to_string(), 1_060));
+        let first = rows();
+        assert_eq!(first.len(), SEEN_PEERS as usize);
+        assert_eq!(first[0], ("p0".to_string(), 1_000));
+        assert_eq!(first[7], ("p7".to_string(), 1_070));
+        // A peer with full history takes the latest report's place, once.
+        report("full1", true, 400);
+        report("full2", true, 300);
+        let now = rows();
+        assert_eq!(now.len(), SEEN_PEERS as usize);
+        assert_eq!(now[0], ("full1".to_string(), 400));
+        assert!(now.iter().all(|(p, _)| p != "p7" && p != "full2"));
         // Too long to be a key: not recorded.
-        store.record_seen("p1", &[("x".repeat(65), 1)]).unwrap();
+        store
+            .record_seen("p1", false, &[("x".repeat(65), 1)])
+            .unwrap();
         let count: i64 = store
             .conn()
             .query_row("SELECT count(*) FROM key_seen", [], |r| r.get(0))

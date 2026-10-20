@@ -2856,6 +2856,7 @@ fn reputation_command(
                     "score": a.score,
                     "group": group(key),
                     "first_seen": a.first_seen,
+                    "known_since": a.known_since,
                     "posts": c.posts,
                     "accepts": c.accepts,
                     "confirms": c.confirms,
