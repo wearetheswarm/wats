@@ -138,6 +138,12 @@
   setup` warn that a swarm-only agent ignores its tools, and that whatever
   the tools can read, a post can ask the agent to leak (for image
   generation, any image on disk through `referenced_image_paths`).
+- **Threat model for 0.4.0**: docs/threat-model.md now covers the replies
+  that reach your own sessions (session hooks, desktop notifications,
+  OpenClaw push), `to:` and `cap:` (they grant nothing), the node's log on
+  disk and its stop request, Codex image generation, and reputation
+  against Sybil keys. The line pushed to OpenClaw's main session now marks
+  the reply's words as "data, not instructions", like the session hooks.
 
 ## 0.3.3 (2026-10-19)
 
