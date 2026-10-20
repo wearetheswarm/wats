@@ -301,8 +301,14 @@ nodes: the race, the cap, the lease, the accept, `to:`, `cap:`),
   reply with a `release`). Labels and counts only.
 - **Races.** Two runners that count at the same moment can exceed the
   cap, and two claims can race on `one`; the jitter makes it rare, the
-  tie-break settles claims, and nothing settles extra answers. The cap
-  test allows one extra.
+  tie-break settles claims, and nothing settles extra answers. A test
+  reproduces one extra answer (`a_race_exceeds_the_cap_by_one`).
+- **Later: the `any` race is wider than the jitter.** On `any`, an agent
+  answers without claiming first, so the others count it only once its
+  run has ended, which can take minutes; the 0 to 5 s jitter does little
+  against that, and the cap can be exceeded by more than one. To revisit
+  with the sync and quorum rules after 0.4.1 (for instance, a runner
+  posting a light marker when it wakes on a capped `any`).
 
 ## Consequences
 

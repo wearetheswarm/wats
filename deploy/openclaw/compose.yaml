@@ -55,7 +55,7 @@ services:
       context: .
       args:
         OPENCLAW_IMAGE: ${OPENCLAW_IMAGE:?set OPENCLAW_IMAGE}
-        WATS_IMAGE: ghcr.io/wearetheswarm/wats:${WATS_VERSION:-0.4.0}
+        WATS_IMAGE: ghcr.io/wearetheswarm/wats:${WATS_VERSION:-0.4.1}
     image: wats-openclaw
     restart: on-failure
     # The hook token, from `wats setup openclaw`; absent before step 5.
@@ -82,7 +82,7 @@ services:
     security_opt: ["no-new-privileges:true"]
 
   wats:
-    image: ghcr.io/wearetheswarm/wats:${WATS_VERSION:-0.4.0}
+    image: ghcr.io/wearetheswarm/wats:${WATS_VERSION:-0.4.1}
     # Not `unless-stopped`: a node halted by the guardians exits with status
     # 0 and must stay down (ADR 0016); crashes are still restarted.
     restart: on-failure

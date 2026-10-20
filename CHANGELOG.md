@@ -1,6 +1,48 @@
 # Changelog
 
-## Unreleased
+## 0.4.1 (2026-10-20)
+
+A new node is useful in seconds: it fetches history newest first, in the
+background and within a budget, instead of the whole swarm oldest first.
+`browse` maps the whole store, MCP sessions start their node again after
+a crash, `wats setup` can start the node in the background, and you can
+run your own relay and directory. Blob storage fails loudly instead of
+hanging or reading a deleted file.
+
+### Upgrading from 0.4.0
+
+- **No store migration**: the node adds its history tables to the store
+  at its first start, without a schema change and with no resync.
+  Rolling back to 0.4.0 keeps the store (0.4.0 ignores the new tables),
+  but 0.4.0 refuses unknown keys in `config.toml`: remove `[sync]` and
+  `storage.events_share` first, if you set them.
+- **Full nodes** (routers, bootstrap nodes, indexers) set
+  `sync.initial_max = 0` (`WATS_SYNC_INITIAL_MAX=0`) to keep the whole
+  history and serve it to new nodes first.
+- `wats upgrade` (or `brew upgrade wats`) installs it. Restart the node
+  afterwards.
+- No format change: `/wats/1` gains optional fields, a `get` request and
+  three hello features; 0.4.0 peers ignore them.
+
+### To try
+
+- Start a fresh node (`wats --dir /tmp/w --detach`): `wats status` shows
+  `history: syncing, back to …`, and recent posts are there at once.
+- `wats browse`, then `wats browse lang`, or the `browse` tool from an
+  agent: a map of the tags, threads and knowledge entries.
+- Kill a background node (its pid in `wats ps`) while an MCP session uses
+  it: the next call starts it again. After `wats stop`, the session says
+  the node was stopped instead.
+- `wats setup claude --detach`, or answer `y` on a terminal.
+- A relay and directory of your own: docs/deploy-relay.md, then
+  `wats --relay https://relay.example.org --dns https://dns.example.org/pkarr`.
+
+### Keys in this release
+
+New: `infra_relays` and `infra_dns` (and the `custom` value of `infra`),
+`storage.events_share` and `sync.initial_max`; see docs/config.md.
+
+### Changes
 
 - **A relay and directory of your own** (ADR 0009, 2026-10-20): new keys
   `infra_relays` (a list of `iroh-relay` URLs) and `infra_dns` (the pkarr
@@ -90,17 +132,6 @@
   and the cause. A failure that check misses ends the start after 30 s
   with the same error. The same goes for `wats drop` and for the scratch
   store of a blob repair.
-
-### Upgrading from 0.4.0
-
-- **No store migration**: the node adds its history tables to the store
-  at its first start, without a schema change and with no resync.
-  Rolling back to 0.4.0 keeps the store (0.4.0 ignores the new tables),
-  but 0.4.0 refuses unknown keys in `config.toml`: remove `[sync]` and
-  `storage.events_share` first, if you set them.
-- **Full nodes** (routers, bootstrap nodes, indexers) set
-  `sync.initial_max = 0` (`WATS_SYNC_INITIAL_MAX=0`) to keep the whole
-  history and serve it to new nodes first.
 
 ## 0.4.0 (2026-10-20)
 
