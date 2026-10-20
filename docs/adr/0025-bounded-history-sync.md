@@ -99,7 +99,8 @@ goes back to its owners, as the ADR rules require.
 6. **A new node trusts nobody for a week.** The cold-start floor is 0 for
    keys this node first stored less than 7 days ago (`received_at`). On
    its first day, a node, full pull or not, promotes only digests that the
-   asker accepted.
+   asker accepted. (Up to 0.4.1. Since 0.4.2, the age can come from the
+   peers: see "Key age" in the implementation notes.)
 7. **No fetch by id exists.** `read` of an id the node does not hold
    answers "not known to this node". ADR 0020's decision 4 ("evicted
    bodies are restored on `read`") has no mechanism yet.
@@ -539,6 +540,14 @@ The banner is printed at start, so it shows the state stored then.
    (fact 6), so "knowledge first" shows as entries only the digests the
    asker accepted, during the first week. Accept that? Taking key age from
    `ts` instead would be forgeable by backdating.
+   **Confirmed by Vincent (2026-10-20): option 1.** The age comes from
+   the median of at least 3 independent peers' `seen` reports, one of
+   them at least from a peer with full history, clamped between the key's
+   own earliest `ts` and this node's first sight; with fewer, the local
+   first sight, as before. A minority of lying peers cannot age a key; a
+   majority can (the same trust as the peers serving history). Node-local:
+   no wire or format change, no schema bump. Implemented in 0.4.2: see
+   "Key age" in the implementation notes.
 4. **The defaults**: events share 50 %; `sync.initial_max` at 50 % of it;
    kept-forever sub-cap 10 %; knowledge 20 %; per-author 2 % (all node
    policy).
@@ -856,12 +865,89 @@ A walk over a range ends in one of four ways.
   JSON. It is served on every page and `get`.
 - **Recorded.** A report is kept only for events this node stored, under
   their verified author. For each key, only the earliest reports of at most
-  8 peers are kept in `key_seen`.
-- **Estimated.** `Store::author_seen_estimate` gives the median of at least
-  three distinct peers. It is no earlier than the key's oldest `ts` and no
-  later than this node's own first sight.
-- **Not used yet.** It does not feed the age floor until that is decided:
-  `reputation.rs` does not read it.
+  8 peers are kept in `key_seen`. (0.4.1; 0.4.2 changes which reports are
+  kept and uses them for the age floor: see "Key age" below.)
+
+**Key age (0.4.2, open question 3, option 1)**
+
+The age floor of reputation (ADR 0019 §2.3) counts from when the swarm
+first saw a key, when enough peers say so. The code is
+`reputation::peers_first_seen` (the rule), `reputation::build` (where it
+is applied), `Store::record_seen` and `Store::seen_reports` (`key_seen`,
+`seen_peers`) and `Node::probe_seen` (`node/history.rs`).
+
+- **The rule.** The upper median of the peers' reports for the key, when
+  at least 3 independent peers reported it and at least one of them has
+  full history. The upper median is the later of the two middle reports
+  for an even count: early reports age a key only when they are more
+  than half. It is clamped:
+  - never before the key's earliest `ts` among its events this node holds
+    in the network;
+  - never after this node's own first sight of the key in the network
+    (its `first_seen`), which also wins when the key's `ts` is after it
+    (clock skew).
+
+  Otherwise (fewer than 3, or none with full history), the age counts
+  from this node's first sight, as in 0.4.1.
+- **Independent** means distinct peer endpoint ids, the same notion as
+  "two distinct peers" in a range's confirmation. A report comes over the
+  peer's authenticated connection, so it cannot be made in another peer's
+  name, and this node never reports to itself. An endpoint id costs
+  nothing to make, though: the median resists a minority of the peers
+  that reported a key, not a Sybil majority. That is the trust this node
+  already gives the peers serving its history.
+- **Full history** is the `history_full` feature of the peer's latest
+  hello when it served its reports, kept per peer in `seen_peers` (a new
+  table, created on open like `key_seen`; no schema bump). A peer that
+  stops advertising it loses that status at its next reports. The claim
+  is not checked: anyone can advertise `history_full`, so it is a gate
+  (one report at least comes from a node claiming the whole history),
+  not a defence. The median is the defence.
+- **Which reports count.** Each peer's earliest report per key, for at
+  most 8 peers per key: the first 8 peers to report it, whatever they
+  report (0.4.1 kept the 8 earliest, which let peers reporting early
+  times push the others out). One exception, so that a key can meet the
+  full-history gate: a peer with full history takes the place of the
+  latest report of a key that has none from such a peer.
+- **Reports for held events too.** A report now comes for every event of
+  a page this node holds after the page, stored now or already (its
+  signature is checked either way), not only for the events new to it.
+  Otherwise the fill, which reads most history from one peer, would give
+  most keys one report.
+- **Announces asked of each neighbor.** Once no fill range is pending,
+  each history pass asks the `sync_desc` neighbors not asked yet since the
+  node started (8 at most per network, trusted ones first) for their
+  announces, newest first, 16 pages at most each (`kinds: ["announce"]`,
+  `partial`). Their `seen` for a key's announce is when each first stored
+  it, usually the key's first event. Announces not held yet are stored, as
+  the fill's phase 0 would. Without this, the union check's two held
+  pages reach only recent events, whose `seen` is recent.
+- **Errors go one way.** An honest peer's report is never earlier than
+  when it first saw the key, and the clamp keeps the estimate no later
+  than this node's own first sight: the age is never younger than in
+  0.4.1, and honest error only makes it younger than the truth.
+- **When it is refreshed.** At every rebuild of a network's table: when
+  the store changed and the table is older than `reputation.ttl` (60 s),
+  or once it is older than an hour. Reports for events already held do
+  not change the store's sequence, so they show at the hourly rebuild at
+  the latest.
+- **Where it shows.** `wats reputation --json` gives `first_seen` (this
+  node's) and `known_since` (what the floor counts from).
+- **What still uses the local first sight.** The vouch clusters (a vouch
+  within 7 days of first seeing the key) and the new-author proof of work
+  of an event: both compare it with local `received_at`.
+- **Known gaps.** Keys with no announce have reports only from the peers
+  that served their events (the fill's walker, the union check), so most
+  of them keep the local age. `seen_peers` holds a row per peer with a
+  kept report, never pruned (at most 8 per key).
+
+**Tests (key age)**: `reputation.rs` (the median, both clamps, fewer than
+3 peers, no peer with full history, one lying peer, half, a majority, and
+a table built from reports), `store.rs` (each peer's earliest report, its
+full-history status, the first 8 peers, the full-history exception), and
+`tests/history.rs` (`a_new_node_takes_an_old_keys_age_from_its_peers`: a
+new node fills from three peers, one with full history, and an old key
+gets its 40 days).
 
 **The fill's phases**
 

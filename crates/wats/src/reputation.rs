@@ -168,6 +168,30 @@ pub fn floor(age: u64, work: f64) -> f64 {
     (age_floor(age) + pow_bonus(work)).min(FLOOR_CAP)
 }
 
+/// Distinct peers that must have reported a key's first sighting before
+/// their median sets its age (ADR 0025, "Key age").
+pub const SEEN_QUORUM: usize = 3;
+
+/// When the swarm first saw a key, from its peers' reports `(seen, full)`,
+/// one per distinct peer (`key_seen`): the median of at least
+/// [`SEEN_QUORUM`] reports, one of them at least from a peer that
+/// advertises full history; no earlier than `oldest_ts`, the earliest `ts`
+/// the key claims, and no later than `local`, this node's own first sight.
+/// `None` otherwise: the age counts from `local`, as before 0.4.2.
+///
+/// The median is the upper one: with an even count, the later of the two
+/// middle reports. Peers reporting early times age a key only when they
+/// are more than half of those that reported it.
+pub fn peers_first_seen(reports: &[(u64, bool)], oldest_ts: u64, local: u64) -> Option<u64> {
+    if reports.len() < SEEN_QUORUM || !reports.iter().any(|(_, full)| *full) {
+        return None;
+    }
+    let mut seen: Vec<u64> = reports.iter().map(|(seen, _)| *seen).collect();
+    seen.sort_unstable();
+    let median = *seen.get(seen.len() / 2)?;
+    Some(median.max(oldest_ts).min(local))
+}
+
 /// What one author received and gave, for `wats reputation`.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Counts {
@@ -190,6 +214,10 @@ pub struct Author {
     pub score: f64,
     /// When this node first stored an event of it in this network.
     pub first_seen: Option<u64>,
+    /// When its age floor counts from: the median of its peers' first
+    /// sightings when enough of them reported it ([`peers_first_seen`]),
+    /// else [`Author::first_seen`]. Never later than `first_seen`.
+    pub known_since: Option<u64>,
     /// Spare proof of work, in units of required work.
     pub work: f64,
     pub counts: Counts,
@@ -370,9 +398,11 @@ pub fn build(
     let seq = store.last_seq()?;
     let mut table = Table::empty(net, seq, now, local);
 
-    // When this node first stored an event of each key.
+    // When this node first stored an event of each key, and the earliest
+    // `ts` each key claims.
     let events = store.author_events(net)?;
     let mut authors: HashMap<String, Author> = HashMap::new();
+    let mut oldest: HashMap<&str, u64> = HashMap::new();
     for event in &events {
         match authors.get_mut(&event.author) {
             Some(author) => {
@@ -387,7 +417,25 @@ pub fn build(
                 authors.insert(event.author.clone(), author);
             }
         }
+        let ts = oldest.entry(event.author.as_str()).or_insert(event.ts);
+        *ts = (*ts).min(event.ts);
     }
+    // When the age floor counts from (ADR 0025, "Key age"): the peers'
+    // median when enough of them reported the key, else this node's own
+    // first sight.
+    let reports = store.seen_reports()?;
+    for (key, author) in &mut authors {
+        let Some(first) = author.first_seen else {
+            continue;
+        };
+        let from_peers = reports.get(key).and_then(|r| {
+            let ts = oldest.get(key.as_str()).copied().unwrap_or(first);
+            peers_first_seen(r, ts, first)
+        });
+        author.known_since = Some(from_peers.unwrap_or(first));
+    }
+    drop(oldest);
+    drop(reports);
 
     // Groups (§2.4): rotations and this node's profiles (hard), declared
     // owners and vouch clusters (soft).
@@ -561,8 +609,8 @@ pub fn build(
     }
     drop(events);
     for (key, author) in &mut authors {
-        if let Some(first) = author.first_seen {
-            author.floor = floor(now.saturating_sub(first), author.work);
+        if let Some(since) = author.known_since {
+            author.floor = floor(now.saturating_sub(since), author.work);
         }
         author.trust = trust.get(key).copied().unwrap_or(0.0);
     }
@@ -915,6 +963,140 @@ mod tests {
         };
         assert_eq!(floor_at(t0 + DAY), 0.0);
         assert_eq!(floor_at(t0 + 30 * DAY), AGE_FLOOR_CAP);
+    }
+
+    #[test]
+    fn peers_age_a_key_by_their_median_within_its_ts_and_our_sight() {
+        let (ts, local) = (1_000, 9_000);
+        let full = |seen: u64| (seen, true);
+        let part = |seen: u64| (seen, false);
+        // The median of three, one with full history.
+        assert_eq!(
+            peers_first_seen(&[full(4_000), part(2_000), part(3_000)], ts, local),
+            Some(3_000)
+        );
+        // The upper median of an even count.
+        assert_eq!(
+            peers_first_seen(
+                &[full(2_000), part(3_000), part(4_000), part(5_000)],
+                ts,
+                local
+            ),
+            Some(4_000)
+        );
+        // Never older than the key's own earliest ts.
+        assert_eq!(
+            peers_first_seen(&[full(10), part(20), part(30)], ts, local),
+            Some(ts)
+        );
+        // Never newer than this node's own first sight.
+        assert_eq!(
+            peers_first_seen(&[full(20_000), part(30_000), part(40_000)], ts, local),
+            Some(local)
+        );
+        // And when the key claims a ts after it (clock skew), our sight.
+        assert_eq!(
+            peers_first_seen(&[full(2_000), part(3_000), part(4_000)], 9_500, local),
+            Some(local)
+        );
+    }
+
+    #[test]
+    fn fewer_than_three_peers_or_none_full_leave_the_local_age() {
+        let (ts, local) = (1_000, 9_000);
+        assert_eq!(peers_first_seen(&[], ts, local), None);
+        assert_eq!(
+            peers_first_seen(&[(2_000, true), (3_000, true)], ts, local),
+            None
+        );
+        assert_eq!(
+            peers_first_seen(&[(2_000, false), (3_000, false), (4_000, false)], ts, local),
+            None,
+            "no peer with full history"
+        );
+    }
+
+    #[test]
+    fn a_minority_of_peers_cannot_age_a_key_a_majority_can() {
+        let (ts, local) = (0, 100 * DAY);
+        let honest = 99 * DAY;
+        let lie = DAY;
+        // One liar of three, even with full history: the honest median.
+        let one = [(lie, true), (honest, false), (honest + 1, false)];
+        assert_eq!(peers_first_seen(&one, ts, local), Some(honest));
+        // Half of an even count: still not enough.
+        let half = [(lie, true), (lie, false), (honest, false), (honest, false)];
+        assert_eq!(peers_first_seen(&half, ts, local), Some(honest));
+        // A majority can (accepted: the trust of the peers serving history).
+        let most = [(lie, true), (lie, false), (honest, false)];
+        assert_eq!(peers_first_seen(&most, ts, local), Some(lie));
+    }
+
+    #[test]
+    fn a_new_node_ages_a_key_from_its_peers_reports() {
+        let store = Store::open_in_memory().unwrap();
+        let t0 = 1_700_000_000;
+        let now = t0 + 40 * DAY;
+        let key = ed25519_dalek::SigningKey::from_bytes(&[11; 32]);
+        let note = |ts: u64, text: &str| {
+            crate::event::Draft {
+                net: "public".into(),
+                kind: Some(crate::event::Kind::Note),
+                title: Some(text.into()),
+                text: text.into(),
+                ..Default::default()
+            }
+            .sign(&key, ts, 0)
+            .unwrap()
+        };
+        // Posted 40 days ago, stored here a minute ago: a fresh install.
+        let event = note(t0, "an old key's first post");
+        store.insert(&event, now - 60).unwrap();
+        let author = event.author.clone();
+        let pow = PowPolicy {
+            min_pow_bits: Some(256),
+            schedule: Vec::new(),
+        };
+        let local = HashSet::new();
+        let at = |store: &Store| {
+            let table = build(store, "public", &local, now, &pow).unwrap();
+            let a = &table.authors[&author];
+            (a.floor, a.known_since)
+        };
+        assert_eq!(at(&store), (0.0, Some(now - 60)), "no reports yet");
+        let report = |peer: &str, full: bool, seen: u64| {
+            store
+                .record_seen(peer, full, &[(author.clone(), seen)])
+                .unwrap();
+        };
+        report("p1", false, t0 + 10);
+        report("p2", false, t0 + 20);
+        assert_eq!(at(&store).0, 0.0, "two peers are not enough");
+        report("p3", false, t0 + 30);
+        assert_eq!(at(&store).0, 0.0, "none with full history");
+        report("p4", true, t0 + 40);
+        assert_eq!(at(&store), (AGE_FLOOR_CAP, Some(t0 + 30)));
+        // Peers that all claim to have seen a key before its first post
+        // cannot age it past that post's ts.
+        let other = ed25519_dalek::SigningKey::from_bytes(&[12; 32]);
+        let fresh = crate::event::Draft {
+            net: "public".into(),
+            kind: Some(crate::event::Kind::Note),
+            title: Some("fresh".into()),
+            text: "fresh".into(),
+            ..Default::default()
+        }
+        .sign(&other, now - 120, 0)
+        .unwrap();
+        store.insert(&fresh, now - 60).unwrap();
+        for peer in ["p1", "p2", "p3", "p4"] {
+            store
+                .record_seen(peer, peer == "p4", &[(fresh.author.clone(), t0)])
+                .unwrap();
+        }
+        let table = build(&store, "public", &local, now, &pow).unwrap();
+        assert_eq!(table.authors[&fresh.author].floor, 0.0);
+        assert_eq!(table.authors[&fresh.author].known_since, Some(now - 120));
     }
 
     #[test]

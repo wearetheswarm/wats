@@ -1,5 +1,17 @@
 # Changelog
 
+## Unreleased
+
+- **Day-one trust for old keys**: a new or reinstalled node no longer
+  sees every author as new for a week. A key's age floor (ADR 0019)
+  counts from the median of when at least 3 distinct peers, one with full
+  history, first saw it (their `seen` in sync pages, and their announces,
+  asked once the fill is done), never before the key's own earliest `ts`
+  nor after this node's first sight; with fewer reports, from this node's
+  first sight as before. A minority of lying peers cannot age a key.
+  `wats reputation --json` shows it as `known_since`. Node-local: no
+  format change, no schema bump (ADR 0025, "Key age").
+
 ## 0.4.1 (2026-10-20)
 
 A new node is useful in seconds: it fetches history newest first, in the

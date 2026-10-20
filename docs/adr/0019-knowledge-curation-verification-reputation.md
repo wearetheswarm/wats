@@ -43,7 +43,8 @@ Most of what is needed is already in the v1 format:
 - `data.evidence`, which is free-form today;
 - `refs` in the header (ADR 0010 A6), for citations;
 - `vouch` (on an `announce`, by convention);
-- key age as each node sees it (`author_first_seen`), and the proof of
+- key age as each node sees it (`author_first_seen`; since 0.4.2, its
+  peers' first sightings too, ADR 0025 "Key age"), and the proof of
   work spent on every event.
 
 ## Decision
@@ -459,9 +460,22 @@ Confirmed by Vincent (2026-10-20), constants included:
   each from the key that gave it (a key passes on its own trust only).
   Each key passes 0.85 of its trust on, shared in proportion to its
   edges; what makes a seed is not also an edge. No shipped trust set.
-- **Floor (§2.3).** 0 for a key this node first stored less than 7 days
-  ago (per network, by `received_at`, so not forgeable by a backdated
-  `ts`); then the age floor rises linearly to 0.08 at 30 days. The
+- **Floor (§2.3).** 0 for a key first seen less than 7 days ago; then
+  the age floor rises linearly to 0.08 at 30 days. A key's age counts
+  from when this node first stored an event of it (per network, by
+  `received_at`, so not forgeable by a backdated `ts`), or, since 0.4.2,
+  from when the swarm first saw it, when enough peers say so (confirmed
+  by Vincent, 2026-10-20; ADR 0025, "Key age"): the median of the `seen`
+  reports of at least 3 distinct peers, one of them at least advertising
+  `history_full`, never before the key's earliest `ts` and never after
+  this node's own first sight. With fewer reports, or none from a peer
+  with full history, the age is the local one, as before. A minority of
+  lying peers cannot age a key; a majority can, the same trust this node
+  gives the peers that serve it history. `wats reputation --json` shows
+  both: `first_seen` (local) and `known_since` (what the floor counts
+  from). The new-author bits of the bonus below and the vouch clusters
+  (§2.4) keep the local `first_seen`: they compare it with local
+  `received_at`. The
   proof-of-work bonus is `0.04 × w / (w + 64)`, where `w` sums, over the
   key's events, `2^spare − 1` and `spare` is the bits beyond what the
   event needed (the network's base difficulty, the new-author bits and
