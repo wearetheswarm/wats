@@ -2663,7 +2663,7 @@ impl Node {
     }
 
     /// Put an unreadable blob back (see [`Node::blob_unreadable`]): fetch it
-    /// from `providers` into a scratch store, BLAKE3-verified, then import
+    /// from `providers` into a scratch file, BLAKE3-verified, then import
     /// it again. The blob store has no way to reset an entry, but an
     /// import writes the file and the entry anew, even over a complete
     /// entry whose file is gone. With `size`, only that many bytes are
@@ -2691,7 +2691,7 @@ impl Node {
         if let Err(e) = tokio::fs::remove_dir_all(&dir).await
             && e.kind() != std::io::ErrorKind::NotFound
         {
-            warn!(dir = %dir.display(), "scratch store of a repair not removed: {e:#}");
+            warn!(dir = %dir.display(), "scratch file of a repair not removed: {e:#}");
         }
         match repaired {
             Ok(true) => {
@@ -2706,6 +2706,11 @@ impl Node {
         }
     }
 
+    /// [`Node::repair_blob`] into `dir`, from the first of `candidates`
+    /// that has the blob. Fetched without a blob store: the downloader
+    /// would trust the main store's entry, and a scratch store would leak
+    /// one thread per repair when closed, for as long as the node runs
+    /// (`docs/upstream/iroh-blobs-runtime-drop-issue.md`).
     async fn repair_into(
         &self,
         hash: Hash,
@@ -2713,9 +2718,8 @@ impl Node {
         candidates: Vec<EndpointId>,
         dir: &Path,
     ) -> Result<bool> {
-        let options = iroh_blobs::store::fs::options::Options::new(dir);
-        let scratch = open_blob_store(dir, options).await?;
-        let downloader = scratch.downloader(self.endpoint());
+        tokio::fs::create_dir_all(dir).await?;
+        let file = dir.join("content");
         let request = match size {
             Some(size) => GetRequest::builder()
                 .root(ChunkRanges::chunks(..size.div_ceil(1024).max(1)))
@@ -2724,39 +2728,82 @@ impl Node {
         };
         let mut fetched = false;
         for provider in candidates {
-            let attempt = downloader.download(request.clone(), vec![provider]);
+            let attempt = self.fetch_verified(provider, request.clone(), size, &file);
             match tokio::time::timeout(Duration::from_secs(60), attempt).await {
-                Ok(Ok(_)) => {}
-                Ok(Err(e)) => {
-                    debug!(%hash, %provider, "repair fetch failed: {e:#}");
-                    self.provider_failed(provider);
-                    continue;
-                }
-                Err(_) => {
-                    debug!(%hash, %provider, "repair fetch timed out");
-                    self.provider_failed(provider);
-                    continue;
-                }
-            }
-            match scratch.blobs().status(hash).await? {
-                BlobStatus::Complete { size: got } if size.is_none_or(|s| s == got) => {
+                Ok(Ok(true)) => {
                     self.provider_ok(provider);
                     fetched = true;
                     break;
                 }
-                _ => continue,
+                // Another size than the one asked for.
+                Ok(Ok(false)) => {}
+                Ok(Err(e)) => {
+                    debug!(%hash, %provider, "repair fetch failed: {e:#}");
+                    self.provider_failed(provider);
+                }
+                Err(_) => {
+                    debug!(%hash, %provider, "repair fetch timed out");
+                    self.provider_failed(provider);
+                }
             }
         }
         if !fetched {
-            scratch.shutdown().await.ok();
             return Ok(false);
         }
-        let file = dir.join("content");
-        scratch.blobs().export(hash, &file).finish().await?;
-        scratch.shutdown().await.ok();
         let added = self.blobs.add_path(&file).temp_tag().await?;
         anyhow::ensure!(added.hash() == hash, "restored content has another hash");
         Ok(!self.blob_unreadable(hash).await)
+    }
+
+    /// Fetch `request` (one blob) from `provider` into `file`, each chunk
+    /// verified against the blob's BLAKE3 hash as it arrives. False, with
+    /// nothing read past the header, when `size` is given and the
+    /// provider's blob has another size; with the size right, `request`
+    /// covers the whole blob, its last chunk included, which proves it.
+    async fn fetch_verified(
+        &self,
+        provider: EndpointId,
+        request: GetRequest,
+        size: Option<u64>,
+        file: &Path,
+    ) -> Result<bool> {
+        use bao_tree::io::BaoContentItem;
+        use iroh_blobs::get::fsm;
+        use tokio::io::{AsyncSeekExt, AsyncWriteExt};
+
+        let connection = self.endpoint().connect(provider, iroh_blobs::ALPN).await?;
+        let connected = fsm::start(connection, request, Default::default())
+            .next()
+            .await?;
+        let fsm::ConnectedNext::StartRoot(root) = connected.next().await? else {
+            bail!("the provider answered with no blob");
+        };
+        let (mut content, got) = root.next().next().await?;
+        if size.is_some_and(|size| size != got) {
+            return Ok(false);
+        }
+        let mut out = tokio::io::BufWriter::new(tokio::fs::File::create(file).await?);
+        let mut at = 0u64;
+        let end = loop {
+            match content.next().await {
+                fsm::BlobContentNext::More((next, item)) => {
+                    if let BaoContentItem::Leaf(leaf) = item? {
+                        if leaf.offset != at {
+                            out.seek(std::io::SeekFrom::Start(leaf.offset)).await?;
+                        }
+                        out.write_all(&leaf.data).await?;
+                        at = leaf.offset.saturating_add(leaf.data.len() as u64);
+                    }
+                    content = next;
+                }
+                fsm::BlobContentNext::Done(end) => break end,
+            }
+        };
+        out.flush().await?;
+        if let fsm::EndBlobNext::Closing(closing) = end.next() {
+            closing.next().await?;
+        }
+        Ok(true)
     }
 
     /// Blob collections begun since the node started, aborted ones
@@ -4253,7 +4300,7 @@ impl Node {
         // Kept from the collection from before the first byte until pinned:
         // a partial blob is not, by itself.
         let _hold = self.hold_blob(hash).await;
-        // Recorded but unreadable: fetched again into a scratch store (the
+        // Recorded but unreadable: fetched again into a scratch file (the
         // downloader would trust the entry).
         if self.blob_unreadable(hash).await {
             if !self
