@@ -11,7 +11,9 @@ Command-line flags and `WATS_*` variables, where they exist (`wats --help`), tak
 | Key | Default | |
 |---|---|---|
 | `profile` | default | default author profile of this node |
-| `infra` | wats+n0 | relays and lookup: wats+n0 (ours first, n0 as fallback), wats, n0 or none |
+| `infra` | wats+n0 | relays and lookup: wats+n0 (ours first, n0 as fallback), wats, n0, none, or custom (only infra_relays and infra_dns); with those keys set, the preset that fills in what they do not replace (unset: custom) |
+| `infra_relays` | the preset's | relays of your own (iroh-relay), replacing the preset's: https URLs, with #quic=&lt;port&gt; when QUIC address discovery is not on 7842 (#quic=off: none); docs/deploy-relay.md |
+| `infra_dns` | the preset's | an address directory of your own (iroh-dns-server), replacing the preset's: its pkarr URL, e.g. https://dns.example.org/pkarr; DNS lookups under the URL's host unless #origin=&lt;zone&gt; (or #origin=none) |
 | `port` | random | UDP port to listen on |
 | `nets` | public | networks to join; --net replaces the list |
 | `bootstrap` | none | extra bootstrap nodes &lt;id&gt;@&lt;host&gt;:&lt;port&gt; |

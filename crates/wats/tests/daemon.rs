@@ -45,6 +45,15 @@ async fn background_session_hands_over_to_a_daemon() -> anyhow::Result<()> {
     // Hermetic: relay and lookup cannot apply, nothing to bootstrap from.
     let mut health = status["health"].clone();
     let connectivity = health.as_object_mut().unwrap().remove("connectivity");
+    // Blob collection: not checked yet, or running.
+    let storage = health["checks"].as_object_mut().unwrap().remove("storage");
+    assert!(
+        matches!(
+            storage.as_ref().and_then(|s| s.as_str()),
+            Some("unknown" | "ok")
+        ),
+        "{status}"
+    );
     assert_eq!(
         health,
         json!({"state": "ok", "checks": {

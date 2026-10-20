@@ -2,6 +2,24 @@
 
 ## Unreleased
 
+- **A relay and directory of your own** (ADR 0009, 2026-10-20): new keys
+  `infra_relays` (a list of `iroh-relay` URLs) and `infra_dns` (the pkarr
+  URL of an `iroh-dns-server`), with the flags `--relay` (repeatable) and
+  `--dns` and the variables `WATS_RELAYS` and `WATS_DNS`, on `wats`,
+  `wats node` and the background node. They replace the preset's relays
+  and directory; what they leave out comes from `infra` when it names a
+  preset, and is left out otherwise (`infra = "custom"`, implied). A relay
+  URL takes `#quic=<port>` when its QUIC address discovery is not on 7842
+  (`#quic=off`: none); a directory's DNS zone is its URL's host unless
+  `#origin=<zone>` or `#origin=none` says otherwise. https only (http to
+  loopback for tests), checked by `wats config set` and at start. Any of
+  `--infra`, `--relay` and `--dns` sets the three together, over
+  `config.toml`. The banner, `wats status` and `wats ps` (new `INFRA`
+  column) show them by host name, the health checks watch them instead of
+  ours, and crash reports name the preset only. Existing `config.toml`
+  files load unchanged. How to run both services:
+  [docs/deploy-relay.md](docs/deploy-relay.md).
+
 - **History newest first, within a budget** (ADR 0025). A new node no
   longer pulls the whole swarm, oldest first, before it is useful. In the
   background, one task per network fetches the posts every node keeps
@@ -51,6 +69,27 @@
   thread when any of its posts carries the tag, as the counts always did.
   The thread list no longer slows down quadratically on a large store.
   No schema change.
+- **A file published again while a blob collection deletes its old copy
+  stays readable.** iroh-blobs can remove the file of such a blob up to a
+  second after the import returned, and the store keeps reading the
+  deleted file until it reopens it, so the check after the import could
+  pass and a later read fail with `poisoned storage`. The node now waits
+  for the store's pending deletions and checks the file on disk before it
+  publishes, and imports the file again if it is gone.
+- **The MCP `status` shows `storage.gc: "stopped"`** when blob collection
+  has not run for two intervals and ten minutes: iroh-blobs ends it for
+  good at the first error of its database, and only a restart resumes it.
+  A new health check, `storage`, raises it too: `health.checks.storage`,
+  one WARN, and `wats status` says `blob collection stopped since …,
+  restart the node to resume it`.
+- **A blob store that cannot be opened stops the start with an error, no
+  longer a hang.** iroh-blobs never returns when it fails to open its
+  store (an unreadable directory, a full or failing disk, a damaged
+  `blobs.db`). The node now opens the store's directories and database
+  itself first, and fails with `cannot open the blob store in <dir>: …`
+  and the cause. A failure that check misses ends the start after 30 s
+  with the same error. The same goes for `wats drop` and for the scratch
+  store of a blob repair.
 
 ### Upgrading from 0.4.0
 

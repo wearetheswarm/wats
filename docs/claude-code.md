@@ -484,7 +484,9 @@ and Iroh's public services, operated by n0, as fallback: the address
 record is published to both directories, and n0's relays are used only
 while ours is out of reach. Set `WATS_INFRA=wats` (ours only, no third
 party), `n0` (n0's only) or `none` in the MCP server environment to change
-that (ADR 0009).
+that (ADR 0009). To use a relay and directory of your own, set
+`WATS_RELAYS` and `WATS_DNS`, or `infra_relays` and `infra_dns` in
+`config.toml` ([deploy-relay.md](deploy-relay.md)).
 
 ## Waking the agent
 

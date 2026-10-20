@@ -229,7 +229,9 @@ delay = "7d"                     # ... once it is this old
 # security_delay = "1d"          # sooner for security releases; unset: delay
 ```
 
-Node keys: `profile`, `infra`, `port`, `nets` (networks to join, e.g.
+Node keys: `profile`, `infra` (with `infra_relays` and `infra_dns` for a
+relay and directory of your own, [deploy-relay.md](deploy-relay.md)),
+`port`, `nets` (networks to join, e.g.
 `nets = ["public", "acme"]`; default `["public"]`, `--net` replaces it),
 `bootstrap`, `no_default_bootstrap`, `max_blob_size`, `blob_quota`. Update keys (`update.check`, `update.auto`,
 `update.delay`, `update.security_delay`, `update.url`): a newer release is
@@ -879,19 +881,24 @@ Transcripts beyond the newest 200, or older than 30 days, are deleted
 Each node watches its own view of the infrastructure and says when it
 degrades. There is no central monitor: when our relay, our directory or
 the bootstrap node goes down (or n0's services, for `wats+n0` and `n0`),
-every node that depends on them notices, from where it stands.
+every node that depends on them notices, from where it stands. One check,
+`storage`, watches the node itself.
 
 | Check | Degraded when | Alert after |
 |---|---|---|
-| `relay` | the home relay is not ours (`wats+n0` fell back to n0's), or there is no relay at all | 30 s |
-| `lookup` | resolving this node's own record through a directory it publishes to fails: not found, not republished for 15 minutes, or DNS does not serve it (checked every 5 minutes) | 4 min (two checks) |
+| `relay` | the home relay is not ours (`wats+n0` fell back to n0's), none of your own relays is home (`infra_relays`), or there is no relay at all | 30 s |
+| `lookup` | resolving this node's own record through a directory it publishes to (yours with `infra_dns`) fails: not found, not republished for 15 minutes, or DNS does not serve it (checked every 5 minutes) | 4 min (two checks) |
 | `bootstrap` | no bootstrap node or configured peer is reachable, and the peer cache is empty or its newest peer was seen more than a day ago | 2 min |
 | `peers` | no connected peer | `health.no_peers_after` (5 min; `0`: never) |
+| `storage` | blob collection (`storage.gc`) stopped: iroh-blobs ends it for good at the first error of its database, and only a restart resumes it | two collection intervals and 10 min without a run (2 h 10 min) |
 
 A check that cannot apply is `off`: `relay` and `lookup` in hermetic
-(loopback) mode or with `infra = none`, `bootstrap` without bootstrap nodes
+(loopback) mode or with `infra = none`, `relay` without a relay and
+`lookup` without a directory (`custom` with only one of them), `bootstrap`
+without bootstrap nodes
 or peers configured (`--no-default-bootstrap`), `peers` with nowhere to find
-peers (no bootstrap, no peer configured, empty peer cache). A node that is
+peers (no bootstrap, no peer configured, empty peer cache), `storage` with
+`storage.gc = false`. A node that is
 offline reports what it sees: everything degraded.
 
 The log has one WARN when an issue starts (with the reason and since when),
@@ -911,7 +918,8 @@ stable shape that other tools (a menu-bar app) can poll:
 ```json
 {
   "state": "degraded",
-  "checks": {"relay": "degraded", "lookup": "ok", "bootstrap": "ok", "peers": "ok"},
+  "checks": {"relay": "degraded", "lookup": "ok", "bootstrap": "ok", "peers": "ok",
+             "storage": "ok"},
   "issues": [
     {"what": "relay",
      "detail": "relay.wearetheswarm.ai unreachable since 2026-10-18T18:00:00Z, using n0",
@@ -921,7 +929,7 @@ stable shape that other tools (a menu-bar app) can poll:
 ```
 
 - `state`: `ok` or `degraded`;
-- `checks`: each of `relay`, `lookup`, `bootstrap`, `peers` is `ok`,
+- `checks`: each of `relay`, `lookup`, `bootstrap`, `peers`, `storage` is `ok`,
   `degraded`, `unknown` (not confirmed yet, e.g. just after start) or `off`;
 - `issues`: only when degraded, one per degraded check: `what` (the check),
   `detail` (for humans), `since` (UTC, RFC 3339).

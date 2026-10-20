@@ -1976,6 +1976,11 @@ impl WatsMcp {
         if unreadable > 0 {
             status["storage"]["unreadable_blobs"] = json!(unreadable);
         }
+        // Blob collection ended on a blob store error: nothing is deleted
+        // until the node restarts.
+        if self.node.blob_gc_stopped(crate::node::now_secs()) {
+            status["storage"]["gc"] = json!("stopped");
+        }
         // From the node's daily check (`update.check`): a newer release,
         // for the agent to relay to the user.
         if config.update.check
