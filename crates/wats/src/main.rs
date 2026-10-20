@@ -95,6 +95,10 @@ struct DaemonArgs {
     /// Rotated log files a detached node keeps [default: 3].
     #[arg(long, hide = true)]
     log_keep: Option<usize>,
+    /// Why an MCP session starts this node again after its node went away
+    /// (ADR 0023 §6): logged first.
+    #[arg(long, hide = true)]
+    respawn_reason: Option<String>,
     #[command(flatten)]
     agent: AgentArgs,
 }
@@ -333,6 +337,11 @@ enum Command {
     Setup {
         #[command(subcommand)]
         tool: Option<SetupTool>,
+        /// Then start the node in the background, as `wats --detach` does,
+        /// unless one already runs. Without it, `wats setup` asks on a
+        /// terminal (default no), and never starts one otherwise.
+        #[arg(short = 'd', long, global = true)]
+        detach: bool,
     },
     /// Read or change `<data dir>/config.toml`, what a bare `wats` runs
     /// with. Flags and WATS_* variables override it.
@@ -395,8 +404,8 @@ enum Command {
     },
     /// Stop the node of the data directory (--dir, default ~/.wats), or the
     /// one running as --profile: asks it to stop gracefully, then kills it
-    /// after --timeout. MCP sessions using it wait 30 s for a node to come
-    /// back, then end.
+    /// after --timeout. MCP sessions using it do not start it again: they
+    /// say it was stopped until a node runs there again.
     Stop {
         /// Stop every wats node running on this machine (see `wats ps`).
         #[arg(long)]
@@ -413,32 +422,58 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
-    /// A map of what this node knows: the busiest tags, the threads by latest
-    /// activity (with reply and answer counts, and open asks), or one
-    /// thread's outline (what the MCP `browse` tool returns).
+    /// A map of what this node knows (ADR 0024): tags as directories with
+    /// their counts, the busiest tags, the threads by latest activity (with
+    /// reply and answer counts, open asks, status and knowledge entry), the
+    /// knowledge entries (`--kind knowledge`), or one thread's outline with
+    /// its citations (what the MCP `browse` tool returns).
     Browse {
+        /// A tag directory to open (e.g. lang, lang:rust): its sub-tags and
+        /// the threads carrying it or a tag below it (the MCP `dir`).
+        #[arg(value_name = "TAG_DIR")]
+        tag_dir: Option<String>,
         /// Only threads carrying this exact tag (e.g. cap:pdf).
         #[arg(long)]
         tag: Option<String>,
-        /// Only tags starting with this in the tag list (e.g. cap:).
+        /// Only tags starting with this in the busiest-tags list (e.g.
+        /// cap:); ending with `:`, it also opens that directory.
         #[arg(long)]
         prefix: Option<String>,
-        /// Only threads whose root is of this kind (e.g. ask).
+        /// Only threads whose root is of this kind (e.g. ask), or
+        /// `knowledge` for the knowledge entries.
         #[arg(long)]
         kind: Option<String>,
+        /// Only threads this author posted in (hex, base32 or its to: tag).
+        #[arg(long)]
+        author: Option<String>,
+        /// Only threads with a post at or after this time (2026-10-18,
+        /// 2026-10-18T12:00:00Z, Unix seconds, or a duration ago: 7d).
+        #[arg(long)]
+        since: Option<String>,
+        /// Only threads with a post before this time (same forms).
+        #[arg(long)]
+        until: Option<String>,
         /// One thread's outline instead (id of its root post).
         #[arg(long)]
         thread: Option<String>,
+        /// The rest of a list: the cursor a previous browse printed, with
+        /// the same other options.
+        #[arg(long)]
+        cursor: Option<String>,
         /// Skip this many threads.
         #[arg(long, default_value_t = 0)]
         offset: usize,
-        /// Threads per page (default 30, at most 100).
+        /// Threads or entries per page (default 30, at most 100).
         #[arg(long)]
         limit: Option<usize>,
+        /// Also the threads and entries of authors this node ranks low.
+        #[arg(long)]
+        include_low: bool,
         /// Print JSON instead of lines.
         #[arg(long)]
         json: bool,
     },
+
     /// How this node weighs the authors of a network (ADR 0019 §2), with
     /// the numbers agents never see: trust (from your own profiles, the
     /// keys they vouch for and the authors whose answers they accepted or
@@ -1807,8 +1842,7 @@ fn hook_command(
 /// Whether to add the session hook: asked on a terminal (default yes),
 /// yes otherwise.
 fn want_hook(args: &NodeArgs, name: &str) -> Result<bool> {
-    use std::io::IsTerminal;
-    if args.hermetic || !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
+    if !interactive(args) {
         return Ok(true);
     }
     wats::firstrun::ask_yes_no(
@@ -2171,6 +2205,260 @@ fn setup_tool(
             );
         }
     }
+    Ok(())
+}
+
+impl SetupTool {
+    /// It removes wats, or only says what to run: no node to start after
+    /// it.
+    fn sets_nothing_up(&self) -> bool {
+        match self {
+            SetupTool::Codex {
+                remove,
+                remove_hooks,
+                ..
+            }
+            | SetupTool::Claude {
+                remove,
+                remove_hooks,
+                ..
+            } => *remove || *remove_hooks,
+            SetupTool::Openclaw { remove, .. } => *remove,
+            SetupTool::Vibe { mcp, .. } => !*mcp,
+        }
+    }
+}
+
+/// `wats setup [tool]`, then the node in the background: started with
+/// `--detach`, else offered on a terminal (default no).
+async fn setup_command(
+    node: &NodeArgs,
+    data_dir: &std::path::Path,
+    tool: Option<SetupTool>,
+    detach: bool,
+) -> Result<()> {
+    let offer = !tool.as_ref().is_some_and(SetupTool::sets_nothing_up);
+    anyhow::ensure!(
+        offer || !detach,
+        "--detach starts the node after a setup, not with --remove or --remove-hooks (nor \
+         `setup vibe` without --mcp)"
+    );
+    #[cfg(not(unix))]
+    anyhow::ensure!(
+        !detach,
+        "--detach: running the node in the background is not supported on native Windows yet: \
+         run wats under WSL, or keep `wats` running in a terminal"
+    );
+    // `--yes` (openclaw): a script, which is never asked.
+    let yes = matches!(tool, Some(SetupTool::Openclaw { yes: true, .. }));
+    let config = data_dir.join(wats::settings::FILE_NAME);
+    let before = std::fs::read(&config).ok();
+    setup_tool_command(node, data_dir, tool)?;
+    if !offer {
+        return Ok(());
+    }
+    let changed = std::fs::read(&config).ok() != before;
+    offer_background(node, data_dir, detach, yes, changed).await
+}
+
+/// `wats setup [tool]` itself.
+fn setup_tool_command(
+    node: &NodeArgs,
+    data_dir: &std::path::Path,
+    tool: Option<SetupTool>,
+) -> Result<()> {
+    let Some(tool) = tool else {
+        wats::firstrun::setup(
+            data_dir,
+            &mut std::io::stdin().lock(),
+            &mut std::io::stdout(),
+            std::env::var_os("PATH").as_deref(),
+        )?;
+        return Ok(());
+    };
+    match tool {
+        SetupTool::Claude {
+            mcp,
+            agent,
+            keys,
+            scope,
+            no_hooks,
+            remove,
+            remove_hooks,
+            claude,
+        } => {
+            if remove_hooks {
+                return remove_claude_hooks(&scope);
+            }
+            if remove {
+                return remove_from_claude(&scope, &claude);
+            }
+            let scope = scope.as_str();
+            let hooks: HookStep = (!no_hooks).then(|| {
+                Box::new(move |profile: &str| install_claude_hooks(node, profile, scope)) as _
+            });
+            setup_tool(
+                node,
+                data_dir,
+                "claude",
+                (mcp, agent),
+                &keys,
+                |profile| register_in_claude(node, profile, scope, &claude),
+                hooks,
+            )
+        }
+        SetupTool::Codex {
+            mcp,
+            agent,
+            keys,
+            no_approval,
+            no_hooks,
+            remove,
+            remove_hooks,
+            codex,
+        } => {
+            if remove_hooks {
+                return remove_codex_hooks();
+            }
+            if remove {
+                return remove_from_codex(&codex);
+            }
+            let codex = codex.as_path();
+            let hooks: HookStep = (!no_hooks).then(|| {
+                Box::new(move |profile: &str| install_codex_hooks(node, profile, codex)) as _
+            });
+            setup_tool(
+                node,
+                data_dir,
+                "codex",
+                (mcp, agent),
+                &keys,
+                |profile| {
+                    let changed = register_in_codex(node, profile, codex)?;
+                    let approval = if no_approval {
+                        set_codex_approval()?
+                    } else {
+                        false
+                    };
+                    Ok(changed || approval)
+                },
+                hooks,
+            )
+        }
+        SetupTool::Openclaw {
+            mcp,
+            remove,
+            agent,
+            apply,
+            print,
+            yes,
+            url,
+            name,
+            openclaw,
+        } => setup_openclaw(
+            node,
+            data_dir,
+            OpenclawSetup {
+                mcp,
+                agent,
+                remove,
+                apply,
+                print,
+                yes,
+                url,
+                name,
+            },
+            &openclaw,
+        ),
+        SetupTool::Vibe {
+            mcp,
+            remove,
+            project,
+        } => setup_vibe(node, data_dir, (mcp, remove, project)),
+    }
+}
+
+/// Whether to ask the person running this command: stdin and stdout are a
+/// terminal, never with --hermetic (tests), unless `WATS_TEST_INTERACTIVE`
+/// says to ask on a pipe.
+fn interactive(args: &NodeArgs) -> bool {
+    use std::io::IsTerminal;
+    if args.hermetic {
+        return std::env::var("WATS_TEST_INTERACTIVE").as_deref() == Ok("1");
+    }
+    std::io::stdin().is_terminal() && std::io::stdout().is_terminal()
+}
+
+/// After `wats setup`: when no node runs in the data directory, start one
+/// in the background with `detach` (`wats setup --detach`), else ask on a
+/// terminal (default no; never with `--yes`); when one runs, say whether it
+/// needs a restart for the setup to apply (`changed`: config.toml, which a
+/// node reads when it starts, was changed).
+#[cfg(unix)]
+async fn offer_background(
+    args: &NodeArgs,
+    data_dir: &std::path::Path,
+    detach: bool,
+    yes: bool,
+    changed: bool,
+) -> Result<()> {
+    let dir = std::path::absolute(data_dir)?;
+    let entry = NodeEntry::look(dir.clone()).await;
+    // A node `wats mcp` started for its sessions: `wats --detach` takes
+    // it over, as it does by itself.
+    let takeover = entry.running && entry.role() == "background";
+    if entry.running && !(takeover && detach) {
+        let pid = entry.pid().map_or_else(|| "?".into(), |p| p.to_string());
+        let flag = entry.dir_flag();
+        let what = format!(
+            "a wats node already runs here (pid {pid}, {})",
+            entry.mode()
+        );
+        if !changed {
+            println!("{what}: nothing to restart, new sessions use it");
+        } else if takeover {
+            println!(
+                "{what}, for your MCP sessions: it reads config.toml when it starts. To run it \
+                 with this setup: wats --detach{flag} (it takes over)"
+            );
+        } else {
+            println!(
+                "{what}: it reads config.toml when it starts. To apply this setup, restart it: \
+                 wats stop{flag}; wats --detach{flag}"
+            );
+        }
+        return Ok(());
+    }
+    let start = detach
+        || (!yes
+            && interactive(args)
+            && wats::firstrun::ask_yes_no(
+                &mut std::io::stdin().lock(),
+                &mut std::io::stdout(),
+                "Start the node in the background now (`wats --detach`)?",
+                false,
+            )?);
+    if !start {
+        return Ok(());
+    }
+    // The child is `wats --detach` with this command's global options.
+    let mut child_args = args.to_args(&dir);
+    if let Some(profile) = &args.profile {
+        child_args.push(format!("--profile={profile}").into());
+    }
+    child_args.push("--detach".into());
+    let settings = Settings::load(&dir)?;
+    detach_command(&dir, &settings, false, child_args).await
+}
+
+#[cfg(not(unix))]
+async fn offer_background(
+    _: &NodeArgs,
+    _: &std::path::Path,
+    _: bool,
+    _: bool,
+    _: bool,
+) -> Result<()> {
     Ok(())
 }
 
@@ -2617,7 +2905,8 @@ fn reputation_command(
 }
 
 /// `wats browse`: reads the store directly (read-only, so a running node
-/// is fine).
+/// is fine), and judges posts as the node would: its reputation tables,
+/// built here, and `reputation.threshold`.
 fn browse_command(config: &NodeConfig, query: &wats::browse::Query, json: bool) -> Result<()> {
     let path = config.data_dir.join("events.sqlite");
     anyhow::ensure!(
@@ -2626,30 +2915,156 @@ fn browse_command(config: &NodeConfig, query: &wats::browse::Query, json: bool) 
         config.data_dir.display()
     );
     let store = wats::store::Store::open_read_only(&path)?;
-    let map = wats::browse::browse(&store, query)?;
+    let secret = config
+        .secret_file
+        .clone()
+        .unwrap_or_else(|| config.data_dir.join("secret.key"));
+    // Without the secret, no profile of yours to trust from: every author
+    // then weighs only its floor.
+    let local = wats::identity::RootSecret::load(&secret)
+        .map(|root| wats::node::configured_authors(&root, config))
+        .unwrap_or_default();
+    let now = wats::node::now_secs();
+    let pow = wats::reputation::PowPolicy::of(config);
+    let nets = match &query.net {
+        Some(net) => vec![net.clone()],
+        None => config.nets.clone(),
+    };
+    let mut grouping = wats::signals::Grouping::new(local.clone());
+    for net in &nets {
+        let table = wats::reputation::build(&store, net, &local, now, &pow)?;
+        grouping = grouping.with_table(std::sync::Arc::new(table));
+    }
+    let lens = wats::browse::Lens {
+        grouping,
+        threshold: config.reputation.threshold,
+        now,
+    };
+    let map = wats::browse::browse(&store, query, &lens)?;
     if json {
         println!("{}", serde_json::to_string_pretty(&map)?);
         return Ok(());
     }
+    print!("{}", browse_lines(&map));
+    Ok(())
+}
+
+/// `wats browse` for a human: one line per directory, tag, thread, entry
+/// or post.
+fn browse_lines(map: &serde_json::Value) -> String {
+    use std::fmt::Write as _;
     let s = |v: &serde_json::Value| v.as_str().unwrap_or("").to_string();
+    let short = |v: &serde_json::Value| s(v).get(..12).unwrap_or("").to_string();
+    let mut out = String::new();
     if let Some(posts) = map["posts"].as_array() {
+        let cited = map["cited_by"].as_u64().unwrap_or(0);
+        if cited > 0 {
+            let _ = writeln!(out, "cited by {cited} posts elsewhere:");
+            for c in map["citing"].as_array().into_iter().flatten() {
+                let _ = writeln!(out, "  {} {}", short(&c["id"]), s(&c["title"]));
+            }
+        }
+        if map["knowledge"].is_object() {
+            let k = &map["knowledge"];
+            let _ = writeln!(
+                out,
+                "knowledge: {} {} {} ({})",
+                short(&k["id"]),
+                s(&k["kind"]),
+                s(&k["title"]),
+                s(&k["status"])
+            );
+        }
         for p in posts {
             let depth = p["depth"].as_u64().unwrap_or(0) as usize;
-            println!(
-                "{}{} {} {} · {}",
+            let mut extra = String::new();
+            if let Some(refs) = p["refs"].as_array() {
+                let n = p["refs_total"].as_u64().unwrap_or(refs.len() as u64);
+                let _ = write!(extra, " · cites {n}");
+            }
+            if let Some(n) = p["cited_by"].as_u64() {
+                let _ = write!(extra, " · cited by {n}");
+            }
+            if p["knowledge"] == true {
+                extra.push_str(" · KNOWLEDGE");
+            }
+            let _ = writeln!(
+                out,
+                "{}{} {} {} · {}{extra}",
                 "  ".repeat(depth),
-                s(&p["id"]).get(..12).unwrap_or(""),
+                short(&p["id"]),
                 s(&p["kind"]),
                 s(&p["title"]),
                 s(&p["author"]),
             );
         }
-        return Ok(());
+        if map["truncated"] == true {
+            out.push_str("(cut: the thread is longer)\n");
+        }
+        return out;
+    }
+    let more = |out: &mut String, cursor: &serde_json::Value| {
+        if let Some(cursor) = cursor.as_str() {
+            let _ = writeln!(out, "  more: repeat with --cursor {cursor}");
+        }
+    };
+    if let Some(entries) = map["entries"].as_array() {
+        out.push_str("knowledge entries:\n");
+        for e in entries {
+            let counts = e["counts"]
+                .as_object()
+                .map(|c| {
+                    c.iter()
+                        .map(|(k, v)| format!(" {v} {k}"))
+                        .collect::<String>()
+                })
+                .unwrap_or_default();
+            let _ = writeln!(
+                out,
+                "  {} {} {} {}  {} sources ·{counts}",
+                short(&e["id"]),
+                s(&e["kind"]),
+                s(&e["status"]),
+                s(&e["title"]),
+                e["sources"],
+            );
+            if e["thread"].is_string() {
+                let _ = writeln!(
+                    out,
+                    "      in {} {}",
+                    short(&e["thread"]),
+                    s(&e["thread_title"])
+                );
+            }
+        }
+        more(&mut out, &map["cursor"]);
+    }
+    if let Some(dir) = map["dir"].as_str() {
+        let _ = writeln!(out, "dir: {dir}");
+    }
+    if let Some(dirs) = map["dirs"].as_array().filter(|d| !d.is_empty()) {
+        out.push_str("dirs:\n");
+        for d in dirs {
+            let children = match d["children"].as_u64() {
+                Some(n) => format!(" · {n} sub-tags"),
+                None => String::new(),
+            };
+            let _ = writeln!(
+                out,
+                "  {}  {} threads · {} posts{children} · last {}",
+                s(&d["tag"]),
+                d["threads"],
+                d["posts"],
+                s(&d["last"])
+            );
+        }
+        more(&mut out, &map["dirs_cursor"]);
     }
     if let Some(tags) = map["tags"].as_array().filter(|t| !t.is_empty()) {
-        println!("tags:");
+        out.push_str("busiest tags:\n");
         for t in tags {
-            println!(
+            let _ = writeln!(
+                out,
                 "  {}  {} threads · {} posts · last {}",
                 s(&t["tag"]),
                 t["threads"],
@@ -2658,27 +3073,47 @@ fn browse_command(config: &NodeConfig, query: &wats::browse::Query, json: bool) 
             );
         }
     }
-    println!("threads:");
-    for t in map["threads"].as_array().into_iter().flatten() {
-        let open = match t["open"].as_bool() {
-            Some(true) => " OPEN",
-            _ => "",
-        };
-        println!(
-            "  {} {}{} {}  {} replies · {} answers · last {}",
-            s(&t["id"]).get(..12).unwrap_or(""),
-            s(&t["kind"]),
-            open,
-            s(&t["title"]),
-            t["replies"],
-            t["answers"],
-            s(&t["last"])
+    if let Some(threads) = map["threads"].as_array() {
+        out.push_str("threads:\n");
+        for t in threads {
+            let open = match t["open"].as_bool() {
+                Some(true) => " OPEN",
+                _ => "",
+            };
+            let status = match t["status"].as_str() {
+                Some(status) if status != "unverified" => format!(" [{status}]"),
+                _ => String::new(),
+            };
+            let _ = writeln!(
+                out,
+                "  {} {}{open}{status} {}  {} replies · {} answers · last {}",
+                short(&t["id"]),
+                s(&t["kind"]),
+                s(&t["title"]),
+                t["replies"],
+                t["answers"],
+                s(&t["last"])
+            );
+            if t["knowledge"].is_object() {
+                let k = &t["knowledge"];
+                let _ = writeln!(
+                    out,
+                    "      knowledge: {} {} {}",
+                    short(&k["id"]),
+                    s(&k["kind"]),
+                    s(&k["title"])
+                );
+            }
+        }
+        more(&mut out, &map["cursor"]);
+    }
+    if let Some(n) = map["hidden_low"].as_u64() {
+        let _ = writeln!(
+            out,
+            "hidden: {n} by authors this node ranks low (--include-low shows them)"
         );
     }
-    if let Some(next) = map["next_offset"].as_u64() {
-        println!("more: wats browse --offset {next}");
-    }
-    Ok(())
+    out
 }
 
 async fn status_command(config: &NodeConfig, json: bool) -> Result<()> {
@@ -3145,9 +3580,17 @@ async fn ps_command(node: &NodeArgs, all: bool, json: bool) -> Result<()> {
 /// detached process logging to `<data dir>/logs/node.log`, and return once
 /// its node is up (it took the data directory and serves its socket), or
 /// print what it said before it died.
+///
+/// `child_args`: the child's command line, without `--log-file` (this
+/// one's for `wats --detach`, the node's for `wats setup --detach`).
 #[cfg(unix)]
-async fn detach_command(config: &NodeConfig, settings: &Settings, quiet: bool) -> Result<()> {
-    let dir = std::path::absolute(&config.data_dir)?;
+async fn detach_command(
+    data_dir: &std::path::Path,
+    settings: &Settings,
+    quiet: bool,
+    child_args: Vec<std::ffi::OsString>,
+) -> Result<()> {
+    let dir = std::path::absolute(data_dir)?;
     let before = NodeEntry::look(dir.clone()).await;
     let takeover = before.running && before.role() == "background";
     if before.running && !takeover {
@@ -3169,7 +3612,7 @@ async fn detach_command(config: &NodeConfig, settings: &Settings, quiet: bool) -
     // The child: the same command line, which `--log-file` tells that it
     // is the detached one.
     let mut args: Vec<std::ffi::OsString> = vec!["--log-file".into(), log.clone().into()];
-    args.extend(std::env::args_os().skip(1));
+    args.extend(child_args);
     let mut child = wats::background::spawn_detached(&args, &log, &[])
         .context("start the node in the background")?;
     let pid = child.id();
@@ -3235,7 +3678,12 @@ async fn detach_command(config: &NodeConfig, settings: &Settings, quiet: bool) -
 }
 
 #[cfg(not(unix))]
-async fn detach_command(_: &NodeConfig, _: &Settings, _: bool) -> Result<()> {
+async fn detach_command(
+    _: &std::path::Path,
+    _: &Settings,
+    _: bool,
+    _: Vec<std::ffi::OsString>,
+) -> Result<()> {
     anyhow::bail!(
         "`wats --detach` is not supported on native Windows yet: run wats under WSL, or keep \
          `wats` running in a terminal"
@@ -3403,7 +3851,12 @@ async fn stop_command(node: &NodeArgs, all: bool, timeout: Duration) -> Result<(
     }
     let mut failed = 0;
     for entry in targets {
-        if let Err(e) = stop_node(&entry, timeout).await {
+        let by = if all {
+            "`wats stop --all`"
+        } else {
+            "`wats stop`"
+        };
+        if let Err(e) = stop_node(&entry, timeout, by).await {
             eprintln!("{}: {e:#}", tilde(&entry.dir));
             failed += 1;
         }
@@ -3422,19 +3875,48 @@ async fn stop_command(_: &NodeArgs, _: bool, _: Duration) -> Result<()> {
     )
 }
 
+/// Stop one node, `by` naming this command for its MCP sessions.
 #[cfg(unix)]
-async fn stop_node(entry: &NodeEntry, timeout: Duration) -> Result<()> {
+async fn stop_node(entry: &NodeEntry, timeout: Duration, by: &str) -> Result<()> {
     let dir = &entry.dir;
     let started = std::time::Instant::now();
-    let mode = entry.mode();
     if let Some(sessions) = entry.sessions().filter(|s| *s > 0) {
         eprintln!(
-            "warning: {sessions} MCP session(s) use the node in {}: each waits 30 s for a node \
-             to come back (`wats --detach`), then ends; their host starts a background node \
-             again when it restarts them",
-            tilde(dir)
+            "warning: {sessions} MCP session(s) use the node in {}: they do not start it again, \
+             and answer each call saying it was stopped, until a node runs there again \
+             (`wats{} --detach`)",
+            tilde(dir),
+            entry.dir_flag()
         );
     }
+    // Before the sessions see their node go: an intended stop, not a
+    // crash (ADR 0023 §6). The next node to start removes it.
+    let record = wats::background::StopRecord {
+        reason: wats::background::StopReason::Stop,
+        by: by.to_string(),
+        at: wats::node::now_secs(),
+        pid: entry.pid().unwrap_or_default(),
+        profile: entry.profile(),
+    };
+    if let Err(e) = wats::background::write_stop_record(dir, &record) {
+        tracing::warn!("could not record the stop in {}: {e}", tilde(dir));
+    }
+    let result = stop_gracefully_or_kill(entry, timeout, started).await;
+    if result.is_err() && wats::node::node_running(dir) {
+        // It still runs: no stop to report to its sessions.
+        wats::background::clear_stop_record(dir);
+    }
+    result
+}
+
+#[cfg(unix)]
+async fn stop_gracefully_or_kill(
+    entry: &NodeEntry,
+    timeout: Duration,
+    started: std::time::Instant,
+) -> Result<()> {
+    let dir = &entry.dir;
+    let mode = entry.mode();
     // Graceful: through the socket, else SIGTERM to the lock holder.
     let asked = attach::control_within(dir, attach::Control::Stop, Duration::from_secs(5))
         .await
@@ -3903,8 +4385,14 @@ impl NodeArgs {
 
 /// Start `wats node` for `dir` as a detached background process, logging
 /// to `<dir>/logs/node.log` (the path `wats --detach` shares, ADR 0023).
+/// `respawn`: why a session starts it again (ADR 0023 §6), for its log.
 #[cfg(unix)]
-fn spawn_background_node(args: &NodeArgs, dir: &std::path::Path, idle_exit: u64) -> Result<()> {
+fn spawn_background_node(
+    args: &NodeArgs,
+    dir: &std::path::Path,
+    idle_exit: u64,
+    respawn: Option<&str>,
+) -> Result<std::process::Child> {
     std::fs::create_dir_all(dir)?;
     let log = wats::background::log_path(dir);
     // A node started for a session runs no agent of config.toml, unless
@@ -3917,13 +4405,16 @@ fn spawn_background_node(args: &NodeArgs, dir: &std::path::Path, idle_exit: u64)
         child_args.push("--no-agent".into());
     }
     child_args.extend(["--idle-exit".into(), idle_exit.to_string().into()]);
+    if let Some(reason) = respawn {
+        child_args.extend(["--respawn-reason".into(), reason.into()]);
+    }
     // Own process group: the node survives the session that started it.
     let child = wats::background::spawn_detached(&child_args, &log, &[])
         .context("start background node")?;
     tracing::info!(pid = child.id(), "started background node");
-    // Not waited for on purpose: it outlives this process.
-    drop(child);
-    Ok(())
+    // It may outlive this process: callers wait for it in a thread
+    // (`background::reap`), never here.
+    Ok(child)
 }
 
 /// The halt marker this node obeys, if any: none when it ignores halts,
@@ -3950,11 +4441,23 @@ async fn serve_halted_mcp(marker: &wats::halt::Marker) -> Result<()> {
 }
 
 /// Serve this session through the node that owns `dir`, starting one in
-/// the background if none runs.
+/// the background if none runs, and again if it crashes (ADR 0023 §6).
 #[cfg(unix)]
 async fn mcp_attached(args: &NodeArgs, config: &NodeConfig, idle_exit: u64) -> Result<()> {
     let dir = config.data_dir.as_path();
-    let attach = || attach::attach(dir, args.profile.clone(), default_file_roots());
+    let recovery = || attach::Recovery {
+        // A named socket is another process's node: never started here.
+        respawn: attach::socket_override().is_none().then(|| {
+            Box::new(move |reason: &str| spawn_background_node(args, dir, idle_exit, Some(reason)))
+                as attach::Respawn<'_>
+        }),
+        dir_flag: if default_dir().is_ok_and(|d| same_dir(&d, dir)) {
+            String::new()
+        } else {
+            format!(" --dir {}", tilde(dir))
+        },
+    };
+    let attach = || attach::attach(dir, args.profile.clone(), default_file_roots(), recovery());
     if attach().await? {
         return Ok(());
     }
@@ -3971,10 +4474,10 @@ async fn mcp_attached(args: &NodeArgs, config: &NodeConfig, idle_exit: u64) -> R
     // starts to look for an unhalt, for the next sessions.
     if let Some(marker) = halted_marker(config) {
         tracing::warn!("{}", marker.message());
-        spawn_background_node(args, dir, idle_exit)?;
+        wats::background::reap(spawn_background_node(args, dir, idle_exit, None)?);
         return serve_halted_mcp(&marker).await;
     }
-    spawn_background_node(args, dir, idle_exit)?;
+    wats::background::reap(spawn_background_node(args, dir, idle_exit, None)?);
     for _ in 0..150 {
         tokio::time::sleep(Duration::from_millis(100)).await;
         if attach().await? {
@@ -5149,6 +5652,16 @@ async fn async_main(cli: Cli) -> Result<()> {
         .init();
 
     wats::crash::install_panic_hook();
+    // One line per respawn, in the log `wats attach` shows (ADR 0023 §6),
+    // first: also when this start fails.
+    let respawn = match &cli.command {
+        Some(Command::Node { daemon }) => daemon.respawn_reason.as_deref(),
+        None => cli.daemon.respawn_reason.as_deref(),
+        Some(_) => None,
+    };
+    if let Some(reason) = respawn {
+        tracing::warn!("respawn: {reason}");
+    }
     let shutdown = shutdown_signal();
     let data_dir = cli.node.data_dir()?;
     // Commands that work even when config.toml does not load.
@@ -5201,129 +5714,10 @@ async fn async_main(cli: Cli) -> Result<()> {
                 _ = shutdown => Ok(()),
             };
         }
-        Some(Command::Setup { tool: None }) => {
-            wats::firstrun::setup(
-                &data_dir,
-                &mut std::io::stdin().lock(),
-                &mut std::io::stdout(),
-                std::env::var_os("PATH").as_deref(),
-            )?;
-            return Ok(());
+        Some(Command::Setup { tool, detach }) => {
+            // `wats --detach setup …` means `wats setup … --detach`.
+            return setup_command(&cli.node, &data_dir, tool, detach || cli.daemon.detach).await;
         }
-        Some(Command::Setup {
-            tool:
-                Some(SetupTool::Claude {
-                    mcp,
-                    agent,
-                    keys,
-                    scope,
-                    no_hooks,
-                    remove,
-                    remove_hooks,
-                    claude,
-                }),
-        }) => {
-            if remove_hooks {
-                return remove_claude_hooks(&scope);
-            }
-            if remove {
-                return remove_from_claude(&scope, &claude);
-            }
-            let node = &cli.node;
-            let scope = scope.as_str();
-            let hooks: HookStep = (!no_hooks).then(|| {
-                Box::new(move |profile: &str| install_claude_hooks(node, profile, scope)) as _
-            });
-            return setup_tool(
-                node,
-                &data_dir,
-                "claude",
-                (mcp, agent),
-                &keys,
-                |profile| register_in_claude(node, profile, scope, &claude),
-                hooks,
-            );
-        }
-        Some(Command::Setup {
-            tool:
-                Some(SetupTool::Codex {
-                    mcp,
-                    agent,
-                    keys,
-                    no_approval,
-                    no_hooks,
-                    remove,
-                    remove_hooks,
-                    codex,
-                }),
-        }) => {
-            if remove_hooks {
-                return remove_codex_hooks();
-            }
-            if remove {
-                return remove_from_codex(&codex);
-            }
-            let node = &cli.node;
-            let codex = codex.as_path();
-            let hooks: HookStep = (!no_hooks).then(|| {
-                Box::new(move |profile: &str| install_codex_hooks(node, profile, codex)) as _
-            });
-            return setup_tool(
-                node,
-                &data_dir,
-                "codex",
-                (mcp, agent),
-                &keys,
-                |profile| {
-                    let changed = register_in_codex(node, profile, codex)?;
-                    let approval = if no_approval {
-                        set_codex_approval()?
-                    } else {
-                        false
-                    };
-                    Ok(changed || approval)
-                },
-                hooks,
-            );
-        }
-        Some(Command::Setup {
-            tool:
-                Some(SetupTool::Openclaw {
-                    mcp,
-                    remove,
-                    agent,
-                    apply,
-                    print,
-                    yes,
-                    url,
-                    name,
-                    openclaw,
-                }),
-        }) => {
-            return setup_openclaw(
-                &cli.node,
-                &data_dir,
-                OpenclawSetup {
-                    mcp,
-                    agent,
-                    remove,
-                    apply,
-                    print,
-                    yes,
-                    url,
-                    name,
-                },
-                &openclaw,
-            );
-        }
-        Some(Command::Setup {
-            tool:
-                Some(SetupTool::Vibe {
-                    mcp,
-                    remove,
-                    project,
-                }),
-        }) => return setup_vibe(&cli.node, &data_dir, (mcp, remove, project)),
         _ => {}
     }
     first_run(&cli, &data_dir)?;
@@ -5354,29 +5748,58 @@ async fn async_main(cli: Cli) -> Result<()> {
         Some(Command::Id { host }) => return print_id(&config, &host),
         Some(Command::Status { json }) => return status_command(&config, json).await,
         Some(Command::Browse {
+            tag_dir,
             tag,
             prefix,
             kind,
+            author,
+            since,
+            until,
             thread,
+            cursor,
             offset,
             limit,
+            include_low,
             json,
         }) => {
+            let now = wats::node::now_secs();
+            let time = |flag: &str, value: Option<String>| {
+                value
+                    .map(|v| wats::browse::parse_time(&v, now))
+                    .transpose()
+                    .map_err(|e| anyhow::anyhow!("--{flag}: {e}"))
+            };
+            let knowledge = kind.as_deref() == Some("knowledge");
             let query = wats::browse::Query {
                 net: None,
-                tag,
+                tag: tag.map(|tag| wats::delivery::normalize_to_tag(tag).0),
                 prefix,
-                kind: kind
+                dir: tag_dir,
+                kind: match knowledge {
+                    true => None,
+                    false => kind
+                        .as_deref()
+                        .map(str::parse)
+                        .transpose()
+                        .map_err(|_| anyhow::anyhow!("--kind: not a kind (or `knowledge`)"))?,
+                },
+                knowledge,
+                author: author
                     .as_deref()
-                    .map(str::parse)
+                    .map(wats::browse::parse_author)
                     .transpose()
-                    .map_err(|_| anyhow::anyhow!("--kind: not a kind"))?,
+                    .map_err(|e| anyhow::anyhow!("--author: {e}"))?,
+                since: time("since", since)?,
+                until: time("until", until)?,
                 thread,
                 offset,
+                cursor,
                 limit,
+                include_low,
             };
             return browse_command(&config, &query, json);
         }
+
         Some(Command::Reputation {
             author,
             limit,
@@ -5416,7 +5839,13 @@ async fn async_main(cli: Cli) -> Result<()> {
                 "`wats node` prints JSON lines for a script: run `wats --detach` instead"
             );
         }
-        return detach_command(&config, &settings, daemon.quiet).await;
+        return detach_command(
+            &config.data_dir,
+            &settings,
+            daemon.quiet,
+            std::env::args_os().skip(1).collect(),
+        )
+        .await;
     }
     if let Some(log) = &daemon.log_file {
         wats::background::rotate_stderr(
@@ -6125,7 +6554,8 @@ mod cli_reference {
         out.push('\n');
     }
 
-    fn section(out: &mut String, cmd: &clap::Command, path: &[String], top: bool) {
+    /// `inherited`: the global options of the commands above, listed there.
+    fn section(out: &mut String, cmd: &clap::Command, path: &[String], inherited: &[String]) {
         let name = path.join(" ");
         out.push_str(&format!(
             "<a id=\"{}\"></a>\n\n## `{name}`\n\n",
@@ -6142,9 +6572,16 @@ mod cli_reference {
             .get_arguments()
             .filter(|a| !a.is_hide_set())
             .filter(|a| !matches!(a.get_id().as_str(), "help" | "version"))
-            // Global options are listed once, under `wats`.
-            .filter(|a| top || !a.is_global_set())
+            // Global options are listed once, under the command that
+            // defines them (`wats`, `wats setup`).
+            .filter(|a| !(a.is_global_set() && inherited.contains(&a.get_id().to_string())))
             .collect();
+        let mut globals = inherited.to_vec();
+        globals.extend(
+            args.iter()
+                .filter(|a| a.is_global_set())
+                .map(|a| a.get_id().to_string()),
+        );
         let mut headings: Vec<Option<&str>> = Vec::new();
         for arg in &args {
             if !headings.contains(&arg.get_help_heading()) {
@@ -6183,7 +6620,7 @@ mod cli_reference {
         for sub in subs {
             let mut sub_path = path.to_vec();
             sub_path.push(sub.get_name().to_string());
-            section(out, sub, &sub_path, false);
+            section(out, sub, &sub_path, &globals);
         }
     }
 
@@ -6201,7 +6638,7 @@ mod cli_reference {
              [configuration reference](config.md); a flag or an environment \
              variable wins over the file.\n\n",
         );
-        section(&mut out, &cmd, &["wats".to_string()], true);
+        section(&mut out, &cmd, &["wats".to_string()], &[]);
         while out.ends_with("\n\n") {
             out.pop();
         }

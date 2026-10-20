@@ -339,6 +339,15 @@ async fn run_control(
         Control::Info => Ok(info(node, sessions)),
         Control::Stop => {
             tracing::info!("stopping: asked by `wats stop`");
+            // Before any session sees its node go: they must not start it
+            // again (`wats stop` records it first, naming itself).
+            let config = node.config();
+            crate::background::record_stop(
+                &config.data_dir,
+                crate::background::StopReason::Stop,
+                "a stop request on its socket",
+                &config.profile,
+            );
             let answer = info(node, sessions);
             // Let this answer go out first.
             let node = Arc::clone(node);
@@ -353,6 +362,12 @@ async fn run_control(
                 bail!("this node is not a background node: it does not hand over");
             }
             tracing::info!("a daemon is taking over this data directory: stopping");
+            crate::background::record_stop(
+                &node.config().data_dir,
+                crate::background::StopReason::HandOver,
+                "a daemon taking over",
+                &node.config().profile,
+            );
             node.request_stop();
             Ok(serde_json::json!("handing over"))
         }
@@ -470,6 +485,9 @@ const RETRIED_TOOLS: [&str; 7] = [
 #[derive(Debug, Clone)]
 struct InFlight {
     id: serde_json::Value,
+    /// Its method: the answer to `tools/list` is kept for when no node
+    /// runs.
+    method: String,
     line: String,
     /// It may be sent again to the next node.
     retry: bool,
@@ -490,6 +508,7 @@ fn in_flight(line: &str) -> Option<InFlight> {
     };
     Some(InFlight {
         id,
+        method: method.to_string(),
         line: line.to_string(),
         retry,
     })
@@ -500,26 +519,461 @@ fn lost_call(id: &serde_json::Value) -> String {
     serde_json::json!({
         "jsonrpc": "2.0",
         "id": id,
-        "error": {"code": -32000, "message": "the wats node restarted during this call,             which may or may not have taken effect: check (e.g. with search) before trying again"},
+        "error": {"code": -32000, "message": "the wats node restarted during this call, \
+            which may or may not have taken effect: check (e.g. with search) before trying again"},
     })
     .to_string()
+}
+
+/// The answer to a call lost when the node went away and none serves the
+/// session now: `message` says why, and a call that may have published
+/// says that too.
+#[cfg(unix)]
+fn lost_without_node(
+    call: &InFlight,
+    message: &str,
+    tools: Option<&serde_json::Value>,
+) -> Option<serde_json::Value> {
+    let request: serde_json::Value = serde_json::from_str(&call.line).ok()?;
+    if call.method == "tools/call" && !call.retry {
+        let message = format!(
+            "The wats node stopped during this call, which may or may not have taken effect: \
+             check (e.g. with search) once it runs again. {message}"
+        );
+        return crate::halt::answer_without_node(&request, &message, tools);
+    }
+    crate::halt::answer_without_node(&request, message, tools)
+}
+
+/// At most this many nodes started again by one session within
+/// [`RESPAWN_WINDOW`] (ADR 0023 §6), so that a node that crashes at start
+/// does not loop forever; then the session says so on every call.
+pub const RESPAWN_LIMIT: usize = 5;
+/// See [`RESPAWN_LIMIT`].
+pub const RESPAWN_WINDOW: std::time::Duration = std::time::Duration::from_secs(10 * 60);
+/// The wait after a node started again failed, before the next start:
+/// 1 s, doubling with each failure in a row, at most 30 s.
+#[cfg(unix)]
+const RESPAWN_BACKOFF: std::time::Duration = std::time::Duration::from_secs(1);
+#[cfg(unix)]
+const RESPAWN_BACKOFF_MAX: std::time::Duration = std::time::Duration::from_secs(30);
+/// How long a node started again has to accept sessions.
+#[cfg(unix)]
+const RESPAWN_START_WAIT: std::time::Duration = std::time::Duration::from_secs(20);
+/// How long a session waits for a node that holds the data directory but
+/// accepts no session yet (starting, or a daemon taking over).
+#[cfg(unix)]
+const NODE_START_WAIT: std::time::Duration = std::time::Duration::from_secs(60);
+/// How long a hand-over keeps the sessions waiting for the daemon (whose
+/// takeover waits up to 30 s), in seconds.
+#[cfg(unix)]
+const HAND_OVER_WAIT: u64 = 60;
+/// How long a session waits for the node of a named socket
+/// ([`SOCKET_ENV`]) to come back.
+#[cfg(unix)]
+const NAMED_SOCKET_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
+/// Locked by the session that starts a node again: the other sessions of
+/// the data directory wait for that node instead of starting their own.
+pub const RESPAWN_LOCK: &str = "respawn.lock";
+
+/// Starts a background node for the data directory, and logs the reason
+/// it is given.
+pub type Respawn<'a> = Box<dyn Fn(&str) -> Result<std::process::Child> + Send + Sync + 'a>;
+
+/// What an MCP session does when its node goes away (ADR 0023 §6).
+pub struct Recovery<'a> {
+    /// Starts the node again. `None` on a named socket ([`SOCKET_ENV`]):
+    /// that node is another container's, never started here.
+    pub respawn: Option<Respawn<'a>>,
+    /// `--dir <dir>` when the data directory is not the default, for the
+    /// commands the session suggests.
+    pub dir_flag: String,
+}
+
+/// Where the session stands with its data directory's node.
+#[cfg(unix)]
+enum State {
+    /// A node accepts this session.
+    Up(tokio::net::UnixStream),
+    /// Stopped on purpose, or halted: not started again; the message says
+    /// why.
+    Stopped(String),
+    /// A node holds the data directory without accepting sessions yet, or
+    /// a daemon is taking over: wait for it.
+    Starting,
+    /// No node runs, and none is starting.
+    Gone,
+}
+
+/// One MCP session relayed to the node of its data directory, across node
+/// changes.
+#[cfg(unix)]
+struct Session<'a> {
+    data_dir: &'a Path,
+    socket: PathBuf,
+    recovery: Recovery<'a>,
+    /// The node served last, from its lock file.
+    node: Option<crate::node::LockHolder>,
+    /// When this session started a node again, within [`RESPAWN_WINDOW`].
+    respawns: std::collections::VecDeque<std::time::Instant>,
+    /// Failed starts in a row.
+    failures: u32,
+    last_failure: Option<String>,
+}
+
+#[cfg(unix)]
+impl Session<'_> {
+    async fn connect(&self) -> Option<tokio::net::UnixStream> {
+        tokio::net::UnixStream::connect(&self.socket).await.ok()
+    }
+
+    /// Note the node this session is attached to now.
+    fn note_node(&mut self) {
+        self.node = crate::node::lock_holder(self.data_dir)
+            .filter(|_| crate::node::node_running(self.data_dir));
+    }
+
+    fn profile(&self) -> String {
+        self.node
+            .as_ref()
+            .and_then(|h| h.profile.clone())
+            .unwrap_or_else(|| "default".into())
+    }
+
+    fn start_command(&self) -> String {
+        format!("wats{} --detach", self.recovery.dir_flag)
+    }
+
+    async fn assess(&self) -> State {
+        use crate::background::StopReason;
+        // A halted node may still accept sessions only to close them
+        // (ADR 0016 §3): the marker first.
+        if let Some(marker) = crate::halt::read_marker(self.data_dir) {
+            return State::Stopped(crate::halt::mcp_message(&marker));
+        }
+        if let Some(stream) = self.connect().await {
+            return State::Up(stream);
+        }
+        match crate::background::read_stop_record(self.data_dir) {
+            Some(r) if r.reason == StopReason::Stop => {
+                return State::Stopped(self.stopped_message(&r));
+            }
+            Some(r)
+                if r.reason == StopReason::HandOver
+                    && crate::node::now_secs().saturating_sub(r.at) < HAND_OVER_WAIT =>
+            {
+                return State::Starting;
+            }
+            _ => {}
+        }
+        if crate::node::node_running(self.data_dir) {
+            State::Starting
+        } else {
+            State::Gone
+        }
+    }
+
+    fn stopped_message(&self, record: &crate::background::StopRecord) -> String {
+        format!(
+            "The wats node for profile {} was stopped with {} at {}: this session does not \
+             start it again. Tell the user. To use the swarm again, start it with `{}` (or \
+             restart this MCP session); this session reconnects on its next call.",
+            record.profile.as_deref().unwrap_or("default"),
+            record.by,
+            crate::runs::format_time(record.at),
+            self.start_command(),
+        )
+    }
+
+    fn gave_up_message(&self) -> String {
+        format!(
+            "The wats node for profile {} keeps stopping: this session started it {} times in \
+             {} minutes{}, and does not try again on its own for now. Tell the user: see {}, \
+             then start it with `{}` (or restart this MCP session); this session reconnects on \
+             its next call.",
+            self.profile(),
+            self.respawns.len(),
+            RESPAWN_WINDOW.as_secs() / 60,
+            self.last_failure
+                .as_deref()
+                .map(|f| format!(" (last: {f})"))
+                .unwrap_or_default(),
+            crate::background::log_path(self.data_dir).display(),
+            self.start_command(),
+        )
+    }
+
+    fn unreachable_message(&self) -> String {
+        if self.recovery.respawn.is_none() {
+            return format!(
+                "No wats node listens on {} ({SOCKET_ENV}). Tell the user to start that node; \
+                 this session reconnects on its next call.",
+                self.socket.display()
+            );
+        }
+        let pid = crate::node::lock_holder(self.data_dir)
+            .map(|h| format!(" (pid {})", h.pid))
+            .unwrap_or_default();
+        format!(
+            "The wats node in {}{pid} holds its data directory but accepts no session. Tell the \
+             user to restart it (`wats stop{}`, then `{}`); this session reconnects on its next \
+             call.",
+            self.data_dir.display(),
+            self.recovery.dir_flag,
+            self.start_command(),
+        )
+    }
+
+    /// Why the node went away, for the logs: without a stop record, it
+    /// was not asked to. Its process is gone once it lets go of the data
+    /// directory lock (a zombie still answers `kill -0`).
+    async fn why_lost(&self) -> String {
+        let Some(h) = &self.node else {
+            return "the node went away without `wats stop`".to_string();
+        };
+        for _ in 0..5 {
+            if crate::node::lock_holder(self.data_dir).is_none_or(|now| now.pid != h.pid)
+                || !crate::node::node_running(self.data_dir)
+            {
+                return format!(
+                    "the node (pid {}) exited without `wats stop` (killed or crashed)",
+                    h.pid
+                );
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        format!(
+            "the node (pid {}) closed this session without `wats stop`",
+            h.pid
+        )
+    }
+
+    /// Whether this session may start a node now ([`RESPAWN_LIMIT`]).
+    fn may_respawn(&mut self) -> bool {
+        let now = std::time::Instant::now();
+        while self
+            .respawns
+            .front()
+            .is_some_and(|t| now.duration_since(*t) >= RESPAWN_WINDOW)
+        {
+            self.respawns.pop_front();
+        }
+        self.recovery.respawn.is_some() && self.respawns.len() < RESPAWN_LIMIT
+    }
+
+    /// The node went away (`why`): find the next one, starting it if
+    /// nothing else will. `Err` with what to tell the client when no node
+    /// serves this session for now.
+    async fn recover(&mut self, why: &str) -> Result<Result<tokio::net::UnixStream, String>> {
+        let since = std::time::Instant::now();
+        loop {
+            match self.assess().await {
+                State::Up(stream) => return Ok(Ok(stream)),
+                State::Stopped(message) => return Ok(Err(message)),
+                State::Starting => {
+                    if since.elapsed() >= NODE_START_WAIT {
+                        return Ok(Err(self.unreachable_message()));
+                    }
+                }
+                State::Gone if self.recovery.respawn.is_none() => {
+                    if since.elapsed() >= NAMED_SOCKET_WAIT {
+                        return Ok(Err(self.unreachable_message()));
+                    }
+                }
+                State::Gone => {
+                    if !self.may_respawn() {
+                        return Ok(Err(self.gave_up_message()));
+                    }
+                    if let Some(stream) = self.respawn(why).await? {
+                        return Ok(Ok(stream));
+                    }
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+    }
+
+    /// Start a node again, unless another session does: `Some` once one
+    /// accepts this session. Holds [`RESPAWN_LOCK`] meanwhile, and through
+    /// the wait after a failed start, so that the sessions of one data
+    /// directory start one node at a time; the data directory lock still
+    /// lets only one run.
+    async fn respawn(&mut self, why: &str) -> Result<Option<tokio::net::UnixStream>> {
+        let Some(spawn) = &self.recovery.respawn else {
+            return Ok(None);
+        };
+        let lock = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(self.data_dir.join(RESPAWN_LOCK));
+        // Without the file (a read-only directory?), start it anyway.
+        let _lock = match lock {
+            Ok(file) => match file.try_lock() {
+                Ok(()) => Some(file),
+                Err(std::fs::TryLockError::WouldBlock) => return Ok(None),
+                Err(std::fs::TryLockError::Error(_)) => None,
+            },
+            Err(_) => None,
+        };
+        // Another session's node may be up, or starting, by now.
+        match self.assess().await {
+            State::Gone => {}
+            State::Up(stream) => return Ok(Some(stream)),
+            State::Stopped(_) | State::Starting => return Ok(None),
+        }
+        let started = std::time::Instant::now();
+        self.respawns.push_back(started);
+        let reason = format!(
+            "{why}; started again by the MCP session pid {} ({} of at most {RESPAWN_LIMIT} in {} \
+             min)",
+            std::process::id(),
+            self.respawns.len(),
+            RESPAWN_WINDOW.as_secs() / 60,
+        );
+        tracing::warn!("{reason}");
+        let failure = match spawn(&reason) {
+            Err(e) => format!("{e:#}"),
+            Ok(mut child) => loop {
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                if let Some(stream) = self.connect().await {
+                    tracing::info!(pid = child.id(), "the new node accepts this session");
+                    self.failures = 0;
+                    crate::background::reap(child);
+                    return Ok(Some(stream));
+                }
+                match child.try_wait() {
+                    // It lost the data directory to another node.
+                    Ok(Some(_)) if crate::node::node_running(self.data_dir) => return Ok(None),
+                    Ok(Some(status)) => break format!("the new node exited at start ({status})"),
+                    Ok(None) if started.elapsed() >= RESPAWN_START_WAIT => {
+                        let pid = child.id();
+                        crate::background::reap(child);
+                        break format!(
+                            "the new node (pid {pid}) accepted no session within {} s",
+                            RESPAWN_START_WAIT.as_secs()
+                        );
+                    }
+                    Ok(None) => {}
+                    Err(e) => break e.to_string(),
+                }
+            },
+        };
+        self.failures = self.failures.saturating_add(1);
+        tracing::warn!(
+            "{failure}; see {}",
+            crate::background::log_path(self.data_dir).display()
+        );
+        self.last_failure = Some(failure);
+        if self.may_respawn() {
+            let backoff = RESPAWN_BACKOFF
+                .saturating_mul(2u32.saturating_pow(self.failures.saturating_sub(1)))
+                .min(RESPAWN_BACKOFF_MAX);
+            tokio::time::sleep(backoff).await;
+        }
+        Ok(None)
+    }
+
+    /// Answer the client while no node serves it, saying `message`, until
+    /// a node accepts this session again (started by hand, by another
+    /// session, or by this one when nothing says not to): then returns it
+    /// with the request that found it. `None` when the client leaves.
+    async fn serve_down<R, W>(
+        &mut self,
+        stdin: &mut tokio::io::Lines<R>,
+        stdout: &mut W,
+        setup: &mut Vec<String>,
+        mut message: String,
+        tools: Option<&serde_json::Value>,
+    ) -> Result<Option<(tokio::net::UnixStream, String)>>
+    where
+        R: tokio::io::AsyncBufRead + Unpin,
+        W: tokio::io::AsyncWrite + Unpin,
+    {
+        while let Some(line) = stdin.next_line().await? {
+            let Ok(request) = serde_json::from_str::<serde_json::Value>(&line) else {
+                continue;
+            };
+            // The client's setup, answered here, is replayed to the next
+            // node.
+            if setup.len() < 2 && is_setup(&line) {
+                setup.push(line.clone());
+            } else if request.get("id").is_none_or(serde_json::Value::is_null) {
+                continue; // a notification
+            }
+            match self.assess().await {
+                _ if is_setup(&line) => {}
+                State::Up(stream) => return Ok(Some((stream, line))),
+                State::Stopped(said) => message = said,
+                State::Starting => {}
+                State::Gone if self.may_respawn() => {
+                    let why = "no node runs (the last one went away without `wats stop`)";
+                    match self.recover(why).await? {
+                        Ok(stream) => return Ok(Some((stream, line))),
+                        Err(said) => message = said,
+                    }
+                }
+                State::Gone if self.recovery.respawn.is_some() => {
+                    message = self.gave_up_message();
+                }
+                State::Gone => {}
+            }
+            if let Some(reply) = crate::halt::answer_without_node(&request, &message, tools) {
+                stdout.write_all(format!("{reply}\n").as_bytes()).await?;
+                stdout.flush().await?;
+            }
+        }
+        Ok(None)
+    }
+}
+
+/// Write one line to the node.
+#[cfg(unix)]
+async fn send_line(to_node: &mut tokio::net::unix::OwnedWriteHalf, line: &[u8]) -> Result<()> {
+    to_node.write_all(line).await?;
+    if !line.ends_with(b"\n") {
+        to_node.write_all(b"\n").await?;
+    }
+    Ok(())
+}
+
+/// The id of the client's `initialize`, among the setup lines.
+#[cfg(unix)]
+fn initialize_id(setup: &[String]) -> Option<serde_json::Value> {
+    setup
+        .iter()
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .find(|v| v["method"] == "initialize")
+        .map(|v| v["id"].clone())
 }
 
 /// Attach this process's stdio to the node owning `data_dir`, if one is
 /// running. Returns `Ok(false)` when no node is listening.
 ///
-/// When the node goes away (e.g. a background node handing over to a
-/// daemon), the session waits up to 30 s for a node to listen again,
-/// replays the client's `initialize` and `initialized` to it, swallows the
-/// new `initialize` answer, and carries on: the MCP client sees nothing.
-/// A call in flight at that moment is sent once more to the new node if it
-/// only reads; otherwise the client gets an error for it (see
+/// When the node goes away, the session finds the next one and replays
+/// the client's `initialize` and `initialized` to it, swallowing the new
+/// `initialize` answer: the MCP client sees nothing (ADR 0023 §6).
+///
+/// - **A daemon takes over** (a hand-over record), or a node holds the
+///   data directory: the session waits for it.
+/// - **Crashed or killed** (no stop record): the session starts a
+///   background node again through `recovery`, as `wats mcp` does when
+///   none runs; the sessions of the data directory converge on one node
+///   ([`RESPAWN_LOCK`], then the data directory lock), and each gives up
+///   after [`RESPAWN_LIMIT`] starts in [`RESPAWN_WINDOW`].
+/// - **Stopped with `wats stop`**, or halted (ADR 0016 §3): the session
+///   does not start it again. It stays up and answers every call with
+///   why, and reconnects on the first call once a node listens again.
+///
+/// A call in flight when the node went away is sent once more to the next
+/// node if it only reads; otherwise the client gets an error for it (see
 /// [`RETRIED_TOOLS`]).
 #[cfg(unix)]
 pub async fn attach(
     data_dir: &Path,
     profile: Option<String>,
     file_roots: Vec<PathBuf>,
+    recovery: Recovery<'_>,
 ) -> Result<bool> {
     use tokio::io::AsyncBufReadExt;
     if let Some(profile) = &profile
@@ -527,8 +981,8 @@ pub async fn attach(
     {
         bail!("profile name must be 1-64 chars of [a-z0-9_-]");
     }
-    let path = socket_path(data_dir);
-    let Ok(mut stream) = tokio::net::UnixStream::connect(&path).await else {
+    let socket = socket_path(data_dir);
+    let Ok(mut stream) = tokio::net::UnixStream::connect(&socket).await else {
         return Ok(false);
     };
     let mut handshake = serde_json::to_vec(&Handshake {
@@ -541,6 +995,15 @@ pub async fn attach(
         client: client_from_env(),
     })?;
     handshake.push(b'\n');
+    let mut session = Session {
+        data_dir,
+        socket,
+        recovery,
+        node: None,
+        respawns: std::collections::VecDeque::new(),
+        failures: 0,
+        last_failure: None,
+    };
     let mut stdin = BufReader::new(tokio::io::stdin()).lines();
     let mut stdout = tokio::io::stdout();
     let mut setup: Vec<String> = Vec::new();
@@ -550,24 +1013,46 @@ pub async fn attach(
     // next node after a change.
     let mut pending: Vec<InFlight> = Vec::new();
     let mut resend: Vec<InFlight> = Vec::new();
+    // A request that came while no node served this session, for the
+    // next one.
+    let mut held: Option<String> = None;
+    // The node's last answer to `tools/list`, for when none runs.
+    let mut tools: Option<serde_json::Value> = None;
+    // Nodes that closed this session without a word, in a row.
+    let mut silent = 0u32;
     loop {
+        session.note_node();
         let (from_node, mut to_node) = stream.into_split();
-        to_node.write_all(&handshake).await?;
-        for line in &setup {
-            to_node.write_all(line.as_bytes()).await?;
-            to_node.write_all(b"\n").await?;
-        }
+        let mut answered = false;
+        // The calls to send again, once only (lost again, the client gets
+        // an error), then the request that found this node.
+        let mut again: Vec<String> = Vec::new();
         for call in std::mem::take(&mut resend) {
-            to_node.write_all(call.line.as_bytes()).await?;
-            to_node.write_all(b"\n").await?;
-            // Once only: lost again, the client gets an error.
+            again.push(call.line.clone());
             pending.push(InFlight {
                 retry: false,
                 ..call
             });
         }
+        if let Some(line) = held.take() {
+            pending.extend(in_flight(&line));
+            again.push(line);
+        }
+        // A node that dies during the replay is lost like any other.
+        let replayed = async {
+            send_line(&mut to_node, &handshake).await?;
+            for line in setup.iter().chain(&again) {
+                send_line(&mut to_node, line.as_bytes()).await?;
+            }
+            anyhow::Ok(())
+        }
+        .await
+        .is_ok();
         let mut from_node = BufReader::new(from_node).lines();
         loop {
+            if !replayed {
+                break;
+            }
             tokio::select! {
                 line = stdin.next_line() => {
                     let Some(line) = line? else { return Ok(true) };
@@ -580,15 +1065,18 @@ pub async fn attach(
                     }) {
                         pending.push(call);
                     }
-                    to_node.write_all(line.as_bytes()).await?;
-                    to_node.write_all(b"\n").await?;
+                    if send_line(&mut to_node, line.as_bytes()).await.is_err() {
+                        break;
+                    }
                 }
                 line = from_node.next_line() => {
-                    let Some(line) = line? else { break };
-                    let answer = serde_json::from_str::<serde_json::Value>(&line)
+                    // A killed node may reset the connection: lost too.
+                    let Ok(Some(line)) = line else { break };
+                    answered = true;
+                    let value = serde_json::from_str::<serde_json::Value>(&line)
                         .ok()
-                        .filter(|v| v.get("method").is_none())
-                        .and_then(|v| v.get("id").cloned());
+                        .filter(|v| v.get("method").is_none());
+                    let answer = value.as_ref().and_then(|v| v.get("id").cloned());
                     if let Some(id) = &swallow
                         && answer.as_ref() == Some(id)
                     {
@@ -596,6 +1084,11 @@ pub async fn attach(
                         continue;
                     }
                     if let Some(id) = &answer {
+                        if pending.iter().any(|c| &c.id == id && c.method == "tools/list")
+                            && let Some(result) = value.as_ref().and_then(|v| v.get("result"))
+                        {
+                            tools = Some(result.clone());
+                        }
                         pending.retain(|c| &c.id != id);
                     }
                     stdout.write_all(line.as_bytes()).await?;
@@ -604,42 +1097,56 @@ pub async fn attach(
                 }
             }
         }
-        // The node went away: on a guardian halt, say so to the client
-        // from here on (ADR 0016 §3); otherwise wait for the next one.
-        if let Some(marker) = crate::halt::read_marker(data_dir) {
-            crate::halt::serve_halted_mcp(stdin, stdout, &crate::halt::mcp_message(&marker))
-                .await?;
-            return Ok(true);
-        }
-        let mut next = None;
-        for _ in 0..300 {
-            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-            if let Ok(s) = tokio::net::UnixStream::connect(&path).await {
-                next = Some(s);
-                break;
+        // The node went away: the next one, or why there is none.
+        silent = if answered {
+            0
+        } else {
+            silent.saturating_add(1)
+        };
+        let why = session.why_lost().await;
+        let next = if silent >= 10 {
+            Err(session.unreachable_message())
+        } else {
+            session.recover(&why).await?
+        };
+        match next {
+            Ok(next) => {
+                stream = next;
+                swallow = initialize_id(&setup);
+                for call in std::mem::take(&mut pending) {
+                    if call.retry {
+                        resend.push(call);
+                    } else {
+                        stdout.write_all(lost_call(&call.id).as_bytes()).await?;
+                        stdout.write_all(b"\n").await?;
+                        stdout.flush().await?;
+                    }
+                }
+            }
+            Err(message) => {
+                tracing::warn!("{message}");
+                for call in std::mem::take(&mut pending) {
+                    if let Some(reply) = lost_without_node(&call, &message, tools.as_ref()) {
+                        stdout.write_all(format!("{reply}\n").as_bytes()).await?;
+                        stdout.flush().await?;
+                    }
+                }
+                let back = session
+                    .serve_down(&mut stdin, &mut stdout, &mut setup, message, tools.as_ref())
+                    .await?;
+                let Some((next, line)) = back else {
+                    return Ok(true);
+                };
+                stream = next;
+                swallow = initialize_id(&setup);
+                held = Some(line);
             }
         }
-        let Some(s) = next else { return Ok(true) };
-        stream = s;
-        for call in std::mem::take(&mut pending) {
-            if call.retry {
-                resend.push(call);
-            } else {
-                stdout.write_all(lost_call(&call.id).as_bytes()).await?;
-                stdout.write_all(b"\n").await?;
-                stdout.flush().await?;
-            }
-        }
-        swallow = setup
-            .iter()
-            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
-            .find(|v| v["method"] == "initialize")
-            .map(|v| v["id"].clone());
     }
 }
 
 #[cfg(not(unix))]
-pub async fn attach(_: &Path, _: Option<String>, _: Vec<PathBuf>) -> Result<bool> {
+pub async fn attach(_: &Path, _: Option<String>, _: Vec<PathBuf>, _: Recovery<'_>) -> Result<bool> {
     Ok(false)
 }
 
@@ -759,6 +1266,35 @@ mod tests {
                 .unwrap()
                 .contains("restarted")
         );
+        assert!(
+            !lost["error"]["message"].as_str().unwrap().contains("  "),
+            "one line: {lost}"
+        );
+    }
+
+    #[test]
+    fn calls_lost_with_no_node_back_say_why() {
+        let call = |tool: &str| {
+            in_flight(&format!(
+                r#"{{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{{"name":"{tool}"}}}}"#
+            ))
+            .unwrap()
+        };
+        let stopped = "The wats node for profile default was stopped with `wats stop`";
+        let read = lost_without_node(&call("search"), stopped, None).unwrap();
+        assert_eq!(read["id"], 3);
+        assert_eq!(read["result"]["isError"], true);
+        assert_eq!(read["result"]["content"][0]["text"], stopped);
+        // A write may have gone out: the client is told to check.
+        let post = lost_without_node(&call("post"), stopped, None).unwrap();
+        let text = post["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("may or may not have taken effect"), "{text}");
+        assert!(text.ends_with(stopped), "{text}");
+        // Listing tools: the node's last list.
+        let tools = serde_json::json!({"tools": [{"name": "search"}]});
+        let list = in_flight(r#"{"jsonrpc":"2.0","id":4,"method":"tools/list"}"#).unwrap();
+        let listed = lost_without_node(&list, stopped, Some(&tools)).unwrap();
+        assert_eq!(listed["result"], tools);
     }
 
     #[test]

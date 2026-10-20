@@ -1400,6 +1400,9 @@ impl Node {
                 Err(e) => return Err(e),
             }
         };
+        // A node runs again: the stop of the last one, by `wats stop` or a
+        // hand-over, is over. MCP sessions that said so reconnect.
+        crate::background::clear_stop_record(&config.data_dir);
         // For `wats ps` (ADR 0023): where to look for this node.
         if let Some(registry) = &config.registry
             && let Err(e) = crate::background::register(registry, &config.data_dir)

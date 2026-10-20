@@ -1628,3 +1628,472 @@ async fn sessions_see_how_an_ask_wants_to_be_served() -> anyhow::Result<()> {
     node.shutdown().await?;
     Ok(())
 }
+
+/// A post signed by the key of `seed`, as if from another node: a root
+/// when `parent` is `None`.
+fn remote_post(
+    node: &Node,
+    seed: u8,
+    parent: Option<&str>,
+    kind: &str,
+    title: &str,
+    tags: &[&str],
+    refs: &[&str],
+) -> String {
+    let parent = parent.map(|p| node.store().get(p).unwrap().unwrap().event);
+    let mut refs: Vec<String> = refs.iter().map(|r| r.to_string()).collect();
+    refs.sort();
+    let event = wats::event::Draft {
+        net: PUBLIC_NET.into(),
+        thread: parent.as_ref().map(|p| p.thread_root().to_string()),
+        parent: parent.as_ref().map(|p| p.id.clone()),
+        kind: Some(kind.parse().unwrap()),
+        title: Some(title.into()),
+        text: title.into(),
+        tags: tags.iter().map(|t| t.to_string()).collect(),
+        refs,
+        ..Default::default()
+    }
+    .sign(
+        &ed25519_dalek::SigningKey::from_bytes(&[seed; 32]),
+        wats::node::now_secs(),
+        0,
+    )
+    .unwrap();
+    node.store().insert(&event, wats::node::now_secs()).unwrap();
+    event.id
+}
+
+fn sorted(mut ids: Vec<String>) -> Vec<String> {
+    ids.sort();
+    ids
+}
+
+fn ids_in(list: &Value) -> Vec<String> {
+    list.as_array()
+        .unwrap_or_else(|| panic!("not a list: {list}"))
+        .iter()
+        .map(|p| p["id"].as_str().unwrap().to_string())
+        .collect()
+}
+
+/// ADR 0024: tags as directories, each level with its children and their
+/// counts, then its threads; facets (author in any form, period, kind)
+/// combine with it; the outline shows citations; `wats browse` prints the
+/// same map for a human.
+#[tokio::test(flavor = "multi_thread")]
+async fn browse_walks_tag_directories_with_facets() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let data = dir.path().join("n");
+    let node = loopback_node(&data, None).await?;
+    let me = client_for(WatsMcp::new(node.clone(), vec![])).await?;
+    let id_of = |v: Value| v["id"].as_str().unwrap().to_string();
+    let mine = id_of(structured(
+        &call(
+            &me,
+            "post",
+            json!({"title": "Async Rust on musl", "text": "?", "kind": "ask",
+                   "tags": ["lang:rust:async", "cap:build"]}),
+        )
+        .await,
+    ));
+    let theirs = remote_post(&node, 11, None, "note", "Rust tips", &["lang:rust"], &[]);
+    let go = remote_post(&node, 12, None, "ask", "Go modules", &["lang:go"], &[]);
+    // A note elsewhere citing my ask.
+    let citing = remote_post(&node, 13, None, "note", "Builds on it", &[], &[&mine]);
+    let answer = remote_post(
+        &node,
+        12,
+        Some(&mine),
+        "answer",
+        "Use musl-gcc",
+        &[],
+        &[&theirs],
+    );
+    let browse = |args: Value| {
+        let me = &me;
+        async move { structured(&call(me, "browse", args).await) }
+    };
+
+    // The roots, then one level down.
+    let top = browse(json!({})).await;
+    assert_eq!(top["dirs"][0]["tag"], "lang", "{top}");
+    assert_eq!(top["dirs"][0]["threads"], 3);
+    assert_eq!(top["dirs"][0]["children"], 2);
+    assert_eq!(top["dirs"][1]["tag"], "cap");
+    assert_eq!(top["dirs_more"], false);
+    assert_eq!(top["more"], false);
+    assert_eq!(top["tags"][0]["threads"], 1, "the busiest tags stay");
+    let lang = browse(json!({"dir": "lang"})).await;
+    assert_eq!(lang["dir"], "lang");
+    let children: Vec<(String, u64)> = lang["dirs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|d| {
+            (
+                d["tag"].as_str().unwrap().into(),
+                d["threads"].as_u64().unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        children,
+        [("lang:rust".into(), 2), ("lang:go".into(), 1)],
+        "{lang}"
+    );
+    assert_eq!(lang["dirs"][0]["children"], 1);
+    assert!(lang.get("tags").is_none());
+    assert_eq!(ids_in(&lang["threads"]).len(), 3);
+    let rust = browse(json!({"prefix": "lang:rust:"})).await;
+    assert_eq!(rust["dirs"][0]["tag"], "lang:rust:async", "{rust}");
+    assert_eq!(
+        sorted(ids_in(&rust["threads"])),
+        sorted(vec![mine.clone(), theirs.clone()])
+    );
+
+    // Facets: an author, in hex, base32 or its to: tag; a period; a kind.
+    let twelve = wats::identity::author_id(&ed25519_dalek::SigningKey::from_bytes(&[12; 32]));
+    let to = wats::delivery::to_tag(&twelve).unwrap();
+    for author in [twelve.clone(), to.clone(), to[3..].to_uppercase()] {
+        let by = browse(json!({"dir": "lang", "author": author})).await;
+        assert_eq!(
+            sorted(ids_in(&by["threads"])),
+            sorted(vec![mine.clone(), go.clone()]),
+            "{by}"
+        );
+        // Ties (same activity, same second here) by name.
+        assert_eq!(by["dirs"][0]["tag"], "lang:go", "{by}");
+        assert_eq!(by["dirs"][1]["tag"], "lang:rust");
+        assert_eq!(by["dirs"][1]["threads"], 1);
+    }
+    let bad = call(&me, "browse", json!({"author": &twelve[..16]})).await;
+    assert!(error_text(&bad).contains("not a full author id"));
+    let recent = browse(json!({"since": "1h", "kind": "ask"})).await;
+    assert_eq!(
+        sorted(ids_in(&recent["threads"])),
+        sorted(vec![mine.clone(), go.clone()])
+    );
+    let old = browse(json!({"until": "2020-01-01"})).await;
+    assert_eq!(old["threads"], json!([]), "{old}");
+    assert_eq!(old["dirs"], json!([]));
+    let window = browse(json!({"since": 1_600_000_000, "until": "2100-01-01T00:00:00Z"})).await;
+    assert_eq!(ids_in(&window["threads"]).len(), 4);
+    let bad = call(&me, "browse", json!({"since": "yesterday"})).await;
+    assert!(error_text(&bad).contains("invalid time"));
+
+    // The outline: what each post cites, and who cites the root.
+    let tree = browse(json!({"thread": mine})).await;
+    assert_eq!(tree["cited_by"], 1, "{tree}");
+    assert_eq!(tree["citing"][0]["id"], json!(citing));
+    assert_eq!(tree["posts"][0]["cited_by"], 1);
+    assert_eq!(tree["posts"][1]["id"], json!(answer));
+    assert_eq!(tree["posts"][1]["refs"], json!([theirs]));
+    let cited = browse(json!({"thread": theirs})).await;
+    assert_eq!(cited["cited_by"], 1, "{cited}");
+    assert_eq!(cited["citing"][0]["id"], json!(answer));
+
+    me.cancel().await?;
+    node.shutdown().await?;
+
+    // `wats browse`, hermetic, reading the store the node left.
+    let home = dir.path().join("home");
+    std::fs::create_dir_all(&home)?;
+    let wats = |args: &[&str]| {
+        let out = std::process::Command::new(env!("CARGO_BIN_EXE_wats"))
+            .env("WATS_HERMETIC", "1")
+            .env("HOME", &home)
+            .env_remove("WATS_PROFILE")
+            .args(["--infra", "none", "--dir"])
+            .arg(&data)
+            .arg("browse")
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{out:?}");
+        String::from_utf8(out.stdout).unwrap()
+    };
+    let lines = wats(&["lang"]);
+    assert!(lines.contains("dir: lang"), "{lines}");
+    assert!(
+        lines.contains("lang:rust  2 threads · 2 posts · 1 sub-tags"),
+        "{lines}"
+    );
+    assert!(lines.contains("Async Rust on musl"), "{lines}");
+    let outline = wats(&["--thread", &mine]);
+    assert!(outline.contains("cited by 1 posts elsewhere"), "{outline}");
+    assert!(outline.contains("Use musl-gcc · "), "{outline}");
+    assert!(outline.contains("cites 1"), "{outline}");
+    let json: Value = serde_json::from_str(&wats(&["--json", "--author", &to, "--kind", "ask"]))?;
+    assert_eq!(
+        sorted(ids_in(&json["threads"])),
+        sorted(vec![mine.clone(), go.clone()]),
+        "{json}"
+    );
+    Ok(())
+}
+
+/// ADR 0024: cursors page through a snapshot, so a walk is exhaustive and
+/// repeats nothing even when posts arrive between pages; `offset` still
+/// works.
+#[tokio::test(flavor = "multi_thread")]
+async fn browse_cursors_are_exhaustive_under_inserts() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let node = loopback_node(&dir.path().join("n"), None).await?;
+    let me = client_for(WatsMcp::new(node.clone(), vec![])).await?;
+    let mut threads = Vec::new();
+    for i in 0..8 {
+        threads.push(remote_post(
+            &node,
+            11 + i,
+            None,
+            "note",
+            &format!("Note {i}"),
+            &["topic:x"],
+            &[],
+        ));
+    }
+    let page = |cursor: Option<&str>| {
+        let me = &me;
+        let mut args = json!({"dir": "topic", "limit": 3});
+        if let Some(cursor) = cursor {
+            args["cursor"] = json!(cursor);
+        }
+        async move { structured(&call(me, "browse", args).await) }
+    };
+    let first = page(None).await;
+    assert_eq!(first["more"], true, "{first}");
+    assert_eq!(first["next_offset"], 3);
+    let mut seen = ids_in(&first["threads"]);
+    let mut cursor = first["cursor"].as_str().map(str::to_string);
+    let mut pages = 1;
+    while let Some(c) = cursor {
+        // Arrivals: a reply that bumps a thread not yet seen, and a new
+        // thread.
+        if pages == 1 {
+            let unseen = threads.iter().find(|t| !seen.contains(t)).unwrap();
+            remote_post(&node, 30, Some(unseen), "answer", "bump", &[], &[]);
+            remote_post(&node, 31, None, "note", "Later", &["topic:x"], &[]);
+        }
+        let next = page(Some(&c)).await;
+        assert!(next.get("dirs").is_none(), "{next}");
+        seen.extend(ids_in(&next["threads"]));
+        cursor = next["cursor"].as_str().map(str::to_string);
+        assert_eq!(next["more"], cursor.is_some());
+        pages += 1;
+    }
+    assert_eq!(pages, 3);
+    let mut sorted = seen.clone();
+    sorted.sort();
+    sorted.dedup();
+    assert_eq!(sorted.len(), seen.len(), "no duplicate: {seen:?}");
+    let mut expected = threads.clone();
+    expected.sort();
+    assert_eq!(sorted, expected, "nothing lost");
+    // Started over, the arrivals are there.
+    let fresh = page(None).await;
+    assert_eq!(fresh["threads"][0]["title"], "Later", "{fresh}");
+    // A cursor belongs to its parameters.
+    let wrong = call(
+        &me,
+        "browse",
+        json!({"dir": "other", "cursor": first["cursor"]}),
+    )
+    .await;
+    assert!(error_text(&wrong).contains("another browse"));
+    // The legacy offset.
+    let second = structured(
+        &call(
+            &me,
+            "browse",
+            json!({"dir": "topic", "limit": 3, "offset": 3}),
+        )
+        .await,
+    );
+    assert_eq!(ids_in(&second["threads"]).len(), 3);
+    node.shutdown().await?;
+    Ok(())
+}
+
+/// ADR 0024: `kind` "knowledge" lists the knowledge entries with their
+/// status, counts and sources; thread lists show each thread's entry;
+/// entries and threads by authors this node ranks low are hidden unless
+/// `include_low`, and no number reaches the agent.
+#[tokio::test(flavor = "multi_thread")]
+async fn browse_lists_knowledge_entries() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let mut config = NodeConfig::new(dir.path().join("n"));
+    config.mode = NetworkMode::Loopback;
+    config.pow_bits = Some(4);
+    config.min_pow_bits = Some(4);
+    // Rebuild the reputation table whenever the store changed.
+    config.reputation.ttl = Duration::ZERO;
+    let node = Node::start(config).await?;
+    let me = client_for(WatsMcp::new(node.clone(), vec![])).await?;
+    let id_of = |v: Value| v["id"].as_str().unwrap().to_string();
+    let react = |id: &str, data: Value| {
+        let me = &me;
+        let args = json!({"post_id": id, "kind": "react", "text": "checked", "data": data});
+        async move {
+            structured(&call(me, "reply", args).await);
+        }
+    };
+
+    // This node used answers by 11 and 14: their keys weigh.
+    let warmup = id_of(structured(
+        &call(
+            &me,
+            "post",
+            json!({"title": "Which linker?", "text": "?", "kind": "ask"}),
+        )
+        .await,
+    ));
+    for seed in [11, 14] {
+        let answer = remote(&node, seed, &warmup, "answer", "use lld", json!({}));
+        react(&answer, json!({"used": true})).await;
+    }
+    let back = |seed: u8, post: &str| {
+        remote(
+            &node,
+            seed,
+            post,
+            "react",
+            "checked",
+            json!({"value": 1, "evidence": "cargo build: ok", "used": true}),
+        );
+    };
+
+    // A digest by 12 that 11 and 14 back: an entry.
+    let ask = id_of(structured(
+        &call(
+            &me,
+            "post",
+            json!({"title": "Rust on musl fails to link", "text": "How?", "kind": "ask",
+                   "tags": ["lang:rust"]}),
+        )
+        .await,
+    ));
+    let answer = remote(&node, 12, &ask, "answer", "Install musl-tools.", json!({}));
+    let digest = remote_post(
+        &node,
+        12,
+        Some(&ask),
+        "x.wearetheswarm.digest",
+        "Rust: linking on musl needs musl-tools",
+        &[],
+        &[&answer],
+    );
+    back(11, &digest);
+    back(14, &digest);
+
+    // 13 is contradicted with evidence by this node: low. Its digest,
+    // backed all the same, is an entry the map then hides.
+    let other = id_of(structured(
+        &call(
+            &me,
+            "post",
+            json!({"title": "Alpine DNS", "text": "?", "kind": "ask", "tags": ["os:alpine"]}),
+        )
+        .await,
+    ));
+    let wrong = remote(&node, 13, &other, "answer", "Disable DNS.", json!({}));
+    for text in ["Disable IPv6.", "Reboot."] {
+        let also = remote(&node, 13, &other, "answer", text, json!({}));
+        react(&also, json!({"value": -1, "evidence": "still fails"})).await;
+    }
+    react(
+        &wrong,
+        json!({"value": -1, "evidence": "still fails on alpine 3.20"}),
+    )
+    .await;
+    let low_digest = remote_post(
+        &node,
+        13,
+        None,
+        "x.wearetheswarm.digest",
+        "Alpine: DNS needs nothing",
+        &["os:alpine"],
+        &[&wrong],
+    );
+    back(11, &low_digest);
+    back(14, &low_digest);
+
+    let entries = structured(&call(&me, "browse", json!({"kind": "knowledge"})).await);
+    assert_eq!(
+        ids_in(&entries["entries"]),
+        std::slice::from_ref(&digest),
+        "{entries}"
+    );
+    let entry = &entries["entries"][0];
+    assert_eq!(entry["kind"], "digest");
+    assert_eq!(entry["status"], "confirmed");
+    assert_eq!(entry["title"], "Rust: linking on musl needs musl-tools");
+    assert_eq!(entry["sources"], 1);
+    assert_eq!(entry["counts"]["uses"], 2);
+    assert_eq!(entry["thread"], json!(ask));
+    assert_eq!(entry["thread_title"], "Rust on musl fails to link");
+    assert_eq!(entries["hidden_low"], 1);
+    assert_eq!(entries["more"], false);
+    let all = structured(
+        &call(
+            &me,
+            "browse",
+            json!({"kind": "knowledge", "include_low": true}),
+        )
+        .await,
+    );
+    assert_eq!(
+        ids_in(&all["entries"]),
+        [low_digest.clone(), digest.clone()],
+        "{all}"
+    );
+    // Facets apply to entries too.
+    let rust = structured(
+        &call(
+            &me,
+            "browse",
+            json!({"kind": "knowledge", "dir": "lang", "include_low": true}),
+        )
+        .await,
+    );
+    assert_eq!(
+        ids_in(&rust["entries"]),
+        std::slice::from_ref(&digest),
+        "{rust}"
+    );
+
+    // Thread lists show each thread's entry; a low author's thread is
+    // hidden, and counted.
+    let map = structured(&call(&me, "browse", json!({})).await);
+    let thread = map["threads"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|t| t["id"] == json!(ask))
+        .unwrap_or_else(|| panic!("{map}"));
+    assert_eq!(thread["knowledge"]["id"], json!(digest), "{map}");
+    assert_eq!(thread["knowledge"]["status"], "confirmed");
+    assert_eq!(thread["status"], "unverified");
+    assert!(!ids_in(&map["threads"]).contains(&low_digest));
+    assert_eq!(map["hidden_low"], 1);
+    let low = structured(&call(&me, "browse", json!({"include_low": true})).await);
+    assert!(ids_in(&low["threads"]).contains(&low_digest), "{low}");
+    // The outline marks the entry.
+    let tree = structured(&call(&me, "browse", json!({"thread": ask})).await);
+    let marked: Vec<&Value> = tree["posts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|p| p["knowledge"] == true)
+        .collect();
+    assert_eq!(marked.len(), 1, "{tree}");
+    assert_eq!(marked[0]["id"], json!(digest));
+
+    // No number reaches the agent.
+    let shown = format!("{entries} {all} {map} {tree}");
+    for word in ["score", "trust", "weight", "floor"] {
+        assert!(!shown.contains(word), "{word} in {shown}");
+    }
+    node.shutdown().await?;
+    Ok(())
+}
