@@ -517,6 +517,64 @@ async fn a_cut_is_served_honestly_and_read_fetches_below_it() -> anyhow::Result<
     assert_eq!(missing.is_error, Some(true));
     assert!(format!("{missing:?}").contains("nor by the peers asked"));
     client.cancel().await?;
+
+    // A full node whose only peer has a cut is not misled: it records a
+    // cut of its own, and does not say it holds the whole history.
+    a.shutdown().await?;
+    let mut c_config = config(&dir.path().join("c"), &[&b]);
+    c_config.initial_max = InitialMax::Bytes(0);
+    let c = Node::start(c_config).await?;
+    done(&c).await;
+    assert!(seq(&c, &recent.id).is_some());
+    assert!(
+        c.store()
+            .sync_ranges(PUBLIC_NET)?
+            .iter()
+            .any(|r| r.state == RangeState::Cut)
+    );
+    assert!(!c.history_full());
+    assert_eq!(state(&c), "done");
+    c.shutdown().await?;
+    b.shutdown().await?;
+    Ok(())
+}
+
+/// One key takes at most 2 % of the window (ADR 0025 §4): a peer serving
+/// a newest slice of junk from one key does not crowd out the rest.
+#[tokio::test(flavor = "multi_thread")]
+async fn one_key_takes_a_small_share_of_the_window() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let a = Node::start(config(&dir.path().join("a"), &[])).await?;
+    let now = now_secs();
+    let junk_key = key(99);
+    let junk: Vec<Event> = (0..120u64)
+        .map(|i| {
+            sign(
+                Draft {
+                    net: PUBLIC_NET.into(),
+                    kind: Some(Kind::Note),
+                    title: Some(format!("junk {i}")),
+                    text: "junk ".repeat(300),
+                    ..Draft::default()
+                },
+                &junk_key,
+                now - 60 - i,
+            )
+        })
+        .collect();
+    let real = notes(80, now - 3600);
+    hold(&a, &junk);
+    hold(&a, &real);
+    let mut b_config = config(&dir.path().join("b"), &[&a]);
+    let budget = 400 * 1024;
+    b_config.initial_max = InitialMax::Bytes(budget);
+    let b = Node::start(b_config).await?;
+    done(&b).await;
+    let junk_held = junk.iter().filter(|e| seq(&b, &e.id).is_some()).count();
+    let real_held = real.iter().filter(|e| seq(&b, &e.id).is_some()).count();
+    // 2 % of 400 KiB: a handful of 1.6 KiB events.
+    assert!(junk_held <= 6, "{junk_held} junk events held");
+    assert!(real_held >= 40, "{real_held} real events held");
     b.shutdown().await?;
     a.shutdown().await?;
     Ok(())

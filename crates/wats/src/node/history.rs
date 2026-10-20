@@ -134,6 +134,20 @@ pub struct History {
     gets: std::sync::Mutex<std::collections::VecDeque<std::time::Instant>>,
 }
 
+/// Which holes a request is served around (ADR 0025 §3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Holes {
+    /// Every one: a descending page stops at the first.
+    All,
+    /// The cut and the skipped ranges: a `partial` request takes what a
+    /// pending range holds.
+    Intentional,
+    /// Those and the initial fill still running: an ascending pull from
+    /// below them is refused. Catch-up ranges are not, as a 0.4.0 node
+    /// served what it held during its own catch-up.
+    Ascending,
+}
+
 /// A `sync` request as [`Node::serve_sync`] serves it.
 #[derive(Debug)]
 pub struct SyncAsk {
@@ -382,17 +396,22 @@ impl Node {
     /// The holes in this node's history of `net`: `(lo_ts, top_ts)`, whose
     /// complete history it does not hold (ADR 0025 §3).
     pub fn history_holes(&self, net: &str) -> Vec<(u64, u64)> {
-        self.holes(net, false)
+        self.holes(net, Holes::All)
     }
 
-    /// The holes; with `intentional_only`, the cut and the skipped ranges
-    /// only, not the ranges still pending.
-    fn holes(&self, net: &str, intentional_only: bool) -> Vec<(u64, u64)> {
+    /// The holes of `net` that count for `which` request.
+    fn holes(&self, net: &str, which: Holes) -> Vec<(u64, u64)> {
         self.store
             .sync_ranges(net)
             .unwrap_or_default()
             .iter()
-            .filter(|r| !intentional_only || r.state != RangeState::Pending)
+            .filter(|r| match which {
+                Holes::All => true,
+                Holes::Intentional => r.state != RangeState::Pending,
+                // A catch-up range is opened on every new neighbor: it is
+                // recent, and today's nodes serve what they hold there too.
+                Holes::Ascending => r.state != RangeState::Pending || !r.phase.is_empty(),
+            })
             .filter_map(|r| Some((r.hole_lo(), r.hole_top()?)))
             .collect()
     }
@@ -1367,7 +1386,11 @@ impl Node {
         }
         let limit = limit.clamp(1, proto::MAX_SYNC_PAGE);
         // A `partial` requester takes what is held in a pending range.
-        let holes = self.holes(net, partial);
+        let holes = match (partial, before.is_some()) {
+            (true, _) => self.holes(net, Holes::Intentional),
+            (false, true) => self.holes(net, Holes::All),
+            (false, false) => self.holes(net, Holes::Ascending),
+        };
         let mut stop = None;
         match &before {
             None => {

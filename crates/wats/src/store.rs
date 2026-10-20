@@ -3775,4 +3775,242 @@ mod tests {
     fn hex_key(seed: u8) -> String {
         hex::encode(key(seed).verifying_key().as_bytes())
     }
+    fn range(lo: u64, hi: u64, phase: &str) -> SyncRange {
+        SyncRange {
+            id: 0,
+            net: "public".into(),
+            lo_ts: lo,
+            hi_ts: hi,
+            cursor_ts: hi,
+            cursor_id: String::new(),
+            state: RangeState::Pending,
+            phase: phase.into(),
+            opened: hi.saturating_sub(600),
+            base_bytes: 0,
+        }
+    }
+
+    #[test]
+    fn descending_pages_with_filters() {
+        let store = Store::open_in_memory().unwrap();
+        let events: Vec<Event> = (0..10u8)
+            .map(|i| {
+                let kind = if i % 3 == 0 {
+                    Kind::Announce
+                } else {
+                    Kind::Note
+                };
+                post(i % 2 + 1, 100 + u64::from(i), kind, &[], &format!("e{i}"))
+            })
+            .collect();
+        for (i, e) in events.iter().enumerate() {
+            store.insert(e, 1000 + i as u64).unwrap();
+        }
+        let ts = |rows: &[SeenRow]| -> Vec<u64> {
+            rows.iter()
+                .map(|(v, _)| v["ts"].as_u64().unwrap())
+                .collect()
+        };
+        let mut q = PageQuery {
+            net: "public".into(),
+            before: Some((108, String::new())),
+            limit: 3,
+            ..PageQuery::default()
+        };
+        let page = store.sync_page(&q).unwrap();
+        assert_eq!(ts(&page), [107, 106, 105]);
+        // Each event carries when this node stored it.
+        assert_eq!(page[0].1, 1007);
+        // A lower bound with no id keeps its own second: a range's `lo`.
+        q.after = (104, String::new());
+        q.limit = 10;
+        assert_eq!(ts(&store.sync_page(&q).unwrap()), [107, 106, 105, 104]);
+        q.after = (0, String::new());
+        q.above_ts = Some(102);
+        assert_eq!(ts(&store.sync_page(&q).unwrap()), [107, 106, 105, 104, 103]);
+        q.above_ts = None;
+        q.kinds = vec!["announce".into()];
+        assert_eq!(ts(&store.sync_page(&q).unwrap()), [106, 103, 100]);
+        q.authors = vec![events[0].author.clone()];
+        assert_eq!(ts(&store.sync_page(&q).unwrap()), [106, 100]);
+        // Ascending, as 0.4.0 serves it.
+        let up = PageQuery {
+            net: "public".into(),
+            after: (107, String::new()),
+            limit: 10,
+            ..PageQuery::default()
+        };
+        assert_eq!(ts(&store.sync_page(&up).unwrap()), [107, 108, 109]);
+    }
+
+    #[test]
+    fn ranges_hold_their_holes_and_move_the_watermark_last() {
+        let store = Store::open_in_memory().unwrap();
+        store.set_sync_watermark("public", 1_000).unwrap();
+        // An interrupted catch-up: its cursor half-way down.
+        store.add_sync_range(&range(400, 2_000, "")).unwrap();
+        let mut walked = store.sync_ranges("public").unwrap().remove(0);
+        (walked.cursor_ts, walked.cursor_id) = (1_500, "ab".into());
+        store.update_sync_range(&walked).unwrap();
+        assert_eq!(walked.hole_top(), Some(1_500));
+        assert_eq!(walked.hole_lo(), 400);
+        // A newer one above it, completed first: the watermark waits.
+        store.add_sync_range(&range(1_400, 3_000, "")).unwrap();
+        let mut newer = store.sync_ranges("public").unwrap().remove(0);
+        assert_eq!(newer.hi_ts, 3_000, "newest first");
+        newer.state = RangeState::Done;
+        store.update_sync_range(&newer).unwrap();
+        assert_eq!(newer.hole_top(), None);
+        assert_eq!(store.settle_sync_ranges("public").unwrap(), None);
+        assert_eq!(store.sync_watermark("public").unwrap(), 1_000);
+        // The old one resumes and completes: the newest opening wins.
+        walked.state = RangeState::Done;
+        store.update_sync_range(&walked).unwrap();
+        assert_eq!(store.settle_sync_ranges("public").unwrap(), Some(2_400));
+        assert_eq!(store.sync_watermark("public").unwrap(), 2_400);
+        assert!(store.sync_ranges("public").unwrap().is_empty());
+        // A cut is a hole from 0; a skipped range one of its own; both stay.
+        let mut cut = range(0, 500, "");
+        cut.state = RangeState::Cut;
+        store.add_sync_range(&cut).unwrap();
+        let mut skipped = range(2_000, 2_200, "");
+        skipped.state = RangeState::Skipped;
+        skipped.opened = 2_600;
+        store.add_sync_range(&skipped).unwrap();
+        let holes: Vec<(u64, Option<u64>)> = store
+            .sync_ranges("public")
+            .unwrap()
+            .iter()
+            .map(|r| (r.hole_lo(), r.hole_top()))
+            .collect();
+        assert_eq!(holes, [(2_000, Some(2_200)), (0, Some(500))]);
+        assert_eq!(store.settle_sync_ranges("public").unwrap(), Some(2_600));
+        assert_eq!(store.sync_ranges("public").unwrap().len(), 2);
+        // The initial fill before its window holds nothing below its top.
+        let fill = range(0, 9_000, "keep");
+        assert_eq!(fill.hole_top(), Some(9_000));
+        let mut window = fill.clone();
+        (window.phase, window.cursor_ts) = (PHASE_WINDOW.into(), 7_000);
+        assert_eq!(window.hole_top(), Some(7_000));
+    }
+
+    #[test]
+    fn migrates_schema_v7_without_a_resync() {
+        let store = Store::open_in_memory().unwrap();
+        let event = post(1, 10, Kind::Note, &[], "kept across the migration");
+        store.insert(&event, 10).unwrap();
+        store.set_sync_watermark("public", 77).unwrap();
+        let conn = store.conn.into_inner().unwrap();
+        conn.execute_batch("DROP TABLE sync_ranges; DROP TABLE key_seen; PRAGMA user_version = 7;")
+            .unwrap();
+        let store = Store::init(conn).unwrap();
+        assert_eq!(store.count().unwrap(), 1);
+        assert_eq!(
+            store.sync_watermark("public").unwrap(),
+            77,
+            "its meaning kept"
+        );
+        assert!(store.sync_ranges("public").unwrap().is_empty());
+        store.add_sync_range(&range(0, 100, "keep")).unwrap();
+        assert!(store.store_bytes() > 0);
+    }
+
+    #[test]
+    fn peers_first_sightings_need_three_peers_and_are_clamped() {
+        let store = Store::open_in_memory().unwrap();
+        let event = post(3, 1_000, Kind::Note, &[], "a key's first post");
+        store.insert(&event, 5_000).unwrap();
+        let author = event.author.clone();
+        store.record_seen("p1", &[(author.clone(), 2_000)]).unwrap();
+        store.record_seen("p2", &[(author.clone(), 3_000)]).unwrap();
+        assert_eq!(store.author_seen_estimate(&author).unwrap(), None);
+        // A peer's earliest report counts.
+        store.record_seen("p2", &[(author.clone(), 2_500)]).unwrap();
+        store.record_seen("p2", &[(author.clone(), 9_000)]).unwrap();
+        store.record_seen("p3", &[(author.clone(), 4_000)]).unwrap();
+        assert_eq!(store.author_seen_estimate(&author).unwrap(), Some(2_500));
+        // Never before the oldest ts it claims, never after our own sight.
+        for peer in ["p4", "p5", "p6", "p7"] {
+            store.record_seen(peer, &[(author.clone(), 1)]).unwrap();
+        }
+        assert_eq!(store.author_seen_estimate(&author).unwrap(), Some(1_000));
+        let late = post(4, 1_000, Kind::Note, &[], "seen late by peers");
+        store.insert(&late, 1_200).unwrap();
+        for peer in ["p1", "p2", "p3"] {
+            store
+                .record_seen(peer, &[(late.author.clone(), 9_000)])
+                .unwrap();
+        }
+        assert_eq!(
+            store.author_seen_estimate(&late.author).unwrap(),
+            Some(1_200)
+        );
+    }
+
+    /// Store bytes per event at 50k events, for `sync.initial_max`
+    /// (ADR 0025 §2): `cargo test -p wats --lib -- --ignored
+    /// store_bytes_at_50k --nocapture`.
+    #[test]
+    #[ignore]
+    fn store_bytes_at_50k_events() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("events.sqlite")).unwrap();
+        let empty = store.store_bytes();
+        let keys: Vec<SigningKey> = (0..200u16)
+            .map(|i| {
+                let mut bytes = [9u8; 32];
+                bytes[..2].copy_from_slice(&i.to_be_bytes());
+                SigningKey::from_bytes(&bytes)
+            })
+            .collect();
+        let text = "a typical answer, a few lines long, about linking Rust on musl. ";
+        let mut roots: Vec<Event> = Vec::new();
+        for i in 0..50_000usize {
+            let key = &keys[i % keys.len()];
+            let ts = 1_700_000_000 + i as u64;
+            let event = if i % 5 == 0 || roots.is_empty() {
+                Draft {
+                    net: "public".into(),
+                    kind: Some(Kind::Ask),
+                    title: Some(format!("question {i}")),
+                    text: text.repeat(3),
+                    tags: vec!["rust".into(), "musl".into()],
+                    ..Draft::default()
+                }
+                .sign(key, ts, 0)
+                .unwrap()
+            } else {
+                let parent = &roots[roots.len() - 1 - (i % roots.len().min(20))];
+                let (kind, body, data) = match i % 3 {
+                    0 => (
+                        Kind::React,
+                        "+1".to_string(),
+                        serde_json::json!({"value": 1}),
+                    ),
+                    _ => (Kind::Answer, text.repeat(4), serde_json::json!({})),
+                };
+                Draft {
+                    net: "public".into(),
+                    thread: Some(parent.thread_root().to_string()),
+                    parent: Some(parent.id.clone()),
+                    kind: Some(kind),
+                    text: body,
+                    data: data.as_object().unwrap().clone(),
+                    ..Draft::default()
+                }
+                .sign(key, ts, 0)
+                .unwrap()
+            };
+            store.insert(&event, ts).unwrap();
+            if event.kind == Kind::Ask {
+                roots.push(event);
+            }
+        }
+        let bytes = store.store_bytes() - empty;
+        println!(
+            "50k events: {} store bytes, {} per event",
+            bytes,
+            bytes / 50_000
+        );
+    }
 }

@@ -509,6 +509,57 @@ mod tests {
     }
 
     #[test]
+    fn history_fields_are_optional_both_ways() {
+        // A descending, filtered request round-trips.
+        let request = Request::Sync {
+            net: "public".into(),
+            after_ts: 5,
+            after_id: String::new(),
+            before_ts: Some(9),
+            before_id: Some("ab".into()),
+            kinds: vec!["vouch".into()],
+            authors: vec![],
+            partial: true,
+            limit: 8,
+        };
+        let json = serde_json::to_string(&request).unwrap();
+        assert!(json.contains("\"before_ts\":9") && !json.contains("authors"));
+        assert!(matches!(
+            crate::strict_json::from_slice::<Request>(json.as_bytes()).unwrap(),
+            Request::Sync {
+                before_ts: Some(9),
+                partial: true,
+                ..
+            }
+        ));
+        // A 0.4.0 page has neither `gap` nor `seen`; a 0.4.1 page with them
+        // still reads as a page on any node.
+        let old: Response =
+            crate::strict_json::from_slice(br#"{"type":"sync_page","events":[],"more":false}"#)
+                .unwrap();
+        assert!(matches!(old, Response::SyncPage { gap: None, ref seen, .. } if seen.is_empty()));
+        let new: Response = crate::strict_json::from_slice(
+            br#"{"type":"sync_page","events":[],"more":false,"gap":{"hi_ts":7},"seen":[]}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            new,
+            Response::SyncPage {
+                gap: Some(Gap { hi_ts: 7 }),
+                ..
+            }
+        ));
+        let get: Request = crate::strict_json::from_slice(
+            br#"{"type":"get","net":"public","ids":["ab"],"include":"thread"}"#,
+        )
+        .unwrap();
+        assert!(matches!(get, Request::Get { ref include, .. } if include == "thread"));
+        let ours = NodeInfo::ours();
+        assert!(ours.features.iter().any(|f| f == FEATURE_SYNC_DESC));
+        assert!(ours.features.iter().any(|f| f == FEATURE_GET));
+    }
+
+    #[test]
     fn requests_roundtrip_as_json() {
         let request = Request::sync_after("public", 1, "", 10);
         let json = serde_json::to_string(&request).unwrap();
