@@ -1347,3 +1347,82 @@ async fn review3_interior_events_held_only_by_the_second_peer() -> anyhow::Resul
     assert_eq!(missed_runs, 0);
     Ok(())
 }
+
+/// REVIEW4 (A): the same with the missed events deeper than the union
+/// check's two held pages (page 16 here, 256 in production): 80 notes, P
+/// missed notes 50..55. With no trusted walker, H's union read goes to the
+/// range's bottom: the 5 come, and the range is never confirmed without
+/// them.
+#[tokio::test(flavor = "multi_thread")]
+async fn review4_deep_interior_events_and_a_confirmed_range() -> anyhow::Result<()> {
+    let mut missed_runs = 0;
+    for _ in 0..6 {
+        let dir = tempfile::tempdir()?;
+        let all = notes(80, now_secs() - 3600);
+        let p = reference(&dir.path().join("p")).await?;
+        let h = reference(&dir.path().join("h")).await?;
+        let interior: Vec<Event> = all[50..55].to_vec();
+        hold(&p, &all[..50]);
+        hold(&p, &all[55..]);
+        hold(&h, &all);
+        let n = Node::start(config(&dir.path().join("n"), &[])).await?;
+        for peer in [&p, &h] {
+            n.add_peer(peer.endpoint().addr()).await?;
+        }
+        done(&n).await;
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        let got = interior.iter().filter(|e| seq(&n, &e.id).is_some()).count();
+        let ranges = n.store().sync_ranges(PUBLIC_NET)?;
+        assert_eq!(
+            got,
+            interior.len(),
+            "state {}, ranges {ranges:?}",
+            state(&n)
+        );
+        if got < interior.len() {
+            missed_runs += 1;
+        }
+        for node in [n, p, h] {
+            node.shutdown().await?;
+        }
+    }
+    assert_eq!(missed_runs, 0);
+    Ok(())
+}
+
+/// REVIEW4 (1): the same as review3_two_honest… with the second peer
+/// coming up a few seconds after the first (as neighbors arrive one by one
+/// at a start): the later neighbor's check confirms the range.
+#[tokio::test(flavor = "multi_thread")]
+async fn review4_second_peer_later_never_confirms() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let now = now_secs();
+    let missed: Vec<Event> = (0..20u32)
+        .map(|i| note(i, now - 600 - u64::from(i) * 60))
+        .collect();
+    let p1 = reference(&dir.path().join("p1")).await?;
+    let p2 = reference(&dir.path().join("p2")).await?;
+    hold(&p1, &missed);
+    hold(&p2, &missed);
+    let r_dir = dir.path().join("r");
+    std::fs::create_dir_all(&r_dir)?;
+    Store::open(&r_dir.join("events.sqlite"))?.set_sync_watermark(PUBLIC_NET, now - 3600)?;
+    let mut r_config = config(&r_dir, &[]);
+    r_config.initial_max = InitialMax::Bytes(0);
+    let r = Node::start(r_config).await?;
+    r.add_peer(p1.endpoint().addr()).await?;
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    r.add_peer(p2.endpoint().addr()).await?;
+    eventually("the second peer confirms", 40, || {
+        (missed.iter().all(|e| seq(&r, &e.id).is_some())
+            && r.store().sync_ranges(PUBLIC_NET).unwrap().is_empty()
+            && state(&r) == "full")
+            .then_some(())
+    })
+    .await;
+    assert!(r.history_full());
+    for node in [r, p1, p2] {
+        node.shutdown().await?;
+    }
+    Ok(())
+}

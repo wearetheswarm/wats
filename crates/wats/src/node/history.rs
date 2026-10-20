@@ -146,9 +146,11 @@ struct Progress {
     /// Bytes stored per key chain by the fill, across its passes (ADR
     /// 0025 §4: one key's share).
     author_bytes: HashMap<String, u64>,
-    /// Confirmation probes per unconfirmed range id: when next, and the
-    /// delay that led there.
-    probes: HashMap<i64, (std::time::Instant, Duration)>,
+    /// Confirmation probes per (unconfirmed range id, neighbor): when next,
+    /// and the delay that led there.
+    probes: HashMap<(i64, EndpointId), (std::time::Instant, Duration)>,
+    /// Claimers of each unconfirmed range so far, across passes.
+    claims: HashMap<i64, HashSet<EndpointId>>,
     /// (range id, trusted peer) pairs that answered a probe with a gap.
     probe_skip: HashSet<(i64, EndpointId)>,
     /// Passes in a row where a range failed: the retry backs off.
@@ -739,7 +741,9 @@ impl Node {
                 });
             });
         if outcome.is_ok() {
-            outcome = self.confirm_unconfirmed(net, &peers).await;
+            let mut all = peers.clone();
+            all.extend(pass.older.iter().copied());
+            outcome = self.confirm_unconfirmed(net, &all).await;
         }
         let fill_running = self
             .store
@@ -760,21 +764,13 @@ impl Node {
         // opened for them): what they hold since the watermark the pass
         // started with, bounded like the union check (ADR 0025 §5). Not
         // after the fill (watermark 0): its union check ran.
-        let check: Vec<EndpointId> = self
-            .set_progress(net, |p| p.check.drain().collect())
-            .unwrap_or_default();
         if self.history_pending(net) || watermark == 0 {
+            // Not drained: they wait for the range to end.
             return Ok(());
         }
-        let check: Vec<EndpointId> = check
-            .into_iter()
-            .filter(|p| !pass.served.contains(p) && !pass.behind.contains(p))
-            .collect();
-        if check.is_empty() {
-            return Ok(());
-        }
-        // At most so many an hour: the check has no budget of its own.
-        let allowed = self
+        // At most so many an hour, as the check has no budget of its own;
+        // over the cap, the neighbors stay queued for later.
+        let check: Vec<EndpointId> = self
             .set_progress(net, |p| {
                 let now = std::time::Instant::now();
                 while p
@@ -784,15 +780,18 @@ impl Node {
                 {
                     p.joins.pop_front();
                 }
-                let allowed = p.joins.len() < JOIN_CHECKS_PER_HOUR;
-                if allowed {
-                    p.joins.push_back(now);
+                if p.check.is_empty() || p.joins.len() >= JOIN_CHECKS_PER_HOUR {
+                    return Vec::new();
                 }
-                allowed
+                p.joins.push_back(now);
+                p.check.drain().collect()
             })
-            .unwrap_or(false);
-        if !allowed {
-            debug!(%net, "history: neighbor checks over their hourly cap; skipped");
+            .unwrap_or_default();
+        let check: Vec<EndpointId> = check
+            .into_iter()
+            .filter(|p| !pass.served.contains(p) && !pass.behind.contains(p))
+            .collect();
+        if check.is_empty() {
             return Ok(());
         }
         let started = now_secs();
@@ -807,7 +806,7 @@ impl Node {
             ..Walk::default()
         };
         let top = started.saturating_add(MAX_CLOCK_SKEW_SECS);
-        self.union_check(net, top, &check, &walk, &mut pass, &mut None)
+        self.union_check(net, top, &check, &walk, &mut pass, false)
             .await?;
         if !self.history_pending(net) {
             self.store.set_sync_watermark(net, started)?;
@@ -926,17 +925,30 @@ impl Node {
                     },
                     ..Walk::default()
                 };
-                let mut bottom = Some((range.cursor_ts, range.cursor_id.clone()));
-                self.union_check(net, range.hi_ts, &others, &walk, pass, &mut bottom)
+                // Exhaustive unless a trusted peer walked the range.
+                let exhaustive = end != End::Complete;
+                self.union_check(net, range.hi_ts, &others, &walk, pass, exhaustive)
                     .await?;
-                if let Some(bottom) = bottom {
-                    (range.cursor_ts, range.cursor_id) = bottom;
-                }
             }
             if end == End::Unconfirmed && self.confirmed_by(&pass.claimers) {
                 end = End::Complete;
             }
+            let span = (range.lo_ts, range.hi_ts);
             self.finish(&mut range, end)?;
+            // Claims carried over to later passes, for an unconfirmed range
+            // as walked: merged with another span, it starts over.
+            if range.state == RangeState::Unconfirmed {
+                let claims = std::mem::take(&mut pass.claimers);
+                let kept = (range.lo_ts, range.hi_ts) == span;
+                let id = range.id;
+                self.set_progress(net, |p| {
+                    if kept {
+                        p.claims.insert(id, claims);
+                    } else {
+                        p.claims.remove(&id);
+                    }
+                });
+            }
         }
         Ok(false)
     }
@@ -977,18 +989,21 @@ impl Node {
 
     /// The union check (ADR 0025 §5): what `peers` hold between `walk.floor`
     /// and `top` that this node does not, so that no single peer's
-    /// omission sticks. Bounded, as 0.4.0's catch-up from each neighbor
-    /// was not: a `sync_desc` peer is read newest first until
-    /// [`UNION_HELD_PAGES`] pages in a row bring nothing new; an older
-    /// peer ascending from the floor, up to [`UNION_SHARE`] % of the budget
-    /// in what it sends. It trades exhaustiveness for bandwidth: an event
-    /// a peer holds below a run of held pages is not fetched.
+    /// omission sticks.
     ///
-    /// With a `bottom` (the cursor a walk reached), a `sync_desc` peer that
-    /// brought nothing new is then asked one page below it: nothing there
-    /// makes it a claimer (it covered the range); events there are stored,
-    /// and `bottom` moves down to them. An older peer read to its end with
-    /// nothing new is a claimer too.
+    /// - **Bounded** (`exhaustive` false), when a trusted peer walked the
+    ///   range: a `sync_desc` peer is read newest first until
+    ///   [`UNION_HELD_PAGES`] pages in a row bring nothing new. It trades
+    ///   exhaustiveness for bandwidth, and claims nothing.
+    /// - **Exhaustive**, when no trusted peer did: a `sync_desc` peer is
+    ///   read down to the floor, as 0.4.0 read each neighbor. One that gets
+    ///   there with no gap and nothing new, having served events of the
+    ///   range (or trusted), covered the range: it becomes a claimer. Events
+    ///   it brings void the earlier claims.
+    ///
+    /// An older peer is read ascending from the floor, up to [`UNION_SHARE`]
+    /// % of the budget in what it sends; read to its end with nothing new,
+    /// it is a claimer too. Every read stops at `walk.stop_at`.
     async fn union_check(
         &self,
         net: &str,
@@ -996,7 +1011,7 @@ impl Node {
         peers: &[EndpointId],
         walk: &Walk,
         pass: &mut Pass,
-        bottom: &mut Option<(u64, String)>,
+        exhaustive: bool,
     ) -> Result<()> {
         let cap = self
             .history_budget()
@@ -1029,9 +1044,11 @@ impl Node {
             }
             let (mut held_pages, mut received, mut new_total) = (0usize, 0u64, 0usize);
             let mut served = 0usize;
-            // Whether the read ended as it should (not on a failure, a gap
-            // or the older peers' cap): only then can the peer claim.
-            let mut clean = false;
+            // An exhaustive read asks for what the peer holds for sure; after
+            // a gap, what it holds at all (`partial`), and claims nothing.
+            let mut partial = !exhaustive;
+            // Whether it read to the end, with no gap and under the cap.
+            let mut to_end = false;
             loop {
                 self.still_running()?;
                 if walk
@@ -1049,7 +1066,7 @@ impl Node {
                         before_id: Some(scratch.cursor_id.clone()),
                         kinds: Vec::new(),
                         authors: Vec::new(),
-                        partial: true,
+                        partial,
                         limit: self.config.history.page,
                     }
                 } else {
@@ -1093,66 +1110,33 @@ impl Node {
                 };
                 if gap.is_some() {
                     pass.gapped.insert(peer);
+                    if partial {
+                        break;
+                    }
+                    partial = true;
+                    continue;
+                }
+                if events.is_empty() || !more {
+                    to_end = !partial || !desc;
                     break;
                 }
-                if events.is_empty() || !more || (desc && held_pages >= UNION_HELD_PAGES) {
-                    clean = true;
+                if !exhaustive && desc && held_pages >= UNION_HELD_PAGES {
                     break;
                 }
                 if !desc && received >= cap {
                     break;
                 }
             }
-            // Only a peer that served events of the range, all held, can
-            // claim; a trusted one may hold nothing.
-            if !clean || new_total > 0 || (served == 0 && !self.trusted(&peer)) {
-                continue;
-            }
-            if !desc {
-                pass.claimers.insert(peer);
-                continue;
-            }
-            // One page below the bottom the walk reached.
-            let Some((ts, id)) = bottom.clone() else {
-                continue;
-            };
-            let below = Request::Sync {
-                net: net.to_string(),
-                after_ts: walk.floor,
-                after_id: String::new(),
-                before_ts: Some(ts),
-                before_id: Some(id.clone()),
-                kinds: Vec::new(),
-                authors: Vec::new(),
-                partial: false,
-                limit: self.config.history.page,
-            };
-            let Some((events, more, gap, seen)) = self.page(peer, &below).await else {
-                continue;
-            };
-            if gap.is_some() {
-                pass.gapped.insert(peer);
-                if events.is_empty() {
-                    continue;
-                }
-            }
-            if events.is_empty() && !more {
-                pass.claimers.insert(peer);
-                continue;
-            }
-            let mut probe = scratch.clone();
-            (probe.cursor_ts, probe.cursor_id) = (ts, id);
-            let below_walk = Walk {
-                floor: walk.floor,
-                author_cap: walk.author_cap,
-                ..Walk::default()
-            };
-            if self
-                .take_page(&mut probe, peer, &events, &seen, &below_walk, pass, true)
-                .await
-                .is_ok()
+            // A claimer read the whole range, found nothing new, and served
+            // events of it (or is trusted, whose word on nothing is enough).
+            if (exhaustive || !desc)
+                && to_end
+                && new_total == 0
+                && (served > 0
+                    || self.trusted(&peer)
+                    || self.holds_below(peer, net, walk.floor).await)
             {
-                *bottom = Some((probe.cursor_ts, probe.cursor_id));
+                pass.claimers.insert(peer);
             }
         }
         Ok(())
@@ -1183,6 +1167,29 @@ impl Node {
         }
     }
 
+    /// Whether `peer` holds an event below `floor`: a peer with history
+    /// can say a quiet span is empty; one with none (a fresh id) cannot
+    /// (ADR 0025 §9).
+    async fn holds_below(&self, peer: EndpointId, net: &str, floor: u64) -> bool {
+        if floor == 0 {
+            return false;
+        }
+        let request = Request::Sync {
+            net: net.to_string(),
+            after_ts: 0,
+            after_id: String::new(),
+            before_ts: Some(floor),
+            before_id: Some(String::new()),
+            kinds: Vec::new(),
+            authors: Vec::new(),
+            partial: false,
+            limit: 1,
+        };
+        self.page(peer, &request)
+            .await
+            .is_some_and(|(events, ..)| !events.is_empty())
+    }
+
     /// How many of `events` this node does not hold.
     fn unheld(&self, events: &[Value]) -> usize {
         events
@@ -1192,17 +1199,17 @@ impl Node {
             .count()
     }
 
-    /// Unconfirmed ranges, when a trusted peer is up (ADR 0025 §9): the
-    /// union check of the whole span against it, then one page below the
-    /// range's cursor. Nothing new from either confirms the range; what
-    /// comes is stored, and the range stays unconfirmed. Tried again with
-    /// a backoff (1 min, doubling up to an hour); a peer that answers with
-    /// a gap there is not asked about that range again.
+    /// Unconfirmed ranges (ADR 0025 §9): each neighbor that has not claimed
+    /// one yet gets its exhaustive union check over the whole span, trusted
+    /// neighbors first, so that a neighbor that comes up later can confirm
+    /// it. What comes is stored; the claims add up across passes (in
+    /// memory), and a trusted one or two distinct ones confirm the range.
+    /// Each (range, neighbor) is tried again with a backoff (1 min,
+    /// doubling up to an hour); a neighbor that answers with a gap there
+    /// is not asked about that range again.
     async fn confirm_unconfirmed(&self, net: &str, peers: &[EndpointId]) -> Result<()> {
-        let trusted: Vec<EndpointId> = peers.iter().copied().filter(|p| self.trusted(p)).collect();
-        if trusted.is_empty() {
-            return Ok(());
-        }
+        let mut peers: Vec<EndpointId> = peers.to_vec();
+        peers.sort_by_key(|p| !self.trusted(p));
         let ranges: Vec<SyncRange> = self
             .store
             .sync_ranges(net)?
@@ -1211,61 +1218,72 @@ impl Node {
             .collect();
         let now = std::time::Instant::now();
         for mut range in ranges {
-            let due = self
+            let mut claims = self
                 .set_progress(net, |p| {
-                    p.probes.get(&range.id).is_none_or(|(at, _)| *at <= now)
+                    p.claims.get(&range.id).cloned().unwrap_or_default()
                 })
-                .unwrap_or(true);
-            if !due {
-                continue;
-            }
-            let mut done = false;
-            for &peer in &trusted {
-                let skip = self
-                    .set_progress(net, |p| p.probe_skip.contains(&(range.id, peer)))
+                .unwrap_or_default();
+            for &peer in &peers {
+                let key = (range.id, peer);
+                let due = self
+                    .set_progress(net, |p| {
+                        !claims.contains(&peer)
+                            && !p.probe_skip.contains(&key)
+                            && p.probes.get(&key).is_none_or(|(at, _)| *at <= now)
+                    })
                     .unwrap_or(false);
-                if skip {
+                if !due {
                     continue;
                 }
-                let mut pass = Pass::default();
+                let mut pass = Pass {
+                    claimers: claims.clone(),
+                    ..Pass::default()
+                };
                 let walk = Walk {
                     floor: range.lo_ts,
+                    stop_at: self
+                        .history_budget()
+                        .map(|b| self.store.store_bytes().saturating_add(b)),
                     ..Walk::default()
                 };
-                let mut bottom = Some((range.cursor_ts, range.cursor_id.clone()));
-                self.union_check(net, range.hi_ts, &[peer], &walk, &mut pass, &mut bottom)
+                self.union_check(net, range.hi_ts, &[peer], &walk, &mut pass, true)
                     .await?;
-                if let Some(bottom) = bottom {
-                    (range.cursor_ts, range.cursor_id) = bottom;
-                }
-                if pass.claimers.contains(&peer) {
+                claims = pass.claimers;
+                let gapped = pass.gapped.contains(&peer);
+                let claimed = claims.contains(&peer);
+                self.set_progress(net, |p| {
+                    if gapped {
+                        p.probe_skip.insert(key);
+                    }
+                    if claimed {
+                        p.probes.remove(&key);
+                    } else {
+                        let delay = p
+                            .probes
+                            .get(&key)
+                            .map_or(PROBE_FIRST, |(_, d)| d.saturating_mul(2).min(PROBE_MAX));
+                        let at = now.checked_add(delay).unwrap_or(now);
+                        p.probes.insert(key, (at, delay));
+                    }
+                });
+                if self.confirmed_by(&claims) {
                     info!(
                         %net,
-                        "history: a trusted peer confirmed {} – {}",
+                        "history: {} – {} confirmed",
                         date(range.lo_ts),
                         date(range.hi_ts)
                     );
                     range.state = RangeState::Done;
-                    done = true;
-                }
-                if pass.gapped.contains(&peer) {
-                    self.set_progress(net, |p| p.probe_skip.insert((range.id, peer)));
-                }
-                self.store.update_sync_range(&range)?;
-                if done {
+                    self.store.update_sync_range(&range)?;
                     break;
                 }
             }
             self.set_progress(net, |p| {
-                if done {
-                    p.probes.remove(&range.id);
+                if range.state == RangeState::Done {
+                    p.claims.remove(&range.id);
+                    p.probes.retain(|(id, _), _| *id != range.id);
                 } else {
-                    let delay = p
-                        .probes
-                        .get(&range.id)
-                        .map_or(PROBE_FIRST, |(_, d)| d.saturating_mul(2).min(PROBE_MAX));
-                    let at = now.checked_add(delay).unwrap_or(now);
-                    p.probes.insert(range.id, (at, delay));
+                    p.claims.insert(range.id, claims);
                 }
             });
         }
@@ -1589,7 +1607,12 @@ impl Node {
                         return Ok(End::Budget);
                     }
                     let trusted = self.trusted(&peer);
-                    if !partial && covering && (content || trusted) {
+                    if !partial
+                        && covering
+                        && (content
+                            || trusted
+                            || self.holds_below(peer, &range.net, walk.floor).await)
+                    {
                         pass.claimers.insert(peer);
                         if trusted {
                             return Ok(End::Complete);

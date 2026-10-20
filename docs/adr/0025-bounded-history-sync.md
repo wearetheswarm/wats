@@ -674,7 +674,7 @@ code is in `crates/wats/src/node/history.rs` (the task, serving, `get`),
   start when it is larger. A fill then never pushes into ADR 0012's 110 %
   ceiling.
 
-**What a range ends as (§9, after three reviews)**
+**What a range ends as (§9, after four reviews)**
 
 A walk over a range ends in one of four ways.
 
@@ -687,15 +687,20 @@ A walk over a range ends in one of four ways.
   - **Trusted.** A trusted peer is one of the node's configured peers or
     bootstrap nodes (`seed_ids`).
   - **Covering.** A peer *covers* a range when it is read from the range's
-    top down. It can be the peer the walk asks first, or a later one in the
-    union check, which reads from the top until 2 pages in a row bring
-    nothing new and then asks one page below the walk's cursor.
+    top down to its floor. It can be the peer the walk asks first, or a
+    later one in an exhaustive union check (below). A read cut short by the
+    2-held-pages shortcut never covers.
   - **What comes after a claim voids it.** Events a later peer serves below
     an earlier peer's "nothing more", or that the union check finds missing,
     void every earlier claim.
-  - **No events, no claim.** A peer that served no events confirms nothing,
-    unless it is trusted. Two fresh ids cannot confirm a range by holding
+  - **No events, no claim.** A peer that served no events of the range
+    confirms nothing, unless it is trusted or holds an event below the
+    range's floor (one page asked): a peer with history can say a quiet
+    span is empty, and two fresh ids cannot confirm a range by holding
     nothing.
+  - **Claims add up across passes.** Claims on an unconfirmed range are
+    kept, in memory, so a neighbor that comes up later can bring the
+    second one. A span that merges with another starts over.
   - **Never confirms.** A `gap`, a `partial` answer and one untrusted peer's
     word never confirm.
   - **Peers that cover nothing.** A peer asked only from lower down (after
@@ -710,14 +715,16 @@ A walk over a range ends in one of four ways.
   - **0.4.1 peers.** A descending page from a 0.4.1 peer stops there with a
     `gap`, so that a trusted node never passes on a confirmation it does not
     have. The 0.4.1 peer still takes the events with `partial`.
-  - **Later confirmation.** When a trusted peer is up, a later pass runs the
-    union check of the whole span against it, then one page below the
-    range's cursor.
-    - If neither brings anything new, the range is confirmed.
-    - If they bring events, those are stored, the cursor moves down to
-      them, and the range stays unconfirmed.
-    - These probes back off from 1 min, doubling up to an hour.
-    - A trusted peer that answers with a gap there is not asked about that
+  - **Later confirmation.** Each pass gives every neighbor that has not
+    claimed the range yet, trusted ones first, an exhaustive union check of
+    the whole span, a neighbor that comes up later included.
+    - A neighbor read to the floor with nothing new claims.
+    - Events it brings are stored and void the earlier claims; the range
+      stays unconfirmed.
+    - A trusted claimer, or two distinct ones, confirm the range.
+    - Each (range, neighbor) pair backs off from 1 min, doubling up to an
+      hour.
+    - A neighbor that answers with a gap there is not asked about that
       range again.
 - **The budget.** The only cut is the one the budget makes:
   - the fill records it at the cursor actually reached, never above it;
@@ -745,17 +752,23 @@ A walk over a range ends in one of four ways.
 - **The union check.** After each range, every neighbor that did not cover
   it from its top is asked what it holds that the walk did not bring, so
   that no single peer's omission sticks.
-  - **A `sync_desc` neighbor** is read newest first from the range's top,
-    with `partial`, until 2 pages in a row bring nothing new.
+  - **Bounded, when a trusted peer walked the range** (it is confirmed). A
+    `sync_desc` neighbor is read newest first from the range's top, with
+    `partial`, until 2 pages in a row bring nothing new. This shortcut
+    trades exhaustiveness for bandwidth: an event a peer holds below a run
+    of pages already held is not fetched. It claims nothing.
+  - **Exhaustive, when no trusted peer did.** A `sync_desc` neighbor is
+    read down to the range's floor, as 0.4.0 read each neighbor. The read
+    asks for what the neighbor holds for sure; after a gap it asks with
+    `partial` and claims nothing. Only such a read can claim. This is the
+    cost of having no trusted peer: a seedless node with 5 neighbors reads
+    the span about 5 times, within the range's budget. Confirming an
+    unconfirmed range costs the same, once per neighbor and range, under
+    the backoff.
   - **An older neighbor** is read ascending from the range's floor, up to
-    5 % of the budget in what it sends.
-  - **Both** stop at the range's budget.
-
-  This shortcut trades exhaustiveness for bandwidth, the same trade as
-  0.4.0's catch-up from each neighbor: an event a peer holds below a run of
-  pages already held is not fetched. Without it, a newcomer with 5
-  neighbors and the default 2.5 GiB budget would download the window about
-  5 times.
+    5 % of the budget in what it sends. Read to its end with nothing new,
+    it claims.
+  - **Every read** stops at the range's budget.
 - **New networks.** A network whose nodes are all new ends unconfirmed when
   it holds nothing yet: a peer with no events confirms nothing. It serves
   0.4.0 pulls all the same.
@@ -800,7 +813,7 @@ A walk over a range ends in one of four ways.
 - **A neighbor that joins others already up** gets the union check from the
   watermark the pass started with (5 % of the budget at most), never from
   one the pass moved. Not after the fill: its own union check ran. At most
-  12 such checks an hour.
+  12 such checks an hour; over that, the neighbors stay queued for later.
 - **A catch-up range above a pending fill.** A node stopped during its
   fill has watermark 0. At its next start it opens a catch-up range above
   the fill (from the fill's top − 10 min) before resuming the fill, so the
@@ -901,7 +914,9 @@ A walk over a range ends in one of four ways.
   - events held only by the second of two untrusted peers, fetched by the
     union check whichever is walked first;
   - two honest untrusted peers confirming a seedless node, which a
-    newcomer then trusts;
+    newcomer then trusts, also when the second one comes up later;
+  - events missing deep inside the first walker's answer, fetched by the
+    exhaustive union check, and never confirmed without them;
   - `read` below the cut;
   - a full node not misled by a cut node;
   - the per-key share, against junk notes and against junk announces;
