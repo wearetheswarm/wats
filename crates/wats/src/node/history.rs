@@ -1223,6 +1223,13 @@ impl Node {
     }
 
     /// How many of `events` this node does not hold.
+    /// The author of the event `id`, when this node holds it (a tombstone
+    /// included).
+    fn held_author(&self, id: &str) -> Option<String> {
+        let (_, _, stored) = self.store.get_raw(id).ok().flatten()?;
+        stored.get("author")?.as_str().map(str::to_string)
+    }
+
     fn unheld(&self, events: &[Value]) -> usize {
         events
             .iter()
@@ -1765,8 +1772,9 @@ impl Node {
     /// is when each peer first stored a key's announce, usually the key's
     /// first event. The fill reads most history from one peer, and a key
     /// needs [`crate::reputation::SEEN_QUORUM`] peers' reports for its age
-    /// (ADR 0025, "Key age"). Announces not held yet are stored, as the
-    /// fill's phase 0 would.
+    /// (ADR 0025, "Key age"). It stores nothing: announces not held here
+    /// are skipped (the fill's phase 0 fetches them, under the per-key
+    /// share and the budget).
     async fn probe_seen(&self, net: &str, peers: &[EndpointId]) {
         for &peer in peers {
             let ask = self
@@ -1815,14 +1823,13 @@ impl Node {
                         break;
                     }
                     before = (h.ts, h.id.to_string());
-                    match self.accept_value(value.clone(), Origin::Pulled).await {
-                        Ok(Some((event, _))) => {
-                            if let Some(at) = seen.as_ref().and_then(|s| s.get(i)) {
-                                reports.push((event.author().to_string(), *at));
-                            }
-                        }
-                        Ok(None) => {}
-                        Err(e) => debug!(peer = %peer.fmt_short(), "seen probe: {e:#}"),
+                    // Stores nothing: only events held here count, under
+                    // the author this node verified when it stored them.
+                    if let Some(at) = seen.as_ref().and_then(|s| s.get(i))
+                        && let Some(author) = self.held_author(h.id)
+                        && author == h.author
+                    {
+                        reports.push((author, *at));
                     }
                 }
                 self.record_seen(peer, &reports);

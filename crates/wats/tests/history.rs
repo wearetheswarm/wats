@@ -1515,6 +1515,11 @@ async fn a_new_node_takes_an_old_keys_age_from_its_peers() -> anyhow::Result<()>
         hold(peer, &events);
         hold(peer, &traffic);
     }
+    // An announce only p2 holds, older than what the union check reads:
+    // the probe reads it but stores nothing new (the fill's per-key share
+    // and budget would not apply).
+    let only_p2 = root(Kind::Announce, "only p2 has it", &key(78), now - 30 * DAY);
+    hold(&p2, std::slice::from_ref(&only_p2));
     assert!(p1.history_full(), "the reference with full history");
     assert!(!p2.history_full());
     let mut n_config = config(&dir.path().join("n"), &[&p1, &p2, &p3]);
@@ -1537,6 +1542,10 @@ async fn a_new_node_takes_an_old_keys_age_from_its_peers() -> anyhow::Result<()>
     let reports = &reports[&author];
     assert_eq!(reports.len(), 3, "{reports:?}");
     assert_eq!(reports.iter().filter(|(_, full)| *full).count(), 1);
+    // p2 was probed (its report is there); what it alone holds was not
+    // stored, and no report came for it.
+    assert!(seq(&n, &only_p2.id).is_none(), "the probe stored an event");
+    assert!(!n.store().seen_reports()?.contains_key(&only_p2.author));
     for node in [n, p1, p2, p3] {
         node.shutdown().await?;
     }

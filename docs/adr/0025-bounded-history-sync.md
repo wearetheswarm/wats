@@ -919,9 +919,12 @@ is applied), `Store::record_seen` and `Store::seen_reports` (`key_seen`,
   node started (8 at most per network, trusted ones first) for their
   announces, newest first, 16 pages at most each (`kinds: ["announce"]`,
   `partial`). Their `seen` for a key's announce is when each first stored
-  it, usually the key's first event. Announces not held yet are stored, as
-  the fill's phase 0 would. Without this, the union check's two held
-  pages reach only recent events, whose `seen` is recent.
+  it, usually the key's first event. The probe stores nothing: a report
+  counts only for an announce this node already holds, under the author
+  it verified when it stored it; the others are skipped. Storing them
+  would bypass the fill's per-key share and budget (phase 0 fetches the
+  kept-forever kinds under both). Without the probe, the union check's
+  two held pages reach only recent events, whose `seen` is recent.
 - **Errors go one way.** An honest peer's report is never earlier than
   when it first saw the key, and the clamp keeps the estimate no later
   than this node's own first sight: the age is never younger than in
@@ -947,7 +950,7 @@ a table built from reports), `store.rs` (each peer's earliest report, its
 full-history status, the first 8 peers, the full-history exception), and
 `tests/history.rs` (`a_new_node_takes_an_old_keys_age_from_its_peers`: a
 new node fills from three peers, one with full history, and an old key
-gets its 40 days).
+gets its 40 days; an announce only one probed peer holds is not stored).
 
 **The fill's phases**
 
