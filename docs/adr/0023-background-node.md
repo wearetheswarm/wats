@@ -1,10 +1,12 @@
 # 0023. Running the node in the background
 
-Status: Proposed (2026-10-20). Ships in 0.4.0.
+Status: Proposed (2026-10-20). Ships in 0.4.0; §6 amended for 0.4.1
+(MCP sessions when their node goes away).
 
-Code: `crates/wats/src/background.rs`, `crates/wats/src/main.rs`
-(`detach_command`, `attach_command`, `ps_command`, `stop_command`),
-`crates/wats/src/attach.rs` (`Control::Info`, `Control::Stop`),
+Code: `crates/wats/src/background.rs` (and the stop record),
+`crates/wats/src/main.rs` (`detach_command`, `attach_command`,
+`ps_command`, `stop_command`), `crates/wats/src/attach.rs`
+(`Control::Info`, `Control::Stop`, a session's `Recovery`),
 `crates/wats/src/node.rs` (the lock holder record).
 
 Source: Vincent, relayed: a must-have for 0.4.0.
@@ -166,12 +168,100 @@ prints `stopped … in 0.4 s` or `did not stop within 10 s: killed
 (SIGKILL)`, and fails if the node survives that.
 
 **MCP sessions.** Stopping a node that MCP sessions use: `wats stop` warns
-with their count and stops it anyway. Each session's `wats mcp` waits 30 s
-for a node to listen again (ADR 0021 §4): `wats --detach` within that time
-and they carry on; otherwise the session ends, and its host starts a
-background node again when it restarts `wats mcp`. Stopping an MCP
-background node with sessions is therefore rarely useful; the warning
-says so.
+with their count and stops it anyway. The sessions do not start it again;
+they say it was stopped until a node runs there again (below).
+
+**When an MCP session loses its node** (amended for 0.4.1). Decided by
+Vincent (2026-10-20): "MCP sessions: respawn the node after a crash;
+after an explicit `wats stop`, don't respawn, and the session says
+clearly that the node was stopped." In 0.4.0 a session waited 30 s for a
+node to listen again, then ended, whatever the cause.
+
+- **A stop from a crash.** A node stopped on purpose leaves a record in
+  `<data dir>/stopped.json` (reason, who asked, when, its pid and
+  profile) before its sessions see it go. `wats stop` writes it itself
+  before asking (`` `wats stop` `` or `` `wats stop --all` ``), so the
+  SIGTERM and SIGKILL fallbacks are covered too, and removes it if the
+  node survives. The node writes one on a `stop` request from anything
+  else on its socket, and a `hand_over` record when a daemon takes over
+  (the `hand_over` request, or the `start_daemon` tool). The next node to
+  start in the data directory removes it, whatever started it. A session
+  that loses its node and finds no record treats it as a crash. The
+  record lives in the data directory rather than in `~/.wats/run`: the
+  session always knows its data directory, a hermetic process has no
+  registry, and a registry entry goes away with its node; the halt marker
+  (ADR 0016) lives there for the same reasons.
+- **Crash** (killed, panicked, socket gone, without a record): the
+  session starts a background node the way `wats mcp` does when none
+  runs (`wats node --idle-exit`, the same data directory and flags, so
+  the same profile), waits up to 20 s for it to accept sessions, replays
+  the client's `initialize` and carries on. A read in flight is sent
+  again. A write in flight (`post`, `reply`…) is not: nothing proves that
+  a killed node did not publish it, so the client gets an error saying
+  the node restarted during the call, which may or may not have taken
+  effect, to check before retrying (the idempotency key of ADR 0021 §4
+  would lift this).
+- **One node for all sessions.** The session that takes
+  `<data dir>/respawn.lock` (an advisory lock, non-blocking) starts the
+  node; the others wait while that lock or the data directory lock is
+  held, then attach to the new node. Should two nodes start anyway (a
+  0.4.0 session), the data directory lock lets one run and the other
+  exits naming its holder.
+- **Backoff.** At most 5 starts per session in 10 minutes. After a failed
+  start (the node exits, or accepts no session within 20 s), the session
+  waits 1 s, then 2, 4, 8… (at most 30 s) before the next, holding the
+  respawn lock so that the other sessions wait too. Past the limit it
+  answers every call: "The wats node for profile X keeps stopping: this
+  session started it 5 times in 10 minutes (last: …) … see <log>, then
+  start it with `wats --detach` (or restart this MCP session)". A later
+  call tries again once the window allows it.
+- **Stopped with `wats stop`**: no start. The session stays up and
+  answers every tool call with an error result: "The wats node for
+  profile X was stopped with `wats stop` at <time>: this session does not
+  start it again. Tell the user. To use the swarm again, start it with
+  `wats --detach` (or restart this MCP session); this session reconnects
+  on its next call." `tools/list` returns the node's last list, so the
+  host keeps the tools; a call in flight gets the same message (a write
+  also says it may have gone out). It stays up rather than exiting after
+  a grace period: when `wats mcp` exits, the host shows a dead server,
+  usually without the reason, and the agent loses the tools for the rest
+  of the conversation; a session that answers lets the agent tell the
+  user what happened and what to run, and comes back by itself. It costs
+  an idle process per session.
+- **Back on.** At each call, a session without a node first tries the
+  socket: a node started since (`wats --detach`, a new session's
+  background node, a service) serves it, after the replayed `initialize`.
+  When the record is gone and still nothing runs (that node went away
+  too, without `wats stop`), the session starts one as after a crash.
+- **Other exits.**
+  - A daemon taking over (`hand_over` record): the session waits up to
+    60 s for it, and starts nothing.
+  - A guardian halt (ADR 0016 §3): the halt marker, as before: the
+    session says the network is halted and starts nothing (that node
+    would stop again at once). It now reconnects once the marker is gone
+    (`wats resume`) and a node runs.
+  - The idle exit of a background node happens only when no session is
+    attached: no session sees it.
+  - Upgrades: `wats upgrade` and `update.auto` never restart a node, so
+    no session sees one stop for that.
+  - Ctrl-C or SIGTERM to a daemon (a terminal, a service manager,
+    `kill`): not `wats stop`, so its sessions start a background node, as
+    ADR 0021 §4 has it: stopping a daemon stops its agent, not the
+    sessions' use of the swarm. `wats stop` stops both.
+  - A node that holds the data directory but accepts no session (its
+    socket file deleted): the session waits up to 60 s, then says so,
+    naming its pid, with `wats stop` and `wats --detach`.
+  - A named socket (`WATS_MCP_SOCKET`, docs/docker.md): never started
+    from here. The session waits 30 s, then says no node listens there,
+    and reconnects on a later call once one does.
+- **Logs.** Each start writes one line first in the new node's log,
+  shown by `wats attach`, also when that start fails:
+  ``respawn: the node (pid N) exited without `wats stop` (killed or
+  crashed); started again by the MCP session pid M (k of at most 5 in 10
+  min)``. The session logs it
+  too, with each failure, on its stderr (the host's MCP log).
+- **Native Windows** has no background mode and no socket: `wats mcp`
+  runs its own node in-process, as before.
 
 ### 7. Platforms
 
@@ -218,8 +308,8 @@ says so.
 - Native Windows: a detached process (`DETACHED_PROCESS`) and named pipes
   for the socket.
 - A `config.toml` key for the log size and count.
-- An MCP session that, when its node stops for good, starts a background
-  node again instead of ending.
+- An idempotency key for writes, so that a session can send a `post` in
+  flight again to the node it started after a crash (ADR 0021 §4).
 
 ## Consequences
 

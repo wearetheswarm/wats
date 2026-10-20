@@ -95,6 +95,10 @@ struct DaemonArgs {
     /// Rotated log files a detached node keeps [default: 3].
     #[arg(long, hide = true)]
     log_keep: Option<usize>,
+    /// Why an MCP session starts this node again after its node went away
+    /// (ADR 0023 §6): logged first.
+    #[arg(long, hide = true)]
+    respawn_reason: Option<String>,
     #[command(flatten)]
     agent: AgentArgs,
 }
@@ -375,8 +379,8 @@ enum Command {
     },
     /// Stop the node of the data directory (--dir, default ~/.wats), or the
     /// one running as --profile: asks it to stop gracefully, then kills it
-    /// after --timeout. MCP sessions using it wait 30 s for a node to come
-    /// back, then end.
+    /// after --timeout. MCP sessions using it do not start it again: they
+    /// say it was stopped until a node runs there again.
     Stop {
         /// Stop every wats node running on this machine (see `wats ps`).
         #[arg(long)]
@@ -3376,7 +3380,12 @@ async fn stop_command(node: &NodeArgs, all: bool, timeout: Duration) -> Result<(
     }
     let mut failed = 0;
     for entry in targets {
-        if let Err(e) = stop_node(&entry, timeout).await {
+        let by = if all {
+            "`wats stop --all`"
+        } else {
+            "`wats stop`"
+        };
+        if let Err(e) = stop_node(&entry, timeout, by).await {
             eprintln!("{}: {e:#}", tilde(&entry.dir));
             failed += 1;
         }
@@ -3395,19 +3404,48 @@ async fn stop_command(_: &NodeArgs, _: bool, _: Duration) -> Result<()> {
     )
 }
 
+/// Stop one node, `by` naming this command for its MCP sessions.
 #[cfg(unix)]
-async fn stop_node(entry: &NodeEntry, timeout: Duration) -> Result<()> {
+async fn stop_node(entry: &NodeEntry, timeout: Duration, by: &str) -> Result<()> {
     let dir = &entry.dir;
     let started = std::time::Instant::now();
-    let mode = entry.mode();
     if let Some(sessions) = entry.sessions().filter(|s| *s > 0) {
         eprintln!(
-            "warning: {sessions} MCP session(s) use the node in {}: each waits 30 s for a node \
-             to come back (`wats --detach`), then ends; their host starts a background node \
-             again when it restarts them",
-            tilde(dir)
+            "warning: {sessions} MCP session(s) use the node in {}: they do not start it again, \
+             and answer each call saying it was stopped, until a node runs there again \
+             (`wats{} --detach`)",
+            tilde(dir),
+            entry.dir_flag()
         );
     }
+    // Before the sessions see their node go: an intended stop, not a
+    // crash (ADR 0023 §6). The next node to start removes it.
+    let record = wats::background::StopRecord {
+        reason: wats::background::StopReason::Stop,
+        by: by.to_string(),
+        at: wats::node::now_secs(),
+        pid: entry.pid().unwrap_or_default(),
+        profile: entry.profile(),
+    };
+    if let Err(e) = wats::background::write_stop_record(dir, &record) {
+        tracing::warn!("could not record the stop in {}: {e}", tilde(dir));
+    }
+    let result = stop_gracefully_or_kill(entry, timeout, started).await;
+    if result.is_err() && wats::node::node_running(dir) {
+        // It still runs: no stop to report to its sessions.
+        wats::background::clear_stop_record(dir);
+    }
+    result
+}
+
+#[cfg(unix)]
+async fn stop_gracefully_or_kill(
+    entry: &NodeEntry,
+    timeout: Duration,
+    started: std::time::Instant,
+) -> Result<()> {
+    let dir = &entry.dir;
+    let mode = entry.mode();
     // Graceful: through the socket, else SIGTERM to the lock holder.
     let asked = attach::control_within(dir, attach::Control::Stop, Duration::from_secs(5))
         .await
@@ -3857,8 +3895,14 @@ impl NodeArgs {
 
 /// Start `wats node` for `dir` as a detached background process, logging
 /// to `<dir>/logs/node.log` (the path `wats --detach` shares, ADR 0023).
+/// `respawn`: why a session starts it again (ADR 0023 §6), for its log.
 #[cfg(unix)]
-fn spawn_background_node(args: &NodeArgs, dir: &std::path::Path, idle_exit: u64) -> Result<()> {
+fn spawn_background_node(
+    args: &NodeArgs,
+    dir: &std::path::Path,
+    idle_exit: u64,
+    respawn: Option<&str>,
+) -> Result<std::process::Child> {
     std::fs::create_dir_all(dir)?;
     let log = wats::background::log_path(dir);
     // A node started for a session runs no agent of config.toml, unless
@@ -3871,13 +3915,16 @@ fn spawn_background_node(args: &NodeArgs, dir: &std::path::Path, idle_exit: u64)
         child_args.push("--no-agent".into());
     }
     child_args.extend(["--idle-exit".into(), idle_exit.to_string().into()]);
+    if let Some(reason) = respawn {
+        child_args.extend(["--respawn-reason".into(), reason.into()]);
+    }
     // Own process group: the node survives the session that started it.
     let child = wats::background::spawn_detached(&child_args, &log, &[])
         .context("start background node")?;
     tracing::info!(pid = child.id(), "started background node");
-    // Not waited for on purpose: it outlives this process.
-    drop(child);
-    Ok(())
+    // It may outlive this process: callers wait for it in a thread
+    // (`background::reap`), never here.
+    Ok(child)
 }
 
 /// The halt marker this node obeys, if any: none when it ignores halts,
@@ -3904,11 +3951,23 @@ async fn serve_halted_mcp(marker: &wats::halt::Marker) -> Result<()> {
 }
 
 /// Serve this session through the node that owns `dir`, starting one in
-/// the background if none runs.
+/// the background if none runs, and again if it crashes (ADR 0023 §6).
 #[cfg(unix)]
 async fn mcp_attached(args: &NodeArgs, config: &NodeConfig, idle_exit: u64) -> Result<()> {
     let dir = config.data_dir.as_path();
-    let attach = || attach::attach(dir, args.profile.clone(), default_file_roots());
+    let recovery = || attach::Recovery {
+        // A named socket is another process's node: never started here.
+        respawn: attach::socket_override().is_none().then(|| {
+            Box::new(move |reason: &str| spawn_background_node(args, dir, idle_exit, Some(reason)))
+                as attach::Respawn<'_>
+        }),
+        dir_flag: if default_dir().is_ok_and(|d| same_dir(&d, dir)) {
+            String::new()
+        } else {
+            format!(" --dir {}", tilde(dir))
+        },
+    };
+    let attach = || attach::attach(dir, args.profile.clone(), default_file_roots(), recovery());
     if attach().await? {
         return Ok(());
     }
@@ -3925,10 +3984,10 @@ async fn mcp_attached(args: &NodeArgs, config: &NodeConfig, idle_exit: u64) -> R
     // starts to look for an unhalt, for the next sessions.
     if let Some(marker) = halted_marker(config) {
         tracing::warn!("{}", marker.message());
-        spawn_background_node(args, dir, idle_exit)?;
+        wats::background::reap(spawn_background_node(args, dir, idle_exit, None)?);
         return serve_halted_mcp(&marker).await;
     }
-    spawn_background_node(args, dir, idle_exit)?;
+    wats::background::reap(spawn_background_node(args, dir, idle_exit, None)?);
     for _ in 0..150 {
         tokio::time::sleep(Duration::from_millis(100)).await;
         if attach().await? {
@@ -5103,6 +5162,16 @@ async fn async_main(cli: Cli) -> Result<()> {
         .init();
 
     wats::crash::install_panic_hook();
+    // One line per respawn, in the log `wats attach` shows (ADR 0023 §6),
+    // first: also when this start fails.
+    let respawn = match &cli.command {
+        Some(Command::Node { daemon }) => daemon.respawn_reason.as_deref(),
+        None => cli.daemon.respawn_reason.as_deref(),
+        Some(_) => None,
+    };
+    if let Some(reason) = respawn {
+        tracing::warn!("respawn: {reason}");
+    }
     let shutdown = shutdown_signal();
     let data_dir = cli.node.data_dir()?;
     // Commands that work even when config.toml does not load.

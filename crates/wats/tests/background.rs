@@ -455,3 +455,173 @@ async fn detach_takes_over_an_mcp_background_node() -> anyhow::Result<()> {
     client.cancel().await?;
     Ok(())
 }
+
+type Client = rmcp::service::RunningService<rmcp::RoleClient, ()>;
+
+/// `wats mcp` for `dir`, as an MCP host starts it, with this machine's
+/// home and registry.
+async fn mcp_session(machine: &Machine, dir: &Path) -> anyhow::Result<Client> {
+    use rmcp::ServiceExt;
+    let mut cmd = tokio::process::Command::new(env!("CARGO_BIN_EXE_wats"));
+    cmd.env("WATS_HERMETIC", "1")
+        .env("HOME", machine.dir("home"))
+        .env("WATS_RUN_DIR", machine.run_dir())
+        .env_remove("WATS_RUNNER_TOKEN")
+        .env_remove("WATS_DIR")
+        .env_remove("WATS_PROFILE")
+        .env_remove("WATS_MCP_SOCKET")
+        .args([
+            "--infra",
+            "none",
+            "--pow-bits=0",
+            "--min-pow-bits=0",
+            "--dir",
+        ])
+        .arg(dir)
+        .args(["mcp", "--idle-exit", "30"]);
+    Ok(
+        ().serve(rmcp::transport::TokioChildProcess::new(cmd)?)
+            .await?,
+    )
+}
+
+/// The `status` tool: its result, or the text of its error.
+async fn status(client: &Client) -> Result<Value, String> {
+    let result = client
+        .call_tool(rmcp::model::CallToolRequestParams::new("status"))
+        .await
+        .map_err(|e| e.to_string())?;
+    if result.is_error == Some(true) {
+        return Err(serde_json::to_string(&result.content).unwrap());
+    }
+    Ok(result.structured_content.unwrap_or(Value::Null))
+}
+
+/// SIGKILL to a node this test started.
+fn kill(pid: u64) {
+    let status = Command::new("kill")
+        .args(["-KILL", &pid.to_string()])
+        .status()
+        .unwrap();
+    assert!(status.success());
+}
+
+fn node_log(dir: &Path) -> String {
+    std::fs::read_to_string(dir.join("logs").join("node.log")).unwrap_or_default()
+}
+
+/// A node killed under its MCP sessions is started again, once for all of
+/// them, and they carry on (ADR 0023 §6).
+#[tokio::test(flavor = "multi_thread")]
+async fn sessions_start_a_killed_node_again_once() -> anyhow::Result<()> {
+    let machine = Machine::new();
+    let a = machine.dir("a");
+    let first = mcp_session(&machine, &a).await?;
+    assert_eq!(status(&first).await.unwrap()["mode"], "background");
+    let second = mcp_session(&machine, &a).await?;
+    assert_eq!(status(&second).await.unwrap()["mode"], "background");
+    let old = machine.running(&a).expect("ps lists the node");
+    assert_eq!(old["sessions"], 2, "{old}");
+    let old_pid = old["pid"].as_u64().unwrap();
+
+    kill(old_pid);
+    let (one, two) = tokio::join!(status(&first), status(&second));
+    assert_eq!(one.unwrap()["mode"], "background");
+    assert_eq!(two.unwrap()["mode"], "background");
+    // One new node, serving both.
+    let nodes = machine.ps(false);
+    assert_eq!(nodes.len(), 1, "{nodes:?}");
+    let new = machine.running(&a).expect("a node runs again");
+    assert_ne!(new["pid"], old["pid"]);
+    assert_eq!(new["mode"], "mcp-background", "{new}");
+    assert_eq!(new["sessions"], 2, "{new}");
+    // Its log says why, once.
+    let log = node_log(&a);
+    assert_eq!(log.matches("respawn: ").count(), 1, "{log}");
+    assert!(
+        log.contains(&format!(
+            "respawn: the node (pid {old_pid}) exited without `wats stop` (killed or crashed)"
+        )),
+        "{log}"
+    );
+    first.cancel().await?;
+    second.cancel().await?;
+    Ok(())
+}
+
+/// `wats stop` is not undone by the sessions: they say the node was
+/// stopped until it runs again, then reconnect (ADR 0023 §6).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_session_does_not_start_a_stopped_node_again() -> anyhow::Result<()> {
+    let machine = Machine::new();
+    let a = machine.dir("a");
+    assert!(machine.detach(&a, &[]).status.success());
+    let client = mcp_session(&machine, &a).await?;
+    assert_eq!(status(&client).await.unwrap()["mode"], "daemon");
+
+    let out = machine.stop(&["--dir", a.to_str().unwrap()]);
+    assert!(out.status.success(), "{out:?}");
+    assert!(
+        text(&out.stderr).contains("1 MCP session(s) use the node"),
+        "{out:?}"
+    );
+    let record = wats::background::read_stop_record(&a).expect("the stop is recorded");
+    assert_eq!(record.reason, wats::background::StopReason::Stop);
+    assert_eq!(record.by, "`wats stop`");
+    for _ in 0..3 {
+        let said = status(&client).await.unwrap_err();
+        assert!(
+            said.contains("for profile default was stopped with `wats stop` at "),
+            "{said}"
+        );
+        assert!(
+            said.contains(&format!("wats --dir {} --detach", a.display())),
+            "{said}"
+        );
+    }
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert!(machine.running(&a).is_none(), "not started again");
+    assert!(!node_log(&a).contains("respawn: "));
+
+    // Started again by hand: the session reconnects on its next call.
+    assert!(machine.detach(&a, &[]).status.success());
+    assert!(wats::background::read_stop_record(&a).is_none());
+    assert_eq!(status(&client).await.unwrap()["mode"], "daemon");
+    client.cancel().await?;
+    Ok(())
+}
+
+/// A node that fails at start is started again a bounded number of times,
+/// with a growing wait, then the session says so (ADR 0023 §6).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_session_gives_up_on_a_node_that_fails_at_start() -> anyhow::Result<()> {
+    let machine = Machine::new();
+    let a = machine.dir("a");
+    assert!(machine.detach(&a, &[]).status.success());
+    let client = mcp_session(&machine, &a).await?;
+    assert_eq!(status(&client).await.unwrap()["mode"], "daemon");
+    let pid = machine.running(&a).unwrap()["pid"].as_u64().unwrap();
+
+    // From now on a node fails at start.
+    std::fs::write(a.join("config.toml"), "not [valid toml")?;
+    kill(pid);
+    let started = Instant::now();
+    let said = status(&client).await.unwrap_err();
+    assert!(said.contains("keeps stopping"), "{said}");
+    assert!(said.contains("started it 5 times in 10 minutes"), "{said}");
+    assert!(said.contains("exited at start"), "{said}");
+    // 1 + 2 + 4 + 8 s between the five starts.
+    assert!(started.elapsed() >= Duration::from_secs(15));
+    let log = node_log(&a);
+    assert_eq!(log.matches("respawn: ").count(), 5, "{log}");
+    assert!(log.contains("invalid "), "{log}");
+    assert!(machine.running(&a).is_none());
+    // Given up: the next call is answered at once, the same way.
+    let again = Instant::now();
+    let said = status(&client).await.unwrap_err();
+    assert!(said.contains("keeps stopping"), "{said}");
+    assert!(again.elapsed() < Duration::from_secs(5));
+    assert_eq!(node_log(&a).matches("respawn: ").count(), 5);
+    client.cancel().await?;
+    Ok(())
+}

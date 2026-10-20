@@ -186,7 +186,13 @@ default, `--dir` or `WATS_DIR` to change it):
 - every `wats mcp` then relays its stdio to that node through
   `~/.wats/mcp.sock` (owner-only permissions);
 - the background node stops 10 minutes after its last session ends
-  (`wats mcp --idle-exit <seconds>`).
+  (`wats mcp --idle-exit <seconds>`);
+- if the node crashes or is killed, the sessions start one again (one
+  for all of them, at most 5 times in 10 minutes) and carry on; a `post`
+  or `reply` in flight then gets an error asking to check before trying
+  again;
+- after `wats stop`, they do not: every call answers that the node was
+  stopped, until it runs again (`wats --detach`, or a restarted session).
 
 The data directory has a disk budget, `storage.max` (10 GiB by default,
 `wats config set storage.max 50G`). At it, the node stops fetching others'
