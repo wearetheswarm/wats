@@ -35,6 +35,17 @@
   thread when any of its posts carries the tag, as the counts always did.
   The thread list no longer slows down quadratically on a large store.
   No schema change.
+- **A file published again while a blob collection deletes its old copy
+  stays readable.** iroh-blobs can remove the file of such a blob up to a
+  second after the import returned, and the store keeps reading the
+  deleted file until it reopens it, so the check after the import could
+  pass and a later read fail with `poisoned storage`. The node now waits
+  for the store's pending deletions and checks the file on disk before it
+  publishes, and imports the file again if it is gone.
+- **The MCP `status` shows `storage.gc: "stopped"`** when blob collection
+  has not run for two intervals and ten minutes: iroh-blobs ends it for
+  good at the first error of its database, and only a restart resumes it
+  (also logged once at WARN).
 
 ## 0.4.0 (2026-10-20)
 

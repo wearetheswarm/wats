@@ -206,3 +206,68 @@ async fn readd_during_gc_can_lose_the_file() {
   scratch `FsStore`, exported to a file and imported again into the main
   store, which restores it.
 - Files a crash left behind are removed at start, before GC runs.
+- After an import, `sync_db` and a check of the data file on disk (see
+  the addendum), not a read: the import is repeated if the file is gone.
+
+---
+
+## Addendum (2026-10-20, after two CI flakes): more for the same issue, or a second one
+
+Found while chasing a `poisoned storage` read and a hung test on CI
+(ubuntu-latest), same versions.
+
+1. **A re-add's file can disappear up to a second after the add
+   returned.** The sweep's `delete` and the import's `Set` can land in the
+   same write batch of the meta actor (delete first, so the hash is not
+   `protected` yet). The `Set` is answered before the batch commits, and
+   `DeleteSet::commit` unlinks the file only after it. A write batch that
+   runs out of commands waits for more up to `max_read_duration` (1 s by
+   default; `run_inner` uses it for write batches too, not
+   `max_write_duration`). Meanwhile `status` says `Complete` (reads join
+   the batch) and reads go through the still-loaded handle, whose open
+   file descriptor reads the unlinked file. The next load of the entry
+   fails to open the file and the handle becomes `Poisoned`. In the re-add
+   repro above, with a second file check after `store.sync_db()`, under
+   CPU load (10 busy loops on 12 cores, three repros at
+   once): 28 of 5000 adds ended with no file, 5 of them only after
+   `sync_db` (the file was still there when `add_bytes` returned). A
+   caller can wait for the pending deletions with `sync_db` (a top-level
+   command ends the open batch) and then check the file.
+2. **`FsStore::load_with_opts` never returns when the store cannot be
+   opened.** `Actor::new` takes the store's private runtime; when it fails
+   (`create_dir_all`, `redb::Database::create`) the runtime is dropped on
+   one of its own worker threads. `RtWrapper::drop` runs
+   `block_in_place(|| drop(rt))`, and `BlockingPool::shutdown` then waits
+   for every blocking-pool thread to exit, including the one it runs on.
+   The task never completes, and neither does `load_with_opts`. Repro:
+
+   ```rust
+   #[tokio::test(flavor = "multi_thread")]
+   async fn failed_open_returns() {
+       let dir = tempfile::tempdir().unwrap();
+       let root = dir.path().join("blobs");
+       std::fs::create_dir_all(&root).unwrap();
+       std::fs::write(root.join("data"), b"x").unwrap(); // a file where the data dir goes
+       let options = iroh_blobs::store::fs::options::Options::new(&root);
+       let open = FsStore::load_with_opts(root.join("blobs.db"), options);
+       let r = tokio::time::timeout(Duration::from_secs(10), open).await;
+       assert!(r.is_ok(), "load_with_opts hung"); // fails: it hangs
+   }
+   ```
+
+   A stack sample shows the `iroh-blob-store-N` thread in
+   `RtWrapper::drop` → `block_in_place` → `BlockingPool::shutdown`. Fix:
+   return the runtime to the caller on error (or build the actor before
+   moving the runtime into it), or drop it with `shutdown_background`.
+3. **`HashContext::load` can miss its wakeup.** A second task on an entry
+   being loaded waits with
+   `while matches!(*self.state.borrow(), Loading) { self.state.0.subscribe().changed().await }`.
+   `subscribe()` marks the current value as seen, so if the loader's
+   `send_replace` lands between `borrow()` and `subscribe()`, `changed()`
+   waits for a later change that may never come, and the request hangs.
+   Found by reading; subscribing before the check (or `wait_for`) fixes it.
+4. **GC stops for good at the first error of a run.** `run_gc` `break`s
+   when `gc_run_once` fails, with one `error!` line; nothing restarts it
+   but a new store. Retrying at the next interval (an error is likely
+   transient) or surfacing the stop through the API would help; wats now
+   reports a collection overdue in its status.
