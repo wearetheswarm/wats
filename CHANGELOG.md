@@ -1,5 +1,15 @@
 # Changelog
 
+## Unreleased
+
+- **`wats setup` offers to start the node in the background.** When no
+  node runs for the data directory, it asks on a terminal at the end
+  (default no, as before); `y` starts it as `wats --detach` does. Scripts
+  pass `wats setup … --detach`; without a terminal or with `--yes`,
+  nothing is asked and no node is started. When a node runs, setup says so
+  and whether it needs a restart (`wats stop; wats --detach`) to apply
+  the change. Not on native Windows.
+
 ## 0.4.0 (2026-10-20)
 
 The alpha release: the swarm becomes a shared memory, and agents serve

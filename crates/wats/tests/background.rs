@@ -455,3 +455,133 @@ async fn detach_takes_over_an_mcp_background_node() -> anyhow::Result<()> {
     client.cancel().await?;
     Ok(())
 }
+
+/// `wats setup` offers to start the node in the background: asked on a
+/// terminal (`WATS_TEST_INTERACTIVE` asks on a pipe), Enter keeps the
+/// default no, `y` starts it as `wats --detach` does; without a terminal,
+/// only `--detach` starts it (also as `wats --detach setup …`); when a
+/// node runs, nothing is asked and it says whether to restart it. With
+/// `setup vibe` (a throwaway VIBE_HOME): no agent in config.toml.
+#[test]
+fn setup_offers_to_start_the_node_in_the_background() {
+    use std::io::Write;
+    let machine = Machine::new();
+    let a = machine.dir("a");
+    let question = "Start the node in the background now (`wats --detach`)? [y/N]";
+    let setup = |before: &[&str], args: &[&str], input: Option<&str>| -> Output {
+        let mut command = machine.wats();
+        command
+            .env("VIBE_HOME", machine.dir("vibe"))
+            .env("USER", "alice")
+            .args([
+                "--infra",
+                "none",
+                "--pow-bits=0",
+                "--min-pow-bits=0",
+                "--dir",
+            ])
+            .arg(&a)
+            .args(before)
+            .arg("setup")
+            .args(args)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let Some(input) = input else {
+            return command.output().unwrap();
+        };
+        command
+            .env("WATS_TEST_INTERACTIVE", "1")
+            .stdin(Stdio::piped());
+        let mut child = command.spawn().unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(input.as_bytes())
+            .unwrap();
+        child.wait_with_output().unwrap()
+    };
+    let stop = || {
+        let out = machine.stop(&["--dir", a.to_str().unwrap()]);
+        assert!(out.status.success(), "{out:?}");
+        assert!(machine.running(&a).is_none());
+    };
+
+    // On a terminal, Enter: no node.
+    let out = setup(&[], &["vibe", "--mcp"], Some("\n"));
+    let said = text(&out.stdout);
+    assert!(out.status.success(), "{out:?}");
+    assert!(
+        said.contains("Mistral Vibe: wats MCP server added"),
+        "{said}"
+    );
+    assert!(said.contains(question), "{said}");
+    assert!(machine.running(&a).is_none());
+
+    // Without a terminal: no question, no node.
+    let out = setup(&[], &["vibe", "--mcp"], None);
+    let said = text(&out.stdout);
+    assert!(out.status.success(), "{out:?}");
+    assert!(!said.contains("Start the node"), "{said}");
+    assert!(machine.running(&a).is_none());
+
+    // `y`: a detached node, and where its log is.
+    let out = setup(&[], &["vibe", "--mcp"], Some("y\n"));
+    let err = text(&out.stderr);
+    assert!(out.status.success(), "{out:?}");
+    assert!(text(&out.stdout).contains(question), "{out:?}");
+    assert!(err.contains("running in the background · pid "), "{err}");
+    assert!(err.contains("logs/node.log"), "{err}");
+    assert!(err.contains("wats attach --dir "), "{err}");
+    let node = machine.running(&a).expect("ps lists it");
+    assert_eq!(node["mode"], "detached", "{node}");
+    let pid = node["pid"].as_u64().unwrap();
+
+    // A node runs: no question; config.toml unchanged, nothing to restart.
+    let out = setup(&[], &["vibe", "--mcp"], Some("y\n"));
+    let said = text(&out.stdout);
+    assert!(out.status.success(), "{out:?}");
+    assert!(!said.contains("Start the node"), "{said}");
+    assert!(
+        said.contains(&format!(
+            "a wats node already runs here (pid {pid}, detached)"
+        )) && said.contains("nothing to restart"),
+        "{said}"
+    );
+    // An agent added to config.toml: restart it to apply (`--detach` does
+    // not start a second node). `--agent` alone never runs `claude`.
+    let out = setup(
+        &[],
+        &["claude", "--agent", "--detach", "--claude", "/nonexistent"],
+        None,
+    );
+    let said = text(&out.stdout);
+    assert!(out.status.success(), "{out:?}");
+    assert!(
+        said.contains("To apply this setup, restart it: wats stop --dir ")
+            && said.contains("; wats --detach --dir "),
+        "{said}"
+    );
+    assert_eq!(machine.running(&a).unwrap()["pid"], pid);
+    stop();
+    std::fs::remove_file(a.join("config.toml")).unwrap();
+
+    // Without a terminal, --detach starts it; before `setup` too.
+    for (before, args) in [
+        (&[][..], &["vibe", "--mcp", "--detach"][..]),
+        (&["--detach"][..], &["vibe", "--mcp"][..]),
+    ] {
+        let out = setup(before, args, None);
+        let err = text(&out.stderr);
+        assert!(out.status.success(), "{out:?}");
+        assert!(!text(&out.stdout).contains("Start the node"), "{out:?}");
+        assert!(err.contains("running in the background · pid "), "{err}");
+        assert_eq!(machine.running(&a).expect("started")["mode"], "detached");
+        stop();
+    }
+
+    // A removal starts nothing.
+    let out = setup(&[], &["vibe", "--remove", "--detach"], None);
+    assert!(!out.status.success(), "{out:?}");
+    assert!(text(&out.stderr).contains("not with --remove"), "{out:?}");
+}
