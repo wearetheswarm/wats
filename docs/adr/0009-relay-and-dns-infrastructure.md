@@ -67,7 +67,8 @@ in `config.toml`):
   `WATS_INFRA=n0` work for any local experiment.
 - **Our services are fixed for now.** The relay URL, its QUIC port, the
   pkarr URL and the DNS origin are constants in `infra.rs`. Arbitrary relay
-  URLs can come later, if someone needs to run a private set.
+  URLs can come later, if someone needs to run a private set. (They came
+  on 2026-10-20: see "Custom relays and directory" below.)
 - **Existing values keep working.** `wats`, `n0`, `wats+n0` and `none` parse
   as before. Only the meaning of `wats+n0` changed: it used to put both relay
   sets in one map and resolve through both directories at once; it is now
@@ -211,3 +212,100 @@ are told apart only by which checks fail together); lookups of other
 peers that fail while our own record resolves; a relay that accepts
 connections but does not forward. The node's own outage cannot be told
 from the infrastructure's: an offline node reports everything degraded.
+
+## Custom relays and directory (2026-10-20)
+
+Our services were constants in the binary: nobody could run their own
+relay or directory without building their own wats, which contradicts a
+swarm that is fully decentralisable. Since 0.4.1 a node takes relays and
+a directory of its own. How to run them:
+[deploy-relay.md](../deploy-relay.md).
+
+**Keys.** Two flat keys next to `infra`, rather than an `[infra]` table:
+`infra` stays a top-level string, so every existing `config.toml` loads
+unchanged, and `wats config set` handles the new keys as any top-level
+key.
+
+| Key | Flag | Variable | Value |
+|---|---|---|---|
+| `infra` | `--infra` | `WATS_INFRA` | a preset, now also `custom` |
+| `infra_relays` | `--relay` (repeatable) | `WATS_RELAYS` (comma-separated) | relay URLs |
+| `infra_dns` | `--dns` | `WATS_DNS` | the pkarr URL of a directory |
+
+**URL forms.** What a service needs beyond its URL goes in the URL's
+fragment, which is never sent to the server, so one string works in the
+file, on the command line and in an environment variable:
+
+- a relay is `https://relay.example.org`. Its QUIC address-discovery port
+  is Iroh's default, 7842, unless `#quic=<port>` says otherwise;
+  `#quic=off` disables it. A relay URL has no path (Iroh adds `/relay`).
+  A plain http relay has no QUIC address discovery, which needs TLS;
+- a directory is its pkarr URL, `https://dns.example.org/pkarr`; a URL
+  without a path gets `/pkarr`, where `iroh-dns-server` serves it. The DNS
+  origin (the zone of the `_iroh.<z32 id>.<origin>` TXT records) is the
+  URL's host: our directory and n0's both follow that convention. The
+  fragment overrides it, `#origin=<zone>`, or `#origin=none` for pkarr
+  over HTTPS only (also the default for an IP address or `localhost`), for
+  a directory without a delegated zone.
+
+A query string was the other candidate for these options, but `?` is a
+glob character in zsh, and a query is sent to the server.
+
+**Semantics: custom services replace, never add.**
+
+- `infra_relays` replaces the preset's relays, and `infra_dns` its
+  directories. Adding them in front of the preset, with the preset as
+  fallback, was the alternative; replacing is clearer and brings no
+  third party the user did not name.
+- What they do not replace comes from `infra` when it names a preset
+  (`infra = "wats"` with `infra_relays`: your relays, our directory), and
+  is left out otherwise: `infra` unset means `custom` when a custom
+  service is set. So with only `infra_relays`, a node has no directory,
+  and with only `infra_dns`, no relay.
+- `none` with a custom service is an error, and so is `custom` without
+  one.
+- Custom relays turn off the relay fallback of `wats+n0` (there is no
+  "ours" to fall back from); `wats+n0` with only `infra_relays` keeps both
+  directories, ours first.
+- **The command line sets the group.** Any of `--infra`, `--relay` and
+  `--dns` (or their variables) replaces all three keys of `config.toml`,
+  rather than each flag overriding its own key. Otherwise `--infra none`
+  would still use the relays of the file, and `--infra wats` would no
+  longer mean ours alone. `--hermetic` still forces `none`.
+
+**Validation.** https only; plain http only to `localhost` or a loopback
+address, for tests. A host, no user or password, no query, no path on a
+relay, only the fragments above, a valid DNS name in `#origin=`, no relay
+listed twice. `wats config set` checks each value, and saving checks the
+three keys together; the node checks them again at start. Garbage is an
+error, never ignored.
+
+**Visibility.** The banner, `wats status`, the MCP `status` tool (`infra`)
+and `wats ps` (a new `INFRA` column) show the preset and the custom
+services by host, e.g. `custom (relay relay.example.org; dns
+dns.example.org)` or `wats (relay relay.example.org)`. The health checks
+follow: `relay` is degraded when none of the custom relays is home, and
+`lookup` probes the custom directory (without the DNS step when it has no
+origin); the relay check is off without a relay, the lookup check without
+a directory. Crash reports name the preset only (`custom`,
+`wats+custom`), never a host.
+
+**Private networks and bootstrap nodes.** The infrastructure is the
+node's, for every network it joins: a private network (ADR 0015) whose
+nodes set the same keys runs on its own services, with nothing more to
+wire. The router's compose file passes `WATS_RELAYS` and `WATS_DNS`
+through, empty by default.
+
+**Iroh.** Nothing needed patching: `RelayMap` takes any URLs with their
+QUIC port, and `PkarrPublisher`, `PkarrResolver` and `DnsAddressLookup`
+take any pkarr URL and origin. The builder is fed from a pure "endpoint
+plan" (relay map, directories to publish to and to resolve through),
+which the tests check without network; one integration test runs two
+endpoints, with no IP transport, through an `iroh-relay` server on
+127.0.0.1.
+
+**Left out.** Relay auth tokens (`RelayConfig::with_auth_token`, for
+`iroh-relay`'s `access.shared_token`); allowlists by endpoint id work.
+Several custom directories (one replaces the preset's; a list could come
+later, resolved in order as ours and n0's are). A custom fallback set for
+custom relays: Iroh picks the fastest of a list as home relay.

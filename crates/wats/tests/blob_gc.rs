@@ -22,7 +22,7 @@ const ROUNDS: usize = 4;
 fn config(dir: &Path, gc_ms: u64) -> NodeConfig {
     let mut config = NodeConfig::new(dir);
     config.mode = NetworkMode::Loopback;
-    config.infra = wats::infra::Infra::None;
+    config.infra = wats::infra::Infra::NONE;
     config.pow_bits = Some(8);
     config.min_pow_bits = Some(8);
     config.blob_gc_interval = Duration::from_millis(gc_ms);

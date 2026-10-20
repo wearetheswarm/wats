@@ -2,6 +2,24 @@
 
 ## Unreleased
 
+- **A relay and directory of your own** (ADR 0009, 2026-10-20): new keys
+  `infra_relays` (a list of `iroh-relay` URLs) and `infra_dns` (the pkarr
+  URL of an `iroh-dns-server`), with the flags `--relay` (repeatable) and
+  `--dns` and the variables `WATS_RELAYS` and `WATS_DNS`, on `wats`,
+  `wats node` and the background node. They replace the preset's relays
+  and directory; what they leave out comes from `infra` when it names a
+  preset, and is left out otherwise (`infra = "custom"`, implied). A relay
+  URL takes `#quic=<port>` when its QUIC address discovery is not on 7842
+  (`#quic=off`: none); a directory's DNS zone is its URL's host unless
+  `#origin=<zone>` or `#origin=none` says otherwise. https only (http to
+  loopback for tests), checked by `wats config set` and at start. Any of
+  `--infra`, `--relay` and `--dns` sets the three together, over
+  `config.toml`. The banner, `wats status` and `wats ps` (new `INFRA`
+  column) show them by host name, the health checks watch them instead of
+  ours, and crash reports name the preset only. Existing `config.toml`
+  files load unchanged. How to run both services:
+  [docs/deploy-relay.md](docs/deploy-relay.md).
+
 - **`wats setup` offers to start the node in the background.** When no
   node runs for the data directory, it asks on a terminal at the end
   (default no, as before); `y` starts it as `wats --detach` does. Scripts

@@ -235,6 +235,9 @@ Every channel carries a little stranger-written text, marked as data:
   address) to n0's directory, and uses n0's relays while ours is out of
   reach. n0 then sees the same metadata as our relay and DNS. `infra=wats`
   keeps n0 out entirely.
+- **Custom relays and directory** (`infra_relays`, `infra_dns`, 0.4.1):
+  their operator sees that same metadata in our place, and no more; they
+  replace ours and n0's, so the node trusts no other operator with it.
 - **The release check** (`update.check`, on by default): once a day the
   node asks the GitHub API (or `update.url`) for the latest release, which
   tells GitHub this node's IP address and wats version (user agent). It

@@ -6,6 +6,8 @@
 //! ```toml
 //! profile = "alice"            # default profile of `wats mcp` sessions
 //! infra = "wats"               # ours only; default: wats+n0
+//! # infra_relays = ["https://relay.example.org"]  # your own (ADR 0009)
+//! # infra_dns = "https://dns.example.org/pkarr"
 //!
 //! [agents.claude]              # one table per agent (ADR 0021)
 //! runtime = "claude"           # run the Claude agent with the node
@@ -46,6 +48,11 @@ pub const RUNTIMES: [&str; 3] = ["claude", "codex", "openclaw"];
 pub struct Settings {
     pub profile: Option<String>,
     pub infra: Option<String>,
+    /// Relays of your own, replacing the preset's (ADR 0009).
+    #[serde(default)]
+    pub infra_relays: Vec<String>,
+    /// A directory of your own, replacing the preset's (ADR 0009).
+    pub infra_dns: Option<String>,
     pub port: Option<u16>,
     /// Networks to join; empty: `public`. `--net` replaces the list.
     #[serde(default)]
@@ -388,6 +395,7 @@ impl Settings {
     /// Check what serde cannot: runtimes, access levels, gateway URLs,
     /// capabilities, which table a key belongs to, agent names.
     pub fn check(&self) -> Result<()> {
+        self.infra().context("infra, infra_relays, infra_dns")?;
         let tables = std::iter::once(("agent".to_string(), &self.agent)).chain(
             self.agents
                 .iter()
@@ -438,6 +446,15 @@ impl Settings {
         crate::roster::configured(self, Path::new(""), "user")?;
         self.update.policy().context("[update]")?;
         Ok(())
+    }
+
+    /// The infrastructure the file chooses, without flags (ADR 0009).
+    pub fn infra(&self) -> Result<crate::infra::Infra> {
+        crate::infra::Infra::resolve(
+            self.infra.as_deref(),
+            &self.infra_relays,
+            self.infra_dns.as_deref(),
+        )
     }
 
     /// The [`REMOVED_KEYS`] set in the file.
@@ -570,7 +587,24 @@ pub const KEYS: &[Key] = &[
         "infra",
         ValueType::Infra,
         "wats+n0",
-        "relays and lookup: wats+n0 (ours first, n0 as fallback), wats, n0 or none",
+        "relays and lookup: wats+n0 (ours first, n0 as fallback), wats, n0, none, or custom \
+         (only infra_relays and infra_dns); with those keys set, the preset that fills in what \
+         they do not replace (unset: custom)",
+    ),
+    key(
+        "infra_relays",
+        ValueType::List,
+        "the preset's",
+        "relays of your own (iroh-relay), replacing the preset's: https URLs, with #quic=<port> \
+         when QUIC address discovery is not on 7842 (#quic=off: none); docs/deploy-relay.md",
+    ),
+    key(
+        "infra_dns",
+        ValueType::Text,
+        "the preset's",
+        "an address directory of your own (iroh-dns-server), replacing the preset's: its pkarr \
+         URL, e.g. https://dns.example.org/pkarr; DNS lookups under the URL's host unless \
+         #origin=<zone> (or #origin=none)",
     ),
     key(
         "port",
@@ -1115,6 +1149,11 @@ fn toml_value(key: &Key, raw: &str) -> Result<toml_edit::Value> {
         }
         // The lenient form here; `ConfigFile::save` and `Settings::load`
         // check it against `agent.openclaw_insecure_ok`.
+        ValueType::Text if key.name == "infra_dns" => {
+            raw.parse::<crate::infra::Directory>()
+                .map_err(|e| invalid(format!("{e:#}")))?;
+            raw.trim().into()
+        }
         ValueType::Text if key.name == "agent.openclaw_url" => {
             crate::openclaw::check_url(raw, true).map_err(|e| invalid(format!("{e:#}")))?;
             raw.into()
@@ -1127,7 +1166,7 @@ fn toml_value(key: &Key, raw: &str) -> Result<toml_edit::Value> {
             raw.into()
         }
         ValueType::Infra => {
-            raw.parse::<crate::infra::Infra>()
+            raw.parse::<crate::infra::Preset>()
                 .map_err(|e| invalid(e.to_string()))?;
             raw.into()
         }
@@ -1208,6 +1247,13 @@ fn toml_value(key: &Key, raw: &str) -> Result<toml_edit::Value> {
             if key.name == "agent.caps" {
                 for cap in &items {
                     crate::agent::check_cap(cap).map_err(invalid)?;
+                }
+            }
+            if key.name == "infra_relays" {
+                for relay in &items {
+                    relay
+                        .parse::<crate::infra::CustomRelay>()
+                        .map_err(|e| invalid(format!("{e:#}")))?;
                 }
             }
             items.into_iter().collect::<toml_edit::Array>().into()
@@ -1922,6 +1968,81 @@ mod tests {
         let mut file = ConfigFile::open(dir.path()).unwrap();
         file.set("update.security_delay", "1d").unwrap();
         assert!(file.set("update.delay", "1w").is_err());
+    }
+
+    #[test]
+    fn custom_infrastructure_keys() {
+        // Old files load unchanged.
+        for (text, want) in [("", "wats+n0"), ("infra = \"wats\"\n", "wats")] {
+            let settings = Settings::parse(text).unwrap();
+            settings.check().unwrap();
+            assert_eq!(settings.infra().unwrap().to_string(), want);
+        }
+        let settings = Settings::parse(
+            "infra_relays = [\"https://relay.example.org#quic=7843\"]\n\
+             infra_dns = \"https://dns.example.org/pkarr\"\n",
+        )
+        .unwrap();
+        settings.check().unwrap();
+        let infra = settings.infra().unwrap();
+        assert_eq!(infra.preset, crate::infra::Preset::Custom);
+        assert_eq!(infra.relays[0].quic_port, Some(7843));
+        // Garbage, or a contradiction, does not load.
+        for text in [
+            "infra_relays = [\"http://relay.example.org\"]\n",
+            "infra_relays = \"https://relay.example.org\"\n",
+            "infra_dns = \"https://dns.example.org/pkarr?x=1\"\n",
+            "infra = \"none\"\ninfra_dns = \"https://dns.example.org\"\n",
+            "infra = \"custom\"\n",
+            "infra = \"aws\"\n",
+        ] {
+            let loaded = Settings::parse(text).and_then(|s| s.check());
+            assert!(loaded.is_err(), "{text}");
+        }
+
+        // `wats config set`: each value checked, the three keys together
+        // when saved.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(FILE_NAME), "infra = \"wats\" # mine\n").unwrap();
+        let mut file = ConfigFile::open(dir.path()).unwrap();
+        file.set(
+            "infra_relays",
+            "https://a.example.org, https://b.example.org#quic=off",
+        )
+        .unwrap();
+        file.set("infra_dns", " https://dns.example.org ").unwrap();
+        for (key, bad) in [
+            ("infra_relays", "https://a.example.org,ftp://b.example.org"),
+            ("infra_relays", "https://a.example.org#quic=x"),
+            ("infra_dns", "dns.example.org"),
+            ("infra_dns", "http://dns.example.org"),
+            ("infra", "aws"),
+        ] {
+            let err = format!("{:#}", file.set(key, bad).unwrap_err());
+            assert!(err.starts_with(key), "{key} {bad}: {err}");
+        }
+        file.save().unwrap();
+        let text = std::fs::read_to_string(dir.path().join(FILE_NAME)).unwrap();
+        assert!(text.starts_with("infra = \"wats\" # mine\n"), "{text}");
+        assert!(text.contains(
+            "infra_relays = [\"https://a.example.org\", \"https://b.example.org#quic=off\"]"
+        ));
+        assert!(text.contains("infra_dns = \"https://dns.example.org\""));
+        let infra = Settings::load(dir.path()).unwrap().infra().unwrap();
+        assert_eq!(
+            infra.to_string(),
+            "wats (relays a.example.org, b.example.org; dns dns.example.org)"
+        );
+        // `none` with custom services is refused when saved.
+        file.set("infra", "none").unwrap();
+        assert!(file.save().is_err());
+        file.set("infra", "custom").unwrap();
+        file.save().unwrap();
+        assert!(file.unset("infra").unwrap());
+        assert!(file.unset("infra_relays").unwrap());
+        file.save().unwrap();
+        let infra = Settings::load(dir.path()).unwrap().infra().unwrap();
+        assert_eq!(infra.to_string(), "custom (no relay; dns dns.example.org)");
     }
 
     #[test]
