@@ -27,6 +27,9 @@ services:
       WATS_BLOB_QUOTA: "${WATS_BLOB_QUOTA:-20G}"
       # Whole data directory (ADR 0012); the node default is 10G.
       WATS_STORAGE_MAX: "${WATS_STORAGE_MAX:-25G}"
+      # The whole history, served to new nodes first (ADR 0025). Releases
+      # before 0.4.1 ignore the variable.
+      WATS_SYNC_INITIAL_MAX: "${WATS_SYNC_INITIAL_MAX:-0}"
       # Collect crash reports from nodes (ADR 0013): /data/wats/reports/.
       WATS_REPORT_ACCEPT: "${WATS_REPORT_ACCEPT:-true}"
       # On a guardian halt, stay up and serve only the halt events, so that

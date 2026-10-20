@@ -641,6 +641,105 @@ If PR B slips, a full node behaves as ADR 0012 says today. It refuses
 events above 110 % of `storage.max`, so a tester who lowers `storage.max`
 a lot would meet that ceiling sooner.
 
+## Implementation notes (PR A)
+
+PR A follows the decision above, with these differences and details. The
+code is in `crates/wats/src/node/history.rs` (the task, serving, `get`),
+`crates/wats/src/store.rs` (ranges, pages) and `crates/wats/src/proto.rs`.
+
+- **Schema 8**: `sync_ranges` as above, plus `id`, `phase` (the fill's
+  phase: `keep`, `own`, `knowledge`, `window`; empty for a catch-up
+  range), `opened` (the range's `S`) and `base_bytes` (where its budget
+  counts from), and the `done` state: a range completed while an older one
+  is still pending waits there, so that the watermark becomes the `S` of
+  the newest one once none is pending. A skipped range also lets the
+  watermark move. The migration only creates tables, so it composes with
+  any other schema 8 change.
+- **Store bytes** are the used pages (`page_count − freelist_count`)
+  only: with WAL, `page_count` already counts the pages committed to the
+  log. Measured with `store_bytes_at_50k_events`: **1,896 store bytes per
+  event** (asks, answers and reacts in threads, tags, full-text index), so
+  the default 2.5 GiB holds about 1.4 million events.
+- **`partial` on `sync`** (new, optional). A pending range is a hole, and
+  every new neighbor opens one (§5): two nodes catching up at once, or a
+  node whose only peer is catching up, stopped each other with a `gap`
+  forever. When every peer answered a `gap`, the walk asks them again with
+  `partial: true`: the server then stops only at its cut and skipped
+  ranges, and serves what it holds in a pending range. That is what an
+  ascending pull always took. The cheap ascending check (`sync_from`) asks
+  `partial` too. A walk that still meets only gaps ends: a catch-up range
+  is done, a fill records its cut there.
+- **Ascending pulls** are refused below the cut, a skipped range or an
+  initial fill still running. Not below a catch-up range still pending:
+  one opens on every new neighbor, so a 0.4.0 peer's pull would always
+  have been refused (found with a real 0.4.0 binary). Such a range is
+  recent, and 0.4.0 nodes served what they held during their own
+  catch-up as well.
+- **A descending request** carries `after_ts`/`after_id` as its lower
+  bound (the range's `lo`, inclusive of that second), so it is not
+  malformed for an older node: it would serve an ascending page, which
+  the requester rejects as out of order. Descending requests only go to
+  peers with `sync_desc`.
+- **`gap.hi_ts`** is counted by whole seconds: the page holds every event
+  with `ts` above it, and the requester goes on below `hi_ts + 1`.
+- **Older peers** (decided with internal after this ADR): no full pull
+  from 0. A peer without `sync_desc` is asked ascending windows: from now
+  − 7 days to the end, then from now − 14 days until the history already
+  held, doubling each time, until the budget is spent or the start
+  reaches the range's `lo`. With no history held yet, the first window is
+  read in full whatever the budget. When the budget runs out inside a
+  window, the cut is the start of the last window read in full; what that
+  window brought below it stays as islands. Older peers have no `kinds`
+  filter: phases 0 and 1 only get what falls inside the windows. The same
+  windows take the rest of a range when every `sync_desc` peer stopped at
+  a cut of its own and an older neighbor is up. `status` shows
+  `syncing from older peers`.
+- **`seen` on `sync_page`** (decided with internal after this ADR): the
+  serving node's `received_at` for each event, as a list parallel to
+  `events`, since the events themselves are signed wire JSON. It is served
+  on every page and `get`, and recorded per key and peer (the peer's
+  earliest report) in `key_seen`. `Store::author_seen_estimate` gives the
+  median of at least three distinct peers, no earlier than the key's
+  oldest `ts` and no later than this node's own first sight. **Served and
+  recorded; not used for the age floor until decided**: `reputation.rs`
+  does not read it.
+- **The fill's phases**: phase 0 is two steps, each capped at 10 % of the
+  budget (the kept-forever kinds, then the node's own posts and the
+  threads they are in); phase 1 is capped at 20 %. The per-key share
+  counts the bytes of the events stored in phase 2, per rotation chain,
+  in memory: a restart in phase 2 starts the counts over. The budget
+  counts every store byte added since the range opened, live traffic
+  included.
+- **A catch-up range above a pending fill.** A node stopped during its
+  fill has watermark 0. At its next start it opens a catch-up range above
+  the fill (from the fill's top − 10 min) before resuming the fill, so the
+  time it was offline is not lost.
+- **Passes.** A pass runs on every new neighbor and network change, every
+  60 s while a range is pending, and every hour otherwise (a short
+  catch-up range). With no neighbor, nothing opens.
+- **History is "old at arrival"**: the runner and `wait` leave out events
+  stored more than 24 h after their `ts` (`agent.catchup` for the runner),
+  whatever brought them. Live posts arrive within seconds of their `ts`.
+- **On demand**: `read` asks for the post when it is not held or its body
+  was evicted, then for the thread when its root is not held, then for a
+  missing parent: up to three `get`s in one call, one at a time, under
+  the node's 60 a minute.
+- **Display**: `status.history` is keyed by network. `wats ps` has a
+  `HISTORY` column (`back to 2026-08-02`, `syncing, back to …`, `full`,
+  `+gaps`). The banner opens the store read-only and shows nothing until
+  the store is at schema 8. Sizes use the binary units of the rest of the
+  CLI (`812.0 MiB / 2.5 GiB`).
+- **Tests** (`crates/wats/tests/history.rs`, hermetic) cover the fill and
+  its phases and cut, `0` as a full pull, an interrupted catch-up, a
+  skipped range, honest serving, `read` below the cut, a full node not
+  misled by a cut node, the per-key share against one junk key, older
+  peers in windows, and `wait`; `tests/agent.rs` covers the runner. A test
+  knob, `history.legacy`, makes a node behave as 0.4.0 on `/wats/1`. A
+  real 0.4.0 binary and this one synced history both ways (hermetic, by
+  hand, before the PR).
+- **Not in PR A**: rotation at the cap and its three fixes (PR B). ADR
+  0012's ceiling is unchanged.
+
 ## Consequences
 
 - A new node is usable in seconds, whatever the network's size: the

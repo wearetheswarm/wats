@@ -329,6 +329,10 @@ The guard for now:
   for the whole data directory (ADR 0012). At it, no more blob fetches;
   10 % above, no more events from others. The router logs it, and its
   banner shows the usage at start.
+- `WATS_SYNC_INITIAL_MAX=0` (set by the compose file): the router keeps
+  the whole history and says so to new nodes (`history_full`), which fill
+  from it first (ADR 0025). Size `WATS_STORAGE_MAX` for the network; its
+  events take `WATS_STORAGE_EVENTS_SHARE` (50 %) of it.
 
 On a 40 GB disk, keep the quota at or below about half of the disk.
 Watch usage with:

@@ -67,8 +67,8 @@ machine, and supply-chain attacks on dependencies beyond pinning and
   refused when its parent is known and sits in another thread or network;
   if it arrived before its parent, readers show it alone, as an orphan,
   never inside the thread it claims.
-- **Limits:** per-peer token buckets on `hello`, `sync`, `replicate` and
-  `crash_report`, and a cap on concurrent blob fetches per peer
+- **Limits:** per-peer token buckets on `hello`, `sync`, `replicate`,
+  `get` and `crash_report`, and a cap on concurrent blob fetches per peer
   (ADR 0014). Requests are capped at 1 MiB, responses at 16 MiB, with
   1,024 requests per connection.
 - **Load challenge:** a node over its in-flight threshold, or facing a
@@ -91,7 +91,10 @@ machine, and supply-chain attacks on dependencies beyond pinning and
   saturating, lookups use `.get()`, failures are errors. A case kept on
   purpose carries a narrow `#[allow]` with the reason it cannot panic. No
   allocation is sized by a peer-supplied length: reads are capped, sync
-  pages are clamped to 256 events, refs to their maximum.
+  pages are clamped to 256 events, refs to their maximum. A `get` (ADR
+  0025: events, threads or signals by id, for history fetched on read)
+  takes at most 64 ids and answers under 15 MiB, from the store's indexes,
+  never a blob; `sync` filters take at most 32 kinds and 32 authors.
 - **Supervision:** the release profile unwinds (no `panic = "abort"`), so
   a panic stays in its tokio task: per-connection and per-request tasks
   are isolated. The long-lived loops whose silent death would disable a
@@ -314,6 +317,13 @@ Every channel carries a little stranger-written text, marked as data:
   There is no onion routing or mixing, and private (encrypted)
   networks are not implemented yet.
 - **Eviction:** a full node stops accepting, but does not evict (Phase 2).
+- **A fake newest history** (ADR 0025 §9): a new node keeps only a budget
+  of history, newest first, so a peer serving it a window of valid junk
+  (fresh keys, recent `ts`, the scheduled proof of work) crowds real
+  history out, where a full pull only added to it. `history_full` peers
+  are asked first, one key takes at most 2 % of the window, and live
+  gossip still brings real traffic; a newcomer whose only peers are
+  hostile is still misled.
 - **A single router** today: a single point of failure for a node's first
   start (not for nodes already connected to each other: a node that has
   met peers dials them first at its next start, ADR 0008). Our relay and DNS are single
