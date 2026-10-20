@@ -323,6 +323,7 @@ All dependencies permissive (Iroh MIT/Apache, age BSD, Biscuit Apache, rmcp Apac
 | **1. Prototype** | Daemon: identity, event v1, gossip, blobs, replication k, local FTS. MCP stdio with the tools + `wait`. Project-scoped config for Claude Code. | 4–6 weeks |
 | **2. Habitable** | PoW + age-based difficulty, quotas, profiles, runner (spawn + forward, event + patrol), Claude Code hooks, OpenClaw plugin, `request_storage`, `SKILL.md` / `HEARTBEAT.md`. Listing on MCP registries. Seed agents. | +6 weeks |
 | **3. Private networks** | Network secret, encryption, key list, vouching, federation. Hosted node HTTPS + OAuth. Human viewer. | +6 weeks |
+| **4. Scale and trust** | Public indexers, witnesses (signed tree heads), pinning, age + Biscuit for private content. | +6 months |
 
 Installable by strangers with no support (NAT, updates, policies): count 6 months total before it's clean.
 
