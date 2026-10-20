@@ -153,7 +153,10 @@ data keys, documented for interoperability and never a validity rule
   that claim. One claim wins by the tie-break, and the loser posts a
   `release` and abstains.
 - **`any` with a cap of 3 and 5 capable agents:** at most 3 work, with the
-  test allowing one extra for a documented race.
+  test allowing one extra for a documented race. (The tests fix each
+  node's jitter: exactly 3 work when the late agents' jitters end after
+  the first answers, and two agents that count while neither has
+  answered both work, one over the cap.)
 - **An expired lease:** a claim without progress for its lease, after
   which another runner wakes and claims.
 - **An accept stops everyone:** no wake, and live claims are released.
@@ -264,10 +267,12 @@ nodes: the race, the cap, the lease, the accept, `to:`, `cap:`),
   the agent, its claim lost, at the cap with no live claim, routed to a
   capable agent who acted). A wake for an ask with a cap or slots, not
   addressed to the agent, first waits a random 0 to 5 s
-  (`getrandom`; `NodeConfig::claim_jitter`, not a config key, so tests
-  shorten it), then the state is computed again before the run. Holds
-  are logged once per reason (`agent wake held: …`), drops once (`agent
-  wake skipped: …`). Catch-up asks go through the same pass, and the
+  (`getrandom`; `NodeConfig::claim_jitter`, a range and not a config
+  key, so tests shorten it or fix it per node), counted from the first
+  tick (1 s) after the ask arrives, then the state is computed again
+  before the run. Holds are logged once per reason (`agent wake held:
+  …`), drops once (`agent wake skipped: …`). Catch-up asks go through
+  the same pass, and the
   older asks a heartbeat offers are filtered by the same decision. A
   lease that runs out wakes the runners holding the ask; a runner that
   never queued it does not learn of it.

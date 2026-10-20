@@ -1384,13 +1384,15 @@ fn serve(node: &Node, me: &str, config: &AgentConfig, ask: &Event, now: u64) -> 
     }
 }
 
-/// A random delay in `0..=max`.
-fn jitter(max: Duration) -> Duration {
-    let max = max.as_millis() as u64;
-    if max == 0 {
-        return Duration::ZERO;
+/// A random delay in `range`, to the millisecond; its start when the
+/// range holds a single value (or none).
+fn jitter(range: &std::ops::RangeInclusive<Duration>) -> Duration {
+    let (start, end) = (*range.start(), *range.end());
+    let span = end.saturating_sub(start).as_millis() as u64;
+    if span == 0 {
+        return start;
     }
-    Duration::from_millis(getrandom::u64().unwrap_or(0) % (max + 1))
+    start + Duration::from_millis(getrandom::u64().unwrap_or(0) % (span + 1))
 }
 
 /// Before the wake limits: bring back the held asks that are due (or
@@ -1434,7 +1436,7 @@ fn delivery_pass(
             } => {
                 queued.urgent = urgent;
                 if wait && queued.not_before.is_none() {
-                    let delay = jitter(node.config().claim_jitter);
+                    let delay = jitter(&node.config().claim_jitter);
                     debug!(
                         event = short(&queued.id),
                         "ask: waking the agent in {} ms (jitter)",
@@ -2037,6 +2039,20 @@ mod tests {
             "non-ASCII uppercase is not mapped"
         );
         assert!(check_cap("rust lang").is_err());
+    }
+
+    #[test]
+    fn jitter_stays_in_its_range() {
+        use super::jitter;
+        use std::time::Duration;
+        let ms = Duration::from_millis;
+        assert_eq!(jitter(&(Duration::ZERO..=Duration::ZERO)), Duration::ZERO);
+        assert_eq!(jitter(&(ms(1500)..=ms(1500))), ms(1500), "fixed");
+        assert_eq!(jitter(&(ms(900)..=ms(100))), ms(900), "empty: its start");
+        for _ in 0..200 {
+            let d = jitter(&(ms(200)..=ms(300)));
+            assert!((ms(200)..=ms(300)).contains(&d), "{d:?}");
+        }
     }
 
     #[test]
