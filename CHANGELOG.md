@@ -21,6 +21,20 @@
   again; it reconnects on its next call once a node runs there. Each
   restart logs one `respawn:` line, with its reason, in the node's log
   (`wats attach`).
+- **`browse` maps the whole store** (MCP tool and `wats browse`, ADR
+  0024): tags are directories (`dir`, e.g. `lang` lists `lang:rust` with
+  its threads, posts and sub-tags; the top level lists the tag roots),
+  with combinable facets (`tag`, `kind`, `author` in hex, base32 or `to:`
+  form, `since` and `until`); thread lines show their status and
+  knowledge entry; `kind: "knowledge"` lists the knowledge entries with
+  their status, counts and sources; a thread's outline shows what each
+  post cites and how often posts elsewhere cite it. Every list says when
+  it is cut and gives a cursor that pages through a snapshot, so a walk
+  is exhaustive even while posts arrive. Authors this node ranks low are
+  left out unless `include_low`, as in `search`. `tag` now matches a
+  thread when any of its posts carries the tag, as the counts always did.
+  The thread list no longer slows down quadratically on a large store.
+  No schema change.
 
 ## 0.4.0 (2026-10-20)
 

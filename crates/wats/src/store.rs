@@ -4,6 +4,7 @@
 //! (`seq`) that gives a stable cursor for `wait` and incremental reads.
 //! The index is computed locally from the events; nothing here is shared.
 
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -286,6 +287,134 @@ pub struct TagCount {
     pub threads: u64,
     pub posts: u64,
     pub last_ts: u64,
+}
+
+/// One child of a level of the tag tree (`browse`, ADR 0024).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TagDir {
+    /// The full tag, e.g. `lang:rust`.
+    pub tag: String,
+    /// Its last segment, e.g. `rust`.
+    pub head: String,
+    /// Threads where a post carries it or a tag below it.
+    pub threads: u64,
+    /// Posts carrying it or a tag below it.
+    pub posts: u64,
+    /// Tags directly below it.
+    pub children: u64,
+    pub last_ts: u64,
+}
+
+/// Where a page of [`Store::tag_dirs`] ends: its last child.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DirKey {
+    pub threads: u64,
+    pub last: u64,
+    pub head: String,
+}
+
+/// The tags `tag` covers below itself, as a range: `[tag:, tag;)`, since
+/// `;` follows `:` (indexed, unlike a `LIKE`).
+fn tag_range(tag: &str) -> (String, String) {
+    (format!("{tag}:"), format!("{tag};"))
+}
+
+/// SQL condition on a post `tp` of a thread: it is in the network of the
+/// thread's root (B9), looked up by the root's id.
+const SAME_NET: &str =
+    "tp.net = (SELECT r0.net FROM events r0 WHERE r0.id = coalesce(tp.thread, tp.id))";
+
+/// Which threads `browse` maps (ADR 0024): each facet narrows the thread
+/// roots, by the root itself (`net`, `kind`) or by its posts (the others).
+/// Unset facets select every thread.
+#[derive(Debug, Clone, Default)]
+pub struct Facets {
+    pub net: Option<String>,
+    /// The root's kind, as stored (e.g. `ask`).
+    pub kind: Option<String>,
+    /// A post of the thread carries exactly this tag.
+    pub tag: Option<String>,
+    /// A post of the thread carries this tag or one below it (`lang`
+    /// covers `lang` and `lang:rust`). Empty: any.
+    pub dir: Option<String>,
+    /// A post of the thread is by this author (hex id)…
+    pub author: Option<String>,
+    /// … at or after `since`…
+    pub since: Option<u64>,
+    /// … and before `until` (Unix seconds).
+    pub until: Option<u64>,
+    /// Only what this node held up to this `seq`: the snapshot a cursor
+    /// pages through, so that later arrivals neither repeat nor hide
+    /// anything. `None`: everything.
+    pub snap: Option<i64>,
+}
+
+impl Facets {
+    fn snap(&self) -> i64 {
+        self.snap.unwrap_or(i64::MAX)
+    }
+
+    /// The SQL condition on a row `e` that it is a thread root these
+    /// facets select, its parameters appended to `args` in order.
+    fn roots_sql(&self, args: &mut Vec<SqlValue>) -> String {
+        let snap = self.snap();
+        let mut conds = vec![
+            "e.thread IS NULL".to_string(),
+            "e.opaque = 0".to_string(),
+            "e.seq <= ?".to_string(),
+        ];
+        args.push(snap.into());
+        if let Some(net) = &self.net {
+            conds.push("e.net = ?".into());
+            args.push(net.clone().into());
+        }
+        if let Some(kind) = &self.kind {
+            conds.push("e.kind = ?".into());
+            args.push(kind.clone().into());
+        }
+        // A post of the thread, in the root's network (B9), carries a tag.
+        let tagged = |cond: &str| {
+            format!(
+                "e.id IN (SELECT coalesce(tp.thread, tp.id)
+                     FROM event_tags tt JOIN events tp ON tp.seq = tt.seq
+                     WHERE {cond} AND tp.opaque = 0 AND tp.seq <= ? AND {SAME_NET})"
+            )
+        };
+        if let Some(tag) = &self.tag {
+            conds.push(tagged("tt.tag = ?"));
+            args.push(tag.clone().into());
+            args.push(snap.into());
+        }
+        if let Some(dir) = self.dir.as_deref().map(|d| d.trim_end_matches(':'))
+            && !dir.is_empty()
+        {
+            let (lo, hi) = tag_range(dir);
+            conds.push(tagged("(tt.tag = ? OR (tt.tag >= ? AND tt.tag < ?))"));
+            args.extend([dir.to_string().into(), lo.into(), hi.into(), snap.into()]);
+        }
+        if self.author.is_some() || self.since.is_some() || self.until.is_some() {
+            let mut by = vec!["ap.opaque = 0".to_string(), "ap.seq <= ?".to_string()];
+            args.push(snap.into());
+            if let Some(author) = &self.author {
+                by.push("ap.author = ?".into());
+                args.push(author.clone().into());
+            }
+            if let Some(since) = self.since {
+                by.push("ap.ts >= ?".into());
+                args.push((since.min(i64::MAX as u64) as i64).into());
+            }
+            if let Some(until) = self.until {
+                by.push("ap.ts < ?".into());
+                args.push((until.min(i64::MAX as u64) as i64).into());
+            }
+            conds.push(format!(
+                "e.id IN (SELECT coalesce(ap.thread, ap.id) FROM events ap WHERE {} AND {})",
+                by.join(" AND "),
+                SAME_NET.replace("tp.", "ap.")
+            ));
+        }
+        conds.join(" AND ")
+    }
 }
 
 /// A thread root with its activity (`browse`).
@@ -1287,31 +1416,31 @@ impl Store {
         Ok(n as u64)
     }
 
-    /// The tags of the understood events, busiest first (`browse`): how
-    /// many threads and posts carry each, and their latest `ts`. `prefix`
-    /// keeps the tags that start with it (e.g. `cap:`).
+    /// The tags of the understood events of the threads `facets` selects,
+    /// busiest first (`browse`): how many threads and posts carry each,
+    /// and their latest `ts`. `prefix` keeps the tags that start with it
+    /// (e.g. `cap:`).
     pub fn tag_counts(
         &self,
-        net: Option<&str>,
+        facets: &Facets,
         prefix: Option<&str>,
         limit: usize,
     ) -> Result<Vec<TagCount>> {
-        let mut conds = vec!["e.opaque = 0".to_string()];
-        let mut args: Vec<SqlValue> = Vec::new();
-        if let Some(net) = net {
-            conds.push("e.net = ?".into());
-            args.push(net.to_string().into());
-        }
+        let mut args: Vec<SqlValue> = vec![facets.snap().into()];
+        let mut conds = vec!["p.opaque = 0".to_string(), "p.seq <= ?".to_string()];
         if let Some(prefix) = prefix.filter(|p| !p.is_empty()) {
             conds.push("substr(t.tag, 1, ?) = ?".into());
             args.push((prefix.chars().count() as i64).into());
             args.push(prefix.to_string().into());
         }
+        let roots = facets.roots_sql(&mut args);
         args.push((limit as i64).into());
         let sql = format!(
-            "SELECT t.tag, count(DISTINCT coalesce(e.thread, e.id)), count(*), max(e.ts)
-             FROM event_tags t JOIN events e ON e.seq = t.seq
-             WHERE {} GROUP BY t.tag ORDER BY 2 DESC, 4 DESC, t.tag LIMIT ?",
+            "SELECT t.tag, count(DISTINCT coalesce(p.thread, p.id)), count(*), max(p.ts)
+             FROM event_tags t JOIN events p ON p.seq = t.seq
+                 JOIN events e ON e.id = coalesce(p.thread, p.id) AND e.net = p.net
+             WHERE {} AND {roots}
+             GROUP BY t.tag ORDER BY 2 DESC, 4 DESC, t.tag LIMIT ?",
             conds.join(" AND ")
         );
         let conn = self.conn();
@@ -1321,50 +1450,139 @@ impl Store {
                 tag: r.get(0)?,
                 threads: r.get::<_, i64>(1)? as u64,
                 posts: r.get::<_, i64>(2)? as u64,
-                last_ts: r.get::<_, i64>(3)? as u64,
+                last_ts: r.get::<_, i64>(3)?.max(0) as u64,
             })
         })?;
         rows.collect::<rusqlite::Result<Vec<_>>>()
             .map_err(Into::into)
     }
 
-    /// Thread roots by latest activity (`browse`), optionally of one network,
-    /// one kind, and carrying one tag, with their reply and answer counts.
+    /// One level of the tag tree (`browse`, ADR 0024): the tags directly
+    /// under `level` (under `lang`, `lang:rust`, which also stands for
+    /// `lang:rust:async`; under the empty level, the roots `lang`, `cap`,
+    /// …), each with the threads `facets` selects (its `dir` aside) where
+    /// a post carries it or a tag below it, those posts, their latest
+    /// `ts`, and how many tags sit directly below it. Busiest first, after
+    /// `after`, at most `limit`.
+    pub fn tag_dirs(
+        &self,
+        facets: &Facets,
+        level: &str,
+        after: Option<&DirKey>,
+        limit: usize,
+    ) -> Result<Vec<TagDir>> {
+        let level = level.trim_end_matches(':');
+        let prefix = match level {
+            "" => String::new(),
+            level => format!("{level}:"),
+        };
+        let mut args: Vec<SqlValue> =
+            vec![(prefix.chars().count() as i64).into(), facets.snap().into()];
+        let mut conds = vec!["p.opaque = 0".to_string(), "p.seq <= ?".to_string()];
+        if !level.is_empty() {
+            let (lo, hi) = tag_range(level);
+            conds.push("t.tag >= ? AND t.tag < ?".into());
+            args.push(lo.into());
+            args.push(hi.into());
+        }
+        let roots = Facets {
+            dir: None,
+            ..facets.clone()
+        }
+        .roots_sql(&mut args);
+        let mut page = "";
+        if let Some(key) = after {
+            page = "WHERE threads < ? OR (threads = ? AND (last < ? OR (last = ? AND head > ?)))";
+            let (threads, last) = (key.threads as i64, key.last.min(i64::MAX as u64) as i64);
+            args.extend([threads.into(), threads.into(), last.into(), last.into()]);
+            args.push(key.head.clone().into());
+        }
+        args.push((limit as i64).into());
+        // `rest`: the tag after the level; `head`, its first segment (the
+        // child); `sub`, what follows, whose first segment is a grandchild.
+        let first = |s: &str| {
+            format!(
+                "CASE WHEN instr({s}, ':') > 0 THEN substr({s}, 1, instr({s}, ':') - 1) ELSE {s} END"
+            )
+        };
+        let sql = format!(
+            "WITH m AS (
+                 SELECT substr(t.tag, ? + 1) AS rest, coalesce(p.thread, p.id) AS root,
+                     p.seq AS seq, p.ts AS ts
+                 FROM event_tags t JOIN events p ON p.seq = t.seq
+                     JOIN events e ON e.id = coalesce(p.thread, p.id) AND e.net = p.net
+                 WHERE {} AND {roots}
+             ), h AS (
+                 SELECT {} AS head,
+                     CASE WHEN instr(rest, ':') > 0 THEN substr(rest, instr(rest, ':') + 1) END AS sub,
+                     root, seq, ts
+                 FROM m
+             ), g AS (
+                 SELECT head, count(DISTINCT root) AS threads, count(DISTINCT seq) AS posts,
+                     max(ts) AS last, count(DISTINCT {}) AS children
+                 FROM h WHERE head <> '' GROUP BY head
+             )
+             SELECT head, threads, posts, last, children FROM g {page}
+             ORDER BY threads DESC, last DESC, head LIMIT ?",
+            conds.join(" AND "),
+            first("rest"),
+            first("sub"),
+        );
+        let conn = self.conn();
+        let mut stmt = conn.prepare_cached(&sql)?;
+        let rows = stmt.query_map(params_from_iter(args), |r| {
+            let head: String = r.get(0)?;
+            Ok(TagDir {
+                tag: format!("{prefix}{head}"),
+                head,
+                threads: r.get::<_, i64>(1)? as u64,
+                posts: r.get::<_, i64>(2)? as u64,
+                last_ts: r.get::<_, i64>(3)?.max(0) as u64,
+                children: r.get::<_, i64>(4)? as u64,
+            })
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    }
+
+    /// The thread roots `facets` selects, by latest activity (`browse`),
+    /// with their reply and answer counts: after `after` (the previous
+    /// page's last `(last, seq)`), then skipping `offset`, at most `limit`.
     /// Replies from another network than the root's are not counted (B9).
     pub fn thread_summaries(
         &self,
-        net: Option<&str>,
-        tag: Option<&str>,
-        kind: Option<&Kind>,
+        facets: &Facets,
+        after: Option<(u64, i64)>,
         offset: usize,
         limit: usize,
     ) -> Result<Vec<ThreadSummary>> {
-        let mut conds = vec!["e.thread IS NULL".to_string(), "e.opaque = 0".to_string()];
-        let mut args: Vec<SqlValue> = Vec::new();
-        if let Some(net) = net {
-            conds.push("e.net = ?".into());
-            args.push(net.to_string().into());
-        }
-        if let Some(kind) = kind {
-            conds.push("e.kind = ?".into());
-            args.push(kind.as_str().to_string().into());
-        }
-        if let Some(tag) = tag {
-            conds.push(
-                "EXISTS (SELECT 1 FROM event_tags t WHERE t.seq = e.seq AND t.tag = ?)".into(),
-            );
-            args.push(tag.to_string().into());
+        let snap = facets.snap();
+        // Each root's replies by the thread index: left to itself, the
+        // planner may scan every answer (`events_kind`) or the whole
+        // network (`events_net_ts`) per root.
+        let replies = "events r INDEXED BY events_thread";
+        let reply = "r.thread = e.id AND r.opaque = 0 AND r.net = e.net AND r.seq <= ?";
+        // One snapshot bound per `reply` below.
+        let mut args: Vec<SqlValue> = vec![snap.into(), snap.into(), snap.into()];
+        let roots = facets.roots_sql(&mut args);
+        let mut page = "";
+        if let Some((last, seq)) = after {
+            page = "WHERE last < ? OR (last = ? AND seq < ?)";
+            let last = last.min(i64::MAX as u64) as i64;
+            args.extend([last.into(), last.into(), seq.into()]);
         }
         args.push((limit as i64).into());
         args.push((offset as i64).into());
-        let reply = "r.thread = e.id AND r.opaque = 0 AND r.net = e.net";
         let sql = format!(
-            "SELECT e.seq, e.json,
-                (SELECT count(*) FROM events r WHERE {reply}),
-                (SELECT count(*) FROM events r WHERE {reply} AND r.kind = 'answer' AND r.author <> e.author),
-                max(e.ts, coalesce((SELECT max(r.ts) FROM events r WHERE {reply}), 0)) AS last
-             FROM events e WHERE {} ORDER BY last DESC, e.seq DESC LIMIT ? OFFSET ?",
-            conds.join(" AND ")
+            "SELECT seq, json, replies, answers, last FROM (
+                 SELECT e.seq AS seq, e.json AS json,
+                     (SELECT count(*) FROM {replies} WHERE {reply}) AS replies,
+                     (SELECT count(*) FROM {replies} WHERE {reply} AND r.kind = 'answer'
+                         AND r.author <> e.author) AS answers,
+                     max(e.ts, coalesce((SELECT max(r.ts) FROM {replies} WHERE {reply}), 0)) AS last
+                 FROM events e WHERE {roots}
+             ) {page}
+             ORDER BY last DESC, seq DESC LIMIT ? OFFSET ?"
         );
         let conn = self.conn();
         let mut stmt = conn.prepare_cached(&sql)?;
@@ -1388,10 +1606,88 @@ impl Store {
                 },
                 replies: replies as u64,
                 answers: answers as u64,
-                last_ts: last as u64,
+                last_ts: last.max(0) as u64,
             });
         }
         Ok(out)
+    }
+
+    /// The posts that may be knowledge entries (`browse`, ADR 0024), in the
+    /// threads `facets` selects (its `kind` aside): digests and answers
+    /// that a post replies to or cites (an entry is confirmed, so it has
+    /// one). Newest first, after `after` (the previous page's last
+    /// `(ts, seq)`), at most `limit`.
+    pub fn knowledge_scan(
+        &self,
+        facets: &Facets,
+        after: Option<(u64, i64)>,
+        limit: usize,
+    ) -> Result<Vec<Stored>> {
+        let mut args: Vec<SqlValue> = vec![
+            facets.snap().into(),
+            crate::knowledge::DIGEST_KIND.to_string().into(),
+        ];
+        let roots = Facets {
+            kind: None,
+            ..facets.clone()
+        }
+        .roots_sql(&mut args);
+        let mut page = "";
+        if let Some((ts, seq)) = after {
+            page = "AND (c.ts < ? OR (c.ts = ? AND c.seq < ?))";
+            let ts = ts.min(i64::MAX as u64) as i64;
+            args.extend([ts.into(), ts.into(), seq.into()]);
+        }
+        args.push((limit as i64).into());
+        let sql = format!(
+            "SELECT c.seq, c.json FROM events c
+                 JOIN events e ON e.id = coalesce(c.thread, c.id) AND e.net = c.net
+             WHERE c.opaque = 0 AND c.seq <= ? AND c.kind IN ('answer', ?)
+                 AND (EXISTS (SELECT 1 FROM events x WHERE x.parent = c.id AND x.opaque = 0)
+                     OR EXISTS (SELECT 1 FROM event_refs x WHERE x.ref = c.id))
+                 AND {roots}
+                 {page}
+             ORDER BY c.ts DESC, c.seq DESC LIMIT ?"
+        );
+        self.query(&sql, args)
+    }
+
+    /// How many understood posts outside thread `root` cite each of `ids`
+    /// in their `refs` (`browse`): the ids cited at least once.
+    pub fn cited_elsewhere(&self, ids: &[String], root: &str) -> Result<HashMap<String, u64>> {
+        if ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let sql = format!(
+            "SELECT r.ref, count(*) FROM event_refs r JOIN events e ON e.seq = r.seq
+             WHERE r.ref IN ({}) AND e.opaque = 0 AND coalesce(e.thread, e.id) <> ?
+             GROUP BY r.ref",
+            vec!["?"; ids.len()].join(",")
+        );
+        let mut args: Vec<SqlValue> = ids.iter().map(|id| id.clone().into()).collect();
+        args.push(root.to_string().into());
+        let conn = self.conn();
+        let mut stmt = conn.prepare_cached(&sql)?;
+        let rows = stmt.query_map(params_from_iter(args), |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?.max(0) as u64))
+        })?;
+        rows.collect::<rusqlite::Result<HashMap<_, _>>>()
+            .map_err(Into::into)
+    }
+
+    /// The understood posts outside thread `root` that cite `id` in their
+    /// `refs`, newest first, at most `limit`.
+    pub fn citing(&self, id: &str, root: &str, limit: usize) -> Result<Vec<Stored>> {
+        self.query(
+            "SELECT e.seq, e.json FROM event_refs r JOIN events e ON e.seq = r.seq
+             WHERE r.ref = ? AND e.opaque = 0 AND coalesce(e.thread, e.id) <> ?
+             ORDER BY e.ts DESC, e.seq DESC LIMIT ?",
+            vec![
+                id.to_string().into(),
+                root.to_string().into(),
+                (limit as i64).into(),
+            ],
+        )
     }
 
     /// Remember that replies to `ask` go to the human's MCP host `client`.
@@ -2448,10 +2744,16 @@ mod tests {
         let seq = store.get(&root.id).unwrap().unwrap().seq;
         store.set_ask_notify(&root.id, "claude", 10).unwrap();
         assert_eq!(found(&store, "secret"), 1);
-        assert_eq!(store.tag_counts(None, None, 10).unwrap().len(), 1);
         assert_eq!(
             store
-                .thread_summaries(None, None, None, 0, 10)
+                .tag_counts(&Facets::default(), None, 10)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            store
+                .thread_summaries(&Facets::default(), None, 0, 10)
                 .unwrap()
                 .len(),
             1
@@ -2469,10 +2771,15 @@ mod tests {
         assert_eq!(found(&store, "secret"), 0);
         assert_eq!(found(&store, "pdf"), 0);
         assert_eq!(by_tag(&store, "cap:pdf"), 0);
-        assert!(store.tag_counts(None, None, 10).unwrap().is_empty());
         assert!(
             store
-                .thread_summaries(None, None, None, 0, 10)
+                .tag_counts(&Facets::default(), None, 10)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            store
+                .thread_summaries(&Facets::default(), None, 0, 10)
                 .unwrap()
                 .is_empty()
         );
