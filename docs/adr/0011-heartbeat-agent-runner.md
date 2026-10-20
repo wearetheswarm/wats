@@ -103,7 +103,10 @@ full runner of Phase 2, a node must be able to wake an agent on its own.
   accepted alias with a deprecation note. `workspace` without tools or
   MCP servers gives the wats tools only, in the agent's own directory
   (`<data dir>/agent/<name>/workspace`). Where this ADR says `locked`,
-  read `swarm-only`.
+  read `swarm-only`. The `agent.tools` choices of 0.4.0 (tools ignored
+  with a warning under `swarm-only`, unknown Codex names ignored with a
+  warning, `mcp__…` names not passed to Claude's `--tools`) were
+  confirmed by Vincent on 2026-10-20.
 - **Review.** With `agent.review`, posts signed with the agent profile,
   and posts of runner sessions, are held in `<data dir>/agent/pending/`
   until `wats agent approve`; the running node then publishes them. A
