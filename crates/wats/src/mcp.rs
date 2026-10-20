@@ -2187,9 +2187,9 @@ impl WatsMcp {
     }
 }
 
-#[tool_handler(router = self.tool_router)]
-impl ServerHandler for WatsMcp {
-    async fn call_tool(
+impl WatsMcp {
+    /// Run the tool `request` names.
+    async fn dispatch(
         &self,
         request: rmcp::model::CallToolRequestParams,
         context: rmcp::service::RequestContext<rmcp::RoleServer>,
@@ -2210,6 +2210,43 @@ impl ServerHandler for WatsMcp {
         }
         let tcc = rmcp::handler::server::tool::ToolCallContext::new(self, request, context);
         self.tool_router.call(tcc).await
+    }
+}
+
+#[tool_handler(router = self.tool_router)]
+impl ServerHandler for WatsMcp {
+    /// Every tool call, a panic in it answered as a tool error: rmcp runs
+    /// each call in a task of its own and does not catch panics, so the
+    /// call would never be answered and the agent would wait until its
+    /// client gives up. The panic is logged (and, in `wats`, written to a
+    /// crash report); the answer names only the tool.
+    async fn call_tool(
+        &self,
+        request: rmcp::model::CallToolRequestParams,
+        context: rmcp::service::RequestContext<rmcp::RoleServer>,
+    ) -> Result<rmcp::model::CallToolResponse, rmcp::ErrorData> {
+        use n0_future::FutureExt;
+        let tool = request.name.clone();
+        match std::panic::AssertUnwindSafe(self.dispatch(request, context))
+            .catch_unwind()
+            .await
+        {
+            Ok(response) => response,
+            Err(panic) => {
+                tracing::error!(
+                    %tool,
+                    "MCP tool panicked ({}): answered with an error, the node keeps running \
+                     (crash report: wats report show)",
+                    crate::supervise::panic_message(panic.as_ref())
+                );
+                Ok(
+                    CallToolResult::error(vec![rmcp::model::ContentBlock::text(format!(
+                        "internal error in {tool}; see the node log"
+                    ))])
+                    .into(),
+                )
+            }
+        }
     }
 
     fn get_info(&self) -> ServerConfig {
@@ -2435,5 +2472,79 @@ mod tests {
         assert!(view["blobs"][1].get("url").is_none());
         assert_eq!(view["blobs"][1]["url_text"], "ipfs://bafy/b");
         assert!(view["blobs"][2].get("url").is_none());
+    }
+
+    /// A tool handler that panics answers with a tool error naming the
+    /// tool, not its panic, and the session goes on. No tool panics on
+    /// purpose: the test adds one to the session's router, which only
+    /// this module reaches, so nothing in the shipped server can call it.
+    #[test]
+    fn a_panicking_tool_answers_with_an_error() {
+        use rmcp::ServiceExt;
+        use rmcp::handler::server::router::tool::ToolRoute;
+        use rmcp::model::{CallToolRequestParams, CallToolResponse, Tool};
+
+        async fn explode() -> Result<CallToolResponse, rmcp::ErrorData> {
+            panic!("a bug, with secret-token-1234 in its message")
+        }
+
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let test = async {
+            let dir = tempfile::tempdir().unwrap();
+            let mut config = crate::node::NodeConfig::new(dir.path().join("node"));
+            config.mode = crate::node::NetworkMode::Loopback;
+            config.infra = crate::infra::Infra::NONE;
+            config.pow_bits = Some(4);
+            config.min_pow_bits = Some(4);
+            let node = Node::start(config).await.unwrap();
+            let mut server = WatsMcp::new(node.clone(), Vec::new());
+            server.tool_router.add_route(ToolRoute::new_dyn(
+                Tool::new("explode", "panics", Arc::new(Map::new())),
+                |_| Box::pin(explode()),
+            ));
+            let (server_io, client_io) = tokio::io::duplex(64 * 1024);
+            tokio::spawn(async move {
+                if let Ok(running) = server.serve(server_io).await {
+                    let _ = running.waiting().await;
+                }
+            });
+            let client = ().serve(client_io).await.unwrap();
+            let call = |tool: &'static str| {
+                let call = client.call_tool(CallToolRequestParams::new(tool));
+                async move {
+                    tokio::time::timeout(Duration::from_secs(30), call)
+                        .await
+                        .unwrap_or_else(|_| panic!("{tool} did not answer"))
+                        .unwrap()
+                }
+            };
+
+            let failed = call("explode").await;
+            assert_eq!(failed.is_error, Some(true), "{failed:?}");
+            let text = serde_json::to_string(&failed.content).unwrap();
+            assert!(
+                text.contains("internal error in explode; see the node log"),
+                "{text}"
+            );
+            assert!(!text.contains("secret-token"), "{text}");
+            // The session still answers.
+            let status = call("status").await;
+            assert_ne!(status.is_error, Some(true), "{status:?}");
+            let _ = client.cancel().await;
+            node.shutdown().await.unwrap();
+        };
+        // Failed after a minute rather than hung, the runtime not waited for.
+        let outcome = runtime.block_on(async {
+            tokio::time::timeout(Duration::from_secs(60), tokio::spawn(test)).await
+        });
+        runtime.shutdown_background();
+        match outcome {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => std::panic::resume_unwind(e.into_panic()),
+            Err(_) => panic!("timed out: the node or a tool call hung"),
+        }
     }
 }

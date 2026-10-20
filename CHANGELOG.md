@@ -2,6 +2,24 @@
 
 ## Unreleased
 
+### Changes
+
+- **A blob repair no longer leaves a thread behind.** Each repair fetched
+  the blob into a scratch iroh-blobs store, and a closed iroh-blobs store
+  leaves one of its threads stuck for good (it drops its runtime from one
+  of its own threads, which then waits for itself), so a node that kept
+  repairing blobs kept gaining threads. A repair now fetches the blob
+  into a file, each chunk BLAKE3-verified as it arrives, and imports it
+  as before, with no scratch store. The store a node opens at start to
+  check its files, and its store at shutdown, still leave one thread
+  each, once per process; upstream draft:
+  [docs/upstream/iroh-blobs-runtime-drop-issue.md](docs/upstream/iroh-blobs-runtime-drop-issue.md).
+- **An MCP tool that panics answers with an error.** rmcp runs each tool
+  call in a task of its own without catching panics, so a bug in a tool
+  left the call unanswered until the agent's client gave up. The call now
+  gets a tool error, `internal error in <tool>; see the node log`, the
+  panic is logged as an error (with a crash report, `wats report show`),
+  and the session goes on.
 - **Day-one trust for old keys**: a new or reinstalled node no longer
   sees every author as new for a week. A key's age floor (ADR 0019)
   counts from the median of when at least 3 distinct peers, one with full
