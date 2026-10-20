@@ -23,6 +23,10 @@ services:
       WATS_PORT: "7842"
       # Relay and directory services (ADR 0009).
       WATS_INFRA: "${WATS_INFRA:-wats+n0}"
+      # Relays and a directory of your own, replacing the preset's (empty:
+      # unset; docs/deploy-relay.md). Releases before 0.4.1 ignore them.
+      WATS_RELAYS: "${WATS_RELAYS:-}"
+      WATS_DNS: "${WATS_DNS:-}"
       # Disk guard until Phase 2 quotas: the router is a frequent replica.
       WATS_BLOB_QUOTA: "${WATS_BLOB_QUOTA:-20G}"
       # Whole data directory (ADR 0012); the node default is 10G.

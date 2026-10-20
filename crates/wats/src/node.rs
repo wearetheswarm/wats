@@ -1484,7 +1484,7 @@ impl Node {
             .collect();
         let health = crate::health::Health::new(crate::health::Plan::new(
             config.mode.is_local(),
-            config.infra,
+            &config.infra,
             seed_ids.len(),
             cached.len(),
             config.no_peers_after,
@@ -2126,7 +2126,7 @@ impl Node {
                         let mut probes = Vec::new();
                         for directory in node.config.infra.publish_to() {
                             let probe =
-                                crate::health::probe(node.endpoint(), directory, now_secs()).await;
+                                crate::health::probe(node.endpoint(), &directory, now_secs()).await;
                             probes.push((directory, probe));
                         }
                         if node.endpoint().is_closed() {
@@ -2154,7 +2154,7 @@ impl Node {
                 .iter()
                 .map(|s| (s.url().to_string(), s.is_connected()))
                 .collect();
-            observed.push((What::Relay, relay_problem(self.config.infra, &home)));
+            observed.push((What::Relay, relay_problem(&self.config.infra, &home)));
         }
         let neighbors = self.neighbors();
         if self.health_applies(What::Bootstrap) {
@@ -2308,7 +2308,7 @@ impl Node {
     /// Internet mode, waits (bounded) for a home relay first.
     pub async fn ticket(&self) -> EndpointTicket {
         if self.config.mode == NetworkMode::Internet
-            && self.config.infra != crate::infra::Infra::None
+            && self.config.infra.has_relays()
             && tokio::time::timeout(Duration::from_secs(10), self.endpoint().online())
                 .await
                 .is_err()
@@ -4600,7 +4600,7 @@ mod blob_gc_tests {
     async fn start(dir: &Path, gc: bool) -> Arc<Node> {
         let mut config = NodeConfig::new(dir);
         config.mode = NetworkMode::Loopback;
-        config.infra = crate::infra::Infra::None;
+        config.infra = crate::infra::Infra::NONE;
         config.pow_bits = Some(8);
         config.min_pow_bits = Some(8);
         config.blob_gc = gc;
@@ -4784,7 +4784,7 @@ mod blob_gc_tests {
         let dir = tempfile::tempdir().unwrap();
         let mut config = NodeConfig::new(dir.path().join("n"));
         config.mode = NetworkMode::Loopback;
-        config.infra = crate::infra::Infra::None;
+        config.infra = crate::infra::Infra::NONE;
         config.pow_bits = Some(8);
         config.min_pow_bits = Some(8);
         config.blob_gc_interval = Duration::from_millis(1);
@@ -4826,7 +4826,7 @@ mod blob_gc_tests {
         let a = start(&dir.path().join("a"), false).await;
         let mut config = NodeConfig::new(dir.path().join("b"));
         config.mode = NetworkMode::Loopback;
-        config.infra = crate::infra::Infra::None;
+        config.infra = crate::infra::Infra::NONE;
         config.pow_bits = Some(8);
         config.min_pow_bits = Some(8);
         config.blob_gc_interval = Duration::from_millis(1);

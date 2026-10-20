@@ -5,19 +5,22 @@
 //!
 //! Four checks:
 //! - `relay`: the home relay. Ours unreachable (with `wats+n0`, the node
-//!   fell back to n0's relays), or no relay at all. Read from the
-//!   endpoint's home relay status ([`iroh::Endpoint::home_relay_status`]).
+//!   fell back to n0's relays), none of the custom relays reachable, or no
+//!   relay at all. Read from the endpoint's home relay status
+//!   ([`iroh::Endpoint::home_relay_status`]).
 //! - `lookup`: the address directories this node publishes to. Every few
 //!   minutes the node resolves its own record through each one (pkarr
 //!   over HTTPS, then DNS): not found, stale (not republished), or a
-//!   failing DNS lookup is a failure of that directory.
+//!   failing DNS lookup is a failure of that directory. With custom
+//!   services (`infra_relays`, `infra_dns`), the checks watch those.
 //! - `bootstrap`: none of the configured bootstrap nodes or peers is
 //!   reachable, and the peer cache is empty or stale, so the node has no
 //!   way back into the swarm.
 //! - `peers`: no connected peer (gossip neighbor) for `health.no_peers_after`.
 //!
 //! A check that cannot apply is `off`: no relay or lookup in loopback
-//! (hermetic) mode or with `infra = none`, no bootstrap check without
+//! (hermetic) mode or with `infra = none` (and no relay check without a
+//! relay, no lookup check without a directory), no bootstrap check without
 //! bootstrap nodes or peers configured, no peer check without anywhere to
 //! find peers. A problem becomes an issue only once it lasted its check's
 //! debounce; each issue is logged once when raised (WARN), once if its
@@ -52,7 +55,7 @@ use iroh::{Endpoint, EndpointId};
 use serde_json::{Value, json};
 use tracing::{debug, info, warn};
 
-use crate::infra::{Directory, Infra};
+use crate::infra::{Directory, Infra, Preset};
 
 /// How often the node looks at its checks.
 pub const CHECK_EVERY: Duration = Duration::from_secs(10);
@@ -262,8 +265,10 @@ impl Check {
 /// Which checks apply to a node, and their debounce.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Plan {
-    /// Relay and lookup: Internet mode with an infrastructure.
-    pub infra: bool,
+    /// Relay: Internet mode with relays.
+    pub relay: bool,
+    /// Lookup: Internet mode with a directory.
+    pub lookup: bool,
     /// Bootstrap nodes or peers configured.
     pub bootstrap: bool,
     /// The peer check, with its delay: off without anywhere to find peers
@@ -277,13 +282,14 @@ impl Plan {
     /// peer cache had peers at startup.
     pub fn new(
         loopback: bool,
-        infra: Infra,
+        infra: &Infra,
         seeds: usize,
         cached: usize,
         no_peers_after: Option<Duration>,
     ) -> Self {
         Plan {
-            infra: !loopback && infra != Infra::None,
+            relay: !loopback && infra.has_relays(),
+            lookup: !loopback && infra.has_lookup(),
             bootstrap: seeds > 0,
             no_peers_after: no_peers_after.filter(|_| seeds > 0 || cached > 0),
         }
@@ -307,8 +313,8 @@ impl Health {
         };
         Health {
             checks: vec![
-                check(What::Relay, plan.infra, RELAY_ALERT_AFTER),
-                check(What::Lookup, plan.infra, LOOKUP_ALERT_AFTER),
+                check(What::Relay, plan.relay, RELAY_ALERT_AFTER),
+                check(What::Lookup, plan.lookup, LOOKUP_ALERT_AFTER),
                 check(What::Bootstrap, plan.bootstrap, BOOTSTRAP_ALERT_AFTER),
                 check(
                     What::Peers,
@@ -396,30 +402,42 @@ fn host(url: &str) -> &str {
 }
 
 /// The relay check, from the home relays and whether each is connected.
-pub fn relay_problem(infra: Infra, home: &[(String, bool)]) -> Option<Problem> {
+pub fn relay_problem(infra: &Infra, home: &[(String, bool)]) -> Option<Problem> {
     let ours = host(crate::infra::WATS_RELAY_URL);
     let connected: Vec<&str> = home
         .iter()
         .filter(|(_, c)| *c)
         .map(|(u, _)| host(u))
         .collect();
-    match infra {
-        Infra::None => None,
-        Infra::N0 if connected.is_empty() => {
+    if !infra.relays.is_empty() {
+        // Custom relays replace the preset's: one of them must be home.
+        let custom: Vec<&str> = infra.relays.iter().map(|r| host(r.url.as_str())).collect();
+        if connected.iter().any(|h| custom.contains(h)) {
+            return None;
+        }
+        let failed = match custom.as_slice() {
+            [one] => format!("{one} unreachable"),
+            many => format!("relays {} unreachable", many.join(", ")),
+        };
+        return Some(Problem::new(failed, Some("no relay")));
+    }
+    match infra.preset {
+        Preset::None | Preset::Custom => None,
+        Preset::N0 if connected.is_empty() => {
             Some(Problem::new("n0's relays unreachable", Some("no relay")))
         }
-        Infra::N0 => None,
-        Infra::Wats if !connected.contains(&ours) => Some(Problem::new(
+        Preset::N0 => None,
+        Preset::Wats if !connected.contains(&ours) => Some(Problem::new(
             format!("{ours} unreachable"),
             Some("no relay"),
         )),
-        Infra::Wats => None,
-        Infra::WatsAndN0 if connected.contains(&ours) => None,
-        Infra::WatsAndN0 if connected.is_empty() => Some(Problem::new(
+        Preset::Wats => None,
+        Preset::WatsAndN0 if connected.contains(&ours) => None,
+        Preset::WatsAndN0 if connected.is_empty() => Some(Problem::new(
             format!("{ours} and n0's relays unreachable"),
             Some("no relay"),
         )),
-        Infra::WatsAndN0 => Some(Problem::new(
+        Preset::WatsAndN0 => Some(Problem::new(
             format!("{ours} unreachable"),
             Some("using n0"),
         )),
@@ -442,7 +460,7 @@ pub enum Probe {
 /// The lookup check, from one probe per directory (in the profile's
 /// order).
 pub fn lookup_problem(probes: &[(Directory, Probe)]) -> Option<Problem> {
-    let name = |d: &Directory| host(d.pkarr_url).to_string();
+    let name = |d: &Directory| d.host();
     let failing: Vec<String> = probes
         .iter()
         .filter_map(|(d, p)| {
@@ -503,8 +521,8 @@ pub fn peers_problem(connected: usize) -> Option<Problem> {
 }
 
 /// Resolves this node's own record through `directory`: pkarr over HTTPS
-/// (found, and fresh), then DNS.
-pub async fn probe(endpoint: &Endpoint, directory: Directory, now: u64) -> Probe {
+/// (found, and fresh), then DNS when the directory has a DNS origin.
+pub async fn probe(endpoint: &Endpoint, directory: &Directory, now: u64) -> Probe {
     let me: EndpointId = endpoint.id();
     let Ok(dns) = endpoint.dns_resolver().cloned() else {
         return Probe::NotFound;
@@ -516,11 +534,11 @@ pub async fn probe(endpoint: &Endpoint, directory: Directory, now: u64) -> Probe
     let packet = match tokio::time::timeout(LOOKUP_PROBE_TIMEOUT, client.resolve(me)).await {
         Ok(Ok(packet)) => packet,
         Ok(Err(e)) => {
-            debug!(directory = directory.pkarr_url, "lookup probe: {e:#}");
+            debug!(directory = %directory.pkarr_url, "lookup probe: {e:#}");
             return Probe::NotFound;
         }
         Err(_) => {
-            debug!(directory = directory.pkarr_url, "lookup probe: timeout");
+            debug!(directory = %directory.pkarr_url, "lookup probe: timeout");
             return Probe::NotFound;
         }
     };
@@ -528,18 +546,18 @@ pub async fn probe(endpoint: &Endpoint, directory: Directory, now: u64) -> Probe
     if now.saturating_sub(published) >= RECORD_STALE_AFTER.as_secs() {
         return Probe::Stale;
     }
-    let lookup = dns.lookup_endpoint_by_id(&me, directory.dns_origin);
+    let Some(origin) = directory.dns_origin.as_deref() else {
+        return Probe::Ok;
+    };
+    let lookup = dns.lookup_endpoint_by_id(&me, origin);
     match tokio::time::timeout(LOOKUP_PROBE_TIMEOUT, lookup).await {
         Ok(Ok(_)) => Probe::Ok,
         Ok(Err(e)) => {
-            debug!(directory = directory.dns_origin, "DNS lookup probe: {e:#}");
+            debug!(directory = origin, "DNS lookup probe: {e:#}");
             Probe::DnsFails
         }
         Err(_) => {
-            debug!(
-                directory = directory.dns_origin,
-                "DNS lookup probe: timeout"
-            );
+            debug!(directory = origin, "DNS lookup probe: timeout");
             Probe::DnsFails
         }
     }
@@ -561,7 +579,7 @@ mod tests {
     fn all_on() -> Health {
         Health::new(Plan::new(
             false,
-            Infra::WatsAndN0,
+            &Infra::default(),
             1,
             0,
             Some(DEFAULT_NO_PEERS_AFTER),
@@ -570,7 +588,7 @@ mod tests {
 
     fn fallback() -> Option<Problem> {
         relay_problem(
-            Infra::WatsAndN0,
+            &Infra::default(),
             &[(
                 "https://euw1-1.relay.n0.iroh-canary.iroh.link./".into(),
                 true,
@@ -623,7 +641,7 @@ mod tests {
     #[test]
     fn a_flapping_description_is_not_logged_until_it_lasts() {
         let mut health = all_on();
-        let none = relay_problem(Infra::WatsAndN0, &[]);
+        let none = relay_problem(&Infra::default(), &[]);
         health.observe(What::Relay, fallback(), T0);
         assert!(matches!(
             health.observe(What::Relay, fallback(), T0 + 30),
@@ -694,8 +712,8 @@ mod tests {
         let after = Some(DEFAULT_NO_PEERS_AFTER);
         // Hermetic (loopback) or `infra = none`, nothing configured.
         for plan in [
-            Plan::new(true, Infra::WatsAndN0, 0, 0, after),
-            Plan::new(false, Infra::None, 0, 0, after),
+            Plan::new(true, &Infra::default(), 0, 0, after),
+            Plan::new(false, &Infra::NONE, 0, 0, after),
         ] {
             let mut health = Health::new(plan);
             for what in What::ALL {
@@ -713,17 +731,25 @@ mod tests {
             assert!(!health.is_degraded());
         }
         // Peers met before, no bootstrap: only the peer check.
-        let plan = Plan::new(true, Infra::None, 0, 3, after);
+        let plan = Plan::new(true, &Infra::NONE, 0, 3, after);
         assert_eq!(
-            (plan.infra, plan.bootstrap, plan.no_peers_after),
-            (false, false, after)
+            (plan.relay, plan.lookup, plan.bootstrap, plan.no_peers_after),
+            (false, false, false, after)
         );
+        // Custom relays only: no lookup check; a custom dns only: no relay
+        // check.
+        let relays = Infra::resolve(None, &["https://relay.example.org".into()], None).unwrap();
+        let plan = Plan::new(false, &relays, 0, 0, after);
+        assert_eq!((plan.relay, plan.lookup), (true, false));
+        let dns = Infra::resolve(None, &[], Some("https://dns.example.org")).unwrap();
+        let plan = Plan::new(false, &dns, 0, 0, after);
+        assert_eq!((plan.relay, plan.lookup), (false, true));
         // `health.no_peers_after = 0`.
         assert_eq!(
-            Plan::new(false, Infra::Wats, 1, 0, None).no_peers_after,
+            Plan::new(false, &Infra::preset(Preset::Wats), 1, 0, None).no_peers_after,
             None
         );
-        assert_eq!(relay_problem(Infra::None, &[]), None);
+        assert_eq!(relay_problem(&Infra::NONE, &[]), None);
     }
 
     #[test]
@@ -731,33 +757,56 @@ mod tests {
         let ours = ("https://relay.wearetheswarm.ai./".to_string(), true);
         let n0 = ("https://use1-1.relay.n0.iroh.link./".to_string(), true);
         let down = |(u, _): &(String, bool)| (u.clone(), false);
+        let wats = Infra::preset(Preset::Wats);
+        let n0_infra = Infra::preset(Preset::N0);
         assert_eq!(
-            relay_problem(Infra::WatsAndN0, std::slice::from_ref(&ours)),
+            relay_problem(&Infra::default(), std::slice::from_ref(&ours)),
             None
         );
         assert_eq!(
-            relay_problem(Infra::WatsAndN0, std::slice::from_ref(&n0)).unwrap(),
+            relay_problem(&Infra::default(), std::slice::from_ref(&n0)).unwrap(),
             Problem::new("relay.wearetheswarm.ai unreachable", Some("using n0"))
         );
         assert_eq!(
-            relay_problem(Infra::WatsAndN0, &[down(&ours)])
+            relay_problem(&Infra::default(), &[down(&ours)])
                 .unwrap()
                 .effect
                 .as_deref(),
             Some("no relay")
         );
+        assert_eq!(relay_problem(&wats, std::slice::from_ref(&ours)), None);
         assert_eq!(
-            relay_problem(Infra::Wats, std::slice::from_ref(&ours)),
-            None
-        );
-        assert_eq!(
-            relay_problem(Infra::Wats, &[]).unwrap(),
+            relay_problem(&wats, &[]).unwrap(),
             Problem::new("relay.wearetheswarm.ai unreachable", Some("no relay"))
         );
-        assert_eq!(relay_problem(Infra::N0, std::slice::from_ref(&n0)), None);
-        assert!(relay_problem(Infra::N0, &[down(&n0)]).is_some());
+        assert_eq!(relay_problem(&n0_infra, std::slice::from_ref(&n0)), None);
+        assert!(relay_problem(&n0_infra, &[down(&n0)]).is_some());
         // The relay URL of the profile matches the one checked.
-        assert_eq!(host(&Infra::Wats.relay_urls()[0]), "relay.wearetheswarm.ai");
+        assert_eq!(host(&wats.relay_urls()[0]), "relay.wearetheswarm.ai");
+        // Custom relays: one of them home, whatever the preset.
+        let custom = Infra::resolve(
+            Some("wats+n0"),
+            &[
+                "https://relay.example.org".into(),
+                "https://r2.example.org#quic=7843".into(),
+            ],
+            None,
+        )
+        .unwrap();
+        let mine = ("https://r2.example.org./".to_string(), true);
+        assert_eq!(relay_problem(&custom, std::slice::from_ref(&mine)), None);
+        assert_eq!(
+            relay_problem(&custom, &[ours.clone(), down(&mine)]).unwrap(),
+            Problem::new(
+                "relays relay.example.org, r2.example.org unreachable",
+                Some("no relay")
+            )
+        );
+        let one = Infra::resolve(None, &["http://127.0.0.1:3340".into()], None).unwrap();
+        assert_eq!(
+            relay_problem(&one, &[]).unwrap().failed,
+            "127.0.0.1 unreachable"
+        );
     }
 
     #[test]
@@ -777,6 +826,15 @@ mod tests {
             )
         );
         assert_eq!(lookup_problem(&[]), None);
+        // A custom directory is named by its host.
+        let mine: Directory = "https://pkarr.example.org/pkarr".parse().unwrap();
+        assert_eq!(
+            lookup_problem(&[(mine, Probe::NotFound)]).unwrap(),
+            Problem::new(
+                "pkarr.example.org: our record not found",
+                Some("peers cannot find this node")
+            )
+        );
     }
 
     #[test]

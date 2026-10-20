@@ -234,9 +234,29 @@ struct NodeArgs {
     halt_serve: bool,
     /// Relay and address-lookup services: wats+n0 (the default:
     /// WeAreTheSwarm's own first, Iroh's public ones operated by n0 as
-    /// fallback), wats (ours only), n0 (n0's only) or none.
+    /// fallback), wats (ours only), n0 (n0's only), none, or custom (only
+    /// --relay and --dns). With --relay or --dns, the preset that fills in
+    /// what they do not replace.
     #[arg(long, global = true, env = "WATS_INFRA")]
     infra: Option<String>,
+    /// A relay of your own, replacing the preset's relays (repeatable):
+    /// `https://relay.example.org`, with `#quic=<port>` when its QUIC
+    /// address discovery is not on 7842 (`#quic=off`: none). Overrides
+    /// config.toml `infra`, `infra_relays` and `infra_dns` together with
+    /// --infra and --dns.
+    #[arg(
+        long = "relay",
+        global = true,
+        env = "WATS_RELAYS",
+        value_delimiter = ','
+    )]
+    relays: Vec<String>,
+    /// An address directory of your own (an iroh-dns-server), replacing
+    /// the preset's: its pkarr URL, `https://dns.example.org/pkarr`; the
+    /// DNS zone is the URL's host unless `#origin=<zone>` (or
+    /// `#origin=none`) says otherwise.
+    #[arg(long, global = true, env = "WATS_DNS")]
+    dns: Option<String>,
     /// Bootstrap node `<endpoint-id>@<host>:<port>` (repeatable); the host
     /// is resolved by DNS, the id is pinned.
     #[arg(long, global = true, env = "WATS_BOOTSTRAP", value_delimiter = ',')]
@@ -2554,6 +2574,7 @@ fn config_command(data_dir: &std::path::Path, action: ConfigAction) -> Result<()
             for warning in file.tools_warnings(&key) {
                 eprintln!("warning: {warning}");
             }
+            infra_note(&file, &key);
             safety_after(data_dir, before);
         }
         ConfigAction::Unset { key } => {
@@ -2561,6 +2582,7 @@ fn config_command(data_dir: &std::path::Path, action: ConfigAction) -> Result<()
             if file.unset(&key)? {
                 file.save()?;
             }
+            infra_note(&file, &key);
             safety_after(data_dir, before);
         }
         ConfigAction::List { all } => {
@@ -3105,6 +3127,7 @@ async fn status_command(config: &NodeConfig, json: bool) -> Result<()> {
         None => {
             let mut status = serde_json::json!({
                 "node": "not running",
+                "infra": config.infra.to_string(),
                 "nets": config.nets,
                 "version": env!("CARGO_PKG_VERSION"),
             });
@@ -3365,6 +3388,7 @@ impl NodeEntry {
             "agents": self.agents(),
             "online": self.online(),
             "network": self.network(),
+            "infra": self.info_str("infra"),
             "sessions": self.sessions(),
             "log": self.log(),
         })
@@ -3483,7 +3507,7 @@ async fn ps_command(node: &NodeArgs, all: bool, json: bool) -> Result<()> {
         println!("no wats node running · start one in the background: wats --detach");
         return Ok(());
     }
-    let rows: Vec<[String; 9]> = entries
+    let rows: Vec<[String; 10]> = entries
         .iter()
         .map(|e| {
             let dash = || "-".to_string();
@@ -3491,6 +3515,7 @@ async fn ps_command(node: &NodeArgs, all: bool, json: bool) -> Result<()> {
                 return [
                     dash(),
                     e.mode().to_string(),
+                    dash(),
                     dash(),
                     dash(),
                     dash(),
@@ -3515,13 +3540,15 @@ async fn ps_command(node: &NodeArgs, all: bool, json: bool) -> Result<()> {
                     agents.join(",")
                 },
                 e.network(),
+                e.info_str("infra").unwrap_or_else(dash),
                 e.sessions().map_or_else(dash, |s| s.to_string()),
                 tilde(&e.dir),
             ]
         })
         .collect();
     let header = [
-        "PID", "MODE", "VERSION", "UPTIME", "PROFILE", "AGENTS", "NETWORK", "SESSIONS", "DATA DIR",
+        "PID", "MODE", "VERSION", "UPTIME", "PROFILE", "AGENTS", "NETWORK", "INFRA", "SESSIONS",
+        "DATA DIR",
     ];
     let mut widths: Vec<usize> = header.iter().map(|h| h.chars().count()).collect();
     for row in &rows {
@@ -4029,6 +4056,7 @@ impl NodeArgs {
             &mut self.nets,
             &mut self.bootstrap,
             &mut self.external_addrs,
+            &mut self.relays,
         ] {
             list.retain(|v| !v.trim().is_empty());
         }
@@ -4038,8 +4066,22 @@ impl NodeArgs {
         if self.infra.as_ref().is_some_and(|p| p.trim().is_empty()) {
             self.infra = None;
         }
+        if self.dns.as_ref().is_some_and(|p| p.trim().is_empty()) {
+            self.dns = None;
+        }
         if self.profile.as_ref().is_some_and(|p| p.is_empty()) {
             self.profile = None;
+        }
+    }
+
+    /// The infrastructure, as one group (ADR 0009): any of --infra,
+    /// --relay and --dns (or their WATS_* variables) sets it all, else
+    /// config.toml's `infra`, `infra_relays` and `infra_dns`.
+    fn infra(&self, file: &Settings) -> Result<wats::infra::Infra> {
+        if self.infra.is_some() || !self.relays.is_empty() || self.dns.is_some() {
+            wats::infra::Infra::resolve(self.infra.as_deref(), &self.relays, self.dns.as_deref())
+        } else {
+            file.infra().context("config.toml")
         }
     }
 
@@ -4075,9 +4117,7 @@ impl NodeArgs {
             );
         }
         config.port = self.port.or(file.port);
-        if let Some(infra) = self.infra.as_ref().or(file.infra.as_ref()) {
-            config.infra = infra.parse()?;
-        }
+        config.infra = self.infra(file)?;
         config.secret_file = self.secret_file.as_ref().map(PathBuf::from);
         let file_size = |value: &Option<String>, what: &str| -> Result<Option<u64>> {
             value
@@ -4128,7 +4168,7 @@ impl NodeArgs {
             config.peers.push(EndpointAddr::from(ticket));
         }
         if self.hermetic {
-            config.infra = wats::infra::Infra::None;
+            config.infra = wats::infra::Infra::NONE;
             for entry in &config.bootstrap {
                 anyhow::ensure!(
                     is_local_host(&entry.host),
@@ -4315,6 +4355,12 @@ impl NodeArgs {
         }
         if let Some(infra) = &self.infra {
             args.push(format!("--infra={infra}").into());
+        }
+        for relay in &self.relays {
+            args.push(format!("--relay={relay}").into());
+        }
+        if let Some(dns) = &self.dns {
+            args.push(format!("--dns={dns}").into());
         }
         if let Some(size) = self.max_blob_size {
             args.push(format!("--max-blob-size={size}").into());
@@ -6328,11 +6374,23 @@ fn inbox_command(data_dir: &std::path::Path, action: InboxAction) -> Result<()> 
     Ok(())
 }
 
+/// After `wats config set|unset` of an infra key: what the node will use,
+/// since the three keys combine (ADR 0009).
+fn infra_note(file: &ConfigFile, key: &str) {
+    if !matches!(key, "infra" | "infra_relays" | "infra_dns") {
+        return;
+    }
+    if let Ok(infra) = file.preview().and_then(|s| s.infra()) {
+        eprintln!("infra: {infra} (flags and WATS_* variables override it)");
+    }
+}
+
 /// What crash reports say about this node.
 fn crash_context(config: &NodeConfig) {
     wats::crash::set_context(wats::crash::CrashContext {
         data_dir: config.data_dir.clone(),
-        infra: config.infra.to_string(),
+        // The preset only: a crash report never names a custom host.
+        infra: config.infra.kind(),
         mode: config.role.to_string(),
         own_id: None,
     });
@@ -6341,6 +6399,66 @@ fn crash_context(config: &NodeConfig) {
 /// `docs/cli.md`, generated from the clap definitions above; a test keeps
 /// the published page in step (`WATS_UPDATE_DOCS=1 cargo test -p wats --bin
 /// wats cli_reference` rewrites it).
+#[cfg(test)]
+mod infra_flags {
+    use clap::Parser;
+
+    use super::*;
+
+    fn infra(args: &[&str], file: &str) -> Result<wats::infra::Infra> {
+        let mut cli = Cli::try_parse_from(std::iter::once("wats").chain(args.iter().copied()))?;
+        cli.node.normalize();
+        cli.node.infra(&Settings::parse(file)?)
+    }
+
+    #[test]
+    fn flags_set_the_infrastructure_as_a_group() {
+        let file = "infra = \"wats\"\ninfra_relays = [\"https://relay.example.org\"]\n";
+        // The file alone: wats's directory, the custom relay.
+        assert_eq!(
+            infra(&[], file).unwrap().to_string(),
+            "wats (relay relay.example.org)"
+        );
+        // Any infra flag replaces the three keys of the file.
+        assert_eq!(infra(&["--infra", "n0"], file).unwrap().to_string(), "n0");
+        assert_eq!(
+            infra(&["--infra", "none"], file).unwrap(),
+            wats::infra::Infra::NONE
+        );
+        assert_eq!(
+            infra(&["--dns", "https://dns.example.org"], file)
+                .unwrap()
+                .to_string(),
+            "custom (no relay; dns dns.example.org)"
+        );
+        assert_eq!(
+            infra(
+                &[
+                    "--relay",
+                    "https://a.example.org",
+                    "--relay=https://b.example.org#quic=7843",
+                    "--infra",
+                    "wats+n0",
+                ],
+                "",
+            )
+            .unwrap()
+            .to_string(),
+            "wats+n0 (relays a.example.org, b.example.org)"
+        );
+        // Old files load as before.
+        assert_eq!(infra(&[], "").unwrap(), wats::infra::Infra::default());
+        assert_eq!(infra(&[], "infra = \"n0\"\n").unwrap().to_string(), "n0");
+        // Garbage, from a flag or the file.
+        let err = |args: &[&str], file: &str| format!("{:#}", infra(args, file).unwrap_err());
+        assert!(err(&["--relay", "http://relay.example.org"], "").contains("use https"));
+        assert!(
+            err(&["--infra", "none", "--dns", "https://d.example.org"], "").contains("infra none")
+        );
+        assert!(err(&[], "infra_dns = \"dns.example.org\"\n").contains("config.toml"));
+    }
+}
+
 #[cfg(test)]
 mod cli_reference {
     use clap::CommandFactory;
