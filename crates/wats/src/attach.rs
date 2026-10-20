@@ -183,9 +183,10 @@ async fn accept_sessions(
         let node = Arc::clone(&node);
         counter.0.fetch_add(1, Ordering::SeqCst);
         let guard = SessionGuard(counter.clone());
+        let sessions = counter.clone();
         tokio::spawn(async move {
             let _guard = guard;
-            if let Err(e) = serve_session(node, stream).await {
+            if let Err(e) = serve_session(node, stream, sessions).await {
                 debug!("attached session ended: {e:#}");
             }
         });
@@ -193,7 +194,11 @@ async fn accept_sessions(
 }
 
 #[cfg(unix)]
-async fn serve_session(node: Arc<Node>, stream: tokio::net::UnixStream) -> Result<()> {
+async fn serve_session(
+    node: Arc<Node>,
+    stream: tokio::net::UnixStream,
+    sessions: Sessions,
+) -> Result<()> {
     let (read, write) = stream.into_split();
     let mut reader = BufReader::new(read);
     let mut line = String::new();
@@ -203,7 +208,9 @@ async fn serve_session(node: Arc<Node>, stream: tokio::net::UnixStream) -> Resul
         .await?;
     let first: serde_json::Value = serde_json::from_str(&line).context("bad attach handshake")?;
     if first.get("wats_control").is_some() {
-        return serve_control(&node, first, write).await;
+        // This connection is no MCP session.
+        let others = sessions.active().saturating_sub(1);
+        return serve_control(&node, first, write, others).await;
     }
     let handshake: Handshake = serde_json::from_value(first).context("bad attach handshake")?;
     if handshake.wats_attach != 1 {
@@ -262,6 +269,32 @@ pub enum Control {
         reason: Option<String>,
         profile: Option<String>,
     },
+    /// `wats ps`, `wats --detach` and `wats stop` (ADR 0023): who this
+    /// node is (pid, role, version, start, log), its MCP sessions, peers,
+    /// connectivity and agents.
+    Info,
+    /// `wats stop` (ADR 0023): stop gracefully, whatever the role. Answers
+    /// with [`Control::Info`]'s fields before stopping.
+    Stop,
+}
+
+/// The answer to [`Control::Info`].
+#[cfg(unix)]
+fn info(node: &Node, sessions: usize) -> serde_json::Value {
+    let config = node.config();
+    serde_json::json!({
+        "pid": std::process::id(),
+        "role": config.role.to_string(),
+        "version": env!("CARGO_PKG_VERSION"),
+        "profile": config.profile,
+        "data_dir": config.data_dir,
+        "started": node.started_at(),
+        "log": config.log_file,
+        "sessions": sessions,
+        "peers": node.known_peers().len(),
+        "health": node.health_json(),
+        "agents": config.agents.iter().filter(|a| a.running).map(|a| a.name.clone()).collect::<Vec<_>>(),
+    })
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -276,10 +309,12 @@ async fn serve_control(
     node: &Arc<Node>,
     first: serde_json::Value,
     mut write: tokio::net::unix::OwnedWriteHalf,
+    sessions: usize,
 ) -> Result<()> {
     use serde_json::json;
     let reply = match serde_json::from_value::<ControlLine>(first) {
-        Ok(line) if line.wats_control == 1 => match run_control(node, line.request).await {
+        Ok(line) if line.wats_control == 1 => match run_control(node, line.request, sessions).await
+        {
             Ok(value) => json!({ "ok": value }),
             Err(e) => json!({ "error": format!("{e:#}") }),
         },
@@ -295,8 +330,24 @@ async fn serve_control(
 }
 
 #[cfg(unix)]
-async fn run_control(node: &Arc<Node>, request: Control) -> Result<serde_json::Value> {
+async fn run_control(
+    node: &Arc<Node>,
+    request: Control,
+    sessions: usize,
+) -> Result<serde_json::Value> {
     match request {
+        Control::Info => Ok(info(node, sessions)),
+        Control::Stop => {
+            tracing::info!("stopping: asked by `wats stop`");
+            let answer = info(node, sessions);
+            // Let this answer go out first.
+            let node = Arc::clone(node);
+            tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                node.request_stop();
+            });
+            Ok(answer)
+        }
         Control::HandOver => {
             if node.config().role != crate::node::NodeRole::Background {
                 bail!("this node is not a background node: it does not hand over");
@@ -340,8 +391,17 @@ pub fn retracted_json(events: &[crate::event::Event]) -> serde_json::Value {
 
 /// Send one [`Control`] request to the node running in `data_dir`. `None`
 /// when no node listens there. Returns the node's answer.
-#[cfg(unix)]
 pub async fn control(data_dir: &Path, request: Control) -> Result<Option<serde_json::Value>> {
+    control_within(data_dir, request, std::time::Duration::from_secs(30)).await
+}
+
+/// [`control`], waiting at most `timeout` for the answer.
+#[cfg(unix)]
+pub async fn control_within(
+    data_dir: &Path,
+    request: Control,
+    timeout: std::time::Duration,
+) -> Result<Option<serde_json::Value>> {
     let Ok(stream) = tokio::net::UnixStream::connect(socket_path(data_dir)).await else {
         return Ok(None);
     };
@@ -367,14 +427,18 @@ pub async fn control(data_dir: &Path, request: Control) -> Result<Option<serde_j
         }
         Ok(reply["ok"].clone())
     };
-    tokio::time::timeout(std::time::Duration::from_secs(30), exchange)
+    tokio::time::timeout(timeout, exchange)
         .await
-        .context("the node did not answer within 30 s")?
+        .with_context(|| format!("the node did not answer within {} s", timeout.as_secs()))?
         .map(Some)
 }
 
 #[cfg(not(unix))]
-pub async fn control(_: &Path, _: Control) -> Result<Option<serde_json::Value>> {
+pub async fn control_within(
+    _: &Path,
+    _: Control,
+    _: std::time::Duration,
+) -> Result<Option<serde_json::Value>> {
     Ok(None)
 }
 

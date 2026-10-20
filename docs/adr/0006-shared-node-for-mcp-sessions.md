@@ -23,7 +23,8 @@ sync and replicas to the swarm.
   one `WatsMcp` per session, runs inside the node process.
 - **Starting a node on demand.** If no node is listening, `wats mcp` starts
   `wats node --quiet --idle-exit 600` as a detached process (its own process
-  group, logging to `<data dir>/node.log`), then attaches.
+  group, logging to `<data dir>/node.log`; since ADR 0023,
+  `<data dir>/logs/node.log`, rotated), then attaches.
 - **Idle exit.** The background node exits 10 minutes after its last session
   ends. A node started by hand runs until stopped.
 - **Fallback.** `wats mcp --in-process` keeps the old single-session mode.

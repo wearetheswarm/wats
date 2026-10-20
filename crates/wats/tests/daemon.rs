@@ -87,7 +87,7 @@ async fn background_session_hands_over_to_a_daemon() -> anyhow::Result<()> {
             }
         }
     }
-    let log = std::fs::read_to_string(data.join("daemon.log")).unwrap_or_default();
+    let log = std::fs::read_to_string(data.join("logs").join("node.log")).unwrap_or_default();
     assert_eq!(mode, "daemon", "daemon log:\n{log}");
 
     // `wats status` shows the running daemon, as the MCP tool does.

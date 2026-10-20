@@ -1741,7 +1741,7 @@ pub async fn run(
     info!(runtime = %config.runtime, profile = %config.profile, author = %me, "agent runner started");
     if openclaw {
         info!(
-            gateway = %config.openclaw.url, agent_id = %config.openclaw.agent,
+            gateway = %crate::openclaw::redacted_url(&config.openclaw.url), agent_id = %config.openclaw.agent,
             "agent runs are forwarded to OpenClaw (POST /hooks/agent)"
         );
         info!("{}", crate::openclaw::SPEND_CAPS);

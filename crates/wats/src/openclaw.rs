@@ -155,6 +155,21 @@ pub fn check_url(raw: &str, insecure_ok: bool) -> Result<url::Url> {
     Ok(url)
 }
 
+/// The gateway URL for logs and the banner, which a detached node writes
+/// to disk (ADR 0023): without a user name or password, should one be in
+/// it.
+pub fn redacted_url(raw: &str) -> String {
+    match url::Url::parse(raw.trim()) {
+        Ok(mut url) if !url.username().is_empty() || url.password().is_some() => {
+            let _ = url.set_username("");
+            let _ = url.set_password(None);
+            url.to_string()
+        }
+        Ok(_) => raw.to_string(),
+        Err(_) => "<not a URL>".to_string(),
+    }
+}
+
 /// The host the hook token goes to over plain http beyond loopback
 /// (allowed by `agent.openclaw_insecure_ok`), to warn about at startup.
 pub fn insecure_host(url: &url::Url) -> Option<String> {
@@ -348,7 +363,7 @@ pub async fn wake(notify: &Notify, text: &str) -> Result<()> {
         .body(json!({"text": text, "mode": "now"}).to_string())
         .send()
         .await
-        .map_err(|e| anyhow::anyhow!("cannot reach the OpenClaw gateway: {e}"))?;
+        .map_err(|e| anyhow::anyhow!("cannot reach the OpenClaw gateway: {}", e.without_url()))?;
     let status = response.status();
     anyhow::ensure!(
         status.is_success(),
@@ -476,13 +491,17 @@ async fn send(client: &reqwest::Client, request: &Request, isolated: bool) -> Se
         Err(e) if e.is_connect() => {
             return Sent::Error(Reply::Deferred(format!(
                 "cannot reach the OpenClaw gateway at {}: is it running?",
-                request.endpoint
+                redacted_url(&request.endpoint)
             )));
         }
         Err(e) if e.is_timeout() => return Sent::Error(Reply::TimedOut),
         Err(e) => {
             return Sent::Error(Reply::Failed {
-                error: format!("forward to {}: {e}", request.endpoint),
+                error: format!(
+                    "forward to {}: {}",
+                    redacted_url(&request.endpoint),
+                    e.without_url()
+                ),
                 retry_after: None,
             });
         }
@@ -732,6 +751,20 @@ pub fn backup_path(file: &Path, now: u64) -> PathBuf {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn credentials_never_reach_the_logs() {
+        assert_eq!(
+            redacted_url("https://user:secret@gw.example/x"),
+            "https://gw.example/x"
+        );
+        assert_eq!(
+            redacted_url("http://127.0.0.1:18789"),
+            "http://127.0.0.1:18789"
+        );
+        assert_eq!(redacted_url("not a url"), "<not a URL>");
+    }
+
     use super::*;
 
     #[test]

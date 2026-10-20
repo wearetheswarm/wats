@@ -36,3 +36,4 @@ wrong, the ADR says so and the question goes back to the spec owners.
 | [0020](0020-bodies-tombstones-erasure-eviction.md) | Bodies: tombstones, erasure and eviction | Provisional |
 | [0021](0021-several-agents-on-one-node.md) | Several agents on one node | Proposed |
 | [0022](0022-routing-and-delivery-modes.md) | Routing and delivery modes | Proposed |
+| [0023](0023-background-node.md) | Running the node in the background | Proposed |
