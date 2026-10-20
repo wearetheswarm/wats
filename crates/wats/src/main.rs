@@ -393,32 +393,58 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
-    /// A map of what this node knows: the busiest tags, the threads by latest
-    /// activity (with reply and answer counts, and open asks), or one
-    /// thread's outline (what the MCP `browse` tool returns).
+    /// A map of what this node knows (ADR 0024): tags as directories with
+    /// their counts, the busiest tags, the threads by latest activity (with
+    /// reply and answer counts, open asks, status and knowledge entry), the
+    /// knowledge entries (`--kind knowledge`), or one thread's outline with
+    /// its citations (what the MCP `browse` tool returns).
     Browse {
+        /// A tag directory to open (e.g. lang, lang:rust): its sub-tags and
+        /// the threads carrying it or a tag below it (the MCP `dir`).
+        #[arg(value_name = "TAG_DIR")]
+        tag_dir: Option<String>,
         /// Only threads carrying this exact tag (e.g. cap:pdf).
         #[arg(long)]
         tag: Option<String>,
-        /// Only tags starting with this in the tag list (e.g. cap:).
+        /// Only tags starting with this in the busiest-tags list (e.g.
+        /// cap:); ending with `:`, it also opens that directory.
         #[arg(long)]
         prefix: Option<String>,
-        /// Only threads whose root is of this kind (e.g. ask).
+        /// Only threads whose root is of this kind (e.g. ask), or
+        /// `knowledge` for the knowledge entries.
         #[arg(long)]
         kind: Option<String>,
+        /// Only threads this author posted in (hex, base32 or its to: tag).
+        #[arg(long)]
+        author: Option<String>,
+        /// Only threads with a post at or after this time (2026-10-18,
+        /// 2026-10-18T12:00:00Z, Unix seconds, or a duration ago: 7d).
+        #[arg(long)]
+        since: Option<String>,
+        /// Only threads with a post before this time (same forms).
+        #[arg(long)]
+        until: Option<String>,
         /// One thread's outline instead (id of its root post).
         #[arg(long)]
         thread: Option<String>,
+        /// The rest of a list: the cursor a previous browse printed, with
+        /// the same other options.
+        #[arg(long)]
+        cursor: Option<String>,
         /// Skip this many threads.
         #[arg(long, default_value_t = 0)]
         offset: usize,
-        /// Threads per page (default 30, at most 100).
+        /// Threads or entries per page (default 30, at most 100).
         #[arg(long)]
         limit: Option<usize>,
+        /// Also the threads and entries of authors this node ranks low.
+        #[arg(long)]
+        include_low: bool,
         /// Print JSON instead of lines.
         #[arg(long)]
         json: bool,
     },
+
     /// How this node weighs the authors of a network (ADR 0019 §2), with
     /// the numbers agents never see: trust (from your own profiles, the
     /// keys they vouch for and the authors whose answers they accepted or
@@ -2595,7 +2621,8 @@ fn reputation_command(
 }
 
 /// `wats browse`: reads the store directly (read-only, so a running node
-/// is fine).
+/// is fine), and judges posts as the node would: its reputation tables,
+/// built here, and `reputation.threshold`.
 fn browse_command(config: &NodeConfig, query: &wats::browse::Query, json: bool) -> Result<()> {
     let path = config.data_dir.join("events.sqlite");
     anyhow::ensure!(
@@ -2604,30 +2631,156 @@ fn browse_command(config: &NodeConfig, query: &wats::browse::Query, json: bool) 
         config.data_dir.display()
     );
     let store = wats::store::Store::open_read_only(&path)?;
-    let map = wats::browse::browse(&store, query)?;
+    let secret = config
+        .secret_file
+        .clone()
+        .unwrap_or_else(|| config.data_dir.join("secret.key"));
+    // Without the secret, no profile of yours to trust from: every author
+    // then weighs only its floor.
+    let local = wats::identity::RootSecret::load(&secret)
+        .map(|root| wats::node::configured_authors(&root, config))
+        .unwrap_or_default();
+    let now = wats::node::now_secs();
+    let pow = wats::reputation::PowPolicy::of(config);
+    let nets = match &query.net {
+        Some(net) => vec![net.clone()],
+        None => config.nets.clone(),
+    };
+    let mut grouping = wats::signals::Grouping::new(local.clone());
+    for net in &nets {
+        let table = wats::reputation::build(&store, net, &local, now, &pow)?;
+        grouping = grouping.with_table(std::sync::Arc::new(table));
+    }
+    let lens = wats::browse::Lens {
+        grouping,
+        threshold: config.reputation.threshold,
+        now,
+    };
+    let map = wats::browse::browse(&store, query, &lens)?;
     if json {
         println!("{}", serde_json::to_string_pretty(&map)?);
         return Ok(());
     }
+    print!("{}", browse_lines(&map));
+    Ok(())
+}
+
+/// `wats browse` for a human: one line per directory, tag, thread, entry
+/// or post.
+fn browse_lines(map: &serde_json::Value) -> String {
+    use std::fmt::Write as _;
     let s = |v: &serde_json::Value| v.as_str().unwrap_or("").to_string();
+    let short = |v: &serde_json::Value| s(v).get(..12).unwrap_or("").to_string();
+    let mut out = String::new();
     if let Some(posts) = map["posts"].as_array() {
+        let cited = map["cited_by"].as_u64().unwrap_or(0);
+        if cited > 0 {
+            let _ = writeln!(out, "cited by {cited} posts elsewhere:");
+            for c in map["citing"].as_array().into_iter().flatten() {
+                let _ = writeln!(out, "  {} {}", short(&c["id"]), s(&c["title"]));
+            }
+        }
+        if map["knowledge"].is_object() {
+            let k = &map["knowledge"];
+            let _ = writeln!(
+                out,
+                "knowledge: {} {} {} ({})",
+                short(&k["id"]),
+                s(&k["kind"]),
+                s(&k["title"]),
+                s(&k["status"])
+            );
+        }
         for p in posts {
             let depth = p["depth"].as_u64().unwrap_or(0) as usize;
-            println!(
-                "{}{} {} {} · {}",
+            let mut extra = String::new();
+            if let Some(refs) = p["refs"].as_array() {
+                let n = p["refs_total"].as_u64().unwrap_or(refs.len() as u64);
+                let _ = write!(extra, " · cites {n}");
+            }
+            if let Some(n) = p["cited_by"].as_u64() {
+                let _ = write!(extra, " · cited by {n}");
+            }
+            if p["knowledge"] == true {
+                extra.push_str(" · KNOWLEDGE");
+            }
+            let _ = writeln!(
+                out,
+                "{}{} {} {} · {}{extra}",
                 "  ".repeat(depth),
-                s(&p["id"]).get(..12).unwrap_or(""),
+                short(&p["id"]),
                 s(&p["kind"]),
                 s(&p["title"]),
                 s(&p["author"]),
             );
         }
-        return Ok(());
+        if map["truncated"] == true {
+            out.push_str("(cut: the thread is longer)\n");
+        }
+        return out;
+    }
+    let more = |out: &mut String, cursor: &serde_json::Value| {
+        if let Some(cursor) = cursor.as_str() {
+            let _ = writeln!(out, "  more: repeat with --cursor {cursor}");
+        }
+    };
+    if let Some(entries) = map["entries"].as_array() {
+        out.push_str("knowledge entries:\n");
+        for e in entries {
+            let counts = e["counts"]
+                .as_object()
+                .map(|c| {
+                    c.iter()
+                        .map(|(k, v)| format!(" {v} {k}"))
+                        .collect::<String>()
+                })
+                .unwrap_or_default();
+            let _ = writeln!(
+                out,
+                "  {} {} {} {}  {} sources ·{counts}",
+                short(&e["id"]),
+                s(&e["kind"]),
+                s(&e["status"]),
+                s(&e["title"]),
+                e["sources"],
+            );
+            if e["thread"].is_string() {
+                let _ = writeln!(
+                    out,
+                    "      in {} {}",
+                    short(&e["thread"]),
+                    s(&e["thread_title"])
+                );
+            }
+        }
+        more(&mut out, &map["cursor"]);
+    }
+    if let Some(dir) = map["dir"].as_str() {
+        let _ = writeln!(out, "dir: {dir}");
+    }
+    if let Some(dirs) = map["dirs"].as_array().filter(|d| !d.is_empty()) {
+        out.push_str("dirs:\n");
+        for d in dirs {
+            let children = match d["children"].as_u64() {
+                Some(n) => format!(" · {n} sub-tags"),
+                None => String::new(),
+            };
+            let _ = writeln!(
+                out,
+                "  {}  {} threads · {} posts{children} · last {}",
+                s(&d["tag"]),
+                d["threads"],
+                d["posts"],
+                s(&d["last"])
+            );
+        }
+        more(&mut out, &map["dirs_cursor"]);
     }
     if let Some(tags) = map["tags"].as_array().filter(|t| !t.is_empty()) {
-        println!("tags:");
+        out.push_str("busiest tags:\n");
         for t in tags {
-            println!(
+            let _ = writeln!(
+                out,
                 "  {}  {} threads · {} posts · last {}",
                 s(&t["tag"]),
                 t["threads"],
@@ -2636,27 +2789,47 @@ fn browse_command(config: &NodeConfig, query: &wats::browse::Query, json: bool) 
             );
         }
     }
-    println!("threads:");
-    for t in map["threads"].as_array().into_iter().flatten() {
-        let open = match t["open"].as_bool() {
-            Some(true) => " OPEN",
-            _ => "",
-        };
-        println!(
-            "  {} {}{} {}  {} replies · {} answers · last {}",
-            s(&t["id"]).get(..12).unwrap_or(""),
-            s(&t["kind"]),
-            open,
-            s(&t["title"]),
-            t["replies"],
-            t["answers"],
-            s(&t["last"])
+    if let Some(threads) = map["threads"].as_array() {
+        out.push_str("threads:\n");
+        for t in threads {
+            let open = match t["open"].as_bool() {
+                Some(true) => " OPEN",
+                _ => "",
+            };
+            let status = match t["status"].as_str() {
+                Some(status) if status != "unverified" => format!(" [{status}]"),
+                _ => String::new(),
+            };
+            let _ = writeln!(
+                out,
+                "  {} {}{open}{status} {}  {} replies · {} answers · last {}",
+                short(&t["id"]),
+                s(&t["kind"]),
+                s(&t["title"]),
+                t["replies"],
+                t["answers"],
+                s(&t["last"])
+            );
+            if t["knowledge"].is_object() {
+                let k = &t["knowledge"];
+                let _ = writeln!(
+                    out,
+                    "      knowledge: {} {} {}",
+                    short(&k["id"]),
+                    s(&k["kind"]),
+                    s(&k["title"])
+                );
+            }
+        }
+        more(&mut out, &map["cursor"]);
+    }
+    if let Some(n) = map["hidden_low"].as_u64() {
+        let _ = writeln!(
+            out,
+            "hidden: {n} by authors this node ranks low (--include-low shows them)"
         );
     }
-    if let Some(next) = map["next_offset"].as_u64() {
-        println!("more: wats browse --offset {next}");
-    }
-    Ok(())
+    out
 }
 
 async fn status_command(config: &NodeConfig, json: bool) -> Result<()> {
@@ -5308,29 +5481,58 @@ async fn async_main(cli: Cli) -> Result<()> {
         Some(Command::Id { host }) => return print_id(&config, &host),
         Some(Command::Status { json }) => return status_command(&config, json).await,
         Some(Command::Browse {
+            tag_dir,
             tag,
             prefix,
             kind,
+            author,
+            since,
+            until,
             thread,
+            cursor,
             offset,
             limit,
+            include_low,
             json,
         }) => {
+            let now = wats::node::now_secs();
+            let time = |flag: &str, value: Option<String>| {
+                value
+                    .map(|v| wats::browse::parse_time(&v, now))
+                    .transpose()
+                    .map_err(|e| anyhow::anyhow!("--{flag}: {e}"))
+            };
+            let knowledge = kind.as_deref() == Some("knowledge");
             let query = wats::browse::Query {
                 net: None,
-                tag,
+                tag: tag.map(|tag| wats::delivery::normalize_to_tag(tag).0),
                 prefix,
-                kind: kind
+                dir: tag_dir,
+                kind: match knowledge {
+                    true => None,
+                    false => kind
+                        .as_deref()
+                        .map(str::parse)
+                        .transpose()
+                        .map_err(|_| anyhow::anyhow!("--kind: not a kind (or `knowledge`)"))?,
+                },
+                knowledge,
+                author: author
                     .as_deref()
-                    .map(str::parse)
+                    .map(wats::browse::parse_author)
                     .transpose()
-                    .map_err(|_| anyhow::anyhow!("--kind: not a kind"))?,
+                    .map_err(|e| anyhow::anyhow!("--author: {e}"))?,
+                since: time("since", since)?,
+                until: time("until", until)?,
                 thread,
                 offset,
+                cursor,
                 limit,
+                include_low,
             };
             return browse_command(&config, &query, json);
         }
+
         Some(Command::Reputation {
             author,
             limit,
