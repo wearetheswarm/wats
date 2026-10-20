@@ -54,9 +54,11 @@
 
 ### Upgrading from 0.4.0
 
-- **Store schema 8**: the node adds its history ranges to the store at
-  its first start, with no resync. Rolling back to 0.4.0 means moving
-  `events.sqlite` aside and syncing again (0.4.0 refuses a newer store).
+- **No store migration**: the node adds its history tables to the store
+  at its first start, without a schema change and with no resync.
+  Rolling back to 0.4.0 keeps the store (0.4.0 ignores the new tables),
+  but 0.4.0 refuses unknown keys in `config.toml`: remove `[sync]` and
+  `storage.events_share` first, if you set them.
 - **Full nodes** (routers, bootstrap nodes, indexers) set
   `sync.initial_max = 0` (`WATS_SYNC_INITIAL_MAX=0`) to keep the whole
   history and serve it to new nodes first.

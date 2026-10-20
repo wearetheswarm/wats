@@ -10,9 +10,17 @@
 //! - **Catch-up** (after a stop or an offline period): a pending range from
 //!   now down to the watermark, walked newest first too, resumable from its
 //!   cursor. The watermark moves only once no range is pending.
-//! - **Older peers** (no neighbor speaks `sync_desc`): ascending windows of
-//!   7 days, then 14, 28…, each read until it meets the history the
-//!   previous one brought, until the budget is spent.
+//! - **Older peers** (neighbors without `sync_desc`), always pulled when
+//!   any is up: ascending windows of 7 days, then 14, 28…, each read until
+//!   it meets the history the previous one brought, until the budget is
+//!   spent.
+//!
+//! A range is complete only when a peer this node trusts (one of its
+//! configured peers or bootstrap nodes) has nothing more below the cursor,
+//! or when two distinct peers say so at the same cursor. A `partial`
+//! answer, a `gap` or one untrusted peer's word leaves it pending; after
+//! [`Tuning::max_attempts`] passes it is closed as what it is: a cut (the
+//! fill) or a skipped range (a catch-up), never as held.
 //!
 //! A node serves its history honestly: a descending page stops at the top
 //! of a hole (its cut, a pending or skipped range) with a `gap`, and an
@@ -20,6 +28,7 @@
 //! partial history for a complete one.
 
 use std::collections::{HashMap, HashSet};
+use std::hash::BuildHasher;
 use std::sync::{Arc, Weak};
 use std::time::Duration;
 
@@ -72,10 +81,10 @@ const GET_TIMEOUT: Duration = Duration::from_secs(3);
 const GETS_PER_MIN: usize = 60;
 /// Ids per `get` of the fill (threads, signals).
 const GET_BATCH: usize = proto::MAX_GET_IDS;
-/// Most events a `get` answers per root (`thread`) and in all
-/// (`signals`), and most bytes in one answer, under the 16 MiB response.
+/// Most events a `get` answers per root (`thread`) and in all, and most
+/// bytes in one answer, under the 16 MiB response.
 const GET_THREAD_MAX: usize = 500;
-const GET_SIGNALS_MAX: usize = 2000;
+const GET_ROWS_MAX: usize = 2000;
 const GET_MAX_BYTES: usize = 15 * 1024 * 1024;
 /// The first window asked from older peers; each next one doubles.
 const OLDER_WINDOW_SECS: u64 = 7 * 24 * 3600;
@@ -83,10 +92,11 @@ const OLDER_WINDOW_SECS: u64 = 7 * 24 * 3600;
 /// How the history task behaves (tests shorten or slow it).
 #[derive(Debug, Clone)]
 pub struct Tuning {
-    /// With no neighbor speaking `sync_desc` this long after the first
-    /// neighbor came up, the node falls back to older peers' ascending
-    /// pulls.
-    pub older_peers_wait: Duration,
+    /// Passes with neighbors up a range may stay unconfirmed (gaps,
+    /// partial answers, one untrusted peer's word) before it is closed: a
+    /// cut for the fill, a skipped range for a catch-up. A pending range
+    /// is a hole that refuses 0.4.0 pulls, so it never stays forever.
+    pub max_attempts: u32,
     /// Events asked per page.
     pub page: u32,
     /// A pause after each page (tests: to stop a walk half-way).
@@ -101,7 +111,7 @@ pub struct Tuning {
 impl Default for Tuning {
     fn default() -> Self {
         Tuning {
-            older_peers_wait: Duration::from_secs(30),
+            max_attempts: 5,
             page: proto::MAX_SYNC_PAGE,
             page_pause: Duration::ZERO,
             retry: Duration::from_secs(60),
@@ -118,11 +128,17 @@ struct Progress {
     older_peers: bool,
     /// The peer that served the last page: asked first on demand.
     source: Option<EndpointId>,
-    /// When the first neighbor came up.
-    first_neighbor: Option<std::time::Instant>,
     /// Neighbors that came up, for the cheap ascending check once no range
     /// is pending.
     check: HashSet<EndpointId>,
+    /// The node came back on the network (its first neighbor, a network
+    /// change): the next pass opens a catch-up range.
+    catch_up: bool,
+    /// Unconfirmed passes per pending range id.
+    attempts: HashMap<i64, u32>,
+    /// Bytes stored per key chain by the fill, across its passes (ADR
+    /// 0025 §4: one key's share).
+    author_bytes: HashMap<String, u64>,
 }
 
 /// The history tasks' shared state.
@@ -137,15 +153,17 @@ pub struct History {
 /// Which holes a request is served around (ADR 0025 §3).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Holes {
-    /// Every one: a descending page stops at the first.
+    /// Every one: what `status` and `history_full` count.
     All,
+    /// A descending page stops at the first of the cut, the skipped
+    /// ranges and a fill still running, and an ascending pull from below
+    /// one is refused. Not a pending catch-up range: recent history, which
+    /// a node online all along cannot vouch for either (gossip loses
+    /// messages), and which 0.4.0 nodes served during their own catch-up.
+    Serving,
     /// The cut and the skipped ranges: a `partial` request takes what a
     /// pending range holds.
     Intentional,
-    /// Those and the initial fill still running: an ascending pull from
-    /// below them is refused. Catch-up ranges are not, as a 0.4.0 node
-    /// served what it held during its own catch-up.
-    Ascending,
 }
 
 /// A `sync` request as [`Node::serve_sync`] serves it.
@@ -162,14 +180,39 @@ pub struct SyncAsk {
 /// How a walk down a range ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum End {
-    /// A peer had nothing more: the range is held.
+    /// Confirmed: a trusted peer, or two distinct peers at the same cursor,
+    /// had nothing more. The range is held.
     Complete,
     /// The budget is spent.
     Budget,
-    /// Every peer stopped at a hole of its own: nobody reachable holds more.
-    Gapped,
-    /// No peer answered well: try again later.
+    /// Peers answered, but nothing confirms the range is held: gaps,
+    /// `partial` answers, one untrusted peer's word.
+    Open,
+    /// No peer answered: try again later.
     Failed,
+}
+
+/// Peers that said they hold nothing below a cursor (ADR 0025 §9): a
+/// trusted one settles it, otherwise two distinct ones at the same cursor.
+#[derive(Debug, Default)]
+struct Claims {
+    at: Option<(u64, String)>,
+    peers: HashSet<EndpointId>,
+}
+
+impl Claims {
+    /// `peer` has nothing below `cursor`: whether the range is complete.
+    fn claim(&mut self, peer: EndpointId, trusted: bool, cursor: (u64, &str)) -> bool {
+        if trusted {
+            return true;
+        }
+        if self.at.as_ref().map(|(ts, id)| (*ts, id.as_str())) != Some(cursor) {
+            self.at = Some((cursor.0, cursor.1.to_string()));
+            self.peers.clear();
+        }
+        self.peers.insert(peer);
+        self.peers.len() >= 2
+    }
 }
 
 /// What one walk asks for.
@@ -193,7 +236,7 @@ struct Pass {
     behind: HashSet<EndpointId>,
     /// Peers that served pages.
     served: HashSet<EndpointId>,
-    /// Bytes stored per key chain in phase 2.
+    /// Bytes stored per key chain by the fill (kept across passes).
     author_bytes: HashMap<String, u64>,
     /// Key -> the first key of its rotation chain.
     chains: HashMap<String, String>,
@@ -225,6 +268,17 @@ fn chains(rotations: &[(String, String)]) -> HashMap<String, String> {
         out.insert((*key).to_string(), root.to_string());
     }
     out
+}
+
+/// What a walk from the `sync_desc` peers and one from the older peers
+/// say together: the budget stops both; either one confirmed is enough.
+fn combine(desc: End, older: End) -> End {
+    match (desc, older) {
+        (End::Budget, _) | (_, End::Budget) => End::Budget,
+        (End::Complete, _) | (_, End::Complete) => End::Complete,
+        (End::Open, _) | (_, End::Open) => End::Open,
+        _ => End::Failed,
+    }
 }
 
 /// `a * percent / 100` without overflow.
@@ -384,12 +438,23 @@ impl Node {
     }
 
     /// The budget of an initial fill or a catch-up, in store bytes
-    /// (`sync.initial_max`); `None`: no limit, a full node.
+    /// (`sync.initial_max`, at most the events share, so that a fill never
+    /// pushes into ADR 0012's ceiling); `None`: no limit, a full node.
     pub fn history_budget(&self) -> Option<u64> {
+        let share = self.events_share();
         match self.config.initial_max {
-            InitialMax::Auto => self.events_share().map(|s| s / 2).filter(|b| *b > 0),
+            InitialMax::Auto => share.map(|s| s / 2).filter(|b| *b > 0),
             InitialMax::Bytes(0) => None,
-            InitialMax::Bytes(n) => Some(n),
+            InitialMax::Bytes(n) => Some(share.map_or(n, |s| n.min(s))),
+        }
+    }
+
+    /// `sync.initial_max` and the events share it is clamped to, when it
+    /// is larger.
+    pub fn initial_max_clamped(&self) -> Option<(u64, u64)> {
+        match (self.config.initial_max, self.events_share()) {
+            (InitialMax::Bytes(n), Some(share)) if n > share => Some((n, share)),
+            _ => None,
         }
     }
 
@@ -401,19 +466,25 @@ impl Node {
 
     /// The holes of `net` that count for `which` request.
     fn holes(&self, net: &str, which: Holes) -> Vec<(u64, u64)> {
-        self.store
-            .sync_ranges(net)
-            .unwrap_or_default()
+        let ranges = self.store.sync_ranges(net).unwrap_or_default();
+        let mut holes: Vec<(u64, u64)> = ranges
             .iter()
             .filter(|r| match which {
                 Holes::All => true,
                 Holes::Intentional => r.state != RangeState::Pending,
-                // A catch-up range is opened on every new neighbor: it is
-                // recent, and today's nodes serve what they hold there too.
-                Holes::Ascending => r.state != RangeState::Pending || !r.phase.is_empty(),
+                Holes::Serving => r.state != RangeState::Pending || !r.phase.is_empty(),
             })
             .filter_map(|r| Some((r.hole_lo(), r.hole_top()?)))
-            .collect()
+            .collect();
+        // No history yet (before the first pass): nothing below now is
+        // held, as with a fill still to run.
+        if ranges.is_empty()
+            && which != Holes::Intentional
+            && self.store.sync_watermark(net).unwrap_or(0) == 0
+        {
+            holes.push((0, now_secs().saturating_add(MAX_CLOCK_SKEW_SECS)));
+        }
+        holes
     }
 
     /// Whether this node holds the complete history of every network it
@@ -494,6 +565,8 @@ impl Node {
         if let Ok(mut kicks) = self.history.kicks.lock() {
             kicks.insert(net.to_string(), Arc::clone(&kick));
         }
+        // Back from a stop: the first pass with a neighbor catches up.
+        self.note_offline(net);
         let weak = Arc::downgrade(self);
         let name = format!("history {net}");
         let net = net.to_string();
@@ -506,12 +579,15 @@ impl Node {
     }
 
     /// A neighbor came up on `net` (or the network changed): walk what is
-    /// pending, then check what `peers` hold (ADR 0025 §5).
-    pub(super) fn kick_history(&self, net: &str, peers: &[EndpointId]) {
+    /// pending, then check what `peers` hold (ADR 0025 §5). `catch_up`:
+    /// the node was offline on `net` until now (its first neighbor, a
+    /// network change), so a catch-up range opens; a neighbor joining
+    /// those already up only gets the cheap check, as gossip was live.
+    pub(super) fn kick_history(&self, net: &str, peers: &[EndpointId], catch_up: bool) {
         if let Ok(mut progress) = self.history.progress.lock() {
             let p = progress.entry(net.to_string()).or_default();
-            p.first_neighbor.get_or_insert_with(std::time::Instant::now);
             p.check.extend(peers.iter().copied());
+            p.catch_up |= catch_up;
         }
         let kick = self
             .history
@@ -524,12 +600,20 @@ impl Node {
         }
     }
 
-    fn set_progress(&self, net: &str, f: impl FnOnce(&mut Progress)) {
-        if let Ok(mut progress) = self.history.progress.lock() {
-            f(progress.entry(net.to_string()).or_default());
-        }
+    /// The node was offline on `net` until now (started, or lost every
+    /// neighbor): the next pass with a neighbor opens a catch-up range.
+    /// Noted at once, before any `hello`, so that no pass in between
+    /// takes the neighbor without it.
+    pub(super) fn note_offline(&self, net: &str) {
+        self.set_progress(net, |p| p.catch_up = true);
     }
 
+    fn set_progress<T>(&self, net: &str, f: impl FnOnce(&mut Progress) -> T) -> Option<T> {
+        let mut progress = self.history.progress.lock().ok()?;
+        Some(f(progress.entry(net.to_string()).or_default()))
+    }
+
+    /// The current gossip neighbors of `net`: members of it, up now.
     fn neighbors_of(&self, net: &str) -> Vec<EndpointId> {
         let mut peers: Vec<EndpointId> = self
             .neighbors
@@ -549,17 +633,33 @@ impl Node {
             .is_some_and(|i| i.features.iter().any(|f| f == feature))
     }
 
-    /// Peers to walk history from: those with `sync_desc`, `history_full`
-    /// ones first.
-    fn history_peers(&self, net: &str) -> Vec<EndpointId> {
+    /// Whether this node takes `peer`'s word that it holds nothing more
+    /// (ADR 0025 §9): one of its configured peers or bootstrap nodes.
+    /// Anyone else's `history_full` is a hint for the order, no more.
+    fn trusted(&self, peer: &EndpointId) -> bool {
+        self.seed_ids.contains(peer)
+    }
+
+    /// The neighbors of `net` to walk history from, in the order to ask
+    /// them: trusted `history_full` peers, trusted peers, then the others
+    /// in a random order (an endpoint id can be ground), those that claim
+    /// `history_full` first. Split into those with `sync_desc` and the
+    /// older ones.
+    fn history_peers(&self, net: &str) -> (Vec<EndpointId>, Vec<EndpointId>) {
         let me = self.endpoint_id();
-        let mut peers: Vec<EndpointId> = self.neighbors_of(net);
-        peers.extend(self.known_peers());
-        peers.sort();
-        peers.dedup();
-        peers.retain(|p| *p != me && self.has_feature(p, proto::FEATURE_SYNC_DESC));
-        peers.sort_by_key(|p| !self.has_feature(p, proto::FEATURE_HISTORY_FULL));
+        let shuffle = std::collections::hash_map::RandomState::new();
+        let mut peers = self.neighbors_of(net);
+        peers.retain(|p| *p != me);
+        peers.sort_by_cached_key(|p| {
+            (
+                !self.trusted(p),
+                !self.has_feature(p, proto::FEATURE_HISTORY_FULL),
+                shuffle.hash_one(p),
+            )
+        });
         peers
+            .into_iter()
+            .partition(|p| self.has_feature(p, proto::FEATURE_SYNC_DESC))
     }
 
     /// One pass of the history task of `net`: open a range if needed, walk
@@ -569,6 +669,8 @@ impl Node {
         if neighbors.is_empty() {
             return Ok(());
         }
+        // What each neighbor speaks: a hello still in flight, a few seconds
+        // at most. One that does not answer is asked as an older peer.
         for peer in &neighbors {
             if self.peer_info(peer).is_none()
                 && let Ok(Err(e)) =
@@ -577,70 +679,73 @@ impl Node {
                 debug!(peer = %peer.fmt_short(), "hello failed: {e:#}");
             }
         }
-        let peers = self.history_peers(net);
-        let older = peers.is_empty();
-        if older {
-            // Give the neighbors a little time to show they speak
-            // `sync_desc` (ADR 0025 §4, older peers only).
-            let waited = self
-                .history
-                .progress
-                .lock()
-                .ok()
-                .and_then(|p| p.get(net).and_then(|p| p.first_neighbor))
-                .map_or(Duration::MAX, |t| t.elapsed());
-            let wait = self.config.history.older_peers_wait;
-            if waited < wait {
-                let left = wait.saturating_sub(waited);
-                let kick = self
-                    .history
-                    .kicks
-                    .lock()
-                    .ok()
-                    .and_then(|k| k.get(net).cloned());
-                tokio::spawn(async move {
-                    tokio::time::sleep(left).await;
-                    if let Some(kick) = kick {
-                        kick.notify_one();
-                    }
-                });
-                return Ok(());
-            }
-        }
-        self.open_range(net)?;
-        let mut pass = Pass::default();
+        let (peers, older) = self.history_peers(net);
+        // The watermark before this pass: the check below never starts
+        // from one this pass moved.
+        let watermark = self.store.sync_watermark(net)?;
+        let catch_up = self
+            .set_progress(net, |p| std::mem::take(&mut p.catch_up))
+            .unwrap_or(true);
+        self.open_range(net, catch_up)?;
+        let mut pass = Pass {
+            older,
+            author_bytes: self
+                .set_progress(net, |p| std::mem::take(&mut p.author_bytes))
+                .unwrap_or_default(),
+            ..Pass::default()
+        };
         self.set_progress(net, |p| {
             p.running = true;
-            p.older_peers = older;
+            p.older_peers = peers.is_empty();
         });
-        let outcome = self.walk_pending(net, &neighbors, &peers, &mut pass).await;
-        self.set_progress(net, |p| p.running = false);
+        let outcome = self.walk_pending(net, &peers, &mut pass).await;
+        let fill_running = self
+            .store
+            .sync_ranges(net)?
+            .iter()
+            .any(|r| r.state == RangeState::Pending && !r.phase.is_empty());
+        self.set_progress(net, |p| {
+            p.running = false;
+            if fill_running {
+                p.author_bytes = std::mem::take(&mut pass.author_bytes);
+            }
+        });
         outcome?;
         if let Some(watermark) = self.store.settle_sync_ranges(net)? {
             info!(%net, watermark, "history: caught up");
         }
         // The cheap ascending check with the new neighbors (ADR 0025 §5),
         // once nothing is pending: the union of what peers hold.
-        let pending = self
-            .store
-            .sync_ranges(net)?
-            .iter()
-            .any(|r| r.state == RangeState::Pending);
-        if pending {
+        if self.history_pending(net) {
             return Ok(());
         }
         let check: Vec<EndpointId> = self
-            .history
-            .progress
-            .lock()
-            .ok()
-            .and_then(|mut p| p.get_mut(net).map(|p| p.check.drain().collect()))
+            .set_progress(net, |p| p.check.drain().collect())
             .unwrap_or_default();
+        // From the watermark before this pass; after the fill, from the top
+        // of its cut, or not at all when the whole history was confirmed
+        // (an ascending pull from 0 would bring the oldest first).
+        let from = if watermark > 0 {
+            Some(watermark)
+        } else {
+            self.store
+                .sync_ranges(net)?
+                .iter()
+                .filter(|r| r.state == RangeState::Cut)
+                .filter_map(SyncRange::hole_top)
+                .max()
+        };
+        let Some(from) = from else {
+            return Ok(());
+        };
+        let stop_at = self
+            .history_budget()
+            .map(|b| self.store.store_bytes().saturating_add(b));
         for peer in check {
             if pass.served.contains(&peer) || pass.behind.contains(&peer) {
                 continue;
             }
-            match self.sync_from(peer, net).await {
+            match self.sync_from_with(peer, net, from, stop_at).await {
                 Ok(n) => debug!(%net, peer = %peer.fmt_short(), new = n, "checked"),
                 Err(e) => debug!(%net, peer = %peer.fmt_short(), "check failed: {e:#}"),
             }
@@ -649,9 +754,10 @@ impl Node {
     }
 
     /// Open the range a pass walks (ADR 0025 §5): the initial fill when the
-    /// node holds no history of `net`, otherwise a catch-up range from the
-    /// watermark (or the newest pending range) up to now.
-    fn open_range(&self, net: &str) -> Result<()> {
+    /// node holds no history of `net`, otherwise, after an offline period
+    /// (`catch_up`), a catch-up range from the watermark (or the newest
+    /// pending range) up to now.
+    fn open_range(&self, net: &str, catch_up: bool) -> Result<()> {
         let now = now_secs();
         let top = now.saturating_add(MAX_CLOCK_SKEW_SECS);
         let watermark = self.store.sync_watermark(net)?;
@@ -677,7 +783,8 @@ impl Node {
             .iter()
             .filter(|r| r.state == RangeState::Pending)
             .collect();
-        if watermark == 0 && pending.is_empty() {
+        // Nothing missed: online all along, or a watermark ahead of now.
+        if !catch_up || (watermark == 0 && pending.is_empty()) || watermark > now {
             return Ok(());
         }
         let newest = pending.iter().map(|r| r.hi_ts).max();
@@ -712,30 +819,17 @@ impl Node {
         Ok(())
     }
 
-    /// Walk the pending ranges of `net`, newest first.
-    async fn walk_pending(
-        &self,
-        net: &str,
-        neighbors: &[EndpointId],
-        peers: &[EndpointId],
-        pass: &mut Pass,
-    ) -> Result<()> {
+    /// Walk the pending ranges of `net`, newest first: from `peers` (with
+    /// `sync_desc`), then from the older neighbors of the pass.
+    async fn walk_pending(&self, net: &str, peers: &[EndpointId], pass: &mut Pass) -> Result<()> {
         let ranges: Vec<SyncRange> = self
             .store
             .sync_ranges(net)?
             .into_iter()
             .filter(|r| r.state == RangeState::Pending)
             .collect();
-        // Older neighbors, for what no `sync_desc` peer holds.
-        pass.older = neighbors
-            .iter()
-            .copied()
-            .filter(|p| !self.has_feature(p, proto::FEATURE_SYNC_DESC))
-            .collect();
         for mut range in ranges {
-            let end = if peers.is_empty() {
-                self.walk_older(&mut range, neighbors, pass, None).await?
-            } else if range.phase.is_empty() {
+            let end = if range.phase.is_empty() {
                 self.walk_catch_up(&mut range, peers, pass).await?
             } else {
                 self.walk_fill(&mut range, peers, pass).await?
@@ -748,7 +842,8 @@ impl Node {
         Ok(())
     }
 
-    /// A catch-up range, newest first down to its `lo`.
+    /// A catch-up range, newest first down to its `lo`, then what the older
+    /// neighbors hold from its `lo` up (ADR 0025 §5).
     async fn walk_catch_up(
         &self,
         range: &mut SyncRange,
@@ -762,32 +857,16 @@ impl Node {
                 .map(|b| range.base_bytes.saturating_add(b)),
             ..Walk::default()
         };
-        let mut end = self.walk(range, peers, &walk, pass).await?;
-        if end == End::Gapped && !pass.older.is_empty() {
+        let mut end = if peers.is_empty() {
+            End::Failed
+        } else {
+            self.walk(range, peers, &walk, pass).await?
+        };
+        if end != End::Budget && !pass.older.is_empty() {
             let older = pass.older.clone();
-            return self
-                .walk_older(range, &older, pass, Some(range.cursor_ts))
-                .await;
+            end = combine(end, self.walk_older(range, &older, pass, None).await?);
         }
-        if end == End::Gapped {
-            end = End::Complete;
-        }
-        match end {
-            End::Complete | End::Gapped => range.state = RangeState::Done,
-            End::Budget => {
-                warn!(
-                    net = %range.net,
-                    "history: catch-up larger than sync.initial_max; {} – {} skipped",
-                    date(range.lo_ts),
-                    date(range.cursor_ts)
-                );
-                range.state = RangeState::Skipped;
-                range.hi_ts = range.cursor_ts;
-            }
-            End::Failed => {}
-        }
-        self.store.update_sync_range(range)?;
-        Ok(end)
+        self.finish(range, end)
     }
 
     /// The initial fill, phase by phase (ADR 0025 §4).
@@ -799,6 +878,15 @@ impl Node {
     ) -> Result<End> {
         let budget = self.history_budget();
         let net = range.net.clone();
+        // One key's share, for the whole fill but its own posts.
+        let author_cap = budget.map(|b| percent(b, AUTHOR_SHARE));
+        pass.chains = chains(&self.store.rotations()?);
+        // Older peers filter nothing: the window only.
+        if peers.is_empty() && range.phase != PHASE_WINDOW {
+            range.phase = PHASE_WINDOW.into();
+            (range.cursor_ts, range.cursor_id) = (range.hi_ts, String::new());
+            self.store.update_sync_range(range)?;
+        }
         loop {
             let start = self.store.store_bytes();
             let cap = |share: u64| budget.map(|b| start.saturating_add(percent(b, share)));
@@ -807,6 +895,7 @@ impl Node {
                     let walk = Walk {
                         kinds: KEEP_KINDS.iter().map(|k| k.to_string()).collect(),
                         stop_at: cap(KEEP_SHARE),
+                        author_cap,
                         ..Walk::default()
                     };
                     (self.walk(range, peers, &walk, pass).await?, PHASE_OWN)
@@ -836,6 +925,7 @@ impl Node {
                     let walk = Walk {
                         kinds: vec![crate::knowledge::DIGEST_KIND.to_string()],
                         stop_at: cap(KNOWLEDGE_SHARE),
+                        author_cap,
                         ..Walk::default()
                     };
                     let mut end = self.walk(range, peers, &walk, pass).await?;
@@ -853,29 +943,34 @@ impl Node {
                     (end, PHASE_WINDOW)
                 }
                 _ => {
-                    pass.chains = chains(&self.store.rotations()?);
                     let walk = Walk {
                         stop_at: budget.map(|b| range.base_bytes.saturating_add(b)),
-                        author_cap: budget.map(|b| percent(b, AUTHOR_SHARE)),
+                        author_cap,
                         ..Walk::default()
                     };
-                    let end = self.walk(range, peers, &walk, pass).await?;
-                    if end == End::Gapped && !pass.older.is_empty() {
+                    let mut end = if peers.is_empty() {
+                        End::Failed
+                    } else {
+                        self.walk(range, peers, &walk, pass).await?
+                    };
+                    if end != End::Budget && !pass.older.is_empty() {
                         let older = pass.older.clone();
-                        let held = Some(range.cursor_ts);
-                        return self.walk_older(range, &older, pass, held).await;
+                        let held = (range.cursor_ts < range.hi_ts).then_some(range.cursor_ts);
+                        end = combine(end, self.walk_older(range, &older, pass, held).await?);
                     }
-                    return self.end_fill(range, end);
+                    return self.finish(range, end);
                 }
             };
             match end {
-                End::Failed => return Ok(End::Failed),
+                End::Failed => return self.finish(range, End::Failed),
                 End::Budget => info!(
                     %net,
                     phase = %range.phase,
                     "history: the phase reached its share of the budget; moving on"
                 ),
-                End::Gapped => debug!(%net, phase = %range.phase, "history: no peer holds more"),
+                End::Open => {
+                    debug!(%net, phase = %range.phase, "history: phase not confirmed; moving on")
+                }
                 End::Complete => {}
             }
             range.phase = next.to_string();
@@ -884,48 +979,99 @@ impl Node {
         }
     }
 
-    /// The end of the fill: done, with a cut where the budget stopped it
-    /// (or where no peer held more).
-    fn end_fill(&self, range: &mut SyncRange, end: End) -> Result<End> {
+    /// How many unconfirmed passes `range` has had, this one included.
+    fn bump_attempts(&self, net: &str, range: i64) -> u32 {
+        self.set_progress(net, |p| {
+            let n = p.attempts.entry(range).or_default();
+            *n = n.saturating_add(1);
+            *n
+        })
+        .unwrap_or(u32::MAX)
+    }
+
+    /// The end of a walk over `range`: complete, closed (a cut for the
+    /// fill, a skipped range for a catch-up: the budget, or no peer
+    /// confirmed it after [`Tuning::max_attempts`] passes), or still
+    /// pending.
+    fn finish(&self, range: &mut SyncRange, end: End) -> Result<End> {
         let net = range.net.clone();
-        // Gapped: no peer holds older history (their own cuts), so neither
-        // does this node.
-        let cut = match end {
-            End::Failed => return Ok(end),
+        let fill = !range.phase.is_empty();
+        let close = match end {
             End::Complete => false,
-            End::Budget | End::Gapped => true,
+            End::Budget => true,
+            End::Open | End::Failed => {
+                let attempts = self.bump_attempts(&net, range.id);
+                if attempts < self.config.history.max_attempts {
+                    self.store.update_sync_range(range)?;
+                    return Ok(end);
+                }
+                warn!(
+                    %net,
+                    "history: no peer confirmed {} – {} after {attempts} passes; not counted as held",
+                    date(range.lo_ts),
+                    date(range.cursor_ts)
+                );
+                true
+            }
         };
-        if cut {
-            info!(
-                %net,
-                cut = %date(range.cursor_ts),
-                "history: initial fill done; older history is not held here (sync.initial_max)"
+        self.set_progress(&net, |p| {
+            p.attempts.remove(&range.id);
+            if fill {
+                p.author_bytes.clear();
+            }
+        });
+        if fill {
+            // Before its window, nothing below the fill's top is held but
+            // the kinds of its first phases.
+            let top = if range.phase == PHASE_WINDOW {
+                range.cursor_ts
+            } else {
+                range.hi_ts
+            };
+            if close {
+                info!(
+                    %net,
+                    cut = %date(top),
+                    "history: initial fill done; older history is not held here"
+                );
+                self.store.add_sync_range(&SyncRange {
+                    id: 0,
+                    net: net.clone(),
+                    lo_ts: 0,
+                    hi_ts: top,
+                    cursor_ts: top,
+                    cursor_id: String::new(),
+                    state: RangeState::Cut,
+                    phase: String::new(),
+                    opened: now_secs(),
+                    base_bytes: 0,
+                })?;
+            } else {
+                info!(%net, "history: initial fill done, the whole history");
+            }
+            range.phase = PHASE_WINDOW.into();
+            range.state = RangeState::Done;
+        } else if close {
+            warn!(
+                net = %range.net,
+                "history: catch-up not held: {} – {} skipped",
+                date(range.lo_ts),
+                date(range.cursor_ts)
             );
-            self.store.add_sync_range(&SyncRange {
-                id: 0,
-                net: net.clone(),
-                lo_ts: 0,
-                hi_ts: range.cursor_ts,
-                cursor_ts: range.cursor_ts,
-                cursor_id: range.cursor_id.clone(),
-                state: RangeState::Cut,
-                phase: String::new(),
-                opened: now_secs(),
-                base_bytes: 0,
-            })?;
+            range.state = RangeState::Skipped;
+            range.hi_ts = range.cursor_ts;
         } else {
-            info!(%net, "history: initial fill done, the whole history");
+            range.state = RangeState::Done;
         }
-        range.state = RangeState::Done;
         self.store.update_sync_range(range)?;
         Ok(end)
     }
 
     /// Walk down `range` from its cursor, page by page and peer by peer,
     /// persisting the cursor after each page: first from peers that hold
-    /// the range complete, then, when every peer stopped at a range of its
-    /// own still pending, what they hold (`partial`): what the reachable
-    /// swarm holds, as an ascending pull always took.
+    /// the range complete, then, when that confirms nothing, what they hold
+    /// in ranges of their own still pending (`partial`). A `partial`
+    /// answer never completes the range.
     async fn walk(
         &self,
         range: &mut SyncRange,
@@ -934,7 +1080,10 @@ impl Node {
         pass: &mut Pass,
     ) -> Result<End> {
         match self.walk_round(range, peers, walk, pass, false).await? {
-            End::Gapped => self.walk_round(range, peers, walk, pass, true).await,
+            End::Open => match self.walk_round(range, peers, walk, pass, true).await? {
+                End::Budget => Ok(End::Budget),
+                _ => Ok(End::Open),
+            },
             end => Ok(end),
         }
     }
@@ -947,13 +1096,15 @@ impl Node {
         pass: &mut Pass,
         partial: bool,
     ) -> Result<End> {
-        let (mut failed, mut gapped) = (false, false);
+        let mut answered = false;
+        let mut claims = Claims::default();
         for &peer in peers {
             if !partial && pass.behind.contains(&peer) {
-                gapped = true;
+                answered = true;
                 continue;
             }
             loop {
+                self.still_running()?;
                 if walk
                     .stop_at
                     .is_some_and(|stop| self.store.store_bytes() >= stop)
@@ -984,8 +1135,9 @@ impl Node {
                         seen,
                     })) => (events, more, gap, seen),
                     other => {
+                        // One peer failing (or not a member) vetoes nothing:
+                        // the next one is asked.
                         debug!(peer = %peer.fmt_short(), "history page: {other:?}");
-                        failed = true;
                         break;
                     }
                 };
@@ -994,23 +1146,19 @@ impl Node {
                     .await
                 {
                     debug!(peer = %peer.fmt_short(), "history page refused: {e:#}");
-                    failed = true;
                     break;
                 }
+                answered = true;
                 pass.served.insert(peer);
                 self.set_progress(&range.net, |p| p.source = Some(peer));
                 if let Some(Gap { hi_ts }) = gap {
-                    // Everything above the gap came: the next peer goes on
-                    // below it.
-                    let below = hi_ts.saturating_add(1);
-                    if below < range.cursor_ts {
-                        (range.cursor_ts, range.cursor_id) = (below, String::new());
-                    }
-                    if hi_ts >= range.hi_ts {
+                    // The peer holds no more below here. The cursor stays at
+                    // what came: a lying gap skips no history, the next peer
+                    // goes on from there.
+                    if hi_ts >= range.hi_ts && events.is_empty() {
                         pass.behind.insert(peer);
                     }
                     self.store.update_sync_range(range)?;
-                    gapped = true;
                     break;
                 }
                 self.store.update_sync_range(range)?;
@@ -1024,15 +1172,21 @@ impl Node {
                     {
                         return Ok(End::Budget);
                     }
-                    return Ok(End::Complete);
+                    if !partial
+                        && claims.claim(
+                            peer,
+                            self.trusted(&peer),
+                            (range.cursor_ts, &range.cursor_id),
+                        )
+                    {
+                        return Ok(End::Complete);
+                    }
+                    // Not confirmed yet: the next peer, from the same cursor.
+                    break;
                 }
             }
         }
-        Ok(if failed || !gapped {
-            End::Failed
-        } else {
-            End::Gapped
-        })
+        Ok(if answered { End::Open } else { End::Failed })
     }
 
     /// Check a page from `peer` and store its events: strictly descending
@@ -1069,40 +1223,40 @@ impl Node {
             }
             cursor = (h.ts, h.id.to_string());
         }
-        if seen.len() == events.len() {
-            let reports: Vec<(String, u64)> = events
-                .iter()
-                .zip(seen)
-                .filter_map(|(v, s)| Some((head(v)?.author.to_string(), *s)))
-                .collect();
-            if let Err(e) = self.store.record_seen(&peer.to_string(), &reports) {
-                debug!("seen reports not recorded: {e:#}");
-            }
-        }
-        for value in events {
+        let seen = (seen.len() == events.len()).then_some(seen);
+        let mut reports: Vec<(String, u64)> = Vec::new();
+        for (i, value) in events.iter().enumerate() {
             let Some(h) = head(value) else { continue };
-            let (author, kind, id) = (h.author.to_string(), h.kind.to_string(), h.id.to_string());
+            let (author, id) = (h.author.to_string(), h.id.to_string());
             (range.cursor_ts, range.cursor_id) = (h.ts, id.clone());
-            // One key's share of phase 2 (ADR 0025 §4); kept-forever kinds
-            // are never skipped.
+            // One key's share (ADR 0025 §4), kept-forever kinds included:
+            // phase 0 fetched those already.
             let size = serde_json::to_vec(value).map_or(0, |b| b.len() as u64);
             let chain = pass.chain_of(&author).to_string();
             if let Some(cap) = walk.author_cap
-                && !KEEP_KINDS.contains(&kind.as_str())
                 && pass.author_bytes.get(&chain).copied().unwrap_or(0) >= cap
             {
                 continue;
             }
             match self.accept_value(value.clone(), Origin::Pulled).await {
-                Ok(Some((_, true))) => {
+                Ok(Some((event, true))) => {
                     if walk.author_cap.is_some() {
                         let used = pass.author_bytes.entry(chain).or_default();
                         *used = used.saturating_add(size);
                     }
+                    if let Some(at) = seen.and_then(|s| s.get(i)) {
+                        reports.push((event.author().to_string(), *at));
+                    }
                 }
                 Ok(_) => {}
+                // Stopped half-way: the cursor must not pass what was not
+                // stored.
+                Err(e) if self.endpoint().is_closed() => return Err(e),
                 Err(e) => debug!(%id, "history: rejected event: {e:#}"),
             }
+        }
+        if let Err(e) = self.store.record_seen(&peer.to_string(), &reports) {
+            debug!("seen reports not recorded: {e:#}");
         }
         Ok(())
     }
@@ -1139,8 +1293,9 @@ impl Node {
         true
     }
 
-    /// One `get` to `peer`; stores what comes. Returns how many events were
-    /// new.
+    /// One `get` to `peer`; stores what comes, as long as it is what was
+    /// asked: the events of `ids`, their threads, or the replies to them
+    /// and the posts citing them. Returns how many events were new.
     async fn get_from(
         &self,
         peer: EndpointId,
@@ -1165,34 +1320,56 @@ impl Node {
             Ok(Err(e)) => return Err(e),
             Err(_) => bail!("no answer within {timeout:?}"),
         };
-        if seen.len() == events.len() {
-            let reports: Vec<(String, u64)> = events
-                .iter()
-                .zip(&seen)
-                .filter_map(|(v, s)| Some((head(v)?.author.to_string(), *s)))
-                .collect();
-            let _ = self.store.record_seen(&peer.to_string(), &reports);
-        }
+        let asked: HashSet<&str> = ids.iter().map(String::as_str).collect();
+        let field = |v: &Value, key: &str| v.get(key).and_then(Value::as_str).map(str::to_string);
+        let wanted = |v: &Value| -> bool {
+            let is = |key: &str| field(v, key).is_some_and(|x| asked.contains(x.as_str()));
+            match include {
+                "thread" => is("id") || is("thread"),
+                "signals" => {
+                    is("parent")
+                        || v.get("refs").and_then(Value::as_array).is_some_and(|r| {
+                            r.iter()
+                                .filter_map(Value::as_str)
+                                .any(|x| asked.contains(x))
+                        })
+                }
+                _ => is("id"),
+            }
+        };
+        let seen = (seen.len() == events.len()).then_some(seen);
+        let mut reports: Vec<(String, u64)> = Vec::new();
         let mut new: usize = 0;
-        for value in events {
+        for (i, value) in events.into_iter().enumerate() {
             if value.get("net").and_then(Value::as_str) != Some(net) {
                 bail!("peer sent an event of another network");
             }
+            if !wanted(&value) {
+                debug!(peer = %peer.fmt_short(), "get: an event not asked for, not stored");
+                continue;
+            }
             match self.accept_value(value, Origin::Pulled).await {
-                Ok(Some((_, true))) => new = new.saturating_add(1),
+                Ok(Some((event, true))) => {
+                    new = new.saturating_add(1);
+                    if let Some(at) = seen.as_ref().and_then(|s| s.get(i)) {
+                        reports.push((event.author().to_string(), *at));
+                    }
+                }
                 Ok(_) => {}
                 Err(e) => debug!("get: rejected event: {e:#}"),
             }
         }
+        let _ = self.store.record_seen(&peer.to_string(), &reports);
         Ok(new)
     }
 
     /// Older peers (no `sync_desc`): ascending windows from now - 7 days,
     /// then 14, 28…, each read until it meets the history already held,
-    /// until the budget is spent or the range's `lo` is reached. With no
-    /// history `held` yet, the first window is read to its end whatever
-    /// the budget. Also what is left of a range once every `sync_desc`
-    /// peer stopped at a cut of its own.
+    /// until the budget is spent or the range's `lo` is reached. A fill
+    /// with no history `held` yet reads the first window to its end
+    /// whatever the budget. The range is complete only if every window was
+    /// read to its end from a trusted peer; the cursor moves down only
+    /// then.
     async fn walk_older(
         &self,
         range: &mut SyncRange,
@@ -1204,15 +1381,17 @@ impl Node {
         let floor = range.lo_ts;
         let budget = self.history_budget();
         pass.chains = chains(&self.store.rotations()?);
-        let author_cap = if range.phase.is_empty() {
-            None
-        } else {
+        let fill = !range.phase.is_empty();
+        let author_cap = if fill {
             budget.map(|b| percent(b, AUTHOR_SHARE))
+        } else {
+            None
         };
         let stop_at = budget.map(|b| range.base_bytes.saturating_add(b));
         let mut span = OLDER_WINDOW_SECS;
         // `held`: the oldest `ts` held from the windows read so far.
-        let mut first = held.is_none();
+        let mut first = fill && held.is_none();
+        let (mut confirmed, mut answered) = (true, false);
         let end = loop {
             let start = now.saturating_sub(span).max(floor);
             let walk = Walk {
@@ -1222,49 +1401,35 @@ impl Node {
                 ..Walk::default()
             };
             match self.older_window(range, peers, &walk, held, pass).await? {
-                (End::Complete, oldest) => {
+                (End::Complete, oldest, trusted) => {
+                    answered = true;
+                    confirmed &= trusted;
                     held = match (held, oldest) {
                         (Some(h), Some(o)) => Some(h.min(o)),
                         (h, o) => h.or(o),
                     };
-                    // Held from `start` up.
-                    if start < range.cursor_ts {
+                    // Held from `start` up, on a trusted peer's word.
+                    if confirmed && start < range.cursor_ts {
                         (range.cursor_ts, range.cursor_id) = (start, String::new());
                     }
                     self.store.update_sync_range(range)?;
                 }
-                (end, _) => break end,
+                (End::Failed, _, _) if answered => break End::Open,
+                (end, _, _) => break end,
             }
             if start <= floor {
-                break End::Complete;
+                break if confirmed { End::Complete } else { End::Open };
             }
             first = false;
             span = span.saturating_mul(2);
         };
-        match (end, range.phase.is_empty()) {
-            (End::Failed, _) => {}
-            // The fill: done, with a cut at the bottom of the last window
-            // read in full.
-            (_, false) => {
-                range.phase = PHASE_WINDOW.into();
-                return self.end_fill(range, end);
-            }
-            (End::Budget, true) => {
-                range.state = RangeState::Skipped;
-                range.hi_ts = range.cursor_ts;
-                self.store.update_sync_range(range)?;
-            }
-            (_, true) => {
-                range.state = RangeState::Done;
-                self.store.update_sync_range(range)?;
-            }
-        }
         Ok(end)
     }
 
     /// One ascending window from an older peer, from `walk.floor` up to the
-    /// history already `held` (or the end). Returns how it ended and the
-    /// oldest `ts` it brought.
+    /// history already `held` (or the end). Returns how it ended, the
+    /// oldest `ts` it brought, and whether the peer that ended it is
+    /// trusted.
     async fn older_window(
         &self,
         range: &SyncRange,
@@ -1272,7 +1437,7 @@ impl Node {
         walk: &Walk,
         held: Option<u64>,
         pass: &mut Pass,
-    ) -> Result<(End, Option<u64>)> {
+    ) -> Result<(End, Option<u64>, bool)> {
         let mut oldest = None;
         // A cursor of its own: ascending, from the window's start.
         let mut window = range.clone();
@@ -1282,11 +1447,12 @@ impl Node {
         }
         for &peer in peers {
             loop {
+                self.still_running()?;
                 if walk
                     .stop_at
                     .is_some_and(|stop| self.store.store_bytes() >= stop)
                 {
-                    return Ok((End::Budget, oldest));
+                    return Ok((End::Budget, oldest, false));
                 }
                 let request = Request::sync_after(
                     &range.net,
@@ -1343,11 +1509,11 @@ impl Node {
                     tokio::time::sleep(self.config.history.page_pause).await;
                 }
                 if reached.is_some() || !more || events.is_empty() {
-                    return Ok((End::Complete, oldest));
+                    return Ok((End::Complete, oldest, self.trusted(&peer)));
                 }
             }
         }
-        Ok((End::Failed, oldest))
+        Ok((End::Failed, oldest, false))
     }
 
     /// Serve a `sync` request for `net`, honestly (ADR 0025 §3): an
@@ -1388,8 +1554,8 @@ impl Node {
         // A `partial` requester takes what is held in a pending range.
         let holes = match (partial, before.is_some()) {
             (true, _) => self.holes(net, Holes::Intentional),
-            (false, true) => self.holes(net, Holes::All),
-            (false, false) => self.holes(net, Holes::Ascending),
+            (false, true) => self.holes(net, Holes::Serving),
+            (false, false) => self.holes(net, Holes::Serving),
         };
         let mut stop = None;
         match &before {
@@ -1440,19 +1606,37 @@ impl Node {
     }
 
     /// Serve a `get` request (ADR 0025 §3).
+    /// At most [`GET_ROWS_MAX`] events and [`GET_MAX_BYTES`] in all, each
+    /// id once; a thread stops being loaded once the bytes are reached.
     pub(super) fn serve_get(&self, net: &str, ids: &[String], include: &str) -> Response {
         if ids.len() > proto::MAX_GET_IDS {
             return Response::Refused {
                 reason: format!("at most {} ids", proto::MAX_GET_IDS),
             };
         }
+        let mut unique: Vec<String> = Vec::with_capacity(ids.len());
+        for id in ids {
+            if !unique.contains(id) {
+                unique.push(id.clone());
+            }
+        }
+        let ids = unique;
         let rows = match include {
-            "event" => self.store.events_by_ids(net, ids),
+            "event" => self.store.events_by_ids(net, &ids),
             "thread" => {
-                let mut rows = Vec::new();
-                for id in ids {
-                    match self.store.thread_rows(net, id, GET_THREAD_MAX) {
-                        Ok(more) => rows.extend(more),
+                let (mut rows, mut bytes) = (Vec::new(), 0usize);
+                for id in &ids {
+                    let room = GET_ROWS_MAX.saturating_sub(rows.len());
+                    if room == 0 || bytes > GET_MAX_BYTES {
+                        break;
+                    }
+                    match self.store.thread_rows(net, id, GET_THREAD_MAX.min(room)) {
+                        Ok(more) => {
+                            bytes = more.iter().fold(bytes, |b, (v, _)| {
+                                b.saturating_add(serde_json::to_vec(v).map_or(0, |j| j.len()))
+                            });
+                            rows.extend(more);
+                        }
                         Err(e) => {
                             return Response::Refused {
                                 reason: format!("{e:#}"),
@@ -1462,7 +1646,7 @@ impl Node {
                 }
                 Ok(rows)
             }
-            "signals" => self.store.signal_events(net, ids, GET_SIGNALS_MAX),
+            "signals" => self.store.signal_events(net, &ids, GET_ROWS_MAX),
             other => {
                 return Response::Refused {
                     reason: format!("unknown include {other:?}: event, thread or signals"),
@@ -1534,9 +1718,14 @@ impl Node {
                 .lock()
                 .ok()
                 .and_then(|p| p.get(&net).and_then(|p| p.source));
+            // The members of the network up now: trusted ones first.
             let mut others: Vec<EndpointId> = self.neighbors_of(&net);
-            others.extend(self.known_peers());
-            others.sort_by_key(|p| !self.has_feature(p, proto::FEATURE_HISTORY_FULL));
+            others.sort_by_key(|p| {
+                (
+                    !self.trusted(p),
+                    !self.has_feature(p, proto::FEATURE_HISTORY_FULL),
+                )
+            });
             let mut peers: Vec<EndpointId> = Vec::new();
             for peer in source.into_iter().chain(others) {
                 if peer != me
@@ -1571,6 +1760,15 @@ impl Node {
             }
         }
         false
+    }
+
+    /// Fails once the node stopped: a pass still running then writes no
+    /// cursor (a restarted node may already use the store).
+    fn still_running(&self) -> Result<()> {
+        if self.endpoint().is_closed() {
+            bail!("the node stopped");
+        }
+        Ok(())
     }
 
     /// Whether a pending range of `net` remains.
@@ -1620,6 +1818,42 @@ mod tests {
         assert_eq!(chains["b"], "a");
         assert_eq!(chains["y"], "x");
         assert!(!chains.contains_key("a"));
+    }
+
+    fn id(n: u8) -> EndpointId {
+        iroh::SecretKey::from_bytes(&[n; 32]).public()
+    }
+
+    #[test]
+    fn a_range_completes_on_a_trusted_word_or_two_at_one_cursor() {
+        let mut claims = Claims::default();
+        assert!(
+            claims.claim(id(1), true, (10, "a")),
+            "a trusted peer settles it"
+        );
+        let mut claims = Claims::default();
+        assert!(
+            !claims.claim(id(1), false, (10, "a")),
+            "one untrusted peer does not"
+        );
+        assert!(
+            !claims.claim(id(1), false, (10, "a")),
+            "nor twice the same peer"
+        );
+        // A second peer that served more: the first one's word is void.
+        assert!(!claims.claim(id(2), false, (5, "b")));
+        assert!(
+            claims.claim(id(3), false, (5, "b")),
+            "two distinct peers agree"
+        );
+    }
+
+    #[test]
+    fn walks_combine_with_the_budget_first() {
+        assert_eq!(combine(End::Open, End::Budget), End::Budget);
+        assert_eq!(combine(End::Open, End::Complete), End::Complete);
+        assert_eq!(combine(End::Failed, End::Open), End::Open);
+        assert_eq!(combine(End::Failed, End::Failed), End::Failed);
     }
 
     #[test]

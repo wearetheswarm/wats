@@ -250,6 +250,15 @@ impl Request {
             limit,
         }
     }
+
+    /// The same `sync`, asking what the peer holds even in ranges of its
+    /// own still pending: a check, not a claim of complete history.
+    pub fn partial(mut self) -> Self {
+        if let Request::Sync { partial, .. } = &mut self {
+            *partial = true;
+        }
+        self
+    }
 }
 
 /// Send one request to a peer and wait for the response.

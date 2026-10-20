@@ -1698,6 +1698,14 @@ impl Node {
         protocol.set_node(&node);
         // History in the background, one task per network (ADR 0025 §4):
         // nothing here waits for it.
+        if let Some((max, share)) = node.initial_max_clamped() {
+            warn!(
+                "sync.initial_max ({}) is larger than the events share of storage.max ({}): \
+                 the fill stops at the share",
+                format_bytes(max),
+                format_bytes(share)
+            );
+        }
         for net in node.config.nets.clone() {
             node.spawn_history(&net);
         }
@@ -1903,7 +1911,7 @@ impl Node {
             .unwrap_or_default();
         for (net, peers) in nets {
             if !self.config.history.legacy {
-                self.kick_history(&net, &peers);
+                self.kick_history(&net, &peers, true);
                 continue;
             }
             for peer in peers {
@@ -3233,8 +3241,15 @@ impl Node {
                 }
                 Some(Ok(GossipEvent::NeighborUp(id))) => {
                     debug!(%net, peer = %id, "neighbor up");
+                    // The first neighbor: this node was offline on `net`.
+                    let mut first = false;
                     if let Ok(mut n) = self.neighbors.lock() {
-                        n.entry(net.clone()).or_default().insert(id);
+                        let set = n.entry(net.clone()).or_default();
+                        first = set.is_empty();
+                        set.insert(id);
+                    }
+                    if first && !self.config.history.legacy {
+                        self.note_offline(&net);
                     }
                     self.reconnect_kick.notify_one();
                     self.seen(id);
@@ -3250,7 +3265,7 @@ impl Node {
                         // first (ADR 0025); a 0.4.0 node pulled from every
                         // new neighbor, ascending.
                         if !node.config.history.legacy {
-                            node.kick_history(&net, &[id]);
+                            node.kick_history(&net, &[id], first);
                             return;
                         }
                         match node.sync_from(id, &net).await {
@@ -3752,6 +3767,9 @@ impl Node {
         let kind = match &request {
             Request::Hello { .. } => Some(crate::limits::Kind::Hello),
             Request::Sync { .. } => Some(crate::limits::Kind::Sync),
+            Request::Get { include, .. } if include == "thread" => {
+                Some(crate::limits::Kind::GetThread)
+            }
             Request::Get { .. } => Some(crate::limits::Kind::Get),
             Request::Replicate { .. } => Some(crate::limits::Kind::Replicate),
             Request::CrashReport { .. } => Some(crate::limits::Kind::Report),
@@ -3973,18 +3991,33 @@ impl Node {
     /// what a 0.4.0 node does on every new neighbor. Returns how many new
     /// events were stored.
     pub async fn sync_from(&self, peer: EndpointId, net: &str) -> Result<usize> {
-        let started = now_secs();
         let watermark = self.store.sync_watermark(net)?;
+        self.sync_from_with(peer, net, watermark, None).await
+    }
+
+    /// [`Node::sync_from`] from `from` (a watermark), stopping once the
+    /// store holds `stop_at` bytes. The watermark moves only when the peer
+    /// had nothing more and no history range is pending.
+    pub(crate) async fn sync_from_with(
+        &self,
+        peer: EndpointId,
+        net: &str,
+        from: u64,
+        stop_at: Option<u64>,
+    ) -> Result<usize> {
+        let started = now_secs();
         let (mut after_ts, mut after_id) =
-            (watermark.saturating_sub(MAX_CLOCK_SKEW_SECS), String::new());
+            (from.saturating_sub(MAX_CLOCK_SKEW_SECS), String::new());
         let mut new: usize = 0;
+        let mut ended = false;
         for _ in 0..10_000 {
-            let mut request = Request::sync_after(net, after_ts, &after_id, proto::MAX_SYNC_PAGE);
+            if stop_at.is_some_and(|stop| self.store.store_bytes() >= stop) {
+                break;
+            }
             // What the peer holds, a range still pending included: a check,
             // not a claim of complete history.
-            if let Request::Sync { partial, .. } = &mut request {
-                *partial = true;
-            }
+            let request =
+                Request::sync_after(net, after_ts, &after_id, proto::MAX_SYNC_PAGE).partial();
             let (events, more, seen) =
                 match proto::call_solving(self.endpoint(), peer, &request).await? {
                     Response::SyncPage {
@@ -3992,18 +4025,10 @@ impl Node {
                     } => (events, more, seen),
                     other => bail!("unexpected sync response: {other:?}"),
                 };
-            if seen.len() == events.len() {
-                let reports: Vec<(String, u64)> = events
-                    .iter()
-                    .zip(&seen)
-                    .filter_map(|(v, s)| Some((v.get("author")?.as_str()?.to_string(), *s)))
-                    .collect();
-                if let Err(e) = self.store.record_seen(&peer.to_string(), &reports) {
-                    debug!("seen reports not recorded: {e:#}");
-                }
-            }
+            let seen = (seen.len() == events.len()).then_some(seen);
+            let mut reports: Vec<(String, u64)> = Vec::new();
             let mut last = None;
-            for value in events {
+            for (i, value) in events.into_iter().enumerate() {
                 let (Some(ts), Some(id)) = (
                     value.get("ts").and_then(serde_json::Value::as_u64),
                     value
@@ -4019,25 +4044,35 @@ impl Node {
                     bail!("peer sent an out-of-order sync page");
                 }
                 match self.accept_value(value, Origin::Pulled).await {
-                    Ok(Some((_, true))) => new = new.saturating_add(1),
+                    Ok(Some((event, true))) => {
+                        new = new.saturating_add(1);
+                        // Only for what was stored, by its verified author.
+                        if let Some(at) = seen.as_ref().and_then(|s| s.get(i)) {
+                            reports.push((event.author().to_string(), *at));
+                        }
+                    }
                     Ok(_) => {}
                     Err(e) => debug!(%id, "sync: rejected event: {e:#}"),
                 }
                 (after_ts, after_id) = (ts, id.clone());
                 last = Some(id);
             }
+            if let Err(e) = self.store.record_seen(&peer.to_string(), &reports) {
+                debug!("seen reports not recorded: {e:#}");
+            }
             if last.is_none() || !more {
+                ended = true;
                 break;
             }
         }
         // The watermark moves only once no history range is pending (ADR
-        // 0025 §5).
+        // 0025 §5), and when the peer had nothing more.
         let pending = self
             .store
             .sync_ranges(net)?
             .iter()
             .any(|r| r.state == crate::store::RangeState::Pending);
-        if !pending {
+        if ended && !pending {
             self.store.set_sync_watermark(net, started)?;
         }
         Ok(new)

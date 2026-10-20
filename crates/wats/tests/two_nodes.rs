@@ -358,7 +358,8 @@ async fn a_serving_node_keeps_only_halt_events_flowing() -> anyhow::Result<()> {
         matches!(refused, wats::proto::Response::Refused { .. }),
         "{refused:?}"
     );
-    let request = wats::proto::Request::sync_after(PUBLIC_NET, 0, "", 100);
+    // What it holds, as a check (`partial`): this node never synced.
+    let request = wats::proto::Request::sync_after(PUBLIC_NET, 0, "", 100).partial();
     let wats::proto::Response::SyncPage { events, .. } =
         wats::proto::call_solving(a.endpoint(), b.endpoint_id(), &request).await?
     else {
@@ -437,7 +438,8 @@ async fn a_dropped_body_is_served_as_its_tombstone_and_refused() -> anyhow::Resu
     );
 
     // A serves its tombstone to sync.
-    let request = wats::proto::Request::sync_after(PUBLIC_NET, 0, "", 100);
+    // What it holds, as a check (`partial`): this node never synced.
+    let request = wats::proto::Request::sync_after(PUBLIC_NET, 0, "", 100).partial();
     let wats::proto::Response::SyncPage { events, .. } =
         wats::proto::call_solving(b.endpoint(), a.endpoint_id(), &request).await?
     else {

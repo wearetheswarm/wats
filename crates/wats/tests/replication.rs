@@ -252,7 +252,8 @@ async fn sync_requests_are_rate_limited() -> anyhow::Result<()> {
     };
     let a = client("a").await?;
     let b = client("b").await?;
-    let sync = Request::sync_after(PUBLIC_NET, 0, "", 10);
+    // What the server holds: it never synced, so it vouches for nothing.
+    let sync = Request::sync_after(PUBLIC_NET, 0, "", 10).partial();
     let mut answers = Vec::new();
     for _ in 0..4 {
         answers.push(call(a.endpoint(), server.endpoint_id(), &sync).await?);

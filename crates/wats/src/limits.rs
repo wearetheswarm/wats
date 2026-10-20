@@ -65,6 +65,8 @@ pub enum Kind {
     Replicate,
     Report,
     Get,
+    /// `get` of whole threads: a quarter of `get_per_min`.
+    GetThread,
 }
 
 impl Kind {
@@ -75,6 +77,7 @@ impl Kind {
             Kind::Replicate => "replicate",
             Kind::Report => "crash_report",
             Kind::Get => "get",
+            Kind::GetThread => "get_thread",
         }
     }
 }
@@ -129,6 +132,10 @@ impl RateLimiter {
             Kind::Replicate => self.limits.replicate_per_min,
             Kind::Report => self.limits.report_per_min,
             Kind::Get => self.limits.get_per_min,
+            Kind::GetThread => match self.limits.get_per_min {
+                0 => 0,
+                n => (n / 4).max(1),
+            },
         }
     }
 

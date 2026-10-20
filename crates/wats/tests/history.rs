@@ -26,7 +26,7 @@ fn config(dir: &std::path::Path, peers: &[&Arc<Node>]) -> NodeConfig {
     config.min_pow_bits = Some(0);
     config.peers = peers.iter().map(|p| p.endpoint().addr()).collect();
     config.history.page = 16;
-    config.history.older_peers_wait = Duration::from_secs(1);
+    config.history.max_attempts = 3;
     config.history.retry = Duration::from_secs(2);
     config
 }
@@ -84,6 +84,16 @@ fn root(kind: Kind, title: &str, by: &SigningKey, ts: u64) -> Event {
         by,
         ts,
     )
+}
+
+/// A node that holds the whole history of `public`, the reference the
+/// others sync from: its watermark is ahead, so it never catches up and
+/// has no hole, as a node in sync all along (watermark 0 and no range
+/// would be a node with no history yet, which serves nothing as held).
+async fn reference(dir: &std::path::Path) -> anyhow::Result<Arc<Node>> {
+    std::fs::create_dir_all(dir)?;
+    Store::open(&dir.join("events.sqlite"))?.set_sync_watermark(PUBLIC_NET, now_secs() + DAY)?;
+    Node::start(config(dir, &[])).await
 }
 
 /// Store events on a node as if it had them all along.
@@ -163,7 +173,7 @@ fn notes(count: u32, newest: u64) -> Vec<Event> {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_new_node_fills_newest_first_up_to_its_budget() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
-    let a = Node::start(config(&dir.path().join("a"), &[])).await?;
+    let a = reference(&dir.path().join("a")).await?;
     let now = now_secs();
     let base = now - 40 * DAY;
     // Kept forever: an announce and a vouch on it, very old.
@@ -280,7 +290,7 @@ async fn a_new_node_fills_newest_first_up_to_its_budget() -> anyhow::Result<()> 
 #[tokio::test(flavor = "multi_thread")]
 async fn initial_max_zero_pulls_the_whole_history() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
-    let a = Node::start(config(&dir.path().join("a"), &[])).await?;
+    let a = reference(&dir.path().join("a")).await?;
     let window = notes(120, now_secs() - 3600);
     hold(&a, &window);
     let mut b_config = config(&dir.path().join("b"), &[&a]);
@@ -307,7 +317,7 @@ async fn initial_max_zero_pulls_the_whole_history() -> anyhow::Result<()> {
 #[tokio::test(flavor = "multi_thread")]
 async fn catch_up_is_newest_first_and_resumes_after_a_stop() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
-    let a = Node::start(config(&dir.path().join("a"), &[])).await?;
+    let a = reference(&dir.path().join("a")).await?;
     let b_dir = dir.path().join("b");
     let b = Node::start(config(&b_dir, &[&a])).await?;
     done(&b).await;
@@ -362,14 +372,27 @@ async fn catch_up_is_newest_first_and_resumes_after_a_stop() -> anyhow::Result<(
         .collect();
     hold(&a, &later);
     let b = Node::start(config(&b_dir, &[&a])).await?;
-    eventually("the catch-up completes", 60, || {
-        missed
+    for _ in 0..600 {
+        if missed
             .iter()
             .chain(&later)
             .all(|e| seq(&b, &e.id).is_some())
-            .then_some(())
-    })
-    .await;
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(
+        missed
+            .iter()
+            .chain(&later)
+            .all(|e| seq(&b, &e.id).is_some()),
+        "the catch-up completes: {} {:?} missed {} later {}",
+        b.history_json(PUBLIC_NET),
+        b.store().sync_ranges(PUBLIC_NET)?,
+        missed.iter().filter(|e| seq(&b, &e.id).is_some()).count(),
+        later.iter().filter(|e| seq(&b, &e.id).is_some()).count()
+    );
     // The range above first, then the old one resumed.
     let resumed: Vec<i64> = missed
         .iter()
@@ -399,7 +422,7 @@ async fn catch_up_is_newest_first_and_resumes_after_a_stop() -> anyhow::Result<(
 #[tokio::test(flavor = "multi_thread")]
 async fn a_catch_up_beyond_the_budget_is_skipped_and_shown() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
-    let a = Node::start(config(&dir.path().join("a"), &[])).await?;
+    let a = reference(&dir.path().join("a")).await?;
     let b_dir = dir.path().join("b");
     let small = |peers: &[&Arc<Node>]| {
         let mut c = config(&b_dir, peers);
@@ -446,7 +469,7 @@ async fn a_catch_up_beyond_the_budget_is_skipped_and_shown() -> anyhow::Result<(
 #[tokio::test(flavor = "multi_thread")]
 async fn a_cut_is_served_honestly_and_read_fetches_below_it() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
-    let a = Node::start(config(&dir.path().join("a"), &[])).await?;
+    let a = reference(&dir.path().join("a")).await?;
     let now = now_secs();
     let old = root(Kind::Ask, "an old question", &key(1), now - 60 * DAY);
     let recent = reply(&old, Kind::Answer, json!({}), &key(2), now - 60);
@@ -544,7 +567,7 @@ async fn a_cut_is_served_honestly_and_read_fetches_below_it() -> anyhow::Result<
 #[tokio::test(flavor = "multi_thread")]
 async fn one_key_takes_a_small_share_of_the_window() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
-    let a = Node::start(config(&dir.path().join("a"), &[])).await?;
+    let a = reference(&dir.path().join("a")).await?;
     let now = now_secs();
     let junk_key = key(99);
     let junk: Vec<Event> = (0..120u64)
@@ -676,7 +699,7 @@ async fn older_peers_get_stepped_windows_and_interoperate() -> anyhow::Result<()
 #[tokio::test(flavor = "multi_thread")]
 async fn old_history_stays_out_of_wait() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
-    let a = Node::start(config(&dir.path().join("a"), &[])).await?;
+    let a = reference(&dir.path().join("a")).await?;
     let now = now_secs();
     let ancient = root(Kind::Ask, "an ancient question", &key(1), now - 3 * DAY);
     let fresh = root(Kind::Ask, "a fresh question", &key(2), now - 60);
@@ -697,5 +720,369 @@ async fn old_history_stays_out_of_wait() -> anyhow::Result<()> {
     client.cancel().await?;
     b.shutdown().await?;
     a.shutdown().await?;
+    Ok(())
+}
+
+/// REVIEW (B1): a new 0.4.1 node whose only `sync_desc` peer is another new
+/// 0.4.1 node (empty, filling too) and whose other neighbor is a 0.4.0
+/// node holding the history. The empty peer's `partial` answer closes
+/// nothing, and the 0.4.0 neighbor is always pulled.
+#[tokio::test(flavor = "multi_thread")]
+async fn review_partial_peer_hides_older_neighbors_history() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let mut old_config = config(&dir.path().join("old"), &[]);
+    old_config.history.legacy = true;
+    let old = Node::start(old_config).await?;
+    let now = now_secs();
+    let spread: Vec<Event> = (0..40u32)
+        .map(|i| note(i, now - 3600 - u64::from(i) * 3600))
+        .collect();
+    hold(&old, &spread);
+    let b = Node::start(config(&dir.path().join("b"), &[])).await?;
+    let n = Node::start(config(&dir.path().join("n"), &[&b, &old])).await?;
+    done(&n).await;
+    let held = spread.iter().filter(|e| seq(&n, &e.id).is_some()).count();
+    assert_eq!(
+        held,
+        spread.len(),
+        "the 0.4.0 neighbor's history: {} {:?}",
+        n.history_json(PUBLIC_NET),
+        n.store().sync_ranges(PUBLIC_NET)?
+    );
+    for node in [n, b, old] {
+        node.shutdown().await?;
+    }
+    Ok(())
+}
+
+/// REVIEW (B1): the same with a budget (storage.max set), and the control
+/// without the second 0.4.1 node.
+#[tokio::test(flavor = "multi_thread")]
+async fn review_partial_peer_with_budget_and_control() -> anyhow::Result<()> {
+    for with_b in [false, true] {
+        let dir = tempfile::tempdir()?;
+        let mut old_config = config(&dir.path().join("old"), &[]);
+        old_config.history.legacy = true;
+        let old = Node::start(old_config).await?;
+        let now = now_secs();
+        let spread: Vec<Event> = (0..40u32)
+            .map(|i| note(i, now - 3600 - u64::from(i) * 3600))
+            .collect();
+        hold(&old, &spread);
+        let b = Node::start(config(&dir.path().join("b"), &[])).await?;
+        let peers: Vec<&Arc<Node>> = if with_b { vec![&b, &old] } else { vec![&old] };
+        let mut n_config = config(&dir.path().join("n"), &peers);
+        n_config.storage_max = Some(1 << 30);
+        let n = Node::start(n_config).await?;
+        done(&n).await;
+        let held = spread.iter().filter(|e| seq(&n, &e.id).is_some()).count();
+        assert_eq!(held, spread.len(), "with_b={with_b}, state {}", state(&n));
+        for node in [n, b, old] {
+            node.shutdown().await?;
+        }
+    }
+    Ok(())
+}
+
+/// REVIEW (B1): the upgrade path. A 0.4.1 node back after a day offline,
+/// with a 0.4.0 neighbor that holds the day and a fresh 0.4.1 neighbor
+/// that holds nothing: the empty peer completes nothing, the 0.4.0
+/// neighbor is pulled from the old watermark, and only then does the
+/// watermark move.
+#[tokio::test(flavor = "multi_thread")]
+async fn review_catch_up_lost_with_an_empty_desc_peer() -> anyhow::Result<()> {
+    for with_b in [false, true] {
+        let dir = tempfile::tempdir()?;
+        let mut old_config = config(&dir.path().join("old"), &[]);
+        old_config.history.legacy = true;
+        let old = Node::start(old_config).await?;
+        let now = now_secs();
+        let a_dir = dir.path().join("a");
+        {
+            std::fs::create_dir_all(&a_dir)?;
+            let store = Store::open(&a_dir.join("events.sqlite"))?;
+            store.set_sync_watermark(PUBLIC_NET, now - 2 * DAY)?;
+        }
+        let missed: Vec<Event> = (0..30u32)
+            .map(|i| note(i, now - 3600 - u64::from(i) * 1800))
+            .collect();
+        hold(&old, &missed);
+        let b = Node::start(config(&dir.path().join("b"), &[])).await?;
+        let peers: Vec<&Arc<Node>> = if with_b { vec![&b, &old] } else { vec![&old] };
+        let mut a_config = config(&a_dir, &peers);
+        a_config.storage_max = Some(1 << 30);
+        let a = Node::start(a_config).await?;
+        eventually("watermark moves", 60, || {
+            (a.store().sync_watermark(PUBLIC_NET).unwrap() > now - DAY).then_some(())
+        })
+        .await;
+        let held = missed.iter().filter(|e| seq(&a, &e.id).is_some()).count();
+        assert_eq!(held, missed.len(), "with_b={with_b}, state {}", state(&a));
+        for node in [a, b, old] {
+            node.shutdown().await?;
+        }
+    }
+    Ok(())
+}
+
+fn acme_notes(now: u64) -> Vec<Event> {
+    (0..10u32)
+        .map(|i| {
+            sign(
+                Draft {
+                    net: "acme".into(),
+                    kind: Some(Kind::Note),
+                    title: Some(format!("acme {i}")),
+                    text: "acme".into(),
+                    ..Draft::default()
+                },
+                &key(500 + i),
+                now - 7200 - u64::from(i) * 60,
+            )
+        })
+        .collect()
+}
+
+/// REVIEW (S2): two 0.4.1 nodes on a second network, both new, and a
+/// public-only 0.4.1 node both know. Only the members of `acme` are asked,
+/// one failure vetoes nothing, and two fills that nobody can confirm do
+/// not stay pending: each closes with a cut after `max_attempts` passes.
+#[tokio::test(flavor = "multi_thread")]
+async fn review_a_non_member_known_peer_blocks_the_partial_round() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let z = Node::start(config(&dir.path().join("z"), &[])).await?;
+    let nets = vec![PUBLIC_NET.to_string(), "acme".to_string()];
+    let mut y_config = config(&dir.path().join("y"), &[&z]);
+    y_config.nets = nets.clone();
+    let y = Node::start(y_config).await?;
+    let acme = acme_notes(now_secs());
+    hold(&y, &acme);
+    let mut x_config = config(&dir.path().join("x"), &[&z, &y]);
+    x_config.nets = nets;
+    let x = Node::start(x_config).await?;
+    eventually("x holds the acme history", 30, || {
+        acme.iter().all(|e| seq(&x, &e.id).is_some()).then_some(())
+    })
+    .await;
+    for node in [&x, &y] {
+        eventually("the acme fill closes", 60, || {
+            let h = node.history_json("acme");
+            matches!(h["state"].as_str(), Some("done")).then_some(())
+        })
+        .await;
+        assert!(
+            node.store()
+                .sync_ranges("acme")?
+                .iter()
+                .any(|r| r.state == RangeState::Cut),
+            "nobody confirmed older acme history"
+        );
+        assert!(!node.history_full());
+    }
+    for node in [x, y, z] {
+        node.shutdown().await?;
+    }
+    Ok(())
+}
+
+/// REVIEW (S2): the control, without the non-member.
+#[tokio::test(flavor = "multi_thread")]
+async fn review_control_without_non_member() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let z = Node::start(config(&dir.path().join("z"), &[])).await?;
+    let nets = vec![PUBLIC_NET.to_string(), "acme".to_string()];
+    let mut y_config = config(&dir.path().join("y"), &[]);
+    y_config.nets = nets.clone();
+    let y = Node::start(y_config).await?;
+    let acme = acme_notes(now_secs());
+    hold(&y, &acme);
+    let mut x_config = config(&dir.path().join("x"), &[&y]);
+    x_config.nets = nets;
+    let x = Node::start(x_config).await?;
+    eventually("x holds the acme history", 30, || {
+        acme.iter().all(|e| seq(&x, &e.id).is_some()).then_some(())
+    })
+    .await;
+    eventually("the acme fill closes", 60, || {
+        (x.history_json("acme")["state"] == "done").then_some(())
+    })
+    .await;
+    for node in [x, y, z] {
+        node.shutdown().await?;
+    }
+    Ok(())
+}
+
+/// REVIEW (S3): the 2 % per-key share applies to kept-forever kinds too:
+/// one key's junk `announce`s do not take the window.
+#[tokio::test(flavor = "multi_thread")]
+async fn review_keep_kinds_bypass_the_key_share() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let a = reference(&dir.path().join("a")).await?;
+    let now = now_secs();
+    let junk_key = key(99);
+    let junk: Vec<Event> = (0..120u64)
+        .map(|i| {
+            sign(
+                Draft {
+                    net: PUBLIC_NET.into(),
+                    kind: Some(Kind::Announce),
+                    title: Some(format!("junk {i}")),
+                    text: "junk ".repeat(300),
+                    ..Draft::default()
+                },
+                &junk_key,
+                now - 60 - i,
+            )
+        })
+        .collect();
+    let real = notes(80, now - 3600);
+    hold(&a, &junk);
+    hold(&a, &real);
+    let mut b_config = config(&dir.path().join("b"), &[&a]);
+    b_config.initial_max = InitialMax::Bytes(400 * 1024);
+    let b = Node::start(b_config).await?;
+    done(&b).await;
+    let junk_held = junk.iter().filter(|e| seq(&b, &e.id).is_some()).count();
+    let real_held = real.iter().filter(|e| seq(&b, &e.id).is_some()).count();
+    // 2 % of 400 KiB: a handful of 1.6 KiB announces, phase 0 included.
+    assert!(junk_held <= 8, "{junk_held} junk announces held");
+    assert!(real_held >= 40, "{real_held} real notes held");
+    b.shutdown().await?;
+    a.shutdown().await?;
+    Ok(())
+}
+
+/// S6: a catch-up whose only peer stops at a hole everywhere is skipped,
+/// with its dates, never counted as held: a full node then does not say
+/// `history_full`, and refuses an ascending pull from below it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_catch_up_nobody_confirms_is_skipped_not_done() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let now = now_secs();
+    let a_dir = dir.path().join("a");
+    {
+        std::fs::create_dir_all(&a_dir)?;
+        let store = Store::open(&a_dir.join("events.sqlite"))?;
+        store.set_sync_watermark(PUBLIC_NET, now - 2 * DAY)?;
+    }
+    // A fresh peer: its own fill is pending, a hole at the top.
+    let b = Node::start(config(&dir.path().join("b"), &[])).await?;
+    let mut a_config = config(&a_dir, &[&b]);
+    a_config.initial_max = InitialMax::Bytes(0);
+    let a = Node::start(a_config).await?;
+    let skipped = eventually("a skipped range", 60, || {
+        a.store()
+            .sync_ranges(PUBLIC_NET)
+            .unwrap()
+            .into_iter()
+            .find(|r| r.state == RangeState::Skipped)
+    })
+    .await;
+    assert!(skipped.lo_ts <= now - 2 * DAY);
+    assert!(
+        !a.store()
+            .sync_ranges(PUBLIC_NET)?
+            .iter()
+            .any(|r| r.state == RangeState::Done && r.phase.is_empty()),
+        "never done"
+    );
+    assert!(!a.history_full());
+    let line = wats::node::history::line(&a.history_json(PUBLIC_NET));
+    assert!(line.contains("skipped"), "{line}");
+    let pull = Request::sync_after(PUBLIC_NET, now - 2 * DAY, "", 50);
+    assert!(matches!(
+        wats::proto::call_solving(b.endpoint(), a.endpoint_id(), &pull).await?,
+        Response::Refused { .. }
+    ));
+    a.shutdown().await?;
+    b.shutdown().await?;
+    Ok(())
+}
+
+/// B1: a node with no history yet (watermark 0, no range) serves nothing
+/// as complete: a 0.4.0 pull is refused, a descending page gets a gap, and
+/// only a `partial` request gets what it holds.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_node_with_no_history_yet_serves_a_hole() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let mut a_config = config(&dir.path().join("a"), &[]);
+    // Its fill stays pending: as before its first pass.
+    a_config.history.max_attempts = 1000;
+    let a = Node::start(a_config).await?;
+    assert_eq!(a.history_holes(PUBLIC_NET).len(), 1, "before any pass");
+    let mut b_config = config(&dir.path().join("b"), &[&a]);
+    b_config.history.legacy = true;
+    let b = Node::start(b_config).await?;
+    let held = notes(4, now_secs() - 60);
+    hold(&a, &held);
+    let call = |request: Request| {
+        let (b, a) = (Arc::clone(&b), a.endpoint_id());
+        async move { wats::proto::call_solving(b.endpoint(), a, &request).await }
+    };
+    assert!(matches!(
+        call(Request::sync_after(PUBLIC_NET, 0, "", 50)).await?,
+        Response::Refused { .. }
+    ));
+    let desc = |partial| Request::Sync {
+        net: PUBLIC_NET.into(),
+        after_ts: 0,
+        after_id: String::new(),
+        before_ts: Some(now_secs() + 60),
+        before_id: Some(String::new()),
+        kinds: vec![],
+        authors: vec![],
+        partial,
+        limit: 50,
+    };
+    match call(desc(false)).await? {
+        Response::SyncPage { events, gap, .. } => {
+            assert!(events.is_empty() && gap.is_some());
+        }
+        other => panic!("{other:?}"),
+    }
+    match call(desc(true)).await? {
+        Response::SyncPage { events, gap, .. } => {
+            assert_eq!(events.len(), held.len());
+            assert!(gap.is_none());
+        }
+        other => panic!("{other:?}"),
+    }
+    a.shutdown().await?;
+    b.shutdown().await?;
+    Ok(())
+}
+
+/// S5: a `get` answers each id once; smaller fixes: `sync.initial_max`
+/// larger than the events share is clamped to it.
+#[tokio::test(flavor = "multi_thread")]
+async fn get_answers_each_id_once_and_the_budget_is_clamped() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let a = reference(&dir.path().join("a")).await?;
+    let mut b_config = config(&dir.path().join("b"), &[&a]);
+    b_config.history.legacy = true;
+    b_config.storage_max = Some(4 << 20);
+    b_config.initial_max = InitialMax::Bytes(1 << 30);
+    let b = Node::start(b_config).await?;
+    assert_eq!(b.history_budget(), b.events_share());
+    assert_eq!(b.history_budget(), Some(2 << 20));
+    let posts = notes(2, now_secs() - 60);
+    hold(&a, &posts);
+    let ids = vec![
+        posts[0].id.clone(),
+        posts[0].id.clone(),
+        posts[1].id.clone(),
+    ];
+    let get = Request::Get {
+        net: PUBLIC_NET.into(),
+        ids,
+        include: "thread".into(),
+    };
+    match wats::proto::call_solving(b.endpoint(), a.endpoint_id(), &get).await? {
+        Response::SyncPage { events, .. } => assert_eq!(events.len(), 2),
+        other => panic!("{other:?}"),
+    }
+    a.shutdown().await?;
+    b.shutdown().await?;
     Ok(())
 }

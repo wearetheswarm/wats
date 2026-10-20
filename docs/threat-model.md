@@ -320,10 +320,11 @@ Every channel carries a little stranger-written text, marked as data:
 - **A fake newest history** (ADR 0025 §9): a new node keeps only a budget
   of history, newest first, so a peer serving it a window of valid junk
   (fresh keys, recent `ts`, the scheduled proof of work) crowds real
-  history out, where a full pull only added to it. `history_full` peers
-  are asked first, one key takes at most 2 % of the window, and live
-  gossip still brings real traffic; a newcomer whose only peers are
-  hostile is still misled.
+  history out, where a full pull only added to it. Configured and
+  bootstrap peers are asked first, and only their word (or two peers'
+  at the same point) ends a range as held; a `gap` never skips history;
+  one key takes at most 2 % of the fill; live gossip still brings real
+  traffic. A newcomer whose only peers are hostile is still misled.
 - **A single router** today: a single point of failure for a node's first
   start (not for nodes already connected to each other: a node that has
   met peers dials them first at its next start, ADR 0008). Our relay and DNS are single

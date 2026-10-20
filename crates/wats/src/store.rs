@@ -23,7 +23,7 @@ use crate::event::{Event, Kind};
 pub const INDEXED_TAGS: usize = 16;
 use crate::wire::RawEvent;
 
-const SCHEMA_VERSION: i64 = 8;
+const SCHEMA_VERSION: i64 = 7;
 
 const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS events (
@@ -100,7 +100,7 @@ CREATE TABLE IF NOT EXISTS dropped (
     detail    TEXT
 );
 
--- History ranges (ADR 0025 §5, schema 8): what this node still has to
+-- History ranges (ADR 0025 §5): what this node still has to
 -- fetch newest first (pending), or chose not to hold (cut, skipped).
 CREATE TABLE IF NOT EXISTS sync_ranges (
     id         INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -124,7 +124,7 @@ CREATE TABLE IF NOT EXISTS sync_ranges (
 CREATE INDEX IF NOT EXISTS sync_ranges_net ON sync_ranges (net, state);
 
 -- When peers say they first stored an event of a key (`seen` in sync pages,
--- ADR 0025, schema 8): each peer's earliest report per key. Recorded for a
+-- ADR 0025): the earliest reports of at most 8 peers per key. Recorded for a
 -- later age floor; reputation does not read it yet.
 CREATE TABLE IF NOT EXISTS key_seen (
     author TEXT NOT NULL,
@@ -726,8 +726,9 @@ impl Store {
             )?;
         }
         // v4 -> v5: the drop records table (ADR 0020), created by SCHEMA
-        // above. Events are kept. v7 -> v8: the history ranges and the
-        // peers' first sightings (ADR 0025), created by SCHEMA too; the
+        // above. Events are kept. The history ranges and the peers' first
+        // sightings (ADR 0025) are created by SCHEMA too, on any version:
+        // no schema bump, so 0.4.0 still opens the store, and the
         // watermark keeps its meaning, so nothing is synced again.
         if (4..6).contains(&version) {
             // v5 -> v6: the citations table (ADR 0019), filled from the
@@ -2453,6 +2454,9 @@ fn marks(n: usize) -> String {
     vec!["?"; n].join(",")
 }
 
+/// Peers whose first sightings of a key are kept (ADR 0025 §9).
+pub const SEEN_PEERS: i64 = 8;
+
 /// A Unix time as SQLite stores it.
 fn sql_ts(ts: u64) -> i64 {
     ts.min(i64::MAX as u64) as i64
@@ -2733,7 +2737,9 @@ impl Store {
     }
 
     /// Record what `peer` says about when it first stored events of these
-    /// authors (`seen` in sync pages): its earliest report per author.
+    /// authors (`seen` in sync pages): its earliest report per author. The
+    /// callers pass only events they stored, by their verified author. At
+    /// most [`SEEN_PEERS`] peers per key: the earliest reports are kept.
     pub fn record_seen(&self, peer: &str, reports: &[(String, u64)]) -> Result<()> {
         if reports.is_empty() {
             return Ok(());
@@ -2741,12 +2747,38 @@ impl Store {
         let mut conn = self.conn();
         let tx = conn.transaction()?;
         {
-            let mut stmt = tx.prepare_cached(
-                "INSERT INTO key_seen (author, peer, seen) VALUES (?1, ?2, ?3)
-                 ON CONFLICT (author, peer) DO UPDATE SET seen = min(seen, ?3)",
+            let mut known = tx.prepare_cached(
+                "UPDATE key_seen SET seen = min(seen, ?3) WHERE author = ?1 AND peer = ?2",
             )?;
+            let mut latest = tx.prepare_cached(
+                "SELECT peer, seen, (SELECT count(*) FROM key_seen WHERE author = ?1)
+                 FROM key_seen WHERE author = ?1 ORDER BY seen DESC, peer DESC LIMIT 1",
+            )?;
+            let mut forget =
+                tx.prepare_cached("DELETE FROM key_seen WHERE author = ?1 AND peer = ?2")?;
+            let mut insert =
+                tx.prepare_cached("INSERT INTO key_seen (author, peer, seen) VALUES (?1, ?2, ?3)")?;
             for (author, seen) in reports {
-                stmt.execute(params![author, peer, sql_ts(*seen)])?;
+                if author.len() > 64 {
+                    continue;
+                }
+                let seen = sql_ts(*seen);
+                if known.execute(params![author, peer, seen])? > 0 {
+                    continue;
+                }
+                let last: Option<(String, i64, i64)> = latest
+                    .query_row([author], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+                    .optional()?;
+                match last {
+                    Some((_, _, count)) if count < SEEN_PEERS => {}
+                    None => {}
+                    // Full: the latest report gives way to an earlier one.
+                    Some((other, latest, _)) if seen < latest => {
+                        forget.execute(params![author, other])?;
+                    }
+                    Some(_) => continue,
+                }
+                insert.execute(params![author, peer, seen])?;
             }
         }
         tx.commit()?;
@@ -3895,15 +3927,20 @@ mod tests {
     }
 
     #[test]
-    fn migrates_schema_v7_without_a_resync() {
+    fn history_tables_need_no_schema_bump() {
         let store = Store::open_in_memory().unwrap();
         let event = post(1, 10, Kind::Note, &[], "kept across the migration");
         store.insert(&event, 10).unwrap();
         store.set_sync_watermark("public", 77).unwrap();
         let conn = store.conn.into_inner().unwrap();
-        conn.execute_batch("DROP TABLE sync_ranges; DROP TABLE key_seen; PRAGMA user_version = 7;")
+        conn.execute_batch("DROP TABLE sync_ranges; DROP TABLE key_seen;")
             .unwrap();
         let store = Store::init(conn).unwrap();
+        let version: i64 = store
+            .conn()
+            .pragma_query_value(None, "user_version", |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, 7, "a store 0.4.0 still opens");
         assert_eq!(store.count().unwrap(), 1);
         assert_eq!(
             store.sync_watermark("public").unwrap(),
@@ -3945,6 +3982,41 @@ mod tests {
             store.author_seen_estimate(&late.author).unwrap(),
             Some(1_200)
         );
+    }
+
+    #[test]
+    fn first_sightings_keep_the_earliest_of_eight_peers() {
+        let store = Store::open_in_memory().unwrap();
+        let author = "ab".repeat(32);
+        for i in 0..12u64 {
+            store
+                .record_seen(&format!("p{i}"), &[(author.clone(), 1_000 + i * 10)])
+                .unwrap();
+        }
+        // An earlier report from a new peer replaces the latest one.
+        store
+            .record_seen("early", &[(author.clone(), 500)])
+            .unwrap();
+        let rows: Vec<(String, i64)> = {
+            let conn = store.conn();
+            let mut stmt = conn
+                .prepare("SELECT peer, seen FROM key_seen WHERE author = ? ORDER BY seen")
+                .unwrap();
+            stmt.query_map([&author], |r| Ok((r.get(0)?, r.get(1)?)))
+                .unwrap()
+                .map(Result::unwrap)
+                .collect()
+        };
+        assert_eq!(rows.len(), SEEN_PEERS as usize);
+        assert_eq!(rows[0], ("early".to_string(), 500));
+        assert_eq!(rows[7], ("p6".to_string(), 1_060));
+        // Too long to be a key: not recorded.
+        store.record_seen("p1", &[("x".repeat(65), 1)]).unwrap();
+        let count: i64 = store
+            .conn()
+            .query_row("SELECT count(*) FROM key_seen", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, SEEN_PEERS);
     }
 
     /// Store bytes per event at 50k events, for `sync.initial_max`
