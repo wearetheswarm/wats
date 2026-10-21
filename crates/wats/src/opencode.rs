@@ -86,7 +86,7 @@ pub const KNOWN_KEYS: [&str; 17] = [
 
 /// Arguments that would undo a `swarm-only` or `workspace` run: another
 /// agent, auto-approval, another server or directory, an old session.
-pub const REFUSED_ARGS: [&str; 11] = [
+pub const REFUSED_ARGS: [&str; 12] = [
     "--agent",
     "--auto",
     "--yolo",
@@ -98,7 +98,22 @@ pub const REFUSED_ARGS: [&str; 11] = [
     "--session",
     "-s",
     "--fork",
+    "--command",
 ];
+
+/// Built-in permissions that are no tool of [`KNOWN_KEYS`] but that a
+/// workspace MCP server's `<name>_*` rule could match (OpenCode 1.19.3:
+/// workflow approval, plan mode): denied after those rules too.
+pub const OTHER_BUILTIN_KEYS: [&str; 3] = ["workflow_tool_approval", "plan_enter", "plan_exit"];
+
+/// The `OPENCODE_*` variables a `swarm-only` or `workspace` run keeps
+/// from wats's own environment: those that only turn something off, and
+/// Windows' Git Bash path. Every other one is removed (it could add
+/// config, permissions, tools, or move OpenCode's home or managed config:
+/// `OPENCODE_TEST_HOME`, `OPENCODE_TEST_MANAGED_CONFIG_DIR`…); wats then
+/// sets its own.
+pub const KEPT_ENV_PREFIX: &str = "OPENCODE_DISABLE_";
+pub const KEPT_ENV: [&str; 1] = ["OPENCODE_GIT_BASH_PATH"];
 
 /// The agent's own OpenCode config home: `XDG_CONFIG_HOME` of its runs.
 pub fn config_home(work_dir: &Path) -> PathBuf {
@@ -274,6 +289,14 @@ pub fn tools(entries: &[String]) -> Result<(Vec<Tool>, Vec<String>)> {
             ),
             None => (entry, None),
         };
+        // OpenCode matches a rule's key as a wildcard: `t*sk` would be
+        // `task`, `*` everything.
+        if name.contains(['*', '?']) {
+            bail!(
+                "agent.tools: `{name}`: wildcards are refused in OpenCode tool names (a pattern \
+                 would also match tools wats denies, such as task); list each tool"
+            );
+        }
         let lower = name.to_ascii_lowercase();
         let key = if KNOWN_KEYS.contains(&lower.as_str()) {
             if lower == "shell" {
@@ -291,10 +314,10 @@ pub fn tools(entries: &[String]) -> Result<(Vec<Tool>, Vec<String>)> {
                  default rules (a shell included), not the wats agent's (ADR 0031)"
             );
         }
-        if key == "external_directory" && pattern.as_deref().is_none_or(str::is_empty) {
+        if key == "external_directory" {
             bail!(
-                "agent.tools: a bare `external_directory` would let the agent's file tools out \
-                 of its workspace: give the directory, e.g. external_directory(/srv/docs/**)"
+                "agent.tools: `external_directory` is refused for OpenCode: the agent's file \
+                 tools stay in its workspace (put what it may read there, or use inherit)"
             );
         }
         let pattern = pattern.filter(|p| !p.is_empty());
@@ -368,10 +391,12 @@ pub struct Permissions<'a> {
 }
 
 /// The permission object of a `swarm-only` or `workspace` run: `"*"`
-/// denied, then every [`KNOWN_KEYS`] denied unless `agent.tools` lists it
-/// (`workspace`), then the other listed names, the workspace's MCP
-/// servers (`<name>_*`), and `wats_*` allowed last. `None` at `inherit`:
-/// the user's own rules apply.
+/// denied; the workspace's MCP servers (`<name>_*`, `workspace`); then
+/// every [`KNOWN_KEYS`] denied unless `agent.tools` lists it, and the
+/// [`OTHER_BUILTIN_KEYS`] denied, after the servers (a server named
+/// `external` would otherwise allow `external_directory`, the last match
+/// winning); the other listed names; and `wats_*` allowed last. `None`
+/// at `inherit`: the user's own rules apply.
 pub fn permission(p: &Permissions) -> Option<String> {
     if p.access == Access::Inherit {
         return None;
@@ -386,6 +411,11 @@ pub fn permission(p: &Permissions) -> Option<String> {
         listed.iter().find(|t| t.key == key)
     };
     let mut pairs: Vec<(String, String)> = vec![("*".into(), DENY.into())];
+    if p.access == Access::Workspace {
+        for server in p.servers {
+            pairs.push((format!("{}_*", sanitize(server)), ALLOW.into()));
+        }
+    }
     for key in KNOWN_KEYS {
         let rule = match find(key) {
             Some(tool) => rule(key, tool, p),
@@ -393,14 +423,12 @@ pub fn permission(p: &Permissions) -> Option<String> {
         };
         pairs.push((key.to_string(), rule));
     }
+    for key in OTHER_BUILTIN_KEYS {
+        pairs.push((key.to_string(), DENY.into()));
+    }
     for tool in listed {
         if !KNOWN_KEYS.contains(&tool.key.as_str()) {
             pairs.push((tool.key.clone(), rule(&tool.key, tool, p)));
-        }
-    }
-    if p.access == Access::Workspace {
-        for server in p.servers {
-            pairs.push((format!("{}_*", sanitize(server)), ALLOW.into()));
         }
     }
     // Last: it must win over "*".
@@ -436,10 +464,6 @@ fn rule(key: &str, tool: &Tool, p: &Permissions) -> String {
             for pattern in ["*opencode.json*", "*.opencode/*"] {
                 pairs.push((pattern.into(), DENY.into()));
             }
-        }
-        // Outside the workspace, only the directories given.
-        "external_directory" => {
-            pairs.insert(0, ("*".into(), DENY.into()));
         }
         _ => {
             if tool.patterns.is_empty() {
@@ -536,17 +560,162 @@ pub fn run_env(access: Access, work_dir: &Path, config: &str) -> Vec<(&'static s
 }
 
 /// The variables of `vars` a `swarm-only` or `workspace` run removes:
-/// they would add config or permissions, or turn experimental tools on.
+/// every `OPENCODE_*` but [`KEPT_ENV_PREFIX`] and [`KEPT_ENV`].
 pub fn removed_env(vars: impl Iterator<Item = (OsString, OsString)>) -> Vec<OsString> {
     vars.map(|(k, _)| k)
         .filter(|k| {
             let k = k.to_string_lossy();
-            matches!(
-                k.as_ref(),
-                "OPENCODE_CONFIG" | "OPENCODE_CONFIG_DIR" | "OPENCODE_PERMISSION"
-            ) || k.starts_with("OPENCODE_EXPERIMENTAL")
+            k.starts_with("OPENCODE_")
+                && !k.starts_with(KEPT_ENV_PREFIX)
+                && !KEPT_ENV.contains(&k.as_ref())
         })
         .collect()
+}
+
+/// Check `agent.model` for OpenCode: `provider/model`, passed as
+/// `--model=<value>`.
+pub fn check_model(model: &str) -> Result<()> {
+    let ok = !model.starts_with('-')
+        && !model.chars().any(char::is_whitespace)
+        && model
+            .split_once('/')
+            .is_some_and(|(provider, name)| !provider.is_empty() && !name.is_empty());
+    if !ok {
+        bail!("agent.model {model:?}: OpenCode takes provider/model, e.g. azure/gpt-5");
+    }
+    Ok(())
+}
+
+/// The agent definitions OpenCode merges into an agent's config, by key
+/// (`mode` is merged into `agent` after `OPENCODE_CONFIG_CONTENT`;
+/// `agents` is the v2 spelling).
+const AGENT_KEYS: [&str; 3] = ["agent", "agents", "mode"];
+
+/// The directories of markdown agent files, in a config directory.
+const AGENT_DIRS: [&str; 4] = ["agent", "agents", "mode", "modes"];
+
+/// Whether a permission rule value allows anything (`"allow"`, or an
+/// object with an `"allow"`).
+fn allows(value: &Value) -> bool {
+    match value {
+        Value::String(s) => s == "allow",
+        Value::Object(map) => map.values().any(|v| v == "allow"),
+        _ => false,
+    }
+}
+
+/// A rule of a config's `permission` (or legacy `tools`) block that
+/// allows by wildcard: OpenCode keeps such a key where the config put it,
+/// so it can come after wats's denies and win. `None`: none.
+fn wildcard_allow(config: &Value) -> Option<String> {
+    let wild = |k: &str| k.contains(['*', '?']);
+    match &config["permission"] {
+        Value::String(s) if s == "allow" => return Some("permission = \"allow\"".into()),
+        Value::Object(map) => {
+            if let Some((k, _)) = map.iter().find(|(k, v)| wild(k) && allows(v)) {
+                return Some(format!("permission.{k}"));
+            }
+        }
+        _ => {}
+    }
+    config["tools"]
+        .as_object()?
+        .iter()
+        .find(|(k, v)| wild(k) && **v == Value::Bool(true))
+        .map(|(k, _)| format!("tools.{k}"))
+}
+
+/// Refuse a config that could change the run's agent or out-order its
+/// rules: an `agent`, `agents` or `mode` entry named `wats`, or a
+/// wildcard allow in `permission` or `tools`.
+fn check_config_file(path: &Path) -> Result<()> {
+    let text = std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
+    let config: Value = serde_json::from_str(&strip_jsonc(&text))
+        .with_context(|| format!("{}: not valid JSON(C)", path.display()))?;
+    for key in AGENT_KEYS {
+        if config[key].get(AGENT).is_some() {
+            bail!(
+                "{}: defines {key}.{AGENT}, which OpenCode would merge into the agent wats gives \
+                 every run: rename it (ADR 0031)",
+                path.display()
+            );
+        }
+    }
+    if let Some(rule) = wildcard_allow(&config) {
+        bail!(
+            "{}: {rule} allows by wildcard, which could win over the rules wats gives an \
+             OpenCode run: list the tools it allows instead (ADR 0031)",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
+/// Refuse a markdown agent named `wats` in a config directory
+/// (`<dir>/{agent,agents,mode,modes}/wats.md`).
+fn check_agent_files(dir: &Path) -> Result<()> {
+    for sub in AGENT_DIRS {
+        let path = dir.join(sub).join(format!("{AGENT}.md"));
+        if path.exists() {
+            bail!(
+                "{} defines an OpenCode agent named {AGENT}, the agent wats gives every run: \
+                 rename it (ADR 0031)",
+                path.display()
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Before every run (ADR 0031 §4): the config sources an OpenCode run
+/// reads and wats can check. The agent's own OpenCode directory at
+/// `swarm-only` and `workspace`; at `workspace` also the project config
+/// of the run directory and of every directory above it, as OpenCode
+/// walks them outside a git repository (`opencode.json(c)` and
+/// `.opencode/`). `~/.opencode/` is not read (a documented gap, ADR 0031
+/// §4); `inherit` checks nothing.
+pub fn check_config_sources(
+    access: Access,
+    run_dir: &Path,
+    work_dir: &Path,
+    home: Option<&Path>,
+) -> Result<()> {
+    if access == Access::Inherit {
+        return Ok(());
+    }
+    if ISOLATE_GLOBAL_CONFIG {
+        let dir = agent_dir(work_dir);
+        for name in ["config.json", "opencode.json", "opencode.jsonc"] {
+            let path = dir.join(name);
+            if path.exists() {
+                check_config_file(&path)?;
+            }
+        }
+        check_agent_files(&dir)?;
+    }
+    if access != Access::Workspace {
+        return Ok(());
+    }
+    for dir in run_dir.ancestors() {
+        for name in ["opencode.json", "opencode.jsonc"] {
+            let path = dir.join(name);
+            if path.exists() {
+                check_config_file(&path)?;
+            }
+        }
+        if Some(dir) == home {
+            continue;
+        }
+        let dot = dir.join(".opencode");
+        for name in ["opencode.json", "opencode.jsonc"] {
+            let path = dot.join(name);
+            if path.exists() {
+                check_config_file(&path)?;
+            }
+        }
+        check_agent_files(&dot)?;
+    }
+    Ok(())
 }
 
 /// JSONC as plain JSON: comments and trailing commas removed, strings
@@ -620,8 +789,8 @@ pub fn workspace_files(workdir: &Path) -> Vec<PathBuf> {
 }
 
 /// The MCP servers of the workspace's OpenCode config (their tools are
-/// allowed at `workspace`). Refuses a config that is not JSONC, or that
-/// defines `agent.wats` (it would be merged into the run's agent).
+/// allowed at `workspace`). Refuses a config that is not JSONC; what else
+/// a config may not hold is [`check_config_sources`]'.
 pub fn workspace_servers(workdir: &Path) -> Result<Vec<String>> {
     let mut names = Vec::new();
     for path in workspace_files(workdir) {
@@ -629,13 +798,6 @@ pub fn workspace_servers(workdir: &Path) -> Result<Vec<String>> {
             std::fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
         let config: Value = serde_json::from_str(&strip_jsonc(&text))
             .with_context(|| format!("{}: not valid JSON(C)", path.display()))?;
-        if config["agent"].get(AGENT).is_some() {
-            bail!(
-                "{}: defines agent.{AGENT}, the agent wats gives every run: rename it \
-                 (ADR 0031)",
-                path.display()
-            );
-        }
         for name in config["mcp"]
             .as_object()
             .into_iter()
@@ -788,7 +950,6 @@ mod tests {
             "bash(cargo *)",
             "edit",
             "docs_search",
-            "external_directory(/srv/docs/**)",
         ]))
         .unwrap();
         assert_eq!(unknown, ["docs_search"]);
@@ -822,16 +983,77 @@ mod tests {
         assert_eq!(edit["*"], "allow");
         assert_eq!(edit["*opencode.json*"], "deny");
         assert_eq!(edit["*.opencode/*"], "deny");
-        let outside = v["external_directory"].as_object().unwrap();
-        assert_eq!(outside["*"], "deny");
-        assert_eq!(outside["/srv/docs/**"], "allow");
+        assert_eq!(v["external_directory"], "deny");
+    }
+
+    /// A workspace server's `<name>_*` rule comes before the built-in
+    /// denies: a server named `external` (or `doom`, `workflow`) cannot
+    /// allow `external_directory`, the last match winning.
+    #[test]
+    fn server_rules_never_open_built_in_keys() {
+        let json = perms(
+            Access::Workspace,
+            &[],
+            &["external".into(), "doom".into(), "workflow".into()],
+        )
+        .unwrap();
+        let keys = keys_in_order(&json);
+        let at = |k: &str| keys.iter().position(|x| x == k).unwrap();
+        for (server, builtin) in [
+            ("external_*", "external_directory"),
+            ("doom_*", "doom_loop"),
+            ("workflow_*", "workflow_tool_approval"),
+        ] {
+            assert!(
+                at(server) < at(builtin),
+                "{server} before {builtin}: {json}"
+            );
+            let v: Value = serde_json::from_str(&json).unwrap();
+            assert_eq!(v[builtin], "deny");
+            assert_eq!(v[server], "allow");
+        }
+        // As OpenCode evaluates: the last rule whose key matches wins.
+        let last = |tool: &str| {
+            keys.iter()
+                .rev()
+                .find(|k| wildcard_match(tool, k))
+                .cloned()
+                .unwrap()
+        };
+        assert_eq!(last("external_directory"), "external_directory");
+        assert_eq!(last("external_search"), "external_*");
+        assert_eq!(last("wats_post"), "wats_*");
+        assert_eq!(last("bash"), "bash");
+    }
+
+    /// OpenCode's wildcard: `*` any run of characters, `?` one.
+    fn wildcard_match(text: &str, pattern: &str) -> bool {
+        fn go(t: &[char], p: &[char]) -> bool {
+            match p.split_first() {
+                None => t.is_empty(),
+                Some(('*', rest)) => (0..=t.len()).any(|i| go(&t[i..], rest)),
+                Some(('?', rest)) => !t.is_empty() && go(&t[1..], rest),
+                Some((c, rest)) => t.first() == Some(c) && go(&t[1..], rest),
+            }
+        }
+        go(
+            &text.chars().collect::<Vec<_>>(),
+            &pattern.chars().collect::<Vec<_>>(),
+        )
     }
 
     #[test]
-    fn task_and_a_bare_external_directory_are_refused() {
+    fn task_external_directory_and_wildcards_are_refused() {
         assert!(tools(&s(&["task"])).is_err());
         assert!(tools(&s(&["Task(general)"])).is_err());
         assert!(tools(&s(&["external_directory"])).is_err());
+        assert!(tools(&s(&["external_directory(/srv/docs/**)"])).is_err());
+        // A wildcard in a name would match task or external_directory.
+        for name in ["t*sk", "ta?k", "*", "ext*(/srv/**)", "Task*"] {
+            assert!(tools(&s(&[name])).is_err(), "{name}");
+        }
+        // Wildcards in a pattern are fine.
+        assert!(tools(&s(&["bash(git *)"])).is_ok());
         // A bare entry wins over patterns of the same key.
         let (t, _) = tools(&s(&["bash(ls)", "shell"])).unwrap();
         assert_eq!(
@@ -901,6 +1123,7 @@ mod tests {
             "--attach",
             "-c",
             "--session=abc",
+            "--command",
         ] {
             assert!(
                 check_extra_args(Access::SwarmOnly, &s(&[bad])).is_err(),
@@ -947,7 +1170,11 @@ mod tests {
             [
                 ("OPENCODE_CONFIG", "x"),
                 ("OPENCODE_EXPERIMENTAL_LSP_TOOL", "1"),
-                ("OPENCODE_DB", "y"),
+                ("OPENCODE_TEST_HOME", "/elsewhere"),
+                ("OPENCODE_TEST_MANAGED_CONFIG_DIR", "/m"),
+                ("OPENCODE_ENABLE_EXA", "1"),
+                ("OPENCODE_DISABLE_PRUNE", "1"),
+                ("OPENCODE_GIT_BASH_PATH", "C:/git/bash.exe"),
                 ("PATH", "/bin"),
             ]
             .into_iter()
@@ -955,8 +1182,23 @@ mod tests {
         );
         assert_eq!(
             removed,
-            ["OPENCODE_CONFIG", "OPENCODE_EXPERIMENTAL_LSP_TOOL"]
+            [
+                "OPENCODE_CONFIG",
+                "OPENCODE_EXPERIMENTAL_LSP_TOOL",
+                "OPENCODE_TEST_HOME",
+                "OPENCODE_TEST_MANAGED_CONFIG_DIR",
+                "OPENCODE_ENABLE_EXA",
+            ]
         );
+    }
+
+    #[test]
+    fn models_are_provider_slash_model() {
+        assert!(check_model("azure/gpt-5").is_ok());
+        assert!(check_model("amazon-bedrock/anthropic.claude-x").is_ok());
+        for bad in ["gpt-5", "-x/y", "--agent=build", "a/", "/b", "a /b", ""] {
+            assert!(check_model(bad).is_err(), "{bad}");
+        }
     }
 
     #[test]
@@ -969,15 +1211,94 @@ mod tests {
         std::fs::write(dir.path().join("opencode.jsonc"), text).unwrap();
         assert_eq!(workspace_servers(dir.path()).unwrap(), ["docs"]);
         std::fs::create_dir_all(dir.path().join(".opencode")).unwrap();
-        std::fs::write(
-            dir.path().join(".opencode/opencode.json"),
-            r#"{"agent": {"wats": {"permission": "allow"}}}"#,
-        )
-        .unwrap();
-        let e = workspace_servers(dir.path()).unwrap_err();
-        assert!(format!("{e:#}").contains("agent.wats"), "{e:#}");
         std::fs::write(dir.path().join(".opencode/opencode.json"), "{oops").unwrap();
         assert!(workspace_servers(dir.path()).is_err());
+    }
+
+    /// What could change the run's agent or out-order its rules is
+    /// refused, in the workspace, above it, and in the agent's own
+    /// directory: `agent.wats`, `agents.wats`, `mode.wats`, a markdown
+    /// agent `wats.md`, a wildcard allow in `permission` or `tools`.
+    #[test]
+    fn config_sources_that_could_change_the_agent_are_refused() {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("home");
+        let work = root.path().join("data/agent/opencode");
+        let workspace = work.join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        ensure_agent_dir(&work).unwrap();
+        let check = |access| check_config_sources(access, &workspace, &work, Some(&home));
+        assert!(check(Access::Workspace).is_ok());
+        let refused = |path: &Path, text: &str, what: &str| {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, text).unwrap();
+            let e = check(Access::Workspace).unwrap_err();
+            assert!(format!("{e:#}").contains(what), "{what}: {e:#}");
+            std::fs::remove_file(path).unwrap();
+            assert!(check(Access::Workspace).is_ok(), "{what}");
+        };
+        let file = workspace.join("opencode.json");
+        refused(&file, r#"{"agent": {"wats": {}}}"#, "agent.wats");
+        refused(
+            &file,
+            r#"{"agents": {"wats": {"disabled": true}}}"#,
+            "agents.wats",
+        );
+        refused(
+            &file,
+            r#"{"mode": {"wats": {"permission": {"bash": "allow"}}}}"#,
+            "mode.wats",
+        );
+        refused(&file, r#"{"permission": {"b*": "allow"}}"#, "permission.b*");
+        refused(
+            &file,
+            r#"{"permission": {"*": {"x": "allow"}}}"#,
+            "permission.*",
+        );
+        refused(
+            &file,
+            r#"{"permission": "allow"}"#,
+            "permission = \"allow\"",
+        );
+        refused(&file, r#"{"tools": {"ba?h": true}}"#, "tools.ba?h");
+        // A specific allow is replaced by wats's own rule: fine.
+        std::fs::write(&file, r#"{"permission": {"bash": "allow", "b*": "deny"}}"#).unwrap();
+        assert!(check(Access::Workspace).is_ok());
+        std::fs::remove_file(&file).unwrap();
+        for sub in ["agent", "agents", "mode", "modes"] {
+            refused(
+                &workspace.join(".opencode").join(sub).join("wats.md"),
+                "x",
+                "wats.md",
+            );
+        }
+        // Above the workspace, as OpenCode walks up outside a git repo.
+        refused(
+            &root.path().join("opencode.jsonc"),
+            r#"{"mode": {"wats": {}}}"#,
+            "mode.wats",
+        );
+        refused(
+            &root.path().join("data/.opencode/agent/wats.md"),
+            "x",
+            "wats.md",
+        );
+        // The agent's own OpenCode directory, at every isolated level.
+        let own = agent_dir(&work).join("opencode.jsonc");
+        std::fs::write(&own, r#"{"agent": {"wats": {}}}"#).unwrap();
+        assert!(check(Access::SwarmOnly).is_err());
+        assert!(check(Access::Inherit).is_ok());
+        std::fs::remove_file(&own).unwrap();
+        // swarm-only reads no project config: the workspace is not looked at.
+        std::fs::write(&file, r#"{"mode": {"wats": {}}}"#).unwrap();
+        assert!(check(Access::SwarmOnly).is_ok());
+        // ~/.opencode is not read (a documented gap): home's .opencode is skipped.
+        std::fs::remove_file(&file).unwrap();
+        let in_home = home.join("data/agent/opencode/workspace");
+        std::fs::create_dir_all(&in_home).unwrap();
+        std::fs::create_dir_all(home.join(".opencode/agent")).unwrap();
+        std::fs::write(home.join(".opencode/agent/wats.md"), "x").unwrap();
+        assert!(check_config_sources(Access::Workspace, &in_home, &work, Some(&home)).is_ok());
     }
 
     #[test]

@@ -155,7 +155,7 @@ async fn swarm_only_run_is_locked_down() {
     let args = read(dir.path(), "args");
     assert_eq!(
         args.trim(),
-        "run --format json --agent wats --model azure/gpt-test --variant=low",
+        "run --format json --agent wats --model=azure/gpt-test --variant=low",
         "{args}"
     );
     assert_eq!(cwd(dir.path()), work.join("locked").canonicalize().unwrap());
@@ -530,5 +530,146 @@ fn old_opencode_gets_the_block_and_remove_only_prints() {
     assert!(!m.path("data/config.toml").exists());
     for dir in ["home", "xdg-config", "xdg-data"] {
         assert!(m.files(dir).is_empty(), "{dir}");
+    }
+}
+
+/// A config that would change the run's agent, added while the runner
+/// runs, fails the next run before OpenCode starts (the check runs before
+/// every run), with the reason in the run index; the run's token ends.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_config_added_between_runs_fails_the_run() {
+    let dir = tempfile::tempdir().unwrap();
+    let fake = fake(dir.path(), "1.19.3", GOOD_RUN);
+    let config = config(dir.path(), fake, Access::Workspace);
+    let workdir = config.workdir.clone();
+    let work = config.work_dir.clone();
+    let a = node(&dir.path().join("node")).await.unwrap();
+    let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+    let runner = tokio::spawn(wats::agent::run(Arc::clone(&a), config, async {
+        let _ = stopped.await;
+    }));
+    eventually("a first run", || {
+        wats::runs::list(&work).iter().any(|r| r.status == "ok")
+    })
+    .await;
+    let agent = workdir.join(".opencode/agent");
+    std::fs::create_dir_all(&agent).unwrap();
+    std::fs::write(agent.join("wats.md"), "---\npermission: allow\n---\n").unwrap();
+    eventually("a refused run", || {
+        wats::runs::list(&work).iter().any(|r| r.status == "failed")
+    })
+    .await;
+    let _ = stop.send(());
+    runner.await.unwrap().unwrap();
+    let failed = wats::runs::list(&work)
+        .into_iter()
+        .find(|r| r.status == "failed")
+        .unwrap();
+    assert!(
+        failed
+            .error
+            .as_deref()
+            .is_some_and(|e| e.contains("wats.md")),
+        "{failed:?}"
+    );
+    a.shutdown().await.unwrap();
+}
+
+/// SIGHUP to a foreground `wats` (its terminal closed): the node stops as
+/// on Ctrl-C, and the agent run in progress, in its own process group, is
+/// killed with what it started.
+#[test]
+fn sighup_stops_the_node_and_its_runs_group() {
+    let dir = tempfile::tempdir().unwrap();
+    for d in ["home", "xdg-config", "xdg-data", "run"] {
+        std::fs::create_dir_all(dir.path().join(d)).unwrap();
+    }
+    let out = dir.path().join("out");
+    let fake = fake(
+        dir.path(),
+        "1.19.3",
+        &format!(
+            "sleep 300 &\necho $! > {}/grandchild\nsleep 300",
+            out.display()
+        ),
+    );
+    let mut node = std::process::Command::new(env!("CARGO_BIN_EXE_wats"))
+        .env("WATS_HERMETIC", "1")
+        .env("WATS_RUN_DIR", dir.path().join("run"))
+        .env("HOME", dir.path().join("home"))
+        .env("XDG_CONFIG_HOME", dir.path().join("xdg-config"))
+        .env("XDG_DATA_HOME", dir.path().join("xdg-data"))
+        .env("USER", "alice")
+        .env_remove("WATS_PROFILE")
+        .env_remove("WATS_DIR")
+        .args([
+            "--infra",
+            "none",
+            "--no-default-bootstrap",
+            "--loopback",
+            "--dir",
+        ])
+        .arg(dir.path().join("data"))
+        .args([
+            "--agent",
+            "opencode",
+            "--access",
+            "swarm-only",
+            "--heartbeat",
+            "1s",
+            "--run-timeout",
+            "10m",
+            "--agent-command",
+        ])
+        .arg(&fake)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    let pid = loop {
+        let pid = read(dir.path(), "grandchild").trim().to_string();
+        if !pid.is_empty() {
+            break pid;
+        }
+        if let Some(status) = node.try_wait().unwrap() {
+            panic!("the node exited: {status}: {:?}", node.wait_with_output());
+        }
+        assert!(std::time::Instant::now() < deadline, "no run after 60 s");
+        std::thread::sleep(Duration::from_millis(100));
+    };
+    assert!(alive(&pid));
+    let hup = std::process::Command::new("kill")
+        .args(["-HUP", &node.id().to_string()])
+        .status()
+        .unwrap();
+    assert!(hup.success());
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    let status = loop {
+        if let Some(status) = node.try_wait().unwrap() {
+            break status;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the node did not stop on SIGHUP"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    };
+    let stderr = {
+        use std::io::Read;
+        let mut s = String::new();
+        node.stderr.take().unwrap().read_to_string(&mut s).unwrap();
+        s
+    };
+    assert!(status.success(), "{status}: {stderr}");
+    assert!(stderr.contains("SIGHUP"), "{stderr}");
+    let gone = std::time::Instant::now() + Duration::from_secs(20);
+    while alive(&pid) {
+        assert!(
+            std::time::Instant::now() < gone,
+            "the grandchild outlived the node"
+        );
+        std::thread::sleep(Duration::from_millis(100));
     }
 }

@@ -17,9 +17,10 @@
   - The setup wizard finds OpenCode on your PATH and asks its model.
   - Budgets use OpenCode's cost estimate. `inherit` needs `agent.allow`
     and `agent.review`.
-- **Process groups**: at its timeout, an agent run is killed with
-  everything it started (MCP servers, shell commands), for every spawned
-  runtime.
+- **Process groups**: at its timeout or a stop, an agent run is killed
+  with everything it started (MCP servers, shell commands), for every
+  spawned runtime. A foreground `wats` whose terminal closes (SIGHUP) now
+  stops gracefully, as on Ctrl-C, and takes its runs with it.
 
 ## 0.4.3 (2026-10-21)
 

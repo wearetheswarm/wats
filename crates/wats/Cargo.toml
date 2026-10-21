@@ -58,6 +58,11 @@ tar = { version = "=0.4.46", default-features = false }
 # HKDF-SHA256 and ChaCha20-Poly1305.
 hpke = { version = "=0.14.1", default-features = false, features = ["alloc", "getrandom", "x25519", "mlkem", "chacha"] }
 
+# Killing an agent run's process group (src/background.rs, ADR 0031 §3):
+# a safe killpg(2), the version already in the tree.
+[target.'cfg(unix)'.dependencies]
+nix = { version = "=0.31.3", default-features = false, features = ["signal"] }
+
 [dev-dependencies]
 # A local relay server for the relay chaos test (tests/reconnect.rs). Never
 # a normal dependency: the shipped binary has no relay server.

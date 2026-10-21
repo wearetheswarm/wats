@@ -5127,6 +5127,25 @@ fn shutdown_signal() -> Shutdown {
     })
 }
 
+/// `shutdown`, or SIGHUP: the terminal of a foreground node was closed.
+/// The node then stops as on Ctrl-C, and its agent runs, each in a
+/// process group of its own (ADR 0031 §3), are killed with what they
+/// started instead of being left behind. Registered only for the node
+/// itself: a command that does not wait for its shutdown keeps the
+/// default action.
+fn with_hangup(shutdown: Shutdown) -> Shutdown {
+    #[cfg(unix)]
+    if let Ok(mut hangup) = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup()) {
+        return Box::pin(async move {
+            tokio::select! {
+                _ = shutdown => {}
+                _ = hangup.recv() => tracing::warn!("SIGHUP (the terminal closed): stopping"),
+            }
+        });
+    }
+    shutdown
+}
+
 fn print_line(value: serde_json::Value) {
     println!("{value}");
 }
@@ -5490,6 +5509,11 @@ fn agent_config(
     if runtime == "opencode" {
         wats::opencode::check_access(access, &allow, file.review == Some(true))?;
         wats::opencode::check_extra_args(access, &extra_args)?;
+        if let Some(model) = args.agent_model.as_ref().or(file.model.as_ref())
+            && !model.trim().is_empty()
+        {
+            wats::opencode::check_model(model.trim())?;
+        }
         if !wats::opencode::ENFORCE_USD_BUDGET {
             // ADR 0031 open question 11, flipped: runs only, as for Codex.
             budget.max_usd_per_day = f64::INFINITY;
@@ -6737,7 +6761,7 @@ async fn async_main(cli: Cli) -> Result<()> {
         idle_exit: daemon.idle_exit,
         agents,
     };
-    let result = run_node(node, run, shutdown).await;
+    let result = run_node(node, run, with_hangup(shutdown)).await;
     if let Err(e) = &result
         && let Some(path) = wats::crash::record_error(e)
     {

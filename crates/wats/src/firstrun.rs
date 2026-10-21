@@ -489,10 +489,16 @@ fn prompt_after(
     if runtime.as_deref() == Some("opencode") && !keep_runtime {
         writeln!(out, "{OPENCODE_MODEL_ABOUT}")?;
         let default = current(settings, "agent.model").unwrap_or_default();
-        write!(out, "{OPENCODE_MODEL_QUESTION} (agent.model) [{default}]: ")?;
-        let model = match read_answer(input, out)? {
-            Some(answer) if !answer.is_empty() => answer,
-            _ => default,
+        let model = loop {
+            write!(out, "{OPENCODE_MODEL_QUESTION} (agent.model) [{default}]: ")?;
+            let model = match read_answer(input, out)? {
+                Some(answer) if !answer.is_empty() => answer,
+                _ => break default.clone(),
+            };
+            match crate::opencode::check_model(&model) {
+                Ok(()) => break model,
+                Err(e) => writeln!(out, "  {e:#}")?,
+            }
         };
         if !model.is_empty() {
             values.push(("agent.model", model));

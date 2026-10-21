@@ -751,6 +751,58 @@ struct Running {
     /// What woke it, queued again if the OpenClaw gateway was down.
     woke: Vec<Queued>,
     feedback: Vec<String>,
+    /// The spawned CLI's process group, killed if the run is dropped.
+    group: GroupGuard,
+}
+
+/// Ends a run's runner token on drop unless the run started: an early
+/// return (a refused config, a run directory that cannot be made, a CLI
+/// that does not start) leaves no live token behind.
+struct TokenGuard<'a> {
+    node: &'a Node,
+    token: Option<String>,
+}
+
+impl TokenGuard<'_> {
+    /// The run started: its `Running` ends the token.
+    fn disarm(mut self) -> String {
+        self.token.take().unwrap_or_default()
+    }
+}
+
+impl Drop for TokenGuard<'_> {
+    fn drop(&mut self) {
+        if let Some(token) = self.token.take() {
+            self.node.end_runner_token(&token);
+        }
+    }
+}
+
+/// A spawned run's process group (the CLI is its leader, ADR 0031 §3):
+/// killed when the run ends other than by its own exit, and when the run
+/// is dropped without being finished (a runner task aborted, a panic).
+/// Disarmed after a normal exit: the id may then be reused.
+struct GroupGuard(Option<u32>);
+
+impl GroupGuard {
+    fn kill(&mut self) {
+        if let Some(pgid) = self.0.take() {
+            #[cfg(unix)]
+            crate::background::kill_group(pgid);
+            #[cfg(not(unix))]
+            let _ = pgid;
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.0 = None;
+    }
+}
+
+impl Drop for GroupGuard {
+    fn drop(&mut self) {
+        self.kill();
+    }
 }
 
 /// What a run waits on: the agent CLI, or the forward to OpenClaw.
@@ -862,6 +914,7 @@ fn start_forward(
         transcript,
         woke: Vec::new(),
         feedback: Vec::new(),
+        group: GroupGuard(None),
     })
 }
 
@@ -928,13 +981,80 @@ async fn start_run(
     remaining_usd: f64,
 ) -> Result<Running> {
     let (record, transcript) = open_run(config, trigger)?;
-    let file = std::fs::OpenOptions::new().append(true).open(&transcript)?;
     let token = node.new_runner_token(crate::node::RunnerRun {
         id: record.id.clone(),
         events: trigger.events(),
         profile: config.profile.clone(),
         file_roots: Vec::new(),
     });
+    let guard = TokenGuard {
+        node: node.as_ref(),
+        token: Some(token.clone()),
+    };
+    let prepared = prepare_command(config, &token, &transcript, remaining_usd);
+    let (mut command, file) = match prepared {
+        Ok(prepared) => prepared,
+        Err(e) => {
+            fail_run(config, record, &transcript, &format!("{e:#}"));
+            return Err(e);
+        }
+    };
+    // Codex's events go through the runner, which reads the thread id.
+    let stdout = if config.runtime == "codex" {
+        Stdio::piped()
+    } else {
+        file.try_clone()?.into()
+    };
+    let output_file = file.try_clone()?;
+    let spawned = command
+        .stdin(Stdio::piped())
+        .stdout(stdout)
+        .stderr(file)
+        .kill_on_drop(true)
+        .spawn();
+    let mut child = match spawned {
+        Ok(child) => child,
+        Err(e) => {
+            fail_run(config, record, &transcript, &e.to_string());
+            return Err(e).with_context(|| format!("start {}", config.command.display()));
+        }
+    };
+    // From here, a dropped run takes its process group with it.
+    let group = GroupGuard(child.id());
+    let output = child.stdout.take().map(|stdout| {
+        let images = access::codex_generates_images(&config.runtime, config.access, &config.tools)
+            .then(access::codex_home)
+            .flatten()
+            .map(|home| (Arc::clone(node), token.clone(), home));
+        tokio::spawn(codex_output(stdout, output_file, images))
+    });
+    // The prompt goes on stdin: --mcp-config and --allowedTools take several
+    // values and would swallow a positional prompt.
+    if let Some(mut stdin) = child.stdin.take() {
+        stdin.write_all(prompt.as_bytes()).await?;
+    }
+    Ok(Running {
+        record,
+        token: Some(guard.disarm()),
+        work: Work::Child(child, output),
+        started: Instant::now(),
+        deadline: tokio::time::Instant::now() + config.run_timeout,
+        transcript,
+        woke: Vec::new(),
+        feedback: Vec::new(),
+        group,
+    })
+}
+
+/// The command of one spawned run, and its transcript file (stdout and
+/// stderr go there): the runtime's arguments, environment and directory.
+fn prepare_command(
+    config: &AgentConfig,
+    token: &str,
+    transcript: &std::path::Path,
+    remaining_usd: f64,
+) -> Result<(tokio::process::Command, std::fs::File)> {
+    let file = std::fs::OpenOptions::new().append(true).open(transcript)?;
     let mut command = tokio::process::Command::new(&config.command);
     let dir = run_dir(config)?;
     command.current_dir(&dir);
@@ -947,6 +1067,13 @@ async fn start_run(
     command.process_group(0);
     match config.runtime.as_str() {
         "opencode" => {
+            // Checked again before every run: a config may have changed.
+            opencode::check_config_sources(
+                config.access,
+                &dir,
+                &config.work_dir,
+                std::env::home_dir().as_deref(),
+            )?;
             let (tools, _) = if config.access == Access::Workspace {
                 opencode::tools(&config.tools)?
             } else {
@@ -968,7 +1095,7 @@ async fn start_run(
                 access: config.access,
                 wats_command: &config.mcp_command,
                 wats_args: &config.mcp_args,
-                runner_token: &token,
+                runner_token: token,
                 timeout: config.run_timeout,
                 steps: config.max_turns,
                 permission,
@@ -983,7 +1110,7 @@ async fn start_run(
             }
             command
                 .args(opencode::run_args())
-                .args(model_args(config, "--model"))
+                .args(opencode_model_arg(config))
                 .args(&config.extra_args);
         }
         "codex" => {
@@ -999,7 +1126,7 @@ async fn start_run(
                 access: config.access,
                 wats_command: &config.mcp_command,
                 wats_args: &config.mcp_args,
-                runner_token: &token,
+                runner_token: token,
                 disable: &config.codex_disable,
                 enable: &config.codex_enable,
                 workspace_overrides: &workspace_overrides,
@@ -1014,7 +1141,7 @@ async fn start_run(
                 &config.workdir,
                 &config.mcp_command,
                 &config.mcp_args,
-                &token,
+                token,
             )?;
             command
                 .args(access::claude_args(&access::ClaudeRun {
@@ -1031,49 +1158,16 @@ async fn start_run(
                 .args(&config.extra_args);
         }
     };
-    // Codex's events go through the runner, which reads the thread id.
-    let stdout = if config.runtime == "codex" {
-        Stdio::piped()
-    } else {
-        file.try_clone()?.into()
-    };
-    let output_file = file.try_clone()?;
-    let spawned = command
-        .stdin(Stdio::piped())
-        .stdout(stdout)
-        .stderr(file)
-        .kill_on_drop(true)
-        .spawn();
-    let mut child = match spawned {
-        Ok(child) => child,
-        Err(e) => {
-            fail_run(config, record, &transcript, &e.to_string());
-            node.end_runner_token(&token);
-            return Err(e).with_context(|| format!("start {}", config.command.display()));
-        }
-    };
-    let output = child.stdout.take().map(|stdout| {
-        let images = access::codex_generates_images(&config.runtime, config.access, &config.tools)
-            .then(access::codex_home)
-            .flatten()
-            .map(|home| (Arc::clone(node), token.clone(), home));
-        tokio::spawn(codex_output(stdout, output_file, images))
-    });
-    // The prompt goes on stdin: --mcp-config and --allowedTools take several
-    // values and would swallow a positional prompt.
-    if let Some(mut stdin) = child.stdin.take() {
-        stdin.write_all(prompt.as_bytes()).await?;
-    }
-    Ok(Running {
-        record,
-        token: Some(token),
-        work: Work::Child(child, output),
-        started: Instant::now(),
-        deadline: tokio::time::Instant::now() + config.run_timeout,
-        transcript,
-        woke: Vec::new(),
-        feedback: Vec::new(),
-    })
+    Ok((command, file))
+}
+
+/// OpenCode's `--model=<provider/model>`, as one argument (a value can
+/// never be read as a flag), unless the extra arguments choose a model.
+fn opencode_model_arg(config: &AgentConfig) -> Vec<String> {
+    model_args(config, "--model")
+        .get(1)
+        .map(|model| vec![format!("--model={model}")])
+        .unwrap_or_default()
 }
 
 /// Copy a Codex run's JSON events to its transcript. With image
@@ -1147,7 +1241,7 @@ fn completion_status(completion: Option<&str>) -> &'static str {
 async fn finish_run(
     node: &Node,
     config: &AgentConfig,
-    running: Running,
+    mut running: Running,
     outcome: Outcome,
 ) -> Finished {
     use crate::openclaw::Reply;
@@ -1156,13 +1250,12 @@ async fn finish_run(
     }
     match running.work {
         Work::Child(mut child, output) => {
-            if !matches!(outcome, Outcome::Exited(_)) {
+            if matches!(outcome, Outcome::Exited(_)) {
+                running.group.disarm();
+            } else {
                 // Its whole process group first (the CLI is the group's
                 // leader, not yet reaped: the id is still its own).
-                #[cfg(unix)]
-                if let Some(pid) = child.id() {
-                    let _ = crate::background::signal_group(pid, "KILL");
-                }
+                running.group.kill();
                 let _ = child.kill().await;
             }
             // The transcript is complete before the footer goes in.
@@ -1725,6 +1818,9 @@ async fn check_opencode(config: &AgentConfig) -> Result<()> {
         warn!("{warning}");
     }
     opencode::check_extra_args(config.access, &config.extra_args)?;
+    if let Some(model) = &config.model {
+        opencode::check_model(model)?;
+    }
     if config.access == Access::Workspace {
         let (_, unknown) = opencode::tools(&config.tools)?;
         if !unknown.is_empty() {
@@ -1749,6 +1845,12 @@ async fn check_opencode(config: &AgentConfig) -> Result<()> {
         Access::SwarmOnly => config.work_dir.join("locked"),
         Access::Inherit => std::env::current_dir()?,
     };
+    opencode::check_config_sources(
+        config.access,
+        &run_dir,
+        &config.work_dir,
+        std::env::home_dir().as_deref(),
+    )?;
     for warning in
         opencode::start_warnings(config.access, &run_dir, std::env::home_dir().as_deref())
     {

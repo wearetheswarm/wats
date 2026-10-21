@@ -284,8 +284,12 @@ opencode mcp add wats -- /abs/path/wats [--dir <dir>] mcp --profile <profile>
   - OpenCode has child processes: the `wats mcp` server, workspace MCP
     servers, shell commands. So the runner starts it in a **process group
     of its own** and kills the group, not just the `opencode` process.
-  - The other spawned runtimes kill the child only today. Whether to
-    extend this to them is open question 4.
+  - This applies to **every** spawned runtime (Claude Code and Codex
+    too, open question 4): each run is in a process group of its own,
+    and a timeout or a stop kills the whole group. A foreground node
+    stops gracefully on SIGHUP (its terminal closed) as on Ctrl-C, so its
+    runs' groups are killed rather than left behind, and a run dropped
+    without being finished takes its group with it.
   - The wats MCP entry of a run sets `timeout` to `agent.timeout` in
     milliseconds. It is both OpenCode's connect timeout and its per-call
     timeout (`requestTimeout`, `mcp/index.ts`), so a long `wats_wait`
@@ -424,10 +428,9 @@ per-run config (`OPENCODE_CONFIG_CONTENT`, §5), and selects it with
   - **OpenCode allows everything by default**, so `inherit` usually means
     a full shell, edits and web access. `ask` rules are rejected (`run`).
     The banner says so.
-  - `inherit` follows the rule the Claude and Codex runners follow (a
-    warning without `agent.allow` and `agent.review`). Whether OpenCode
-    should refuse instead, as setup does for OpenClaw, is open
-    question 10.
+  - `inherit` without `agent.allow` and `agent.review = true` is
+    **refused** at start, as for OpenClaw (open question 10, default
+    pending confirmation); `wats setup opencode --agent` warns.
 
 **What this enforces.** This comes from the v1.19.3 source, not yet from
 a real run:
@@ -677,10 +680,13 @@ change:
   when `~/.opencode` exists (an existence check).
 - **Q4.** Process-group kill for **every** spawned runtime. Claude Code
   and Codex now start in a process group of their own too. On a timeout
-  or a stop, the runner sends `kill -KILL -- -<pgid>` (with `kill(1)`,
-  as `wats stop` does, since the crate forbids `unsafe`), then kills the
-  child. It never does so after a normal exit, since the id could then
-  be reused.
+  or a stop, the runner kills the group with killpg(2) (through `nix`,
+  since the crate forbids `unsafe`; a failure other than "no such group"
+  is logged), then the child. It never does so after a normal exit,
+  since the id could then be reused. A guard on the run kills the group
+  when a run is dropped unfinished, and a foreground node handles SIGHUP
+  as a graceful stop (review of #191: the CLI is no longer in the
+  terminal's process group, so the hangup would no longer reach it).
 - **Q5.** Warn only: the runner warns when an ancestor of the workspace
   has `opencode.json(c)` or `.opencode/`. No `git init`.
 - **Q6.** `--remove` only prints the key to delete and its file.
@@ -697,15 +703,57 @@ change:
 - **Refused extra arguments**, at `swarm-only` and `workspace`.
   - The list is wider than §1 had it: `--agent`, `--auto`, `--yolo`,
     `--dangerously-skip-permissions`, `--attach`, plus `--dir`,
-    `--continue`/`-c`, `--session`/`-s` and `--fork`.
+    `--continue`/`-c`, `--session`/`-s`, `--fork` and `--command`.
   - The forms with `=` are refused too.
   - `inherit` takes any.
 - **`agent.tools`** for OpenCode:
   - known keys are case-insensitive;
   - `shell` and `bash` are one tool, written under both keys;
   - `key(pattern)` entries of one key are merged, and a bare entry wins;
-  - `external_directory(<dir>)` is accepted, and a bare one refused;
+  - `external_directory` is refused in every form (a pattern such as
+    `external_directory(*)` would let the file tools out anywhere);
+  - wildcards (`*`, `?`) are refused in tool names: OpenCode matches a
+    rule's key as a pattern, so `t*sk` would be `task`;
   - an unknown name is passed through with a warning.
+- **`agent.model`** must be `provider/model` (no leading `-`, no space),
+  and goes as one argument, `--model=<value>`.
+- **The rule order** of a `workspace` run: `"*"` denied, the workspace's
+  MCP servers (`<name>_*` allowed), then every built-in key denied (or
+  its `agent.tools` rule), including `workflow_tool_approval`,
+  `plan_enter` and `plan_exit`, then the other listed names, and
+  `wats_*` last. A server named `external` therefore cannot allow
+  `external_directory`, the last matching rule winning.
+- **The environment** of a `swarm-only` or `workspace` run keeps no
+  `OPENCODE_*` variable of wats's own but `OPENCODE_DISABLE_*` and
+  `OPENCODE_GIT_BASH_PATH` (so `OPENCODE_TEST_HOME` and
+  `OPENCODE_TEST_MANAGED_CONFIG_DIR` go too); wats then sets its own.
+- **Config sources that could change the run's agent are refused**, at
+  start and again before every run (a refused run is indexed `failed`
+  with the reason, and its runner token ends):
+  - in the agent's own OpenCode directory (`swarm-only` and
+    `workspace`), and at `workspace` in the project config of the run
+    directory and of every directory above it (`opencode.json(c)`,
+    `.opencode/opencode.json(c)`), as OpenCode walks them outside a git
+    repository;
+  - an `agent.wats`, `agents.wats` (2.0's spelling; `disabled: true`
+    would fall back to `build`) or `mode.wats` entry (`mode` is merged
+    into `agent` after `OPENCODE_CONFIG_CONTENT`), or a markdown agent
+    `{agent,agents,mode,modes}/wats.md`;
+  - a wildcard allow in `permission` (`"b*": "allow"`, `"permission":
+    "allow"`) or in the legacy `tools` (`"ba?h": true`): OpenCode keeps a
+    key where the config put it, so such a rule could come after wats's
+    top-level denies and win for the fallback agent. Specific keys are
+    replaced in place by wats's own rule, and the `wats` agent's rules
+    come last anyway; only the fallback needed this.
+  - **Not checked** (a workspace-trust gap, §4): `~/.opencode/`, which
+    wats does not read; managed config; a console organisation's config.
+- **The runner token** is ended by a guard on every early return of a
+  run's preparation (a refused config, a run directory that cannot be
+  made, a CLI that does not start), for every spawned runtime.
+- **The wizard's MCP question** for OpenCode defaults to yes, as for
+  Claude Code, Codex, OpenClaw and Vibe (ADR 0027 §2): the answer is
+  still the user's, asked on a terminal, and nothing is written without
+  a terminal.
 - **Edit deny patterns** are `*opencode.json*` and `*.opencode/*`. A
   prefix wildcard is used because OpenCode matches paths relative to its
   worktree, which is `/` outside a git repository. This must be checked

@@ -80,17 +80,23 @@ differs:
     as usual: wats leaves `XDG_DATA_HOME` alone, and never opens the file.
   - `~/.claude` is not read either (`OPENCODE_DISABLE_CLAUDE_CODE`), and
     at `swarm-only`, no project config (`OPENCODE_DISABLE_PROJECT_CONFIG`).
-  - `OPENCODE_CONFIG`, `OPENCODE_CONFIG_DIR`, `OPENCODE_PERMISSION` and
-    `OPENCODE_EXPERIMENTAL*` are removed from the run's environment.
+  - Every `OPENCODE_*` variable of the node's own environment is removed
+    from the run's, but `OPENCODE_DISABLE_*` and `OPENCODE_GIT_BASH_PATH`
+    (so `OPENCODE_CONFIG`, `OPENCODE_PERMISSION`, `OPENCODE_EXPERIMENTAL*`
+    or `OPENCODE_TEST_HOME` cannot add config or move OpenCode's home).
 - **Nothing in your session history**: `OPENCODE_DB=:memory:`. Each run
   is a fresh session; the transcript is wats's own.
 - **Refused extra arguments** at `swarm-only` and `workspace`, since they
   would undo the level: `--agent`, `--auto`, `--yolo`,
   `--dangerously-skip-permissions`, `--attach`, `--dir`, `--continue`,
-  `--session`, `--fork`. `--model`, `--variant` and the like are fine.
+  `--session`, `--fork`, `--command`. `--model`, `--variant` and the like
+  are fine. `agent.model` must be `provider/model`, and goes as
+  `--model=<value>`.
 - **Timeout**: past `agent.timeout`, the runner kills the run's whole
   process group: OpenCode and what it started (MCP servers, shell
-  commands).
+  commands). So does a stop, Ctrl-C, or closing the terminal of a
+  foreground `wats` (SIGHUP stops it gracefully). Every spawned runtime
+  works this way.
 - **Version**: the runner reads `opencode --version` at start. It refuses
   OpenCode older than 1.17.0, and warns from 2.0 on (not checked yet).
 
@@ -131,7 +137,18 @@ run too.
   plugins and MCP servers there run code.
 - `task` is refused: a subagent runs with OpenCode's own rules (a shell
   included), not the `wats` agent's.
-- A workspace config that defines an agent named `wats` is refused.
+- `external_directory` is refused in any form, and so are wildcards in
+  tool names (`t*sk` would be `task`).
+- **Config that could change the run's agent is refused**, at start and
+  before every run (the run is then `failed`, with the reason): in the
+  agent's own OpenCode directory, and at `workspace` in the workspace and
+  every directory above it (`opencode.json(c)`, `.opencode/`):
+  - an agent named `wats` under `agent`, `agents` or `mode`, or a file
+    `{agent,agents,mode,modes}/wats.md`;
+  - a wildcard allow in `permission` (`"b*": "allow"`, `"permission":
+    "allow"`) or in the legacy `tools`.
+
+  `~/.opencode/` is not checked: wats does not read it (below).
 
 ### What is enforced, and what is not
 

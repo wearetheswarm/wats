@@ -492,8 +492,8 @@ wats --agent claude --access inherit                          # this run only
     (the data directory, `config.toml`, `wats config`…), and `edit` may
     not touch the workspace's `opencode.json` or `.opencode/`. `task` is
     refused (a subagent has OpenCode's own rules, a shell included), and
-    so is a bare `external_directory` (give a directory:
-    `external_directory(/srv/docs/**)`). See [opencode.md](opencode.md).
+    so are `external_directory` and wildcards in tool names (`t*sk`). See
+    [opencode.md](opencode.md).
   - **`swarm-only` ignores `agent.tools`**: `wats config set` and `wats
     setup` say so in one warning line, and the agent starts with the wats
     tools only. `inherit` has every tool of your own configuration anyway.

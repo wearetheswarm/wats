@@ -4752,6 +4752,7 @@ dependencies = [
  "mimalloc",
  "minisign-verify",
  "n0-future",
+ "nix",
  "redb",
  "reqwest",
  "rmcp",
