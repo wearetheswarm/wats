@@ -58,8 +58,8 @@ On a machine with, say, 8 CPUs and 200 GB free:
    fleet ~/.wats-fleet: 6 node(s)
    check: wats fleet check · logs: wats fleet logs · stop: wats fleet stop
    an MCP client on node-1: wats mcp --dir ~/.wats-fleet/node-1
-   NODE    STATUS  PID    VERSION  UPTIME  NETWORK           FLEET           AGENTS        LOG
-   node-1  ok      50290  0.4.3    12s     online (5 peers)  met 5/5, 4 now  1/1 (claude)  clean
+   NODE    STATUS  PID    VERSION  UPTIME  NETWORK           NODES 24H  FLEET           AGENTS        LOG
+   node-1  ok      50290  0.4.3    12s     online (5 peers)  9          met 5/5, 4 now  1/1 (claude)  clean
    …
    fleet ~/.wats-fleet: 6 of 6 node(s) ok
    ```

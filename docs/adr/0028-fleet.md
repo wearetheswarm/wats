@@ -154,7 +154,9 @@ current neighbors cannot be all the others; each joining node still
 contacts every bootstrap entry, so every pair meets. The table shows both
 (`met 5/5, 3 now`). If large fleets show partial meshes in practice, the
 rule can become "the fleet's graph is connected" without changing
-anything else.
+anything else. The table also shows, for information, the nodes each one
+heard from in 24 h (`NODES 24H`, the swarm size of ADR 0026); `--json`
+gives the node's whole `swarm` value.
 
 No model call: the agents are checked from the configuration, the node's
 own list of running agents, and the command's presence. Exit code 0 when

@@ -45,6 +45,7 @@ pub mod signals;
 pub mod store;
 pub mod strict_json;
 pub mod supervise;
+pub mod swarm;
 pub mod unanswered;
 pub mod unicode;
 mod unicode_tables;

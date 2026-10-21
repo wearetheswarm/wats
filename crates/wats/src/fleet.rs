@@ -787,6 +787,8 @@ pub struct NodeReport {
     pub version: Option<String>,
     pub uptime_secs: Option<u64>,
     pub network: String,
+    /// The swarm it sees, per network (ADR 0026): `neighbors`, `nodes_24h`.
+    pub swarm: Value,
     /// Gossip neighbors now, all of them and those of the fleet.
     pub neighbors: usize,
     pub fleet_neighbors: usize,
@@ -1004,6 +1006,7 @@ async fn check_node(
         Some(state) => state.to_string(),
         None => "-".into(),
     };
+    report.swarm = info["swarm"].clone();
     report.agents_running = info["agents"]
         .as_array()
         .into_iter()
@@ -1120,9 +1123,18 @@ pub async fn check(
 pub fn table(reports: &[NodeReport]) -> String {
     let dash = || "-".to_string();
     let header = [
-        "NODE", "STATUS", "PID", "VERSION", "UPTIME", "NETWORK", "FLEET", "AGENTS", "LOG",
+        "NODE",
+        "STATUS",
+        "PID",
+        "VERSION",
+        "UPTIME",
+        "NETWORK",
+        "NODES 24H",
+        "FLEET",
+        "AGENTS",
+        "LOG",
     ];
-    let rows: Vec<[String; 9]> = reports
+    let rows: Vec<[String; 10]> = reports
         .iter()
         .map(|r| {
             let agents = if r.agents_expected.is_empty() {
@@ -1146,6 +1158,7 @@ pub fn table(reports: &[NodeReport]) -> String {
                 r.uptime_secs
                     .map_or_else(dash, crate::background::format_uptime),
                 r.network.clone(),
+                crate::swarm::ps_cell(Some(&r.swarm)),
                 if r.running {
                     format!("met {}/{}, {} now", r.met, r.others, r.fleet_neighbors)
                 } else {

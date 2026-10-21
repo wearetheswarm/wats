@@ -248,6 +248,12 @@ async fn a_kept_blob_with_its_file_gone_and_no_peer_is_reported() {
 /// fails cleanly.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_kept_blob_with_its_file_gone_comes_back_from_a_peer() {
+    // The node logs, shown when the test fails.
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter("wats=debug")
+        .with_ansi(false)
+        .with_test_writer()
+        .try_init();
     let dir = tempfile::tempdir().unwrap();
     let (data_a, data_b) = (dir.path().join("a"), dir.path().join("b"));
     let path = dir.path().join("file.bin");
@@ -256,9 +262,7 @@ async fn a_kept_blob_with_its_file_gone_comes_back_from_a_peer() {
     let mut b_config = config(&data_b, 10);
     b_config.peers.push(a.endpoint().addr());
     let b = Node::start(b_config).await.unwrap();
-    a.wait_for_neighbor(PUBLIC_NET, Duration::from_secs(10))
-        .await
-        .unwrap();
+    neighbors(&a, &b).await;
     let event = a
         .publish(
             Draft {
@@ -273,8 +277,14 @@ async fn a_kept_blob_with_its_file_gone_comes_back_from_a_peer() {
         .await
         .unwrap();
     let blob = event.blobs[0].clone();
+    // B fetches it itself once it has the post: A's push goes only to the
+    // peers A knows by then.
+    eventually("post on b", || async {
+        b.store().get(&event.id).unwrap().map(|_| ())
+    })
+    .await;
     eventually("blob on b", || async {
-        b.blob_bytes(&blob.hash).await.ok().flatten()
+        b.fetch_and_export(&blob).await.ok().flatten()
     })
     .await;
     b.shutdown().await.unwrap();
@@ -300,9 +310,8 @@ async fn a_kept_blob_with_its_file_gone_comes_back_from_a_peer() {
     let mut b_config = config(&data_b, 10);
     b_config.peers.push(a.endpoint().addr());
     let b = Node::start(b_config).await.unwrap();
-    a.wait_for_neighbor(PUBLIC_NET, Duration::from_secs(10))
-        .await
-        .unwrap();
+    // B itself, not C, which A may still list for a moment.
+    neighbors(&a, &b).await;
     let bytes = a.blob_bytes(&blob.hash).await.unwrap().expect("restored");
     assert_eq!(&bytes[..], &content(2)[..]);
     assert_eq!(a.unreadable_blobs(), 0);
@@ -313,13 +322,20 @@ async fn a_kept_blob_with_its_file_gone_comes_back_from_a_peer() {
     let mut d_config = config(&dir.path().join("d"), 10);
     d_config.peers.push(a.endpoint().addr());
     let d = Node::start(d_config).await.unwrap();
-    d.wait_for_neighbor(PUBLIC_NET, Duration::from_secs(10))
-        .await
-        .unwrap();
+    neighbors(&a, &d).await;
     let exported = d.fetch_and_export(&blob).await.unwrap().expect("served");
     assert_eq!(std::fs::read(exported).unwrap(), content(2));
     d.shutdown().await.unwrap();
     a.shutdown().await.unwrap();
+}
+
+/// Wait until `a` and `b` are each other's neighbors.
+async fn neighbors(a: &Node, b: &Node) {
+    eventually("neighbors", || async {
+        (a.neighbors().contains(&b.endpoint_id()) && b.neighbors().contains(&a.endpoint_id()))
+            .then_some(())
+    })
+    .await;
 }
 
 async fn eventually<F, Fut, T>(what: &str, mut f: F) -> T

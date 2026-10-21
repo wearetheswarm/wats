@@ -212,6 +212,8 @@ fn up_check_logs_restart_and_stop_a_fleet_of_three() {
         assert!(node["neighbors"].as_u64().unwrap() >= 1, "{node}");
         assert_eq!(node["version"], env!("CARGO_PKG_VERSION"));
         assert_eq!(node["agents_running"][0], "claude", "{node}");
+        // The swarm it sees (ADR 0026), per network.
+        assert!(node["swarm"]["public"].is_object(), "{node}");
     }
 
     // Logs, each line prefixed with its node.
