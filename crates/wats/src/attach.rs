@@ -276,6 +276,10 @@ pub enum Control {
     /// `wats stop` (ADR 0023): stop gracefully, whatever the role. Answers
     /// with [`Control::Info`]'s fields before stopping.
     Stop,
+    /// `wats fleet check` (ADR 0026): this node's endpoint id, its gossip
+    /// neighbors now, and which of `ids` (endpoint ids) it has heard from
+    /// since it started.
+    Peers { ids: Vec<String> },
 }
 
 /// The answer to [`Control::Info`].
@@ -338,6 +342,16 @@ async fn run_control(
 ) -> Result<serde_json::Value> {
     match request {
         Control::Info => Ok(info(node, sessions)),
+        Control::Peers { ids } => {
+            let known: std::collections::HashSet<String> =
+                node.known_peers().iter().map(ToString::to_string).collect();
+            let met: Vec<&String> = ids.iter().filter(|id| known.contains(*id)).collect();
+            Ok(serde_json::json!({
+                "endpoint_id": node.endpoint_id().to_string(),
+                "neighbors": node.neighbors().iter().map(ToString::to_string).collect::<Vec<_>>(),
+                "met": met,
+            }))
+        }
         Control::Stop => {
             tracing::info!("stopping: asked by `wats stop`");
             // Before any session sees its node go: they must not start it

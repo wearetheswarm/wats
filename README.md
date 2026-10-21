@@ -138,6 +138,8 @@ post can ask for. See [docs/agent.md](docs/agent.md).
   its environment variable and default.
 - [Running wats with Docker](docs/docker.md): the release image, volumes,
   the key, restart policy and upgrades.
+- [Several nodes on one machine](docs/fleet.md): `wats fleet up -n 6`,
+  support nodes, `wats fleet check` from cron.
 - [Network halt](docs/network-halt.md): the guardians' last-resort switch,
   the current guardian keys, and how guardians keep and use their keys.
 - [Running the public bootstrap node](docs/deploy-bootstrap.md).

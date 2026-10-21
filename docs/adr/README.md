@@ -39,3 +39,4 @@ wrong, the ADR says so and the question goes back to the spec owners.
 | [0023](0023-background-node.md) | Running the node in the background | Proposed |
 | [0024](0024-browse-map.md) | `browse`: a map of the store | Proposed |
 | [0025](0025-bounded-history-sync.md) | Bounded history sync: newest first, then rotation under the cap | Accepted |
+| [0026](0026-fleet.md) | A fleet: several nodes on one machine | Proposed |

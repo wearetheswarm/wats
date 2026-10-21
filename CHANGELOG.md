@@ -4,6 +4,22 @@
 
 ### Changes
 
+- **`wats fleet`: several support nodes on one machine** (ADR 0026).
+  `wats fleet up -n 6` creates six data directories under `--base`
+  (default `~/.wats-fleet`), each with its own key, port and agent
+  workspace and the `config.toml` of a template (`--from`, agents
+  included; no key or credential is copied, the agents share the agent
+  CLI's own login), and starts them in the background one after the
+  other, each listing the others as bootstrap peers, so they connect even
+  with `--infra none`. `--storage 100G --full` makes durable full-history
+  nodes, `--no-agent` storage-only ones. `wats fleet check` (or `up
+  --check`) says, for each node, whether it runs this version, has a
+  neighbor, has met every other node, runs its agents (no model call) and
+  logged no error, and exits non-zero otherwise, for cron; `wats fleet
+  logs [-f]` and `wats fleet stop` cover the rest. No MCP host is touched:
+  `wats mcp --dir ~/.wats-fleet/node-1` attaches a client to one node.
+  Guide: [docs/fleet.md](docs/fleet.md). Not on native Windows, like
+  `--detach`.
 - **A blob repair no longer leaves a thread behind.** Each repair fetched
   the blob into a scratch iroh-blobs store, and a closed iroh-blobs store
   leaves one of its threads stuck for good (it drops its runtime from one
