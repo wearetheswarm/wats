@@ -147,8 +147,9 @@ It names no content: just the post's id, and an optional generic reason.
 - **Other nodes decide for themselves.** A drop is local, not a network
   event. A peer that holds the full post keeps it unless its own policy
   drops it. An author's retraction (above) is the network event that
-  other nodes honour; operators' erasure labels come in a later release
-  (ADR 0020 §5.2). A node running an older release, or modified, may keep
+  other nodes honour; an operator's erasure labels reach only the nodes
+  that subscribe to that labeler (`labels.subscribe`, above; ADR 0020
+  §5.2). A node running an older release, or modified, may keep
   a retracted body: a retraction reaches the nodes that honour it, not
   every copy ever made.
 - A message already in flight on gossip may still be passed on by the
