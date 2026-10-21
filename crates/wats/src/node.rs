@@ -1714,14 +1714,6 @@ impl Node {
             rotation: Default::default(),
         });
         node.measure_storage().await;
-        // This node's profiles, recorded so that rotation keeps their posts
-        // across restarts (ADR 0025 §7).
-        for author in node.local_authors() {
-            let profile = node.local_profile(&author).unwrap_or_default();
-            if let Err(e) = node.store.note_local_key(&author, &profile, now_secs()) {
-                warn!("profile key not recorded: {e:#}");
-            }
-        }
         if node.events_share().is_some() {
             // Rotation at the cap (ADR 0025 §7): checked at start, then
             // every 30 s, in the background.
@@ -1838,6 +1830,20 @@ impl Node {
         }
         node.evaluate_halt();
         protocol.set_node(&node);
+        {
+            // This node's profiles, recorded so that rotation keeps their
+            // posts across restarts (ADR 0025 §7). Off the start: peers
+            // already talk to the node.
+            let node = Arc::clone(&node);
+            tokio::task::spawn_blocking(move || {
+                for author in node.local_authors() {
+                    let profile = node.local_profile(&author).unwrap_or_default();
+                    if let Err(e) = node.store.note_local_key(&author, &profile, now_secs()) {
+                        warn!("profile key not recorded: {e:#}");
+                    }
+                }
+            });
+        }
         // History in the background, one task per network (ADR 0025 §4):
         // nothing here waits for it.
         if let Some((max, share)) = node.initial_max_clamped() {
