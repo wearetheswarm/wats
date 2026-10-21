@@ -36,6 +36,24 @@
 - **Blob lookups by hash use an index.** A new `event_blobs` table (no
   schema bump, filled at open) replaces scans of every event when a body
   is dropped and for replica repair.
+- **`wats`, alone, runs the setup wizard the first time.** On a terminal,
+  with no argument at all and no `config.toml` yet, a bare `wats` asks the
+  node's main choices (now with the agent's access level), then, for each
+  of Claude Code, Codex, OpenClaw and Mistral Vibe found on PATH, whether
+  to register wats as its MCP server (as `wats setup <tool> --mcp` does),
+  then whether to run the node in the background; then it starts the node.
+  It opens with a short welcome ("You are the swarm.", then the motto
+  "Every node is the swarm.") and closes with what was set up and how to
+  talk to the node. The very first start of a node in a data directory,
+  wizard or not, says "You are the swarm." once on stderr (marker
+  `<data dir>/greeted`); nodes that ran before 0.4.3 do not.
+  `wats setup` with no tool runs the same steps. Any argument, no
+  terminal, or a data directory already set up: `wats` behaves as before,
+  so scripts, containers and services are unaffected. Setup now records
+  the revision of its questions in `<data dir>/setup-revision`; a release
+  that adds questions bumps it (whatever its version number), and a bare
+  `wats` on a terminal then asks only those, while other starts log one
+  line. Nodes set up by 0.4.2 or older are asked nothing. ADR 0027.
 - **`wats fleet`: several support nodes on one machine** (ADR 0028).
   `wats fleet up -n 6` creates six data directories under `--base`
   (default `~/.wats-fleet`), each with its own key, port and agent
