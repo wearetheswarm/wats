@@ -113,7 +113,7 @@ has".
 - **Count every `providers` entry**: those after the first are hints
   copied by relays, up to 8 per envelope, and cost nothing to claim.
 
-## A better estimate needs the protocol (proposal, not implemented)
+## A better estimate needs the protocol (not implemented yet)
 
 A node only sees its corner. Two backward-compatible additions would give
 a swarm-wide estimate; neither is worth a wire change for 0.4.3.
@@ -138,6 +138,15 @@ a swarm-wide estimate; neither is worth a wire change for 0.4.3.
 A periodic signed "present" beacon per node per network would count
 exactly, at the price of one gossip message per node per period across
 the whole swarm, and of telling everyone who is online when. Rejected.
+
+### Decided by Vincent (2026-10-21)
+
+- **No central count.** A stats URL that nodes report to, even an
+  optional one, is rejected: nothing centralized. The swarm's size is only
+  ever what nodes estimate from what they see.
+- **Capture-recapture is the planned next step**: the `peer_sample` hello
+  feature and its estimate (1 above) are accepted for a later release, not
+  0.4.3. 0.4.3 ships the node-local figures of "Decision" only.
 
 ## SPEC
 
