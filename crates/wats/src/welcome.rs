@@ -9,6 +9,12 @@
 //! rest of wats. Plain ASCII unless the locale says UTF-8; yellow for the
 //! mark and bold headers only where color is welcome
 //! ([`crate::banner::color_ok`], `NO_COLOR`).
+//!
+//! The brand lines: the headline [`HEADLINE`] ("You are the swarm.") when
+//! the user starts something (the welcome, and a node's very first start
+//! in a data directory, once: [`first_start`]), the motto [`MOTTO`] ("Every
+//! node is the swarm.") with it and in the banner, and the signature "We
+//! are the swarm." at the end of the README.
 
 use std::ffi::OsString;
 
@@ -100,14 +106,21 @@ pub const STEPS: [&str; 3] = [
     "Where the node runs",
 ];
 
+/// The headline: the welcome screen's, and the line of a node's first
+/// start ([`first_start_line`]).
+pub const HEADLINE: &str = "You are the swarm.";
+
+/// The motto that goes with it, under the headline and in the banner.
+pub const MOTTO: &str = "Every node is the swarm.";
+
 /// The welcome screen.
 pub fn welcome(version: &str, kind: &Kind, style: Style) -> String {
     let dot = style.dot();
     let text = [
         String::new(),
+        style.bold(HEADLINE),
+        MOTTO.to_string(),
         format!("Welcome to WeAreTheSwarm {dot} wats {version}"),
-        "Every node is the swarm.".to_string(),
-        String::new(),
     ];
     let mut out = String::from("\n");
     for (art, line) in MARK.iter().zip(&text) {
@@ -118,7 +131,7 @@ pub fn welcome(version: &str, kind: &Kind, style: Style) -> String {
         };
         if !line.is_empty() {
             row.push_str(&" ".repeat(TEXT_COLUMN - art.len()));
-            row.push_str(&style.bold(line));
+            row.push_str(line);
         }
         out.push_str(&row);
         out.push('\n');
@@ -239,9 +252,78 @@ pub fn closing(summary: &Summary, style: Style) -> String {
     out
 }
 
+/// The marker, in the data directory, that its person has seen the
+/// headline: the wizard's welcome, or a node's first start. A file of its
+/// own, which an older wats ignores (`wats upgrade --rollback`).
+pub const GREETED_FILE: &str = "greeted";
+
+/// The line a node prints, on stderr, the first time it starts in a data
+/// directory (`dir`, as shown) where nobody saw the headline yet.
+pub fn first_start_line(dir: &str) -> String {
+    format!("{HEADLINE} Welcome: this is the first start of the node in {dir}.")
+}
+
+/// Record that the headline was shown for `data_dir`. Returns whether this
+/// call recorded it (the first time), atomically: two starts at once never
+/// both get `true`. An error (a read-only directory) is `false`: better
+/// never shown than shown at each start.
+pub fn record_greeting(data_dir: &std::path::Path) -> bool {
+    use std::io::Write;
+    if std::fs::create_dir_all(data_dir).is_err() {
+        return false;
+    }
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(data_dir.join(GREETED_FILE))
+    {
+        Ok(mut file) => {
+            let _ = writeln!(file, "{}", env!("CARGO_PKG_VERSION"));
+            true
+        }
+        Err(_) => false,
+    }
+}
+
+/// Whether a node's start in `data_dir` is its first: no store yet
+/// (`events.sqlite`) and nobody greeted there. A data directory that ran a
+/// node before 0.4.3 has a store: it is recorded as greeted, silently.
+pub fn first_start(data_dir: &std::path::Path) -> bool {
+    if data_dir.join(GREETED_FILE).exists() {
+        return false;
+    }
+    if data_dir.join("events.sqlite").exists() {
+        record_greeting(data_dir);
+        return false;
+    }
+    record_greeting(data_dir)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_first_start_is_greeted_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let data = dir.path().join("d");
+        assert!(first_start(&data));
+        assert!(!first_start(&data), "never again");
+        // A node that ran before 0.4.3: not its first start.
+        let old = dir.path().join("old");
+        std::fs::create_dir_all(&old).unwrap();
+        std::fs::write(old.join("events.sqlite"), "").unwrap();
+        assert!(!first_start(&old));
+        assert!(old.join(GREETED_FILE).exists());
+        // The wizard greeted: the node's first start says nothing.
+        let wizard = dir.path().join("w");
+        assert!(record_greeting(&wizard));
+        assert!(!first_start(&wizard));
+        assert_eq!(
+            first_start_line("~/.wats"),
+            "You are the swarm. Welcome: this is the first start of the node in ~/.wats."
+        );
+    }
 
     const PLAIN: Style = Style {
         color: false,
@@ -259,6 +341,12 @@ mod tests {
         let text = welcome("1.2.3", &first_run(), PLAIN);
         assert!(
             text.contains("Welcome to WeAreTheSwarm - wats 1.2.3"),
+            "{text}"
+        );
+        // The headline first, the motto under it.
+        let headline = text.find("You are the swarm.").expect("the headline");
+        assert!(
+            headline < text.find("Every node is the swarm.").unwrap(),
             "{text}"
         );
         assert!(text.contains("Every node is the swarm."), "{text}");

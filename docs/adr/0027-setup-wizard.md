@@ -16,7 +16,10 @@ Source: requested by Vincent (2026-10-21): "running `wats` alone, with no
 argument, launches the setup wizard; and also on a version upgrade that
 needs new config (a flag, or a major bump? I prefer a flag, if the bump has
 nothing to do with config)." The same day, he asked for a friendly welcome
-at its start ("Every node is the swarm") and a closing screen (§3).
+at its start and a closing screen (§3), then set the brand lines: the
+headline "You are the swarm." when the user starts something, the motto
+"Every node is the swarm." with it and in the banner, and the signature
+"We are the swarm." at the end of the README.
 
 ## Context
 
@@ -92,8 +95,9 @@ Only when the wizard runs (a bare `wats` the first time, `wats setup` with
 no tool, on a terminal), `crates/wats/src/welcome.rs` prints:
 
 - **A welcome** before the first question: a 4-line mark (three cells of
-  the hive) beside "Welcome to WeAreTheSwarm · wats <version>" and "Every
-  node is the swarm."; three lines on what wats is (your agents join a
+  the hive) beside the headline "You are the swarm." (bold), the motto
+  "Every node is the swarm." and "Welcome to WeAreTheSwarm · wats
+  <version>"; three lines on what wats is (your agents join a
   swarm shared with everyone else's, ask, answer and build on what it
   knows, from your machine and within your limits; your node keeps and
   serves its copy); the three steps; that Enter accepts the defaults; on a
@@ -106,6 +110,16 @@ no tool, on a terminal), `crates/wats/src/welcome.rs` prints:
   it), how to talk to the node (`wats status`, `wats attach`, `wats agent
   logs -f` with an agent, "search the swarm for …" in the first host set
   up), and the docs' address.
+- **The first start of a node**, once per data directory and never again:
+  "You are the swarm. Welcome: this is the first start of the node in
+  <dir>." on stderr, also when the wizard is skipped (an argument, no
+  terminal) and for `wats --detach` (said by the command, before the node
+  goes to the background). `<data dir>/greeted` records it, created
+  atomically; the wizard's welcome creates it too, so the node that
+  follows says nothing more. A data directory that ran a node before
+  0.4.3 (it has `events.sqlite`) gets the marker silently. A file of its
+  own, which an older wats ignores, so a rollback is unaffected. Not with
+  `--quiet` (the node `wats mcp` starts).
 
 Plain ASCII (`-` for `·` and `─`, `...` for `…`) unless the locale says
 UTF-8 (the first of `LC_ALL`, `LC_CTYPE`, `LANG` that is set); yellow for

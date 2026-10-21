@@ -180,6 +180,8 @@ fn text(bytes: &[u8]) -> String {
 const BACKGROUND: &str = "Run the node in the background (`wats --detach`";
 /// The welcome screen, shown only by the wizard.
 const WELCOME: &str = "Every node is the swarm.";
+/// The line of a node's very first start in a data directory (stderr).
+const FIRST_START: &str = "You are the swarm. Welcome: this is the first start of the node in ";
 
 /// The first bare `wats` on a terminal: the main choices, then each MCP
 /// host found on PATH (Claude Code: registered through its CLI, with the
@@ -198,6 +200,9 @@ fn first_bare_wats_runs_the_wizard_then_the_node_in_the_background() {
     let (said, err) = (text(&out.stdout), text(&out.stderr));
     assert!(out.status.success(), "{out:?}");
     // The welcome, then the three steps, then the closing screen.
+    assert!(said.contains("You are the swarm."), "{said}");
+    // The welcome greeted: the node's first start says nothing more.
+    assert!(!err.contains(FIRST_START), "{err}");
     assert!(said.contains("Welcome to WeAreTheSwarm · wats "), "{said}");
     assert!(said.contains(WELCOME), "{said}");
     assert!(said.contains("This setup takes three steps:"), "{said}");
@@ -279,6 +284,7 @@ fn first_bare_wats_runs_the_wizard_then_the_node_in_the_background() {
     let (out, node) = machine.foreground(child);
     assert!(!text(&out.stdout).contains("]: "), "{out:?}");
     assert!(!text(&out.stdout).contains(WELCOME), "{out:?}");
+    assert!(!text(&out.stderr).contains(FIRST_START), "{out:?}");
     assert_eq!(node["mode"], "foreground", "{node}");
 }
 
@@ -337,6 +343,22 @@ fn bare_wats_without_a_terminal_runs_the_node_as_before() {
     let config = std::fs::read_to_string(machine.data().join("config.toml")).unwrap();
     assert!(config.contains("# [agents.claude]"), "{config}");
     assert_eq!(machine.revision(), None);
+    // The very first start of a node here: the headline, on stderr, once.
+    assert!(text(&out.stderr).contains(FIRST_START), "{out:?}");
+    let again = machine
+        .foreground(machine.spawn(machine.wats(&[], false), ""))
+        .0;
+    assert!(!text(&again.stderr).contains(FIRST_START), "{again:?}");
+    // A node that ran before 0.4.3 (a store, no marker): not greeted.
+    std::fs::remove_file(machine.data().join("greeted")).unwrap();
+    let upgraded = machine
+        .foreground(machine.spawn(machine.wats(&[], false), ""))
+        .0;
+    assert!(
+        !text(&upgraded.stderr).contains(FIRST_START),
+        "{upgraded:?}"
+    );
+    assert!(machine.data().join("greeted").exists());
 }
 
 /// Any argument keeps today's `wats`, even on a terminal: here (hermetic)
@@ -349,6 +371,7 @@ fn any_argument_skips_the_wizard() {
     let (out, _) = machine.foreground(child);
     assert!(!text(&out.stdout).contains("]: "), "{out:?}");
     assert!(!text(&out.stdout).contains(WELCOME), "{out:?}");
+    assert!(text(&out.stderr).contains(FIRST_START), "{out:?}");
     assert!(machine.calls().is_empty(), "{}", machine.calls());
     assert!(!machine.path("vibe/config.toml").exists());
 }

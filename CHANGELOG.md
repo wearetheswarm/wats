@@ -10,8 +10,11 @@
   of Claude Code, Codex, OpenClaw and Mistral Vibe found on PATH, whether
   to register wats as its MCP server (as `wats setup <tool> --mcp` does),
   then whether to run the node in the background; then it starts the node.
-  It opens with a short welcome ("Every node is the swarm.") and closes
-  with what was set up and how to talk to the node.
+  It opens with a short welcome ("You are the swarm.", then the motto
+  "Every node is the swarm.") and closes with what was set up and how to
+  talk to the node. The very first start of a node in a data directory,
+  wizard or not, says "You are the swarm." once on stderr (marker
+  `<data dir>/greeted`); nodes that ran before 0.4.3 do not.
   `wats setup` with no tool runs the same steps. Any argument, no
   terminal, or a data directory already set up: `wats` behaves as before,
   so scripts, containers and services are unaffected. Setup now records

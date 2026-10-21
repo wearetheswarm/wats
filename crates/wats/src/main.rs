@@ -2277,6 +2277,7 @@ async fn setup_command(
             "{}",
             welcome::welcome(env!("CARGO_PKG_VERSION"), &welcome::Kind::Setup, style)
         );
+        welcome::record_greeting(data_dir);
         print!("{}", welcome::step(1, style));
         let (choices, found) = wats::firstrun::setup_for_wizard(
             data_dir,
@@ -2618,6 +2619,7 @@ async fn setup_wizard(node: &NodeArgs, data_dir: &std::path::Path) -> Result<boo
         "{}",
         welcome::welcome(env!("CARGO_PKG_VERSION"), &kind, style)
     );
+    welcome::record_greeting(data_dir);
     print!("{}", welcome::step(1, style));
     let (choices, found) = wats::firstrun::setup_for_wizard(
         data_dir,
@@ -6225,6 +6227,15 @@ async fn async_main(cli: Cli) -> Result<()> {
             unreachable!("handled above")
         }
     };
+    // The very first start of a node in this data directory: the headline,
+    // once ever (the wizard's welcome counts), on stderr. Before `--detach`
+    // hands over, so that a detached node shows it in this terminal.
+    if !daemon.quiet && wats::welcome::first_start(&data_dir) {
+        eprintln!(
+            "{}",
+            wats::welcome::first_start_line(&tilde(&std::path::absolute(&data_dir)?))
+        );
+    }
     // `wats --detach` (ADR 0023): start this same command in the
     // background, and return once it is up. The child is the process with
     // `--log-file`.
