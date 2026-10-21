@@ -274,3 +274,35 @@ Found while chasing a `poisoned storage` read and a hung test on CI
    but a new store. Retrying at the next interval (an error is likely
    transient) or surfacing the stop through the API would help; wats now
    reports a collection overdue in its status.
+5. **An import does not replace a `Poisoned` entry** (found 2026-10-21,
+   after a `poisoned storage` read on CI right after a repair).
+   `finish_import_impl` calls `ctx.load()` before it moves the new file
+   into place, so the load of an entry whose file is gone sets `Poisoned`,
+   and `BaoFileHandle::complete` then leaves `Poisoned` (and `Complete`)
+   as they are. The database gets the new `Complete` entry, but reads keep
+   failing with `poisoned storage` until the entity is recycled (idle) and
+   loaded again. A read sent right after `add_path` returned can reach the
+   entity before that: on one running store, removing the file, reading
+   (poisoned), `add_path` and reading at once, 1 read in 2000 rounds
+   failed under CPU load (48 busy loops on 12 cores), 0 in 300 idle; all
+   read again 20 ms later. Fix: on import, replace a `Poisoned` handle
+   (and a `Complete` one whose file was replaced).
+6. **Observing a `Poisoned` entry panics a store thread, and the entry is
+   dead until the store reopens.** `BaoFileStorageSubscriber::forward`
+   calls `BaoFileStorage::bitfield()`, which panics on `Poisoned`
+   (`bao_file.rs:410`, "poisoned storage should not be used"). The
+   downloader observes the entry before it fetches (`Remote::local`), and
+   so does the provider's handler of a peer's `Observe` request, so a peer
+   can trigger it. Afterwards every read and import of that hash fails
+   with `entity is dead` (an import of the same content included), and the
+   first read after the panic can even return `Ok` with no bytes while
+   `status` says `Complete { size: 40960 }`. Repro: add a 40 KiB file, tag
+   it, remove its data file, `get_bytes` (poisoned), `observe(hash)`, then
+   `get_bytes` and `add_path`. Fix: report `Poisoned` as an error to the
+   observer instead of panicking.
+
+wats, meanwhile: a read checks that the store returned the whole blob,
+falls back to the data file when it holds the blob (BLAKE3-checked), and
+otherwise fetches the blob again; when the store refuses the import, it
+puts the verified content where the database expects the file, which the
+store reads after a restart.
