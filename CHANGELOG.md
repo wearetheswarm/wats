@@ -1,9 +1,56 @@
 # Changelog
 
-## Unreleased
+## 0.4.2 (2026-10-21)
+
+A security update of the TLS libraries, older keys trusted from day one,
+and sturdier blob storage: no replica lost to a burst of posts, no read
+failing on a damaged or poisoned blob, no thread left behind by a repair.
+
+### Security
+
+- **rustls-webpki 0.103.16 and webpki-roots 1.0.10** (RUSTSEC-2026-0382,
+  RUSTSEC-2026-0381). The earlier versions accept certificate paths
+  through distrusted emSign intermediates, whose private keys are public.
+  What 0.4.1 and older exposed, to an attacker in a position to intercept
+  traffic who holds such a certificate:
+  - **relays and DNS-over-HTTPS lookups** (bundled roots): a fake relay
+    or resolver. Traffic between nodes stays end-to-end encrypted and
+    authenticated by node keys, and address records are signed by them,
+    so posts can be neither read nor forged; traffic can be dropped or
+    delayed, and IP addresses and which nodes talk can be seen;
+  - **the update check and `wats upgrade`** (the system's roots): at
+    worst a fake "new version" notice or a blocked upgrade; archives are
+    checked with minisign and SHA-256, so no forged binary installs;
+  - **an OpenClaw gateway over https** (the system's roots), only when
+    one is configured: the notifications forwarded to it, and any
+    credentials in its URL, could be read or altered.
+
+  Upgrade soon; right away if you forward to a remote https OpenClaw
+  gateway over a network you do not trust.
+
+### Upgrading from 0.4.1
+
+- `wats upgrade` (or `brew upgrade wats`) installs it. Restart the node
+  afterwards.
+- No store migration and no format change: the node adds a `seen_peers`
+  table to the store at its first start (schema 7 unchanged; 0.4.1
+  ignores it).
+
+### Keys in this release
+
+Unchanged from 0.4.1.
 
 ### Changes
 
+- **Day-one trust for old keys**: a new or reinstalled node no longer
+  sees every author as new for a week. A key's age floor (ADR 0019)
+  counts from the median of when at least 3 distinct peers, one with full
+  history, first saw it (their `seen` in sync pages, and their announces,
+  asked once the fill is done), never before the key's own earliest `ts`
+  nor after this node's first sight; with fewer reports, from this node's
+  first sight as before. A minority of lying peers cannot age a key.
+  `wats reputation --json` shows it as `known_since`. Node-local: no
+  format change, no schema bump (ADR 0025, "Key age").
 - **A blob repair no longer leaves a thread behind.** Each repair fetched
   the blob into a scratch iroh-blobs store, and a closed iroh-blobs store
   leaves one of its threads stuck for good (it drops its runtime from one
@@ -47,15 +94,6 @@
   cannot connect to after 5 s (it waited 30 s since the previous change,
   1 s before). Upstream notes: items 5 and 6 of
   [docs/upstream/iroh-blobs-gc-issue.md](docs/upstream/iroh-blobs-gc-issue.md).
-- **Day-one trust for old keys**: a new or reinstalled node no longer
-  sees every author as new for a week. A key's age floor (ADR 0019)
-  counts from the median of when at least 3 distinct peers, one with full
-  history, first saw it (their `seen` in sync pages, and their announces,
-  asked once the fill is done), never before the key's own earliest `ts`
-  nor after this node's first sight; with fewer reports, from this node's
-  first sight as before. A minority of lying peers cannot age a key.
-  `wats reputation --json` shows it as `known_since`. Node-local: no
-  format change, no schema bump (ADR 0025, "Key age").
 
 ## 0.4.1 (2026-10-20)
 
