@@ -601,6 +601,18 @@ const MAX_PROVIDER_ATTEMPTS: usize = 4;
 /// this pause, then twice it.
 const READ_FETCH_TRIES: u32 = 3;
 const READ_FETCH_PAUSE: Duration = Duration::from_millis(500);
+/// A blob pushed to this node (`replicate`) is fetched from its pusher up
+/// to this many times, with the pauses of a read, all tries within
+/// [`PUSH_FETCH_BUDGET`] (the 60 s one try may take) and within what is
+/// left of the request's [`REPLICATE_BUDGET`].
+const PUSH_FETCH_TRIES: u32 = 3;
+const PUSH_FETCH_BUDGET: Duration = Duration::from_secs(60);
+/// The most time the blobs of one `replicate` request take here, fetch
+/// slot waits included, all its blobs together: [`PUSH_TIMEOUT`] less
+/// 30 s for accepting the event and answering, so the answer still comes
+/// before the pusher gives up on it. What is not fetched by then is not
+/// taken (`durability.replicate_budget`; tests shorten it).
+const REPLICATE_BUDGET: Duration = Duration::from_secs(120);
 /// A provider whose fetch failed is skipped for this long, doubling with
 /// each further failure up to [`PROVIDER_BACKOFF_MAX`] (B7).
 const PROVIDER_BACKOFF: Duration = Duration::from_secs(30);
@@ -4544,6 +4556,15 @@ impl Node {
         let legacy = tuning.legacy_replicate;
         let mut stored = Vec::new();
         let mut refusal: Option<&str> = None;
+        // One budget for every blob of the request, and the pusher asked
+        // past its backoff only until it fails one blob: a pusher that
+        // serves nothing holds the request, and its fetch slots, for one
+        // budget at most, and the rest goes the plain way (skipped while
+        // it backs off). One WARN per request for what was not fetched.
+        let started = tokio::time::Instant::now();
+        let budget = tuning.replicate_budget;
+        let mut pusher_failed = false;
+        let mut not_fetched: Vec<&str> = Vec::new();
         for blob in event.blobs.iter().filter(|b| hashes.contains(&b.hash)) {
             if blob.url.is_some() || blob.size > self.config.max_blob_bytes {
                 continue;
@@ -4584,21 +4605,56 @@ impl Node {
                     continue;
                 }
             }
+            let left = budget.saturating_sub(started.elapsed());
+            if !legacy && left.is_zero() {
+                debug!(hash = %blob.hash, pusher = %peer.fmt_short(), "replicate: budget spent, blob not fetched");
+                not_fetched.push(&blob.hash);
+                continue;
+            }
             // At most a few fetches at once for one peer, a few more
             // waiting their turn.
-            let Some(_permit) = self
-                .limiter
-                .blob_fetch(peer, crate::limits::BLOB_FETCH_WAIT)
-                .await
-            else {
+            let wait = if legacy {
+                crate::limits::BLOB_FETCH_WAIT
+            } else {
+                crate::limits::BLOB_FETCH_WAIT.min(left)
+            };
+            let Some(_permit) = self.limiter.blob_fetch(peer, wait).await else {
                 continue;
             };
-            if self.fetch_blob(blob, vec![peer]).await {
+            // 0.4.2 (tests: `legacy_replicate`) asked the pusher once,
+            // and not while it backed off.
+            let fetched = if legacy {
+                self.fetch_blob(blob, vec![peer]).await
+            } else {
+                let left = budget.saturating_sub(started.elapsed());
+                let fetch = async {
+                    if pusher_failed {
+                        self.fetch_blob(blob, vec![peer]).await
+                    } else {
+                        self.fetch_pushed(blob, peer, left).await
+                    }
+                };
+                let fetched = tokio::time::timeout(left, fetch).await.unwrap_or(false);
+                if !fetched {
+                    pusher_failed = true;
+                    not_fetched.push(&blob.hash);
+                }
+                fetched
+            };
+            if fetched {
                 if replica {
                     self.record_replica_intent(hash, blob.size).await;
                 }
                 stored.push(blob.hash.clone());
             }
+        }
+        if let Some(first) = not_fetched.first() {
+            warn!(
+                pusher = %peer.fmt_short(),
+                count = not_fetched.len(),
+                first = %first,
+                "pushed blobs not fetched from their pusher: replicas not taken"
+            );
         }
         // A retraction or an erasure that landed while the blobs came in
         // (S8): what it would have freed is released again.
@@ -4821,6 +4877,38 @@ impl Node {
     /// is never executed (SPEC §2.15).
     async fn fetch_blob(&self, blob: &BlobRef, providers: Vec<EndpointId>) -> bool {
         self.fetch_blob_from(blob, providers, false).await
+    }
+
+    /// Fetch a blob `pusher` asked this node to hold (`replicate`), from
+    /// that peer. It just reached this node, so its backoff as a provider
+    /// (B7, for providers others name) does not skip it: one failed fetch
+    /// from it (a connection that timed out under load, a refusal while a
+    /// possession proof of that blob runs there) would otherwise drop every
+    /// replica it pushes for the next 30 s, doubling up to an hour, without
+    /// telling it. A failed try is tried again after a pause, as a read is,
+    /// within [`PUSH_FETCH_BUDGET`] and `budget` for all tries. Logs at
+    /// debug only: the request logs what it did not fetch, once.
+    async fn fetch_pushed(&self, blob: &BlobRef, pusher: EndpointId, budget: Duration) -> bool {
+        let started = tokio::time::Instant::now();
+        let budget = budget.min(PUSH_FETCH_BUDGET);
+        for attempt in 0..PUSH_FETCH_TRIES {
+            if attempt > 0 {
+                tokio::time::sleep(READ_FETCH_PAUSE.saturating_mul(attempt)).await;
+            }
+            let left = budget.saturating_sub(started.elapsed());
+            if left.is_zero() {
+                break;
+            }
+            match tokio::time::timeout(left, self.fetch_blob_from(blob, vec![pusher], true)).await {
+                Ok(true) => return true,
+                Ok(false) => {
+                    debug!(hash = %blob.hash, pusher = %pusher.fmt_short(), attempt, "pushed blob not fetched yet");
+                }
+                Err(_) => break,
+            }
+        }
+        debug!(hash = %blob.hash, pusher = %pusher.fmt_short(), "pushed blob not fetched from its pusher");
+        false
     }
 
     /// [`Node::fetch_blob`]; with `again`, the providers backing off are

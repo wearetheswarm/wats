@@ -56,6 +56,19 @@ by the wizard when you answer yes. See docs/config.md.
   address and joins the public swarm; add `no_default_bootstrap` to stay
   off it (docs/deploy-relay.md, `wats config` help). The welcome's
   "Docs:" line points to https://wearetheswarm.ai/docs.
+- **A replica pushed to a node is fetched even after a fetch from that
+  peer failed.** One failed fetch from a peer (a connection that timed
+  out under load, a refusal while a possession proof of that file runs
+  there) put it in the providers' backoff (30 s, doubling up to an
+  hour), and the node then dropped every replica that peer pushed in the
+  meantime, at publish time or in repair, answering `replicate` with
+  nothing taken; until 0.4.2 such a replica stayed missing. The pusher
+  has just reached the node: it is now asked, up to 3 times with the
+  pauses of a read. A pusher that serves nothing is bounded: once one
+  file of a request failed every try, the others go the plain way
+  (skipped while it backs off), all the files of a request share one
+  120 s budget (within the pusher's 150 s wait), and what was not
+  fetched is logged once per request, with a count. ADR 0014.
 - **Security updates, installed automatically if you say so.** A new
   key, `update.security_auto` (off when absent), makes the node install
   releases marked security by itself once they are
