@@ -1,14 +1,21 @@
 //! Per-peer rate limits on the request/response protocol (`/wats`): token
 //! buckets per peer and request type, and a cap on the blobs one peer can
-//! make us fetch at once. A first robustness step before strangers run
-//! nodes; gossip has its own limits in Iroh.
+//! make us fetch at once, with a short queue behind it. A first robustness
+//! step before strangers run nodes; gossip has its own limits in Iroh.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use iroh::EndpointId;
-use tokio::sync::Semaphore;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+
+/// How long a blob fetch a peer asked for waits for one of its slots
+/// (`blob_fetches_per_peer`) before it is skipped. With the 60 s a fetch
+/// from that peer may take, the answer still comes within the 150 s a
+/// publisher waits for it.
+pub const BLOB_FETCH_WAIT: Duration = Duration::from_secs(60);
 
 /// Limits per peer, from `[limits]` in config.toml.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -23,6 +30,10 @@ pub struct Limits {
     pub get_per_min: u32,
     /// Blobs one peer can make us fetch at the same time (replication).
     pub blob_fetches_per_peer: usize,
+    /// Blob fetches of one peer that wait for a slot (up to
+    /// [`BLOB_FETCH_WAIT`]) when all its slots are taken; past these, a
+    /// fetch is skipped at once.
+    pub blob_fetch_queue: usize,
     /// Answer with a proof-of-work challenge (`crate::challenge`) instead
     /// of refusing a peer over its rate limit, and challenge peers without
     /// a reputation while overloaded. Only peers that advertise the
@@ -48,6 +59,7 @@ impl Default for Limits {
             report_per_min: 10,
             get_per_min: 120,
             blob_fetches_per_peer: 4,
+            blob_fetch_queue: 16,
             challenge: true,
             challenge_base_bits: 8,
             challenge_max_bits: 24,
@@ -111,7 +123,7 @@ pub struct RateLimiter {
     logged: Mutex<HashMap<(EndpointId, Kind), Instant>>,
     /// Requests let through on a solved challenge, all peers together.
     solved: Mutex<Option<Bucket>>,
-    fetches: Mutex<HashMap<EndpointId, Arc<Semaphore>>>,
+    fetches: PeerSlots,
 }
 
 impl RateLimiter {
@@ -121,7 +133,7 @@ impl RateLimiter {
             buckets: Default::default(),
             logged: Default::default(),
             solved: Default::default(),
-            fetches: Default::default(),
+            fetches: PeerSlots::new(limits.blob_fetches_per_peer, limits.blob_fetch_queue),
         }
     }
 
@@ -201,26 +213,130 @@ impl RateLimiter {
         )
     }
 
-    /// A permit to fetch one blob for `peer`, if it has fewer than
-    /// `blob_fetches_per_peer` fetches running.
-    pub fn blob_fetch(&self, peer: EndpointId) -> Option<tokio::sync::OwnedSemaphorePermit> {
-        let semaphore = {
-            let mut fetches = self.fetches.lock().ok()?;
-            Arc::clone(
-                fetches
-                    .entry(peer)
-                    .or_insert_with(|| Arc::new(Semaphore::new(self.limits.blob_fetches_per_peer))),
-            )
-        };
-        let permit = semaphore.try_acquire_owned().ok();
-        if permit.is_none() {
-            tracing::warn!(
-                peer = %peer.fmt_short(),
-                "peer throttled: {} blob fetches already running for it",
-                self.limits.blob_fetches_per_peer
-            );
+    /// A permit to fetch one blob for `peer`: at once if it has fewer than
+    /// `blob_fetches_per_peer` fetches running, else once one ends, if
+    /// fewer than `blob_fetch_queue` already wait and within `wait`.
+    pub async fn blob_fetch(
+        &self,
+        peer: EndpointId,
+        wait: Duration,
+    ) -> Option<OwnedSemaphorePermit> {
+        match self.fetches.acquire(peer, wait).await {
+            Ok(permit) => Some(permit),
+            Err(why) => {
+                let (running, queued) = (
+                    self.limits.blob_fetches_per_peer,
+                    self.limits.blob_fetch_queue,
+                );
+                match why {
+                    NoSlot::Full => tracing::warn!(
+                        peer = %peer.fmt_short(),
+                        "peer throttled: {running} blob fetches already running for it, {queued} waiting"
+                    ),
+                    NoSlot::TimedOut => tracing::warn!(
+                        peer = %peer.fmt_short(),
+                        "peer throttled: a blob fetch waited {}s for one of its {running} slots",
+                        wait.as_secs()
+                    ),
+                }
+                None
+            }
         }
-        permit
+    }
+}
+
+/// Why [`PeerSlots::acquire`] gave no slot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NoSlot {
+    /// Every slot taken and the queue full.
+    Full,
+    /// Queued, but no slot freed in time.
+    TimedOut,
+}
+
+/// At most `slots` holders at once per peer, and at most `queue` more
+/// waiting for a slot, first come first served. Bounded both ways: a
+/// peer cannot make us run, nor keep waiting, more than that.
+pub struct PeerSlots {
+    slots: usize,
+    queue: usize,
+    peers: Mutex<HashMap<EndpointId, Arc<Gate>>>,
+}
+
+struct Gate {
+    semaphore: Arc<Semaphore>,
+    waiting: AtomicUsize,
+}
+
+/// A place in a [`Gate`]'s queue, given back when dropped (the wait ended
+/// or was cancelled).
+struct Place<'a> {
+    waiting: &'a AtomicUsize,
+    /// Callers that were waiting already.
+    ahead: usize,
+}
+
+impl<'a> Place<'a> {
+    fn take(waiting: &'a AtomicUsize) -> Self {
+        let ahead = waiting.fetch_add(1, Ordering::SeqCst);
+        Place { waiting, ahead }
+    }
+}
+
+impl Drop for Place<'_> {
+    fn drop(&mut self) {
+        self.waiting.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+impl PeerSlots {
+    pub fn new(slots: usize, queue: usize) -> Self {
+        PeerSlots {
+            slots,
+            queue,
+            peers: Default::default(),
+        }
+    }
+
+    fn gate(&self, peer: EndpointId) -> Option<Arc<Gate>> {
+        let mut peers = self.peers.lock().ok()?;
+        if peers.len() >= 1_000 && !peers.contains_key(&peer) {
+            // Forget idle peers: nobody waits for their slots nor holds one.
+            peers.retain(|_, gate| {
+                Arc::strong_count(gate) > 1 || gate.semaphore.available_permits() < self.slots
+            });
+        }
+        let gate = peers.entry(peer).or_insert_with(|| {
+            Arc::new(Gate {
+                semaphore: Arc::new(Semaphore::new(self.slots)),
+                waiting: AtomicUsize::new(0),
+            })
+        });
+        Some(Arc::clone(gate))
+    }
+
+    /// A slot for `peer`, held until the permit is dropped: at once if one
+    /// is free, else after waiting at most `wait` in a queue of at most
+    /// `queue` callers.
+    pub async fn acquire(
+        &self,
+        peer: EndpointId,
+        wait: Duration,
+    ) -> Result<OwnedSemaphorePermit, NoSlot> {
+        let gate = self.gate(peer).ok_or(NoSlot::Full)?;
+        if let Ok(permit) = Arc::clone(&gate.semaphore).try_acquire_owned() {
+            return Ok(permit);
+        }
+        // Taken first, then checked: callers racing for the last place may
+        // all be refused, never all let in.
+        let place = Place::take(&gate.waiting);
+        if place.ahead >= self.queue {
+            return Err(NoSlot::Full);
+        }
+        match tokio::time::timeout(wait, Arc::clone(&gate.semaphore).acquire_owned()).await {
+            Ok(Ok(permit)) => Ok(permit),
+            _ => Err(NoSlot::TimedOut),
+        }
     }
 }
 
@@ -269,17 +385,49 @@ mod tests {
     async fn blob_fetches_are_capped() {
         let limiter = RateLimiter::new(Limits {
             blob_fetches_per_peer: 2,
+            blob_fetch_queue: 0,
             ..Limits::default()
         });
         let a = peer(1);
-        let one = limiter.blob_fetch(a).unwrap();
-        let _two = limiter.blob_fetch(a).unwrap();
-        assert!(limiter.blob_fetch(a).is_none());
-        assert!(limiter.blob_fetch(peer(2)).is_some());
+        let wait = Duration::from_secs(5);
+        let one = limiter.blob_fetch(a, wait).await.unwrap();
+        let _two = limiter.blob_fetch(a, wait).await.unwrap();
+        assert!(limiter.blob_fetch(a, wait).await.is_none(), "no queue");
+        assert!(limiter.blob_fetch(peer(2), wait).await.is_some());
         drop(one);
         assert!(
-            limiter.blob_fetch(a).is_some(),
+            limiter.blob_fetch(a, wait).await.is_some(),
             "a finished fetch frees a slot"
         );
+    }
+
+    #[tokio::test]
+    async fn blob_fetches_queue_behind_the_cap() {
+        let slots = Arc::new(PeerSlots::new(1, 2));
+        let a = peer(1);
+        let long = Duration::from_secs(30);
+        let first = slots.acquire(a, long).await.unwrap();
+        // Two wait their turn; a third finds the queue full at once.
+        let waiters: Vec<_> = (0..2)
+            .map(|_| {
+                let slots = Arc::clone(&slots);
+                tokio::spawn(async move { slots.acquire(a, long).await.map(drop) })
+            })
+            .collect();
+        while slots.gate(a).unwrap().waiting.load(Ordering::SeqCst) < 2 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(slots.acquire(a, long).await.err(), Some(NoSlot::Full));
+        assert!(slots.acquire(peer(2), long).await.is_ok(), "per peer");
+        // Freeing the slot lets both through, one after the other.
+        drop(first);
+        for waiter in waiters {
+            assert_eq!(waiter.await.unwrap(), Ok(()));
+        }
+        // A queued caller gives up after its wait; its place is given back.
+        let _held = slots.acquire(a, long).await.unwrap();
+        let short = Duration::from_millis(50);
+        assert_eq!(slots.acquire(a, short).await.err(), Some(NoSlot::TimedOut));
+        assert_eq!(slots.gate(a).unwrap().waiting.load(Ordering::SeqCst), 0);
     }
 }
