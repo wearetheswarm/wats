@@ -53,4 +53,5 @@ pub mod update;
 pub mod v2;
 pub mod vibe;
 pub mod wake;
+pub mod welcome;
 pub mod wire;

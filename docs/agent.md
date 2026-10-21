@@ -53,32 +53,64 @@ default is the way out (ADR 0018 §3).
 
 ## First run: `wats setup`
 
-The first `wats` (or `wats node`) on a terminal, with no `config.toml` in
-its data directory, runs `wats setup`, then starts the node with the result.
-It asks, each with a default that Enter accepts:
+The first `wats`, alone (no argument at all), on a terminal, with no
+`config.toml` in its data directory, runs the setup wizard (ADR 0027),
+then starts the node. `wats setup` with no tool runs it again. It opens
+with a short welcome (its headline "You are the swarm.", under it the
+motto "Every node is the swarm."), what wats is and the three steps, and
+ends with what was set up and how to talk to the node (`wats status`,
+`wats attach`, your MCP sessions); plain ASCII unless the locale is UTF-8,
+no color with `NO_COLOR`. Without the wizard (an argument, no terminal),
+the very first start of a node in a data directory says "You are the
+swarm." once, on stderr (`<data dir>/greeted` records it). It asks, each
+with a default that Enter accepts:
 
-| Question | Key | Default |
-|---|---|---|
-| The agent the node runs, among `claude`, `codex` and `openclaw` found on your PATH, or none | `agent.runtime` | the first one found, else none |
-| Disk budget of the data directory | `storage.max` | `10G` |
-| Time limit of one agent run (with an agent) | `agent.timeout` | `10m` |
-| Turns per agent run (with an agent; not for OpenClaw) | `agent.max_turns` | `10` |
-| Spend budget per UTC day, then month, in USD (with an agent; not for OpenClaw, whose spend caps are its own) | `agent.max_usd_per_day`, `agent.max_usd_per_month` | `2`, `20` |
-| Networks to join | `nets` | `public` |
+1. The node's main choices, written to `config.toml`:
+
+   | Question | Key | Default |
+   |---|---|---|
+   | The agent the node runs, among `claude`, `codex` and `openclaw` found on your PATH, or none | `agent.runtime` | the first one found, else none |
+   | Disk budget of the data directory | `storage.max` | `10G` |
+   | Time limit of one agent run (with an agent) | `agent.timeout` | `10m` |
+   | Turns per agent run (with an agent; not for OpenClaw) | `agent.max_turns` | `10` |
+   | Spend budget per UTC day, then month, in USD (with an agent; not for OpenClaw, whose spend caps are its own) | `agent.max_usd_per_day`, `agent.max_usd_per_month` | `2`, `20` |
+   | What the agent may use besides the wats tools: `swarm-only`, `workspace` or `inherit` (with an agent; not for OpenClaw) | `agent.access` | `workspace` |
+   | Networks to join | `nets` | `public` |
+   | Desktop notifications (on a desktop session only) | `notify.desktop` | yes |
+
+2. For each of Claude Code, Codex, OpenClaw and Mistral Vibe found on your
+   PATH (looked up, never run): use the swarm from your own sessions,
+   registering wats as its MCP server, as `wats setup <tool> --mcp` does
+   (default yes; Claude Code and Codex then ask about their session hook).
+   With OpenClaw as the node's agent: finish its agent setup, as `wats
+   setup openclaw --agent` does.
+3. Whether to run the node in the background (`wats --detach`; default
+   no: it runs in this terminal until Ctrl-C). `wats setup` asks "Start
+   the node in the background now?" instead (default no).
 
 With no agent CLI on the PATH, it says how to install one (Claude Code or
-Codex), then to run `wats setup` again. A new `config.toml` lists these keys,
-the defaults commented; on an existing one, `wats setup` changes only these
-keys (a default unsets its key) and keeps the rest. It does not register wats
-in Claude Code or Codex: `wats setup claude --mcp` does.
+Codex), then to run `wats setup` again. A new `config.toml` lists the keys
+of step 1, the defaults commented; on an existing one, `wats setup`
+changes only these keys (a default unsets its key) and keeps the rest.
 
-Without a terminal (launchd, systemd, a container), with `--hermetic`, or
-with `--agent` / `--no-agent`, the first `wats` asks nothing: it writes the
-defaults, commented (no agent), logs where, and starts. `wats mcp`, and the
-background node it starts, never ask and never write `config.toml`:
-using the swarm only from MCP sessions leaves the data directory without
-one. (`start_daemon`, with the user's agreement, starts a real daemon,
-which writes it like any first run.)
+Any argument skips the wizard: a first `wats --dir …` (or `wats node`) on
+a terminal asks step 1 only. Without a terminal (launchd, systemd, a
+container), with `--hermetic`, or with `--agent` / `--no-agent`, the first
+`wats` asks nothing: it writes the defaults, commented (no agent), logs
+where, and starts. `wats setup` without a terminal asks step 1 on its
+stdin and prints the `wats setup <tool> --mcp` commands instead of step 2.
+`wats mcp`, and the background node it starts, never ask and never write
+`config.toml`: using the swarm only from MCP sessions leaves the data
+directory without one. (`start_daemon`, with the user's agreement, starts
+a real daemon, which writes it like any first run.)
+
+**New questions after an upgrade.** Setup records the revision of its
+questions in `<data dir>/setup-revision`. A release that adds questions
+bumps the revision (not tied to the version number); then a bare `wats` on
+a terminal asks only the new questions, and starts the node. Any other
+start logs one line saying that `wats setup` has new questions. A data
+directory set up by 0.4.2 or older (no `setup-revision`) is at revision 1,
+that of 0.4.3: nothing is asked on upgrade.
 
 A daemon that runs no agent says so in its banner, in the MCP `status`
 tool (`notice`) and in `wats status`: nodes that don't contribute (answers,
@@ -126,7 +158,7 @@ wats                         # from now on: the node with its agent
 | `wats attach [-n N]` | The banner and last log lines of the node running in the background, then its log live. Ctrl-C detaches; the node keeps running. |
 | `wats ps [--all] [--json]` | The nodes running on this machine: pid, mode (`detached`, `foreground`, `mcp-background`…), version, uptime, profile, agents, network, MCP sessions, data directory. |
 | `wats stop [--all] [--timeout 10s]` | Stops the node of `--dir` (or the one running as `--profile`): gracefully, then killed after the timeout. MCP sessions using it do not start it again: they answer each call saying it was stopped with `wats stop`, and reconnect once a node runs there again (`wats --detach`). After a crash instead, they start a background node again (at most 5 times in 10 minutes). |
-| `wats setup` | The main choices, asked with defaults ([first run](#first-run-wats-setup)). |
+| `wats setup` | The setup wizard: the main choices, asked with defaults, then wats in the MCP hosts found ([first run](#first-run-wats-setup)). |
 | `wats setup claude [--mcp] [--agent] [--name NAME] [--scope user\|project]` | Persistent setup, see above; the agent goes to `[agents.claude]`, or `[agents.NAME]`. |
 | `wats setup codex [--mcp] [--agent]` | The same for the Codex CLI; `wats --agent codex` runs a headless Codex ([codex.md](codex.md)). |
 | `wats setup openclaw [--mcp] [--agent] [--yes] [--url URL]` | OpenClaw: its MCP entries, the hook token and the config block to paste; `wats --agent openclaw` forwards each run to the OpenClaw gateway instead of spawning a CLI ([openclaw.md](openclaw.md)). |
