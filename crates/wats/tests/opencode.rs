@@ -673,3 +673,74 @@ fn sighup_stops_the_node_and_its_runs_group() {
         std::thread::sleep(Duration::from_millis(100));
     }
 }
+
+/// A detached node (`wats --detach`) ignores SIGHUP, as it always did:
+/// only a foreground node stops on it.
+#[test]
+fn a_detached_node_survives_sighup() {
+    let dir = tempfile::tempdir().unwrap();
+    for d in ["home", "xdg-config", "xdg-data", "run"] {
+        std::fs::create_dir_all(dir.path().join(d)).unwrap();
+    }
+    let fake = fake(dir.path(), "1.19.3", "sleep 300");
+    let data = dir.path().join("data");
+    let wats = |args: &[&str]| {
+        let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_wats"));
+        command
+            .env("WATS_HERMETIC", "1")
+            .env("WATS_RUN_DIR", dir.path().join("run"))
+            .env("HOME", dir.path().join("home"))
+            .env("XDG_CONFIG_HOME", dir.path().join("xdg-config"))
+            .env("XDG_DATA_HOME", dir.path().join("xdg-data"))
+            .env("USER", "alice")
+            .env_remove("WATS_PROFILE")
+            .env_remove("WATS_DIR")
+            .args(["--infra", "none", "--no-default-bootstrap", "--dir"])
+            .arg(&data)
+            .args(args)
+            .stdin(std::process::Stdio::null());
+        command
+    };
+    let out = wats(&[
+        "--loopback",
+        "--agent",
+        "opencode",
+        "--access",
+        "swarm-only",
+        "--heartbeat",
+        "1h",
+        "--agent-command",
+        fake.to_str().unwrap(),
+        "--detach",
+    ])
+    .output()
+    .unwrap();
+    assert!(out.status.success(), "{out:?}");
+    let ps = wats(&["ps", "--json"]).output().unwrap();
+    assert!(ps.status.success(), "{ps:?}");
+    let entries: Value = serde_json::from_slice(&ps.stdout).unwrap();
+    let real = std::fs::canonicalize(&data).unwrap();
+    let pid = entries
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| {
+            e["data_dir"]
+                .as_str()
+                .is_some_and(|d| Path::new(d) == data || Path::new(d) == real)
+        })
+        .and_then(|e| e["pid"].as_u64())
+        .unwrap_or_else(|| panic!("no detached node in {entries}"))
+        .to_string();
+    assert!(alive(&pid));
+    let hup = std::process::Command::new("kill")
+        .args(["-HUP", &pid])
+        .status()
+        .unwrap();
+    assert!(hup.success());
+    std::thread::sleep(Duration::from_secs(3));
+    let still = alive(&pid);
+    let stop = wats(&["stop", "--timeout", "10s"]).output().unwrap();
+    assert!(still, "the detached node stopped on SIGHUP");
+    assert!(stop.status.success(), "{stop:?}");
+}

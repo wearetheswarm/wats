@@ -107,13 +107,33 @@ pub const REFUSED_ARGS: [&str; 12] = [
 pub const OTHER_BUILTIN_KEYS: [&str; 3] = ["workflow_tool_approval", "plan_enter", "plan_exit"];
 
 /// The `OPENCODE_*` variables a `swarm-only` or `workspace` run keeps
-/// from wats's own environment: those that only turn something off, and
-/// Windows' Git Bash path. Every other one is removed (it could add
-/// config, permissions, tools, or move OpenCode's home or managed config:
-/// `OPENCODE_TEST_HOME`, `OPENCODE_TEST_MANAGED_CONFIG_DIR`…); wats then
-/// sets its own.
-pub const KEPT_ENV_PREFIX: &str = "OPENCODE_DISABLE_";
-pub const KEPT_ENV: [&str; 1] = ["OPENCODE_GIT_BASH_PATH"];
+/// from wats's own environment (ADR 0031, Implementation): the model's
+/// credentials and catalog (passed through as they are: wats never reads
+/// nor logs them), Windows' Git Bash path, and the switches that only
+/// turn a convenience off. Every other one is removed: it could add
+/// config, permissions or tools, move OpenCode's home or managed config
+/// (`OPENCODE_TEST_HOME`, `OPENCODE_TEST_MANAGED_CONFIG_DIR`…), or hide
+/// what the level counts on (`OPENCODE_DISABLE_PROJECT_CONFIG` would drop
+/// the workspace's MCP servers). wats then sets its own.
+pub const KEPT_ENV: [&str; 17] = [
+    "OPENCODE_API_KEY",
+    "OPENCODE_AUTH_CONTENT",
+    "OPENCODE_MODELS_PATH",
+    "OPENCODE_MODELS_URL",
+    "OPENCODE_GIT_BASH_PATH",
+    "OPENCODE_DISABLE_AUTOUPDATE",
+    "OPENCODE_DISABLE_PRUNE",
+    "OPENCODE_DISABLE_TERMINAL_TITLE",
+    "OPENCODE_DISABLE_DEFAULT_PLUGINS",
+    "OPENCODE_DISABLE_LSP_DOWNLOAD",
+    "OPENCODE_DISABLE_AUTOCOMPACT",
+    "OPENCODE_DISABLE_CLAUDE_CODE",
+    "OPENCODE_DISABLE_CLAUDE_CODE_PROMPT",
+    "OPENCODE_DISABLE_CLAUDE_CODE_SKILLS",
+    "OPENCODE_DISABLE_MODELS_FETCH",
+    "OPENCODE_DISABLE_MOUSE",
+    "OPENCODE_DISABLE_FFF",
+];
 
 /// The agent's own OpenCode config home: `XDG_CONFIG_HOME` of its runs.
 pub fn config_home(work_dir: &Path) -> PathBuf {
@@ -560,14 +580,12 @@ pub fn run_env(access: Access, work_dir: &Path, config: &str) -> Vec<(&'static s
 }
 
 /// The variables of `vars` a `swarm-only` or `workspace` run removes:
-/// every `OPENCODE_*` but [`KEPT_ENV_PREFIX`] and [`KEPT_ENV`].
+/// every `OPENCODE_*` but [`KEPT_ENV`].
 pub fn removed_env(vars: impl Iterator<Item = (OsString, OsString)>) -> Vec<OsString> {
     vars.map(|(k, _)| k)
         .filter(|k| {
             let k = k.to_string_lossy();
-            k.starts_with("OPENCODE_")
-                && !k.starts_with(KEPT_ENV_PREFIX)
-                && !KEPT_ENV.contains(&k.as_ref())
+            k.starts_with("OPENCODE_") && !KEPT_ENV.contains(&k.as_ref())
         })
         .collect()
 }
@@ -594,6 +612,62 @@ const AGENT_KEYS: [&str; 3] = ["agent", "agents", "mode"];
 /// The directories of markdown agent files, in a config directory.
 const AGENT_DIRS: [&str; 4] = ["agent", "agents", "mode", "modes"];
 
+/// OpenCode's wildcard (`util/wildcard.ts`): `*` any run of characters,
+/// `?` exactly one, everything else literal.
+pub fn wildcard_match(text: &str, pattern: &str) -> bool {
+    let t: Vec<char> = text.chars().collect();
+    let p: Vec<char> = pattern.chars().collect();
+    // can[j]: the first i characters of the text match the first j of
+    // the pattern, row by row.
+    let mut can = vec![false; p.len() + 1];
+    can[0] = true;
+    for j in 1..=p.len() {
+        can[j] = can[j - 1] && p[j - 1] == '*';
+    }
+    for c in &t {
+        let mut next = vec![false; p.len() + 1];
+        for j in 1..=p.len() {
+            next[j] = match p[j - 1] {
+                '*' => next[j - 1] || can[j],
+                '?' => can[j - 1],
+                other => can[j - 1] && other == *c,
+            };
+        }
+        can = next;
+    }
+    can[p.len()]
+}
+
+/// Whether a rule key is a pattern.
+fn wild(key: &str) -> bool {
+    key.contains(['*', '?'])
+}
+
+/// The wildcard allows a scanned config may hold (ADR 0031 §4).
+struct Exempt<'a> {
+    /// A config's top-level `permission`: its bare `"*"` is replaced in
+    /// place by wats's own `"*"` deny. Not an agent's own rules.
+    top_level: bool,
+    /// The workspace's MCP servers: `<server>_*` is that server's tools,
+    /// unless the pattern also matches a built-in key.
+    servers: &'a [String],
+}
+
+impl Exempt<'_> {
+    fn allowed(&self, key: &str) -> bool {
+        if key == "*" {
+            return self.top_level;
+        }
+        self.servers
+            .iter()
+            .any(|s| key == format!("{}_*", sanitize(s)))
+            && !KNOWN_KEYS
+                .iter()
+                .chain(OTHER_BUILTIN_KEYS.iter())
+                .any(|builtin| wildcard_match(builtin, key))
+    }
+}
+
 /// Whether a permission rule value allows anything (`"allow"`, or an
 /// object with an `"allow"`).
 fn allows(value: &Value) -> bool {
@@ -605,14 +679,18 @@ fn allows(value: &Value) -> bool {
 }
 
 /// A rule of a config's `permission` (or legacy `tools`) block that
-/// allows by wildcard: OpenCode keeps such a key where the config put it,
-/// so it can come after wats's denies and win. `None`: none.
-fn wildcard_allow(config: &Value) -> Option<String> {
-    let wild = |k: &str| k.contains(['*', '?']);
+/// allows by wildcard, and is not [`Exempt`]: OpenCode keeps such a key
+/// where the config put it, so it can come after wats's denies and win.
+fn wildcard_allow(config: &Value, exempt: &Exempt) -> Option<String> {
     match &config["permission"] {
-        Value::String(s) if s == "allow" => return Some("permission = \"allow\"".into()),
+        Value::String(s) if s == "allow" && !exempt.allowed("*") => {
+            return Some("permission = \"allow\"".into());
+        }
         Value::Object(map) => {
-            if let Some((k, _)) = map.iter().find(|(k, v)| wild(k) && allows(v)) {
+            if let Some((k, _)) = map
+                .iter()
+                .find(|(k, v)| wild(k) && allows(v) && !exempt.allowed(k))
+            {
                 return Some(format!("permission.{k}"));
             }
         }
@@ -621,14 +699,14 @@ fn wildcard_allow(config: &Value) -> Option<String> {
     config["tools"]
         .as_object()?
         .iter()
-        .find(|(k, v)| wild(k) && **v == Value::Bool(true))
+        .find(|(k, v)| wild(k) && **v == Value::Bool(true) && !exempt.allowed(k))
         .map(|(k, _)| format!("tools.{k}"))
 }
 
 /// Refuse a config that could change the run's agent or out-order its
 /// rules: an `agent`, `agents` or `mode` entry named `wats`, or a
-/// wildcard allow in `permission` or `tools`.
-fn check_config_file(path: &Path) -> Result<()> {
+/// wildcard allow in `permission` or `tools` that is not [`Exempt`].
+fn check_config_file(path: &Path, servers: &[String]) -> Result<()> {
     let text = std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
     let config: Value = serde_json::from_str(&strip_jsonc(&text))
         .with_context(|| format!("{}: not valid JSON(C)", path.display()))?;
@@ -641,7 +719,11 @@ fn check_config_file(path: &Path) -> Result<()> {
             );
         }
     }
-    if let Some(rule) = wildcard_allow(&config) {
+    let exempt = Exempt {
+        top_level: true,
+        servers,
+    };
+    if let Some(rule) = wildcard_allow(&config, &exempt) {
         bail!(
             "{}: {rule} allows by wildcard, which could win over the rules wats gives an \
              OpenCode run: list the tools it allows instead (ADR 0031)",
@@ -651,29 +733,267 @@ fn check_config_file(path: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Refuse a markdown agent named `wats` in a config directory
-/// (`<dir>/{agent,agents,mode,modes}/wats.md`).
-fn check_agent_files(dir: &Path) -> Result<()> {
+/// What wats reads of a Markdown agent's front matter: its `name`, and
+/// its `permission` and `tools` rules as `(key, allows)`.
+#[derive(Debug, Default, PartialEq)]
+struct FrontMatter {
+    name: Option<String>,
+    /// `permission: allow`, the whole block as one rule.
+    permission_allow: bool,
+    permission: Vec<(String, bool)>,
+    tools: Vec<(String, bool)>,
+}
+
+/// A YAML scalar as wats accepts it in the keys it reads: plain or
+/// quoted, an end-of-line comment dropped. Flow collections, anchors,
+/// aliases, tags and block scalars are refused: wats cannot tell what
+/// they hold, so it does not guess (fail closed).
+fn yaml_scalar(raw: &str) -> Result<String> {
+    let raw = raw.trim();
+    if let Some(rest) = raw.strip_prefix('"') {
+        let end = rest.find('"').context("an unterminated \" string")?;
+        return Ok(rest[..end].to_string());
+    }
+    if let Some(rest) = raw.strip_prefix('\'') {
+        let end = rest.find('\'').context("an unterminated ' string")?;
+        return Ok(rest[..end].to_string());
+    }
+    if raw.starts_with(['{', '[', '&', '*', '!', '|', '>', '%', '@', '`']) {
+        bail!("{raw:?}: a YAML form wats does not read");
+    }
+    let value = match raw.find(" #") {
+        Some(at) => &raw[..at],
+        None => raw,
+    };
+    Ok(value.trim().to_string())
+}
+
+/// `key: rest` of one YAML line, the key unquoted. `None`: not a
+/// mapping line.
+fn yaml_entry(line: &str) -> Option<(String, &str)> {
+    let line = line.trim();
+    let (key, rest) = if let Some(after) = line.strip_prefix('"') {
+        let end = after.find('"')?;
+        (
+            after[..end].to_string(),
+            after[end + 1..].strip_prefix(':')?,
+        )
+    } else if let Some(after) = line.strip_prefix('\'') {
+        let end = after.find('\'')?;
+        (
+            after[..end].to_string(),
+            after[end + 1..].strip_prefix(':')?,
+        )
+    } else {
+        let at = line
+            .find(": ")
+            .or_else(|| line.strip_suffix(':').map(|k| k.len()))?;
+        (line[..at].trim().to_string(), &line[at + 1..])
+    };
+    Some((key, rest))
+}
+
+fn indent(line: &str) -> usize {
+    line.len() - line.trim_start_matches(' ').len()
+}
+
+/// The rules of a `permission` or `tools` block: each first-level key,
+/// and whether it allows (its value, or any value nested under it).
+fn yaml_rules(children: &[&str], allow: &str) -> Result<Vec<(String, bool)>> {
+    let mut rules: Vec<(String, bool)> = Vec::new();
+    let Some(level) = children.first().map(|l| indent(l)) else {
+        return Ok(rules);
+    };
+    for line in children {
+        let (key, rest) = yaml_entry(line).with_context(|| format!("{line:?}"))?;
+        if key.starts_with(['&', '*', '!', '<']) && !line.trim_start().starts_with(['"', '\'']) {
+            bail!("{key:?}: a YAML form wats does not read");
+        }
+        let value = yaml_scalar(rest)?;
+        if indent(line) == level {
+            rules.push((key, value == allow));
+        } else if indent(line) > level {
+            let last = rules.last_mut().context("an indented rule with no key")?;
+            last.1 |= value == allow;
+        } else {
+            bail!("{line:?}: unexpected indentation");
+        }
+    }
+    Ok(rules)
+}
+
+/// Parse the front matter of a Markdown agent (the block between the
+/// first two `---` lines), as far as [`FrontMatter`] goes. Errors when it
+/// cannot be read for sure: an unterminated block, a tab, a top-level
+/// line that is no `key: value`, or a form [`yaml_scalar`] refuses in
+/// the keys wats reads.
+fn front_matter(text: &str) -> Result<FrontMatter> {
+    let mut out = FrontMatter::default();
+    let mut lines = text.lines();
+    if lines.next().map(str::trim_end) != Some("---") {
+        return Ok(out);
+    }
+    let mut block = Vec::new();
+    let mut closed = false;
+    for line in lines {
+        if matches!(line.trim_end(), "---" | "...") {
+            closed = true;
+            break;
+        }
+        block.push(line);
+    }
+    if !closed {
+        bail!("its front matter has no closing ---");
+    }
+    let meaningful = |l: &&str| !l.trim().is_empty() && !l.trim_start().starts_with('#');
+    let lines: Vec<&str> = block.into_iter().filter(meaningful).collect();
+    if lines
+        .iter()
+        .any(|l| l.starts_with('\t') || l.contains("\t "))
+    {
+        bail!("tabs in its front matter");
+    }
+    let mut i = 0;
+    while i < lines.len() {
+        let line = lines[i];
+        if indent(line) > 0 {
+            bail!("{line:?}: unexpected indentation");
+        }
+        let (key, rest) = yaml_entry(line).with_context(|| format!("{line:?}: not key: value"))?;
+        // A flow mapping, a sequence, an anchor, a tag, a complex key…:
+        // the line could hold any key.
+        if !line.starts_with(['"', '\''])
+            && (key.starts_with(['{', '[', '&', '*', '!', '?', '-', '|', '>', '%', '@', '`'])
+                || key.contains(['{', '}', '[', ']', ',']))
+        {
+            bail!("{line:?}: a YAML form wats does not read");
+        }
+        let mut end = i + 1;
+        while end < lines.len() && indent(lines[end]) > 0 {
+            end += 1;
+        }
+        let children = &lines[i + 1..end];
+        match key.as_str() {
+            "name" => {
+                if !children.is_empty() {
+                    bail!("its name spans several lines");
+                }
+                out.name = Some(yaml_scalar(rest)?);
+            }
+            "permission" | "tools" => {
+                let scalar = yaml_scalar(rest)?;
+                if key == "permission" {
+                    out.permission_allow = scalar == "allow";
+                    if scalar.is_empty() {
+                        out.permission = yaml_rules(children, "allow")?;
+                    } else if !children.is_empty() {
+                        bail!("permission has a value and rules");
+                    }
+                } else if scalar.is_empty() {
+                    out.tools = yaml_rules(children, "true")?;
+                } else {
+                    bail!("tools: {scalar:?}: not a list of rules");
+                }
+            }
+            // Other keys (description, model, prompt…): not read. A
+            // block scalar's lines are its children, skipped with it.
+            _ => {}
+        }
+        i = end;
+    }
+    Ok(out)
+}
+
+/// Refuse the Markdown agents of a config directory
+/// (`<dir>/{agent,agents,mode,modes}/**/*.md`) that OpenCode would key as
+/// `wats` (by the front matter's `name`, else the file name), and those
+/// whose `permission` or `tools` allows by wildcard (an agent's own rules
+/// come last for it: only the workspace's MCP servers are exempt). A
+/// front matter wats cannot read for sure is refused (fail closed).
+fn check_agent_files(dir: &Path, servers: &[String]) -> Result<()> {
+    fn markdown(dir: &Path, out: &mut Vec<PathBuf>) {
+        for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                markdown(&path, out);
+            } else if path.extension().is_some_and(|e| e == "md") {
+                out.push(path);
+            }
+        }
+    }
+    let exempt = Exempt {
+        top_level: false,
+        servers,
+    };
     for sub in AGENT_DIRS {
-        let path = dir.join(sub).join(format!("{AGENT}.md"));
-        if path.exists() {
-            bail!(
-                "{} defines an OpenCode agent named {AGENT}, the agent wats gives every run: \
-                 rename it (ADR 0031)",
-                path.display()
-            );
+        let mut files = Vec::new();
+        markdown(&dir.join(sub), &mut files);
+        for path in files {
+            let text = std::fs::read_to_string(&path)
+                .with_context(|| format!("read {}", path.display()))?;
+            let fm = front_matter(&text).with_context(|| {
+                format!(
+                    "{}: wats cannot read its front matter for sure, so it refuses it (ADR 0031)",
+                    path.display()
+                )
+            })?;
+            let stem = path.file_stem().map(|s| s.to_string_lossy().into_owned());
+            if fm.name.as_deref() == Some(AGENT)
+                || (fm.name.is_none() && stem.as_deref() == Some(AGENT))
+            {
+                bail!(
+                    "{} defines an OpenCode agent named {AGENT}, the agent wats gives every \
+                     run: rename it (ADR 0031)",
+                    path.display()
+                );
+            }
+            let rule = if fm.permission_allow {
+                Some("permission: allow".to_string())
+            } else {
+                fm.permission
+                    .iter()
+                    .find(|(k, a)| *a && wild(k) && !exempt.allowed(k))
+                    .map(|(k, _)| format!("permission.{k}"))
+                    .or_else(|| {
+                        fm.tools
+                            .iter()
+                            .find(|(k, a)| *a && wild(k) && !exempt.allowed(k))
+                            .map(|(k, _)| format!("tools.{k}"))
+                    })
+            };
+            if let Some(rule) = rule {
+                bail!(
+                    "{}: {rule} allows by wildcard: list the tools it allows instead (ADR 0031)",
+                    path.display()
+                );
+            }
         }
     }
     Ok(())
 }
 
+/// `dir` and its ancestors, then those of its real path when it differs
+/// (a symlink, macOS's /tmp → /private/tmp): OpenCode walks the real one,
+/// from its working directory.
+fn ancestor_chain(dir: &Path) -> Result<Vec<PathBuf>> {
+    let mut chain: Vec<PathBuf> = dir.ancestors().map(Path::to_path_buf).collect();
+    let real = std::fs::canonicalize(dir)
+        .with_context(|| format!("resolve {} (its real path)", dir.display()))?;
+    for d in real.ancestors() {
+        if !chain.iter().any(|c| c == d) {
+            chain.push(d.to_path_buf());
+        }
+    }
+    Ok(chain)
+}
+
 /// Before every run (ADR 0031 §4): the config sources an OpenCode run
 /// reads and wats can check. The agent's own OpenCode directory at
 /// `swarm-only` and `workspace`; at `workspace` also the project config
-/// of the run directory and of every directory above it, as OpenCode
-/// walks them outside a git repository (`opencode.json(c)` and
-/// `.opencode/`). `~/.opencode/` is not read (a documented gap, ADR 0031
-/// §4); `inherit` checks nothing.
+/// of the run directory and of every directory above it, along both its
+/// literal and its real path, as OpenCode walks them outside a git
+/// repository (`opencode.json(c)` and `.opencode/`). `~/.opencode/` is
+/// not read (a documented gap, ADR 0031 §4); `inherit` checks nothing.
 pub fn check_config_sources(
     access: Access,
     run_dir: &Path,
@@ -683,37 +1003,51 @@ pub fn check_config_sources(
     if access == Access::Inherit {
         return Ok(());
     }
+    let servers = if access == Access::Workspace {
+        workspace_servers(run_dir)?
+    } else {
+        Vec::new()
+    };
     if ISOLATE_GLOBAL_CONFIG {
         let dir = agent_dir(work_dir);
         for name in ["config.json", "opencode.json", "opencode.jsonc"] {
             let path = dir.join(name);
             if path.exists() {
-                check_config_file(&path)?;
+                check_config_file(&path, &servers)?;
             }
         }
-        check_agent_files(&dir)?;
+        check_agent_files(&dir, &servers)?;
     }
     if access != Access::Workspace {
         return Ok(());
     }
-    for dir in run_dir.ancestors() {
+    let homes: Vec<PathBuf> = home
+        .into_iter()
+        .flat_map(|h| {
+            [
+                h.to_path_buf(),
+                std::fs::canonicalize(h).unwrap_or(h.to_path_buf()),
+            ]
+        })
+        .collect();
+    for dir in ancestor_chain(run_dir)? {
         for name in ["opencode.json", "opencode.jsonc"] {
             let path = dir.join(name);
             if path.exists() {
-                check_config_file(&path)?;
+                check_config_file(&path, &servers)?;
             }
         }
-        if Some(dir) == home {
+        if homes.contains(&dir) {
             continue;
         }
         let dot = dir.join(".opencode");
         for name in ["opencode.json", "opencode.jsonc"] {
             let path = dot.join(name);
             if path.exists() {
-                check_config_file(&path)?;
+                check_config_file(&path, &servers)?;
             }
         }
-        check_agent_files(&dot)?;
+        check_agent_files(&dot, &servers)?;
     }
     Ok(())
 }
@@ -828,10 +1162,30 @@ pub fn start_warnings(access: Access, run_dir: &Path, home: Option<&Path>) -> Ve
         ));
     }
     if access == Access::Workspace {
-        for dir in run_dir.ancestors().skip(1) {
+        let real = std::fs::canonicalize(run_dir).ok();
+        let chain = ancestor_chain(run_dir)
+            .unwrap_or_else(|_| run_dir.ancestors().map(Path::to_path_buf).collect());
+        let homes: Vec<PathBuf> = home
+            .into_iter()
+            .flat_map(|h| {
+                [
+                    h.to_path_buf(),
+                    std::fs::canonicalize(h).unwrap_or(h.to_path_buf()),
+                ]
+            })
+            .collect();
+        // The same file, reached along the literal and the real path, once.
+        let mut seen = std::collections::HashSet::new();
+        for dir in chain
+            .iter()
+            .filter(|d| d.as_path() != run_dir && Some(d.as_path()) != real.as_deref())
+        {
             for name in ["opencode.json", "opencode.jsonc", ".opencode"] {
                 let path = dir.join(name);
-                if path.exists() && Some(dir) != home.filter(|_| name == ".opencode") {
+                if path.exists()
+                    && !(name == ".opencode" && homes.contains(dir))
+                    && seen.insert(std::fs::canonicalize(&path).unwrap_or(path.clone()))
+                {
                     out.push(format!(
                         "{} exists above the agent's workspace: OpenCode loads it as project \
                          config for workspace runs",
@@ -1016,7 +1370,7 @@ mod tests {
         let last = |tool: &str| {
             keys.iter()
                 .rev()
-                .find(|k| wildcard_match(tool, k))
+                .find(|k| reference_match(tool, k))
                 .cloned()
                 .unwrap()
         };
@@ -1026,8 +1380,8 @@ mod tests {
         assert_eq!(last("bash"), "bash");
     }
 
-    /// OpenCode's wildcard: `*` any run of characters, `?` one.
-    fn wildcard_match(text: &str, pattern: &str) -> bool {
+    /// A reference for [`wildcard_match`]: OpenCode's wildcard, recursively.
+    fn reference_match(text: &str, pattern: &str) -> bool {
         fn go(t: &[char], p: &[char]) -> bool {
             match p.split_first() {
                 None => t.is_empty(),
@@ -1174,7 +1528,12 @@ mod tests {
                 ("OPENCODE_TEST_MANAGED_CONFIG_DIR", "/m"),
                 ("OPENCODE_ENABLE_EXA", "1"),
                 ("OPENCODE_DISABLE_PRUNE", "1"),
+                ("OPENCODE_DISABLE_PROJECT_CONFIG", "1"),
                 ("OPENCODE_GIT_BASH_PATH", "C:/git/bash.exe"),
+                ("OPENCODE_API_KEY", "k"),
+                ("OPENCODE_AUTH_CONTENT", "{}"),
+                ("OPENCODE_MODELS_PATH", "/m.json"),
+                ("OPENCODE_MODELS_URL", "https://example.com"),
                 ("PATH", "/bin"),
             ]
             .into_iter()
@@ -1188,8 +1547,169 @@ mod tests {
                 "OPENCODE_TEST_HOME",
                 "OPENCODE_TEST_MANAGED_CONFIG_DIR",
                 "OPENCODE_ENABLE_EXA",
+                "OPENCODE_DISABLE_PROJECT_CONFIG",
             ]
         );
+    }
+
+    #[test]
+    fn wildcards_match_as_opencode_does() {
+        for (text, pattern) in [
+            ("external_directory", "external_*"),
+            ("bash", "b*"),
+            ("bash", "ba?h"),
+            ("bash", "*"),
+            ("bash", "bas"),
+            ("", "*"),
+            ("a", ""),
+            ("doom_loop", "do?m_*"),
+            ("wats_post", "wats_*"),
+            ("wats", "wats_*"),
+        ] {
+            assert_eq!(
+                wildcard_match(text, pattern),
+                reference_match(text, pattern),
+                "{text} ~ {pattern}"
+            );
+        }
+    }
+
+    /// The front matter of Markdown agents: the name OpenCode keys them
+    /// by, and wildcard allows; what wats cannot read for sure is refused.
+    #[test]
+    fn markdown_agents_are_read_by_their_front_matter() {
+        let fm = front_matter(
+            "---\ndescription: >\n  folded: text\n  more\nname: \"helper\" # mine\nmode: subagent\npermission:\n  \"*\": deny\n  bash:\n    \"git *\": allow\n  \"b*\": allow\ntools:\n  webfetch: true\n---\nbody\n",
+        )
+        .unwrap();
+        assert_eq!(fm.name.as_deref(), Some("helper"));
+        assert_eq!(
+            fm.permission,
+            [
+                ("*".to_string(), false),
+                ("bash".to_string(), true),
+                ("b*".to_string(), true)
+            ]
+        );
+        assert_eq!(fm.tools, [("webfetch".to_string(), true)]);
+        assert_eq!(
+            front_matter("no front matter\n").unwrap(),
+            FrontMatter::default()
+        );
+        assert!(
+            front_matter("---\npermission: allow\n---\n")
+                .unwrap()
+                .permission_allow
+        );
+        for bad in [
+            "---\nname: wats\n",                   // not closed
+            "---\nname: {a: b}\n---\n",            // flow
+            "---\n{name: wats}\n---\n",            // not key: value
+            "---\nname: &x wats\n---\n",           // anchor
+            "---\npermission: *x\n---\n",          // alias
+            "---\npermission:\n  *: allow\n---\n", // an alias as key
+            "---\npermission: [a]\n---\n",         // flow
+            "---\nname: |\n  wats\n---\n",         // block scalar
+            "---\n\tname: wats\n---\n",            // tab
+            "---\ntools: true\n---\n",             // not rules
+        ] {
+            assert!(front_matter(bad).is_err(), "{bad:?}");
+        }
+    }
+
+    /// A Markdown agent named `wats` by its front matter, whatever its
+    /// file name, is refused, and so is one with a wildcard allow; a
+    /// front matter wats cannot read is refused too.
+    #[test]
+    fn markdown_agents_named_wats_or_too_open_are_refused() {
+        let root = tempfile::tempdir().unwrap();
+        let work = root.path().join("data/agent/opencode");
+        let workspace = work.join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let check = || check_config_sources(Access::Workspace, &workspace, &work, None);
+        let agents = workspace.join(".opencode/agents/nested");
+        std::fs::create_dir_all(&agents).unwrap();
+        let file = agents.join("helper.md");
+        for (text, what) in [
+            ("---\nname: wats\n---\n", "named wats"),
+            (
+                "---\nname: 'wats'\npermission:\n  \"*\": allow\n---\n",
+                "named wats",
+            ),
+            ("---\npermission:\n  \"*\": allow\n---\n", "permission.*"),
+            (
+                "---\npermission:\n  b*:\n    \"*\": allow\n---\n",
+                "permission.b*",
+            ),
+            ("---\ntools:\n  \"ba?h\": true\n---\n", "tools.ba?h"),
+            ("---\npermission: allow\n---\n", "permission: allow"),
+            ("---\nname: {x: wats}\n---\n", "cannot read"),
+        ] {
+            std::fs::write(&file, text).unwrap();
+            let e = check().unwrap_err();
+            assert!(format!("{e:#}").contains(what), "{text:?}: {e:#}");
+        }
+        // A plain helper is fine; its specific allows are its own.
+        std::fs::write(
+            &file,
+            "---\nname: helper\npermission:\n  bash: allow\n---\nHelp.\n",
+        )
+        .unwrap();
+        assert!(check().is_ok());
+        // Named after its file when it has no name.
+        std::fs::write(agents.join("wats.md"), "Hello.\n").unwrap();
+        assert!(check().is_err());
+        std::fs::remove_file(agents.join("wats.md")).unwrap();
+        // A workspace MCP server's pattern is exempt, unless it would match a built-in key.
+        std::fs::write(
+            workspace.join("opencode.json"),
+            r#"{"mcp": {"docs": {"type": "local", "command": ["d"]}, "external": {"type": "local", "command": ["e"]}}, "permission": {"docs_*": "allow"}}"#,
+        )
+        .unwrap();
+        assert!(check().is_ok());
+        std::fs::write(&file, "---\npermission:\n  docs_*: allow\n---\n").unwrap();
+        assert!(check().is_ok());
+        std::fs::write(
+            workspace.join("opencode.json"),
+            r#"{"mcp": {"external": {"type": "local", "command": ["e"]}}, "permission": {"external_*": "allow"}}"#,
+        )
+        .unwrap();
+        let e = check().unwrap_err();
+        assert!(format!("{e:#}").contains("external_*"), "{e:#}");
+        std::fs::write(
+            workspace.join("opencode.json"),
+            r#"{"permission": {"docs_*": "allow"}}"#,
+        )
+        .unwrap();
+        assert!(check().is_err(), "no such workspace server: refused");
+    }
+
+    /// OpenCode walks the real path: a symlinked workspace is checked
+    /// along its real ancestors too.
+    #[cfg(unix)]
+    #[test]
+    fn the_scan_follows_the_real_path() {
+        let root = tempfile::tempdir().unwrap();
+        let work = root.path().join("data/agent/opencode");
+        let real = root.path().join("a/b/ws");
+        std::fs::create_dir_all(&real).unwrap();
+        std::fs::create_dir_all(&work).unwrap();
+        let link = root.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        std::fs::write(
+            root.path().join("a/opencode.json"),
+            r#"{"mode": {"wats": {}}}"#,
+        )
+        .unwrap();
+        let e = check_config_sources(Access::Workspace, &link, &work, None).unwrap_err();
+        assert!(format!("{e:#}").contains("mode.wats"), "{e:#}");
+        std::fs::remove_file(root.path().join("a/opencode.json")).unwrap();
+        assert!(check_config_sources(Access::Workspace, &link, &work, None).is_ok());
+        let w = start_warnings(Access::Workspace, &link, None);
+        assert!(w.is_empty(), "{w:?}");
+        std::fs::create_dir_all(root.path().join("a/.opencode")).unwrap();
+        let w = start_warnings(Access::Workspace, &link, None);
+        assert_eq!(w.len(), 1, "{w:?}");
     }
 
     #[test]
@@ -1252,14 +1772,19 @@ mod tests {
         refused(&file, r#"{"permission": {"b*": "allow"}}"#, "permission.b*");
         refused(
             &file,
-            r#"{"permission": {"*": {"x": "allow"}}}"#,
-            "permission.*",
+            r#"{"permission": {"*x": {"y": "allow"}}}"#,
+            "permission.*x",
         );
-        refused(
-            &file,
+        // A bare "*" (or "permission": "allow") is replaced by wats's "*" deny.
+        for text in [
             r#"{"permission": "allow"}"#,
-            "permission = \"allow\"",
-        );
+            r#"{"permission": {"*": "allow"}}"#,
+            r#"{"tools": {"*": true}}"#,
+        ] {
+            std::fs::write(&file, text).unwrap();
+            assert!(check(Access::Workspace).is_ok(), "{text}");
+        }
+        std::fs::remove_file(&file).unwrap();
         refused(&file, r#"{"tools": {"ba?h": true}}"#, "tools.ba?h");
         // A specific allow is replaced by wats's own rule: fine.
         std::fs::write(&file, r#"{"permission": {"bash": "allow", "b*": "deny"}}"#).unwrap();

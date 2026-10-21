@@ -684,9 +684,11 @@ change:
   since the crate forbids `unsafe`; a failure other than "no such group"
   is logged), then the child. It never does so after a normal exit,
   since the id could then be reused. A guard on the run kills the group
-  when a run is dropped unfinished, and a foreground node handles SIGHUP
-  as a graceful stop (review of #191: the CLI is no longer in the
-  terminal's process group, so the hangup would no longer reach it).
+  when a run is dropped unfinished, and a **foreground** node handles
+  SIGHUP as a graceful stop (review of #191: the CLI is no longer in the
+  terminal's process group, so the hangup would no longer reach it). A
+  detached node (`--log-file`) still ignores SIGHUP, and a background
+  node of MCP sessions (`--idle-exit`) keeps the default action.
 - **Q5.** Warn only: the runner warns when an ancestor of the workspace
   has `opencode.json(c)` or `.opencode/`. No `git init`.
 - **Q6.** `--remove` only prints the key to delete and its file.
@@ -723,10 +725,24 @@ change:
   `plan_enter` and `plan_exit`, then the other listed names, and
   `wats_*` last. A server named `external` therefore cannot allow
   `external_directory`, the last matching rule winning.
-- **The environment** of a `swarm-only` or `workspace` run keeps no
-  `OPENCODE_*` variable of wats's own but `OPENCODE_DISABLE_*` and
-  `OPENCODE_GIT_BASH_PATH` (so `OPENCODE_TEST_HOME` and
-  `OPENCODE_TEST_MANAGED_CONFIG_DIR` go too); wats then sets its own.
+- **The environment** of a `swarm-only` or `workspace` run keeps only
+  the `OPENCODE_*` variables of `KEPT_ENV` (`opencode.rs`), then wats
+  sets its own:
+  - the model's credentials and catalog, passed through as they are
+    (wats never reads nor logs them): `OPENCODE_API_KEY`,
+    `OPENCODE_AUTH_CONTENT`, `OPENCODE_MODELS_PATH`, `OPENCODE_MODELS_URL`;
+  - `OPENCODE_GIT_BASH_PATH` (Windows);
+  - the switches that only turn a convenience off: `OPENCODE_DISABLE_`
+    `AUTOUPDATE`, `PRUNE`, `TERMINAL_TITLE`, `DEFAULT_PLUGINS`,
+    `LSP_DOWNLOAD`, `AUTOCOMPACT`, `CLAUDE_CODE`, `CLAUDE_CODE_PROMPT`,
+    `CLAUDE_CODE_SKILLS`, `MODELS_FETCH`, `MOUSE`, `FFF`.
+
+  Every other one goes: `OPENCODE_CONFIG*`, `OPENCODE_PERMISSION`,
+  `OPENCODE_EXPERIMENTAL*`, `OPENCODE_TEST_HOME`,
+  `OPENCODE_TEST_MANAGED_CONFIG_DIR`, `OPENCODE_ENABLE_*`, and
+  `OPENCODE_DISABLE_PROJECT_CONFIG` (it would silently drop the
+  workspace's MCP servers at `workspace`; wats sets it itself at
+  `swarm-only`).
 - **Config sources that could change the run's agent are refused**, at
   start and again before every run (a refused run is indexed `failed`
   with the reason, and its runner token ends):
@@ -734,17 +750,31 @@ change:
     `workspace`), and at `workspace` in the project config of the run
     directory and of every directory above it (`opencode.json(c)`,
     `.opencode/opencode.json(c)`), as OpenCode walks them outside a git
-    repository;
+    repository, along both the literal and the **real** path of the run
+    directory (OpenCode walks from its working directory, which a
+    symlinked workdir or macOS's `/tmp` → `/private/tmp` changes);
   - an `agent.wats`, `agents.wats` (2.0's spelling; `disabled: true`
     would fall back to `build`) or `mode.wats` entry (`mode` is merged
-    into `agent` after `OPENCODE_CONFIG_CONTENT`), or a markdown agent
-    `{agent,agents,mode,modes}/wats.md`;
-  - a wildcard allow in `permission` (`"b*": "allow"`, `"permission":
-    "allow"`) or in the legacy `tools` (`"ba?h": true`): OpenCode keeps a
-    key where the config put it, so such a rule could come after wats's
-    top-level denies and win for the fallback agent. Specific keys are
-    replaced in place by wats's own rule, and the `wats` agent's rules
-    come last anyway; only the fallback needed this.
+    into `agent` after `OPENCODE_CONFIG_CONTENT`);
+  - a Markdown agent under `{agent,agents,mode,modes}/` (recursively)
+    that OpenCode would key as `wats`: by its front matter's `name`
+    (OpenCode spreads the front matter over the file name), else its
+    file name. wats reads the front matter's `name`, `permission` and
+    `tools` with a small reader of its own (no YAML dependency) and
+    **fails closed**: an unterminated block, a tab, a top-level line that
+    is no `key: value`, or a flow collection, anchor, alias, tag or block
+    scalar in those keys, refuses the file;
+  - a wildcard allow in `permission` (`"b*": "allow"`) or in the
+    legacy `tools` (`"ba?h": true`), in a config file or a Markdown
+    agent: OpenCode keeps a key where the config put it, so such a rule
+    could come after wats's top-level denies and win for the fallback
+    agent. Specific keys are replaced in place by wats's own rule, and
+    the `wats` agent's rules come last anyway; only the fallback needed
+    this. Exempt: a config's bare `"*": "allow"` (or `"permission":
+    "allow"`, `"tools": {"*": true}`), which wats's own `"*"` deny
+    replaces in place (not in a Markdown agent, whose own rules come
+    last for it); and `<server>_*` for a workspace MCP server whose
+    pattern matches no built-in key (`external_*` stays refused).
   - **Not checked** (a workspace-trust gap, §4): `~/.opencode/`, which
     wats does not read; managed config; a console organisation's config.
 - **The runner token** is ended by a guard on every early return of a

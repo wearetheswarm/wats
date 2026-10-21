@@ -81,9 +81,14 @@ differs:
   - `~/.claude` is not read either (`OPENCODE_DISABLE_CLAUDE_CODE`), and
     at `swarm-only`, no project config (`OPENCODE_DISABLE_PROJECT_CONFIG`).
   - Every `OPENCODE_*` variable of the node's own environment is removed
-    from the run's, but `OPENCODE_DISABLE_*` and `OPENCODE_GIT_BASH_PATH`
-    (so `OPENCODE_CONFIG`, `OPENCODE_PERMISSION`, `OPENCODE_EXPERIMENTAL*`
-    or `OPENCODE_TEST_HOME` cannot add config or move OpenCode's home).
+    from the run's, but the model's credentials and catalog
+    (`OPENCODE_API_KEY`, `OPENCODE_AUTH_CONTENT`, `OPENCODE_MODELS_PATH`,
+    `OPENCODE_MODELS_URL`, passed through, never read), Windows'
+    `OPENCODE_GIT_BASH_PATH`, and the `OPENCODE_DISABLE_*` switches that
+    only turn a convenience off (ADR 0031 lists them). So
+    `OPENCODE_CONFIG`, `OPENCODE_PERMISSION`, `OPENCODE_EXPERIMENTAL*`,
+    `OPENCODE_TEST_HOME` or `OPENCODE_DISABLE_PROJECT_CONFIG` cannot add
+    config, move OpenCode's home, or hide the workspace's MCP servers.
 - **Nothing in your session history**: `OPENCODE_DB=:memory:`. Each run
   is a fresh session; the transcript is wats's own.
 - **Refused extra arguments** at `swarm-only` and `workspace`, since they
@@ -95,8 +100,8 @@ differs:
 - **Timeout**: past `agent.timeout`, the runner kills the run's whole
   process group: OpenCode and what it started (MCP servers, shell
   commands). So does a stop, Ctrl-C, or closing the terminal of a
-  foreground `wats` (SIGHUP stops it gracefully). Every spawned runtime
-  works this way.
+  foreground `wats` (SIGHUP stops it gracefully; a `wats --detach` node
+  ignores SIGHUP, as before). Every spawned runtime works this way.
 - **Version**: the runner reads `opencode --version` at start. It refuses
   OpenCode older than 1.17.0, and warns from 2.0 on (not checked yet).
 
@@ -142,11 +147,15 @@ run too.
 - **Config that could change the run's agent is refused**, at start and
   before every run (the run is then `failed`, with the reason): in the
   agent's own OpenCode directory, and at `workspace` in the workspace and
-  every directory above it (`opencode.json(c)`, `.opencode/`):
-  - an agent named `wats` under `agent`, `agents` or `mode`, or a file
-    `{agent,agents,mode,modes}/wats.md`;
-  - a wildcard allow in `permission` (`"b*": "allow"`, `"permission":
-    "allow"`) or in the legacy `tools`.
+  every directory above it (`opencode.json(c)`, `.opencode/`), along its
+  real path too (a symlinked workdir):
+  - an agent named `wats` under `agent`, `agents` or `mode`;
+  - a Markdown agent under `{agent,agents,mode,modes}/` named `wats` by
+    its front matter's `name` (or, without one, its file name); a front
+    matter wats cannot read for sure is refused;
+  - a wildcard allow in `permission` (`"b*": "allow"`) or in the legacy
+    `tools`, but a config's bare `"*": "allow"` (wats's `"*"` deny takes
+    its place) and `<server>_*` for a workspace MCP server.
 
   `~/.opencode/` is not checked: wats does not read it (below).
 

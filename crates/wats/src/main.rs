@@ -6749,6 +6749,10 @@ async fn async_main(cli: Cli) -> Result<()> {
         tracing::warn!("crash test requested");
         panic!("crash test requested (WATS_CRASH_TEST)");
     }
+    // SIGHUP stops a foreground node (its terminal closed); a detached
+    // node (`--log-file`) ignores it, and a background node of MCP
+    // sessions (`--idle-exit`) keeps the default.
+    let foreground = daemon.log_file.is_none() && daemon.idle_exit.is_none();
     let run = NodeRun {
         post: daemon.post,
         title: daemon.title,
@@ -6761,7 +6765,12 @@ async fn async_main(cli: Cli) -> Result<()> {
         idle_exit: daemon.idle_exit,
         agents,
     };
-    let result = run_node(node, run, with_hangup(shutdown)).await;
+    let shutdown = if foreground {
+        with_hangup(shutdown)
+    } else {
+        shutdown
+    };
+    let result = run_node(node, run, shutdown).await;
     if let Err(e) = &result
         && let Some(path) = wats::crash::record_error(e)
     {
