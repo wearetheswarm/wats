@@ -90,6 +90,12 @@ async fn blobs_go_to_the_k_closest_peers() -> anyhow::Result<()> {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn late_joiner_catches_up_and_fetches_blobs_on_demand() -> anyhow::Result<()> {
+    // The nodes' logs, shown when the test fails.
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter("wats=debug")
+        .with_ansi(false)
+        .with_test_writer()
+        .try_init();
     let dir = tempfile::tempdir()?;
     let a = node(&dir.path().join("a"), &[], 3).await?;
     // Published while nobody listens: more than one sync page.

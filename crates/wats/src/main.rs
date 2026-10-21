@@ -2854,7 +2854,7 @@ fn config_command(data_dir: &std::path::Path, action: ConfigAction) -> Result<()
             println!("# {}", file.path().display());
             println!(
                 "# storage: {} used in {}",
-                wats::node::format_bytes(wats::node::dir_size(data_dir)),
+                wats::node::format_bytes(wats::node::data_usage(data_dir)),
                 data_dir.display()
             );
             // With [agents.<name>] tables, each agent's keys under its name.
@@ -3454,6 +3454,13 @@ async fn status_command(config: &NodeConfig, json: bool) -> Result<()> {
         }
         if let (Some(connectivity), Some(map)) = (connectivity, status.as_object_mut()) {
             map.insert("connectivity".into(), connectivity.into());
+        }
+        // One line for rotation at the cap (ADR 0025 §7).
+        if let Some(rotation) = status
+            .get_mut("storage")
+            .and_then(|s| s.get_mut("rotation"))
+        {
+            *rotation = wats::node::rotation::summary(rotation).into();
         }
         // One line per unanswered ask of this profile (ADR 0018 §4).
         let unanswered = status
@@ -5425,7 +5432,7 @@ fn banner_lines(config: &NodeConfig, agents: &[(String, wats::agent::AgentConfig
         &wats::swarm::stored_json(&config.data_dir, &config.nets, unix_now()),
         true,
     ));
-    let used = wats::node::dir_size(&config.data_dir);
+    let used = wats::node::data_usage(&config.data_dir);
     let max = config.storage_max.unwrap_or(u64::MAX);
     lines.push(format!(
         "storage: {} of {}{}",

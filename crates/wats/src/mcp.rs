@@ -1972,6 +1972,10 @@ impl WatsMcp {
             "health": self.node.health_json(),
             "history": self.node.history_status(),
         });
+        // Rotation at the cap (ADR 0025 §7), with an events share.
+        if self.node.events_share().is_some() {
+            status["storage"]["rotation"] = self.node.rotation_json();
+        }
         // Blobs recorded but whose file is gone, not fetched again yet.
         let unreadable = self.node.unreadable_blobs();
         if unreadable > 0 {

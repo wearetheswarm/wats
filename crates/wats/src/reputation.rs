@@ -420,6 +420,19 @@ pub fn build(
         let ts = oldest.entry(event.author.as_str()).or_insert(event.ts);
         *ts = (*ts).min(event.ts);
     }
+    // What rotation deleted still says when a key was first seen, and its
+    // earliest `ts` (ADR 0025 §7): its age never goes back.
+    for (key, (first_seen, first_ts)) in store.key_firsts(net)? {
+        let Some(author) = authors.get_mut(&key) else {
+            continue;
+        };
+        if let Some(first) = author.first_seen.as_mut() {
+            *first = (*first).min(first_seen);
+        }
+        if let Some(ts) = oldest.get_mut(key.as_str()) {
+            *ts = (*ts).min(first_ts);
+        }
+    }
     // When the age floor counts from (ADR 0025, "Key age"): the peers'
     // median when enough of them reported the key, else this node's own
     // first sight.

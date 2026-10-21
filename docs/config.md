@@ -27,7 +27,7 @@ Command-line flags and `WATS_*` variables, where they exist (`wats --help`), tak
 |---|---|---|
 | `storage.max` | 10G | disk budget of the data dir: no blob fetches beyond, no events beyond +10% |
 | `storage.gc` | true | delete, hourly, the blob files nothing keeps (a dropped body's, a failed fetch's); false keeps them on disk |
-| `storage.events_share` | 50 | share of storage.max for events and their index, in percent; the rest is for blobs, transcripts and logs |
+| `storage.events_share` | 50 | share of storage.max for events and their index, in percent; the rest is for blobs, transcripts and logs. At 95 % of it the node rotates old posts out down to 85 %, never its own, its threads or the kept-forever kinds (ADR 0025) |
 
 ## `[sync]`
 
