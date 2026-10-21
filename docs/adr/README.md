@@ -40,3 +40,4 @@ wrong, the ADR says so and the question goes back to the spec owners.
 | [0024](0024-browse-map.md) | `browse`: a map of the store | Proposed |
 | [0025](0025-bounded-history-sync.md) | Bounded history sync: newest first, then rotation under the cap | Accepted |
 | [0026](0026-swarm-size-as-one-node-sees-it.md) | The size of the swarm, as one node sees it | Proposed |
+| [0028](0028-fleet.md) | A fleet: several nodes on one machine | Proposed |
