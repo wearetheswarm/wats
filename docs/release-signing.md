@@ -128,9 +128,11 @@ checks, once it is `update.delay` old (7 days after its `published_at`), and
 logs that a restart is needed: it never restarts itself, the daemon picks
 the new binary up at its next start.
 
-**Marking a security release.** A release is a security release when its
-name or notes contain `[security]` (any case), or when a line of its notes
-starts with `Security:`, for example:
+**Marking a security release.** A release counts as a security release
+for a node older than its signed security floor (`security.json`, below).
+Without a valid floor, it is one when its name or notes contain
+`[security]` (any case), or when a line of its notes starts with
+`Security:`, for example:
 
 ```text
 Security: fixes a crash on a malformed sync page (GHSA-…).
@@ -156,21 +158,45 @@ bad or rogue release would reach every node at once, and nothing can pull
 a release yet; to be revisited at beta, with several guardians and a way
 to pull a release (ADR 0030).
 
-**A release after a security release.** The node remembers the latest
-release only, and `update.security_auto` and the louder notice go by that
-one. So a release published while nodes may still run a version older
-than the last security release (in practice: within a week or so of it)
-carries the `Security:` line again, naming the security release it
-includes (`Security: includes the fix of 0.4.4 (GHSA-…)`). The release
-notes are written by hand when the release is published and are not
-signed; a signed, cumulative marker (the oldest version free of known
-issues) is not implemented yet (ADR 0030).
+**The security floor (`security.json`).** Each release also attaches
+`security.json` and `security.json.minisig`:
+
+```json
+{"version":"0.4.3","security_floor":"0.4.2"}
+```
+
+The floor is the newest version, up to this release, whose section of
+`CHANGELOG.md` (read at the release's tag) has a `### Security` heading
+(`### Security fixes` counts), or `0.0.0` if none has. The workflow
+computes it with `scripts/security-floor.sh`, without state, and signs the
+file with the release key like the archives (trusted comment
+`file:security.json`). So writing a `### Security` section in the
+release's CHANGELOG entry is all a security release needs: every later
+release carries that floor until a newer security release raises it.
+
+The daily check downloads both files with the latest release, verifies the
+signature with the key compiled in (and that the trusted comment names
+`security.json`), and refuses the file unless its `version` is the latest
+release's own, so that the file of an older release cannot be replayed to
+lower the floor. A node older than the floor counts the latest release as
+a security release (the louder notice, and `update.security_auto`), even
+when the notes of that release do not say so; at or above the floor, it
+does not. ADR 0030.
+
+**The `Security:` line stays as a fallback,** for releases without
+`security.json` (before 0.4.3) and when the file is missing, badly signed,
+for another release or unreadable (the node logs it and never fails the
+check). The release workflow adds it by itself: when a release is its own
+floor (its CHANGELOG section has `### Security`) and its notes do not
+mark it already, it appends a `Security:` line to the notes. Nothing to
+repeat by hand.
 
 ## How releases are signed
 
 The `release` workflow (`.github/workflows/release.yml`) builds each
 archive, writes its `.sha256`, then signs both with minisign before
-attaching them to the GitHub release:
+attaching them to the GitHub release (with `install.sh` and
+`security.json`, signed the same way on the Linux leg):
 
 - minisign itself is a pinned upstream release (currently 0.12), downloaded
   over HTTPS and checked against a SHA-256 hard-coded in the workflow;

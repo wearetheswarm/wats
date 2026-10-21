@@ -38,6 +38,18 @@
   stale `update.json` when `update.check` is off. Not on by default for every node: one release key, a bad or
   rogue release would reach every node at once, and nothing can pull a
   release yet; to be revisited at beta. ADR 0030.
+- **A security release is not hidden by the release after it.** Each
+  release now ships a signed `security.json` naming its security floor:
+  the newest version, up to that release, whose CHANGELOG section has a
+  `### Security` heading (0.4.2 today), computed by the release workflow
+  (`scripts/security-floor.sh`) and signed with the release key like the
+  archives. The daily check verifies it (signature, trusted comment, and
+  that it names the latest release, so an older file cannot be replayed),
+  and a node older than the floor treats the latest release as a security
+  release: the louder notice and, if you opted in, `update.security_auto`.
+  Without a valid `security.json` (older releases, a bad signature), the
+  notes' `Security:` line decides, as before; the workflow now adds that
+  line by itself to a release with a `### Security` section. ADR 0030.
 - **A file keeps its replicas when a node disappears.** A blob was
   pushed to the 3 nodes closest to its hash when it was published, and
   never again: a replica whose node died was gone for good. A node that

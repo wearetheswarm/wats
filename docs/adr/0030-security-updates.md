@@ -10,14 +10,17 @@ node's main choices). Builds on the release check and `wats upgrade` of
 
 Code: `crates/wats/src/update.rs` (`UpdatePolicy::security_auto`,
 `auto_key`, `auto_target`, `security_notice`, `status_json`,
-`start_notice`, `check_rollback`, `KEYS_SINCE`), `crates/wats/src/settings.rs` (the key),
-`crates/wats/src/firstrun.rs` (`ask_security_auto`),
-`crates/wats/src/main.rs` (node start, `wats status`),
-`crates/wats/src/mcp.rs` (the `status` tool),
-`crates/wats/src/safety.rs` (a safety key). Tests: unit tests in those
-modules, `crates/wats/tests/hermetic.rs`
+`start_notice`, `check_rollback`, `KEYS_SINCE`, `security_floor`,
+`verify_security_floor`, `Cache::is_security`, `Install`),
+`crates/wats/src/settings.rs` (the key), `crates/wats/src/firstrun.rs`
+(`ask_security_auto`, `setup-answers`), `crates/wats/src/main.rs` (node
+start, `wats status`), `crates/wats/src/mcp.rs` (the `status` tool),
+`crates/wats/src/safety.rs` (a safety key), `.github/workflows/release.yml`
+(`security.json`), `scripts/security-floor.sh`. Tests: unit tests in
+those modules (fixtures in `crates/wats/tests/fixtures/security-floor/`),
+`crates/wats/tests/hermetic.rs`
 (`status_shows_a_pending_security_release`),
-`crates/wats/tests/setup_wizard.rs`.
+`crates/wats/tests/setup_wizard.rs`, `scripts/test-security-floor.sh`.
 
 Source: product decision by Vincent (2026-10-21): security releases
 installed automatically when the user says so in the wizard (Yes by
@@ -82,34 +85,43 @@ day, since `update.security_delay` applies to both keys; a later No leaves
 the delay in place (it is harmless with both keys off, and a user's own
 delay is never removed).
 
-**Known limit: a normal release can hide a security release.** The cache
-of the daily check holds the latest release only. A security release
-followed, within its delay, by a normal one is not installed by
-`security_auto` (the latest is not marked security), and the louder
-notice does not show; the normal notice does. The rule, documented in
-docs/release-signing.md: a release that follows a security release
-carries the `Security:` line again when a node older than that security
-release would still miss its fix.
+**A normal release no longer hides a security release: the signed
+security floor.** It implements D34 (spec approved 2026-10-21). The cache
+of the daily check holds the latest release only, so a security release
+followed, within its delay, by a normal one used to be missed: the latest
+was not marked security. The security status is now cumulative:
 
-A cumulative marker (a signed `security_floor = "X.Y.Z"`, the oldest
-version free of known security issues: a node below it treats the latest
-release as a security release) was considered and **not implemented**,
-because the tooling it would extend is not in this repository:
+- **Release side** (`.github/workflows/release.yml`, Linux leg): each
+  release gets a `security.json` asset,
+  `{"version":"X.Y.Z","security_floor":"A.B.C"}`, signed with the release
+  key like the archives (`security.json.minisig`, trusted comment
+  `file:security.json`). The floor is the newest version ≤ X.Y.Z whose
+  CHANGELOG section, read at the tag, has a `### Security` heading
+  (`### Security fixes` counts), or `0.0.0`: computed without state by
+  `scripts/security-floor.sh` (tested by `scripts/test-security-floor.sh`
+  in CI: 0.4.2 for every release from 0.4.2 on, today). When a release is
+  its own floor and its notes do not mark it, the workflow appends a
+  `Security:` line to its notes, for nodes that cannot read the floor.
+- **Node side** (`update::security_floor`, `verify_security_floor`): the
+  daily check downloads both assets and verifies the signature with the
+  pinned release key and the trusted-comment check of the archives, then
+  refuses the file unless its `version` is the latest release's (so the
+  file of an older release cannot be replayed to lower the floor) and its
+  floor is not newer than that release. The cache keeps the floor
+  (`security_floor` in `update.json`, ignored by older versions).
+- **Its effect** (`Cache::is_security`): a node older than the floor
+  counts the latest release as a security release, for the notice and the
+  `security_auto` install (whose own verification is unchanged); at or
+  above the floor, it does not, even if the notes say so (the signed
+  floor wins over the unsigned notes).
+- **Fallback:** no asset (releases before this one), a bad signature, a
+  replayed or unreadable file, or a failed download: the notes'
+  `Security:` line decides, as before. Never an error: logged at debug
+  (missing) or info (invalid).
 
-- the release metadata the node reads is the GitHub release's name and
-  notes, written by hand when the release is published, and **not
-  signed**; the `security` flag already comes from there;
-- what `release.yml` signs is the archive, its `.sha256` and
-  `install.sh`; there is no signed manifest, and no Makefile or script
-  that produces release metadata (`make release` does not exist);
-- the daily check downloads the release JSON only, not a signed file.
-
-A signed floor would need a new signed asset (for example
-`security.json`, signed by `release.yml` with the key it already uses),
-fetched and verified by the daily check before it trusts the floor, and a
-way for `release.yml` to compute it (from the previous release's floor,
-or a `### Security` section of the CHANGELOG). That is a change to the
-release process and the check, left for a later ADR.
+Trust: the floor is signed with the release key, the same key that signs
+the binaries, so it adds no new key to trust; the notes, which anyone with
+write access to the releases can edit, only matter as the fallback.
 
 ### 2. The wizard's question
 

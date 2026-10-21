@@ -285,6 +285,91 @@ pub fn verify_signature(
     Ok(())
 }
 
+/// The release asset holding the signed security floor (ADR 0030), and its
+/// signature `security.json.minisig`.
+pub const SECURITY_FILE: &str = "security.json";
+
+/// `security.json`: `{"version":"X.Y.Z","security_floor":"A.B.C"}`.
+#[derive(Debug, Deserialize)]
+struct SecurityFile {
+    version: String,
+    security_floor: String,
+}
+
+/// Check the `security.json` of release `version`: its minisign signature
+/// by `public_key`, made for `file:security.json` (as the archives'), and
+/// that it names `version`, so that the file of an older release cannot be
+/// replayed to lower the floor. Returns the floor, which is at most
+/// `version`.
+pub fn verify_security_floor(
+    public_key: &str,
+    json: &[u8],
+    signature: &str,
+    version: Version,
+) -> Result<Version> {
+    verify_signature(public_key, json, signature, SECURITY_FILE)?;
+    let file: SecurityFile = serde_json::from_slice(json)
+        .context("security.json is not {\"version\", \"security_floor\"}")?;
+    let named = Version::parse(&file.version)
+        .with_context(|| format!("security.json: version {:?} is not X.Y.Z", file.version))?;
+    ensure!(
+        named == version,
+        "security.json is for {named}, not for the release {version}"
+    );
+    let floor = Version::parse(&file.security_floor).with_context(|| {
+        format!(
+            "security.json: security_floor {:?} is not X.Y.Z",
+            file.security_floor
+        )
+    })?;
+    ensure!(
+        floor <= version,
+        "security.json: security_floor {floor} is newer than the release {version}"
+    );
+    Ok(floor)
+}
+
+/// The signed security floor of `release` (ADR 0030): its `security.json`
+/// and `security.json.minisig` assets, fetched with `download` and checked
+/// with [`verify_security_floor`]. None, never an error, when they are
+/// missing (logged at debug: releases before the floor have none), or
+/// unsigned, mismatched or unreadable (logged at info): the notes'
+/// `Security:` line then decides.
+pub async fn security_floor<'a, D, Fut>(
+    release: &'a Release,
+    public_key: &str,
+    download: D,
+) -> Option<Version>
+where
+    D: Fn(&'a Asset) -> Fut,
+    Fut: Future<Output = Result<Vec<u8>>>,
+{
+    let version = release.version()?;
+    let sig_name = format!("{SECURITY_FILE}.minisig");
+    let (Some(json), Some(sig)) = (release.asset(SECURITY_FILE), release.asset(&sig_name)) else {
+        tracing::debug!(
+            "release v{version} has no signed {SECURITY_FILE}: its notes say whether it is a security release"
+        );
+        return None;
+    };
+    let checked = async {
+        let json = download(json).await?;
+        let sig = String::from_utf8(download(sig).await?)
+            .map_err(|_| anyhow!("{sig_name} is not text"))?;
+        verify_security_floor(public_key, &json, &sig, version)
+    }
+    .await;
+    match checked {
+        Ok(floor) => Some(floor),
+        Err(e) => {
+            tracing::info!(
+                "release v{version}: {e:#}; its notes say whether it is a security release"
+            );
+            None
+        }
+    }
+}
+
 /// Check `data` against a `shasum -a 256` line naming `file_name`.
 pub fn verify_sha256(data: &[u8], sha_file: &str, file_name: &str) -> Result<()> {
     let mut parts = sha_file.lines().next().unwrap_or("").split_whitespace();
@@ -769,6 +854,17 @@ impl Source {
         self.release(&format!("releases/tags/v{version}")).await
     }
 
+    /// The latest release and its signed security floor
+    /// ([`Source::security_floor`]), for the daily check.
+    pub async fn latest_with_floor(&self) -> Result<(Release, Option<Version>)> {
+        let release = self.latest().await?;
+        let floor = security_floor(&release, RELEASE_PUBLIC_KEY, |asset| {
+            self.download(asset, MAX_SMALL_BYTES)
+        })
+        .await;
+        Ok((release, floor))
+    }
+
     async fn download(&self, asset: &Asset, limit: usize) -> Result<Vec<u8>> {
         if Self::is_github(&self.base) && !asset.url.is_empty() {
             self.get(&asset.url, "application/octet-stream", limit)
@@ -1015,8 +1111,14 @@ pub struct Cache {
     /// Last check, Unix seconds (also after a failed one).
     pub checked_at: u64,
     pub latest: Option<String>,
+    /// The latest release's notes mark it security (`Security:`), the
+    /// fallback when no signed floor is known.
     #[serde(default)]
     pub security: bool,
+    /// The latest release's signed security floor (`security.json`, ADR
+    /// 0030), when it had a valid one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub security_floor: Option<String>,
     pub published_at: Option<u64>,
     /// The newer version already logged.
     pub notified: Option<String>,
@@ -1025,6 +1127,16 @@ pub struct Cache {
 }
 
 impl Cache {
+    /// Whether the latest release counts as a security release for a
+    /// node running `current`: by the signed floor when there is one
+    /// (`current` older than the floor), else by the notes.
+    pub fn is_security(&self, current: Version) -> bool {
+        match self.security_floor.as_deref().and_then(Version::parse) {
+            Some(floor) => current < floor,
+            None => self.security,
+        }
+    }
+
     pub fn load(data_dir: &Path) -> Option<Cache> {
         let text = std::fs::read(data_dir.join(CACHE_FILE)).ok()?;
         serde_json::from_slice(&text).ok()
@@ -1083,7 +1195,8 @@ pub fn auto_target(
     now: u64,
     install: Install,
 ) -> Option<Version> {
-    if install != Install::Release || policy.auto_key(cache.security).is_none() {
+    let security = cache.is_security(current);
+    if install != Install::Release || policy.auto_key(security).is_none() {
         return None;
     }
     let latest = cache.latest()?;
@@ -1091,13 +1204,14 @@ pub fn auto_target(
         return None;
     }
     let published = cache.published_at?;
-    let delay = policy.delay_for(cache.security).as_secs();
+    let delay = policy.delay_for(security).as_secs();
     (now >= published.saturating_add(delay)).then_some(latest)
 }
 
-/// One look: check the latest release if due (`fetch`), record the result
-/// in the cache, and return the cache. Without `policy.check`, nothing is
-/// read, fetched or written.
+/// One look: check the latest release and its signed security floor if
+/// due (`fetch`, [`Source::latest_with_floor`]), record the result in the
+/// cache, and return the cache. Without `policy.check`, nothing is read,
+/// fetched or written.
 pub async fn tick<F, Fut>(
     policy: &UpdatePolicy,
     data_dir: &Path,
@@ -1106,7 +1220,7 @@ pub async fn tick<F, Fut>(
 ) -> Result<Option<Cache>>
 where
     F: FnOnce() -> Fut,
-    Fut: Future<Output = Result<Release>>,
+    Fut: Future<Output = Result<(Release, Option<Version>)>>,
 {
     if !policy.check {
         return Ok(None);
@@ -1117,11 +1231,12 @@ where
     }
     cache.checked_at = now;
     let fetched = fetch().await;
-    if let Ok(release) = &fetched
+    if let Ok((release, floor)) = &fetched
         && let Some(version) = release.version()
     {
         cache.latest = Some(version.to_string());
         cache.security = release.is_security();
+        cache.security_floor = floor.map(|f| f.to_string());
         cache.published_at = release.published_secs();
     }
     cache.save(data_dir)?;
@@ -1143,7 +1258,7 @@ pub fn security_notice(
     install: Install,
 ) -> Option<String> {
     let latest = cache.latest()?;
-    if latest <= current || !cache.security {
+    if latest <= current || !cache.is_security(current) {
         return None;
     }
     if cache.installed.as_deref() == Some(&latest.to_string()) {
@@ -1206,7 +1321,7 @@ fn status_json_of(
         "current": current.to_string(),
         "latest": latest.to_string(),
         "available": latest > current,
-        "security": latest > current && cache.security,
+        "security": latest > current && cache.is_security(current),
         "checked_at": format_timestamp(cache.checked_at),
         "upgrade": install.hint(),
     });
@@ -1240,7 +1355,7 @@ pub async fn run(policy: UpdatePolicy, data_dir: PathBuf) {
     tokio::time::sleep(FIRST_LOOK_AFTER).await;
     loop {
         let now = now_secs();
-        match tick(&policy, &data_dir, now, || source.latest()).await {
+        match tick(&policy, &data_dir, now, || source.latest_with_floor()).await {
             Ok(Some(mut cache)) => {
                 if let Some(latest) = cache.latest()
                     && latest > current
@@ -1257,7 +1372,7 @@ pub async fn run(policy: UpdatePolicy, data_dir: PathBuf) {
                     let _ = cache.save(&data_dir);
                 }
                 if let Some(version) = auto_target(&policy, &cache, current, now, Install::detect())
-                    && let Some(key) = policy.auto_key(cache.security)
+                    && let Some(key) = policy.auto_key(cache.is_security(current))
                     && failed_auto
                         .is_none_or(|(v, at)| v != version || now >= at + CHECK_EVERY_SECS)
                 {
@@ -1852,6 +1967,235 @@ mod tests {
         assert!(notice.contains("restart wats to use it"), "{notice}");
     }
 
+    /// The signed security floor (ADR 0030). The fixtures are signed with
+    /// a throwaway key (`security-floor/test.pub`, its secret not kept):
+    /// release 1.1.0 with floor 1.0.5, the file of release 1.0.5 (floor
+    /// 1.0.0) to replay, and the good content signed under another name.
+    const FLOOR_FIX: &str = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/security-floor/"
+    );
+
+    fn floor_fixture(file: &str) -> Vec<u8> {
+        std::fs::read(format!("{FLOOR_FIX}{file}")).unwrap()
+    }
+
+    fn floor_key() -> String {
+        String::from_utf8(floor_fixture("test.pub"))
+            .unwrap()
+            .lines()
+            .last()
+            .unwrap()
+            .trim()
+            .to_string()
+    }
+
+    fn floor_sig(file: &str) -> String {
+        String::from_utf8(floor_fixture(file)).unwrap()
+    }
+
+    #[test]
+    fn verifies_the_signed_floor() {
+        let key = floor_key();
+        let json = floor_fixture("security.json");
+        let sig = floor_sig("security.json.minisig");
+        let v110 = Version(1, 1, 0);
+        assert_eq!(
+            verify_security_floor(&key, &json, &sig, v110).unwrap(),
+            Version(1, 0, 5)
+        );
+        // A bad signature: tampered content, another key.
+        let mut tampered = json.clone();
+        tampered[30] ^= 1;
+        let err = verify_security_floor(&key, &tampered, &sig, v110).unwrap_err();
+        assert!(err.to_string().contains("does not verify"), "{err:#}");
+        assert!(verify_security_floor(RELEASE_PUBLIC_KEY, &json, &sig, v110).is_err());
+        // Signed for another file name.
+        let err = verify_security_floor(
+            &key,
+            &json,
+            &floor_sig("security.json.wrong-file.minisig"),
+            v110,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("another file"), "{err:#}");
+        // An older release's file, replayed under the latest one: refused.
+        let err = verify_security_floor(
+            &key,
+            &floor_fixture("replayed.json"),
+            &floor_sig("replayed.json.minisig"),
+            v110,
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("security.json is for 1.0.5, not for the release 1.1.0"),
+            "{err:#}"
+        );
+        // It is fine for its own release.
+        assert_eq!(
+            verify_security_floor(
+                &key,
+                &floor_fixture("replayed.json"),
+                &floor_sig("replayed.json.minisig"),
+                Version(1, 0, 5)
+            )
+            .unwrap(),
+            Version(1, 0, 0)
+        );
+    }
+
+    fn release_with_floor_assets(tag: &str, with: bool) -> Release {
+        let mut r = release(tag, "");
+        if with {
+            for name in ["security.json", "security.json.minisig"] {
+                r.assets.push(Asset {
+                    name: name.into(),
+                    ..Default::default()
+                });
+            }
+        }
+        r
+    }
+
+    /// `security_floor`: the floor when the assets verify; none (the
+    /// notes decide) when they are missing, badly signed or for another
+    /// release. No network: the download is a fake.
+    #[tokio::test]
+    async fn the_floor_falls_back_to_the_notes() {
+        let key = floor_key();
+        let files = |json: &'static str, sig: &'static str| {
+            move |asset: &Asset| {
+                let file = if asset.name == "security.json" {
+                    json
+                } else {
+                    sig
+                };
+                let bytes = floor_fixture(file);
+                async move { Ok::<_, anyhow::Error>(bytes) }
+            }
+        };
+        let good = release_with_floor_assets("v1.1.0", true);
+        assert_eq!(
+            security_floor(&good, &key, files("security.json", "security.json.minisig")).await,
+            Some(Version(1, 0, 5))
+        );
+        // Missing assets: nothing is downloaded.
+        let bare = release_with_floor_assets("v1.1.0", false);
+        let never = |_: &Asset| async { panic!("nothing to download") };
+        assert_eq!(security_floor(&bare, &key, never).await, None);
+        // A bad signature (another key's), a replayed file, a failed
+        // download, or another file under its name.
+        assert_eq!(
+            security_floor(
+                &good,
+                RELEASE_PUBLIC_KEY,
+                files("security.json", "security.json.minisig")
+            )
+            .await,
+            None
+        );
+        assert_eq!(
+            security_floor(&good, &key, files("replayed.json", "replayed.json.minisig")).await,
+            None
+        );
+        let offline = |_: &Asset| async { Err::<Vec<u8>, _>(anyhow!("offline")) };
+        assert_eq!(security_floor(&good, &key, offline).await, None);
+        assert_eq!(
+            security_floor(&good, &key, files("test.pub", "security.json.minisig")).await,
+            None
+        );
+    }
+
+    /// Below the floor, the latest release counts as a security release
+    /// even when its notes do not say so: the notice and the
+    /// `security_auto` install. At or above the floor it does not. No
+    /// floor: the notes' `Security:` line decides.
+    #[test]
+    fn below_the_floor_is_a_security_release() {
+        let t0 = 1_000 * DAY;
+        let late = t0 + 30 * DAY;
+        let sec = UpdatePolicy {
+            check: true,
+            security_auto: true,
+            security_delay: Some(Duration::from_secs(DAY)),
+            ..Default::default()
+        };
+        // Latest 1.1.0, a normal release by its notes, floor 1.0.5.
+        let floored = Cache {
+            security_floor: Some("1.0.5".into()),
+            ..cache("1.1.0", false, t0)
+        };
+        let below = Version(1, 0, 4);
+        assert!(floored.is_security(below));
+        assert!(security_notice(&floored, below, &sec, Install::Release).is_some());
+        assert_eq!(
+            auto_target(&sec, &floored, below, t0 + DAY, Install::Release),
+            Some(Version(1, 1, 0))
+        );
+        assert_eq!(
+            status_json_of(&floored, below, &sec, Install::Release).unwrap()["security"],
+            true
+        );
+        for at_or_above in [Version(1, 0, 5), Version(1, 0, 6)] {
+            assert!(!floored.is_security(at_or_above));
+            assert_eq!(
+                security_notice(&floored, at_or_above, &sec, Install::Release),
+                None
+            );
+            assert_eq!(
+                auto_target(&sec, &floored, at_or_above, late, Install::Release),
+                None
+            );
+        }
+        // A valid floor wins over the notes: marked security, but this
+        // node is at the floor.
+        let marked = Cache {
+            security: true,
+            ..floored.clone()
+        };
+        assert!(!marked.is_security(Version(1, 0, 5)));
+        // No floor (missing or invalid): the notes decide.
+        assert!(cache("1.1.0", true, t0).is_security(Version(1, 0, 9)));
+        assert!(!cache("1.1.0", false, t0).is_security(Version(1, 0, 0)));
+        // A cache written before the floor existed still loads.
+        let old: Cache = serde_json::from_str(
+            r#"{"checked_at":1,"latest":"1.1.0","security":true,"published_at":1,"notified":null,"installed":null}"#,
+        )
+        .unwrap();
+        assert_eq!(old.security_floor, None);
+        assert!(old.is_security(Version(1, 0, 0)));
+    }
+
+    /// The daily check records the floor next to the notes' flag.
+    #[tokio::test]
+    async fn tick_records_the_floor() {
+        let dir = tempfile::tempdir().unwrap();
+        let policy = UpdatePolicy {
+            check: true,
+            ..Default::default()
+        };
+        let t0 = 1_800_000_000;
+        let c = tick(&policy, dir.path(), t0, || async {
+            Ok((release("v1.1.0", ""), Some(Version(1, 0, 5))))
+        })
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(c.security_floor.as_deref(), Some("1.0.5"));
+        assert!(!c.security);
+        assert!(c.is_security(Version(1, 0, 0)));
+        // The next check without a valid floor clears it.
+        let c = tick(&policy, dir.path(), t0 + DAY, || async {
+            Ok((release("v1.1.0", "Security: fixes"), None))
+        })
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(c.security_floor, None);
+        assert!(c.is_security(Version(1, 0, 9)));
+    }
+
     #[test]
     fn checks_at_most_once_a_day() {
         let t0 = 1_000 * DAY;
@@ -1886,7 +2230,7 @@ mod tests {
         let calls = std::sync::atomic::AtomicUsize::new(0);
         let fetch = || async {
             calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            Ok(release("v99.0.0", "Security: fixes"))
+            Ok((release("v99.0.0", "Security: fixes"), None))
         };
         let t0 = 1_800_000_000;
         let c = tick(&policy, dir.path(), t0, fetch).await.unwrap().unwrap();
@@ -1903,7 +2247,7 @@ mod tests {
         tick(&policy, dir.path(), t0 + DAY, fetch).await.unwrap();
         assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
         // A failed check counts as a check: no retry before a day.
-        let failing = || async { Err::<Release, _>(anyhow!("offline")) };
+        let failing = || async { Err::<(Release, Option<Version>), _>(anyhow!("offline")) };
         assert!(
             tick(&policy, dir.path(), t0 + 2 * DAY, failing)
                 .await
@@ -1924,10 +2268,12 @@ mod tests {
         // A prerelease or draft never becomes `latest`.
         let mut pre = release("v100.0.0", "");
         pre.prerelease = true;
-        let c = tick(&policy, dir.path(), t0 + 4 * DAY, || async { Ok(pre) })
-            .await
-            .unwrap()
-            .unwrap();
+        let c = tick(&policy, dir.path(), t0 + 4 * DAY, || async {
+            Ok((pre, None))
+        })
+        .await
+        .unwrap()
+        .unwrap();
         assert_eq!(c.latest.as_deref(), Some("99.0.0"));
     }
 
