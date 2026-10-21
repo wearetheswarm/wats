@@ -189,6 +189,13 @@ fn backfill_event_blobs(conn: &Connection) -> Result<()> {
         .optional()?
         .unwrap_or(0);
     let last: i64 = conn.query_row("SELECT COALESCE(MAX(seq), 0) FROM events", [], |r| r.get(0))?;
+    if conn
+        .query_row("SELECT 1 FROM event_blobs_filled", [], |_| Ok(()))
+        .optional()?
+        .is_none()
+    {
+        conn.execute("INSERT INTO event_blobs_filled (upto) VALUES (?)", [upto])?;
+    }
     while upto < last {
         let next = upto.saturating_add(EVENT_BLOBS_BATCH).min(last);
         conn.execute_batch("BEGIN")?;
@@ -234,7 +241,7 @@ fn insert_opaque_row(
     json: &str,
     received_at: u64,
 ) -> Result<usize> {
-    Ok(conn.execute(
+    let changed = conn.execute(
         "INSERT OR IGNORE INTO events (id, author, ts, net, thread, parent, kind, text, tags, json, received_at, v, opaque)
          VALUES (?, ?, ?, ?, ?, ?, ?, '', '', ?, ?, ?, 1)",
         params![
@@ -249,7 +256,13 @@ fn insert_opaque_row(
             received_at as i64,
             raw.v as i64,
         ],
-    )?)
+    )?;
+    if changed > 0 {
+        // An opaque row lists no blob: the backfill mark moves past it.
+        // `last_insert_rowid` stays the insert's.
+        advance_filled(conn, conn.last_insert_rowid())?;
+    }
+    Ok(changed)
 }
 
 /// Whether a kept full event lists blob `hash`.
@@ -260,6 +273,27 @@ fn blob_referenced(conn: &Connection, hash: &str) -> Result<bool> {
         [hash],
         |r| r.get(0),
     )?)
+}
+
+/// Whether a replica kept through the eviction of a post other than
+/// `id` holds blob `hash` (ADR 0029 §4).
+fn blob_retained_elsewhere(conn: &Connection, hash: &str, id: &str) -> Result<bool> {
+    Ok(conn.query_row(
+        "SELECT EXISTS (SELECT 1 FROM evicted_replicas WHERE hash = ?1 AND id <> ?2)",
+        params![hash, id],
+        |r| r.get(0),
+    )?)
+}
+
+/// Advance the backfill mark of `event_blobs` past `seq` when it is the
+/// next one (N7): a restart then re-scans only what an older release
+/// inserted meanwhile.
+fn advance_filled(conn: &Connection, seq: i64) -> Result<()> {
+    conn.execute(
+        "UPDATE event_blobs_filled SET upto = ?1 WHERE upto = ?1 - 1",
+        [seq],
+    )?;
+    Ok(())
 }
 
 /// Most keys walked back along a rotation chain (ADR 0010 A5): enough
@@ -974,6 +1008,10 @@ impl Store {
             )?;
             let seq = tx.last_insert_rowid();
             index_blobs(&tx, seq, &String::from_utf8(event.to_json())?)?;
+            advance_filled(&tx, seq)?;
+            // A body taken back (an evicted one) lists its blobs again:
+            // the eviction's record of kept replicas is moot.
+            tx.execute("DELETE FROM evicted_replicas WHERE id = ?", [&event.id])?;
             for tag in event.tags.iter().take(INDEXED_TAGS) {
                 tx.execute(
                     "INSERT OR IGNORE INTO event_tags (seq, tag) VALUES (?, ?)",
@@ -1063,6 +1101,22 @@ impl Store {
         detail: Option<&str>,
         now: u64,
     ) -> Result<DropOutcome> {
+        self.drop_body_keeping(id, reason, trigger, detail, now, &[])
+    }
+
+    /// [`Store::drop_body`], recording in the same transaction that the
+    /// replicas `keep` (hashes) stay with the post (ADR 0029 §4, N8): they
+    /// are not in `freed_blobs`, and a later drop of the post for another
+    /// reason releases them.
+    pub fn drop_body_keeping(
+        &self,
+        id: &str,
+        reason: DropReason,
+        trigger: Option<&str>,
+        detail: Option<&str>,
+        now: u64,
+        keep: &[String],
+    ) -> Result<DropOutcome> {
         let mut conn = self.conn();
         let tx = conn.transaction()?;
         let row: Option<(i64, bool, String, String, String, String)> = tx
@@ -1119,7 +1173,11 @@ impl Store {
                 .flatten()
                 .filter_map(|b| b.get("hash").and_then(Value::as_str));
             for hash in hashes {
-                if !outcome.freed_blobs.iter().any(|h| h == hash) && !blob_referenced(&tx, hash)? {
+                if !outcome.freed_blobs.iter().any(|h| h == hash)
+                    && !keep.iter().any(|h| h == hash)
+                    && !blob_referenced(&tx, hash)?
+                    && !blob_retained_elsewhere(&tx, hash, id)?
+                {
                     outcome.freed_blobs.push(hash.to_string());
                 }
             }
@@ -1134,10 +1192,19 @@ impl Store {
             };
             tx.execute("DELETE FROM evicted_replicas WHERE id = ?", [id])?;
             for hash in kept {
-                if !outcome.freed_blobs.contains(&hash) && !blob_referenced(&tx, &hash)? {
+                if !outcome.freed_blobs.contains(&hash)
+                    && !blob_referenced(&tx, &hash)?
+                    && !blob_retained_elsewhere(&tx, &hash, id)?
+                {
                     outcome.freed_blobs.push(hash);
                 }
             }
+        }
+        for hash in keep {
+            tx.execute(
+                "INSERT OR IGNORE INTO evicted_replicas (id, hash) VALUES (?, ?)",
+                params![id, hash],
+            )?;
         }
         tx.execute(
             "INSERT INTO dropped (id, reason, at, trigger, detail) VALUES (?1, ?2, ?3, ?4, ?5)
@@ -1379,6 +1446,44 @@ impl Store {
     /// Whether a kept full event lists blob `hash`.
     pub fn blob_listed(&self, hash: &str) -> Result<bool> {
         blob_referenced(&self.conn(), hash)
+    }
+
+    /// Whether this node keeps blob `hash` for a post: a kept full event
+    /// lists it, or a replica kept through an eviction holds it (N13).
+    pub fn blob_kept(&self, hash: &str) -> Result<bool> {
+        let conn = self.conn();
+        Ok(blob_referenced(&conn, hash)? || blob_retained_elsewhere(&conn, hash, "")?)
+    }
+
+    /// Replicas kept through an eviction, `(id, hash, net)`, at most
+    /// `limit`, the oldest posts first (N4).
+    pub fn evicted_replica_rows(&self, limit: usize) -> Result<Vec<(String, String, String)>> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare_cached(
+            "SELECT r.id, r.hash, e.net FROM evicted_replicas r JOIN events e ON e.id = r.id
+                 ORDER BY e.seq LIMIT ?",
+        )?;
+        let rows = stmt.query_map([limit as i64], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    /// Forget the replica `hash` kept for post `id`; true when nothing keeps
+    /// the blob any more (no kept event lists it, no other eviction holds
+    /// it): the node then untags it.
+    pub fn release_evicted_replica(&self, id: &str, hash: &str) -> Result<bool> {
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        tx.execute(
+            "DELETE FROM evicted_replicas WHERE id = ? AND hash = ?",
+            params![id, hash],
+        )?;
+        let free = !blob_referenced(&tx, hash)? && !blob_retained_elsewhere(&tx, hash, id)?;
+        tx.commit()?;
+        Ok(free)
     }
 
     /// Record that the replicas `hashes` were kept when the body of `id`

@@ -5,12 +5,15 @@
 //! against the hash, into memory: a few KiB, and the last chunk proves the
 //! size.
 //!
-//! While a proof runs, this node refuses that peer's blob requests for
-//! that hash (an intercepting event handler on the blobs protocol), so the
-//! peer cannot answer by fetching the chunks from this node's own copy.
-//! It can still fetch them from a third node that holds the blob: then a
-//! copy exists there, which is what the release needs, but that copy may
-//! be counted twice. A snapshot, too: a peer may delete after proving.
+//! While any proof of a blob runs, this node refuses that blob to every
+//! requester, unknown connections included (an intercepting event handler
+//! on the blobs protocol): neither the peer under proof nor a second
+//! identity of it can fetch the chunks from this node's own copy and relay
+//! them. Proofs are rare and last seconds; a refused reader tries another
+//! provider, or again. The peer can still fetch the chunks from a third
+//! node that holds the blob: then a copy exists there, which is what a
+//! release needs, but it may be counted twice. A snapshot, too: a peer may
+//! delete after proving.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -33,40 +36,40 @@ const PROOF_TIMEOUT: Duration = Duration::from_secs(20);
 /// Events of the blobs protocol waiting for the handler.
 const EVENT_QUEUE: usize = 256;
 
-/// Which connection is which peer, and the (peer, blob) pairs under proof.
+/// The blobs under proof, with how many proofs of each run.
 #[derive(Debug, Default)]
 pub struct Guard {
-    connections: Mutex<HashMap<u64, EndpointId>>,
-    proving: Mutex<HashMap<(EndpointId, Hash), usize>>,
+    proving: Mutex<HashMap<Hash, usize>>,
 }
 
-/// A proof in progress: its (peer, blob) blocked until dropped.
-pub(super) struct Proving {
+/// A proof in progress: its blob refused to every requester until
+/// dropped.
+pub struct Proving {
     guard: Arc<Guard>,
-    key: (EndpointId, Hash),
+    hash: Hash,
 }
 
 impl Drop for Proving {
     fn drop(&mut self) {
         if let Ok(mut proving) = self.guard.proving.lock()
-            && let Some(count) = proving.get_mut(&self.key)
+            && let Some(count) = proving.get_mut(&self.hash)
         {
             *count = count.saturating_sub(1);
             if *count == 0 {
-                proving.remove(&self.key);
+                proving.remove(&self.hash);
             }
         }
     }
 }
 
 impl Guard {
-    /// The event sender for the blobs protocol: connections noted, `get`
-    /// and `get_many` intercepted (refused while a proof against their
-    /// peer and blob runs), the rest as without one. Its handler runs
-    /// supervised: a request is answered as long as the node runs.
+    /// The event sender for the blobs protocol: `get` and `get_many`
+    /// intercepted (refused while a proof of one of their blobs runs), the
+    /// rest as without one. Its handler runs supervised: a request is
+    /// answered as long as the node runs.
     pub fn event_sender(self: &Arc<Self>) -> EventSender {
         let mask = EventMask {
-            connected: ConnectMode::Notify,
+            connected: ConnectMode::None,
             get: RequestMode::Intercept,
             get_many: RequestMode::Intercept,
             push: RequestMode::Disabled,
@@ -91,27 +94,12 @@ impl Guard {
 
     async fn handle(&self, message: ProviderMessage) {
         match message {
-            ProviderMessage::ClientConnectedNotify(msg) => {
-                if let (Some(peer), Ok(mut connections)) =
-                    (msg.inner.endpoint_id, self.connections.lock())
-                {
-                    if connections.len() >= 100_000 {
-                        connections.clear();
-                    }
-                    connections.insert(msg.inner.connection_id, peer);
-                }
-            }
-            ProviderMessage::ConnectionClosed(msg) => {
-                if let Ok(mut connections) = self.connections.lock() {
-                    connections.remove(&msg.inner.connection_id);
-                }
-            }
             ProviderMessage::GetRequestReceived(msg) => {
-                let verdict = self.verdict(msg.inner.connection_id, &[msg.inner.request.hash]);
+                let verdict = self.verdict(&[msg.inner.request.hash]);
                 msg.tx.send(verdict).await.ok();
             }
             ProviderMessage::GetManyRequestReceived(msg) => {
-                let verdict = self.verdict(msg.inner.connection_id, &msg.inner.request.hashes);
+                let verdict = self.verdict(&msg.inner.request.hashes);
                 msg.tx.send(verdict).await.ok();
             }
             // Not asked for in the mask; answered anyway, as without one.
@@ -131,38 +119,39 @@ impl Guard {
         }
     }
 
-    /// Refuse a request of `hashes` on `connection` while one of them is
-    /// under proof against its peer.
-    fn verdict(&self, connection: u64, hashes: &[Hash]) -> Result<(), AbortReason> {
-        let peer = self
-            .connections
-            .lock()
-            .ok()
-            .and_then(|c| c.get(&connection).copied());
-        let Some(peer) = peer else {
-            return Ok(());
-        };
+    /// Refuse a request of `hashes` while a proof of one of them runs,
+    /// whoever asks.
+    fn verdict(&self, hashes: &[Hash]) -> Result<(), AbortReason> {
         let blocked = self
             .proving
             .lock()
-            .is_ok_and(|p| hashes.iter().any(|h| p.contains_key(&(peer, *h))));
+            .is_ok_and(|p| hashes.iter().any(|h| p.contains_key(h)));
         if blocked {
-            debug!(peer = %peer.fmt_short(), "blob request refused: a possession proof against this peer runs");
+            debug!("blob request refused: a possession proof of this blob runs");
             Err(AbortReason::Permission)
         } else {
             Ok(())
         }
     }
 
-    pub(super) fn block(self: &Arc<Self>, peer: EndpointId, hash: Hash) -> Proving {
+    pub(super) fn block(self: &Arc<Self>, hash: Hash) -> Proving {
         if let Ok(mut proving) = self.proving.lock() {
-            let count = proving.entry((peer, hash)).or_insert(0);
+            let count = proving.entry(hash).or_insert(0);
             *count = count.saturating_add(1);
         }
         Proving {
             guard: Arc::clone(self),
-            key: (peer, hash),
+            hash,
         }
+    }
+}
+
+impl Node {
+    /// Test only: refuse blob `hash` to every requester, as while a
+    /// possession proof of it runs, until the returned value is dropped.
+    #[doc(hidden)]
+    pub fn block_blob_requests_for_tests(&self, hash: Hash) -> Proving {
+        self.proof_guard.block(hash)
     }
 }
 
@@ -206,7 +195,7 @@ impl Node {
     /// from it alone a random chunk and the last one (see the module doc).
     /// False on any failure or timeout.
     pub(super) async fn prove_holder(&self, peer: EndpointId, hash: Hash, size: u64) -> bool {
-        let _blocked = self.proof_guard.block(peer, hash);
+        let _blocked = self.proof_guard.block(hash);
         let want = proof_chunks(size, getrandom::u64().unwrap_or(0));
         let proved = tokio::time::timeout(PROOF_TIMEOUT, self.fetch_proof(peer, hash, size, &want))
             .await

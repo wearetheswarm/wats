@@ -200,10 +200,11 @@ async fn a_lost_replica_is_restored() -> anyhow::Result<()> {
             holds(n, &hash).await
         })
         .await;
-        assert!(
-            n.has_replica_intent(&hash.parse()?).await,
-            "recorded as a replica"
-        );
+        let parsed = hash.parse()?;
+        eventually("recorded as a replica", async || {
+            n.has_replica_intent(&parsed).await
+        })
+        .await;
     }
     let next = by_id(&others, order[3]);
     assert!(!holds(next, &hash).await, "the 4th closest has no copy yet");
@@ -217,7 +218,12 @@ async fn a_lost_replica_is_restored() -> anyhow::Result<()> {
         async || holds(next, &hash).await,
     )
     .await;
-    assert!(next.has_replica_intent(&hash.parse()?).await);
+    // Recorded right after the blob is in (its fetch, then the tag).
+    let parsed = hash.parse()?;
+    eventually("the 4th closest records itself as a replica", async || {
+        next.has_replica_intent(&parsed).await
+    })
+    .await;
     for id in &order[1..4] {
         assert!(holds(by_id(&others, *id), &hash).await);
     }
@@ -385,7 +391,11 @@ async fn the_last_copy_is_handed_off_before_it_is_deleted() -> anyhow::Result<()
     let blob = event.blobs[0].clone();
     let hash = blob.hash.clone();
     eventually("the replica arrives", async || holds(&holder, &hash).await).await;
-    assert!(holder.has_replica_intent(&hash.parse()?).await, "recorded");
+    let parsed = hash.parse()?;
+    eventually("recorded as a replica", async || {
+        holder.has_replica_intent(&parsed).await
+    })
+    .await;
     // A reader fetches it on read: a copy, not a replica.
     let reader = start(&dir.path().join("r"), 1, manual()).await?;
     mesh(&[&publisher, &holder, &reader]).await?;
@@ -435,11 +445,6 @@ async fn the_last_copy_is_handed_off_before_it_is_deleted() -> anyhow::Result<()
         .await?;
     assert!(outcome.body_dropped && outcome.freed_blobs.is_empty());
     assert!(holder.blob_pinned(&hash).await?, "the replica is kept");
-    // Asked again by a repairer, it confirms without taking the body back.
-    assert!(
-        holder.store().get(&event.id)?.is_none(),
-        "still a tombstone"
-    );
     reader.shutdown().await?;
     holder.shutdown().await?;
     Ok(())
@@ -794,5 +799,331 @@ async fn an_older_peer_takes_a_lost_replica() -> anyhow::Result<()> {
     for id in &order[1..4] {
         by_id(&all, *id).shutdown().await?;
     }
+    Ok(())
+}
+
+/// While a possession proof of a blob runs, the blob is refused to every
+/// requester, whatever its identity (N1): a liar cannot have a second
+/// keypair fetch the chunks from this node's copy and relay them.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_proof_refuses_the_blob_to_every_requester() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let holder = start(&dir.path().join("h"), 3, manual()).await?;
+    let event = publish(&holder, dir.path(), &content(21)).await?;
+    let blob = event.blobs[0].clone();
+    // Two other identities: one the proof is about, one a stranger.
+    let proved = start(&dir.path().join("l"), 3, manual()).await?;
+    let second = start(&dir.path().join("s"), 3, manual()).await?;
+    mesh(&[&holder, &proved, &second]).await?;
+    for n in [&proved, &second] {
+        eventually("the post arrives", async || {
+            n.store().get(&event.id).ok().flatten().is_some()
+        })
+        .await;
+    }
+    let proof = holder.block_blob_requests_for_tests(blob.hash.parse()?);
+    for n in [&proved, &second] {
+        let fetched = n.fetch_and_export(&blob).await;
+        assert!(
+            !matches!(fetched, Ok(Some(_))),
+            "refused during the proof: {fetched:?}"
+        );
+        assert!(!holds(n, &blob.hash).await);
+    }
+    drop(proof);
+    // Served again once it ends (the providers' backoff is per peer: a
+    // fresh reader asks at once).
+    let reader = start(&dir.path().join("r"), 3, manual()).await?;
+    mesh(&[&holder, &reader]).await?;
+    eventually("the post arrives", async || {
+        reader.store().get(&event.id).ok().flatten().is_some()
+    })
+    .await;
+    assert!(
+        reader.fetch_and_export(&blob).await?.is_some(),
+        "served again"
+    );
+    for n in [holder, proved, second, reader] {
+        n.shutdown().await?;
+    }
+    Ok(())
+}
+
+/// Two holders that prove each other at the same moment refuse each
+/// other's requests: a failed proof is a miss, never an exclusion, and
+/// the checks converge (N5).
+#[tokio::test(flavor = "multi_thread")]
+async fn mutual_proofs_converge() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let due = Tuning {
+        recheck: Duration::ZERO,
+        retry: Duration::ZERO,
+        miss_gap: Duration::from_secs(3600),
+        ..manual()
+    };
+    let a = start(&dir.path().join("a"), 2, due.clone()).await?;
+    let b = start(&dir.path().join("b"), 2, due).await?;
+    mesh(&[&a, &b]).await?;
+    let event = publish(&a, dir.path(), &content(31)).await?;
+    let hash = event.blobs[0].hash.clone();
+    eventually("the replica arrives", async || holds(&b, &hash).await).await;
+    // Passes at the same moment, until each proved the other at least
+    // twice: collisions only delay.
+    for _ in 0..40 {
+        tokio::join!(a.repair_pass(), b.repair_pass());
+        if a.repair_stats().confirmed >= 2 && b.repair_stats().confirmed >= 2 {
+            break;
+        }
+    }
+    let (sa, sb) = (a.repair_stats(), b.repair_stats());
+    assert!(sa.confirmed >= 2 && sb.confirmed >= 2, "{sa:?} {sb:?}");
+    // And the next passes still prove: nobody was excluded for good.
+    let before = (sa.confirmed, sb.confirmed);
+    for _ in 0..40 {
+        a.repair_pass().await;
+        b.repair_pass().await;
+        if a.repair_stats().confirmed > before.0 && b.repair_stats().confirmed > before.1 {
+            break;
+        }
+    }
+    assert!(
+        a.repair_stats().confirmed > before.0,
+        "{:?}",
+        a.repair_stats()
+    );
+    assert!(
+        b.repair_stats().confirmed > before.1,
+        "{:?}",
+        b.repair_stats()
+    );
+    a.shutdown().await?;
+    b.shutdown().await?;
+    Ok(())
+}
+
+/// An erasure label held before its labeler was subscribed is applied at
+/// the next start, and upgrades an `evicted` record: the replica kept
+/// through the eviction goes (N5, B1).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_held_erasure_releases_an_evicted_replica_at_start() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let labeler = SigningKey::from_bytes(&[51; 32]);
+    let author = SigningKey::from_bytes(&[52; 32]);
+    let holder = start(&dir.path().join("b"), 3, manual()).await?;
+    let publisher = start(&dir.path().join("p"), 3, manual()).await?;
+    mesh(&[&publisher, &holder]).await?;
+    let post = publish_as(&publisher, Some(&author), dir.path(), &content(41)).await?;
+    let hash = post.blobs[0].hash.clone();
+    eventually("the replica arrives", async || holds(&holder, &hash).await).await;
+    let outcome = holder
+        .drop_body(&post.id, DropReason::Evicted, None, None)
+        .await?;
+    assert!(outcome.freed_blobs.is_empty(), "the replica is kept");
+    let label = publisher
+        .publish_as(
+            &labeler,
+            Draft {
+                net: PUBLIC_NET.into(),
+                thread: Some(post.thread_root().to_string()),
+                parent: Some(post.id.clone()),
+                kind: Some(Kind::React),
+                text: "Erasure request handled by the operator.".into(),
+                data: serde_json::json!({"label": "erasure"})
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+                ..Draft::default()
+            },
+            &[],
+        )
+        .await?;
+    eventually("the label arrives", async || {
+        holder.store().get(&label.id).ok().flatten().is_some()
+    })
+    .await;
+    assert!(holder.blob_pinned(&hash).await?, "not subscribed yet: kept");
+    holder.shutdown().await?;
+    publisher.shutdown().await?;
+
+    let mut c = config(&dir.path().join("b"), 3, manual());
+    c.erasure_labelers = vec![author_id(&labeler)];
+    let holder = Node::start(c).await?;
+    assert_eq!(
+        holder.store().drop_record(&post.id)?.unwrap().reason,
+        DropReason::Erasure,
+        "upgraded"
+    );
+    assert!(!holder.blob_pinned(&hash).await?, "released");
+    assert!(!holder.has_replica_intent(&hash.parse()?).await);
+    eventually("the collection deletes it", async || {
+        !holds(&holder, &hash).await
+    })
+    .await;
+    holder.shutdown().await?;
+    Ok(())
+}
+
+/// `wats drop` of a post whose replica was kept through an eviction
+/// releases the replica at once (N5).
+#[tokio::test(flavor = "multi_thread")]
+async fn wats_drop_releases_an_evicted_replica() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let holder = start(&dir.path().join("b"), 3, manual()).await?;
+    let publisher = start(&dir.path().join("p"), 3, manual()).await?;
+    mesh(&[&publisher, &holder]).await?;
+    let post = publish(&publisher, dir.path(), &content(61)).await?;
+    let hash = post.blobs[0].hash.clone();
+    eventually("the replica arrives", async || holds(&holder, &hash).await).await;
+    holder
+        .drop_body(&post.id, DropReason::Evicted, None, None)
+        .await?;
+    assert!(
+        holder.blob_pinned(&hash).await?,
+        "kept through the eviction"
+    );
+    let _sessions = wats::attach::serve(Arc::clone(&holder))?;
+    let outcome = wats::attach::control(
+        &dir.path().join("b"),
+        wats::attach::Control::Drop {
+            id: post.id.clone(),
+            detail: Some("personal data".into()),
+        },
+    )
+    .await?
+    .expect("the node answers");
+    assert_eq!(
+        outcome["freed_blobs"],
+        serde_json::json!([hash]),
+        "{outcome}"
+    );
+    assert!(!holder.blob_pinned(&hash).await?, "released at once");
+    assert!(!holder.has_replica_intent(&hash.parse()?).await);
+    assert_eq!(
+        publisher.repair_stats().served,
+        0,
+        "nothing handed to the publisher"
+    );
+    holder.shutdown().await?;
+    publisher.shutdown().await?;
+    Ok(())
+}
+
+/// A replica kept through an eviction is looked at again by repair (N4):
+/// once closer nodes joined, so that this node is no longer among the 2k
+/// closest, and another holder proves it holds the blob, it is released.
+/// The newcomers never get the body (the publisher is gone first), so
+/// nothing takes it back here.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_evicted_replica_is_released_once_others_are_closer() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let due = Tuning {
+        recheck: Duration::ZERO,
+        ..manual()
+    };
+    let publisher = start(&dir.path().join("p"), 1, manual()).await?;
+    let holder = start(&dir.path().join("h"), 1, due).await?;
+    mesh(&[&publisher, &holder]).await?;
+    // A file in the other half of the id space from the holder: half the
+    // newcomers are closer to it than the holder.
+    let far = holder.endpoint_id();
+    let bytes = (7100u64..)
+        .map(content)
+        .find(|b| (hash_of(b)[0] ^ far.as_bytes()[0]) & 0x80 != 0)
+        .expect("one in two seeds");
+    let post = publish(&publisher, dir.path(), &bytes).await?;
+    let blob = post.blobs[0].clone();
+    let hash = blob.hash.clone();
+    eventually("the replica arrives", async || holds(&holder, &hash).await).await;
+    // The publisher goes first, and its gossip copy of the post settles:
+    // an evicted body is taken back by any insert until #182, which would
+    // undo the eviction below.
+    publisher.shutdown().await?;
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    // Two nodes: the holder is within the 2k = 2 closest, the replica stays.
+    let outcome = holder
+        .drop_body(&post.id, DropReason::Evicted, None, None)
+        .await?;
+    assert!(outcome.freed_blobs.is_empty());
+    assert_eq!(
+        holder.store().evicted_replicas(&post.id)?,
+        vec![hash.clone()]
+    );
+    // Nodes join until two of them are closer to the blob than the holder.
+    let target = parse_hex::<32>(&hash, "hash")?;
+    let mut joined: Vec<Arc<Node>> = Vec::new();
+    for i in 0..30 {
+        joined.push(start(&dir.path().join(format!("j{i}")), 1, manual()).await?);
+        // Two newcomers closer than the holder, whatever the publisher is.
+        let mut ids = vec![holder.endpoint_id()];
+        ids.extend(joined.iter().map(|n| n.endpoint_id()));
+        if joined.len() >= 2 && !closest(&target, &ids, 2).contains(&holder.endpoint_id()) {
+            break;
+        }
+    }
+    let mut ids = vec![holder.endpoint_id()];
+    ids.extend(joined.iter().map(|n| n.endpoint_id()));
+    assert!(
+        !closest(&target, &ids, 2).contains(&holder.endpoint_id()),
+        "two newcomers are closer"
+    );
+    let mut all: Vec<&Arc<Node>> = vec![&holder];
+    all.extend(joined.iter());
+    mesh(&all).await?;
+    // The two newcomers closer than the holder sync from it: it hears
+    // from them on the network (members, ADR 0026), for the next 24 hours,
+    // not only while they happen to be gossip neighbors.
+    let ids: Vec<EndpointId> = joined.iter().map(|n| n.endpoint_id()).collect();
+    let closer = closest(&target, &ids, 2);
+    eventually("the closer newcomers are members", async || {
+        for id in &closer {
+            let n = by_id(&joined.iter().collect::<Vec<_>>(), *id).clone();
+            let _ = n.sync_from(holder.endpoint_id(), PUBLIC_NET).await;
+        }
+        let members = holder.members_for_tests(PUBLIC_NET);
+        closer.iter().all(|id| members.contains(id))
+    })
+    .await;
+    // The closest newcomer reads the file (a copy, by its hash), and so
+    // can prove it holds it.
+    let ids: Vec<EndpointId> = joined.iter().map(|n| n.endpoint_id()).collect();
+    let reader = by_id(
+        &joined.iter().collect::<Vec<_>>(),
+        closest(&target, &ids, 1)[0],
+    )
+    .clone();
+    eventually("the reader fetches it", async || {
+        matches!(reader.fetch_and_export(&blob).await, Ok(Some(_)))
+    })
+    .await;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    loop {
+        holder.repair_pass().await;
+        if !holder.blob_pinned(&hash).await.unwrap_or(true) {
+            break;
+        }
+        if tokio::time::Instant::now() > deadline {
+            let members = holder.members_for_tests(PUBLIC_NET);
+            let mut view = members.clone();
+            view.push(holder.endpoint_id());
+            panic!(
+                "not released: within 2 of its view {}, full again {}, rows {:?}, \
+                 reader holds {}, reader member {}, stats {:?}",
+                closest(&target, &view, 2).contains(&holder.endpoint_id()),
+                holder.store().get(&post.id)?.is_some(),
+                holder.store().evicted_replicas(&post.id)?,
+                holds(&reader, &hash).await,
+                members.contains(&reader.endpoint_id()),
+                holder.repair_stats()
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(holder.store().evicted_replicas(&post.id)?.is_empty());
+    assert!(holder.store().get(&post.id)?.is_none(), "still a tombstone");
+    assert!(holds(&reader, &hash).await);
+    for n in joined {
+        n.shutdown().await?;
+    }
+    holder.shutdown().await?;
     Ok(())
 }

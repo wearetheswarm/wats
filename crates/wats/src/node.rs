@@ -38,7 +38,7 @@ use tracing::{debug, info, warn};
 
 pub mod durability;
 pub mod history;
-mod proof;
+pub mod proof;
 
 use crate::bootstrap::BootstrapEntry;
 use crate::event::{BlobRef, Draft, Event, Kind, is_safe_blob_name};
@@ -1829,6 +1829,10 @@ impl Node {
             warn!("this node ignores guardian halts (halt.accept = false)");
         }
         node.evaluate_halt();
+        // The replica bytes, before `replicate` is served (N9).
+        if let Err(e) = node.count_replica_bytes().await {
+            warn!("replica bytes not counted: {e:#}");
+        }
         protocol.set_node(&node);
         // History in the background, one task per network (ADR 0025 §4):
         // nothing here waits for it.
@@ -3840,9 +3844,14 @@ impl Node {
             planned.extend(plan.kept.iter().cloned());
             kept = plan.kept;
         }
-        let mut outcome = self
-            .store
-            .drop_body(id, reason, trigger, detail, now_secs())?;
+        // The kept replicas are recorded in the drop's own transaction
+        // (N8): no crash leaves a kept tag without its record.
+        let mut outcome =
+            self.store
+                .drop_body_keeping(id, reason, trigger, detail, now_secs(), &kept)?;
+        if !kept.is_empty() {
+            info!(%id, blobs = kept.len(), "body evicted, its replicas kept");
+        }
         if let Some(event) = &before {
             // Freed now but not planned: another event that listed them
             // went meanwhile (S7).
@@ -3853,15 +3862,18 @@ impl Node {
                 .cloned()
                 .collect();
             if !late.is_empty() {
-                kept.extend(self.cover_late(event, &late).await);
-            }
-            if !kept.is_empty() {
-                info!(%id, blobs = kept.len(), "body evicted, its replicas kept");
-                outcome.freed_blobs.retain(|h| !kept.contains(h));
-                self.store.record_evicted_replicas(id, &kept)?;
+                let late_kept = self.cover_late(event, &late).await;
+                if !late_kept.is_empty() {
+                    outcome.freed_blobs.retain(|h| !late_kept.contains(h));
+                    // An error here leaves the blob tagged, never deleted;
+                    // the rest is still untagged below.
+                    if let Err(e) = self.store.record_evicted_replicas(id, &late_kept) {
+                        warn!(%id, "kept blobs of an evicted body not recorded: {e:#}");
+                    }
+                }
             }
         }
-        unpin_freed(&self.blobs, &outcome).await;
+        self.untag_freed(&outcome.freed_blobs).await;
         // A freed blob no longer needs repairing: no kept post lists it.
         if let Ok(mut unreadable) = self.blob_keep.unreadable.lock() {
             for hash in &outcome.freed_blobs {
@@ -4156,7 +4168,7 @@ impl Node {
         for (id, applied) in applied {
             match applied {
                 crate::store::Applied::Dropped(outcome) => {
-                    unpin_freed(&self.blobs, &outcome).await;
+                    self.untag_freed(&outcome.freed_blobs).await;
                     info!(%id, retraction = %retraction.id, body = outcome.body_dropped,
                           blobs = outcome.freed_blobs.len(), "retracted by its author: body dropped");
                 }
@@ -4501,9 +4513,11 @@ impl Node {
         // (S8): what it would have freed is released again.
         if !stored.is_empty() && !legacy && !self.event_still_full(&event.id) {
             for hex in &stored {
+                // Only what nothing keeps: no kept event lists it, no
+                // replica kept through an eviction holds it (N13).
                 if let Ok(hash) = hex.parse::<Hash>()
-                    && !self.store.blob_listed(hex).unwrap_or(true)
-                    && let Err(e) = unpin_blob(&self.blobs, hash).await
+                    && !self.store.blob_kept(hex).unwrap_or(true)
+                    && let Err(e) = self.untag_blob(hash).await
                 {
                     warn!(hash = %hex, "blob of a dropped body not untagged: {e:#}");
                 }

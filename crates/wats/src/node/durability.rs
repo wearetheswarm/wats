@@ -86,6 +86,14 @@ const UNREACHABLE_MAX: Duration = Duration::from_secs(24 * 3600);
 /// A check that could not finish (a busy peer, a first miss) comes back
 /// after at most this.
 const NOT_CHECKED_RETRY: Duration = Duration::from_secs(600);
+/// Two misses count as "missing twice" only within this many `miss_gap`s
+/// of each other; past it, a miss starts a new sequence.
+const MISS_WINDOW_GAPS: u32 = 6;
+/// A refusal for good (full, quota, replica share) is remembered this
+/// long: space may be freed.
+const REFUSED_FOR: Duration = Duration::from_secs(6 * 3600);
+/// Rows of `evicted_replicas` looked at in one pass (N4).
+const EVICTED_PER_PASS: usize = 256;
 
 /// How replica repair runs ([`NodeConfig::durability`]); tests shorten it.
 /// Not config keys: constants (ADR 0029).
@@ -205,8 +213,15 @@ impl Misses {
         }
     }
 
-    fn again(&mut self) {
-        self.last = Instant::now();
+    /// One more miss. Misses further apart than [`MISS_WINDOW_GAPS`]
+    /// gaps start a new sequence: two transient failures days apart are
+    /// not "missing twice".
+    fn again(&mut self, gap: Duration) {
+        let now = Instant::now();
+        if now.saturating_duration_since(self.last) > gap.saturating_mul(MISS_WINDOW_GAPS) {
+            self.first = now;
+        }
+        self.last = now;
     }
 
     fn for_good(&self, gap: Duration) -> bool {
@@ -222,8 +237,9 @@ struct Check {
     short: u32,
     /// The peers proven holders at the last check.
     holders: Vec<EndpointId>,
-    /// Peers that refused it for good (full, quota, dropped).
-    refused: HashSet<EndpointId>,
+    /// Peers that refused it for good (full, quota, replica share), and
+    /// when: forgotten after [`REFUSED_FOR`].
+    refused: HashMap<EndpointId, Instant>,
     /// Peers that answered without it and no reason (0.4.2 when full),
     /// or failed their proof.
     declined: HashMap<EndpointId, Misses>,
@@ -235,7 +251,7 @@ impl Check {
             due,
             short: 0,
             holders: Vec::new(),
-            refused: HashSet::new(),
+            refused: HashMap::new(),
             declined: HashMap::new(),
         }
     }
@@ -260,8 +276,10 @@ pub struct State {
     checks: Mutex<HashMap<Hash, Check>>,
     inventory: Mutex<Option<(Instant, Inventory)>>,
     unreachable: Mutex<HashMap<EndpointId, Unreachable>>,
-    /// Bytes of the blobs held as replicas, as of the last inventory plus
-    /// the replicas recorded since.
+    /// When each replica kept through an eviction is looked at next (N4).
+    evicted_due: Mutex<HashMap<Hash, Instant>>,
+    /// Bytes of the blobs held as replicas: counted at start and at each
+    /// inventory, kept up to date on every tag and untag (N9).
     replica_bytes: AtomicU64,
     stats: Counters,
 }
@@ -281,7 +299,7 @@ impl State {
         }
     }
 
-    fn mark_unreachable(&self, peer: EndpointId) {
+    fn mark_unreachable(&self, peer: EndpointId, gap: Duration) {
         if let Ok(mut unreachable) = self.unreachable.lock() {
             let now = Instant::now();
             if unreachable.len() >= 10_000 {
@@ -292,7 +310,7 @@ impl State {
                 failures: 0,
                 until: now,
             });
-            entry.misses.again();
+            entry.misses.again(gap);
             entry.failures = entry.failures.saturating_add(1);
             let doublings = entry.failures.saturating_sub(1).min(16);
             let wait = UNREACHABLE_FIRST
@@ -303,12 +321,12 @@ impl State {
     }
 
     /// Not to be dialed now (it failed lately); a miss is noted.
-    fn skip_dial(&self, peer: &EndpointId) -> bool {
+    fn skip_dial(&self, peer: &EndpointId, gap: Duration) -> bool {
         self.unreachable.lock().is_ok_and(|mut u| {
             u.get_mut(peer).is_some_and(|entry| {
                 let skip = Instant::now() < entry.until;
                 if skip {
-                    entry.misses.again();
+                    entry.misses.again(gap);
                 }
                 skip
             })
@@ -340,6 +358,9 @@ impl State {
         }
     }
 }
+
+/// What a receiver's refusal for good says (`Node::serve_replicate`).
+pub const NOT_TAKING: &str = "not taking replicas";
 
 /// The tag that records a blob held as a replica, followed by its hash.
 pub const REPLICA_TAG: &str = "wats/replica/";
@@ -519,6 +540,12 @@ impl Node {
             .collect()
     }
 
+    /// Test only: the members of `net` as this node sees them.
+    #[doc(hidden)]
+    pub fn members_for_tests(&self, net: &str) -> Vec<EndpointId> {
+        self.members(net)
+    }
+
     /// Whether this node is among the 2k closest to `hash` of its view of
     /// `net`: where a replica is recorded (ADR 0029 §1).
     fn within_twice_k(&self, hash: &Hash, net: &str) -> bool {
@@ -588,6 +615,10 @@ impl Node {
         if self.has_replica_intent(&hash).await {
             return;
         }
+        if !self.replica_fits(size) {
+            debug!(%hash, "replica share full: kept as a read cache");
+            return;
+        }
         match self.blobs.tags().set(replica_tag(&hash), hash).await {
             Ok(()) => {
                 self.durability
@@ -596,6 +627,54 @@ impl Node {
             }
             Err(e) => warn!(%hash, "replica not recorded: {e:#}"),
         }
+    }
+
+    /// Delete every tag of blob `hash` (the next collection deletes it,
+    /// unless a kept event lists it), the replica record included, which
+    /// leaves the replica bytes (N9).
+    pub(super) async fn untag_blob(&self, hash: Hash) -> Result<()> {
+        if self.has_replica_intent(&hash).await
+            && let Ok(BlobStatus::Complete { size }) = self.blobs.status(hash).await
+        {
+            let bytes = &self.durability.replica_bytes;
+            let _ = bytes.try_update(Ordering::Relaxed, Ordering::Relaxed, |b| {
+                Some(b.saturating_sub(size))
+            });
+        }
+        super::unpin_blob(&self.blobs, hash).await
+    }
+
+    /// Untag the blobs a drop freed (best effort: a failure is logged, the
+    /// body is gone anyway).
+    pub(super) async fn untag_freed(&self, freed: &[String]) {
+        for hex in freed {
+            let Ok(hash) = hex.parse::<Hash>() else {
+                continue;
+            };
+            if let Err(e) = self.untag_blob(hash).await {
+                warn!(hash = %hex, "blob of a dropped body not untagged: {e:#}");
+            }
+        }
+    }
+
+    /// Count the bytes of the replicas held (at start, before `replicate`
+    /// is served, and at each inventory).
+    pub(super) async fn count_replica_bytes(&self) -> Result<()> {
+        let mut replicas: Vec<Hash> = Vec::new();
+        let mut tags = self.blobs.tags().list_prefix(REPLICA_TAG).await?;
+        while let Some(tag) = tags.next().await {
+            replicas.push(tag?.hash);
+        }
+        let mut bytes: u64 = 0;
+        for hash in replicas {
+            if let Ok(BlobStatus::Complete { size }) = self.blobs.status(hash).await {
+                bytes = bytes.saturating_add(size);
+            }
+        }
+        self.durability
+            .replica_bytes
+            .store(bytes, Ordering::Relaxed);
+        Ok(())
     }
 
     /// Whether this node recorded blob `hash` as a replica
@@ -658,8 +737,14 @@ impl Node {
 
     /// Whether event `id` is still held in full, with no drop record: a
     /// retraction or an erasure may land while a repair runs.
-    fn still_full(&self, id: &str) -> bool {
-        matches!(self.store.get(id), Ok(Some(_))) && matches!(self.store.drop_record(id), Ok(None))
+    async fn still_full(&self, id: &str) -> bool {
+        let store = Arc::clone(&self.store);
+        let id = id.to_string();
+        tokio::task::spawn_blocking(move || {
+            matches!(store.get(&id), Ok(Some(_))) && matches!(store.drop_record(&id), Ok(None))
+        })
+        .await
+        .unwrap_or(false)
     }
 
     /// Ask `peer` to hold blob `hash` of `event`: `replicate`, through the
@@ -679,20 +764,31 @@ impl Node {
             proto::call_solving_within(self.endpoint(), peer, &request, Some(REPAIR_CONNECT_LIMIT));
         let result = tokio::time::timeout(PUSH_TIMEOUT, call).await;
         drop(slot);
+        if matches!(result, Ok(Ok(_))) {
+            // It answered: reachable again (N2).
+            self.durability.peer_seen(peer);
+        }
         match result {
             Ok(Ok(Response::Replicated { hashes })) if hashes.iter().any(|h| h == hash) => {
                 Answer::Holds
             }
             Ok(Ok(Response::Replicated { .. })) => Answer::Declined,
             Ok(Ok(Response::Refused { reason })) if reason.contains("rate limited") => Answer::Busy,
+            // Only what the receiver says is for good: storage full, quota,
+            // replica share (S2). An event it did not accept is a decline.
+            Ok(Ok(Response::Refused { reason })) if reason.contains(NOT_TAKING) => {
+                debug!(peer = %peer.fmt_short(), %hash, "repair: refused: {reason}");
+                Answer::Refused
+            }
             Ok(Ok(Response::Challenge { .. })) => Answer::Busy,
             Ok(Ok(other)) => {
-                debug!(peer = %peer.fmt_short(), %hash, "repair: refused: {other:?}");
-                Answer::Refused
+                debug!(peer = %peer.fmt_short(), %hash, "repair: declined: {other:?}");
+                Answer::Declined
             }
             Ok(Err(e)) if e.downcast_ref::<proto::ConnectFailed>().is_some() => {
                 debug!(peer = %peer.fmt_short(), "repair: unreachable: {e:#}");
-                self.durability.mark_unreachable(peer);
+                self.durability
+                    .mark_unreachable(peer, self.config.durability.miss_gap);
                 Answer::Unreachable
             }
             Ok(Err(e)) => {
@@ -768,24 +864,11 @@ impl Node {
         let listings =
             tokio::task::spawn_blocking(move || store.blob_listings(LISTINGS_PER_BLOB)).await??;
         let mut tagged: HashSet<Hash> = HashSet::new();
-        let mut replicas: HashSet<Hash> = HashSet::new();
         let mut tags = self.blobs.tags().list_prefix("wats/").await?;
         while let Some(tag) = tags.next().await {
-            let tag = tag?;
-            if tag.name.as_ref().starts_with(REPLICA_TAG.as_bytes()) {
-                replicas.insert(tag.hash);
-            }
-            tagged.insert(tag.hash);
+            tagged.insert(tag?.hash);
         }
-        let mut bytes: u64 = 0;
-        for hash in &replicas {
-            if let Ok(BlobStatus::Complete { size }) = self.blobs.status(*hash).await {
-                bytes = bytes.saturating_add(size);
-            }
-        }
-        self.durability
-            .replica_bytes
-            .store(bytes, Ordering::Relaxed);
+        self.count_replica_bytes().await?;
         let list: Vec<(Hash, Vec<String>)> = listings
             .into_iter()
             .filter_map(|(hash, ids)| {
@@ -840,20 +923,30 @@ impl Node {
             due.into_iter().map(|(_, hash, ids)| (hash, ids)).collect()
         };
         if due.is_empty() {
-            return 0;
+            return self.review_evicted_replicas(tuning.blobs_per_pass).await;
         }
         // Cheap rejects first, not counted: blobs held here that are
         // neither a replica (record or estimate) nor an own post's.
         let mut work: Vec<(Hash, Vec<Arc<Event>>)> = Vec::new();
         let widest = self.replicas_wanted(true);
-        for (hash, ids) in due {
+        let store = Arc::clone(&self.store);
+        let read: Vec<(Hash, Vec<Arc<Event>>)> = tokio::task::spawn_blocking(move || {
+            due.into_iter()
+                .map(|(hash, ids)| {
+                    let events = ids
+                        .iter()
+                        .filter_map(|id| store.get(id).ok().flatten().map(|s| s.event))
+                        .collect();
+                    (hash, events)
+                })
+                .collect()
+        })
+        .await
+        .unwrap_or_default();
+        for (hash, events) in read {
             if work.len() >= tuning.blobs_per_pass {
                 break;
             }
-            let events: Vec<Arc<Event>> = ids
-                .iter()
-                .filter_map(|id| self.store.get(id).ok().flatten().map(|s| s.event))
-                .collect();
             let Some(first) = events.first() else {
                 self.reschedule(hash, true, Vec::new());
                 continue;
@@ -893,7 +986,124 @@ impl Node {
             }
         });
         let outcomes = n0_future::join_all(checks).await;
-        outcomes.iter().filter(|o| **o != Outcome::Skipped).count()
+        let checked = outcomes.iter().filter(|o| **o != Outcome::Skipped).count();
+        let left = tuning.blobs_per_pass.saturating_sub(checked);
+        checked.saturating_add(self.review_evicted_replicas(left).await)
+    }
+
+    /// Replicas kept through an eviction (N4): released once this node is
+    /// no longer among the 2k closest of its view of the post's network and
+    /// k other holders are proven. Never pushed: their post is a tombstone
+    /// here (ADR 0020 §3). At most `budget` looked at; returns those.
+    async fn review_evicted_replicas(&self, budget: usize) -> usize {
+        if budget == 0 {
+            return 0;
+        }
+        let store = Arc::clone(&self.store);
+        let rows =
+            match tokio::task::spawn_blocking(move || store.evicted_replica_rows(EVICTED_PER_PASS))
+                .await
+            {
+                Ok(Ok(rows)) => rows,
+                Ok(Err(e)) => {
+                    warn!("replica repair: evicted replicas not listed: {e:#}");
+                    return 0;
+                }
+                Err(_) => return 0,
+            };
+        let now = Instant::now();
+        let recheck = self.config.durability.recheck;
+        let mut done = 0usize;
+        for (id, hex, net) in rows {
+            if done >= budget {
+                break;
+            }
+            let Ok(hash) = hex.parse::<Hash>() else {
+                continue;
+            };
+            let due = self.durability.evicted_due.lock().ok().map(|mut d| {
+                *d.entry(hash)
+                    .or_insert_with(|| now.checked_add(within(recheck)).unwrap_or(now))
+            });
+            if due.is_none_or(|due| due > now) {
+                continue;
+            }
+            done = done.saturating_add(1);
+            let next = now.checked_add(jittered(recheck)).unwrap_or(now);
+            if let Ok(mut d) = self.durability.evicted_due.lock() {
+                if d.len() > 100_000 {
+                    d.clear();
+                }
+                d.insert(hash, next);
+            }
+            if self.within_twice_k(&hash, &net) {
+                debug!(%hash, %id, "evicted replica kept: within the 2k closest");
+                continue;
+            }
+            let Ok(BlobStatus::Complete { size }) = self.blobs.status(hash).await else {
+                continue;
+            };
+            let k = self.blob_target_k(&hex).await;
+            let proven = self.prove_others(&hash, size, &net, k).await;
+            if proven < k {
+                debug!(%hash, %id, proven, k, "evicted replica kept: too few holders proven");
+                continue;
+            }
+            let store = Arc::clone(&self.store);
+            let (row_id, row_hash) = (id.clone(), hex.clone());
+            match tokio::task::spawn_blocking(move || {
+                store.release_evicted_replica(&row_id, &row_hash)
+            })
+            .await
+            {
+                Ok(Ok(true)) => {
+                    if let Err(e) = self.untag_blob(hash).await {
+                        warn!(%hash, "evicted replica not untagged: {e:#}");
+                    } else {
+                        bump(&self.durability.stats.handed_off);
+                        info!(%hash, %id, "replica released: outside the 2k closest, k holders proven");
+                    }
+                }
+                Ok(Ok(false)) => {}
+                Ok(Err(e)) => warn!(%hash, "evicted replica not released: {e:#}"),
+                Err(_) => {}
+            }
+        }
+        done
+    }
+
+    /// Prove `need` holders of blob `hash` among the closest members of
+    /// `net`, without asking them to take it: proofs only, at most
+    /// [`HANDOFF_TRIES`] peers.
+    async fn prove_others(&self, hash: &Hash, size: u64, net: &str, need: usize) -> usize {
+        let peers = self.members(net);
+        let gap = self.config.durability.miss_gap;
+        // Where it probably is: the providers this node heard of (who
+        // pushed it here), then the closest members.
+        let mut order: Vec<EndpointId> = self
+            .providers_for_hash(&hash.to_hex())
+            .into_iter()
+            .filter(|p| peers.contains(p))
+            .collect();
+        for p in proto::closest(hash.as_bytes(), &peers, peers.len()) {
+            if !order.contains(&p) {
+                order.push(p);
+            }
+        }
+        order.truncate(HANDOFF_TRIES);
+        let mut proven = 0usize;
+        for peer in order {
+            if proven >= need {
+                break;
+            }
+            if self.durability.skip_dial(&peer, gap) {
+                continue;
+            }
+            if self.prove_holder(peer, *hash, size).await {
+                proven = proven.saturating_add(1);
+            }
+        }
+        proven
     }
 
     /// Check one blob (see the module doc), and schedule its next check.
@@ -963,13 +1173,15 @@ impl Node {
             if holders.len() >= need || asked >= need.saturating_add(EXTRA_TRIES) {
                 break;
             }
-            if refused.contains(&peer)
+            if refused
+                .get(&peer)
+                .is_some_and(|at| at.elapsed() < REFUSED_FOR)
                 || self.durability.gone(&peer, gap)
                 || declined.get(&peer).is_some_and(|m| m.for_good(gap))
             {
                 continue;
             }
-            if self.durability.skip_dial(&peer) {
+            if self.durability.skip_dial(&peer, gap) {
                 // Failed lately: a miss, not yet a replacement.
                 if self.durability.gone(&peer, gap) {
                     continue;
@@ -978,7 +1190,7 @@ impl Node {
                 break;
             }
             // A retraction or an erasure may have landed meanwhile.
-            if !self.still_full(&event.id) {
+            if !self.still_full(&event.id).await {
                 self.reschedule(hash, true, Vec::new());
                 return Outcome::Checked;
             }
@@ -998,7 +1210,7 @@ impl Node {
                 Answer::Declined => {
                     let for_good = declined.get(&peer).is_some_and(|m| {
                         let mut m = *m;
-                        m.again();
+                        m.again(gap);
                         m.for_good(gap)
                     });
                     new_declines.push(peer);
@@ -1023,13 +1235,22 @@ impl Node {
             let check = checks
                 .entry(hash)
                 .or_insert_with(|| Check::new(Instant::now()));
-            check.refused.extend(new_refused);
+            let now = Instant::now();
+            check.refused.retain(|_, at| at.elapsed() < REFUSED_FOR);
+            for peer in new_refused {
+                check.refused.insert(peer, now);
+            }
             for peer in new_declines {
                 check
                     .declined
                     .entry(peer)
-                    .and_modify(Misses::again)
+                    .and_modify(|m| m.again(gap))
                     .or_insert_with(Misses::new);
+            }
+            // A proven holder's misses are forgotten (N2).
+            for peer in &holders {
+                check.declined.remove(peer);
+                check.refused.remove(peer);
             }
             if check.refused.len() > 64 {
                 check.refused.clear();
@@ -1135,11 +1356,12 @@ impl Node {
         }
         order.truncate(HANDOFF_TRIES);
         let mut proven = 0usize;
+        let gap = self.config.durability.miss_gap;
         for peer in order {
             if proven >= need {
                 break;
             }
-            if self.durability.skip_dial(&peer) {
+            if self.durability.skip_dial(&peer, gap) {
                 continue;
             }
             if self.confirm(peer, event, blob).await == Answer::Holds {
@@ -1160,6 +1382,19 @@ impl Node {
         let owned = id.to_string();
         let freed = tokio::task::spawn_blocking(move || store.blobs_freed_by(&owned)).await??;
         let mut plan = EvictionPlan::default();
+        // Every replica blob of the post is recorded, freed or not (N8):
+        // when the other events that list it go too, the record keeps it.
+        for blob in event.blobs.iter().filter(|b| b.url.is_none()) {
+            if freed.contains(&blob.hash) {
+                continue;
+            }
+            if let Ok(hash) = blob.hash.parse::<Hash>()
+                && self.has_replica_intent(&hash).await
+                && !plan.kept.contains(&blob.hash)
+            {
+                plan.kept.push(blob.hash.clone());
+            }
+        }
         for hex in freed {
             let Some(blob) = event
                 .blobs
@@ -1267,15 +1502,16 @@ mod tests {
     fn a_peer_is_gone_after_two_misses_far_enough_apart() {
         let state = State::default();
         let peer = id(7);
-        assert!(!state.skip_dial(&peer));
-        state.mark_unreachable(peer);
-        assert!(state.skip_dial(&peer), "not dialed again at once");
-        assert!(!state.gone(&peer, Duration::from_secs(3600)), "one miss");
+        assert!(!state.skip_dial(&peer, Duration::from_secs(3600)));
+        let gap = Duration::from_secs(3600);
+        state.mark_unreachable(peer, gap);
+        assert!(state.skip_dial(&peer, gap), "not dialed again at once");
+        assert!(!state.gone(&peer, gap), "one miss");
         assert!(state.gone(&peer, Duration::ZERO));
-        state.mark_unreachable(peer);
+        state.mark_unreachable(peer, gap);
         assert_eq!(state.unreachable.lock().unwrap()[&peer].failures, 2);
         state.peer_seen(peer);
-        assert!(!state.skip_dial(&peer) && !state.gone(&peer, Duration::ZERO));
+        assert!(!state.skip_dial(&peer, gap) && !state.gone(&peer, Duration::ZERO));
     }
 
     #[test]
@@ -1284,5 +1520,13 @@ mod tests {
         assert!(!misses.for_good(Duration::from_secs(1)));
         misses.last = misses.first.checked_add(Duration::from_secs(2)).unwrap();
         assert!(misses.for_good(Duration::from_secs(1)));
+        // A miss long after the last one starts a new sequence.
+        let mut misses = Misses::new();
+        std::thread::sleep(Duration::from_millis(20));
+        misses.again(Duration::from_millis(1));
+        assert!(
+            !misses.for_good(Duration::from_millis(1)),
+            "6 gaps later: anew"
+        );
     }
 }

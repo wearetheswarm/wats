@@ -86,8 +86,11 @@ machine, and supply-chain attacks on dependencies beyond pinning and
   hour apart, is replaced, which costs one push to the next peer. A
   peer's claim to hold a blob counts only after a possession proof: this
   node fetches from it alone a random chunk and the last one, BAO-verified,
-  while refusing that peer's own requests for the blob, so it cannot
-  relay this node's copy. The receiving side keeps its limits (rate
+  and meanwhile refuses that blob to every requester, unknown connections
+  included: neither the peer nor a second identity of it can fetch the
+  chunks from this node and relay them. Readers of that blob from this
+  node are refused for those seconds and try another provider or again.
+  The receiving side keeps its limits (rate
   limit, 4 fetches and a queue of 16 per peer, `storage.max`); a peer can
   make it a replica only of blobs it is among the 6 closest to, and
   replicas take at most 60 % of the blob part of `storage.max`.
@@ -343,7 +346,7 @@ Every channel carries a little stranger-written text, marked as data:
 - **Possession proofs are snapshots, and may be relayed** (ADR 0029).
   A peer proves it holds a blob at one moment, and may delete it right
   after; it may also fetch the chunks asked for from a third holder
-  (only this node's own copy is refused to it meanwhile). Peers placed
+  (this node's own copy is refused to everyone meanwhile). Peers placed
   close to a hash (endpoint ids are free) can so make an eviction release
   a copy while fewer real copies exist than counted. Eviction needs two
   proven holders when k > 1, and erasure, retractions and `wats drop`

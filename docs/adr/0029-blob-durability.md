@@ -144,23 +144,34 @@ one knowledge prefers when several do, else the oldest, S9):
    post is checked again: a retraction or erasure ends the check.
 3. **Moving on, or not** (S2). Each answer is one of:
    - **proven holder**: counted;
-   - **refusal for good** (`Refused` for full, quota, replica share,
-     body dropped there, not a member): this peer is skipped for this
-     blob from now on, and the next peer is asked;
+   - **refusal for good** (`Refused` saying "not taking replicas": full,
+     quota, replica share): this peer is skipped for this blob for 6 hours
+     (space may be freed), and the next peer is asked;
    - **bare decline** (`Replicated` without the hash, no reason: a
-     0.4.2 peer full, over quota or out of fetch slots; or a failed
+     0.4.2 peer full, over quota or out of fetch slots; any other
+     `Refused`, such as an event the peer did not accept; or a failed
      possession proof, see §4), **unreachable**
      (no connection within 5 s), **busy** (no push slot within 60 s,
      rate limited, a challenge, a timeout), or this pass's **16 requests
      to that peer** spent: the check **ends here, "not checked"**, and
      comes back within 10 minutes. A peer that declined or was unreachable
-     twice, the two misses at least an hour apart (`miss_gap`), is then
-     replaced by the next peer. So a slow or busy peer never makes repair
-     push a copy to a farther one; the probe of the review that left a
-     copy outside the 3 closest is a test now.
+     twice, the two misses at least an hour apart (`miss_gap`) and within
+     6 hours of each other (two transient failures days apart are not
+     "missing twice"), is then replaced by the next peer. A proven holder's
+     misses and refusals are forgotten. So a slow or busy peer never makes
+     repair push a copy to a farther one; the probe of the review that
+     left a copy outside the 3 closest is a test now.
 4. An unreachable peer is not dialed again for 10 min, doubling to 24 h,
-   until it contacts this node again (any request, any gossip message).
-5. Complete: checked again after `recheck` (6 h, ±50 %). Short (every
+   until it contacts this node again (any request, any gossip message)
+   or answers any request of this node.
+5. **Replicas kept through an eviction** (N4): the pass also looks, within
+   its budget, at the rows of `evicted_replicas` that are due (each at a
+   random time within `recheck`, then every `recheck`). One is released
+   once this node is no longer among the 2k closest of its view of the
+   post's network and k other holders are proven: possession proofs only,
+   the providers this node heard of first, then the closest members, at
+   most 6. It is never pushed: its post is a tombstone here.
+6. Complete: checked again after `recheck` (6 h, ±50 %). Short (every
    peer refused for good): after `retry` (10 min), doubling up to
    `recheck`, logged at INFO ("blob short of replicas"). A check that adds
    a proven holder to a blob that had holders before logs "replica
@@ -263,10 +274,15 @@ pressure (`Node::drop_body(.., Evicted, ..)`, rotation), for each blob the
 eviction would free (listed by no other kept event) that it holds whole:
 
 - **A replica** (record) **stays**: the body goes, the blob is kept, and
-  the post is recorded (`evicted_replicas`) so that a later retraction,
-  erasure, label or `wats drop` of it releases the blob (B1). It is
-  released by an eviction only once this node is no longer among the 2k
-  closest of its view **and** k other holders are proven (S4).
+  the post is recorded (`evicted_replicas`, written in the drop's own
+  transaction, for every replica blob of the post, freed now or not, N8)
+  so that a later retraction, erasure, label or `wats drop` of it releases
+  the blob (B1), unless a kept event lists it or another post's eviction
+  record holds it. It is released by an eviction only once this node is
+  no longer among the 2k closest of its view **and** k other holders are
+  proven (S4), and later by repair the same way (§2, N4). A body taken
+  back (an evicted body comes back by sync until #182) clears the record:
+  the blob is listed again, and its replica tag keeps it watched.
 - **Any other copy** (a read cache, an own post's file) needs **other
   holders proven: two when k > 1**, one otherwise. Peers are asked with
   `replicate`, the closest to the blob in the post's network first (those
@@ -287,11 +303,13 @@ with the hash, this node fetches from that peer alone, through the
 the last chunk of the blob, into memory, each verified against the hash
 (BAO): about 2 KiB, and the last chunk proves the size.
 
-- While the proof runs, this node **refuses that peer's blob requests
-  for that hash**: the blobs protocol runs with an event handler that
-  intercepts `get` and `get_many` (`RequestMode::Intercept`) and notes
-  which connection is which peer. The peer cannot answer by fetching the
-  chunks from this node's own copy.
+- While any proof of a blob runs, this node **refuses that blob to every
+  requester**, unknown connections included (N1): the blobs protocol runs
+  with an event handler that intercepts `get` and `get_many`
+  (`RequestMode::Intercept`). Neither the peer nor a second identity of
+  it can fetch the chunks from this node's own copy and relay them.
+  Proofs are rare and last seconds; a refused reader tries another
+  provider, or again later.
 - It can still fetch them from a third holder: then a copy exists there,
   which is what a release needs, but it may be counted twice. And a proof
   is a snapshot: a peer may delete right after. Both stay open (see
@@ -361,7 +379,9 @@ respects, as before.
   One row per (blob hash, kept full event listing it, by `blobs[].hash`,
   URL or not); tombstones and opaque events have none. Filled on insert,
   emptied when a body is dropped or a row deleted, backfilled at open in
-  transactions of 5,000 events from `event_blobs_filled.upto`. No schema
+  transactions of 5,000 events from `event_blobs_filled.upto`, which each
+  insert advances in its own transaction when it is the next `seq` (N7):
+  a restart re-scans only what an older release inserted. No schema
   bump: 0.4.2 still opens the store, and what it inserts meanwhile is
   filled at the next open. Every lookup by hash (`blob_referenced`,
   `blobs_freed_by`, `events_listing_blob`, `blob_listings`) uses it; the
@@ -442,6 +462,20 @@ must send the same fields, which they do.
 - `an_older_peer_takes_a_lost_replica`: a peer answering `replicate` as
   0.4.2 does takes a lost replica, records nothing, proves it later; it
   runs no pass.
+- `a_proof_refuses_the_blob_to_every_requester` (N1): during a proof,
+  the blob is refused to the peer under proof and to another identity;
+  served again after.
+- `mutual_proofs_converge`: two holders proving each other at the same
+  moment keep converging; nobody is excluded.
+- `a_held_erasure_releases_an_evicted_replica_at_start`: a label held
+  before its labeler was subscribed is applied at the next start, turns
+  the `evicted` record into `erasure` and releases the replica.
+- `wats_drop_releases_an_evicted_replica`: through the socket, at once,
+  nothing handed to anyone.
+- `an_evicted_replica_is_released_once_others_are_closer` (N4): once
+  closer nodes joined and one of them proves it holds the blob, repair
+  releases the replica kept through an eviction; its post stays a
+  tombstone.
 - Store: `event_blobs_follow_inserts_drops_and_older_releases`,
   `a_replica_kept_through_eviction_is_freed_by_a_later_drop`. Proofs:
   chunk choice and coverage.
@@ -470,11 +504,35 @@ The coordinator's decisions on the review of PR #183, folded in above:
   members of the post's network; a holder is replaced only after two
   misses an hour apart.
 
+## Decisions on the verification review (2026-10-21)
+
+Fixed: N1 (the guard refuses a blob under proof to everyone), N2 (misses
+forgotten on a proven hold and after 6 quiet gaps, refusals for good
+forgotten after 6 hours, a peer reachable again after any answer), N3
+(the fast path records a replica only under the 60 % share), N4
+(repair looks at the replicas kept through an eviction), N6 (the pass's
+store reads and `still_full` off the async runtime), N7 (the backfill mark
+advanced by each insert), N8 (every replica blob of an evicted post
+recorded, in the drop's transaction; a recording error never skips the
+untagging), N9 (the replica bytes counted at start, before `replicate`
+is served, and kept on every tag and untag), N13 (a blob is untagged only
+when no kept event lists it and no eviction record holds it, in
+`serve_replicate` and in every drop), and S2's nit (an event the peer did
+not accept is a decline, not a refusal for good).
+
 ## Open questions
 
-- **Proofs are snapshots, and may be relayed** from a third holder (§4).
-  Repeated proofs at each check limit the first; the second would need
-  the peer to sign what it serves, a wire change.
+Accepted on the verification review, as they are:
+
+- **N10, relaying from our own copy**: moot since N1.
+- **N11, a proof is a snapshot.** Two chunks prove the peer held the blob
+  at one moment; it may delete right after. Repeated proofs at each check
+  limit it. A third holder may also serve the chunks to a peer that does
+  not hold the blob (§4); closing that would need the peer to sign what
+  it serves, a wire change.
+
+Also open:
+
 - **Excess replicas** are never removed but by eviction outside 2k.
   Measuring them first.
 - **Pass size, recheck and `miss_gap`** are guesses, to be measured on
