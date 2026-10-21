@@ -39,6 +39,7 @@ use tracing::{debug, info, warn};
 pub mod durability;
 pub mod history;
 pub mod proof;
+pub mod rotation;
 
 use crate::bootstrap::BootstrapEntry;
 use crate::event::{BlobRef, Draft, Event, Kind, is_safe_blob_name};
@@ -512,6 +513,16 @@ pub fn dir_size(dir: &Path) -> u64 {
         .sum()
 }
 
+/// ADR 0012's measure of a data directory with no node running on it:
+/// [`dir_size`] less the free pages of its event store, which the file
+/// keeps but reuses (ADR 0025 §7).
+pub fn data_usage(dir: &Path) -> u64 {
+    let free = Store::open_read_only_with(&dir.join("events.sqlite"), Duration::from_millis(200))
+        .map(|store| store.free_bytes())
+        .unwrap_or(0);
+    dir_size(dir).saturating_sub(free)
+}
+
 /// How an event reached this node, for the proof-of-work policy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Origin {
@@ -520,6 +531,9 @@ enum Origin {
     Pushed,
     /// A sync page this node asked for: history, at the schedule only.
     Pulled,
+    /// A `get` on demand, for a `read` (ADR 0025 §6): history, as pulled,
+    /// and the only way an evicted body comes back (ADR 0020 decision 4).
+    Fetched,
 }
 
 /// Largest canonical size of an event of a version this node does not
@@ -583,6 +597,10 @@ fn revalidate_opaque(store: &Store) -> Result<()> {
 pub const MAX_PROVIDERS_PER_ENVELOPE: usize = 8;
 /// Providers tried, one after the other, for one blob fetch (B7).
 const MAX_PROVIDER_ATTEMPTS: usize = 4;
+/// A fetch on read tries its providers this many times, the next after
+/// this pause, then twice it.
+const READ_FETCH_TRIES: u32 = 3;
+const READ_FETCH_PAUSE: Duration = Duration::from_millis(500);
 /// A provider whose fetch failed is skipped for this long, doubling with
 /// each further failure up to [`PROVIDER_BACKOFF_MAX`] (B7).
 const PROVIDER_BACKOFF: Duration = Duration::from_secs(30);
@@ -1297,6 +1315,8 @@ pub struct Node {
     seed_ids: Vec<EndpointId>,
     /// The history tasks (ADR 0025).
     history: history::History,
+    /// Rotation at the cap (ADR 0025 §7).
+    rotation: rotation::Rotation,
     /// Replica repair and last-copy protection (ADR 0029).
     durability: durability::State,
     /// Possession proofs: the blob requests refused meanwhile (ADR 0029).
@@ -1726,10 +1746,30 @@ impl Node {
             network_changed: Default::default(),
             redialing: Default::default(),
             history: Default::default(),
+            rotation: Default::default(),
             durability: Default::default(),
             proof_guard,
         });
         node.measure_storage().await;
+        if node.events_share().is_some() {
+            // Rotation at the cap (ADR 0025 §7): checked at start, then
+            // every 30 s, in the background.
+            let weak = Arc::downgrade(&node);
+            let every = node.config.history.rotation_check;
+            tokio::spawn(supervise("rotation", move || {
+                let weak = weak.clone();
+                async move {
+                    loop {
+                        let Some(node) = weak.upgrade() else { break };
+                        if let Err(e) = node.rotate_if_full().await {
+                            warn!("rotation: {e:#}");
+                        }
+                        drop(node);
+                        tokio::time::sleep(every).await;
+                    }
+                }
+            }));
+        }
         if node.config.storage_max.is_some() {
             let weak = Arc::downgrade(&node);
             tokio::spawn(supervise("storage measure", move || {
@@ -1834,6 +1874,20 @@ impl Node {
             warn!("replica bytes not counted: {e:#}");
         }
         protocol.set_node(&node);
+        {
+            // This node's profiles, recorded so that rotation keeps their
+            // posts across restarts (ADR 0025 §7). Off the start: peers
+            // already talk to the node.
+            let node = Arc::clone(&node);
+            tokio::task::spawn_blocking(move || {
+                for author in node.local_authors() {
+                    let profile = node.local_profile(&author).unwrap_or_default();
+                    if let Err(e) = node.store.note_local_key(&author, &profile, now_secs()) {
+                        warn!("profile key not recorded: {e:#}");
+                    }
+                }
+            });
+        }
         // History in the background, one task per network (ADR 0025 §4):
         // nothing here waits for it.
         if let Some((max, share)) = node.initial_max_clamped() {
@@ -2406,8 +2460,14 @@ impl Node {
             bail!("profile name must be 1-64 chars of [a-z0-9_-]");
         }
         let key = self.root.profile_key(profile);
-        if let Ok(mut local) = self.local_authors.lock() {
-            local.insert(crate::identity::author_id(&key), profile.to_string());
+        let author = crate::identity::author_id(&key);
+        let new = self
+            .local_authors
+            .lock()
+            .is_ok_and(|mut local| local.insert(author.clone(), profile.to_string()).is_none());
+        // Rotation keeps this profile's posts, across restarts (ADR 0025 §7).
+        if new && let Err(e) = self.store.note_local_key(&author, profile, now_secs()) {
+            warn!(profile, "profile key not recorded: {e:#}");
         }
         Ok(key)
     }
@@ -3296,9 +3356,12 @@ impl Node {
 
     async fn measure_storage(&self) {
         let dir = self.config.data_dir.clone();
+        // The store's free pages are free space (ADR 0025 §7): the file
+        // does not shrink, its freed pages are reused.
         let bytes = tokio::task::spawn_blocking(move || dir_size(&dir))
             .await
-            .unwrap_or(0);
+            .unwrap_or(0)
+            .saturating_sub(self.store.free_bytes());
         self.storage_bytes
             .store(bytes, std::sync::atomic::Ordering::Relaxed);
         crate::crash::note_counts(
@@ -3590,8 +3653,27 @@ impl Node {
         }
         let hash: Hash = blob.hash.parse()?;
         if !self.blobs.has(hash).await? || self.blob_unreadable(hash).await {
-            let providers = self.providers_for(blob);
-            if providers.is_empty() || !self.fetch_blob(blob, providers).await {
+            // A read waits for its file: a provider that failed once (a
+            // connection reset, a proof in progress that refuses the blob
+            // meanwhile, ADR 0029) is asked again, after a pause, instead of
+            // giving up on the first miss. The retries do not skip the
+            // providers this read marked as failing.
+            let mut fetched = false;
+            for attempt in 0..READ_FETCH_TRIES {
+                if attempt > 0 {
+                    tokio::time::sleep(READ_FETCH_PAUSE.saturating_mul(attempt)).await;
+                }
+                let providers = self.providers_for(blob);
+                if providers.is_empty() {
+                    break;
+                }
+                if self.fetch_blob_from(blob, providers, attempt > 0).await {
+                    fetched = true;
+                    break;
+                }
+                debug!(hash = %blob.hash, attempt, "blob not fetched on read yet");
+            }
+            if !fetched {
                 return Ok(None);
             }
         }
@@ -4017,7 +4099,9 @@ impl Node {
             self.log_storage("refusing events from others too");
             bail!("storage full");
         }
-        if matches!(event, AnyEvent::Opaque(_))
+        // Tombstones of understood versions are not opaque content: they
+        // stay out of the quota (ADR 0025 §7).
+        if matches!(&event, AnyEvent::Opaque(r) if crate::store::counts_as_opaque(r))
             && let Some(quota) = self.opaque_quota()
             && self.store.opaque_bytes().saturating_add(size as u64) > quota
             && self.store.get_raw(event.id())?.is_none()
@@ -4026,7 +4110,10 @@ impl Node {
             bail!("opaque event quota reached");
         }
         let inserted = match &event {
-            AnyEvent::Known(e) => self.store.insert(e, now_secs())?,
+            AnyEvent::Known(e) => {
+                self.store
+                    .insert_with(e, now_secs(), origin == Origin::Fetched)?
+            }
             AnyEvent::Opaque(r) => {
                 debug!(id = %r.id, v = r.v, "storing opaque event");
                 self.store.insert_raw(r, now_secs())?
@@ -4733,6 +4820,17 @@ impl Node {
     /// content match the hash; the content itself stays untrusted data and
     /// is never executed (SPEC §2.15).
     async fn fetch_blob(&self, blob: &BlobRef, providers: Vec<EndpointId>) -> bool {
+        self.fetch_blob_from(blob, providers, false).await
+    }
+
+    /// [`Node::fetch_blob`]; with `again`, the providers backing off are
+    /// asked too (a read retrying the provider its first try marked).
+    async fn fetch_blob_from(
+        &self,
+        blob: &BlobRef,
+        providers: Vec<EndpointId>,
+        again: bool,
+    ) -> bool {
         let Ok(hash) = blob.hash.parse::<Hash>() else {
             return false;
         };
@@ -4753,7 +4851,7 @@ impl Node {
         // B7: one provider at a time, skipping those that failed lately.
         let candidates: Vec<EndpointId> = providers
             .into_iter()
-            .filter(|p| !self.provider_backing_off(p))
+            .filter(|p| again || !self.provider_backing_off(p))
             .take(MAX_PROVIDER_ATTEMPTS)
             .collect();
         if candidates.is_empty() {

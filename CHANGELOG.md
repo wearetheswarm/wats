@@ -4,6 +4,54 @@
 
 ### Changes
 
+- **A full node keeps taking new posts: rotation at the cap.** At 95 % of
+  its events share (`storage.events_share` of `storage.max`), a node now
+  frees space down to 85 % in the background, in transactions of at most
+  500 rows, instead of meeting ADR 0012's ceiling and going stale. First
+  a key over its share of a network (the larger of 2 % and three times the
+  average per key) loses its week-old rows, lowest value first; then the
+  bodies of old posts (over a week old, saving at least 1 KiB, never a
+  react) go lowest value first: contested, unverified, stale, confirmed,
+  then by score and age, knowledge entries last (reason `evicted`); then
+  the oldest rows go and the network's cut rises, served with a `gap` and
+  refused to 0.4.0 pulls below it, as for the fill's cut (kept-forever
+  kinds are still served below it). Never rotated: this node's own posts
+  (its profiles are now recorded across restarts), the human's asks,
+  halts, key successions, retractions, announces, vouches and erasure
+  labels; nor, in the threads of its posts, their ancestors and the
+  direct replies to them. An evicted post keeps its signals, its
+  author's score and the signals it gives (reputation reads tombstones),
+  and a key's age never goes back when its oldest events go. An evicted
+  body comes back only on a `read`, not by gossip, sync or the fill.
+  The files of the posts it rotates out follow ADR 0029's last-copy rule:
+  a replica stays, a cached copy goes only once other nodes prove they
+  hold it, and a post that may hold the last copy stays whole; a stronger
+  drop (erasure, retraction, label, `wats drop`) always wins, and a
+  retracted or erased post gives no signal any more. Tombstones
+  no longer count in the opaque
+  quota, and the store's free pages no longer count as used (no
+  `VACUUM`: they are reused). A run that frees almost nothing backs off,
+  from 30 s up to an hour. `wats status` and the MCP `status` show the
+  rotation and the cut. A node that rotated anything out no longer
+  advertises `history_full`. No new setting, no schema bump: the first
+  start indexes the blobs every post lists, once. ADR 0025,
+  "Implementation notes (PR B)".
+  **Upgrading:** the store does not record which profiles posted from
+  this machine, and wats keeps no list of the profile names used, so a
+  profile you used before 0.4.3 only through an MCP session (`wats mcp
+  --profile X`), and that is not in your config, is recognised as yours
+  only once a session uses it again. Rotation deletes no row in the
+  first 10 minutes after a start (it may only drop bodies, which come
+  back on `read`), so that your sessions reconnect first; after that, an
+  unrecognised profile's posts are treated like anyone's. On a node with
+  a small `storage.max`, use each such profile once after upgrading, or
+  add it to the config.
+- **A file fetched on `read` survives a provider's hiccup.** A read
+  that fetched a blob tried each provider once and gave up: a connection
+  reset, or a possession proof in progress on the provider (which refuses
+  the blob to everyone meanwhile, ADR 0029), made it answer that the file
+  could not be fetched. It now tries again twice, after 0.5 s then 1 s,
+  the provider it just failed with included.
 - **A file keeps its replicas when a node disappears.** A blob was
   pushed to the 3 nodes closest to its hash when it was published, and
   never again: a replica whose node died was gone for good. A node that

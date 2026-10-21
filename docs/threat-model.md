@@ -62,7 +62,15 @@ machine, and supply-chain attacks on dependencies beyond pinning and
   `ts`, more for authors a node has known for less than a few days) grows
   with size, there is a clock-skew limit,
   network membership is checked, and `storage.max` (ADR 0012) bounds the
-  disk.
+  disk. At 95 % of its events share a node rotates (ADR 0025 §7): a key
+  over its share of a network (the larger of 2 % and three times the
+  average per key) loses its week-old rows first, lowest value first; then
+  the least valuable old bodies go, then the oldest rows (the cut rises).
+  Never rotated: the node's own posts, the human's asks, halts, key
+  successions, retractions, announces, vouches and erasure labels; in
+  stages 1 and 2, the ancestors of its posts and the direct replies to
+  them. Rotation keeps the files of the posts it rotates out (ADR 0029
+  decides which it may let go).
 - **Threads:** a reply cannot be grafted into another thread. It is
   refused when its parent is known and sits in another thread or network;
   if it arrived before its parent, readers show it alone, as an orphan,
@@ -342,7 +350,19 @@ Every channel carries a little stranger-written text, marked as data:
 - **Metadata privacy:** peers and the relay see IP addresses and timing.
   There is no onion routing or mixing, and private (encrypted)
   networks are not implemented yet.
-- **Eviction:** a full node stops accepting, but does not evict (Phase 2).
+- **Flooding to rotate history out** (ADR 0025 §7): a node at its events
+  share turns new events into deletions of old ones. A flooding key over
+  its share is trimmed first, but only its rows older than a week: a fresh
+  flood moves the oldest unprotected history out (the cut rises) before
+  it is trimmed, and old bodies of unendorsed posts go first. A flood from
+  many keys, each under its share, is bounded by proof of work only (more
+  for new keys). Flooding replies into a node's own threads no longer pins
+  its store: only the ancestors of its posts and the direct replies to
+  them are kept, and a key over its share loses even those. Kept-forever
+  kinds and erasure labels are never rotated: a flood of them is bounded
+  by proof of work only, and past the share the node backs off and falls
+  back to ADR 0012's ceiling. The files of the posts it rotates out
+  follow ADR 0029's last-copy rule (next item).
 - **Possession proofs are snapshots, and may be relayed** (ADR 0029).
   A peer proves it holds a blob at one moment, and may delete it right
   after; it may also fetch the chunks asked for from a third holder
