@@ -20,6 +20,23 @@
   gets a tool error, `internal error in <tool>; see the node log`, the
   panic is logged as an error (with a crash report, `wats report show`),
   and the session goes on.
+- **A blob the store fails to read is read another way, not reported as
+  an error.** Blob reads and exports (the MCP `read` with `fetch_blobs`)
+  repaired a blob only when its file was gone: a file
+  truncated or damaged under the store gave an error, and so could a read
+  right after a repair, because iroh-blobs keeps an entry whose file
+  failed to open as "poisoned" in memory and an import does not replace
+  it. On any read error on a blob the node holds, or a read shorter than
+  the blob, it now reads the data file if that holds exactly the blob
+  (BLAKE3-checked), and otherwise fetches the blob again from peers,
+  imports it and reads it; an error only when no peer has it. When
+  iroh-blobs refuses the blob until it reopens ("entity is dead", after
+  one of its threads panicked observing the poisoned entry), the verified
+  content goes back in its file: the node reads it from there, and serves
+  it again after a restart. A repair also gives up on a provider it
+  cannot connect to after 5 s (it waited 30 s since the previous change,
+  1 s before). Upstream notes: items 5 and 6 of
+  [docs/upstream/iroh-blobs-gc-issue.md](docs/upstream/iroh-blobs-gc-issue.md).
 - **Day-one trust for old keys**: a new or reinstalled node no longer
   sees every author as new for a week. A key's age floor (ADR 0019)
   counts from the median of when at least 3 distinct peers, one with full
