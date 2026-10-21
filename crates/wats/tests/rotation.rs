@@ -3,7 +3,7 @@
 //! them and the kept-forever kinds intact; keys over their share go first,
 //! a small team's do not; the cut it raises is served honestly, kept-forever
 //! kinds below it too; a restart halfway is safe; an evicted body comes back
-//! on `read` only; files are never lost by side effect; a run that frees
+//! on `read` only; files follow ADR 0029's last-copy rule; a run that frees
 //! nothing backs off. Hermetic: in-process nodes on loopback.
 
 use std::collections::HashSet;
@@ -674,36 +674,55 @@ async fn a_restart_in_the_middle_of_a_rotation_is_safe() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Rotation never loses a file by side effect: when it rotates out the
-/// post that lists a blob, the node keeps the blob, whether it holds it as
-/// a replica (pushed by `replicate`) or only cached it on a read. Until ADR
-/// 0029's replica record (PR #183) tells the two apart, both are kept, and
-/// logged as `undecided`.
+/// Rotation never loses a file by side effect (ADR 0029's last-copy rule):
+/// when it rotates out the post that lists a blob,
+/// - a node that holds it as a replica (pushed by `replicate`) keeps it,
+///   with a record of the replica, and the post stays as a tombstone;
+/// - a node that only cached it, not responsible for it, frees it once
+///   another node proves it holds it, and the row goes;
+/// - a node that may hold the last copy (no other holder reachable) keeps
+///   the post in full and its file.
 #[tokio::test(flavor = "multi_thread")]
-async fn rotation_keeps_the_files_of_the_posts_it_rotates_out() -> anyhow::Result<()> {
+async fn rotation_evicts_files_by_the_last_copy_rule() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
+    let no_repair = || wats::node::durability::Tuning {
+        repair: false,
+        ..Default::default()
+    };
     let mut a_config = config(&dir.path().join("a"), &[]);
     a_config.replication = 1;
+    a_config.durability = no_repair();
     let a = Node::start(a_config).await?;
-    let holder = |name: &str, peers: &[&Arc<Node>]| -> anyhow::Result<NodeConfig> {
+    let holder = |name: &str, k: usize| -> anyhow::Result<NodeConfig> {
         let node_dir = dir.path().join(name);
         in_sync(&node_dir)?;
-        let mut c = config(&node_dir, peers);
-        c.replication = 1;
+        let mut c = config(&node_dir, &[&a]);
+        c.replication = k;
         c.storage_max = Some(64 * MIB);
         c.events_share = 4;
+        c.durability = no_repair();
         Ok(c)
     };
-    let b = Node::start(holder("b", &[&a])?).await?;
-    let c = Node::start(holder("c", &[&a, &b])?).await?;
+    let b = Node::start(holder("b", 3)?).await?;
+    let c = Node::start(holder("c", 1)?).await?;
+    let d = Node::start(holder("d", 1)?).await?;
+    let all = [&a, &b, &c, &d];
+    for x in all {
+        for y in all {
+            if x.endpoint_id() != y.endpoint_id() {
+                x.add_peer(y.endpoint().addr()).await?;
+                within("a hello", x.hello(y.endpoint_id())).await?;
+            }
+        }
+    }
     eventually("everyone knows everyone", 30, || {
-        (a.known_peers().len() == 2 && !b.known_peers().is_empty() && c.known_peers().len() == 2)
-            .then_some(())
+        all.iter().all(|n| n.known_peers().len() >= 3).then_some(())
     })
     .await;
-    // A file a asks b to hold (k = 1, b the closer of its two peers).
-    let ids = [b.endpoint_id(), c.endpoint_id()];
-    let content = (0u32..200)
+    // A file whose closest node is b: a (k = 1) asks b to hold it; c and d
+    // (k = 1), which know b, are not responsible for it.
+    let ids: Vec<_> = all.iter().map(|n| n.endpoint_id()).collect();
+    let content = (0u32..400)
         .map(|seed| {
             let mut bytes = vec![7u8; 4_096];
             bytes[..4].copy_from_slice(&seed.to_be_bytes());
@@ -713,7 +732,7 @@ async fn rotation_keeps_the_files_of_the_posts_it_rotates_out() -> anyhow::Resul
             let hash = *iroh_blobs::Hash::new(bytes).as_bytes();
             wats::proto::closest(&hash, &ids, 1) == [b.endpoint_id()]
         })
-        .expect("a file closer to b");
+        .expect("a file closest to b");
     let file = dir.path().join("report.bin");
     std::fs::write(&file, &content)?;
     let event = a
@@ -733,44 +752,76 @@ async fn rotation_keeps_the_files_of_the_posts_it_rotates_out() -> anyhow::Resul
         )
         .await?;
     let blob = event.blobs[0].clone();
-    for node in [&b, &c] {
+    let hash: iroh_blobs::Hash = blob.hash.parse()?;
+    for node in [&b, &c, &d] {
         eventually("the post arrives", 30, || {
             node.store().get(&event.id).unwrap().map(|_| ())
         })
         .await;
     }
-    let mut held = false;
+    let mut replica = false;
     for _ in 0..300 {
-        if b.blob_bytes(&blob.hash).await?.is_some() {
-            held = true;
+        if b.has_replica_intent(&hash).await {
+            replica = true;
             break;
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
-    assert!(held, "b holds the replica");
-    assert!(
-        c.fetch_and_export(&blob).await?.is_some(),
-        "c caches it on a read"
-    );
-    for node in [&b, &c] {
-        assert!(node.blob_pinned(&blob.hash).await?);
-        fill(node, event.ts + 1);
-        let run = node.rotate_if_full().await?.expect("a rotation");
-        assert!(run.rows > 0, "{run:?}");
+    assert!(replica, "b holds a replica");
+    for node in [&c, &d] {
         assert!(
-            node.store().get_raw(&event.id)?.is_none(),
-            "the oldest post went"
+            within("a read", node.fetch_and_export(&blob))
+                .await?
+                .is_some(),
+            "cached on a read"
         );
-        assert!(node.store().unpin_pending()?.is_empty());
-        assert!(node.blob_pinned(&blob.hash).await?, "the file stays");
-        assert_eq!(
-            node.store().retained_blobs()?,
-            [(blob.hash.clone(), "undecided".to_string())]
-        );
+        assert!(!node.has_replica_intent(&hash).await);
     }
-    for node in [b, c, a] {
-        node.shutdown().await?;
+
+    // The replica stays, with its record; the post stays as a tombstone.
+    fill(&b, event.ts + 1);
+    let run = within("b rotates", b.rotate_if_full())
+        .await?
+        .expect("a run");
+    assert!(run.rows > 0, "{run:?}");
+    assert!(b.store().get(&event.id)?.is_none(), "evicted");
+    assert!(b.store().get_raw(&event.id)?.is_some(), "a tombstone kept");
+    assert_eq!(
+        b.store().evicted_replicas(&event.id)?,
+        std::slice::from_ref(&blob.hash)
+    );
+    assert!(b.blob_pinned(&blob.hash).await?, "the replica is kept");
+
+    // A cached copy, with a and b proving they hold it: freed, the row goes.
+    fill(&c, event.ts + 1);
+    let run = within("c rotates", c.rotate_if_full())
+        .await?
+        .expect("a run");
+    assert!(run.rows > 0, "{run:?}");
+    assert!(c.store().get_raw(&event.id)?.is_none(), "the row went");
+    assert!(
+        !c.blob_pinned(&blob.hash).await?,
+        "freed for the collection"
+    );
+
+    // Nobody else reachable: maybe the last copy. The post stays in full,
+    // and its file; the cut rises past it, an island.
+    for node in [a, b, c] {
+        within("a shutdown", node.shutdown()).await?;
     }
+    fill(&d, event.ts + 1);
+    let run = within("d rotates", d.rotate_if_full())
+        .await?
+        .expect("a run");
+    assert!(run.rows > 0, "{run:?}");
+    assert!(d.store().get(&event.id)?.is_some(), "kept in full");
+    assert!(d.blob_pinned(&blob.hash).await?, "the file is kept");
+    assert!(
+        d.store()
+            .cut_ts(PUBLIC_NET)?
+            .is_some_and(|cut| cut >= event.ts)
+    );
+    within("a shutdown", d.shutdown()).await?;
     Ok(())
 }
 

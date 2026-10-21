@@ -45,7 +45,7 @@ use tracing::{debug, info, warn};
 use super::{Node, now_secs};
 use crate::event::Event;
 use crate::signals::Grouping;
-use crate::store::{EVICT_MIN_SAVING, Keep, Rotated, RotationLog, RowHead, Store};
+use crate::store::{DropReason, EVICT_MIN_SAVING, Keep, Rotated, RotationLog, RowHead, Store};
 
 /// Rotation starts when the store bytes reach this share of the events
 /// share, and runs until they are back under the next one.
@@ -617,78 +617,115 @@ impl Node {
         Ok(run)
     }
 
-    /// Whether rotation keeps blob `hash` once no kept post lists it, and
-    /// why (ADR 0025 PR B notes, "Blobs"): rotation of events never loses a
-    /// file by side effect. Blob retention follows blob responsibility, own
-    /// posts and pins, not whether a body is held.
-    ///
-    /// The decision belongs to ADR 0029's replica record (PR #183: keep when
-    /// `has_replica_intent`, own, pinned, or `is_responsible(hash,
-    /// blob_target_k(hash))`; route the others through its last-copy rule).
-    /// Until it lands, this node cannot tell a replica from a blob it only
-    /// cached, so it keeps every one: nothing is lost, and a cached blob
-    /// stays until that record decides.
-    fn rotation_keeps_blob(&self, _hash: &str) -> Option<&'static str> {
-        Some(crate::store::RETAIN_UNDECIDED)
+    /// Rotate out the post `id` that lists blobs, through the node's
+    /// eviction (ADR 0029): it keeps a blob it holds as a replica, frees one
+    /// only once other holders are proven, and refuses the eviction when it
+    /// may hold the last copy. Before, this node's estimate of being among
+    /// the k responsible for a blob it holds may add to the replica record,
+    /// never remove from it. Returns whether the body went; a refusal, a
+    /// stronger drop reason or a protection (checked again, strictly only
+    /// with `strictly`) leaves it.
+    async fn evict_through_node(&self, id: &str, keep: &Arc<Keep>, strictly: bool) -> Result<bool> {
+        let (store, keep_for, owned) = (Arc::clone(&self.store), Arc::clone(keep), id.to_string());
+        let (rotatable, event) = blocking(move || {
+            let rotatable = store.rotatable(&owned, &keep_for, strictly)?;
+            Ok((rotatable, store.get(&owned)?.map(|s| s.event)))
+        })
+        .await?;
+        let (true, Some(event)) = (rotatable, event) else {
+            return Ok(false);
+        };
+        for blob in event.blobs.iter().filter(|b| b.url.is_none()) {
+            let Ok(hash) = blob.hash.parse::<iroh_blobs::Hash>() else {
+                continue;
+            };
+            if !self.has_replica_intent(&hash).await && self.holds_blob(blob).await {
+                let k = self.blob_target_k(&blob.hash).await;
+                if self.is_responsible(&blob.hash, k) {
+                    self.record_replica_intent(hash, blob.size).await;
+                }
+            }
+        }
+        match self.drop_body(id, DropReason::Evicted, None, None).await {
+            Ok(outcome) => Ok(outcome.body_dropped),
+            Err(e)
+                if e.downcast_ref::<super::durability::KeptLastCopy>()
+                    .is_some() =>
+            {
+                debug!(%id, "rotation: {e:#}");
+                Ok(false)
+            }
+            Err(e) => Err(e),
+        }
     }
 
-    /// Settle the blobs rotation freed (`unpin_pending`): listed again by a
-    /// kept post, nothing to do; kept ([`Node::rotation_keeps_blob`],
-    /// logged in `blob_retained` in the transaction that settles it, the
-    /// tag stays); otherwise untagged, and forgotten once untagged. Best
-    /// effort: what fails stays pending for the next run. The store work
-    /// runs on blocking threads.
+    /// Before stage 0 or 2 deletes the rows `ids`: evict, through the node,
+    /// those that list blobs ([`Node::evict_through_node`]). A row whose
+    /// eviction is refused stays full, and `delete_rows` leaves it; one
+    /// whose eviction kept replicas stays as a tombstone.
+    async fn evict_listing_blobs(
+        &self,
+        ids: &[String],
+        keep: &Arc<Keep>,
+        strictly: bool,
+    ) -> Result<()> {
+        let (store, owned) = (Arc::clone(&self.store), ids.to_vec());
+        let listing = blocking(move || store.lists_blobs(&owned)).await?;
+        for id in ids.iter().filter(|id| listing.contains(*id)) {
+            self.evict_through_node(id, keep, strictly).await?;
+        }
+        Ok(())
+    }
+
+    /// Why this node keeps a blob left in `unpin_pending` (rotation's
+    /// transactions free none any more: the rows that list blobs go through
+    /// the node's eviction first): a replica, this node responsible for it,
+    /// or no proof that another node holds it. Never freed here: nothing
+    /// proves it is not the last copy.
+    async fn residual_reason(&self, hash: &str) -> &'static str {
+        if let Ok(parsed) = hash.parse::<iroh_blobs::Hash>()
+            && self.has_replica_intent(&parsed).await
+        {
+            return "replica";
+        }
+        if self.is_responsible(hash, self.blob_target_k(hash).await) {
+            return "responsible";
+        }
+        crate::store::RETAIN_UNDECIDED
+    }
+
+    /// Settle the blobs left in `unpin_pending` (by a run of an earlier
+    /// build, or a crash between a transaction and its settling): listed
+    /// again by a kept post, nothing to do; otherwise kept, logged in
+    /// `blob_retained` with [`Node::residual_reason`] in the transaction that
+    /// settles it. The store work runs on blocking threads.
     async fn unpin_rotated(&self) {
         let store = Arc::clone(&self.store);
         let pending = match blocking(move || store.unpin_pending()).await {
             Ok(pending) => pending,
             Err(e) => {
-                warn!("rotation: blobs to untag not read: {e:#}");
+                warn!("rotation: blobs to settle not read: {e:#}");
                 return;
             }
         };
         if pending.is_empty() {
             return;
         }
-        let (mut kept, mut done, mut untag) = (Vec::new(), Vec::new(), Vec::new());
+        let (mut kept, mut done) = (Vec::new(), Vec::new());
         for (hash, listed, reason) in pending {
             if listed {
                 done.push(hash);
             } else if let Some(reason) = reason {
                 kept.push((hash, reason));
-            } else if let Some(reason) = self.rotation_keeps_blob(&hash) {
-                kept.push((hash, reason.to_string()));
             } else {
-                untag.push(hash);
+                let reason = self.residual_reason(&hash).await.to_string();
+                kept.push((hash, reason));
             }
         }
         let store = Arc::clone(&self.store);
         let now = now_secs();
         if let Err(e) = blocking(move || store.settle_unpin(&kept, &done, now)).await {
             warn!("rotation: kept blobs not recorded: {e:#}");
-            return;
-        }
-        let mut untagged = Vec::new();
-        for hash in untag {
-            let Ok(parsed) = hash.parse::<iroh_blobs::Hash>() else {
-                untagged.push(hash);
-                continue;
-            };
-            match super::unpin_blob(&self.blobs, parsed).await {
-                Ok(()) => {
-                    if let Ok(mut unreadable) = self.blob_keep.unreadable.lock() {
-                        unreadable.remove(&parsed);
-                    }
-                    untagged.push(hash);
-                }
-                Err(e) => warn!(%hash, "rotation: blob not untagged yet: {e:#}"),
-            }
-        }
-        if !untagged.is_empty() {
-            let store = Arc::clone(&self.store);
-            if let Err(e) = blocking(move || store.settle_unpin(&[], &untagged, now)).await {
-                warn!("rotation: untagged blobs not recorded: {e:#}");
-            }
         }
     }
 
@@ -740,6 +777,7 @@ impl Node {
                     bytes = bytes.saturating_sub(len);
                     ids.push(id);
                 }
+                self.evict_listing_blobs(&ids, keep, true).await?;
                 let (store, keep_for) = (Arc::clone(&self.store), Arc::clone(keep));
                 let rotated = blocking(move || {
                     store.delete_rows(&ids, &keep_for, crate::store::Deletion::Trim, now)
@@ -782,6 +820,18 @@ impl Node {
                 break;
             }
             let ids = chunk.to_vec();
+            // Those that list blobs go through the node's eviction, under
+            // ADR 0029's last-copy rule; the store's batch leaves them.
+            let (store, owned) = (Arc::clone(&self.store), ids.clone());
+            let listing = blocking(move || store.lists_blobs(&owned)).await?;
+            for id in ids.iter().filter(|id| listing.contains(*id)) {
+                if self.store.store_bytes() <= to {
+                    break;
+                }
+                if self.evict_through_node(id, keep, false).await? {
+                    dropped = dropped.saturating_add(1);
+                }
+            }
             let (store, keep_for) = (Arc::clone(&self.store), Arc::clone(keep));
             let rotated = blocking(move || store.evict_bodies(&ids, &keep_for, now)).await?;
             dropped = dropped.saturating_add(rotated.rows as u64);
@@ -860,6 +910,7 @@ impl Node {
             });
             self.before_last_copy(&batch);
             let ids: Vec<String> = batch.into_iter().map(|r| r.id).collect();
+            self.evict_listing_blobs(&ids, keep, false).await?;
             let (store, keep_for) = (Arc::clone(&self.store), Arc::clone(keep));
             let rotated = blocking(move || {
                 store.delete_rows(&ids, &keep_for, crate::store::Deletion::Cut, now)

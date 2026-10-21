@@ -1228,41 +1228,49 @@ backoff), `crates/wats/src/store.rs` (`Keep`, `evict_bodies`,
   `wats compact` (an offline `VACUUM`) can come later.
 
 **Blobs** (Vincent, 2026-10-21: rotation must not lose a file by side
-effect)
+effect; ADR 0029 decides, merged first)
 
-- **Which blobs a kept post lists** is an index, `event_blobs (hash,
-  seq)`, one definition shared with ADR 0029 (#183): one row per
-  `blobs[].hash` of a kept full event, none for tombstones and opaque
-  events; filled on insert, cleared when a body is dropped or a row
-  deleted (`drop_body`, `delete_opaque_row`, rotation's `delete_rows`,
-  the v1–v3 wipe). The rows of an older release, or of a downgraded node
-  meanwhile, are indexed at open from `event_blobs_filled.upto`, in
-  transactions of 5,000 events. An entry whose row is gone or no longer
-  full counts for nothing. A batch's hashes are checked in one query. The
-  blob collection still reads every kept event (`referenced_blobs`), as
-  before.
-- When rotation drops or deletes the last full post that lists a blob,
-  the blob goes to `unpin_pending`, in the same transaction. After it, or
-  at the next run after a crash, each one is settled, on blocking threads:
-  - listed again by a full post: nothing to do;
-  - kept: recorded in `blob_retained`, a log, in the transaction that
-    settles it; the tag stays;
-  - otherwise: untagged, and forgotten once untagged (the next collection
-    deletes the file).
-- **Which blobs are kept** (`Node::rotation_keeps_blob`): blob retention
-  follows blob responsibility, own posts and pins, not whether a body is
-  held. The record of responsibility is ADR 0029's (PR #183:
-  `has_replica_intent`, written when a blob arrives by `replicate`; own;
-  pinned; `is_responsible(hash, blob_target_k(hash))`, whose XOR estimate
-  only adds; its last-copy hand-off for the others). Until it lands, this
-  node cannot tell a replica from a blob it only cached, so **rotation
-  keeps every blob** (logged `undecided`): no file is lost; a blob only
-  cached stays until that record decides. Once #183 is merged, rotation
-  uses it, and routes the blobs it may let go through its last-copy rule.
-- Own posts are never rotated, so their blobs stay listed.
-- **Kept blobs can fill the blob part of `storage.max`.** PR B evicts no
-  blob: as today, the node then stops fetching blobs at `storage.max`,
-  and refuses events above 110 % (ADR 0012).
+- **Which blobs a kept post lists** is ADR 0029's index, `event_blobs
+  (hash, seq)`: one row per `blobs[].hash` of a kept full event, none for
+  tombstones and opaque events; filled on insert, cleared when a body is
+  dropped or a row deleted (`drop_body`, `delete_opaque_row`, rotation's
+  `delete_rows`, the v1–v3 wipe), backfilled at open from
+  `event_blobs_filled.upto`. A batch's hashes are checked in one query.
+- **A post that lists blobs goes through the node's eviction**, never
+  through rotation's own transactions: `Store::lists_blobs` picks them out
+  of each batch, and `Node::evict_through_node` evicts them one by one
+  with `Node::drop_body(.., Evicted, ..)`, ADR 0029's path:
+  - first, this node's estimate may **add** to the replica record: a blob
+    it holds with no replica record, and for which it is among the
+    `blob_target_k` closest (`is_responsible`), gets one
+    (`record_replica_intent`); the estimate never removes one;
+  - a blob held as a replica (`has_replica_intent`, written when it came
+    by `replicate`) is kept, recorded in `evicted_replicas` with its k, in
+    the drop's transaction;
+  - a blob only cached is freed only once other nodes prove they hold it
+    (`hand_off_before_drop`: two proofs when k > 1); otherwise the
+    eviction is refused (`KeptLastCopy`), and the post stays in full,
+    with its file;
+  - a stronger drop reason recorded meanwhile (erasure, retraction,
+    label, own) wins: `Store::rotatable` checks it first, and
+    `drop_body_keeping` never downgrades it.
+- Then stages 0 and 2 delete the rows: a tombstone whose eviction kept
+  replicas stays (its record must stay reviewable by repair), as does a
+  post whose eviction was refused; both are islands below the cut.
+  Stage 1's batch (`evict_bodies`) only takes posts that list no blob and
+  have no drop record.
+- **Own posts** are never rotated, so their blobs stay listed. **Pins**
+  do not exist yet.
+- `unpin_pending` and `blob_retained` stay for what an earlier build or a
+  crash left: such a blob is kept (`replica`, `responsible`, or
+  `undecided`: no proof that another node holds it), never freed there.
+- **An evicted body comes back only on a `read`**, which also clears its
+  `evicted_replicas` (the body lists its blobs again). A body that gossip,
+  `replicate` or a sync page brings again is refused, and its record of
+  kept replicas stays.
+- **Kept blobs can fill the blob part of `storage.max`.** Rotation evicts
+  no blob by value: as before, the node then stops fetching blobs at
+  `storage.max`, and refuses events above 110 % (ADR 0012).
 
 **What a node shows**
 
@@ -1315,7 +1323,8 @@ effect)
   runtime (blocker).
 - Blob retention from ADR 0029's record, not from this node's peer view
   at rotation time (a well-connected replica could otherwise think itself
-  not responsible); until #183, keep everything.
+  not responsible): rotation's evictions go through ADR 0029's
+  last-copy rule, the estimate only adding to the replica record.
 - Tombstones' signals keep counting.
 - The narrowed protection, and stage 0 above it.
 - Stage 0 per network, `max(2 %, 3 × average)`, a week's grace, value
@@ -1345,7 +1354,8 @@ effect)
   recorded after the plan protects inside the transaction (stage 0 keeps
   only what is strictly kept); erasure labels kept; the blob index
   follows bodies and is filled at open; an evicted body comes back on
-  `read` only; a transaction failing halfway changes nothing (a test fail
+  `read` only, and a body redelivered by gossip or sync keeps its record
+  of kept replicas; a transaction failing halfway changes nothing (a test fail
   point); deleted rows free store bytes and freed pages are reused.
 - `node/rotation.rs`: the value order on a fixed graph (contested,
   unverified older then newer, a sibling of this node's answer, voted,
@@ -1363,8 +1373,10 @@ effect)
   raised cut served with a `gap` to a 0.4.1 peer, refused to a 0.4.0 pull
   below it, and an announce below it served to a kept-kinds request; a
   node stopped in the middle of a rotation, consistent, then finishing
-  it; files kept when their post is rotated out, on a replica and on a
-  cache (until #183); many tombstones leaving room for opaque events; an
+  it; files when their post is rotated out, on a replica and on a
+  cache, by ADR 0029's last-copy rule (a replica kept with its record, a
+  cached copy freed once others prove they hold it, a possible last copy
+  kept in full); many tombstones leaving room for opaque events; an
   evicted body staying evicted through a push, a `replicate` and a sync
   page, and back on `read`; a run that frees nothing backing off.
 
@@ -1372,8 +1384,7 @@ effect)
 
 - The proof-of-work bonus of deleted events (above).
 - Profiles used only before 0.4.3 (above).
-- Blob retention and eviction (ADR 0029, #183): until then, rotation keeps
-  every blob.
+- Blob eviction by value (ADR 0029 follow-up).
 - The digest before the last copy goes (above).
 - A fresh flood is not trimmed for a week (the grace, above).
 
