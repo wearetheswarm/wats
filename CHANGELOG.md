@@ -4,7 +4,7 @@
 
 ### Changes
 
-- **`wats fleet`: several support nodes on one machine** (ADR 0026).
+- **`wats fleet`: several support nodes on one machine** (ADR 0028).
   `wats fleet up -n 6` creates six data directories under `--base`
   (default `~/.wats-fleet`), each with its own key, port and agent
   workspace and the `config.toml` of a template (`--from`, agents

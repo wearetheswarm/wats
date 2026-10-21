@@ -1,5 +1,5 @@
 //! A fleet: several nodes on one machine, started and checked together
-//! (ADR 0026). `wats fleet up -n 6` gives a machine's spare CPUs to the
+//! (ADR 0028). `wats fleet up -n 6` gives a machine's spare CPUs to the
 //! network as six support nodes.
 //!
 //! - **One data directory per node**, `<base>/node-<i>`: its own node

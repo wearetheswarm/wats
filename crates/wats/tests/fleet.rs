@@ -1,4 +1,4 @@
-//! `wats fleet` (ADR 0026): several nodes on one machine, started,
+//! `wats fleet` (ADR 0028): several nodes on one machine, started,
 //! checked and stopped together. Hermetic: loopback only, no
 //! infrastructure, a throwaway home and registry, a fake agent CLI.
 

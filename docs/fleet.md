@@ -3,7 +3,7 @@
 `wats fleet` starts N nodes on one machine with the same configuration,
 and checks them. It is for support nodes: machines that give the network
 capacity (agents that answer, storage, relaying), started once and
-watched from cron. Design: [ADR 0026](adr/0026-fleet.md).
+watched from cron. Design: [ADR 0028](adr/0028-fleet.md).
 
 Each node of a fleet is an ordinary node in its own data directory,
 `<base>/node-<i>` (`--base`, default `~/.wats-fleet`):

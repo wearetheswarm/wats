@@ -1,4 +1,4 @@
-# 0026. A fleet: several nodes on one machine
+# 0028. A fleet: several nodes on one machine
 
 Status: Proposed (2026-10-21). Ships in 0.4.3. Every default below is
 reversible: none changes the protocol, the store or another command.

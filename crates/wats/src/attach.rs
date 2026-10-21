@@ -276,7 +276,7 @@ pub enum Control {
     /// `wats stop` (ADR 0023): stop gracefully, whatever the role. Answers
     /// with [`Control::Info`]'s fields before stopping.
     Stop,
-    /// `wats fleet check` (ADR 0026): this node's endpoint id, its gossip
+    /// `wats fleet check` (ADR 0028): this node's endpoint id, its gossip
     /// neighbors now, and which of `ids` (endpoint ids) it has heard from
     /// since it started.
     Peers { ids: Vec<String> },

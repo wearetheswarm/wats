@@ -425,7 +425,7 @@ enum Command {
         timeout: Duration,
     },
     /// Several nodes on this machine, started and checked together (ADR
-    /// 0026): `wats fleet up -n 6` creates six data directories under
+    /// 0028): `wats fleet up -n 6` creates six data directories under
     /// --base, each with its own key, port and agent workspace and the
     /// config.toml of --from, and starts them in the background, peered
     /// with each other. `wats ps`, `wats attach --dir <base>/node-<i>` and
@@ -4028,7 +4028,7 @@ async fn stop_gracefully_or_kill(
     anyhow::bail!("{what} still runs after SIGKILL")
 }
 
-/// `wats fleet` (ADR 0026): the global options become each node's.
+/// `wats fleet` (ADR 0028): the global options become each node's.
 async fn fleet_command(
     node: &NodeArgs,
     fleet: wats::fleet::FleetCommand,
