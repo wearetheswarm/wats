@@ -581,6 +581,18 @@ const MAX_PROVIDER_ATTEMPTS: usize = 4;
 const PROVIDER_BACKOFF: Duration = Duration::from_secs(30);
 const PROVIDER_BACKOFF_MAX: Duration = Duration::from_secs(3600);
 
+/// Replication requests a publisher has running at once to one peer: the
+/// default `limits.blob_fetches_per_peer` of receivers, 0.4.0 and 0.4.1
+/// included, which skip the blobs past it. A receiver fetches the blobs of
+/// one request one after the other.
+const PUSHES_PER_PEER: usize = 4;
+/// Pushes to one peer waiting for one of its [`PUSHES_PER_PEER`] slots;
+/// past these, or after [`PUSH_WAIT`], a push is skipped (logged).
+const PUSH_QUEUE: usize = 64;
+const PUSH_WAIT: Duration = Duration::from_secs(600);
+/// How long a publisher waits for the answer to one replication request.
+const PUSH_TIMEOUT: Duration = Duration::from_secs(150);
+
 /// How often the blob store collects the blobs nothing keeps
 /// (`storage.gc`).
 pub const BLOB_GC_INTERVAL: Duration = Duration::from_secs(3600);
@@ -1247,6 +1259,8 @@ pub struct Node {
     stop: tokio::sync::Notify,
     /// Per-peer request limits.
     limiter: crate::limits::RateLimiter,
+    /// Replication requests this node has running, per peer it pushes to.
+    pushes: crate::limits::PeerSlots,
     /// Load challenges (ADR 0014 addendum).
     challenger: crate::challenge::Challenger,
     /// `/wats` requests being served.
@@ -1662,6 +1676,7 @@ impl Node {
             storage_logged: Default::default(),
             stop: Default::default(),
             limiter: crate::limits::RateLimiter::new(limits),
+            pushes: crate::limits::PeerSlots::new(PUSHES_PER_PEER, PUSH_QUEUE),
             challenger: crate::challenge::Challenger::new(
                 limits.challenge_base_bits,
                 limits.challenge_max_bits,
@@ -3001,16 +3016,27 @@ impl Node {
                 hashes,
             };
             async move {
+                // No more requests at once than the peer fetches blobs at
+                // once: it would skip the others.
+                let slot = match self.pushes.acquire(peer, PUSH_WAIT).await {
+                    Ok(slot) => slot,
+                    Err(why) => {
+                        warn!(peer = %peer.fmt_short(), ?why, "replication skipped: too many pushes to this peer");
+                        return (peer, None);
+                    }
+                };
                 let result = tokio::time::timeout(
-                    Duration::from_secs(150),
+                    PUSH_TIMEOUT,
                     proto::call_solving(self.endpoint(), peer, &request),
                 )
                 .await;
-                (peer, result)
+                drop(slot);
+                (peer, Some(result))
             }
         });
         let mut confirmed: HashMap<String, Vec<EndpointId>> = HashMap::new();
         for (peer, result) in n0_future::join_all(calls).await {
+            let Some(result) = result else { continue };
             match result {
                 Ok(Ok(Response::Replicated { hashes })) => {
                     for hash in hashes {
@@ -4066,8 +4092,13 @@ impl Node {
                         continue;
                     }
                     self.add_hints(&blob.hash, &[peer]);
-                    // At most a few fetches at once for one peer.
-                    let Some(_permit) = self.limiter.blob_fetch(peer) else {
+                    // At most a few fetches at once for one peer, a few more
+                    // waiting their turn.
+                    let Some(_permit) = self
+                        .limiter
+                        .blob_fetch(peer, crate::limits::BLOB_FETCH_WAIT)
+                        .await
+                    else {
                         continue;
                     };
                     if self.fetch_blob(blob, vec![peer]).await {

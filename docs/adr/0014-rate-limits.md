@@ -26,6 +26,8 @@ Code: `crates/wats/src/limits.rs`, `Node::handle_request`.
 - **Blob fetches:** at most `limits.blob_fetches_per_peer` (4) blobs that
   one peer makes us fetch at once (replication requests). Further blobs of
   a request are skipped and the peer is told which ones were stored.
+  Since 0.4.2 they first wait in a short queue, and publishers pace their
+  pushes: see "Blob fetch queue and paced pushes" below.
 
 ### Blob fetches (addendum, 2026-10-16, security review B7 and B10)
 
@@ -105,6 +107,43 @@ under load. Protocol only: events do not change.
 New keys: `limits.challenge` (true), `limits.challenge_base_bits` (8),
 `limits.challenge_max_bits` (24). `overload_in_flight` and
 `solved_per_min` are `Limits` fields without a key for now.
+
+### Blob fetch queue and paced pushes (implementation note, 2026-10-21)
+
+Code: `crates/wats/src/limits.rs` (`PeerSlots`), `Node::replicate`,
+`Node::handle_request`. Protocol and events do not change.
+
+A publisher pushes each post's blobs in a task of its own, so a burst of
+posts (8 at once in `tests/blob_threads.rs`) sent as many `replicate`
+requests to a peer at the same moment. The receiver fetched 4 and skipped
+the others; it never fetches the blob of a post it got by gossip, so a
+skipped push was a replica lost for good, unless the report (the hashes
+the peer answered with, logged as `replication ... report=`) was read.
+
+- **Receiver: a queue behind the limit.** A blob fetch over a peer's
+  `blob_fetches_per_peer` (4) slots waits for one, first come first
+  served, up to `BLOB_FETCH_WAIT` (60 s; with the 60 s a fetch from that
+  peer may take, the answer still comes within the publisher's 150 s).
+  At most `blob_fetch_queue` (16) fetches of one peer wait; past these,
+  or after the wait, the blob is skipped and logged as before. Per peer
+  and bounded both ways, so the limit still protects the node: a peer
+  makes it run at most 4 fetches and keep at most 16 waiting requests,
+  within its `replicate` rate limit and the overload challenge (waiting
+  requests count as in flight). `blob_fetch_queue` is a `Limits` field
+  without a key, like `overload_in_flight`. This covers bursts from 0.4.0
+  and 0.4.1 publishers.
+- **Publisher: no more pushes at once than receivers fetch.** A node
+  runs at most `PUSHES_PER_PEER` (4, the default `blob_fetches_per_peer`)
+  `replicate` requests at once to one peer; the receiver fetches the
+  blobs of one request one after the other, so it never has more than 4
+  fetches running for this publisher and skips none. Further pushes wait
+  their turn (at most `PUSH_QUEUE`, 64, per peer, for up to `PUSH_WAIT`,
+  10 min; past these a push is skipped with a WARN). This covers 0.4.0
+  and 0.4.1 receivers, which skip instead of queueing.
+- **Not done:** retrying a push the peer answered without some hashes.
+  Paced pushes are not skipped for the limit any more; a refusal for
+  another reason (storage full, quota, body dropped) would be refused
+  again, and repair of lost replicas stays Phase 2 (ADR 0005).
 
 ## Consequences
 

@@ -14,6 +14,16 @@
   check its files, and its store at shutdown, still leave one thread
   each, once per process; upstream draft:
   [docs/upstream/iroh-blobs-runtime-drop-issue.md](docs/upstream/iroh-blobs-runtime-drop-issue.md).
+- **A burst of posts with blobs keeps all its replicas.** A publisher
+  pushes each post's blobs in a task of its own, so 8 posts published at
+  once sent 8 `replicate` requests to a peer together; the peer fetched 4
+  blobs from it at a time and skipped the others (`peer throttled: 4
+  blob fetches already running for it`), and since a node never fetches
+  the blob of a post it got by gossip, those replicas never arrived. A
+  publisher now runs at most 4 pushes at once to one peer (more wait
+  their turn, up to 64), and a receiver queues up to 16 more fetches of a
+  peer, for up to 60 s, before it skips one. The per-peer limit stays;
+  both sides work with 0.4.0 and 0.4.1 peers. ADR 0014.
 - **An MCP tool that panics answers with an error.** rmcp runs each tool
   call in a task of its own without catching panics, so a bug in a tool
   left the call unanswered until the agent's client gave up. The call now

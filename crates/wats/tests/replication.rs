@@ -380,3 +380,132 @@ async fn blob_export_never_follows_symlinks() -> anyhow::Result<()> {
     a.shutdown().await?;
     Ok(())
 }
+
+/// More blobs pushed at once than the receiver fetches at once for one
+/// peer (`limits.blob_fetches_per_peer`, 4).
+const BURST: u8 = 12;
+
+/// A blob large enough that fetching it takes a while, so pushes overlap.
+fn burst_content(seed: u8) -> Vec<u8> {
+    (0..256 * 1024).map(|i| (i % 251) as u8 ^ seed).collect()
+}
+
+/// Publish [`BURST`] posts with a blob each, all at once, on `publisher`.
+async fn publish_burst(
+    publisher: &Arc<Node>,
+    dir: &std::path::Path,
+) -> anyhow::Result<Vec<wats::event::Event>> {
+    let mut files = Vec::new();
+    for seed in 0..BURST {
+        let path = dir.join(format!("burst-{seed}.bin"));
+        std::fs::write(&path, burst_content(seed))?;
+        files.push(path);
+    }
+    let publishes = files.into_iter().enumerate().map(|(i, path)| async move {
+        let attachment = Attachment { path, name: None };
+        publisher
+            .publish(note(&format!("burst {i}")), &[attachment])
+            .await
+    });
+    n0_future::join_all(publishes).await.into_iter().collect()
+}
+
+/// `receiver` comes to hold every blob of `events` by itself: never read
+/// nor fetched here, so only a push can have brought them.
+async fn all_pushed(receiver: &Node, events: &[wats::event::Event]) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    loop {
+        let mut missing = Vec::new();
+        for event in events {
+            if !receiver.blob_pinned(&event.blobs[0].hash).await.unwrap() {
+                missing.push(event.blobs[0].hash.clone());
+            }
+        }
+        if missing.is_empty() {
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "{} of {} pushed blobs never arrived: {missing:?}",
+            missing.len(),
+            events.len()
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// A burst of posts with blobs: every replica arrives through the push,
+/// although the receiver fetches only a few blobs at once for one peer.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_burst_of_pushes_reaches_its_replicas() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let receiver = node(&dir.path().join("receiver"), &[], 3).await?;
+    let publisher = node(&dir.path().join("publisher"), &[&receiver], 3).await?;
+    publisher
+        .wait_for_neighbor(PUBLIC_NET, Duration::from_secs(10))
+        .await?;
+    let events = publish_burst(&publisher, dir.path()).await?;
+    all_pushed(&receiver, &events).await;
+    publisher.shutdown().await?;
+    receiver.shutdown().await?;
+    Ok(())
+}
+
+/// The same burst to a receiver that skips, rather than queues, the
+/// fetches past its limit, as 0.4.0 and 0.4.1 do: the publisher sends no
+/// more pushes at once than that limit.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_publisher_paces_its_pushes_to_an_older_receiver() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let mut config = NodeConfig::new(dir.path().join("receiver"));
+    config.mode = NetworkMode::Loopback;
+    config.pow_bits = Some(0);
+    config.min_pow_bits = Some(0);
+    config.limits.blob_fetch_queue = 0;
+    let receiver = Node::start(config).await?;
+    let publisher = node(&dir.path().join("publisher"), &[&receiver], 3).await?;
+    publisher
+        .wait_for_neighbor(PUBLIC_NET, Duration::from_secs(10))
+        .await?;
+    let events = publish_burst(&publisher, dir.path()).await?;
+    all_pushed(&receiver, &events).await;
+    publisher.shutdown().await?;
+    receiver.shutdown().await?;
+    Ok(())
+}
+
+/// Pushes as a 0.4.1 publisher sends them, all at once: the receiver
+/// queues those past its per-peer limit instead of dropping them.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_receiver_queues_pushes_past_its_limit() -> anyhow::Result<()> {
+    use wats::proto::{Request, Response, call_solving};
+    let dir = tempfile::tempdir()?;
+    let receiver = node(&dir.path().join("receiver"), &[], 3).await?;
+    // k = 0: the publisher pushes nothing itself; the test does.
+    let publisher = node(&dir.path().join("publisher"), &[&receiver], 0).await?;
+    publisher
+        .wait_for_neighbor(PUBLIC_NET, Duration::from_secs(10))
+        .await?;
+    let events = publish_burst(&publisher, dir.path()).await?;
+    let to = receiver.endpoint_id();
+    let calls = events.iter().map(|event| {
+        let request = Request::Replicate {
+            event: serde_json::to_value(event).unwrap(),
+            hashes: vec![event.blobs[0].hash.clone()],
+        };
+        let endpoint = publisher.endpoint();
+        async move { call_solving(endpoint, to, &request).await }
+    });
+    for (event, response) in events.iter().zip(n0_future::join_all(calls).await) {
+        match response? {
+            Response::Replicated { hashes } => {
+                assert_eq!(hashes, vec![event.blobs[0].hash.clone()], "{}", event.id)
+            }
+            other => panic!("push of {} refused: {other:?}", event.id),
+        }
+    }
+    all_pushed(&receiver, &events).await;
+    publisher.shutdown().await?;
+    receiver.shutdown().await?;
+    Ok(())
+}
