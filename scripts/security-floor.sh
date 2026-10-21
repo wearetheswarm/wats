@@ -14,7 +14,9 @@ set -eu
 
 die() { printf 'security-floor.sh: %s\n' "$*" >&2; exit 1; }
 
-[ $# -ge 1 ] && [ $# -le 2 ] || die "usage: sh scripts/security-floor.sh VERSION [CHANGELOG]"
+if [ $# -lt 1 ] || [ $# -gt 2 ]; then
+  die "usage: sh scripts/security-floor.sh VERSION [CHANGELOG]"
+fi
 VERSION="${1#v}"
 CHANGELOG="${2:-$(dirname "$0")/../CHANGELOG.md}"
 printf '%s\n' "$VERSION" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$' || die "$1 is not X.Y.Z"
