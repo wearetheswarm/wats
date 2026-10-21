@@ -1102,6 +1102,8 @@ pub fn provider_backoff(failures: u32) -> Duration {
 
 /// How often the peer cache is saved (B1).
 const PEER_CACHE_SAVE_SECS: u64 = 300;
+/// From the first neighbor to the `swarm: …` line of the log (ADR 0026).
+const SWARM_LINE_SETTLE: Duration = Duration::from_secs(10);
 /// How often the reconnect loop looks at the peers while online.
 const RECONNECT_WATCH_EVERY: Duration = Duration::from_secs(1);
 /// At most one catch-up with every neighbor per this long, on network
@@ -1277,6 +1279,9 @@ pub struct Node {
     fetched: tokio::sync::broadcast::Sender<BlobRef>,
     /// Peers seen recently, with the time we last heard from them.
     peers: std::sync::Mutex<HashMap<EndpointId, u64>>,
+    /// The nodes heard from per network in the last 24 h, kept in
+    /// `swarm.json` (ADR 0026).
+    swarm: std::sync::Mutex<crate::swarm::Sightings>,
     /// Blob hash -> nodes that announced they hold it (hints, unverified).
     hints: std::sync::Mutex<HashMap<String, Vec<EndpointId>>>,
     /// Providers whose last blob fetches failed: (failures, retry after).
@@ -1672,6 +1677,7 @@ impl Node {
             .spawn(endpoint.clone());
         let downloader = blobs.downloader(&endpoint);
         let protocol = WatsProtocol::default();
+        let endpoint_id = endpoint.id();
         let mut router = Router::builder(endpoint)
             .accept(iroh_gossip::ALPN, gossip.clone())
             .accept(iroh_blobs::ALPN, BlobsProtocol::new(&blobs, None));
@@ -1693,6 +1699,12 @@ impl Node {
         }
 
         let limits = config.limits;
+        let swarm = crate::swarm::Sightings::load(
+            &config.data_dir,
+            &config.nets,
+            Some(endpoint_id),
+            now_secs(),
+        );
         let node = Arc::new(Self {
             config,
             router,
@@ -1713,6 +1725,7 @@ impl Node {
             neighbors: Default::default(),
             fetched: tokio::sync::broadcast::channel(256).0,
             peers: std::sync::Mutex::new(bootstrap.iter().map(|id| (*id, now_secs())).collect()),
+            swarm: std::sync::Mutex::new(swarm),
             hints: Default::default(),
             provider_backoff: Default::default(),
             peer_info: Default::default(),
@@ -1805,6 +1818,7 @@ impl Node {
                         tokio::time::sleep(Duration::from_secs(PEER_CACHE_SAVE_SECS)).await;
                         let Some(node) = weak.upgrade() else { break };
                         node.save_peer_cache().await;
+                        node.save_swarm().await;
                     }
                 }
             }));
@@ -1831,6 +1845,7 @@ impl Node {
         }
         node.spawn_reconnect();
         node.spawn_repair();
+        node.spawn_swarm_line();
         if !node.config.erasure_labelers.is_empty() {
             node.apply_held_erasures().await;
         }
@@ -2209,6 +2224,30 @@ impl Node {
                         Err(e) => debug!(ask = %root, "desktop notification failed: {e:#}"),
                     }
                 });
+            }
+        });
+    }
+
+    /// One `swarm: …` line per network in the log (ADR 0026), once: when
+    /// the node first has a neighbor, and the gossip had
+    /// [`SWARM_LINE_SETTLE`] to bring the others.
+    fn spawn_swarm_line(self: &Arc<Self>) {
+        let weak = Arc::downgrade(self);
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                let Some(node) = weak.upgrade() else { return };
+                if node.endpoint().is_closed() {
+                    return;
+                }
+                if !node.neighbors().is_empty() {
+                    break;
+                }
+            }
+            tokio::time::sleep(SWARM_LINE_SETTLE).await;
+            let Some(node) = weak.upgrade() else { return };
+            for line in crate::swarm::lines(&node.swarm_json(), true) {
+                info!("{line}");
             }
         });
     }
@@ -3463,6 +3502,51 @@ impl Node {
         all
     }
 
+    /// Heard from `id` on `net` (ADR 0026): `nodes_24h` of `swarm`.
+    fn sighted(&self, net: &str, id: EndpointId) {
+        if id == self.endpoint_id() {
+            return;
+        }
+        if let Ok(mut swarm) = self.swarm.lock() {
+            swarm.note(net, id, now_secs());
+        }
+    }
+
+    /// The `swarm` value of `status` (ADR 0026), per network joined: the
+    /// gossip neighbors now, and the distinct nodes heard from on it in
+    /// the last 24 hours (with the neighbors).
+    pub fn swarm_json(&self) -> serde_json::Value {
+        let now = now_secs();
+        let nets = self.joined_nets();
+        let neighbors = self.neighbors.lock().map(|n| n.clone()).unwrap_or_default();
+        let swarm = self.swarm.lock();
+        nets.into_iter()
+            .map(|net| {
+                let up = neighbors.get(&net).cloned().unwrap_or_default();
+                let seen = swarm.as_ref().map_or(up.len(), |s| s.count(&net, now, &up));
+                (net, crate::swarm::net_json(up.len(), seen))
+            })
+            .collect::<serde_json::Map<_, _>>()
+            .into()
+    }
+
+    /// Persist the sightings of the last 24 hours (ADR 0026).
+    pub async fn save_swarm(&self) {
+        let now = now_secs();
+        let Some(sightings) = self.swarm.lock().ok().map(|mut s| {
+            s.prune(now);
+            s.clone()
+        }) else {
+            return;
+        };
+        let dir = self.config.data_dir.clone();
+        match tokio::task::spawn_blocking(move || sightings.save(&dir, now)).await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => warn!("swarm sightings not saved: {e:#}"),
+            Err(e) => warn!("swarm sightings not saved: {e}"),
+        }
+    }
+
     fn seen(&self, peer: EndpointId) {
         self.durability.peer_seen(peer);
         if let Ok(mut peers) = self.peers.lock() {
@@ -3626,6 +3710,7 @@ impl Node {
             match receiver.next().await {
                 Some(Ok(GossipEvent::Received(msg))) => {
                     self.seen(msg.delivered_from);
+                    self.sighted(&net, msg.delivered_from);
                     if let Err(e) = self
                         .handle_message(&net, &msg.content, msg.delivered_from)
                         .await
@@ -3647,6 +3732,7 @@ impl Node {
                     }
                     self.reconnect_kick.notify_one();
                     self.seen(id);
+                    self.sighted(&net, id);
                     let node = Arc::clone(&self);
                     let net = net.clone();
                     tokio::spawn(async move {
@@ -3696,6 +3782,11 @@ impl Node {
         };
         if event.net() != net {
             bail!("event for net {:?} on topic {net:?}", event.net());
+        }
+        // The node that broadcast a new, valid event: the first provider
+        // of its envelope (ADR 0026). A claim, one per new event.
+        if new && let Some(origin) = envelope.providers.first().and_then(|p| p.parse().ok()) {
+            self.sighted(net, origin);
         }
         if let (true, AnyEvent::Known(event)) = (new, &event) {
             let mut providers: Vec<EndpointId> = envelope
@@ -4175,6 +4266,11 @@ impl Node {
         solution: Option<crate::challenge::Solution>,
     ) -> Response {
         self.seen(peer);
+        if let Request::Sync { net, .. } | Request::Get { net, .. } = &request
+            && self.joined(net)
+        {
+            self.sighted(net, peer);
+        }
         let kind = match &request {
             Request::Hello { .. } => Some(crate::limits::Kind::Hello),
             Request::Sync { .. } => Some(crate::limits::Kind::Sync),
@@ -4738,6 +4834,9 @@ impl Node {
         if let Ok(mut n) = self.neighbors.lock() {
             n.remove(net);
         }
+        if let Ok(mut swarm) = self.swarm.lock() {
+            swarm.forget(net);
+        }
         if sender.is_some()
             && let Ok(mut left) = self.left_nets.lock()
         {
@@ -5039,6 +5138,7 @@ impl Node {
 
     pub async fn shutdown(&self) -> Result<()> {
         self.save_peer_cache().await;
+        self.save_swarm().await;
         self.gossip.shutdown().await.ok();
         self.router.shutdown().await?;
         // The router shuts the blob protocol down, which also closes the store.
@@ -5744,5 +5844,95 @@ mod blob_gc_tests {
             assert!(node.read_blob_file(hash).await.is_none());
             node.shutdown().await.unwrap();
         });
+    }
+}
+
+/// The swarm as one node sees it (ADR 0026): who broadcast what it got.
+#[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::arithmetic_side_effects
+)]
+mod swarm_tests {
+    use super::*;
+    use crate::event::Kind;
+
+    async fn start(dir: &Path) -> Arc<Node> {
+        let mut config = NodeConfig::new(dir);
+        config.mode = NetworkMode::Loopback;
+        config.infra = crate::infra::Infra::NONE;
+        config.pow_bits = Some(8);
+        config.min_pow_bits = Some(8);
+        Node::start(config).await.unwrap()
+    }
+
+    fn envelope(event: &serde_json::Value, providers: &[EndpointId]) -> Vec<u8> {
+        serde_json::to_vec(&serde_json::json!({
+            "ev": ENVELOPE_VERSION,
+            "event": event,
+            "providers": providers.iter().map(ToString::to_string).collect::<Vec<_>>(),
+        }))
+        .unwrap()
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_node_that_broadcast_a_new_event_counts_once() {
+        let dir = tempfile::tempdir().unwrap();
+        // Two nodes that never meet: b's posts reach a by hand.
+        let a = start(&dir.path().join("a")).await;
+        let b = start(&dir.path().join("b")).await;
+        let seen = |node: &Node| node.swarm_json()["public"]["nodes_24h"].clone();
+        assert_eq!(
+            a.swarm_json(),
+            serde_json::json!({"public": {"neighbors": 0, "nodes_24h": 0}})
+        );
+        let note = |text: &str| Draft {
+            net: PUBLIC_NET.into(),
+            kind: Some(Kind::Note),
+            title: Some("hello".into()),
+            text: text.into(),
+            ..Draft::default()
+        };
+        let post = |text: &'static str| {
+            let b = Arc::clone(&b);
+            async move { serde_json::to_value(b.publish(note(text), &[]).await.unwrap()).unwrap() }
+        };
+        let relay = SecretKey::from_bytes(&[9; 32]).public();
+        let other = SecretKey::from_bytes(&[10; 32]).public();
+        // The first provider is the node that broadcast it; the others
+        // are blob hints, not sightings. Nor is `from`: the receive loop
+        // counts the neighbor that delivered it.
+        let first = post("one").await;
+        a.handle_message(
+            PUBLIC_NET,
+            &envelope(&first, &[b.endpoint_id(), other]),
+            relay,
+        )
+        .await
+        .unwrap();
+        assert_eq!(seen(&a), 1);
+        // The same event again, claimed by another node: not new, not
+        // counted.
+        a.handle_message(PUBLIC_NET, &envelope(&first, &[other]), relay)
+            .await
+            .unwrap();
+        assert_eq!(seen(&a), 1);
+        // An invalid event counts for nothing.
+        let mut forged = post("two").await;
+        forged["text"] = "changed".into();
+        let _ = a
+            .handle_message(PUBLIC_NET, &envelope(&forged, &[other]), relay)
+            .await;
+        assert_eq!(seen(&a), 1);
+        // This node's own id is never counted.
+        let third = post("three").await;
+        a.handle_message(PUBLIC_NET, &envelope(&third, &[a.endpoint_id()]), relay)
+            .await
+            .unwrap();
+        assert_eq!(seen(&a), 1);
+        a.shutdown().await.unwrap();
+        b.shutdown().await.unwrap();
     }
 }

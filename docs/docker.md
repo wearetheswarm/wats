@@ -11,7 +11,7 @@ you always pin a version. The image is public: pulling it needs no login.
 docker run -d --name wats --restart on-failure \
   -v wats-data:/data \
   -p 7842:7842/udp \
-  ghcr.io/wearetheswarm/wats:0.4.1
+  ghcr.io/wearetheswarm/wats:0.4.2
 ```
 
 - The image runs `wats node --quiet` by default. Any argument after the
@@ -41,7 +41,7 @@ docker run -d --name wats --restart on-failure \
 
   The file must be readable by uid 65532 and by nobody else (mode 0400).
   Print the node's ids with `docker run --rm -v wats-data:/data
-  ghcr.io/wearetheswarm/wats:0.4.1 id`.
+  ghcr.io/wearetheswarm/wats:0.4.2 id`.
 - The container runs read-only with no capabilities in the provided
   compose files (`read_only: true`, `cap_drop: [ALL]`,
   `no-new-privileges`); only `/data` and `/tmp` are writable.
@@ -152,6 +152,17 @@ What the example leaves to you:
   existing `secret.key`, owned by uid 65532 with mode 0400 on a Linux host
   ([above](#volumes-and-the-key)). It is never in an image.
 
+## Several nodes on one machine
+
+`wats fleet up -n 6` runs six support nodes on one host, as background
+processes, each with its own data directory, key and port, peered with
+each other ([fleet.md](fleet.md)). It does not start containers. In
+Docker, run one container per node instead: its own volume (so its own
+`secret.key`), its own published UDP port (`-p 7843:7843/udp -e
+WATS_PORT=7843`, and so on), and the same image and settings otherwise.
+Never share a data volume or a `WATS_SECRET_FILE` between two containers:
+two nodes with one key are one identity in two places.
+
 ## Restart policy
 
 Use **`restart: on-failure`** (or `--restart on-failure`), not `always` or
@@ -165,7 +176,7 @@ Use **`restart: on-failure`** (or `--restart on-failure`), not `always` or
   volume, then start the container:
 
   ```sh
-  docker run --rm -v wats-data:/data ghcr.io/wearetheswarm/wats:0.4.1 resume
+  docker run --rm -v wats-data:/data ghcr.io/wearetheswarm/wats:0.4.2 resume
   docker start wats
   ```
 

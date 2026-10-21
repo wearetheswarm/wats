@@ -400,9 +400,9 @@ enum Command {
     },
     /// List the wats nodes running on this machine: pid, mode (detached,
     /// foreground, or started by `wats mcp`), version, uptime, profile,
-    /// agents, network, MCP sessions and data directory. Finds the nodes of
-    /// `~/.wats`, of --dir, and of every data directory a node ran in
-    /// (`~/.wats/run`).
+    /// agents, network, nodes heard from in 24 h (ADR 0026), MCP sessions
+    /// and data directory. Finds the nodes of `~/.wats`, of --dir, and of
+    /// every data directory a node ran in (`~/.wats/run`).
     Ps {
         /// Also list the known data directories where no node runs.
         #[arg(long)]
@@ -424,8 +424,17 @@ enum Command {
         #[arg(long, default_value = "10s", value_parser = parse_duration)]
         timeout: Duration,
     },
-    /// Show the node: running or not, networks, peers, storage, version
-    /// and the update notice (what the MCP `status` tool returns).
+    /// Several nodes on this machine, started and checked together (ADR
+    /// 0028): `wats fleet up -n 6` creates six data directories under
+    /// --base, each with its own key, port and agent workspace and the
+    /// config.toml of --from, and starts them in the background, peered
+    /// with each other. `wats ps`, `wats attach --dir <base>/node-<i>` and
+    /// `wats mcp --dir <base>/node-<i>` work on each node as on any other.
+    Fleet(wats::fleet::FleetCommand),
+    /// Show the node: running or not, networks, peers, the swarm it sees
+    /// (gossip neighbors and nodes heard from in 24 h, per network),
+    /// storage, version and the update notice (what the MCP `status` tool
+    /// returns).
     Status {
         /// Print JSON instead of `key: value` lines.
         #[arg(long)]
@@ -3176,6 +3185,8 @@ async fn status_command(config: &NodeConfig, json: bool) -> Result<()> {
                 status["update"] = update;
             }
             status["halt"] = wats::halt::offline_status(&config.data_dir, config.halt.accept);
+            // What its last runs heard from (ADR 0026).
+            status["swarm"] = wats::swarm::stored_json(&config.data_dir, &config.nets, unix_now());
             if let Some(retractions) = wats::retract::status_json(&config.data_dir, unix_now()) {
                 status["agent_retractions"] = retractions;
             }
@@ -3237,7 +3248,17 @@ async fn status_command(config: &NodeConfig, json: bool) -> Result<()> {
         // One line per network: "history: syncing, back to 2026-09-14,
         // 812.0 MiB / 2.5 GiB" (ADR 0025 §8).
         let history = status.as_object_mut().and_then(|map| map.remove("history"));
+        // One line per network: "swarm: 3 neighbors, 17 nodes seen in 24
+        // h" (ADR 0026).
+        let swarm = status.as_object_mut().and_then(|map| map.remove("swarm"));
+        let running = status["node"] == "running";
         for line in status_lines("", &status) {
+            println!("{line}");
+        }
+        for line in swarm
+            .iter()
+            .flat_map(|swarm| wats::swarm::lines(swarm, running))
+        {
             println!("{line}");
         }
         if let Some(history) = history.as_ref().and_then(|h| h.as_object()) {
@@ -3467,6 +3488,7 @@ impl NodeEntry {
             "agents": self.agents(),
             "online": self.online(),
             "network": self.network(),
+            "swarm": self.info.as_ref().map(|i| i["swarm"].clone()),
             "infra": self.info_str("infra"),
             "sessions": self.sessions(),
             "history": self.info.as_ref().map(|i| i["history"].clone()),
@@ -3587,7 +3609,7 @@ async fn ps_command(node: &NodeArgs, all: bool, json: bool) -> Result<()> {
         println!("no wats node running · start one in the background: wats --detach");
         return Ok(());
     }
-    let rows: Vec<[String; 11]> = entries
+    let rows: Vec<[String; 12]> = entries
         .iter()
         .map(|e| {
             let dash = || "-".to_string();
@@ -3595,6 +3617,7 @@ async fn ps_command(node: &NodeArgs, all: bool, json: bool) -> Result<()> {
                 return [
                     dash(),
                     e.mode().to_string(),
+                    dash(),
                     dash(),
                     dash(),
                     dash(),
@@ -3621,6 +3644,7 @@ async fn ps_command(node: &NodeArgs, all: bool, json: bool) -> Result<()> {
                     agents.join(",")
                 },
                 e.network(),
+                wats::swarm::ps_cell(e.info.as_ref().map(|i| &i["swarm"])),
                 e.info_str("infra").unwrap_or_else(dash),
                 e.sessions().map_or_else(dash, |s| s.to_string()),
                 e.history(),
@@ -3629,8 +3653,18 @@ async fn ps_command(node: &NodeArgs, all: bool, json: bool) -> Result<()> {
         })
         .collect();
     let header = [
-        "PID", "MODE", "VERSION", "UPTIME", "PROFILE", "AGENTS", "NETWORK", "INFRA", "SESSIONS",
-        "HISTORY", "DATA DIR",
+        "PID",
+        "MODE",
+        "VERSION",
+        "UPTIME",
+        "PROFILE",
+        "AGENTS",
+        "NETWORK",
+        "NODES 24H",
+        "INFRA",
+        "SESSIONS",
+        "HISTORY",
+        "DATA DIR",
     ];
     let mut widths: Vec<usize> = header.iter().map(|h| h.chars().count()).collect();
     for row in &rows {
@@ -3741,7 +3775,11 @@ async fn detach_command(
     if !quiet {
         print_art(settings, false);
         if let Ok(banner) = std::fs::read_to_string(wats::background::banner_path(&dir)) {
-            eprint!("{banner}");
+            let banner: Vec<String> = banner.lines().map(str::to_string).collect();
+            let live = entry.info.as_ref().map(|i| &i["swarm"]);
+            for line in wats::swarm::refresh_banner(&banner, live) {
+                eprintln!("{line}");
+            }
         }
     }
     if takeover {
@@ -3830,7 +3868,9 @@ async fn attach_command(node: &NodeArgs, lines: usize, mut shutdown: Shutdown) -
         banner = std::fs::read_to_string(wats::background::banner_path(&entry.dir))
             .map(|text| text.lines().map(str::to_string).collect())
             .unwrap_or_default();
-        for line in &banner {
+        // The swarm as the node sees it now, not as it started (ADR 0026).
+        let live = entry.info.as_ref().map(|i| &i["swarm"]);
+        for line in wats::swarm::refresh_banner(&banner, live) {
             writeln!(out, "{line}")?;
         }
     } else {
@@ -4050,6 +4090,51 @@ async fn stop_gracefully_or_kill(
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
     anyhow::bail!("{what} still runs after SIGKILL")
+}
+
+/// `wats fleet` (ADR 0028): the global options become each node's.
+async fn fleet_command(
+    node: &NodeArgs,
+    fleet: wats::fleet::FleetCommand,
+    shutdown: Shutdown,
+) -> Result<()> {
+    anyhow::ensure!(
+        node.port.is_none(),
+        "--port: each node of a fleet has its own port (`wats fleet up --port-base <port>`)"
+    );
+    anyhow::ensure!(
+        node.secret_file.is_none(),
+        "--secret-file: each node of a fleet has its own key, in its data directory"
+    );
+    anyhow::ensure!(
+        node.external_addrs.is_empty(),
+        "--external-addr: each node of a fleet has its own port; set external_addrs in each \
+         node's config.toml instead"
+    );
+    // Network options, as a child's command line, without what the fleet
+    // sets per node or writes in each config.toml.
+    let node_args: Vec<String> = node
+        .to_args(std::path::Path::new(""))
+        .into_iter()
+        .skip(2)
+        .map(|a| a.to_string_lossy().into_owned())
+        .filter(|a| {
+            a != "--hermetic"
+                && !a.starts_with("--bootstrap=")
+                && !a.starts_with("--storage-max=")
+                && !a.starts_with("--sync-initial-max=")
+        })
+        .collect();
+    let ctx = wats::fleet::Options {
+        node_args_given: !node_args.is_empty(),
+        node_args,
+        bootstrap: node.bootstrap.clone(),
+        data_dir: node.data_dir()?,
+        storage_max: node.storage_max,
+        initial_max: node.sync_initial_max,
+        hermetic: node.hermetic,
+    };
+    wats::fleet::run(ctx, fleet, shutdown).await
 }
 
 /// `key: value` lines, nested keys joined with dots, `node` first.
@@ -5098,6 +5183,12 @@ fn banner_lines(config: &NodeConfig, agents: &[(String, wats::agent::AgentConfig
             ""
         }
     ));
+    // The swarm: connecting, with the nodes heard from in the last 24 h
+    // of the previous runs (ADR 0026); the log says more once connected.
+    lines.extend(wats::swarm::lines(
+        &wats::swarm::stored_json(&config.data_dir, &config.nets, unix_now()),
+        true,
+    ));
     let used = wats::node::dir_size(&config.data_dir);
     let max = config.storage_max.unwrap_or(u64::MAX);
     lines.push(format!(
@@ -5841,6 +5932,7 @@ async fn async_main(cli: Cli) -> Result<()> {
         Some(Command::Stop { all, timeout }) => {
             return stop_command(&cli.node, all, timeout).await;
         }
+        Some(Command::Fleet(fleet)) => return fleet_command(&cli.node, fleet, shutdown).await,
         Some(Command::Agent { name, action }) => {
             return tokio::select! {
                 result = agent_watch(&data_dir, name.as_deref(), action) => result,
@@ -5958,7 +6050,8 @@ async fn async_main(cli: Cli) -> Result<()> {
             | Command::Inbox { .. }
             | Command::Attach { .. }
             | Command::Ps { .. }
-            | Command::Stop { .. },
+            | Command::Stop { .. }
+            | Command::Fleet(_),
         ) => {
             unreachable!("handled above")
         }

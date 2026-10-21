@@ -284,6 +284,10 @@ pub enum Control {
     /// `wats stop` (ADR 0023): stop gracefully, whatever the role. Answers
     /// with [`Control::Info`]'s fields before stopping.
     Stop,
+    /// `wats fleet check` (ADR 0028): this node's endpoint id, its gossip
+    /// neighbors now, and which of `ids` (endpoint ids) it has heard from
+    /// since it started.
+    Peers { ids: Vec<String> },
 }
 
 /// The answer to [`Control::Info`].
@@ -300,6 +304,7 @@ fn info(node: &Node, sessions: usize) -> serde_json::Value {
         "log": config.log_file,
         "sessions": sessions,
         "peers": node.known_peers().len(),
+        "swarm": node.swarm_json(),
         "health": node.health_json(),
         "history": node.history_status(),
         "agents": config.agents.iter().filter(|a| a.running).map(|a| a.name.clone()).collect::<Vec<_>>(),
@@ -346,6 +351,16 @@ async fn run_control(
 ) -> Result<serde_json::Value> {
     match request {
         Control::Info => Ok(info(node, sessions)),
+        Control::Peers { ids } => {
+            let known: std::collections::HashSet<String> =
+                node.known_peers().iter().map(ToString::to_string).collect();
+            let met: Vec<&String> = ids.iter().filter(|id| known.contains(*id)).collect();
+            Ok(serde_json::json!({
+                "endpoint_id": node.endpoint_id().to_string(),
+                "neighbors": node.neighbors().iter().map(ToString::to_string).collect::<Vec<_>>(),
+                "met": met,
+            }))
+        }
         Control::Stop => {
             tracing::info!("stopping: asked by `wats stop`");
             // Before any session sees its node go: they must not start it
