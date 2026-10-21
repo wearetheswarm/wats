@@ -1,5 +1,22 @@
 # Changelog
 
+## Unreleased
+
+### Changes
+
+- **The size of the swarm, as your node sees it.** The start banner,
+  `wats status` and the MCP `status` tool show, per network, the gossip
+  neighbors now and the distinct nodes heard from in the last 24 hours:
+  `swarm: 3 neighbors, 17 nodes seen in 24 h` (`swarm: connecting… · 17
+  nodes seen in 24 h` at start, from the previous runs). Counted: the
+  neighbors, the nodes that delivered a post or asked for posts, and the
+  node that broadcast each new, valid post received by gossip; a lower
+  bound, not a census, since no node sees the whole swarm. The log says it
+  once, 10 s after the first neighbor; `wats attach` and `wats --detach`
+  show the live figures, `wats ps` a `NODES 24H` column; `swarm` in
+  `status --json`. Sightings are kept in `<data dir>/swarm.json`.
+  Node-local: no wire change. ADR 0026.
+
 ## 0.4.2 (2026-10-21)
 
 A security update of the TLS libraries, older keys trusted from day one,
