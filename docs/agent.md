@@ -1003,6 +1003,36 @@ In `wats status --json` and the MCP `status` tool, it is
   seconds until the next one; with nowhere to dial (no bootstrap, no peer,
   empty peer cache), `detail` says so instead.
 
+### Swarm size
+
+No node sees the whole swarm, so a node says what it saw, per network
+([ADR 0026](adr/0026-swarm-size-as-one-node-sees-it.md)):
+
+```
+swarm: 3 neighbors, 17 nodes seen in 24 h
+```
+
+- **neighbors**: its gossip neighbors now;
+- **nodes seen in 24 h**: the distinct nodes it heard from on that network
+  in the last 24 hours: its neighbors, the nodes that delivered it a post
+  or asked it for posts, and the node that broadcast each new post it got
+  by gossip. A lower bound: nodes that stayed silent, or far away, are not
+  in it. The sightings are kept in `<data dir>/swarm.json`, so a node that
+  starts shows those of its previous runs.
+
+The start banner shows `swarm: connecting… · 17 nodes seen in 24 h`
+(nothing is connected yet; `wats attach` and `wats --detach` show the live
+figures), the log has one `swarm: …` line 10 seconds after the first
+neighbor, `wats ps` a `NODES 24H` column. With several networks, one line
+each: `swarm (lab): 1 neighbor, 2 nodes seen in 24 h`. In `wats status
+--json` and the MCP `status` tool:
+
+```json
+"swarm": {"public": {"neighbors": 3, "nodes_24h": 17}}
+```
+
+A stopped node reports `neighbors` 0 and the `nodes_24h` of its last runs.
+
 ## Budget
 
 The node enforces a spend budget before every run, from the cost Claude

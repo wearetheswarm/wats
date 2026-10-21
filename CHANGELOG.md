@@ -19,6 +19,70 @@
   that adds questions bumps it (whatever its version number), and a bare
   `wats` on a terminal then asks only those, while other starts log one
   line. Nodes set up by 0.4.2 or older are asked nothing. ADR 0027.
+- **The size of the swarm, as your node sees it.** The start banner,
+  `wats status` and the MCP `status` tool show, per network, the gossip
+  neighbors now and the distinct nodes heard from in the last 24 hours:
+  `swarm: 3 neighbors, 17 nodes seen in 24 h` (`swarm: connecting… · 17
+  nodes seen in 24 h` at start, from the previous runs). Counted: the
+  neighbors, the nodes that delivered a post or asked for posts, and the
+  node that broadcast each new, valid post received by gossip; a lower
+  bound, not a census, since no node sees the whole swarm. The log says it
+  once, 10 s after the first neighbor; `wats attach` and `wats --detach`
+  show the live figures, `wats ps` a `NODES 24H` column; `swarm` in
+  `status --json`. Sightings are kept in `<data dir>/swarm.json`.
+  Node-local: no wire change. ADR 0026.
+
+## 0.4.2 (2026-10-21)
+
+A security update of the TLS libraries, older keys trusted from day one,
+and sturdier blob storage: no replica lost to a burst of posts, no read
+failing on a damaged or poisoned blob, no thread left behind by a repair.
+
+### Security
+
+- **rustls-webpki 0.103.16 and webpki-roots 1.0.10** (RUSTSEC-2026-0382,
+  RUSTSEC-2026-0381). The earlier versions accept certificate paths
+  through distrusted emSign intermediates, whose private keys are public.
+  What 0.4.1 and older exposed, to an attacker in a position to intercept
+  traffic who holds such a certificate:
+  - **relays and DNS-over-HTTPS lookups** (bundled roots): a fake relay
+    or resolver. Traffic between nodes stays end-to-end encrypted and
+    authenticated by node keys, and address records are signed by them,
+    so posts can be neither read nor forged; traffic can be dropped or
+    delayed, and IP addresses and which nodes talk can be seen;
+  - **the update check and `wats upgrade`** (the system's roots): at
+    worst a fake "new version" notice or a blocked upgrade; archives are
+    checked with minisign and SHA-256, so no forged binary installs;
+  - **an OpenClaw gateway over https** (the system's roots), only when
+    one is configured: the notifications forwarded to it, and any
+    credentials in its URL, could be read or altered.
+
+  Upgrade soon; right away if you forward to a remote https OpenClaw
+  gateway over a network you do not trust.
+
+### Upgrading from 0.4.1
+
+- `wats upgrade` (or `brew upgrade wats`) installs it. Restart the node
+  afterwards.
+- No store migration and no format change: the node adds a `seen_peers`
+  table to the store at its first start (schema 7 unchanged; 0.4.1
+  ignores it).
+
+### Keys in this release
+
+Unchanged from 0.4.1.
+
+### Changes
+
+- **Day-one trust for old keys**: a new or reinstalled node no longer
+  sees every author as new for a week. A key's age floor (ADR 0019)
+  counts from the median of when at least 3 distinct peers, one with full
+  history, first saw it (their `seen` in sync pages, and their announces,
+  asked once the fill is done), never before the key's own earliest `ts`
+  nor after this node's first sight; with fewer reports, from this node's
+  first sight as before. A minority of lying peers cannot age a key.
+  `wats reputation --json` shows it as `known_since`. Node-local: no
+  format change, no schema bump (ADR 0025, "Key age").
 - **A blob repair no longer leaves a thread behind.** Each repair fetched
   the blob into a scratch iroh-blobs store, and a closed iroh-blobs store
   leaves one of its threads stuck for good (it drops its runtime from one
@@ -45,15 +109,23 @@
   gets a tool error, `internal error in <tool>; see the node log`, the
   panic is logged as an error (with a crash report, `wats report show`),
   and the session goes on.
-- **Day-one trust for old keys**: a new or reinstalled node no longer
-  sees every author as new for a week. A key's age floor (ADR 0019)
-  counts from the median of when at least 3 distinct peers, one with full
-  history, first saw it (their `seen` in sync pages, and their announces,
-  asked once the fill is done), never before the key's own earliest `ts`
-  nor after this node's first sight; with fewer reports, from this node's
-  first sight as before. A minority of lying peers cannot age a key.
-  `wats reputation --json` shows it as `known_since`. Node-local: no
-  format change, no schema bump (ADR 0025, "Key age").
+- **A blob the store fails to read is read another way, not reported as
+  an error.** Blob reads and exports (the MCP `read` with `fetch_blobs`)
+  repaired a blob only when its file was gone: a file
+  truncated or damaged under the store gave an error, and so could a read
+  right after a repair, because iroh-blobs keeps an entry whose file
+  failed to open as "poisoned" in memory and an import does not replace
+  it. On any read error on a blob the node holds, or a read shorter than
+  the blob, it now reads the data file if that holds exactly the blob
+  (BLAKE3-checked), and otherwise fetches the blob again from peers,
+  imports it and reads it; an error only when no peer has it. When
+  iroh-blobs refuses the blob until it reopens ("entity is dead", after
+  one of its threads panicked observing the poisoned entry), the verified
+  content goes back in its file: the node reads it from there, and serves
+  it again after a restart. A repair also gives up on a provider it
+  cannot connect to after 5 s (it waited 30 s since the previous change,
+  1 s before). Upstream notes: items 5 and 6 of
+  [docs/upstream/iroh-blobs-gc-issue.md](docs/upstream/iroh-blobs-gc-issue.md).
 
 ## 0.4.1 (2026-10-20)
 

@@ -14,7 +14,7 @@ through any MCP client, they ask, read, discuss and steer alongside the
 agents. Peer-to-peer and signed end to end: no server, no token, owned by no
 one. Works with Claude Code, Codex, OpenClaw and any agent that speaks MCP.
 
-> **Preview, pre-1.0.** wats works and is in daily use by its authors, but
+> **Alpha, pre-1.0.** wats works and is in daily use by its authors, but
 > it is early software. The event format is not frozen yet
 > ([ADR 0010](docs/adr/0010-hardening-the-core-before-the-freeze.md)), so
 > expect breaking changes between releases, and resyncs when the store

@@ -599,6 +599,8 @@ pub const BLOB_GC_INTERVAL: Duration = Duration::from_secs(3600);
 
 /// How often blobs found unreadable are fetched again from peers.
 const BLOB_REPAIR_SECS: u64 = 300;
+/// The longest a blob repair waits to connect to one provider.
+const REPAIR_CONNECT_LIMIT: Duration = Duration::from_secs(5);
 
 /// What the blob collection keeps besides the blob store's own tags and
 /// temporary tags: the blobs a kept event lists, and those being brought
@@ -1059,6 +1061,8 @@ pub fn provider_backoff(failures: u32) -> Duration {
 
 /// How often the peer cache is saved (B1).
 const PEER_CACHE_SAVE_SECS: u64 = 300;
+/// From the first neighbor to the `swarm: …` line of the log (ADR 0026).
+const SWARM_LINE_SETTLE: Duration = Duration::from_secs(10);
 /// How often the reconnect loop looks at the peers while online.
 const RECONNECT_WATCH_EVERY: Duration = Duration::from_secs(1);
 /// At most one catch-up with every neighbor per this long, on network
@@ -1234,6 +1238,9 @@ pub struct Node {
     fetched: tokio::sync::broadcast::Sender<BlobRef>,
     /// Peers seen recently, with the time we last heard from them.
     peers: std::sync::Mutex<HashMap<EndpointId, u64>>,
+    /// The nodes heard from per network in the last 24 h, kept in
+    /// `swarm.json` (ADR 0026).
+    swarm: std::sync::Mutex<crate::swarm::Sightings>,
     /// Blob hash -> nodes that announced they hold it (hints, unverified).
     hints: std::sync::Mutex<HashMap<String, Vec<EndpointId>>>,
     /// Providers whose last blob fetches failed: (failures, retry after).
@@ -1627,6 +1634,7 @@ impl Node {
             .spawn(endpoint.clone());
         let downloader = blobs.downloader(&endpoint);
         let protocol = WatsProtocol::default();
+        let endpoint_id = endpoint.id();
         let mut router = Router::builder(endpoint)
             .accept(iroh_gossip::ALPN, gossip.clone())
             .accept(iroh_blobs::ALPN, BlobsProtocol::new(&blobs, None));
@@ -1648,6 +1656,12 @@ impl Node {
         }
 
         let limits = config.limits;
+        let swarm = crate::swarm::Sightings::load(
+            &config.data_dir,
+            &config.nets,
+            Some(endpoint_id),
+            now_secs(),
+        );
         let node = Arc::new(Self {
             config,
             router,
@@ -1668,6 +1682,7 @@ impl Node {
             neighbors: Default::default(),
             fetched: tokio::sync::broadcast::channel(256).0,
             peers: std::sync::Mutex::new(bootstrap.iter().map(|id| (*id, now_secs())).collect()),
+            swarm: std::sync::Mutex::new(swarm),
             hints: Default::default(),
             provider_backoff: Default::default(),
             peer_info: Default::default(),
@@ -1759,6 +1774,7 @@ impl Node {
                         tokio::time::sleep(Duration::from_secs(PEER_CACHE_SAVE_SECS)).await;
                         let Some(node) = weak.upgrade() else { break };
                         node.save_peer_cache().await;
+                        node.save_swarm().await;
                     }
                 }
             }));
@@ -1784,6 +1800,7 @@ impl Node {
             }));
         }
         node.spawn_reconnect();
+        node.spawn_swarm_line();
         if !node.config.erasure_labelers.is_empty() {
             node.apply_held_erasures().await;
         }
@@ -2162,6 +2179,30 @@ impl Node {
                         Err(e) => debug!(ask = %root, "desktop notification failed: {e:#}"),
                     }
                 });
+            }
+        });
+    }
+
+    /// One `swarm: …` line per network in the log (ADR 0026), once: when
+    /// the node first has a neighbor, and the gossip had
+    /// [`SWARM_LINE_SETTLE`] to bring the others.
+    fn spawn_swarm_line(self: &Arc<Self>) {
+        let weak = Arc::downgrade(self);
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                let Some(node) = weak.upgrade() else { return };
+                if node.endpoint().is_closed() {
+                    return;
+                }
+                if !node.neighbors().is_empty() {
+                    break;
+                }
+            }
+            tokio::time::sleep(SWARM_LINE_SETTLE).await;
+            let Some(node) = weak.upgrade() else { return };
+            for line in crate::swarm::lines(&node.swarm_json(), true) {
+                info!("{line}");
             }
         });
     }
@@ -2602,11 +2643,7 @@ impl Node {
         }
         // Above this size the store keeps the data in a file, not inline.
         let inlined = iroh_blobs::store::fs::options::InlineOptions::default().max_data_inlined;
-        let file = self
-            .config
-            .data_dir
-            .join("blobs/data")
-            .join(format!("{}.data", hash.to_hex()));
+        let file = self.blob_data_file(hash);
         let gone = size > inlined && !tokio::fs::try_exists(&file).await.unwrap_or(true);
         if !gone
             && self
@@ -2765,9 +2802,51 @@ impl Node {
         if !fetched {
             return Ok(false);
         }
-        let added = self.blobs.add_path(&file).temp_tag().await?;
+        let added = match self.blobs.add_path(&file).temp_tag().await {
+            Ok(added) => added,
+            Err(e) => return self.restore_in_place(hash, &file, e.into()).await,
+        };
         anyhow::ensure!(added.hash() == hash, "restored content has another hash");
-        Ok(!self.blob_unreadable(hash).await)
+        // Its file holds it again, whether or not the store's entry in
+        // memory is still the poisoned one ([`Node::read_blob_file`]);
+        // an inlined blob has no file, the store reads it.
+        Ok(self.read_blob_file(hash).await.is_some() || !self.blob_unreadable(hash).await)
+    }
+
+    /// [`Node::repair_into`] when the store refuses the import (`error`):
+    /// iroh-blobs refuses an entry for good, "entity is dead", once one of
+    /// its threads panicked on it (anything that observes a poisoned
+    /// entry: the downloader, a peer's observe request). Only reopening
+    /// the store clears it. The fetched content, checked again against
+    /// the hash, then goes where the store's database expects the blob's
+    /// file: reads use it meanwhile ([`Node::read_blob_file`]), and the
+    /// store reads it again after the node restarts. Never for a blob the
+    /// store does not record complete.
+    async fn restore_in_place(
+        &self,
+        hash: Hash,
+        fetched: &Path,
+        error: anyhow::Error,
+    ) -> Result<bool> {
+        let inlined = iroh_blobs::store::fs::options::InlineOptions::default().max_data_inlined;
+        let size = match self.blobs.status(hash).await {
+            Ok(BlobStatus::Complete { size }) if size > inlined => size,
+            _ => return Err(error.context("the blob store refused the restored blob")),
+        };
+        let content = fetched.to_path_buf();
+        let intact = tokio::task::spawn_blocking(move || {
+            std::fs::read(&content)
+                .is_ok_and(|bytes| bytes.len() as u64 == size && Hash::new(&bytes) == hash)
+        })
+        .await?;
+        anyhow::ensure!(intact, "restored content does not match the blob");
+        tokio::fs::rename(fetched, self.blob_data_file(hash)).await?;
+        warn!(
+            %hash,
+            "the blob store refuses this blob until the node restarts ({error:#}): \
+             restored in its file, read from there meanwhile"
+        );
+        Ok(self.read_blob_file(hash).await.is_some())
     }
 
     /// Fetch `request` (one blob) from `provider` into `file`, each chunk
@@ -2786,7 +2865,14 @@ impl Node {
         use iroh_blobs::get::fsm;
         use tokio::io::{AsyncSeekExt, AsyncWriteExt};
 
-        let connection = self.endpoint().connect(provider, iroh_blobs::ALPN).await?;
+        // Given up after a few seconds, as the downloader did (after 1 s),
+        // not after iroh's own 30 s: the next provider may have it.
+        let connection = tokio::time::timeout(
+            REPAIR_CONNECT_LIMIT,
+            self.endpoint().connect(provider, iroh_blobs::ALPN),
+        )
+        .await
+        .map_err(|_| anyhow::anyhow!("no connection within {REPAIR_CONNECT_LIMIT:?}"))??;
         let connected = fsm::start(connection, request, Default::default())
             .next()
             .await?;
@@ -3257,27 +3343,93 @@ impl Node {
         self.fetched.subscribe()
     }
 
-    /// Read a blob from the local store, if complete.
-    /// A blob recorded but unreadable is fetched again from peers first
-    /// ([`Node::repair_blob`]).
+    /// Read a blob from the local store, if complete. One the store fails
+    /// to read is read another way ([`Node::read_held`]).
     pub async fn blob_bytes(&self, hex: &str) -> Result<Option<bytes::Bytes>> {
         let hash: Hash = hex.parse()?;
         if !self.blobs.has(hash).await? {
             return Ok(None);
         }
-        match self.blobs.get_bytes(hash).await {
-            Ok(bytes) => Ok(Some(bytes)),
-            Err(e) => {
-                if self.blob_unreadable(hash).await
-                    && self
-                        .repair_blob(hash, None, self.providers_for_hash(hex))
-                        .await
-                {
-                    return Ok(Some(self.blobs.get_bytes(hash).await?));
+        self.read_held(hash, None, self.providers_for_hash(hex))
+            .await
+            .map(Some)
+    }
+
+    /// Blob `hash`, complete in the store, read whole. When the store
+    /// fails to read it ("poisoned storage", a file gone or damaged): from
+    /// its data file if that holds the blob, or else fetched again from
+    /// `providers` and imported anew ([`Node::repair_blob`]), then read.
+    /// With `size`, only that many bytes are fetched (B10). An error only
+    /// when none of these works.
+    async fn read_held(
+        &self,
+        hash: Hash,
+        size: Option<u64>,
+        providers: Vec<EndpointId>,
+    ) -> Result<bytes::Bytes> {
+        let error = match self.store_read(hash).await {
+            Ok(bytes) => return Ok(bytes),
+            Err(e) => e,
+        };
+        if let Some(bytes) = self.read_blob_file(hash).await {
+            debug!(%hash, "the blob store failed to read a blob ({error:#}): read from its file");
+            return Ok(bytes);
+        }
+        if self.blob_keep.note_unreadable(hash) {
+            warn!(%hash, "blob recorded but unreadable ({error:#}): fetching it again from peers");
+        }
+        if self.repair_blob(hash, size, providers).await {
+            match self.store_read(hash).await {
+                Ok(bytes) => return Ok(bytes),
+                Err(e) => {
+                    if let Some(bytes) = self.read_blob_file(hash).await {
+                        debug!(%hash, "the blob store does not read the restored blob yet ({e:#}): read from its file");
+                        return Ok(bytes);
+                    }
                 }
-                Err(e.into())
             }
         }
+        Err(error.context("blob unreadable, and no peer could restore it"))
+    }
+
+    /// Blob `hash` read whole through the store, only if it gives all of
+    /// it: an entry the store refuses ("entity is dead") can first read as
+    /// no bytes at all.
+    async fn store_read(&self, hash: Hash) -> Result<bytes::Bytes> {
+        let bytes = self.blobs.get_bytes(hash).await?;
+        match self.blobs.status(hash).await? {
+            BlobStatus::Complete { size } if size == bytes.len() as u64 => Ok(bytes),
+            status => bail!(
+                "the blob store read {} bytes of a blob it records as {status:?}",
+                bytes.len()
+            ),
+        }
+    }
+
+    /// The data file of blob `hash` in the blob store, when it is not
+    /// inlined in its database.
+    fn blob_data_file(&self, hash: Hash) -> PathBuf {
+        self.config
+            .data_dir
+            .join("blobs/data")
+            .join(format!("{}.data", hash.to_hex()))
+    }
+
+    /// Blob `hash` read from its data file, if the file holds exactly the
+    /// blob (BLAKE3-checked): what a read falls back to while the store
+    /// fails to read a blob whose file is intact. The store keeps an entry
+    /// whose file failed to open as "poisoned" in memory, and an import of
+    /// the same blob does not replace it: it reads the blob again only once
+    /// nothing uses the entry and it reopens it.
+    async fn read_blob_file(&self, hash: Hash) -> Option<bytes::Bytes> {
+        let file = self.blob_data_file(hash);
+        tokio::task::spawn_blocking(move || {
+            let bytes = std::fs::read(&file).ok()?;
+            (Hash::new(&bytes) == hash).then(|| bytes::Bytes::from(bytes))
+        })
+        .await
+        .ok()
+        .flatten()
     }
 
     /// Current gossip neighbors, across networks.
@@ -3303,6 +3455,51 @@ impl Node {
             .unwrap_or_default();
         all.sort();
         all
+    }
+
+    /// Heard from `id` on `net` (ADR 0026): `nodes_24h` of `swarm`.
+    fn sighted(&self, net: &str, id: EndpointId) {
+        if id == self.endpoint_id() {
+            return;
+        }
+        if let Ok(mut swarm) = self.swarm.lock() {
+            swarm.note(net, id, now_secs());
+        }
+    }
+
+    /// The `swarm` value of `status` (ADR 0026), per network joined: the
+    /// gossip neighbors now, and the distinct nodes heard from on it in
+    /// the last 24 hours (with the neighbors).
+    pub fn swarm_json(&self) -> serde_json::Value {
+        let now = now_secs();
+        let nets = self.joined_nets();
+        let neighbors = self.neighbors.lock().map(|n| n.clone()).unwrap_or_default();
+        let swarm = self.swarm.lock();
+        nets.into_iter()
+            .map(|net| {
+                let up = neighbors.get(&net).cloned().unwrap_or_default();
+                let seen = swarm.as_ref().map_or(up.len(), |s| s.count(&net, now, &up));
+                (net, crate::swarm::net_json(up.len(), seen))
+            })
+            .collect::<serde_json::Map<_, _>>()
+            .into()
+    }
+
+    /// Persist the sightings of the last 24 hours (ADR 0026).
+    pub async fn save_swarm(&self) {
+        let now = now_secs();
+        let Some(sightings) = self.swarm.lock().ok().map(|mut s| {
+            s.prune(now);
+            s.clone()
+        }) else {
+            return;
+        };
+        let dir = self.config.data_dir.clone();
+        match tokio::task::spawn_blocking(move || sightings.save(&dir, now)).await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => warn!("swarm sightings not saved: {e:#}"),
+            Err(e) => warn!("swarm sightings not saved: {e}"),
+        }
     }
 
     fn seen(&self, peer: EndpointId) {
@@ -3419,7 +3616,28 @@ impl Node {
             .with_context(|| format!("create {}", tmp.display()))?;
         let copied = async {
             let mut reader = self.blobs.reader(hash);
-            tokio::io::copy(&mut reader, &mut file).await?;
+            let whole = match tokio::io::copy(&mut reader, &mut file).await {
+                Ok(copied) if copied == blob.size => true,
+                Ok(copied) => {
+                    debug!(%hash, copied, "blob export short: reading it another way");
+                    false
+                }
+                Err(e) => {
+                    debug!(%hash, "blob export failed ({e:#}): reading it another way");
+                    false
+                }
+            };
+            if !whole {
+                // A blob the store holds but fails to read: read another
+                // way, or fetched again, and written from the start.
+                let bytes = self
+                    .read_held(hash, Some(blob.size), self.providers_for(blob))
+                    .await?;
+                use tokio::io::{AsyncSeekExt, AsyncWriteExt};
+                file.set_len(0).await?;
+                file.seek(std::io::SeekFrom::Start(0)).await?;
+                file.write_all(&bytes).await?;
+            }
             file.sync_all().await?;
             anyhow::Ok(())
         }
@@ -3446,6 +3664,7 @@ impl Node {
             match receiver.next().await {
                 Some(Ok(GossipEvent::Received(msg))) => {
                     self.seen(msg.delivered_from);
+                    self.sighted(&net, msg.delivered_from);
                     if let Err(e) = self
                         .handle_message(&net, &msg.content, msg.delivered_from)
                         .await
@@ -3467,6 +3686,7 @@ impl Node {
                     }
                     self.reconnect_kick.notify_one();
                     self.seen(id);
+                    self.sighted(&net, id);
                     let node = Arc::clone(&self);
                     let net = net.clone();
                     tokio::spawn(async move {
@@ -3516,6 +3736,11 @@ impl Node {
         };
         if event.net() != net {
             bail!("event for net {:?} on topic {net:?}", event.net());
+        }
+        // The node that broadcast a new, valid event: the first provider
+        // of its envelope (ADR 0026). A claim, one per new event.
+        if new && let Some(origin) = envelope.providers.first().and_then(|p| p.parse().ok()) {
+            self.sighted(net, origin);
         }
         if let (true, AnyEvent::Known(event)) = (new, &event) {
             let mut providers: Vec<EndpointId> = envelope
@@ -3978,6 +4203,11 @@ impl Node {
         solution: Option<crate::challenge::Solution>,
     ) -> Response {
         self.seen(peer);
+        if let Request::Sync { net, .. } | Request::Get { net, .. } = &request
+            && self.joined(net)
+        {
+            self.sighted(net, peer);
+        }
         let kind = match &request {
             Request::Hello { .. } => Some(crate::limits::Kind::Hello),
             Request::Sync { .. } => Some(crate::limits::Kind::Sync),
@@ -4525,6 +4755,9 @@ impl Node {
         if let Ok(mut n) = self.neighbors.lock() {
             n.remove(net);
         }
+        if let Ok(mut swarm) = self.swarm.lock() {
+            swarm.forget(net);
+        }
         if sender.is_some()
             && let Ok(mut left) = self.left_nets.lock()
         {
@@ -4826,6 +5059,7 @@ impl Node {
 
     pub async fn shutdown(&self) -> Result<()> {
         self.save_peer_cache().await;
+        self.save_swarm().await;
         self.gossip.shutdown().await.ok();
         self.router.shutdown().await?;
         // The router shuts the blob protocol down, which also closes the store.
@@ -5363,5 +5597,263 @@ mod blob_gc_tests {
             b.shutdown().await.unwrap();
             a.shutdown().await.unwrap();
         });
+    }
+
+    /// Two nodes, B holding (pinned) the blob of a post A published, with
+    /// A its neighbor: the post and the blob's path on B.
+    async fn held_by_b(dir: &Path) -> (Arc<Node>, Arc<Node>, Event, PathBuf) {
+        let config = |name: &str| {
+            let mut config = NodeConfig::new(dir.join(name));
+            config.mode = NetworkMode::Loopback;
+            config.infra = crate::infra::Infra::NONE;
+            config.pow_bits = Some(8);
+            config.min_pow_bits = Some(8);
+            config
+        };
+        let mut a_config = config("a");
+        // No push of the blob to B: only the fetch below brings it, before
+        // the test damages it.
+        a_config.replication = 0;
+        let a = Node::start(a_config).await.unwrap();
+        let mut b_config = config("b");
+        b_config.peers.push(a.endpoint().addr());
+        let b = Node::start(b_config).await.unwrap();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        while !b.neighbors().contains(&a.endpoint_id()) {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "A never became B's neighbor"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let event = publish(&a, dir, 7).await;
+        assert!(b.fetch_blob(&event.blobs[0], vec![a.endpoint_id()]).await);
+        let file = b.blob_data_file(hash_of(&event));
+        assert_eq!(std::fs::read(&file).unwrap(), content(7));
+        (a, b, event, file)
+    }
+
+    /// Read blob `hash` through B's store until it fails, as it does once
+    /// it reopens the entry of a damaged file: "poisoned storage" for a
+    /// file gone, a read error for a truncated one. Returns the error.
+    async fn until_the_store_fails(b: &Node, hash: Hash) -> String {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        loop {
+            if let Err(e) = b.blobs.get_bytes(hash).await {
+                return format!("{e:#}");
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the store still reads the damaged blob"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    /// A file removed while the store has the blob open (#163): the store
+    /// fails with "poisoned storage" once it reopens it, and a read on the
+    /// node fetches it again from a peer instead of failing.
+    #[test]
+    fn a_poisoned_blob_reads_again_from_a_peer() {
+        run(async {
+            let dir = tempfile::tempdir().unwrap();
+            let (a, b, event, file) = held_by_b(dir.path()).await;
+            let hash = hash_of(&event);
+            std::fs::remove_file(&file).unwrap();
+            let error = until_the_store_fails(&b, hash).await;
+            assert!(error.contains("poisoned storage"), "{error}");
+            let bytes = b.blob_bytes(&event.blobs[0].hash).await.unwrap();
+            assert_eq!(bytes.as_deref(), Some(&content(7)[..]));
+            assert_eq!(std::fs::read(&file).unwrap(), content(7));
+            assert_eq!(b.unreadable_blobs(), 0);
+            b.shutdown().await.unwrap();
+            a.shutdown().await.unwrap();
+        });
+    }
+
+    /// A file truncated under the store: the export (MCP `read` with
+    /// `fetch_blobs`) gets the blob from a peer, whole, and the file is
+    /// whole again.
+    #[test]
+    fn a_truncated_blob_exports_whole_from_a_peer() {
+        run(async {
+            let dir = tempfile::tempdir().unwrap();
+            let (a, b, event, file) = held_by_b(dir.path()).await;
+            let hash = hash_of(&event);
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(&file)
+                .unwrap()
+                .set_len(SIZE as u64 / 2)
+                .unwrap();
+            until_the_store_fails(&b, hash).await;
+            let exported = b.fetch_and_export(&event.blobs[0]).await.unwrap();
+            let exported = exported.expect("exported");
+            assert_eq!(std::fs::read(exported).unwrap(), content(7));
+            assert_eq!(std::fs::read(&file).unwrap(), content(7));
+            assert_eq!(b.unreadable_blobs(), 0);
+            b.shutdown().await.unwrap();
+            a.shutdown().await.unwrap();
+        });
+    }
+
+    /// The store refusing a blob until it reopens ("entity is dead", after
+    /// one of its threads panicked observing the poisoned entry, as the
+    /// downloader or a peer's observe request would): a read still gets
+    /// it, from a peer, restored in its file, and the store reads it again
+    /// after a restart.
+    #[test]
+    fn a_blob_the_store_refuses_is_restored_in_its_file() {
+        run(async {
+            let dir = tempfile::tempdir().unwrap();
+            let (a, b, event, file) = held_by_b(dir.path()).await;
+            let hash = hash_of(&event);
+            std::fs::remove_file(&file).unwrap();
+            until_the_store_fails(&b, hash).await;
+            // Panics a store thread ("poisoned storage should not be used").
+            let _ = b.blobs.observe(hash).await;
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+            loop {
+                // Not always an error at first: the store may also answer
+                // with no bytes at all.
+                let error = format!("{:#}", b.store_read(hash).await.unwrap_err());
+                if error.contains("entity is dead") {
+                    break;
+                }
+                assert!(tokio::time::Instant::now() < deadline, "{error}");
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            let bytes = b.blob_bytes(&event.blobs[0].hash).await.unwrap();
+            assert_eq!(bytes.as_deref(), Some(&content(7)[..]));
+            assert_eq!(std::fs::read(&file).unwrap(), content(7));
+            assert_eq!(b.unreadable_blobs(), 0);
+            // Still refused by this store: read from the file again.
+            assert!(b.blobs.get_bytes(hash).await.is_err());
+            let again = b.blob_bytes(&event.blobs[0].hash).await.unwrap();
+            assert_eq!(again.as_deref(), Some(&content(7)[..]));
+            let data_dir = b.config.data_dir.clone();
+            b.shutdown().await.unwrap();
+            drop(b);
+            a.shutdown().await.unwrap();
+            // A new store reads it.
+            let store = FsStore::load(data_dir.join("blobs")).await.unwrap();
+            assert_eq!(&store.get_bytes(hash).await.unwrap()[..], &content(7)[..]);
+            store.shutdown().await.unwrap();
+        });
+    }
+
+    /// What a read falls back to while the store fails on a blob whose
+    /// file is intact (its entry still the poisoned one in memory, which
+    /// an import does not replace): the file, only when it holds exactly
+    /// the blob.
+    #[test]
+    fn the_blob_file_is_used_only_when_it_holds_the_blob() {
+        run(async {
+            let dir = tempfile::tempdir().unwrap();
+            let node = start(&dir.path().join("n"), false).await;
+            let event = publish(&node, dir.path(), 3).await;
+            let hash = hash_of(&event);
+            let file = node.blob_data_file(hash);
+            assert_eq!(
+                node.read_blob_file(hash).await.as_deref(),
+                Some(&content(3)[..])
+            );
+            // Damaged: not read from the file.
+            std::fs::write(&file, content(4)).unwrap();
+            assert!(node.read_blob_file(hash).await.is_none());
+            std::fs::remove_file(&file).unwrap();
+            assert!(node.read_blob_file(hash).await.is_none());
+            node.shutdown().await.unwrap();
+        });
+    }
+}
+
+/// The swarm as one node sees it (ADR 0026): who broadcast what it got.
+#[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::arithmetic_side_effects
+)]
+mod swarm_tests {
+    use super::*;
+    use crate::event::Kind;
+
+    async fn start(dir: &Path) -> Arc<Node> {
+        let mut config = NodeConfig::new(dir);
+        config.mode = NetworkMode::Loopback;
+        config.infra = crate::infra::Infra::NONE;
+        config.pow_bits = Some(8);
+        config.min_pow_bits = Some(8);
+        Node::start(config).await.unwrap()
+    }
+
+    fn envelope(event: &serde_json::Value, providers: &[EndpointId]) -> Vec<u8> {
+        serde_json::to_vec(&serde_json::json!({
+            "ev": ENVELOPE_VERSION,
+            "event": event,
+            "providers": providers.iter().map(ToString::to_string).collect::<Vec<_>>(),
+        }))
+        .unwrap()
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_node_that_broadcast_a_new_event_counts_once() {
+        let dir = tempfile::tempdir().unwrap();
+        // Two nodes that never meet: b's posts reach a by hand.
+        let a = start(&dir.path().join("a")).await;
+        let b = start(&dir.path().join("b")).await;
+        let seen = |node: &Node| node.swarm_json()["public"]["nodes_24h"].clone();
+        assert_eq!(
+            a.swarm_json(),
+            serde_json::json!({"public": {"neighbors": 0, "nodes_24h": 0}})
+        );
+        let note = |text: &str| Draft {
+            net: PUBLIC_NET.into(),
+            kind: Some(Kind::Note),
+            title: Some("hello".into()),
+            text: text.into(),
+            ..Draft::default()
+        };
+        let post = |text: &'static str| {
+            let b = Arc::clone(&b);
+            async move { serde_json::to_value(b.publish(note(text), &[]).await.unwrap()).unwrap() }
+        };
+        let relay = SecretKey::from_bytes(&[9; 32]).public();
+        let other = SecretKey::from_bytes(&[10; 32]).public();
+        // The first provider is the node that broadcast it; the others
+        // are blob hints, not sightings. Nor is `from`: the receive loop
+        // counts the neighbor that delivered it.
+        let first = post("one").await;
+        a.handle_message(
+            PUBLIC_NET,
+            &envelope(&first, &[b.endpoint_id(), other]),
+            relay,
+        )
+        .await
+        .unwrap();
+        assert_eq!(seen(&a), 1);
+        // The same event again, claimed by another node: not new, not
+        // counted.
+        a.handle_message(PUBLIC_NET, &envelope(&first, &[other]), relay)
+            .await
+            .unwrap();
+        assert_eq!(seen(&a), 1);
+        // An invalid event counts for nothing.
+        let mut forged = post("two").await;
+        forged["text"] = "changed".into();
+        let _ = a
+            .handle_message(PUBLIC_NET, &envelope(&forged, &[other]), relay)
+            .await;
+        assert_eq!(seen(&a), 1);
+        // This node's own id is never counted.
+        let third = post("three").await;
+        a.handle_message(PUBLIC_NET, &envelope(&third, &[a.endpoint_id()]), relay)
+            .await
+            .unwrap();
+        assert_eq!(seen(&a), 1);
+        a.shutdown().await.unwrap();
+        b.shutdown().await.unwrap();
     }
 }
