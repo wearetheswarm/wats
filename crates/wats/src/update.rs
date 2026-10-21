@@ -466,6 +466,83 @@ pub fn rollback(exe: &Path) -> Result<PathBuf> {
     Ok(old)
 }
 
+/// Keys of config.toml with the first release that knows them, from 0.4.1
+/// on: an older wats refuses a config.toml that sets one (unknown keys are
+/// errors). A release adding a key lists it here.
+pub const KEYS_SINCE: &[(&str, Version)] = &[
+    ("infra_relays", Version(0, 4, 1)),
+    ("infra_dns", Version(0, 4, 1)),
+    ("storage.events_share", Version(0, 4, 1)),
+    ("sync.initial_max", Version(0, 4, 1)),
+    ("update.security_auto", Version(0, 4, 3)),
+];
+
+/// The keys set in `data_dir`'s config.toml that wats `version` does not
+/// know ([`KEYS_SINCE`]). None when config.toml is absent or unreadable.
+pub fn keys_unknown_to(data_dir: &Path, version: Version) -> Vec<&'static str> {
+    let Ok(file) = crate::settings::ConfigFile::open(data_dir) else {
+        return Vec::new();
+    };
+    KEYS_SINCE
+        .iter()
+        .filter(|(key, since)| version < *since && file.get(key).is_some())
+        .map(|(key, _)| *key)
+        .collect()
+}
+
+/// The version `<binary> --version` prints (`wats X.Y.Z`), if it runs.
+pub fn binary_version(binary: &Path) -> Option<Version> {
+    let out = std::process::Command::new(binary)
+        .arg("--version")
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()?;
+    let text = String::from_utf8_lossy(&out.stdout);
+    Version::parse(text.trim().strip_prefix("wats ")?)
+}
+
+/// Before `wats upgrade --rollback`: when the previous binary (`old`) is
+/// older than `current`, refuse while config.toml sets keys it would
+/// refuse, and name the `wats config unset` commands to run first, with
+/// this binary (the older one cannot unset a key it does not know, nor
+/// start with it). A previous binary that does not say its version is not
+/// checked.
+pub fn check_rollback(old: &Path, data_dir: &Path, current: Version) -> Result<()> {
+    let Some(version) = binary_version(old).filter(|v| *v < current) else {
+        return Ok(());
+    };
+    let keys = keys_unknown_to(data_dir, version);
+    if keys.is_empty() {
+        return Ok(());
+    }
+    let dir = shell_word(&data_dir.display().to_string());
+    let commands: Vec<String> = keys
+        .iter()
+        .map(|key| format!("  wats --dir {dir} config unset {key}"))
+        .collect();
+    bail!(
+        "the previous binary is wats {version}, which refuses {} in {}: it would not start. \
+         Unset {} first, with this wats:\n{}\nthen run `wats upgrade --rollback` again",
+        keys.join(", "),
+        data_dir.join(crate::settings::FILE_NAME).display(),
+        if keys.len() == 1 { "it" } else { "them" },
+        commands.join("\n")
+    )
+}
+
+/// `s` as one shell word: as is when plain, else single-quoted.
+fn shell_word(s: &str) -> String {
+    let plain = !s.is_empty()
+        && s.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"/._-+:@%=,".contains(&b));
+    if plain {
+        s.to_string()
+    } else {
+        format!("'{}'", s.replace('\'', r"'\''"))
+    }
+}
+
 /// Run `<binary> --version` and expect `wats <version>`: the new binary
 /// runs on this machine before it replaces the current one.
 pub fn check_version_output(binary: &Path, version: Version) -> Result<()> {
@@ -689,6 +766,7 @@ pub async fn upgrade_command(opts: UpgradeOptions) -> Result<()> {
     );
     if opts.rollback {
         let exe = current_exe()?;
+        check_rollback(&old_path(&exe), &opts.data_dir, current)?;
         let old = rollback(&exe)?;
         println!("restored {} from {}", exe.display(), old.display());
         restart_note("the restored binary");
@@ -1706,6 +1784,84 @@ mod tests {
         };
         assert!(!may_check(&on, true));
         assert!(!may_check(&off, false));
+    }
+
+    #[test]
+    fn keys_since_are_real_keys() {
+        for (key, _) in KEYS_SINCE {
+            crate::settings::find_key(key).unwrap();
+        }
+        assert!(
+            KEYS_SINCE.contains(&("update.security_auto", Version(0, 4, 3))),
+            "ADR 0030"
+        );
+    }
+
+    /// `wats upgrade --rollback` to an older binary refuses while
+    /// config.toml sets keys that binary refuses, with the exact commands
+    /// to run first (ADR 0030); otherwise it goes ahead.
+    #[cfg(unix)]
+    #[test]
+    fn rollback_names_the_keys_an_older_wats_refuses() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let old = dir.path().join("wats.old");
+        let fake = |version: &str| {
+            std::fs::write(&old, format!("#!/bin/sh\necho 'wats {version}'\n")).unwrap();
+            std::fs::set_permissions(&old, std::fs::Permissions::from_mode(0o755)).unwrap();
+        };
+        let data = dir.path().join("my data");
+        std::fs::create_dir_all(&data).unwrap();
+        let config = data.join(crate::settings::FILE_NAME);
+        std::fs::write(
+            &config,
+            "[update]\nsecurity_auto = true\nsecurity_delay = \"1d\"\n",
+        )
+        .unwrap();
+        let current = Version(0, 4, 3);
+        fake("0.4.2");
+        assert_eq!(binary_version(&old), Some(Version(0, 4, 2)));
+        assert_eq!(
+            keys_unknown_to(&data, Version(0, 4, 2)),
+            ["update.security_auto"]
+        );
+        let err = check_rollback(&old, &data, current)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("wats 0.4.2, which refuses update.security_auto"),
+            "{err}"
+        );
+        assert!(
+            err.contains(&format!(
+                "  wats --dir '{}' config unset update.security_auto\n",
+                data.display()
+            )),
+            "{err}"
+        );
+        // 0.4.3 or newer knows it; so does this binary's own version.
+        fake("0.4.3");
+        check_rollback(&old, &data, Version(0, 4, 4)).unwrap();
+        fake("0.4.2");
+        check_rollback(&old, &data, Version(0, 4, 2)).unwrap();
+        // 0.4.0 also refuses the keys of 0.4.1.
+        std::fs::write(&config, "[sync]\ninitial_max = \"0\"\n").unwrap();
+        fake("0.4.0");
+        let err = check_rollback(&old, &data, current)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("config unset sync.initial_max"), "{err}");
+        // No such key set, no config.toml, or an old binary that does not
+        // say its version: go ahead.
+        std::fs::write(&config, "[update]\nauto = true\n").unwrap();
+        check_rollback(&old, &data, current).unwrap();
+        std::fs::remove_file(&config).unwrap();
+        check_rollback(&old, &data, current).unwrap();
+        std::fs::write(&old, "#!/bin/sh\nexit 1\n").unwrap();
+        assert_eq!(binary_version(&old), None);
+        check_rollback(&old, &data, current).unwrap();
+        assert_eq!(shell_word("/home/me/.wats"), "/home/me/.wats");
+        assert_eq!(shell_word("it's"), r"'it'\''s'");
     }
 
     #[test]

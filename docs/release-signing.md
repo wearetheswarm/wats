@@ -102,7 +102,11 @@ above), each trusted comment names the expected file
 (`file:wats-X.Y.Z-<target>.tar.gz`, `….sha256`), and the SHA-256 matches.
 It then writes the new binary next to the current one, checks that it runs
 (`--version`), renames it over the current one, and keeps the previous one
-as `<binary>.old` (`wats upgrade --rollback` puts it back). A running node
+as `<binary>.old` (`wats upgrade --rollback` puts it back). Before putting
+an older binary back, `--rollback` asks it its version and refuses while
+`config.toml` sets keys that version does not know (an older wats refuses
+unknown keys), printing the `wats config unset …` commands to run first
+(ADR 0030). A running node
 keeps the old version until it is restarted; `wats upgrade` says so.
 `wats upgrade --check` only reports.
 
@@ -152,10 +156,15 @@ bad or rogue release would reach every node at once, and nothing can pull
 a release yet; to be revisited at beta, with several guardians and a way
 to pull a release (ADR 0030).
 
-A release that follows a security release within its delay should carry
-the `Security:` line again when it includes the fix: the node remembers
-the latest release only, so `update.security_auto` and the louder notice
-go by that one.
+**A release after a security release.** The node remembers the latest
+release only, and `update.security_auto` and the louder notice go by that
+one. So a release published while nodes may still run a version older
+than the last security release (in practice: within a week or so of it)
+carries the `Security:` line again, naming the security release it
+includes (`Security: includes the fix of 0.4.4 (GHSA-…)`). The release
+notes are written by hand when the release is published and are not
+signed; a signed, cumulative marker (the oldest version free of known
+issues) is not implemented yet (ADR 0030).
 
 ## How releases are signed
 

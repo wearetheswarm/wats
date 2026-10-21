@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+### Upgrading from 0.4.2
+
+- **Rolling back to 0.4.2** keeps working unless you answered yes to
+  security updates: 0.4.2 refuses unknown keys in `config.toml`, so
+  `wats upgrade --rollback` now checks the previous binary's version and,
+  when `config.toml` sets a key it does not know (here
+  `update.security_auto`), stops before swapping anything and prints the
+  command to run first: `wats --dir <data dir> config unset
+  update.security_auto`. Then run the rollback again. ADR 0030.
+
 ### Changes
 
 - **Security updates, installed automatically if you say so.** A new
@@ -14,7 +24,7 @@
   Homebrew install. The setup wizard and `wats setup` ask "Install
   security updates automatically?" (default yes): yes sets
   `security_auto = true` and, unless a delay is set, `security_delay =
-  "1d"`; no writes `security_auto = false`. Nodes set up before are not
+  "1d"`; no leaves the key unset (off). Nodes set up before are not
   asked (it is part of setup revision 1) and keep running as they do. A
   pending security release now gets a louder notice, without installing
   anything: a `SECURITY RELEASE: wats X.Y.Z …` line with the command to

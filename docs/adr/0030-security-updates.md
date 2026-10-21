@@ -10,7 +10,7 @@ node's main choices). Builds on the release check and `wats upgrade` of
 
 Code: `crates/wats/src/update.rs` (`UpdatePolicy::security_auto`,
 `auto_key`, `auto_target`, `security_notice`, `status_json`,
-`start_notice`), `crates/wats/src/settings.rs` (the key),
+`start_notice`, `check_rollback`, `KEYS_SINCE`), `crates/wats/src/settings.rs` (the key),
 `crates/wats/src/firstrun.rs` (`ask_security_auto`),
 `crates/wats/src/main.rs` (node start, `wats status`),
 `crates/wats/src/mcp.rs` (the `status` tool),
@@ -69,12 +69,34 @@ help now says that it applies to both keys. `update.security_auto` is a
 safety key (`crate::safety`): an agent turning it on in config.toml is
 flagged until the user runs `wats config ack`, like `update.auto`.
 
-**Known limit.** The cache of the daily check holds the latest release
-only. A security release followed, within its delay, by a normal one is
-not installed by `security_auto` (the latest is not marked security), and
-the louder notice does not show; the normal notice does. A release that
-follows a security release should carry the `Security:` line again when it
-includes the fix; release notes say so (docs/release-signing.md).
+**Known limit: a normal release can hide a security release.** The cache
+of the daily check holds the latest release only. A security release
+followed, within its delay, by a normal one is not installed by
+`security_auto` (the latest is not marked security), and the louder
+notice does not show; the normal notice does. The rule, documented in
+docs/release-signing.md: a release that follows a security release
+carries the `Security:` line again when a node older than that security
+release would still miss its fix.
+
+A cumulative marker (a signed `security_floor = "X.Y.Z"`, the oldest
+version free of known security issues: a node below it treats the latest
+release as a security release) was considered and **not implemented**,
+because the tooling it would extend is not in this repository:
+
+- the release metadata the node reads is the GitHub release's name and
+  notes, written by hand when the release is published, and **not
+  signed**; the `security` flag already comes from there;
+- what `release.yml` signs is the archive, its `.sha256` and
+  `install.sh`; there is no signed manifest, and no Makefile or script
+  that produces release metadata (`make release` does not exist);
+- the daily check downloads the release JSON only, not a signed file.
+
+A signed floor would need a new signed asset (for example
+`security.json`, signed by `release.yml` with the key it already uses),
+fetched and verified by the daily check before it trusts the floor, and a
+way for `release.yml` to compute it (from the previous release's floor,
+or a `### Security` section of the CHANGELOG). That is a change to the
+release process and the check, left for a later ADR.
 
 ### 2. The wizard's question
 
@@ -85,14 +107,17 @@ then:
     Install security updates automatically? (update.security_auto) [Y/n]
 
 - **Yes is the prompt's default**; the user decides. When `wats setup`
-  runs again, the default is the current value (as for
-  `notify.desktop`), so a No is not turned back into a Yes by Enter.
+  runs again, the default is the current value when the key is set (as
+  for `notify.desktop`): Yes after a Yes, No after a `security_auto =
+  false` set by hand; with the key absent, Yes again.
 - **Yes** writes `security_auto = true` and, when no
   `update.security_delay` is set, `security_delay = "1d"`; a delay of the
   user's own is kept.
-- **No** writes `security_auto = false`, explicitly, although `false` is
-  the default: the answer is recorded as the user's (`ALWAYS_WRITTEN` in
-  `firstrun.rs`; other keys at their default are unset).
+- **No** leaves `update.security_auto` unset (it unsets it after an
+  earlier Yes): absent is false, and a wats older than 0.4.3 refuses the
+  key (Consequences, "Rollback"), so most users keep a working rollback. The cost:
+  a No is not remembered, so a later `wats setup` asks with Yes as the
+  default again. (Revised 2026-10-21; the first version wrote `false`.)
 - **A Homebrew install** is not asked: one line says that `brew upgrade
   wats` installs its updates and that wats tells the user when a
   security release is out. Nothing is written.
@@ -199,10 +224,22 @@ before installing. Until then, the user opts in, per machine.
 - `crates/wats/tests/setup_wizard.rs` answers one more question in the
   wizard; the catch-up hint from revision 0 counts 10 questions.
 - **Rollback.** config.toml refuses unknown keys, so a wats older than
-  0.4.3 refuses a config.toml that sets `update.security_auto` (either
-  answer writes it). Before `wats upgrade --rollback` to 0.4.2, run `wats
-  config unset update.security_auto`, or remove the line from config.toml
-  afterwards. The same holds for any key a release adds.
+  0.4.3 refuses a config.toml that sets `update.security_auto` (only a
+  Yes writes it), and its `wats config unset` refuses the unknown key
+  too. So `wats upgrade --rollback` now checks first (`check_rollback`):
+  it runs `<binary>.old --version` (cheap: the previous binary, run as
+  the upgrade path already runs the new one), and when that version is
+  older than this one and config.toml sets a key it does not know
+  (`KEYS_SINCE` in `update.rs`: the 0.4.1 keys and
+  `update.security_auto`), it refuses before swapping anything, naming
+  the keys and the exact commands to run first with the current binary,
+  `wats --dir <data dir> config unset update.security_auto`, then the
+  rollback again. A warning after the swap would leave the user with a
+  node that does not start and no binary able to unset the key. It
+  checks the data directory of the command (`--dir`, `WATS_DIR` or the
+  default) only; other data directories (a fleet) are not looked at. A
+  previous binary that does not print its version is not checked. A
+  release adding a key adds it to `KEYS_SINCE`.
 
 ## SPEC
 

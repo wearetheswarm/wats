@@ -115,10 +115,6 @@ pub const SECURITY_AUTO_HOMEBREW: &str = "Security updates: Homebrew installed t
 /// The `update.security_delay` a Yes sets when none is set.
 pub const SECURITY_DELAY: &str = "1d";
 
-/// Keys written even at their default value: the user's answer, recorded
-/// as such.
-const ALWAYS_WRITTEN: [&str; 1] = ["update.security_auto"];
-
 /// One question after the agent runtime.
 #[derive(Debug, Clone, Copy)]
 struct Question {
@@ -558,7 +554,11 @@ pub fn render(choices: &Choices) -> Result<String> {
             settings::check_value("notify.desktop", on)?
         ));
     }
-    if let Some(on) = chosen("update.security_auto") {
+    // Only a Yes is written: absent is false, and a wats older than 0.4.3
+    // refuses the key (ADR 0030).
+    if let Some(on) =
+        chosen("update.security_auto").filter(|v| !is_default("update.security_auto", v))
+    {
         text.push_str(&format!(
             "\n[update]\n# {}\nsecurity_auto = {}\n",
             settings::find_key("update.security_auto")?.help,
@@ -634,7 +634,7 @@ pub fn apply(data_dir: &Path, choices: &Choices) -> Result<PathBuf> {
             Some(name) => agent_key(name, key),
             None => key.to_string(),
         };
-        if is_default(&key, value) && !ALWAYS_WRITTEN.contains(&key.as_str()) {
+        if is_default(&key, value) {
             file.unset(&key)?;
         } else {
             file.set(&key, value)?;
@@ -812,11 +812,13 @@ fn ask_and_write_with(
     Ok((choices, found))
 }
 
-/// The security updates question (ADR 0030), default Yes (or the current
-/// value, when `wats setup` runs again): Yes sets `update.security_auto`
-/// and, when none is set, `update.security_delay` to [`SECURITY_DELAY`];
-/// No writes `update.security_auto = false`. Not asked for a Homebrew
-/// install (`homebrew`), which the node never upgrades.
+/// The security updates question (ADR 0030), default Yes (or No when
+/// `wats setup` runs again over a `security_auto = false` set by hand):
+/// Yes sets `update.security_auto` and, when none is set,
+/// `update.security_delay` to [`SECURITY_DELAY`]; No leaves
+/// `update.security_auto` unset (absent is false), so that a rollback to
+/// a wats that does not know the key keeps working. Not asked for a
+/// Homebrew install (`homebrew`), which the node never upgrades.
 fn ask_security_auto(
     input: &mut impl BufRead,
     out: &mut impl Write,
@@ -1022,8 +1024,9 @@ mod tests {
             policy.security_delay,
             Some(std::time::Duration::from_secs(86400))
         );
-        // Again: the current value is the default; "n" writes false (not
-        // unset, though false is the default) and keeps the delay.
+        // Again: the current value is the default; "n" unsets the key
+        // (absent is false, and an older wats refuses it) and keeps the
+        // delay.
         let mut out = Vec::new();
         setup_with(
             data.path(),
@@ -1035,14 +1038,25 @@ mod tests {
         .unwrap();
         let said = String::from_utf8(out).unwrap();
         assert!(said.contains("(update.security_auto) [Y/n]"), "{said}");
+        let text = std::fs::read_to_string(data.path().join(FILE_NAME)).unwrap();
+        assert!(!text.contains("security_auto ="), "{text}");
         let settings = Settings::load(data.path()).unwrap();
-        assert_eq!(settings.update.security_auto, Some(false));
+        assert_eq!(settings.update.security_auto, None);
+        assert!(!settings.update.policy().unwrap().security_auto);
         assert_eq!(settings.update.security_delay.as_deref(), Some("1d"));
+        // Set to false by hand: that is the default of the next run.
+        let mut file = ConfigFile::open(data.path()).unwrap();
+        file.set("update.security_auto", "false").unwrap();
+        file.save().unwrap();
         let mut out = Vec::new();
         setup_with(data.path(), &mut "".as_bytes(), &mut out, None, false).unwrap();
         let said = String::from_utf8(out).unwrap();
         assert!(said.contains("(update.security_auto) [y/N]"), "{said}");
-        // No on a new data directory: written as false, no delay.
+        assert_eq!(
+            Settings::load(data.path()).unwrap().update.security_auto,
+            None
+        );
+        // No on a new data directory: nothing written, no delay.
         let other = tempfile::tempdir().unwrap();
         setup_with(
             other.path(),
@@ -1053,10 +1067,10 @@ mod tests {
         )
         .unwrap();
         let text = std::fs::read_to_string(other.path().join(FILE_NAME)).unwrap();
-        assert!(text.contains("\nsecurity_auto = false\n"), "{text}");
+        assert!(!text.contains("security_auto"), "{text}");
         assert!(!text.contains("security_delay = "), "{text}");
         let settings = Settings::load(other.path()).unwrap();
-        assert_eq!(settings.update.security_auto, Some(false));
+        assert_eq!(settings.update.security_auto, None);
         // Yes with a delay of the user's own: kept.
         let mut file = ConfigFile::open(other.path()).unwrap();
         file.set("update.security_delay", "12h").unwrap();
