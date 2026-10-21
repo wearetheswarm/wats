@@ -368,6 +368,20 @@ async fn a_blob_of_knowledge_reaches_five_replicas() -> anyhow::Result<()> {
     let holder = by_id(&all, five[0]);
     assert_eq!(holder.blob_target_k(&knowledge).await, 5);
     assert_eq!(holder.blob_target_k(&ordinary).await, 3);
+    // Evicted on one of the two closest (always within its 2k), the
+    // knowledge replica is recorded with k = 5: once its post is a
+    // tombstone, knowledge cannot be computed again (review 2).
+    let evictor = five
+        .iter()
+        .map(|id| by_id(&all, *id))
+        .find(|n| n.endpoint_id() != publisher.endpoint_id())
+        .expect("one of the two closest is not the publisher");
+    evictor
+        .drop_body(&digest.id, DropReason::Evicted, None, None)
+        .await?;
+    let rows = evictor.store().evicted_replica_details(&digest.id)?;
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!((rows[0].0.as_str(), rows[0].1), (knowledge.as_str(), 5));
     for n in nodes {
         n.shutdown().await?;
     }
@@ -1123,6 +1137,51 @@ async fn an_evicted_replica_is_released_once_others_are_closer() -> anyhow::Resu
     assert!(holds(&reader, &hash).await);
     for n in joined {
         n.shutdown().await?;
+    }
+    holder.shutdown().await?;
+    Ok(())
+}
+
+/// The review of replicas kept through evictions walks every row, most
+/// overdue first: rows that stay (here, all within the 2k closest) do not
+/// pin the head (review 1). One row per pass here.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_evicted_replica_review_reaches_every_row() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let one = Tuning {
+        recheck: Duration::from_secs(3600),
+        evicted_per_pass: 1,
+        ..manual()
+    };
+    let publisher = start(&dir.path().join("p"), 3, manual()).await?;
+    let holder = start(&dir.path().join("h"), 3, one).await?;
+    mesh(&[&publisher, &holder]).await?;
+    let mut posts = Vec::new();
+    for seed in 0..3 {
+        let post = publish(&publisher, dir.path(), &content(800 + seed)).await?;
+        let hash = post.blobs[0].hash.clone();
+        eventually("the replica arrives", async || holds(&holder, &hash).await).await;
+        posts.push(post);
+    }
+    // No gossip copy may come back after the evictions.
+    publisher.shutdown().await?;
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    for post in &posts {
+        holder
+            .drop_body(&post.id, DropReason::Evicted, None, None)
+            .await?;
+    }
+    let due_later = |id: &str| -> anyhow::Result<bool> {
+        let rows = holder.store().evicted_replica_details(id)?;
+        Ok(!rows.is_empty() && rows.iter().all(|(_, _, due)| *due > wats::node::now_secs()))
+    };
+    for pass in 1..=3 {
+        holder.repair_pass().await;
+        let reviewed = posts
+            .iter()
+            .filter(|p| due_later(&p.id).unwrap_or(false))
+            .count();
+        assert_eq!(reviewed, pass, "one more row reviewed each pass");
     }
     holder.shutdown().await?;
     Ok(())

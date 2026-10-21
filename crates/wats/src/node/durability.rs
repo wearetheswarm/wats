@@ -92,7 +92,8 @@ const MISS_WINDOW_GAPS: u32 = 6;
 /// A refusal for good (full, quota, replica share) is remembered this
 /// long: space may be freed.
 const REFUSED_FOR: Duration = Duration::from_secs(6 * 3600);
-/// Rows of `evicted_replicas` looked at in one pass (N4).
+/// Rows of `evicted_replicas` read in one pass (N4), the most overdue
+/// first: [`Tuning::evicted_per_pass`].
 const EVICTED_PER_PASS: usize = 256;
 
 /// How replica repair runs ([`NodeConfig::durability`]); tests shorten it.
@@ -123,6 +124,9 @@ pub struct Tuning {
     /// A peer is replaced only after two misses (unreachable, or a bare
     /// decline) at least this far apart.
     pub miss_gap: Duration,
+    /// Rows of `evicted_replicas` read per pass: [`EVICTED_PER_PASS`];
+    /// tests lower it.
+    pub evicted_per_pass: usize,
     /// Test only: answer `replicate` as 0.4.2 does (a blob already held
     /// goes through the fetch slots and the storage checks; nothing
     /// recorded).
@@ -144,6 +148,7 @@ impl Default for Tuning {
             inventory_every: Duration::from_secs(3600),
             knowledge_replication: KNOWLEDGE_REPLICATION,
             miss_gap: Duration::from_secs(3600),
+            evicted_per_pass: EVICTED_PER_PASS,
             legacy_replicate: false,
             lie_replicate: false,
         }
@@ -276,8 +281,6 @@ pub struct State {
     checks: Mutex<HashMap<Hash, Check>>,
     inventory: Mutex<Option<(Instant, Inventory)>>,
     unreachable: Mutex<HashMap<EndpointId, Unreachable>>,
-    /// When each replica kept through an eviction is looked at next (N4).
-    evicted_due: Mutex<HashMap<Hash, Instant>>,
     /// Bytes of the blobs held as replicas: counted at start and at each
     /// inventory, kept up to date on every tag and untag (N9).
     replica_bytes: AtomicU64,
@@ -457,8 +460,11 @@ impl std::error::Error for KeptLastCopy {}
 /// What an eviction does with the blobs it would free (ADR 0029 §4).
 #[derive(Debug, Default)]
 pub(super) struct EvictionPlan {
-    /// Replicas kept: the body goes, the blob stays.
-    pub kept: Vec<String>,
+    /// Replicas kept: the body goes, the blob stays; with the k each
+    /// wants, recorded with it.
+    pub kept: Vec<(String, usize)>,
+    /// The k of every blob of the post, computed while it is still full.
+    pub ks: HashMap<String, usize>,
     /// Blobs other nodes proved they hold: released.
     pub released: Vec<String>,
     /// Blobs no other node proved it holds: the eviction is refused.
@@ -637,9 +643,19 @@ impl Node {
             && let Ok(BlobStatus::Complete { size }) = self.blobs.status(hash).await
         {
             let bytes = &self.durability.replica_bytes;
-            let _ = bytes.try_update(Ordering::Relaxed, Ordering::Relaxed, |b| {
-                Some(b.saturating_sub(size))
-            });
+            let mut current = bytes.load(Ordering::Relaxed);
+            loop {
+                let next = current.saturating_sub(size);
+                match bytes.compare_exchange_weak(
+                    current,
+                    next,
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                ) {
+                    Ok(_) => break,
+                    Err(seen) => current = seen,
+                }
+            }
         }
         super::unpin_blob(&self.blobs, hash).await
     }
@@ -774,9 +790,10 @@ impl Node {
             }
             Ok(Ok(Response::Replicated { .. })) => Answer::Declined,
             Ok(Ok(Response::Refused { reason })) if reason.contains("rate limited") => Answer::Busy,
-            // Only what the receiver says is for good: storage full, quota,
-            // replica share (S2). An event it did not accept is a decline.
-            Ok(Ok(Response::Refused { reason })) if reason.contains(NOT_TAKING) => {
+            // A refusal (storage full, quota, replica share, the event
+            // rejected by its policy) means that peer will not hold it: the
+            // next peer is asked at once, for 6 hours (S2, review 3).
+            Ok(Ok(Response::Refused { reason })) => {
                 debug!(peer = %peer.fmt_short(), %hash, "repair: refused: {reason}");
                 Answer::Refused
             }
@@ -1000,8 +1017,10 @@ impl Node {
             return 0;
         }
         let store = Arc::clone(&self.store);
+        let now_secs = crate::node::now_secs();
+        let limit = self.config.durability.evicted_per_pass.min(budget);
         let rows =
-            match tokio::task::spawn_blocking(move || store.evicted_replica_rows(EVICTED_PER_PASS))
+            match tokio::task::spawn_blocking(move || store.evicted_replica_rows(now_secs, limit))
                 .await
             {
                 Ok(Ok(rows)) => rows,
@@ -1011,65 +1030,78 @@ impl Node {
                 }
                 Err(_) => return 0,
             };
-        let now = Instant::now();
         let recheck = self.config.durability.recheck;
         let mut done = 0usize;
-        for (id, hex, net) in rows {
+        for (id, hex, net, row_k) in rows {
             if done >= budget {
                 break;
             }
             let Ok(hash) = hex.parse::<Hash>() else {
                 continue;
             };
-            let due = self.durability.evicted_due.lock().ok().map(|mut d| {
-                *d.entry(hash)
-                    .or_insert_with(|| now.checked_add(within(recheck)).unwrap_or(now))
-            });
-            if due.is_none_or(|due| due > now) {
-                continue;
-            }
             done = done.saturating_add(1);
-            let next = now.checked_add(jittered(recheck)).unwrap_or(now);
-            if let Ok(mut d) = self.durability.evicted_due.lock() {
-                if d.len() > 100_000 {
-                    d.clear();
-                }
-                d.insert(hash, next);
+            // Due again after `recheck` (jittered), whatever happens below:
+            // the next rows come first meanwhile.
+            let next = now_secs.saturating_add(jittered(recheck).as_secs());
+            let store = Arc::clone(&self.store);
+            let (due_id, due_hash) = (id.clone(), hex.clone());
+            if let Ok(Err(e)) =
+                tokio::task::spawn_blocking(move || store.set_evicted_due(&due_id, &due_hash, next))
+                    .await
+            {
+                warn!(%hash, "evicted replica not rescheduled: {e:#}");
             }
+            // Not held any more (a fault, a manual cleanup): nothing to keep.
+            let Ok(BlobStatus::Complete { size }) = self.blobs.status(hash).await else {
+                self.forget_evicted_replica(&id, &hex, hash).await;
+                continue;
+            };
             if self.within_twice_k(&hash, &net) {
                 debug!(%hash, %id, "evicted replica kept: within the 2k closest");
                 continue;
             }
-            let Ok(BlobStatus::Complete { size }) = self.blobs.status(hash).await else {
-                continue;
+            // The k recorded at eviction (5 for knowledge): the post is a
+            // tombstone, so knowledge cannot be computed again (review 2).
+            let k = if row_k > 0 {
+                row_k
+            } else {
+                self.blob_target_k(&hex).await
             };
-            let k = self.blob_target_k(&hex).await;
             let proven = self.prove_others(&hash, size, &net, k).await;
             if proven < k {
                 debug!(%hash, %id, proven, k, "evicted replica kept: too few holders proven");
                 continue;
             }
-            let store = Arc::clone(&self.store);
-            let (row_id, row_hash) = (id.clone(), hex.clone());
-            match tokio::task::spawn_blocking(move || {
-                store.release_evicted_replica(&row_id, &row_hash)
-            })
-            .await
-            {
-                Ok(Ok(true)) => {
-                    if let Err(e) = self.untag_blob(hash).await {
-                        warn!(%hash, "evicted replica not untagged: {e:#}");
-                    } else {
-                        bump(&self.durability.stats.handed_off);
-                        info!(%hash, %id, "replica released: outside the 2k closest, k holders proven");
-                    }
-                }
-                Ok(Ok(false)) => {}
-                Ok(Err(e)) => warn!(%hash, "evicted replica not released: {e:#}"),
-                Err(_) => {}
+            if self.forget_evicted_replica(&id, &hex, hash).await {
+                bump(&self.durability.stats.handed_off);
+                info!(%hash, %id, k, "replica released: outside the 2k closest, k holders proven");
             }
         }
         done
+    }
+
+    /// Forget the replica `hex` kept for post `id`, and untag the blob
+    /// when nothing else keeps it. True when it was untagged.
+    async fn forget_evicted_replica(&self, id: &str, hex: &str, hash: Hash) -> bool {
+        let store = Arc::clone(&self.store);
+        let (row_id, row_hash) = (id.to_string(), hex.to_string());
+        match tokio::task::spawn_blocking(move || store.release_evicted_replica(&row_id, &row_hash))
+            .await
+        {
+            Ok(Ok(true)) => match self.untag_blob(hash).await {
+                Ok(()) => true,
+                Err(e) => {
+                    warn!(%hash, "evicted replica not untagged: {e:#}");
+                    false
+                }
+            },
+            Ok(Ok(false)) => false,
+            Ok(Err(e)) => {
+                warn!(%hash, "evicted replica not released: {e:#}");
+                false
+            }
+            Err(_) => false,
+        }
     }
 
     /// Prove `need` holders of blob `hash` among the closest members of
@@ -1177,7 +1209,9 @@ impl Node {
                 .get(&peer)
                 .is_some_and(|at| at.elapsed() < REFUSED_FOR)
                 || self.durability.gone(&peer, gap)
-                || declined.get(&peer).is_some_and(|m| m.for_good(gap))
+                || declined
+                    .get(&peer)
+                    .is_some_and(|m| m.for_good(gap) && m.last.elapsed() < REFUSED_FOR)
             {
                 continue;
             }
@@ -1237,6 +1271,7 @@ impl Node {
                 .or_insert_with(|| Check::new(Instant::now()));
             let now = Instant::now();
             check.refused.retain(|_, at| at.elapsed() < REFUSED_FOR);
+            check.declined.retain(|_, m| m.last.elapsed() < REFUSED_FOR);
             for peer in new_refused {
                 check.refused.insert(peer, now);
             }
@@ -1382,17 +1417,25 @@ impl Node {
         let owned = id.to_string();
         let freed = tokio::task::spawn_blocking(move || store.blobs_freed_by(&owned)).await??;
         let mut plan = EvictionPlan::default();
+        for blob in event.blobs.iter().filter(|b| b.url.is_none()) {
+            if !plan.ks.contains_key(&blob.hash) {
+                let k = self.blob_target_k(&blob.hash).await;
+                plan.ks.insert(blob.hash.clone(), k);
+            }
+        }
+        let k_of = |hex: &str| plan_k(&plan.ks, hex, self.config.replication);
         // Every replica blob of the post is recorded, freed or not (N8):
         // when the other events that list it go too, the record keeps it.
+        let mut kept: Vec<(String, usize)> = Vec::new();
         for blob in event.blobs.iter().filter(|b| b.url.is_none()) {
             if freed.contains(&blob.hash) {
                 continue;
             }
             if let Ok(hash) = blob.hash.parse::<Hash>()
                 && self.has_replica_intent(&hash).await
-                && !plan.kept.contains(&blob.hash)
+                && !kept.iter().any(|(h, _)| *h == blob.hash)
             {
-                plan.kept.push(blob.hash.clone());
+                kept.push((blob.hash.clone(), k_of(&blob.hash)));
             }
         }
         for hex in freed {
@@ -1410,7 +1453,7 @@ impl Node {
             if !self.holds_blob(blob).await {
                 continue;
             }
-            let k = self.blob_target_k(&hex).await;
+            let k = k_of(&hex);
             if self.has_replica_intent(&hash).await {
                 if !self.within_twice_k(&hash, &event.net)
                     && self.hand_off(event, blob, k).await >= k
@@ -1418,7 +1461,7 @@ impl Node {
                     bump(&self.durability.stats.handed_off);
                     plan.released.push(hex);
                 } else {
-                    plan.kept.push(hex);
+                    kept.push((hex, k));
                 }
                 continue;
             }
@@ -1432,13 +1475,19 @@ impl Node {
                 plan.stranded.push(hex);
             }
         }
+        plan.kept = kept;
         Ok(plan)
     }
 
     /// Blobs an eviction freed that its plan did not cover (another event
     /// that listed them was dropped meanwhile): handed off now with the
     /// event read before the drop, or kept (S7). Returns those kept.
-    pub(super) async fn cover_late(&self, event: &Event, late: &[String]) -> Vec<String> {
+    pub(super) async fn cover_late(
+        &self,
+        event: &Event,
+        late: &[String],
+        ks: &HashMap<String, usize>,
+    ) -> Vec<(String, usize)> {
         let mut kept = Vec::new();
         for hex in late {
             let Some(blob) = event.blobs.iter().find(|b| &b.hash == hex) else {
@@ -1447,13 +1496,19 @@ impl Node {
             if !self.holds_blob(blob).await {
                 continue;
             }
-            let need = self.blob_target_k(hex).await.clamp(1, 2);
+            let k = plan_k(ks, hex, self.config.replication);
+            let need = k.clamp(1, 2);
             if self.hand_off(event, blob, need).await < need {
-                kept.push(hex.clone());
+                kept.push((hex.clone(), k));
             }
         }
         kept
     }
+}
+
+/// The k a plan computed for blob `hex`, else `fallback`.
+fn plan_k(ks: &HashMap<String, usize>, hex: &str, fallback: usize) -> usize {
+    ks.get(hex).copied().unwrap_or(fallback)
 }
 
 #[cfg(test)]

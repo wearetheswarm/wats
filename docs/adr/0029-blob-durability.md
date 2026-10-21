@@ -144,12 +144,13 @@ one knowledge prefers when several do, else the oldest, S9):
    post is checked again: a retraction or erasure ends the check.
 3. **Moving on, or not** (S2). Each answer is one of:
    - **proven holder**: counted;
-   - **refusal for good** (`Refused` saying "not taking replicas": full,
-     quota, replica share): this peer is skipped for this blob for 6 hours
-     (space may be freed), and the next peer is asked;
+   - **refusal** (any `Refused` but "rate limited": full, quota,
+     replica share, or the event rejected by the peer's policy): that
+     peer will not hold it, so it is skipped for this blob for 6 hours
+     (space may be freed, a policy may change), and the next peer is
+     asked at once;
    - **bare decline** (`Replicated` without the hash, no reason: a
-     0.4.2 peer full, over quota or out of fetch slots; any other
-     `Refused`, such as an event the peer did not accept; or a failed
+     0.4.2 peer full, over quota or out of fetch slots; or a failed
      possession proof, see §4), **unreachable**
      (no connection within 5 s), **busy** (no push slot within 60 s,
      rate limited, a challenge, a timeout), or this pass's **16 requests
@@ -165,12 +166,17 @@ one knowledge prefers when several do, else the oldest, S9):
    until it contacts this node again (any request, any gossip message)
    or answers any request of this node.
 5. **Replicas kept through an eviction** (N4): the pass also looks, within
-   its budget, at the rows of `evicted_replicas` that are due (each at a
-   random time within `recheck`, then every `recheck`). One is released
-   once this node is no longer among the 2k closest of its view of the
-   post's network and k other holders are proven: possession proofs only,
-   the providers this node heard of first, then the closest members, at
-   most 6. It is never pushed: its post is a tombstone here.
+   its budget, at the rows of `evicted_replicas` that are due, the most
+   overdue first (a `due` column, at most 256 rows a pass); each review
+   moves the row's `due` on by `recheck` (jittered), so rows that stay
+   never pin the head. A row whose blob this node no longer holds is
+   deleted, and the blob untagged if nothing else keeps it. One is
+   released once this node is no longer among the 2k closest of its view
+   of the post's network and k other holders are proven, k being the one
+   recorded at eviction (5 for knowledge: the post is a tombstone since,
+   so knowledge cannot be computed again): possession proofs only, the
+   providers this node heard of first, then the closest members, at most
+   6. It is never pushed: its post is a tombstone here.
 6. Complete: checked again after `recheck` (6 h, ±50 %). Short (every
    peer refused for good): after `retry` (10 min), doubling up to
    `recheck`, logged at INFO ("blob short of replicas"). A check that adds
@@ -518,7 +524,31 @@ untagging), N9 (the replica bytes counted at start, before `replicate`
 is served, and kept on every tag and untag), N13 (a blob is untagged only
 when no kept event lists it and no eviction record holds it, in
 `serve_replicate` and in every drop), and S2's nit (an event the peer did
-not accept is a decline, not a refusal for good).
+not accept is a decline, not a refusal for good; reversed in the last
+round below: such a peer is skipped for the blob at once, for 6 hours).
+
+## Decisions on the last verification round (2026-10-21)
+
+- **The evicted-replica review reaches every row**: due-ordered rows
+  (`due` column), each review moving its row on; rows whose blob is gone
+  are deleted.
+- **Evicted knowledge replicas keep k = 5**: the k is recorded in the row
+  at eviction and used at release.
+- **A decline for good expires** after 6 hours, as refusals do.
+- **Erasure and retraction win** over an eviction planned before them:
+  in the drop's transaction, an eviction never overwrites a stronger
+  drop record, and records no replica under it.
+- **A refusal of the event by the peer's policy** skips that peer for the
+  blob at once (for 6 hours), as before the first review; only bare
+  declines, failed proofs and unreachable peers go through the miss
+  sequence.
+- **A proof's refusals back the reader off** (not changed). A reader
+  refused during a proof marks that provider failed, which skips it for
+  every blob for 30 s, doubling up to an hour on further failures, and a
+  success clears it. The blobs protocol gives the reader no way to tell
+  "busy, retry" from a failure without a wire change, and proofs are rare
+  and last seconds, so the cost is a reader trying another provider
+  first for a while.
 
 ## Open questions
 

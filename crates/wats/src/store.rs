@@ -159,12 +159,18 @@ CREATE TABLE IF NOT EXISTS event_blobs_filled (
 
 -- Blobs kept as replicas when the body that listed them was evicted (ADR
 -- 0029 §5): a later retraction, erasure, label or `wats drop` of that
--- post releases them, unless a kept event lists them.
+-- post releases them, unless a kept event lists them. `k`: the replicas
+-- the blob wanted when evicted (5 for knowledge; the post is a tombstone
+-- since, so knowledge cannot be computed again). `due`: when repair looks
+-- at it next (Unix seconds).
 CREATE TABLE IF NOT EXISTS evicted_replicas (
     id   TEXT NOT NULL,
     hash TEXT NOT NULL,
+    k    INTEGER NOT NULL DEFAULT 0,
+    due  INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (id, hash)
 ) WITHOUT ROWID;
+CREATE INDEX IF NOT EXISTS evicted_replicas_due ON evicted_replicas (due);
 "#;
 
 /// Events whose blobs one backfill transaction of `event_blobs` indexes.
@@ -830,6 +836,25 @@ impl Store {
                  DROP TABLE IF EXISTS events_fts;",
             )?;
         }
+        // `evicted_replicas` from a build that had no `k` or `due` (never
+        // released, but cheap to bring along).
+        for column in ["k", "due"] {
+            let has: bool = conn.query_row(
+                "SELECT EXISTS (SELECT 1 FROM pragma_table_info('evicted_replicas') WHERE name = ?)",
+                [column],
+                |r| r.get(0),
+            )?;
+            let table: bool = conn.query_row(
+                "SELECT EXISTS (SELECT 1 FROM sqlite_master WHERE name = 'evicted_replicas')",
+                [],
+                |r| r.get(0),
+            )?;
+            if table && !has {
+                conn.execute_batch(&format!(
+                    "ALTER TABLE evicted_replicas ADD COLUMN {column} INTEGER NOT NULL DEFAULT 0;"
+                ))?;
+            }
+        }
         conn.execute_batch(SCHEMA)?;
         if (1..4).contains(&version) {
             // v2 -> v3: the event format was hardened before the freeze (ADR
@@ -1115,10 +1140,23 @@ impl Store {
         trigger: Option<&str>,
         detail: Option<&str>,
         now: u64,
-        keep: &[String],
+        keep: &[(String, usize)],
     ) -> Result<DropOutcome> {
         let mut conn = self.conn();
         let tx = conn.transaction()?;
+        // A stronger reason recorded meanwhile (an erasure or retraction
+        // landing while an eviction was planned) wins: an eviction never
+        // downgrades it, and keeps no replica under it.
+        let recorded: Option<String> = tx
+            .query_row("SELECT reason FROM dropped WHERE id = ?", [id], |r| {
+                r.get(0)
+            })
+            .optional()?;
+        let outranked = reason == DropReason::Evicted
+            && recorded
+                .as_deref()
+                .is_some_and(|r| r != DropReason::Evicted.as_str());
+        let keep: &[(String, usize)] = if outranked { &[] } else { keep };
         let row: Option<(i64, bool, String, String, String, String)> = tx
             .query_row(
                 "SELECT seq, opaque, title, text, tags, json FROM events WHERE id = ?",
@@ -1174,7 +1212,7 @@ impl Store {
                 .filter_map(|b| b.get("hash").and_then(Value::as_str));
             for hash in hashes {
                 if !outcome.freed_blobs.iter().any(|h| h == hash)
-                    && !keep.iter().any(|h| h == hash)
+                    && !keep.iter().any(|(h, _)| h == hash)
                     && !blob_referenced(&tx, hash)?
                     && !blob_retained_elsewhere(&tx, hash, id)?
                 {
@@ -1200,24 +1238,27 @@ impl Store {
                 }
             }
         }
-        for hash in keep {
+        for (hash, k) in keep {
             tx.execute(
-                "INSERT OR IGNORE INTO evicted_replicas (id, hash) VALUES (?, ?)",
-                params![id, hash],
+                "INSERT INTO evicted_replicas (id, hash, k, due) VALUES (?, ?, ?, 0)
+                 ON CONFLICT (id, hash) DO UPDATE SET k = MAX(k, excluded.k)",
+                params![id, hash, *k as i64],
             )?;
         }
-        tx.execute(
-            "INSERT INTO dropped (id, reason, at, trigger, detail) VALUES (?1, ?2, ?3, ?4, ?5)
-             ON CONFLICT (id) DO UPDATE SET reason = excluded.reason, at = excluded.at,
-                 trigger = excluded.trigger, detail = excluded.detail",
-            params![
-                id,
-                reason.as_str(),
-                now.min(i64::MAX as u64) as i64,
-                trigger,
-                detail
-            ],
-        )?;
+        if !outranked {
+            tx.execute(
+                "INSERT INTO dropped (id, reason, at, trigger, detail) VALUES (?1, ?2, ?3, ?4, ?5)
+                 ON CONFLICT (id) DO UPDATE SET reason = excluded.reason, at = excluded.at,
+                     trigger = excluded.trigger, detail = excluded.detail",
+                params![
+                    id,
+                    reason.as_str(),
+                    now.min(i64::MAX as u64) as i64,
+                    trigger,
+                    detail
+                ],
+            )?;
+        }
         tx.commit()?;
         self.opaque_bytes.fetch_add(added, Ordering::Relaxed);
         Ok(outcome)
@@ -1455,15 +1496,60 @@ impl Store {
         Ok(blob_referenced(&conn, hash)? || blob_retained_elsewhere(&conn, hash, "")?)
     }
 
-    /// Replicas kept through an eviction, `(id, hash, net)`, at most
-    /// `limit`, the oldest posts first (N4).
-    pub fn evicted_replica_rows(&self, limit: usize) -> Result<Vec<(String, String, String)>> {
+    /// Replicas kept through an eviction that are due at `now`, `(id, hash,
+    /// net, k)`, the most overdue first, at most `limit` (N4): each review
+    /// moves a row's `due` on ([`Store::set_evicted_due`]), so no row pins
+    /// the head.
+    pub fn evicted_replica_rows(
+        &self,
+        now: u64,
+        limit: usize,
+    ) -> Result<Vec<(String, String, String, usize)>> {
         let conn = self.conn();
         let mut stmt = conn.prepare_cached(
-            "SELECT r.id, r.hash, e.net FROM evicted_replicas r JOIN events e ON e.id = r.id
-                 ORDER BY e.seq LIMIT ?",
+            "SELECT r.id, r.hash, e.net, r.k FROM evicted_replicas r JOIN events e ON e.id = r.id
+                 WHERE r.due <= ?1 ORDER BY r.due LIMIT ?2",
         )?;
-        let rows = stmt.query_map([limit as i64], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+        let rows = stmt.query_map(
+            params![now.min(i64::MAX as u64) as i64, limit as i64],
+            |r| {
+                Ok((
+                    r.get(0)?,
+                    r.get(1)?,
+                    r.get(2)?,
+                    r.get::<_, i64>(3)?.max(0) as usize,
+                ))
+            },
+        )?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    /// When repair looks at the replica `hash` kept for post `id` next.
+    pub fn set_evicted_due(&self, id: &str, hash: &str, due: u64) -> Result<()> {
+        self.conn().execute(
+            "UPDATE evicted_replicas SET due = ? WHERE id = ? AND hash = ?",
+            params![due.min(i64::MAX as u64) as i64, id, hash],
+        )?;
+        Ok(())
+    }
+
+    /// The replicas kept for post `id`, with the k each wanted and when it
+    /// is due.
+    pub fn evicted_replica_details(&self, id: &str) -> Result<Vec<(String, usize, u64)>> {
+        let conn = self.conn();
+        let mut stmt =
+            conn.prepare_cached("SELECT hash, k, due FROM evicted_replicas WHERE id = ?")?;
+        let rows = stmt.query_map([id], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, i64>(1)?.max(0) as usize,
+                r.get::<_, i64>(2)?.max(0) as u64,
+            ))
+        })?;
         let mut out = Vec::new();
         for row in rows {
             out.push(row?);
@@ -1488,12 +1574,13 @@ impl Store {
 
     /// Record that the replicas `hashes` were kept when the body of `id`
     /// was evicted (ADR 0029 §5).
-    pub fn record_evicted_replicas(&self, id: &str, hashes: &[String]) -> Result<()> {
+    pub fn record_evicted_replicas(&self, id: &str, hashes: &[(String, usize)]) -> Result<()> {
         let conn = self.conn();
-        for hash in hashes {
+        for (hash, k) in hashes {
             conn.execute(
-                "INSERT OR IGNORE INTO evicted_replicas (id, hash) VALUES (?, ?)",
-                params![id, hash],
+                "INSERT INTO evicted_replicas (id, hash, k, due) VALUES (?, ?, ?, 0)
+                 ON CONFLICT (id, hash) DO UPDATE SET k = MAX(k, excluded.k)",
+                params![id, hash, *k as i64],
             )?;
         }
         Ok(())
@@ -3854,6 +3941,36 @@ mod tests {
     }
 
     #[test]
+    fn an_eviction_never_overrides_an_erasure() {
+        let store = Store::open_in_memory().unwrap();
+        let hash = "dd".repeat(32);
+        let event = with_blobs(1, 10, "erased while an eviction was planned", &[&hash]);
+        store.insert(&event, 10).unwrap();
+        // The erasure lands first; the eviction planned before it comes after.
+        store
+            .drop_body(&event.id, DropReason::Erasure, Some("label"), None, 20)
+            .unwrap();
+        let late = store
+            .drop_body_keeping(
+                &event.id,
+                DropReason::Evicted,
+                None,
+                None,
+                30,
+                &[(hash.clone(), 3)],
+            )
+            .unwrap();
+        assert!(late.freed_blobs.is_empty());
+        let record = store.drop_record(&event.id).unwrap().unwrap();
+        assert_eq!(record.reason, DropReason::Erasure, "the erasure wins");
+        assert_eq!(record.trigger.as_deref(), Some("label"));
+        assert!(
+            store.evicted_replicas(&event.id).unwrap().is_empty(),
+            "no record"
+        );
+    }
+
+    #[test]
     fn a_replica_kept_through_eviction_is_freed_by_a_later_drop() {
         let store = Store::open_in_memory().unwrap();
         let hash = "cc".repeat(32);
@@ -3865,7 +3982,7 @@ mod tests {
         assert_eq!(evicted.freed_blobs, vec![hash.clone()]);
         // The node kept it: recorded.
         store
-            .record_evicted_replicas(&event.id, std::slice::from_ref(&hash))
+            .record_evicted_replicas(&event.id, &[(hash.clone(), 3)])
             .unwrap();
         assert_eq!(
             store.evicted_replicas(&event.id).unwrap(),

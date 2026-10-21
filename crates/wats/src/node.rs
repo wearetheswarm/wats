@@ -3824,8 +3824,9 @@ impl Node {
         trigger: Option<&str>,
         detail: Option<&str>,
     ) -> Result<DropOutcome> {
-        let mut kept: Vec<String> = Vec::new();
+        let mut kept: Vec<(String, usize)> = Vec::new();
         let mut planned: Vec<String> = Vec::new();
+        let mut ks: HashMap<String, usize> = HashMap::new();
         let before = if reason == DropReason::Evicted {
             self.store.get(id)?.map(|s| s.event)
         } else {
@@ -3841,8 +3842,9 @@ impl Node {
                 .into());
             }
             planned.extend(plan.released);
-            planned.extend(plan.kept.iter().cloned());
+            planned.extend(plan.kept.iter().map(|(h, _)| h.clone()));
             kept = plan.kept;
+            ks = plan.ks;
         }
         // The kept replicas are recorded in the drop's own transaction
         // (N8): no crash leaves a kept tag without its record.
@@ -3862,9 +3864,11 @@ impl Node {
                 .cloned()
                 .collect();
             if !late.is_empty() {
-                let late_kept = self.cover_late(event, &late).await;
+                let late_kept = self.cover_late(event, &late, &ks).await;
                 if !late_kept.is_empty() {
-                    outcome.freed_blobs.retain(|h| !late_kept.contains(h));
+                    outcome
+                        .freed_blobs
+                        .retain(|h| !late_kept.iter().any(|(k, _)| k == h));
                     // An error here leaves the blob tagged, never deleted;
                     // the rest is still untagged below.
                     if let Err(e) = self.store.record_evicted_replicas(id, &late_kept) {
