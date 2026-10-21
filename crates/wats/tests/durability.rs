@@ -942,6 +942,53 @@ async fn a_push_is_fetched_after_a_failed_fetch_from_its_pusher() -> anyhow::Res
     Ok(())
 }
 
+/// A pusher that serves nothing holds a `replicate` request one budget at
+/// most, whatever the number of its blobs: once one blob failed every try,
+/// the others go the plain way (skipped while the pusher backs off), and
+/// all of them share one budget. Asking each of the 6 blobs 3 times would
+/// take 9 s in pauses alone.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_pusher_that_serves_nothing_holds_a_request_one_budget_at_most() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let publisher = start(&dir.path().join("p"), 3, manual()).await?;
+    // One with a short budget, one with the default (120 s) and only the
+    // plain way after the first failure to bound it.
+    let short = Tuning {
+        replicate_budget: Duration::from_secs(1),
+        ..manual()
+    };
+    let budgeted = start(&dir.path().join("b"), 3, short).await?;
+    let plain = start(&dir.path().join("d"), 3, manual()).await?;
+    mesh(&[&publisher, &budgeted, &plain]).await?;
+    let files: Vec<Vec<u8>> = (0..6).map(|i| content(60 + i)).collect();
+    let _refused: Vec<_> = files
+        .iter()
+        .map(|f| publisher.block_blob_requests_for_tests(iroh_blobs::Hash::from_bytes(hash_of(f))))
+        .collect();
+    let mut attachments = Vec::new();
+    for (i, bytes) in files.iter().enumerate() {
+        let path = dir.path().join(format!("many{i}.bin"));
+        std::fs::write(&path, bytes)?;
+        attachments.push(Attachment { path, name: None });
+    }
+    let event = publisher
+        .publish(note("six files nobody can fetch"), &attachments)
+        .await?;
+    assert_eq!(event.blobs.len(), 6);
+    let started = tokio::time::Instant::now();
+    let report = publisher.replicate(&event).await;
+    let took = started.elapsed();
+    assert!(report.is_empty(), "nothing taken: {report:?}");
+    assert!(
+        took < Duration::from_secs(5),
+        "the requests took {took:?}: one budget, not one per blob"
+    );
+    for n in [publisher, budgeted, plain] {
+        n.shutdown().await?;
+    }
+    Ok(())
+}
+
 /// Two holders that prove each other at the same moment refuse each
 /// other's requests: a failed proof is a miss, never an exclusion, and
 /// the checks converge (N5).

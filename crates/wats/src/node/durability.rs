@@ -134,6 +134,10 @@ pub struct Tuning {
     /// Test only: answer every `replicate` with its hashes, holding
     /// nothing (a lying peer).
     pub lie_replicate: bool,
+    /// The most time the blobs of one `replicate` request may take here,
+    /// fetch slot waits included: [`super::REPLICATE_BUDGET`]; tests
+    /// shorten it.
+    pub replicate_budget: Duration,
 }
 
 impl Default for Tuning {
@@ -151,6 +155,7 @@ impl Default for Tuning {
             evicted_per_pass: EVICTED_PER_PASS,
             legacy_replicate: false,
             lie_replicate: false,
+            replicate_budget: super::REPLICATE_BUDGET,
         }
     }
 }

@@ -41,7 +41,12 @@ Code: `crates/wats/src/limits.rs`, `Node::handle_request`.
   skipped: it has just reached the node. Its blob is fetched from it up
   to 3 times, after 0.5 s then 1 s, within 60 s for all tries; before
   (until 0.4.3), one failed fetch from a peer dropped every replica it
-  pushed for the length of its backoff.
+  pushed for the length of its backoff. A pusher that serves nothing is
+  bounded: once one blob of a request failed every try, the others of
+  that request go the plain way (skipped while it backs off), and all
+  the blobs of a request share one budget of 120 s, fetch slot waits
+  included (the pusher waits 150 s for the answer). What was not fetched
+  is logged once per request, with a count.
 - **Declared size.** A node requests only the chunks covering the size
   the event declares, so a blob larger than declared never costs more than
   what was checked against `max_blob_bytes` and the blob quota. The blob
