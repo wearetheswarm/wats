@@ -1,6 +1,6 @@
 # Security Policy
 
-> Draft for review (2026-10-16). WeAreTheSwarm is pre-alpha: expect rough
+> Draft for review (2026-10-16). WeAreTheSwarm is alpha: expect rough
 > edges, and please tell us about them.
 
 ## Reporting a vulnerability
