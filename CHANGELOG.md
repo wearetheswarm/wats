@@ -1,9 +1,31 @@
 # Changelog
 
-## Unreleased
+## 0.4.3 (2026-10-21)
+
+The robustness release. A full node keeps working: at the cap it rotates
+its lowest-value history out instead of going stale, never its own posts
+or what may be the last copy of a file. Files keep their replicas when a
+node disappears (5 for knowledge), proven by possession checks. A bare
+`wats` welcomes you with a setup wizard, `wats fleet` runs several support
+nodes on one machine, every node shows the size of the swarm it sees, and
+security updates can install themselves, if you say so.
 
 ### Upgrading from 0.4.2
 
+- `wats upgrade` (or `brew upgrade wats`) installs it. Restart the node
+  afterwards.
+- **No store migration and no format change**: the node adds its
+  rotation and replica tables to the store at its first start and indexes
+  the blobs every post lists, once (schema 7 unchanged; 0.4.2 ignores
+  them). No wire change.
+- **Rotation and profiles used only over MCP**: a profile used before
+  0.4.3 only through `wats mcp --profile X`, and not in your config, is
+  recognised as yours once a session uses it again; rotation deletes no
+  row in the first 10 minutes after a start. On a node with a small
+  `storage.max`, use each such profile once after upgrading, or add it to
+  the config (details under "rotation at the cap" below).
+- Nodes set up by 0.4.2 or older are not asked the new setup questions;
+  `wats setup` asks them when you want.
 - **Rolling back to 0.4.2** keeps working unless you answered yes to
   security updates: 0.4.2 refuses unknown keys in `config.toml`, so
   `wats upgrade --rollback` now checks the previous binary's version and,
@@ -11,6 +33,21 @@
   `update.security_auto`), stops before swapping anything and prints the
   command to run first: `wats --dir <data dir> config unset
   update.security_auto`. Then run the rollback again. ADR 0030.
+
+### To try
+
+- `wats` alone, in a fresh data directory on a terminal
+  (`HOME=/tmp/w wats`): the welcome and the setup wizard.
+- `wats status`: `swarm: 3 neighbors, 17 nodes seen in 24 h`, and the
+  rotation state once the store fills up.
+- `wats fleet up -n 3 --no-agent --base /tmp/fleet`, then
+  `wats fleet check` and `wats fleet stop`.
+- `wats setup` on a terminal: answer the security updates question.
+
+### Keys in this release
+
+New: `update.security_auto`; `update.security_delay` is now set to `1d`
+by the wizard when you answer yes. See docs/config.md.
 
 ### Changes
 
