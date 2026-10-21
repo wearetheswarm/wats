@@ -524,6 +524,9 @@ enum Origin {
     Pushed,
     /// A sync page this node asked for: history, at the schedule only.
     Pulled,
+    /// A `get` on demand, for a `read` (ADR 0025 §6): history, as pulled,
+    /// and the only way an evicted body comes back (ADR 0020 decision 4).
+    Fetched,
 }
 
 /// Largest canonical size of an event of a version this node does not
@@ -3864,21 +3867,6 @@ impl Node {
         Ok(outcome)
     }
 
-    /// Whether this node is one of the k peers responsible for blob `hash`
-    /// (SPEC §2.5, ADR 0005): among the k closest to the hash by XOR,
-    /// itself and the peers it knows counted, k = `replication`. A local
-    /// estimate, as publishers make it. Rotation keeps such a blob when it
-    /// drops the posts that list it (ADR 0025, "Blobs").
-    pub fn blob_responsible(&self, hash: &str) -> bool {
-        let Ok(bytes) = crate::event::parse_hex::<32>(hash, "hash") else {
-            return false;
-        };
-        let me = self.endpoint_id();
-        let mut peers = self.known_peers();
-        peers.push(me);
-        proto::closest(&bytes, &peers, self.config.replication.max(1)).contains(&me)
-    }
-
     /// Whether this node keeps blob `hash` under a tag.
     pub async fn blob_pinned(&self, hash: &str) -> Result<bool> {
         let hash: Hash = hash.parse()?;
@@ -4016,7 +4004,10 @@ impl Node {
             bail!("opaque event quota reached");
         }
         let inserted = match &event {
-            AnyEvent::Known(e) => self.store.insert(e, now_secs())?,
+            AnyEvent::Known(e) => {
+                self.store
+                    .insert_with(e, now_secs(), origin == Origin::Fetched)?
+            }
             AnyEvent::Opaque(r) => {
                 debug!(id = %r.id, v = r.v, "storing opaque event");
                 self.store.insert_raw(r, now_secs())?

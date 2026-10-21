@@ -1,15 +1,21 @@
 //! Rotation at the cap (ADR 0025 §7): a node at its events share keeps
-//! taking new posts, under its share, with its own posts, the threads it
-//! joined and the kept-forever kinds intact; the cut it raises is served
-//! honestly; a restart halfway is safe; blobs follow responsibility.
-//! Hermetic: in-process nodes on loopback.
+//! taking new posts, under its share, with its own posts, the posts around
+//! them and the kept-forever kinds intact; keys over their share go first,
+//! a small team's do not; the cut it raises is served honestly, kept-forever
+//! kinds below it too; a restart halfway is safe; an evicted body comes back
+//! on `read` only; files are never lost by side effect; a run that frees
+//! nothing backs off. Hermetic: in-process nodes on loopback.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 
 use ed25519_dalek::SigningKey;
+use rmcp::ServiceExt;
+use rmcp::model::{CallToolRequestParams, CallToolResult};
 use serde_json::{Value, json};
 use wats::event::{Draft, Event, Kind};
+use wats::mcp::WatsMcp;
 use wats::node::{Attachment, NetworkMode, Node, NodeConfig, PUBLIC_NET, now_secs};
 use wats::proto::{Request, Response};
 use wats::store::{DropReason, RangeState, Store};
@@ -44,6 +50,10 @@ fn key(n: u32) -> SigningKey {
     let mut bytes = [9u8; 32];
     bytes[..4].copy_from_slice(&n.to_be_bytes());
     SigningKey::from_bytes(&bytes)
+}
+
+fn author(n: u32) -> String {
+    wats::identity::author_id(&key(n))
 }
 
 fn own_key(dir: &std::path::Path) -> anyhow::Result<SigningKey> {
@@ -115,15 +125,17 @@ fn hold(store: &Store, events: &[Event]) {
 }
 
 /// What rotation never drops, held by a node whose own key is `own`:
-/// returns them, oldest of all.
+/// returns them, oldest of all. A kept-forever kind and its reply, an own
+/// post, a thread this node answered in: the root (an ancestor of the
+/// answer) and the direct reply to the answer.
 fn protected(own: &SigningKey, ts: u64) -> Vec<Event> {
     let announce = root(Kind::Announce, "I review Rust", &key(1), ts);
     let vouch = reply(&announce, Kind::Vouch, json!({}), &key(2), ts + 1);
     let mine = root(Kind::Note, "my own note", own, ts + 2);
     let theirs = root(Kind::Ask, "a question I answered", &key(3), ts + 3);
     let my_answer = reply(&theirs, Kind::Answer, json!({}), own, ts + 4);
-    let other_answer = reply(&theirs, Kind::Answer, json!({}), &key(4), ts + 5);
-    vec![announce, vouch, mine, theirs, my_answer, other_answer]
+    let to_mine = reply(&my_answer, Kind::Answer, json!({}), &key(4), ts + 5);
+    vec![announce, vouch, mine, theirs, my_answer, to_mine]
 }
 
 /// Every protected event is held in full.
@@ -134,12 +146,25 @@ fn assert_protected(node: &Node, events: &[Event]) {
     }
 }
 
-/// No unprotected row of `public` is left strictly below the cut.
-fn assert_cut_honest(node: &Node, kept: &[Event]) -> u64 {
+/// The cut is honest: no row this test stored and rotation deleted is
+/// above it, but those of keys stage 0 trimmed (`trimmed`); no row below it
+/// is left but what is kept (`kept`, kept-forever kinds, this node's).
+/// Returns the cut.
+fn assert_cut_honest(node: &Node, stored: &[Event], kept: &[Event], trimmed: &[String]) -> u64 {
     let cut = node.store().cut_ts(PUBLIC_NET).unwrap().expect("a cut");
+    for event in stored {
+        if node.store().get_raw(&event.id).unwrap().is_none() {
+            assert!(
+                event.ts <= cut || trimmed.contains(&event.author),
+                "{} at {} deleted above the cut {cut}",
+                event.id,
+                event.ts
+            );
+        }
+    }
     let rows = node
         .store()
-        .net_rows_after(PUBLIC_NET, (0, ""), 100_000)
+        .net_rows_after(PUBLIC_NET, (0, ""), 1_000_000)
         .unwrap();
     let local = node.local_authors();
     for row in rows.iter().filter(|r| r.ts < cut) {
@@ -166,10 +191,53 @@ async fn eventually<T>(what: &str, secs: u64, mut check: impl FnMut() -> Option<
     }
 }
 
-/// Soak: a node with a 2 MiB events share takes 2,000 new posts, a round
-/// of 25 at a time, rotating whenever it reaches 95 %. It never goes over
-/// its share; old bodies go first (stage 1), then old rows (stage 2), and
-/// the cut rises; what is never dropped is all there.
+/// Fill `node`'s store with short posts newer than `from_ts`, by many
+/// keys, up to rotation's threshold.
+fn fill(node: &Node, from_ts: u64) -> Vec<Event> {
+    let (at, _) = node.rotation_bounds().unwrap();
+    let mut n = 50_000;
+    let mut out = Vec::new();
+    while node.store().store_bytes() < at {
+        let event = note(
+            n,
+            2_000 + n % 300,
+            from_ts + u64::from(n - 50_000) / 10,
+            false,
+        );
+        hold(node.store(), std::slice::from_ref(&event));
+        out.push(event);
+        n += 1;
+    }
+    out
+}
+
+type Client = rmcp::service::RunningService<rmcp::RoleClient, ()>;
+
+async fn client_for(node: &Arc<Node>) -> Client {
+    let (server_io, client_io) = tokio::io::duplex(64 * 1024);
+    let server = WatsMcp::new(Arc::clone(node), vec![]);
+    tokio::spawn(async move {
+        if let Ok(running) = server.serve(server_io).await {
+            let _ = running.waiting().await;
+        }
+    });
+    ().serve(client_io).await.unwrap()
+}
+
+async fn call(client: &Client, tool: &'static str, args: Value) -> CallToolResult {
+    client
+        .call_tool(
+            CallToolRequestParams::new(tool).with_arguments(args.as_object().unwrap().clone()),
+        )
+        .await
+        .unwrap()
+}
+
+/// Soak: a node with a 2 MiB events share takes 2,000 new posts while its
+/// rotation runs by itself every 50 ms. It never goes over its share. A key
+/// holding much of the old history is trimmed first (stage 0), old bodies
+/// go (stage 1), then old rows (stage 2) and the cut rises; what is never
+/// dropped is all there.
 #[tokio::test(flavor = "multi_thread")]
 async fn the_store_stays_under_its_share_while_traffic_flows() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
@@ -178,18 +246,21 @@ async fn the_store_stays_under_its_share_while_traffic_flows() -> anyhow::Result
     let own = own_key(&b_dir)?;
     let now = now_secs();
     let kept = protected(&own, now - 60 * DAY);
-    let old: Vec<Event> = (0..150)
+    // Old history: 150 notes from 50 keys, and one key that wrote as much.
+    let mut old: Vec<Event> = (0..150)
         .map(|i| note(i, 100 + i % 50, now - 30 * DAY + u64::from(i) * 600, true))
         .collect();
+    old.extend((0..150).map(|i| note(500 + i, 7, now - 29 * DAY + u64::from(i) * 600, true)));
     let mut b_config = config(&b_dir, &[]);
     b_config.storage_max = Some(8 * MIB);
     b_config.events_share = 25;
+    b_config.history.rotation_check = Duration::from_millis(50);
     let b = Node::start(b_config).await?;
     let share = b.events_share().unwrap();
     hold(b.store(), &kept);
     hold(b.store(), &old);
 
-    let mut runs = Vec::new();
+    let mut stored = old.clone();
     let mut max_seen = 0;
     for round in 0..80u32 {
         let live: Vec<Event> = (0..25u32)
@@ -205,9 +276,8 @@ async fn the_store_stays_under_its_share_while_traffic_flows() -> anyhow::Result
             })
             .collect();
         hold(b.store(), &live);
-        if let Some(run) = b.rotate_if_full().await? {
-            runs.push(run);
-        }
+        stored.extend(live);
+        tokio::time::sleep(Duration::from_millis(40)).await;
         let bytes = b.store().store_bytes();
         max_seen = max_seen.max(bytes);
         assert!(
@@ -215,20 +285,26 @@ async fn the_store_stays_under_its_share_while_traffic_flows() -> anyhow::Result
             "round {round}: {bytes} store bytes over the {share} share"
         );
     }
+    eventually("the last rotation done", 30, || {
+        (b.rotation_json()["state"] == "idle").then_some(())
+    })
+    .await;
+    let runs = b.store().rotation_runs()?;
     assert!(runs.len() >= 3, "it rotated several times: {runs:?}");
+    assert!(runs.iter().map(|r| r.trimmed).sum::<u64>() > 0, "{runs:?}");
     assert!(runs.iter().map(|r| r.bodies).sum::<u64>() > 0, "{runs:?}");
     assert!(runs.iter().map(|r| r.rows).sum::<u64>() > 0, "{runs:?}");
     assert!(max_seen > share * 9 / 10, "the share was reached");
-    // Old bodies went first: stage 1 dropped them, reason evicted.
-    assert!(old.iter().any(|e| {
-        b.store()
-            .drop_record(&e.id)
+    assert!(
+        old.iter().filter(|e| e.author == author(7)).any(|e| b
+            .store()
+            .get_raw(&e.id)
             .unwrap()
-            .is_some_and(|r| r.reason == DropReason::Evicted)
-            || b.store().get_raw(&e.id).unwrap().is_none()
-    }));
+            .is_none()),
+        "the heavy key was trimmed"
+    );
     assert_protected(&b, &kept);
-    let cut = assert_cut_honest(&b, &kept);
+    let cut = assert_cut_honest(&b, &stored, &kept, &[author(7)]);
     assert!(cut > now - 2 * DAY, "the cut rose into the traffic");
     // The newest posts are all there.
     let newest = note(
@@ -244,13 +320,9 @@ async fn the_store_stays_under_its_share_while_traffic_flows() -> anyhow::Result
     assert!(history["rotated_ts"].is_u64(), "{history}");
     assert!(wats::node::history::line(&history).contains("(rotation, "));
     let rotation = b.rotation_json();
-    assert_eq!(rotation["state"], "idle");
     assert!(rotation["last"]["at"].is_u64(), "{rotation}");
     assert!(wats::node::rotation::summary(&rotation).contains("old rows deleted"));
-    assert!(
-        !b.history_full(),
-        "a node that rotated rows out is not full"
-    );
+    assert!(!b.history_full(), "a node that rotated is not full");
     // Search still works on what is held.
     assert!(
         !b.store()
@@ -261,8 +333,9 @@ async fn the_store_stays_under_its_share_while_traffic_flows() -> anyhow::Result
     Ok(())
 }
 
-/// A key over its share of the events (a flood) is trimmed first, before
-/// any other post loses its body or the cut moves.
+/// A key that wrote much of a network's history (a flood, a week old or
+/// more) is trimmed first, lowest value first, before any other post loses
+/// its body or the cut moves.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_flooding_key_is_trimmed_before_anyone_else() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
@@ -282,13 +355,18 @@ async fn a_flooding_key_is_trimmed_before_anyone_else() -> anyhow::Result<()> {
     let (at, _) = b.rotation_bounds().unwrap();
     hold(b.store(), &kept);
     hold(b.store(), &honest);
-    // One key floods recent junk until the store is full.
+    // One key floods, from 20 days ago, until the store is full; some of
+    // the flood replies to this node's answer.
+    let my_answer = &kept[4];
     let mut n = 10_000;
     while b.store().store_bytes() < at {
-        hold(
-            b.store(),
-            &[note(n, 7, now - DAY + u64::from(n - 10_000), true)],
-        );
+        let ts = now - 20 * DAY + u64::from(n - 10_000);
+        let junk = if n % 2 == 0 {
+            reply(my_answer, Kind::Answer, json!({}), &key(7), ts)
+        } else {
+            note(n, 7, ts, true)
+        };
+        hold(b.store(), &[junk]);
         n += 1;
     }
     let run = b.rotate_if_full().await?.expect("a rotation");
@@ -309,9 +387,68 @@ async fn a_flooding_key_is_trimmed_before_anyone_else() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// In a small team network, five keys write everything, about a fifth
+/// each: none is over its share (three times the average), so stage 0
+/// trims nobody, and the usual stages free the space.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_small_teams_keys_are_not_trimmed() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let b_dir = dir.path().join("b");
+    in_sync(&b_dir)?;
+    let now = now_secs();
+    let mut b_config = config(&b_dir, &[]);
+    b_config.storage_max = Some(8 * MIB);
+    b_config.events_share = 25;
+    let b = Node::start(b_config).await?;
+    let (at, _) = b.rotation_bounds().unwrap();
+    let mut n = 0u32;
+    while b.store().store_bytes() < at {
+        hold(
+            b.store(),
+            &[note(
+                n,
+                300 + n % 5,
+                now - 30 * DAY + u64::from(n) * 600,
+                true,
+            )],
+        );
+        n += 1;
+    }
+    let run = b.rotate_if_full().await?.expect("a rotation");
+    assert_eq!(run.trimmed, 0, "{run:?}");
+    assert!(run.bodies + run.rows > 0, "{run:?}");
+    b.shutdown().await?;
+    Ok(())
+}
+
+/// One descending page from `b`, asked by `a`.
+async fn desc_page(
+    a: &Node,
+    b: &Node,
+    before: (u64, String),
+    kinds: Vec<String>,
+) -> anyhow::Result<(Vec<Value>, Option<u64>)> {
+    let request = Request::Sync {
+        net: PUBLIC_NET.into(),
+        after_ts: 0,
+        after_id: String::new(),
+        before_ts: Some(before.0),
+        before_id: Some(before.1),
+        kinds,
+        authors: vec![],
+        partial: false,
+        limit: 256,
+    };
+    match wats::proto::call_solving(a.endpoint(), b.endpoint_id(), &request).await? {
+        Response::SyncPage { events, gap, .. } => Ok((events, gap.map(|g| g.hi_ts))),
+        other => panic!("page expected: {other:?}"),
+    }
+}
+
 /// Once rotation raised the cut, the node serves it honestly: a descending
-/// page (0.4.1 and later) stops at it with a `gap`, an ascending pull
-/// from below it (0.4.0) is refused, and one from above is served.
+/// page (0.4.1 and later) stops at it with a `gap`, an ascending pull from
+/// below it (0.4.0) is refused, and one from above is served. Kept-forever
+/// kinds below it are still served to who asks for them only.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_raised_cut_is_served_honestly_to_newer_and_older_peers() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
@@ -323,6 +460,8 @@ async fn a_raised_cut_is_served_honestly_to_newer_and_older_peers() -> anyhow::R
     b_config.events_share = 25;
     let b = Node::start(b_config).await?;
     let (at, _) = b.rotation_bounds().unwrap();
+    let announce = root(Kind::Announce, "an old announce", &key(1), now - 4 * DAY);
+    hold(b.store(), std::slice::from_ref(&announce));
     // Short posts, recent: stage 2 only.
     let mut n = 0;
     let mut all = Vec::new();
@@ -334,28 +473,14 @@ async fn a_raised_cut_is_served_honestly_to_newer_and_older_peers() -> anyhow::R
     }
     let run = b.rotate_if_full().await?.expect("a rotation");
     assert!(run.rows > 0, "{run:?}");
-    let cut = assert_cut_honest(&b, &[]);
+    let cut = assert_cut_honest(&b, &all, &[], &[]);
+    assert!(announce.ts < cut);
 
     let a = Node::start(config(&dir.path().join("a"), &[&b])).await?;
     // A descending page stops at the cut, with a gap.
     let mut before = (now + 3600, String::new());
     let gap = loop {
-        let request = Request::Sync {
-            net: PUBLIC_NET.into(),
-            after_ts: 0,
-            after_id: String::new(),
-            before_ts: Some(before.0),
-            before_id: Some(before.1.clone()),
-            kinds: vec![],
-            authors: vec![],
-            partial: false,
-            limit: 256,
-        };
-        let Response::SyncPage { events, gap, .. } =
-            wats::proto::call_solving(a.endpoint(), b.endpoint_id(), &request).await?
-        else {
-            panic!("page expected");
-        };
+        let (events, gap) = desc_page(&a, &b, before.clone(), vec![]).await?;
         assert!(events.iter().all(|e| e["ts"].as_u64().unwrap() > cut));
         if let Some(last) = events.last() {
             before = (
@@ -367,7 +492,18 @@ async fn a_raised_cut_is_served_honestly_to_newer_and_older_peers() -> anyhow::R
             break gap;
         }
     };
-    assert_eq!(gap.map(|g| g.hi_ts), Some(cut));
+    assert_eq!(gap, Some(cut));
+    // The kept-forever kinds, asked for alone, are served below it.
+    let kept_kinds: Vec<String> = wats::node::history::KEEP_KINDS
+        .iter()
+        .map(|k| k.to_string())
+        .collect();
+    let (events, gap) = desc_page(&a, &b, (now + 3600, String::new()), kept_kinds).await?;
+    assert!(
+        events.iter().any(|e| e["id"] == announce.id.as_str()),
+        "{events:?}"
+    );
+    assert_eq!(gap, None);
     // An ascending pull from below the cut is refused; above, served.
     match wats::proto::call_solving(
         a.endpoint(),
@@ -417,12 +553,12 @@ async fn a_restart_in_the_middle_of_a_rotation_is_safe() -> anyhow::Result<()> {
     let own = own_key(&b_dir)?;
     let now = now_secs();
     let kept = protected(&own, now - 60 * DAY);
+    let rows: Vec<Event> = (0..8_000)
+        .map(|i| note(i, 100 + i % 300, now - 10 * DAY + u64::from(i) * 60, false))
+        .collect();
     let bytes = {
         let store = Store::open(&b_dir.join("events.sqlite"))?;
         hold(&store, &kept);
-        let rows: Vec<Event> = (0..8_000)
-            .map(|i| note(i, 100 + i % 300, now - 10 * DAY + u64::from(i) * 60, false))
-            .collect();
         hold(&store, &rows);
         store.store_bytes()
     };
@@ -444,19 +580,21 @@ async fn a_restart_in_the_middle_of_a_rotation_is_safe() -> anyhow::Result<()> {
     let (_, to) = b.rotation_bounds().unwrap();
     assert!(b.store().store_bytes() > to, "stopped halfway");
     assert_protected(&b, &kept);
-    let first_cut = assert_cut_honest(&b, &kept);
+    let first_cut = assert_cut_honest(&b, &rows, &kept, &[]);
     drop(b);
 
     b_config.history.rotation_pause = Duration::ZERO;
     let b = Node::start(b_config).await?;
     // Below 95 % it waits for more; with more, it rotates by itself.
-    fill(&b, now);
+    let more = fill(&b, now);
     eventually("the rotation finished", 60, || {
         (b.store().store_bytes() <= to && b.rotation_json()["state"] == "idle").then_some(())
     })
     .await;
     assert_protected(&b, &kept);
-    assert!(assert_cut_honest(&b, &kept) >= first_cut);
+    let mut stored = rows.clone();
+    stored.extend(more);
+    assert!(assert_cut_honest(&b, &stored, &kept, &[]) >= first_cut);
     assert!(b.store().unpin_pending()?.is_empty());
     let ranges = b.store().sync_ranges(PUBLIC_NET)?;
     assert_eq!(
@@ -468,55 +606,35 @@ async fn a_restart_in_the_middle_of_a_rotation_is_safe() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Fill `node`'s store with short recent posts, newer than anything held,
-/// up to rotation's threshold.
-fn fill(node: &Node, from_ts: u64) {
-    let (at, _) = node.rotation_bounds().unwrap();
-    let mut n = 50_000;
-    while node.store().store_bytes() < at {
-        hold(
-            node.store(),
-            &[note(
-                n,
-                2_000 + n % 300,
-                from_ts + u64::from(n - 50_000) / 10,
-                false,
-            )],
-        );
-        n += 1;
-    }
-}
-
-/// Rotation never loses a file by side effect: a node responsible for a
-/// blob (one of its k replicas) keeps it when rotation deletes the post
-/// that lists it; a node that only cached it on a read lets it go.
+/// Rotation never loses a file by side effect: when it rotates out the
+/// post that lists a blob, the node keeps the blob, whether it holds it as
+/// a replica (pushed by `replicate`) or only cached it on a read. Until ADR
+/// 0029's replica record (PR #183) tells the two apart, both are kept, and
+/// logged as `undecided`.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_responsible_replica_keeps_the_blob_a_cache_lets_it_go() -> anyhow::Result<()> {
+async fn rotation_keeps_the_files_of_the_posts_it_rotates_out() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     let mut a_config = config(&dir.path().join("a"), &[]);
     a_config.replication = 1;
     let a = Node::start(a_config).await?;
-    let holder = |name: &str, k: usize, peers: &[&Arc<Node>]| -> anyhow::Result<NodeConfig> {
+    let holder = |name: &str, peers: &[&Arc<Node>]| -> anyhow::Result<NodeConfig> {
         let node_dir = dir.path().join(name);
         in_sync(&node_dir)?;
         let mut c = config(&node_dir, peers);
-        c.replication = k;
+        c.replication = 1;
         c.storage_max = Some(64 * MIB);
         c.events_share = 4;
         Ok(c)
     };
-    let b = Node::start(holder("b", 3, &[&a])?).await?;
-    let c = Node::start(holder("c", 1, &[&a, &b])?).await?;
-    let holders = [b, c];
-    let (b, c) = (&holders[0], &holders[1]);
+    let b = Node::start(holder("b", &[&a])?).await?;
+    let c = Node::start(holder("c", &[&a, &b])?).await?;
     eventually("everyone knows everyone", 30, || {
         (a.known_peers().len() == 2 && !b.known_peers().is_empty() && c.known_peers().len() == 2)
             .then_some(())
     })
     .await;
-    // A file whose closest node is b: a asks b to hold it (k = 1), and c,
-    // which knows b, is not responsible for it (k = 1).
-    let ids = [a.endpoint_id(), b.endpoint_id(), c.endpoint_id()];
+    // A file a asks b to hold (k = 1, b the closer of its two peers).
+    let ids = [b.endpoint_id(), c.endpoint_id()];
     let content = (0u32..200)
         .map(|seed| {
             let mut bytes = vec![7u8; 4_096];
@@ -527,7 +645,7 @@ async fn a_responsible_replica_keeps_the_blob_a_cache_lets_it_go() -> anyhow::Re
             let hash = *iroh_blobs::Hash::new(bytes).as_bytes();
             wats::proto::closest(&hash, &ids, 1) == [b.endpoint_id()]
         })
-        .unwrap_or_else(|| panic!("a file closest to b: {ids:?}"));
+        .expect("a file closer to b");
     let file = dir.path().join("report.bin");
     std::fs::write(&file, &content)?;
     let event = a
@@ -547,7 +665,7 @@ async fn a_responsible_replica_keeps_the_blob_a_cache_lets_it_go() -> anyhow::Re
         )
         .await?;
     let blob = event.blobs[0].clone();
-    for node in [b, c] {
+    for node in [&b, &c] {
         eventually("the post arrives", 30, || {
             node.store().get(&event.id).unwrap().map(|_| ())
         })
@@ -566,10 +684,7 @@ async fn a_responsible_replica_keeps_the_blob_a_cache_lets_it_go() -> anyhow::Re
         c.fetch_and_export(&blob).await?.is_some(),
         "c caches it on a read"
     );
-    assert!(b.blob_responsible(&blob.hash));
-    assert!(!c.blob_responsible(&blob.hash));
-
-    for node in [b, c] {
+    for node in [&b, &c] {
         assert!(node.blob_pinned(&blob.hash).await?);
         fill(node, event.ts + 1);
         let run = node.rotate_if_full().await?.expect("a rotation");
@@ -579,17 +694,13 @@ async fn a_responsible_replica_keeps_the_blob_a_cache_lets_it_go() -> anyhow::Re
             "the oldest post went"
         );
         assert!(node.store().unpin_pending()?.is_empty());
+        assert!(node.blob_pinned(&blob.hash).await?, "the file stays");
+        assert_eq!(
+            node.store().retained_blobs()?,
+            [(blob.hash.clone(), "undecided".to_string())]
+        );
     }
-    // The replica keeps its tag, and says why.
-    assert!(b.blob_pinned(&blob.hash).await?);
-    assert_eq!(
-        b.store().retained_blobs()?,
-        [(blob.hash.clone(), "replica".to_string())]
-    );
-    // The cache does not: the blob is the collection's to delete.
-    assert!(!c.blob_pinned(&blob.hash).await?);
-    assert!(c.store().retained_blobs()?.is_empty());
-    for node in holders.iter().chain([&a]) {
+    for node in [b, c, a] {
         node.shutdown().await?;
     }
     Ok(())
@@ -641,6 +752,99 @@ async fn many_tombstones_leave_room_for_opaque_events() -> anyhow::Result<()> {
     b.publish_signed(v3).await?;
     assert!(b.store().get_raw(&id)?.is_some());
     assert!(b.store().opaque_bytes() > 0);
+    b.shutdown().await?;
+    Ok(())
+}
+
+/// An evicted body stays evicted when it comes back by gossip, a
+/// `replicate` push or a sync page; a `read` fetches it back (ADR 0020
+/// decision 4).
+#[tokio::test(flavor = "multi_thread")]
+async fn an_evicted_body_comes_back_on_read_only() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let a_dir = dir.path().join("a");
+    in_sync(&a_dir)?;
+    let a = Node::start(config(&a_dir, &[])).await?;
+    let now = now_secs();
+    let post = note(1, 42, now - 3_600, true);
+    hold(a.store(), std::slice::from_ref(&post));
+    let b_dir = dir.path().join("b");
+    in_sync(&b_dir)?;
+    let b = Node::start(config(&b_dir, &[&a])).await?;
+    b.wait_for_neighbor(PUBLIC_NET, Duration::from_secs(10))
+        .await?;
+    hold(b.store(), std::slice::from_ref(&post));
+    b.store()
+        .drop_body(&post.id, DropReason::Evicted, None, None, now)?;
+    let evicted = |b: &Node| b.store().get(&post.id).unwrap().is_none();
+    assert!(evicted(&b));
+    // Pushed again (gossip, a local publish): refused, the tombstone stays.
+    let full = serde_json::to_value(&post)?;
+    assert!(b.publish_signed(full.clone()).await.is_err());
+    assert!(evicted(&b));
+    // A replicate push.
+    let push = Request::Replicate {
+        event: full,
+        hashes: vec![],
+    };
+    let answer = wats::proto::call_solving(a.endpoint(), b.endpoint_id(), &push).await?;
+    assert!(matches!(answer, Response::Replicated { .. }), "{answer:?}");
+    assert!(evicted(&b));
+    // A sync page.
+    b.sync_from(a.endpoint_id(), PUBLIC_NET).await?;
+    assert!(evicted(&b));
+    // A read fetches it back.
+    let client = client_for(&b).await;
+    let read = call(&client, "read", json!({"id": post.id})).await;
+    assert_ne!(read.is_error, Some(true), "{read:?}");
+    eventually("the body is back", 10, || (!evicted(&b)).then_some(())).await;
+    assert!(b.store().drop_record(&post.id)?.is_none());
+    client.cancel().await?;
+    for node in [b, a] {
+        node.shutdown().await?;
+    }
+    Ok(())
+}
+
+/// A run that frees almost nothing (all that is left is kept) backs off:
+/// the next check does not run again at once, only once the store grew by
+/// 1 % of its share.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_rotation_that_frees_nothing_backs_off() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let b_dir = dir.path().join("b");
+    in_sync(&b_dir)?;
+    let own = own_key(&b_dir)?;
+    let now = now_secs();
+    let mut b_config = config(&b_dir, &[]);
+    b_config.storage_max = Some(8 * MIB);
+    b_config.events_share = 25;
+    let b = Node::start(b_config).await?;
+    let (at, _) = b.rotation_bounds().unwrap();
+    let share = b.events_share().unwrap();
+    // Only this node's own posts: nothing to rotate.
+    let mut n = 0u32;
+    let mut add = |b: &Node, until: u64| {
+        while b.store().store_bytes() < until {
+            let ts = now - 30 * DAY + u64::from(n);
+            hold(
+                b.store(),
+                &[root(Kind::Note, &format!("mine {n}"), &own, ts)],
+            );
+            n += 1;
+        }
+    };
+    add(&b, at);
+    let first = b.rotate_if_full().await?.expect("a first run");
+    assert_eq!(first.bodies + first.trimmed + first.rows, 0, "{first:?}");
+    assert!(b.rotate_if_full().await?.is_none(), "backed off");
+    assert!(b.rotation_json()["backoff_secs"].as_u64().unwrap() > 0);
+    // The store grows by 1 % of its share: it tries again.
+    let grown = b.store().store_bytes() + share / 100 + 1;
+    add(&b, grown);
+    assert!(b.rotate_if_full().await?.is_some(), "grown: tried again");
+    let seen: HashSet<String> = b.local_authors();
+    assert!(seen.contains(&wats::identity::author_id(&own)));
     b.shutdown().await?;
     Ok(())
 }

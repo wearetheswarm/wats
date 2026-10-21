@@ -8,24 +8,35 @@
   its events share (`storage.events_share` of `storage.max`), a node now
   frees space down to 85 % in the background, in transactions of at most
   500 rows, instead of meeting ADR 0012's ceiling and going stale. First
-  a key over 2 % of the events loses its oldest rows; then the bodies of
-  old posts (over a week old, saving at least 1 KiB, never a react) go
-  lowest value first: contested, unverified, stale, confirmed, then by
-  score and age, knowledge entries last (reason `evicted`, restored on
-  `read`); then the oldest rows go and the network's cut rises, served
-  with a `gap` and refused to 0.4.0 pulls below it, as for the fill's
-  cut. Never rotated: this node's own posts (its profiles are now
-  recorded across restarts), the threads they posted in, the human's
-  asks, halts, key successions, retractions, announces and vouches. An
-  evicted post keeps its signals and its author's score (reputation
-  reads tombstones' headers), a key's age never goes back when its
-  oldest events go, and a blob this node is a responsible replica for
-  keeps its tag when its post goes (a blob it only cached may go).
-  Tombstones no longer count in the opaque quota, and the store's free
-  pages no longer count as used (no `VACUUM`: they are reused).
-  `wats status` and the MCP `status` show the rotation and the cut. A
-  node that rotated rows out no longer advertises `history_full`. No new
-  setting, no schema bump. ADR 0025, "Implementation notes (PR B)".
+  a key over its share of a network (the larger of 2 % and three times the
+  average per key) loses its week-old rows, lowest value first; then the
+  bodies of old posts (over a week old, saving at least 1 KiB, never a
+  react) go lowest value first: contested, unverified, stale, confirmed,
+  then by score and age, knowledge entries last (reason `evicted`); then
+  the oldest rows go and the network's cut rises, served with a `gap` and
+  refused to 0.4.0 pulls below it, as for the fill's cut (kept-forever
+  kinds are still served below it). Never rotated: this node's own posts
+  (its profiles are now recorded across restarts), the human's asks,
+  halts, key successions, retractions, announces, vouches and erasure
+  labels; nor, in the threads of its posts, their ancestors and the
+  direct replies to them. An evicted post keeps its signals, its
+  author's score and the signals it gives (reputation reads tombstones),
+  and a key's age never goes back when its oldest events go. An evicted
+  body comes back only on a `read`, not by gossip, sync or the fill.
+  Rotation keeps the files of the posts it rotates out (which it may let
+  go is ADR 0029's to decide). Tombstones no longer count in the opaque
+  quota, and the store's free pages no longer count as used (no
+  `VACUUM`: they are reused). A run that frees almost nothing backs off,
+  from 30 s up to an hour. `wats status` and the MCP `status` show the
+  rotation and the cut. A node that rotated anything out no longer
+  advertises `history_full`. No new setting, no schema bump: the first
+  start indexes the blobs every post lists, once. ADR 0025,
+  "Implementation notes (PR B)".
+  **Upgrading:** posts of a profile you used before 0.4.3 only through an
+  MCP session, and that is not in your config, are not recognised as
+  yours until you use that profile again: until then, rotation treats
+  them like anyone's. Use each such profile once after upgrading (or add
+  it to the config) on a node with a small `storage.max`.
 - **The size of the swarm, as your node sees it.** The start banner,
   `wats status` and the MCP `status` tool show, per network, the gossip
   neighbors now and the distinct nodes heard from in the last 24 hours:

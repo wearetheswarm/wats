@@ -1047,11 +1047,12 @@ gets its 40 days; an announce only one probed peer holds is not stored).
 
 ## Implementation notes (PR B)
 
-PR B (0.4.3) follows §7, with these differences and details. The code is
-in `crates/wats/src/node/rotation.rs` (the run, its stages, the plan),
-`crates/wats/src/store.rs` (`Keep`, `evict_bodies`, `delete_rows`, the
-cut, `key_first`) and `Node::blob_responsible` (`crates/wats/src/node.rs`,
-next to the blob code).
+PR B (0.4.3) follows §7, with these differences and details, as amended
+after its review (2026-10-21; "Review decisions" below). The code is in
+`crates/wats/src/node/rotation.rs` (the run, its stages, the plan, the
+backoff), `crates/wats/src/store.rs` (`Keep`, `evict_bodies`,
+`delete_rows`, the cut, `key_first`, `event_blobs`, `store_meta`) and
+`crates/wats/src/node/history.rs` (serving).
 
 **When it runs**
 
@@ -1059,84 +1060,105 @@ next to the blob code).
   it frees space down to 85 %. Checked at start, then every 30 s
   (`rotation_check`, a test knob), in a task of its own; one run at a
   time. Without `storage.max` there is no share and no rotation.
-- **Batches.** At most 500 rows per transaction, with a 5 ms pause after
-  each, so gossip inserts wait little. The heavy parts (the scans, the
-  value plan) run on blocking threads; each scan step holds the store
-  lock for at most 2,000 rows.
+- **Off the runtime.** Every scan, plan and transaction runs on a
+  blocking thread; a scan holds the store lock for at most 5,000 rows (by
+  `seq`) or 2,000 (by time), a transaction for at most 500 rows, with a
+  5 ms pause after each.
 - **A node that stops** ends its run at the next pause: a restarted node
   may already use the store. The next check starts a new run from what
   the store holds; a run keeps no state of its own.
 - **Hysteresis.** A run stopped at, say, 90 % does not resume until the
   store is back at 95 %.
+- **Backoff.** A run that frees less than 1 % of what it had to free
+  (what is left is kept, or ranges are still being fetched) backs off:
+  30 s, doubling up to an hour, with one warning per step. It runs again
+  earlier only once the store grew by 1 % of its share since. `status`
+  shows it (`backoff_secs`).
 - **Every node with `storage.max`** rotates, `sync.initial_max = 0`
-  included (decision). A full node that reaches its share keeps taking
-  live events, instead of meeting ADR 0012's ceiling, and stops
-  advertising `history_full` (below). Routers and bootstrap nodes size
-  `storage.max` for the network, as ADR 0012 already asks.
+  included. A full node that reaches its share keeps taking live events,
+  instead of meeting ADR 0012's ceiling, and stops advertising
+  `history_full` once rotation dropped anything (below). Routers and
+  bootstrap nodes size `storage.max` for the network, as ADR 0012 asks.
 
 **The stages** (one more than §7, before the others)
 
-0. **Keys over their share** (new, decided here). A key, with its
-   `rotate` chain, whose rows hold more than 2 % of the bytes of all rows
-   (their JSON) loses its oldest unprotected rows first, down to that
-   share, largest key first. The cut does not move: as with the fill's
-   per-key share (§4, phase 2), these are skipped events, not a hole in
-   time. This node's own keys are never trimmed. Why before stage 1: a
-   flood pays for itself before anyone else's body or old history goes
-   (see "Threats" below). In a network where a few keys write
-   everything, this trims them first; that is the fill's 2 % rule, kept
-   for the life of the store.
+0. **Keys over their share** (decided in PR B, amended by the review).
+   Per network, a key with its `rotate` chain may hold the larger of 2 %
+   of the network's bytes and three times the average per key there
+   (keys with rows in the network). Over it, it loses rows down to it,
+   largest excess first: rows older than a week only, tombstones and
+   opaque rows first, then full events lowest value first (the stage 1
+   order). The cut does not move: as with the fill's per-key share (§4,
+   phase 2), these are skipped events, not a hole in time. This node's
+   own keys are never trimmed, and stage 0 honours the strict protection
+   only (below). In a five-key team network, no key is over its share.
 1. **Bodies, lowest value first.** As §7:
    - only full events whose body saves at least 1 KiB (the JSON of the
-     full event against that of its tombstone, measured exactly);
+     full event against that of its tombstone, measured exactly). The
+     candidates are chosen in SQL by the size of their title, text and
+     tags (at least 512 bytes), before the exact check;
    - never a `react` (its body is its signal, fact 3);
    - value order: status (`contested` < `unverified` < `stale` <
      `confirmed`, `Status::rank`), then the post's score (v1b, with this
      node's reputation tables), then older first, then the id; knowledge
      entries (`knowledge::compute` on the candidates' threads: digests
      and canonical answers that are entries now) last;
-   - **a week's grace** (decision): posts younger than 7 days keep their
-     bodies in stage 1. A new post is `unverified` with a zero score
-     until signals come; without the grace, every new long post would be
-     the first to go. Stage 2 still deletes old rows whatever their age.
-   - At most the 200,000 oldest candidates are ranked in one run (memory
-     and time bound); beyond, the value order applies among those.
+   - **a week's grace**: posts younger than 7 days keep their bodies in
+     stages 0 and 1. A new post is `unverified` with a zero score until
+     signals come. Stage 2 still deletes old rows whatever their age.
+   - At most the 200,000 oldest candidates are ranked in one run; the
+     scan keeps 16 bytes per candidate (at most 400,000 at once), about
+     130 once ranked: some 30 MB at the peak.
 2. **The cut rises.** As §7: whole rows, oldest first across networks
-   (the networks' streams merged by `(ts, id)`), and the cut of each
-   network rises to the newest row deleted there, **in the same
-   transaction**.
-   - **One cut range** per network, phase `rotation`, `opened` = when it
-     was last raised. The fill's cut it replaces, and the skipped and
-     unconfirmed ranges entirely below it, are folded into it.
-   - **Never below a range still pending** (decision): a walk holds its
-     range in memory and stores events down to its `lo`, so stage 2
-     deletes only below the lowest `lo` of the network's pending ranges.
-     The fill (`lo` 0) therefore blocks stage 2 in its network until it
-     ends; its budget is clamped to the share (PR A), so it ends.
+   (the networks' streams merged by `(ts, id)`), read from each
+   network's cut up, and the network's **rotation cut** rises to the
+   newest row deleted there, in the same transaction.
+   - **Its own range** (`cut`, phase `rotation`, `opened` = when it was
+     last raised), apart from the fill's cut. The fill's cut and the
+     skipped and unconfirmed ranges below it stay.
+   - **Kept-forever kinds are served below it.** A `sync` asking only for
+     kept-forever kinds (phase 0 of a fill) is stopped by the fill's cut
+     and skipped ranges, not by the rotation cut, since rotation never
+     deletes them. Without this, once every node rotated, a newcomer
+     could no longer fetch old announces, vouches or rotations by sync.
+   - **Never below a range still pending**: a walk holds its range in
+     memory and stores events down to its `lo`, so stage 2 deletes only
+     below the lowest `lo` of the network's pending ranges. The fill
+     (`lo` 0) therefore blocks stage 2 in its network until it ends; its
+     budget is clamped to the share (PR A), so it ends.
    - **Nothing in a network whose history task never ran** (watermark 0,
      no range): a cut there would stop its fill from starting.
-   - **A catch-up never opens below the cut** (`open_range`), which
-     rotation may raise above the watermark.
+   - **Neither a catch-up nor a union check goes below the cut**
+     (`open_range`, `union_check`): what is there, the next run would
+     delete again.
    - **A bound per run:** stage 2 stops once the rows it deleted weigh,
-     at the store's average bytes per row, twice what was to be freed
-     (freed pages can lag behind deletions); the next check goes on.
-     Measured: deleting half of 2,000 rows frees about 43 % of the store
-     bytes at once.
+     at the store's average bytes per row (measured at the start of stage
+     2), twice what was to be freed; the next check goes on.
    - **Islands.** Protected rows stay below the cut, served by `get`, not
-     by `sync` pages, as in PR A.
+     by `sync` pages, but the kept-forever kinds (above).
 
-**Never dropped** (`store::Keep`), in any stage: the posts of this
-node's profiles; every row of the threads they posted in; the asks of
-`ask_notify` and their threads; the kept-forever kinds (`KEEP_KINDS`:
-halts, `rotate`, retractions, announces, vouches). Checked when the plan
-is made and again inside each transaction, so a post of this node's in a
-thread since then keeps the thread.
+**What is kept** (`store::Keep`; narrowed by the review)
 
-- **This node's profiles survive restarts** (decision): `local_authors`
-  only knows the profiles used since the node started and those of its
-  config. Every profile key is now recorded in a new table,
-  `local_keys`, when first used (and the configured ones at start). A
-  profile used only before 0.4.3 and not configured is not known.
+- **Strictly, in every stage:** the posts of this node's profiles; the
+  asks of `ask_notify`; the kept-forever kinds (`KEEP_KINDS`: halts,
+  `rotate`, retractions, announces, vouches) and erasure labels (a
+  `react` with `data.label = "erasure"`, so that it keeps travelling).
+- **In stages 1 and 2:** in the threads those posts are in, their
+  ancestors (up to the root, 64 levels at most) and the direct replies to
+  them. The other rows of those threads are anyone's, ranked like any
+  other; stage 0 may trim even these when their author is over its share.
+  Protecting whole threads let a key flooding replies into this node's
+  ask pin the store full, up to ADR 0012's ceiling.
+- **Checked twice:** when the plan is made, and inside each transaction,
+  so that a post of this node's since the plan (it now protects its
+  parent and ancestors: a walk of the row's replies, 2,000 at most), or a
+  profile recorded in `local_keys` since, counts.
+- **This node's profiles survive restarts:** every profile key is
+  recorded in `local_keys` when first used (and the configured ones at
+  start, off the start path). A profile used before 0.4.3 only, and not
+  configured, is not known: the store does not record where a post came
+  from, and `received_at` close to `ts` holds for every live post too, so
+  no heuristic tells such posts apart. The CHANGELOG says so.
 
 **The last copy** (Vincent, 2026-10-21)
 
@@ -1153,22 +1175,30 @@ thread since then keeps the thread.
 
 - **Tombstones' heads.** `net_signal_rows`, `heads`, `vouches` and
   `ask_roots` accept a tombstone of an understood version (an opaque row
-  of version 1 or 2 with `body_hash`): an evicted post keeps its signals
-  and its author's score, an evicted ask its asker. Reacts are never
-  evicted in stage 1, so their signals stay.
+  of version 1 or 2 with `body_hash`) as a target: an evicted post keeps
+  its signals and its author's score, an evicted ask its asker.
+- **Tombstones' signals** (review). A tombstone also stays a source:
+  `signal_rows` and `net_signal_rows` accept it, and a dropped body keeps
+  its `event_refs` (they are header fields), as does a tombstone received
+  as such. A reasoned reply evicted still contests, a citing post still
+  cites; reacts are never evicted in stage 1, so their values stay.
 - **Key age.** Rows deleted in stage 0 or 2 leave, per key and network,
-  their earliest `received_at` and `ts` in a new table, `key_first`, in
-  the same transaction. `Store::author_first_seen` (the new-author proof
-  of work) and `reputation::build` (`first_seen`, the `ts` clamp of
+  their earliest `received_at` and `ts` in `key_first`, in the same
+  transaction. `Store::author_first_seen` (the new-author proof of work)
+  and `reputation::build` (`first_seen`, the `ts` clamp of
   `known_since`) take them into account: a key's age never goes back
   when its oldest events go. `key_seen` is untouched.
 - **Known gap.** The spare proof of work of deleted events (the floor's
   PoW bonus) is not kept: a key's bonus counts the events held.
 
-**ADR 0020 is unchanged**
+**ADR 0020**
 
-- Stage 1 drops with reason `evicted`; a body comes back on `read` or
-  any later copy, as before.
+- Stage 1 drops with reason `evicted`. **The body comes back only on a
+  `read`** (review; ADR 0020 decision 4): a `get` on demand restores it
+  (`Store::insert_with(.., restore)`, `Origin::Fetched`); gossip, a
+  `replicate` push, a sync page and the fill keep the tombstone, so that
+  nothing rotation evicted comes back to be evicted again. The record
+  expires after 30 days, as before; after that, a body is taken like any.
 - Stage 2 deletes an `evicted` record with its row; it keeps every other
   record (`own`, `retraction`, `erasure`, `label`), so a body dropped for
   those reasons is still refused when it comes back, as a tombstone.
@@ -1176,106 +1206,174 @@ thread since then keeps the thread.
 **Storage measures**
 
 - **The opaque quota** counts only rows of versions this node does not
-  understand and v2 submissions (decision: submissions keep their
-  quota; ADR 0015 bounds them by retention). Tombstones of understood
-  versions are out of it, stored here or received, and an incoming
-  tombstone is not checked against the quota.
+  understand and v2 submissions (submissions keep their quota; ADR 0015
+  bounds them by retention). Tombstones of understood versions are out of
+  it, stored here or received, and an incoming tombstone is not checked
+  against the quota.
+- **Open cost** (review). The count is kept in `store_meta`
+  (`opaque_bytes`, with `opaque_seq`, the newest `seq` it covers), written
+  in the transaction of each change that counts; an open adds only the
+  rows above `opaque_seq`, and counts everything again once a day (a
+  downgraded node may have deleted rows without updating it: it then
+  over-counts, the safe way).
+- **Byte counts** are `LENGTH(CAST(json AS BLOB))`, bytes, not
+  characters, wherever a budget is counted.
 - **Free pages.** Store bytes were already used pages (PR A). ADR 0012's
   measure is now the data directory less the store's free pages (the
   node's measure, the banner, `wats config list`).
-- **No vacuum** (decision): no `VACUUM` (it rewrites and locks the whole
-  store) and no `auto_vacuum` (it cannot be turned on for an existing
-  file without one). Freed pages are reused by later inserts, so the
-  file stops growing at its high-water mark. The WAL is left as SQLite
-  manages it. A `wats compact` (an offline `VACUUM`) can come later.
+- **No vacuum:** no `VACUUM` (it rewrites and locks the whole store) and
+  no `auto_vacuum` (it cannot be turned on for an existing file without
+  one). Freed pages are reused by later inserts, so the file stops
+  growing at its high-water mark. The WAL is left as SQLite manages it. A
+  `wats compact` (an offline `VACUUM`) can come later.
 
 **Blobs** (Vincent, 2026-10-21: rotation must not lose a file by side
 effect)
 
+- **Which blobs a kept post lists** is an index, `event_blobs (hash,
+  seq)`, filled on insert of a full event, cleared when its body is
+  dropped or its row deleted (like `event_tags`). The rows of a release
+  before 0.4.3, or of a downgraded node meanwhile, are indexed at open,
+  from the `seq` recorded in `store_meta` (`event_blobs_seq`), in steps
+  of 20,000. An entry whose row is gone or no longer full counts for
+  nothing. A batch's hashes are checked in one query. The blob
+  collection still reads every kept event (`referenced_blobs`), as
+  before. (ADR 0029, PR #183, needs the same lookup: one table, one
+  definition, aligned with it.)
 - When rotation drops or deletes the last full post that lists a blob,
   the blob goes to `unpin_pending`, in the same transaction. After it, or
-  at the next run after a crash, each one is looked at again:
+  at the next run after a crash, each one is settled, on blocking threads:
   - listed again by a full post: nothing to do;
-  - **this node is responsible for it** (`Node::blob_responsible`: one of
-    the k closest by XOR to the hash, itself and the peers it knows
-    counted, k = `replication`, SPEC §2.5): it keeps its tag, and the
-    blob is recorded in `blob_retained` with the reason `replica`;
-  - otherwise (a blob it only cached, fetched on a read): its tag goes,
-    and the next collection deletes the file, as for any dropped body.
+  - kept: recorded in `blob_retained`, a log, in the transaction that
+    settles it; the tag stays;
+  - otherwise: untagged, and forgotten once untagged (the next collection
+    deletes the file).
+- **Which blobs are kept** (`Node::rotation_keeps_blob`): blob retention
+  follows blob responsibility, own posts and pins, not whether a body is
+  held. The record of responsibility is ADR 0029's (PR #183:
+  `has_replica_intent`, written when a blob arrives by `replicate`; own;
+  pinned; `is_responsible(hash, blob_target_k(hash))`, whose XOR estimate
+  only adds; its last-copy hand-off for the others). Until it lands, this
+  node cannot tell a replica from a blob it only cached, so **rotation
+  keeps every blob** (logged `undecided`): no file is lost; a blob only
+  cached stays until that record decides. Once #183 is merged, rotation
+  uses it, and routes the blobs it may let go through its last-copy rule.
 - Own posts are never rotated, so their blobs stay listed.
 - **Kept blobs can fill the blob part of `storage.max`.** PR B evicts no
   blob: as today, the node then stops fetching blobs at `storage.max`,
   and refuses events above 110 % (ADR 0012).
-- Blob eviction order, replica repair, pinning and a last-copy check are
-  ADR 0029's. `blob_retained` and `Node::blob_retained` (the reasons) are
-  where they plug in.
 
 **What a node shows**
 
 - `status.storage.rotation` (MCP, `wats status --json`): `state`
-  (`idle`, `running` with its `stage`), the bounds, and the last run
-  (`at`, `bodies`, `trimmed`, `rows`, `before`, `after`), from a new
-  table, `rotation_log` (the last 100 runs). `wats status` prints it as
-  one line.
+  (`idle`, `running` with its `stage`), the bounds, the last run (`at`,
+  `bodies`, `trimmed`, `rows`, `before`, `after`: what it actually
+  dropped and deleted, from `rotation_log`, the last 100 runs), and
+  `backoff_secs`. `wats status` prints it as one line.
 - The `history` object gains `rotated_ts`, when rotation last raised the
   cut, and its line `cut <date> (rotation, <date>)`.
-- **`history_full`** is not advertised once rotation deleted rows
-  (`key_first` holds any): stage 0 leaves no hole in time, but the
-  history is no longer complete.
+- **`history_full`** is not advertised once rotation dropped a body or
+  deleted a row (`store_meta.history_lossy`).
 
 **Crash safety**
 
 - Each batch is one transaction: the tombstones and their drop records;
-  or the deleted rows, their `key_first`, the cut and the skipped or
-  unconfirmed ranges it absorbs. A crash leaves the store as after the
-  last batch: never rows gone above the cut this node advertises.
-- Blobs to untag are recorded in the same transaction, untagged after.
-- Every new table is created on open (`CREATE TABLE IF NOT EXISTS`):
-  `local_keys`, `key_first`, `unpin_pending`, `blob_retained`,
-  `rotation_log`. No schema bump; 0.4.2 still opens the store (it then
-  ignores `key_first`).
+  or the deleted rows, their `key_first`, the index rows and the raised
+  cut; in both, the blobs to settle and `history_lossy`. A crash leaves
+  the store as after the last batch: never rows gone above the cut this
+  node advertises.
+- Every new table and index is created on open (`CREATE ... IF NOT
+  EXISTS`): `local_keys`, `key_first`, `unpin_pending`, `blob_retained`,
+  `rotation_log`, `event_blobs`, `store_meta`, and the index
+  `events_author_ts (author, ts, id)`. No schema bump; 0.4.2 still opens
+  the store (it then ignores them; the next 0.4.3 open catches up on the
+  rows it stored).
 
 **Threats**
 
 - **Flooding to evict others' posts.** Rotation turns a flood into
-  deletions. Stage 0 deletes a flooding key's rows first; a flood from
-  many keys (each under 2 %) pays the new-author proof of work per event
-  (ADR 0010), and then only moves old, unprotected history out: never
-  this node's posts, its threads, or the kept-forever kinds, and old
-  bodies go in value order (confirmed and knowledge entries last).
-- **Kept-forever kinds** are never rotated: a key flooding vouches or
-  announces is bounded by proof of work and the fill's per-key share,
-  not by rotation. A store whose protected rows alone exceed the share
-  logs it at every run and falls back to ADR 0012's ceiling.
+  deletions. A flooding key over its share is trimmed first, but only
+  rows older than a week (the grace): a fresh flood is not trimmed in
+  stage 0 for a week, and meanwhile stages 1 and 2 move old, unprotected
+  history out. A flood from many keys, each under its share, pays the
+  new-author proof of work per event (ADR 0010).
+- **Flooding replies into this node's threads** no longer pins the
+  store: only the ancestors of its posts and the direct replies to them
+  are kept in stages 1 and 2, and stage 0 trims even those for a key over
+  its share.
+- **Kept-forever kinds and erasure labels** are never rotated: a key
+  flooding vouches, announces or erasure labels is bounded by proof of
+  work and the fill's per-key share, not by rotation. A store whose kept
+  rows alone exceed the share backs off and falls back to ADR 0012's
+  ceiling.
+
+**Review decisions** (coordinator, for Vincent, 2026-10-21)
+
+- The blob index, one query per batch, nothing synchronous on the
+  runtime (blocker).
+- Blob retention from ADR 0029's record, not from this node's peer view
+  at rotation time (a well-connected replica could otherwise think itself
+  not responsible); until #183, keep everything.
+- Tombstones' signals keep counting.
+- The narrowed protection, and stage 0 above it.
+- Stage 0 per network, `max(2 %, 3 × average)`, a week's grace, value
+  order within a key.
+- The rotation cut apart from the fill's, kept-forever kinds served
+  below it.
+- The backoff.
+- Stage 1's SQL pre-filter on body size; bounded memory.
+- Scans on blocking threads, stage 2 from the cut, the
+  `events(author, ts, id)` index.
+- `local_keys` checked inside the transaction; no heuristic for older
+  profiles (none is reliable), said in the CHANGELOG.
+- Nits: the log counts what was done; the stage-2 bound measured after
+  stages 0 and 1; byte lengths; the cached opaque count; erasure labels
+  kept; `history_full` off after any eviction; `blob_retained` written
+  with the settling; the union check above the cut.
+- Evicted bodies come back on `read` only.
 
 **Tests**
 
-- `store.rs`: tombstones out of the opaque quota (reopened too); the heads
-  of tombstones for reputation; eviction honours the never-drop list,
-  reacts and the 1 KiB floor and records freed blobs; deletion raises the
-  cut, keeps the islands, the key's age and the non-evicted drop records,
-  and refuses an erased body again; a transaction failing halfway changes
-  nothing (a test fail point); deleted rows free store bytes and freed
-  pages are reused.
+- `store.rs`: tombstones out of the opaque quota (reopened too) and the
+  cached count across opens; the heads of tombstones; eviction honours the
+  narrowed protection, reacts and the 1 KiB floor and records freed
+  blobs; deletion raises the rotation cut apart from other ranges, keeps
+  the islands, the key's age and the non-evicted drop records, and
+  refuses an erased body again; a post of this node's, or a profile,
+  recorded after the plan protects inside the transaction (stage 0 keeps
+  only what is strictly kept); erasure labels kept; the blob index
+  follows bodies and is filled at open; an evicted body comes back on
+  `read` only; a transaction failing halfway changes nothing (a test fail
+  point); deleted rows free store bytes and freed pages are reused.
 - `node/rotation.rs`: the value order on a fixed graph (contested,
-  unverified older then newer then voted, confirmed, entry; own posts,
-  joined threads, kept kinds, reacts, short and recent bodies left out);
-  an evicted post (and its evicted ask) keeps its author's score.
-- `tests/rotation.rs` (hermetic, loopback): a soak, 2,000 posts in rounds
-  into a 2 MiB share, never over it, with bodies dropped, the cut raised
-  and every protected row kept; a flooding key trimmed before anyone
-  else; the raised cut served with a `gap` to a 0.4.1 peer and refused to
-  a 0.4.0 pull below it; a node stopped in the middle of a rotation,
-  consistent, then finishing it; a responsible replica keeping a blob
-  whose post was rotated out, and a cache-only node letting it go; many
-  tombstones leaving room for opaque events.
+  unverified older then newer, a sibling of this node's answer, voted,
+  confirmed, entry; own posts, an ancestor, a reply to this node's post,
+  kept kinds, reacts, short and recent bodies left out); an evicted post
+  (and its evicted ask) keeps its author's score; evicting the posts that
+  give signals (a reasoned contesting reply, a citing post, the post)
+  changes no status nor score.
+- `tests/rotation.rs` (hermetic, loopback): a soak, 2,000 posts into a
+  2 MiB share while rotation runs by itself every 50 ms, never over the
+  share, with a heavy old key trimmed, bodies dropped, the cut raised,
+  every deleted row at or below the cut but the trimmed key's, and every
+  protected row kept; a flooding key (old, partly replying to this node's
+  answer) trimmed before anyone else; a five-key team not trimmed; the
+  raised cut served with a `gap` to a 0.4.1 peer, refused to a 0.4.0 pull
+  below it, and an announce below it served to a kept-kinds request; a
+  node stopped in the middle of a rotation, consistent, then finishing
+  it; files kept when their post is rotated out, on a replica and on a
+  cache (until #183); many tombstones leaving room for opaque events; an
+  evicted body staying evicted through a push, a `replicate` and a sync
+  page, and back on `read`; a run that frees nothing backing off.
 
 **Known gaps (later)**
 
 - The proof-of-work bonus of deleted events (above).
 - Profiles used only before 0.4.3 (above).
-- Blob eviction (ADR 0029).
+- Blob retention and eviction (ADR 0029, #183): until then, rotation keeps
+  every blob.
 - The digest before the last copy goes (above).
+- A fresh flood is not trimmed for a week (the grace, above).
 
 ## Consequences
 

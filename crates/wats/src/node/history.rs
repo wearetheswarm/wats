@@ -225,7 +225,7 @@ enum End {
 }
 
 /// What one walk asks for.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 struct Walk {
     kinds: Vec<String>,
     authors: Vec<String>,
@@ -511,17 +511,25 @@ impl Node {
     /// The holes in this node's history of `net`: `(lo_ts, top_ts)`, whose
     /// complete history it does not hold (ADR 0025 §3).
     pub fn history_holes(&self, net: &str) -> Vec<(u64, u64)> {
-        self.holes(net, Holes::All)
+        self.holes(net, Holes::All, false)
     }
 
-    /// The holes of `net` that count for `which` request.
-    fn holes(&self, net: &str, which: Holes) -> Vec<(u64, u64)> {
+    /// The holes of `net` that count for `which` request. `kept_only`: a
+    /// request for kept-forever kinds only, which rotation never deletes,
+    /// so its cut is no hole for them (the fill's cut and skipped ranges
+    /// still are).
+    fn holes(&self, net: &str, which: Holes, kept_only: bool) -> Vec<(u64, u64)> {
         let ranges = self.store.sync_ranges(net).unwrap_or_default();
         let mut holes: Vec<(u64, u64)> = ranges
             .iter()
             .filter(|r| match which {
                 Holes::All => true,
                 Holes::Intentional => r.state != RangeState::Pending,
+            })
+            .filter(|r| {
+                !(kept_only
+                    && r.state == RangeState::Cut
+                    && r.phase == crate::store::PHASE_ROTATION)
             })
             .filter_map(|r| match r.state {
                 // Held, but not confirmed: no confirmation for a 0.4.1
@@ -547,7 +555,7 @@ impl Node {
     pub fn history_full(&self) -> bool {
         self.history_budget().is_none()
             && !self.config.history.legacy
-            && !self.store.rotation_deleted_rows().unwrap_or(true)
+            && !self.store.history_lossy().unwrap_or(true)
             && self.joined_nets().iter().all(|net| self.holds_all(net))
     }
 
@@ -1063,6 +1071,19 @@ impl Node {
         pass: &mut Pass,
         exhaustive: bool,
     ) -> Result<()> {
+        // Never below the cut: what is there, the next rotation would
+        // delete again (ADR 0025 PR B).
+        let cut = self.store.cut_ts(net)?.unwrap_or(0);
+        let clamped;
+        let walk = if cut > walk.floor {
+            clamped = Walk {
+                floor: cut,
+                ..walk.clone()
+            };
+            &clamped
+        } else {
+            walk
+        };
         let cap = self
             .history_budget()
             .or(self.events_share())
@@ -1889,7 +1910,7 @@ impl Node {
             }
             for peer in &peers {
                 match self
-                    .get_from(*peer, net, batch, include, PAGE_TIMEOUT)
+                    .get_from(*peer, net, batch, include, PAGE_TIMEOUT, Origin::Pulled)
                     .await
                 {
                     Ok(_) => break,
@@ -1903,6 +1924,8 @@ impl Node {
     /// One `get` to `peer`; stores what comes, as long as it is what was
     /// asked: the events of `ids`, their threads, or the replies to them
     /// and the posts citing them. Returns how many events were new.
+    /// `origin`: [`Origin::Fetched`] for a `read`, the only way an evicted
+    /// body comes back; [`Origin::Pulled`] for the fill.
     async fn get_from(
         &self,
         peer: EndpointId,
@@ -1910,6 +1933,7 @@ impl Node {
         ids: &[String],
         include: &str,
         timeout: Duration,
+        origin: Origin,
     ) -> Result<usize> {
         let request = Request::Get {
             net: net.to_string(),
@@ -1955,7 +1979,7 @@ impl Node {
                 debug!(peer = %peer.fmt_short(), "get: an event not asked for, not stored");
                 continue;
             }
-            match self.accept_value(value, Origin::Pulled).await {
+            match self.accept_value(value, origin).await {
                 Ok(Some((event, stored))) => {
                     if stored {
                         new = new.saturating_add(1);
@@ -2190,15 +2214,18 @@ impl Node {
             }
         }
         let limit = limit.clamp(1, proto::MAX_SYNC_PAGE);
+        // Kept-forever kinds only (phase 0 of a fill): rotation never
+        // deletes them, so they are served below its cut (ADR 0025 PR B).
+        let kept_only = !kinds.is_empty() && kinds.iter().all(|k| KEEP_KINDS.contains(&k.as_str()));
         // A `partial` requester takes what is held in a pending range.
         let holes = match (partial, before.is_some()) {
             // A descending page stops at every hole, so that a 0.4.1 peer
             // never takes what is pending here as held.
-            (false, true) => self.holes(net, Holes::All),
+            (false, true) => self.holes(net, Holes::All, kept_only),
             // A 0.4.0 pull is refused only below what the budget left out
             // on purpose: anything else is served as held, as a 0.4.0
             // node serves what it holds.
-            _ => self.holes(net, Holes::Intentional),
+            _ => self.holes(net, Holes::Intentional, kept_only),
         };
         let mut stop = None;
         match &before {
@@ -2381,7 +2408,10 @@ impl Node {
             }
             let mut answered = false;
             for peer in peers.into_iter().take(GET_PEERS) {
-                match self.get_from(peer, &net, &ids, include, GET_TIMEOUT).await {
+                match self
+                    .get_from(peer, &net, &ids, include, GET_TIMEOUT, Origin::Fetched)
+                    .await
+                {
                     Ok(_) => {
                         self.provider_ok(peer);
                         answered = true;

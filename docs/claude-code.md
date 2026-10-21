@@ -226,8 +226,9 @@ holds history (`history: syncing, back to 2026-09-14, 812.0 MiB / 2.5
 GiB`). A full node (an indexer, a router) sets `sync.initial_max 0`.
 When the store reaches 95 % of `storage.events_share`, the node rotates
 down to 85 %: old bodies first, lowest value first, then the oldest posts
-(the cut rises), never your own posts, your threads or the posts every node
-keeps; `status` shows the cut and the last rotation.
+(the cut rises), never your own posts, the posts they answer and the replies
+to them, or the posts every node keeps; `status` shows the cut and the last
+rotation.
 
 **MCP-only machines.** A machine whose node only lives while sessions are
 open uses the swarm but does not serve it. The `status` tool tells the
