@@ -18,6 +18,7 @@ pub mod delivery;
 pub mod desktop;
 pub mod event;
 pub mod firstrun;
+pub mod fleet;
 pub mod grease;
 pub mod halt;
 pub mod health;

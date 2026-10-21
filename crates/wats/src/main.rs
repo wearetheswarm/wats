@@ -424,6 +424,13 @@ enum Command {
         #[arg(long, default_value = "10s", value_parser = parse_duration)]
         timeout: Duration,
     },
+    /// Several nodes on this machine, started and checked together (ADR
+    /// 0028): `wats fleet up -n 6` creates six data directories under
+    /// --base, each with its own key, port and agent workspace and the
+    /// config.toml of --from, and starts them in the background, peered
+    /// with each other. `wats ps`, `wats attach --dir <base>/node-<i>` and
+    /// `wats mcp --dir <base>/node-<i>` work on each node as on any other.
+    Fleet(wats::fleet::FleetCommand),
     /// Show the node: running or not, networks, peers, the swarm it sees
     /// (gossip neighbors and nodes heard from in 24 h, per network),
     /// storage, version and the update notice (what the MCP `status` tool
@@ -4054,6 +4061,51 @@ async fn stop_gracefully_or_kill(
     anyhow::bail!("{what} still runs after SIGKILL")
 }
 
+/// `wats fleet` (ADR 0028): the global options become each node's.
+async fn fleet_command(
+    node: &NodeArgs,
+    fleet: wats::fleet::FleetCommand,
+    shutdown: Shutdown,
+) -> Result<()> {
+    anyhow::ensure!(
+        node.port.is_none(),
+        "--port: each node of a fleet has its own port (`wats fleet up --port-base <port>`)"
+    );
+    anyhow::ensure!(
+        node.secret_file.is_none(),
+        "--secret-file: each node of a fleet has its own key, in its data directory"
+    );
+    anyhow::ensure!(
+        node.external_addrs.is_empty(),
+        "--external-addr: each node of a fleet has its own port; set external_addrs in each \
+         node's config.toml instead"
+    );
+    // Network options, as a child's command line, without what the fleet
+    // sets per node or writes in each config.toml.
+    let node_args: Vec<String> = node
+        .to_args(std::path::Path::new(""))
+        .into_iter()
+        .skip(2)
+        .map(|a| a.to_string_lossy().into_owned())
+        .filter(|a| {
+            a != "--hermetic"
+                && !a.starts_with("--bootstrap=")
+                && !a.starts_with("--storage-max=")
+                && !a.starts_with("--sync-initial-max=")
+        })
+        .collect();
+    let ctx = wats::fleet::Options {
+        node_args_given: !node_args.is_empty(),
+        node_args,
+        bootstrap: node.bootstrap.clone(),
+        data_dir: node.data_dir()?,
+        storage_max: node.storage_max,
+        initial_max: node.sync_initial_max,
+        hermetic: node.hermetic,
+    };
+    wats::fleet::run(ctx, fleet, shutdown).await
+}
+
 /// `key: value` lines, nested keys joined with dots, `node` first.
 fn status_lines(prefix: &str, value: &serde_json::Value) -> Vec<String> {
     use serde_json::Value;
@@ -5849,6 +5901,7 @@ async fn async_main(cli: Cli) -> Result<()> {
         Some(Command::Stop { all, timeout }) => {
             return stop_command(&cli.node, all, timeout).await;
         }
+        Some(Command::Fleet(fleet)) => return fleet_command(&cli.node, fleet, shutdown).await,
         Some(Command::Agent { name, action }) => {
             return tokio::select! {
                 result = agent_watch(&data_dir, name.as_deref(), action) => result,
@@ -5966,7 +6019,8 @@ async fn async_main(cli: Cli) -> Result<()> {
             | Command::Inbox { .. }
             | Command::Attach { .. }
             | Command::Ps { .. }
-            | Command::Stop { .. },
+            | Command::Stop { .. }
+            | Command::Fleet(_),
         ) => {
             unreachable!("handled above")
         }
