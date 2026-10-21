@@ -26,7 +26,8 @@
   The files of the posts it rotates out follow ADR 0029's last-copy rule:
   a replica stays, a cached copy goes only once other nodes prove they
   hold it, and a post that may hold the last copy stays whole; a stronger
-  drop (erasure, retraction, label, `wats drop`) always wins. Tombstones
+  drop (erasure, retraction, label, `wats drop`) always wins, and a
+  retracted or erased post gives no signal any more. Tombstones
   no longer count in the opaque
   quota, and the store's free pages no longer count as used (no
   `VACUUM`: they are reused). A run that frees almost nothing backs off,
@@ -35,11 +36,22 @@
   advertises `history_full`. No new setting, no schema bump: the first
   start indexes the blobs every post lists, once. ADR 0025,
   "Implementation notes (PR B)".
-  **Upgrading:** posts of a profile you used before 0.4.3 only through an
-  MCP session, and that is not in your config, are not recognised as
-  yours until you use that profile again: until then, rotation treats
-  them like anyone's. Use each such profile once after upgrading (or add
-  it to the config) on a node with a small `storage.max`.
+  **Upgrading:** the store does not record which profiles posted from
+  this machine, and wats keeps no list of the profile names used, so a
+  profile you used before 0.4.3 only through an MCP session (`wats mcp
+  --profile X`), and that is not in your config, is recognised as yours
+  only once a session uses it again. Rotation deletes no row in the
+  first 10 minutes after a start (it may only drop bodies, which come
+  back on `read`), so that your sessions reconnect first; after that, an
+  unrecognised profile's posts are treated like anyone's. On a node with
+  a small `storage.max`, use each such profile once after upgrading, or
+  add it to the config.
+- **A file fetched on `read` survives a provider's hiccup.** A read
+  that fetched a blob tried each provider once and gave up: a connection
+  reset, or a possession proof in progress on the provider (which refuses
+  the blob to everyone meanwhile, ADR 0029), made it answer that the file
+  could not be fetched. It now tries again twice, after 0.5 s then 1 s,
+  the provider it just failed with included.
 - **A file keeps its replicas when a node disappears.** A blob was
   pushed to the 3 nodes closest to its hash when it was published, and
   never again: a replica whose node died was gone for good. A node that

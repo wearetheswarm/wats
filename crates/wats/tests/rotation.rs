@@ -35,6 +35,7 @@ fn config(dir: &std::path::Path, peers: &[&Arc<Node>]) -> NodeConfig {
     // The tests drive rotation themselves, unless they say otherwise.
     config.history.rotation_check = Duration::from_secs(3600);
     config.history.rotation_pause = Duration::ZERO;
+    config.history.rotation_start_delay = Duration::ZERO;
     config
 }
 
@@ -303,7 +304,13 @@ async fn the_store_stays_under_its_share_while_traffic_flows() -> anyhow::Result
         (b.rotation_json()["state"] == "idle").then_some(())
     })
     .await;
-    assert!(b.store().store_bytes() <= share);
+    // Measured once the WAL is checkpointed: the last run's freed pages
+    // counted (a page or two of slack).
+    assert!(
+        b.store().store_bytes() <= share / 100 * 101,
+        "{} over {share}",
+        b.store().store_bytes()
+    );
     let runs = b.store().rotation_runs()?;
     assert!(runs.len() >= 3, "it rotated several times: {runs:?}");
     assert!(runs.iter().map(|r| r.trimmed).sum::<u64>() > 0, "{runs:?}");
@@ -637,14 +644,18 @@ async fn a_restart_in_the_middle_of_a_rotation_is_safe() -> anyhow::Result<()> {
     b_config.history.rotation_check = Duration::from_millis(200);
     b_config.history.rotation_pause = Duration::from_millis(400);
     let b = Node::start(b_config.clone()).await?;
-    eventually("a batch deleted", 30, || {
-        b.store().cut_ts(PUBLIC_NET).unwrap().map(|_| ())
+    // A batch deleted, and the run still going.
+    eventually("a batch deleted, the run going on", 30, || {
+        (b.store().cut_ts(PUBLIC_NET).unwrap().is_some() && b.rotation_json()["state"] == "running")
+            .then_some(())
     })
     .await;
-    assert_eq!(b.rotation_json()["state"], "running");
     b.shutdown().await?;
     // The interrupted run stops at its next pause.
-    tokio::time::sleep(Duration::from_millis(1_000)).await;
+    eventually("the run stopped", 30, || {
+        (b.rotation_json()["state"] == "idle").then_some(())
+    })
+    .await;
     let (_, to) = b.rotation_bounds().unwrap();
     assert!(b.store().store_bytes() > to, "stopped halfway");
     assert_protected(&b, &kept);
@@ -822,6 +833,84 @@ async fn rotation_evicts_files_by_the_last_copy_rule() -> anyhow::Result<()> {
             .is_some_and(|cut| cut >= event.ts)
     );
     within("a shutdown", d.shutdown()).await?;
+    Ok(())
+}
+
+/// Stage 1 with a post that lists a blob: the store's batch leaves it, the
+/// node's eviction (ADR 0029) takes its body, and the node stops saying it
+/// holds the full history.
+#[tokio::test(flavor = "multi_thread")]
+async fn stage_one_evicts_a_post_with_a_file_through_the_node() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let b_dir = dir.path().join("b");
+    in_sync(&b_dir)?;
+    let mut b_config = config(&b_dir, &[]);
+    b_config.storage_max = Some(8 * MIB);
+    b_config.events_share = 25;
+    b_config.durability = wats::node::durability::Tuning {
+        repair: false,
+        ..Default::default()
+    };
+    let b = Node::start(b_config).await?;
+    let (at, _) = b.rotation_bounds().unwrap();
+    let now = now_secs();
+    // A file this node holds, listed by a recent post too: evicting the
+    // old one frees nothing, so no proof is needed.
+    let file = dir.path().join("notes.bin");
+    std::fs::write(&file, vec![9u8; 4_096])?;
+    let recent = b
+        .publish_as(
+            &key(88),
+            Draft {
+                net: PUBLIC_NET.into(),
+                kind: Some(Kind::Note),
+                title: Some("the notes".into()),
+                text: "attached".into(),
+                ..Draft::default()
+            },
+            &[Attachment {
+                path: file,
+                name: None,
+            }],
+        )
+        .await?;
+    let old = sign(
+        Draft {
+            net: PUBLIC_NET.into(),
+            kind: Some(Kind::Note),
+            title: Some("the notes, a month ago".into()),
+            text: format!("notes: {}", "a long body worth dropping. ".repeat(60)),
+            blobs: recent.blobs.clone(),
+            ..Draft::default()
+        },
+        &key(89),
+        now - 30 * DAY,
+    );
+    hold(b.store(), std::slice::from_ref(&old));
+    assert!(b.history_full() || b.history_budget().is_some());
+    // Short recent posts up to the threshold: only the old body is worth
+    // dropping.
+    let mut n = 0;
+    while b.store().store_bytes() < at {
+        hold(
+            b.store(),
+            &[note(n, 300 + n % 200, now - DAY + u64::from(n), false)],
+        );
+        n += 1;
+    }
+    let run = within("b rotates", b.rotate_if_full())
+        .await?
+        .expect("a run");
+    assert!(run.bodies >= 1, "{run:?}");
+    assert!(b.store().get(&old.id)?.is_none(), "its body went");
+    assert_eq!(
+        b.store().drop_record(&old.id)?.map(|r| r.reason),
+        Some(DropReason::Evicted)
+    );
+    assert!(b.store().get(&recent.id)?.is_some());
+    assert!(b.store().history_lossy()?, "no longer the full history");
+    assert!(!b.history_full());
+    b.shutdown().await?;
     Ok(())
 }
 

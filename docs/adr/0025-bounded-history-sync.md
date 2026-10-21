@@ -1073,7 +1073,15 @@ backoff), `crates/wats/src/store.rs` (`Keep`, `evict_bodies`,
   (what is left is kept, or ranges are still being fetched) backs off:
   30 s, doubling up to an hour, with one warning per step. It runs again
   earlier only once the store grew by 1 % of its share since. `status`
-  shows it (`backoff_secs`).
+  shows it (`backoff_secs`). A run that fails backs off the same way
+  (final review), and a row that cannot be read or tombstoned is logged,
+  counted and skipped, never aborting the run, so that stage 2 stays
+  reachable.
+- **No deletion in the first minutes** (final review). A run deletes no
+  row (stages 0 and 2) before the node has run for 10 minutes
+  (`rotation_start_delay`, a test knob); it may drop bodies, which come
+  back on read. A profile used before 0.4.3 only through an MCP session
+  is known again once a session uses it (below).
 - **Every node with `storage.max`** rotates, `sync.initial_max = 0`
   included. A full node that reaches its share keeps taking live events,
   instead of meeting ADR 0012's ceiling, and stops advertising
@@ -1144,8 +1152,9 @@ backoff), `crates/wats/src/store.rs` (`Keep`, `evict_bodies`,
   `rotate`, retractions, announces, vouches) and erasure labels (a
   `react` with `data.label = "erasure"`, so that it keeps travelling).
 - **In stages 1 and 2:** in the threads those posts are in, their
-  ancestors (up to the root, 64 levels at most) and the direct replies to
-  them. The other rows of those threads are anyone's, ranked like any
+  ancestors (up to the root, 64 levels at most), the thread root itself
+  even when a link up to it is missing or was trimmed (final review), and
+  the direct replies to them. The other rows of those threads are anyone's, ranked like any
   other; stage 0 may trim even these when their author is over its share.
   Protecting whole threads let a key flooding replies into this node's
   ask pin the store full, up to ADR 0012's ceiling.
@@ -1155,10 +1164,13 @@ backoff), `crates/wats/src/store.rs` (`Keep`, `evict_bodies`,
   profile recorded in `local_keys` since, counts.
 - **This node's profiles survive restarts:** every profile key is
   recorded in `local_keys` when first used (and the configured ones at
-  start, off the start path). A profile used before 0.4.3 only, and not
-  configured, is not known: the store does not record where a post came
-  from, and `received_at` close to `ts` holds for every live post too, so
-  no heuristic tells such posts apart. The CHANGELOG says so.
+  start, off the start path). A profile used before 0.4.3 only through an
+  MCP session, and not configured, is not known: wats keeps no list of
+  the profile names used (keys are derived from the root secret on
+  demand), the store does not record where a post came from, and
+  `received_at` close to `ts` holds for every live post too, so no
+  heuristic tells such posts apart. Hence the start delay above, and the
+  CHANGELOG's upgrade note.
 
 **The last copy** (Vincent, 2026-10-21)
 
@@ -1177,11 +1189,17 @@ backoff), `crates/wats/src/store.rs` (`Keep`, `evict_bodies`,
   `ask_roots` accept a tombstone of an understood version (an opaque row
   of version 1 or 2 with `body_hash`) as a target: an evicted post keeps
   its signals and its author's score, an evicted ask its asker.
-- **Tombstones' signals** (review). A tombstone also stays a source:
-  `signal_rows` and `net_signal_rows` accept it, and a dropped body keeps
+- **Tombstones' signals** (review). An evicted tombstone stays a source:
+  `signal_rows` and `net_signal_rows` accept it, and an evicted body keeps
   its `event_refs` (they are header fields), as does a tombstone received
   as such. A reasoned reply evicted still contests, a citing post still
   cites; reacts are never evicted in stage 1, so their values stay.
+- **Not a withdrawn one** (final review). A drop for any other reason
+  (retraction, erasure, label, the human's own) deletes the post's
+  `event_refs`, as before PR B, also on the tombstone of an earlier
+  eviction; and a tombstone with such a drop record is no source in those
+  queries (`source_sql`): a retracted reasoned reply, with its author's
+  -1, no longer contests.
 - **Key age.** Rows deleted in stage 0 or 2 leave, per key and network,
   their earliest `received_at` and `ts` in `key_first`, in the same
   transaction. `Store::author_first_seen` (the new-author proof of work)
@@ -1259,6 +1277,15 @@ effect; ADR 0029 decides, merged first)
   post whose eviction was refused; both are islands below the cut.
   Stage 1's batch (`evict_bodies`) only takes posts that list no blob and
   have no drop record.
+- **Bounded** (final review). A post kept as a possible last copy is not
+  tried again for an hour (plus up to a quarter more, spread by its id),
+  in memory: each try may ask peers for proofs. At most 200 evictions
+  through the node per run; stage 1 runs its cheap batch (in transactions
+  of 100 bodies, the store measured after each) before them, and stages 0
+  and 2 stop at the cap, never raising the cut past a post not tried.
+- **Every eviction marks the history lossy** (`store_meta.history_lossy`,
+  in the drop's transaction), whatever the path: `history_full` is not
+  advertised after one.
 - **Own posts** are never rotated, so their blobs stay listed. **Pins**
   do not exist yet.
 - `unpin_pending` and `blob_retained` stay for what an earlier build or a
@@ -1281,8 +1308,14 @@ effect; ADR 0029 decides, merged first)
   `backoff_secs`. `wats status` prints it as one line.
 - The `history` object gains `rotated_ts`, when rotation last raised the
   cut, and its line `cut <date> (rotation, <date>)`.
-- **`history_full`** is not advertised once rotation dropped a body or
+- **`history_full`** is not advertised once a body was evicted or rotation
   deleted a row (`store_meta.history_lossy`).
+- **Erasure labels below the rotation cut** (final review) are served to
+  a `sync` whose kinds are kept-forever kinds and `react`: below the
+  rotation cut, among reacts, only erasure labels (the only ones rotation
+  keeps there), with no `gap` at that cut. The fill's phase 0 does not ask
+  for reacts yet, so newcomers still get them on `get` with the labelled
+  post's signals (a later change of the fill).
 
 **Crash safety**
 
@@ -1379,12 +1412,22 @@ effect; ADR 0029 decides, merged first)
   kept in full); many tombstones leaving room for opaque events; an
   evicted body staying evicted through a push, a `replicate` and a sync
   page, and back on `read`; a run that frees nothing backing off.
+- Final review: `rotation_never_overrides_a_stronger_reason`,
+  `any_eviction_marks_the_history_lossy`,
+  `the_thread_root_of_an_own_post_is_kept_without_the_links_up`,
+  `a_retraction_takes_the_refs_an_eviction_keeps` (`store.rs`);
+  `a_retracted_reasoned_reply_no_longer_contests` (`node/rotation.rs`);
+  `stage_one_evicts_a_post_with_a_file_through_the_node`
+  (`tests/rotation.rs`: the store's batch leaves it, the node evicts it,
+  the history is no longer full); the restart and soak tests poll for the
+  run's state instead of waiting a fixed time.
 
 **Known gaps (later)**
 
 - The proof-of-work bonus of deleted events (above).
 - Profiles used only before 0.4.3 (above).
 - Blob eviction by value (ADR 0029 follow-up).
+- The fill asking for erasure labels by sync (above).
 - The digest before the last copy goes (above).
 - A fresh flood is not trimmed for a week (the grace, above).
 

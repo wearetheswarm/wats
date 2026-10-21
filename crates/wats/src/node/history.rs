@@ -124,6 +124,10 @@ pub struct Tuning {
     pub rotation_check: Duration,
     /// A pause after each rotation transaction, so that inserts get in.
     pub rotation_pause: Duration,
+    /// Rotation deletes no row before the node has run this long (ADR 0025
+    /// PR B: a profile used before 0.4.3 only through MCP is known again
+    /// once a session uses it).
+    pub rotation_start_delay: Duration,
 }
 
 impl Default for Tuning {
@@ -135,6 +139,7 @@ impl Default for Tuning {
             legacy: false,
             rotation_check: Duration::from_secs(30),
             rotation_pause: Duration::from_millis(5),
+            rotation_start_delay: Duration::from_secs(600),
         }
     }
 }
@@ -2214,9 +2219,25 @@ impl Node {
             }
         }
         let limit = limit.clamp(1, proto::MAX_SYNC_PAGE);
-        // Kept-forever kinds only (phase 0 of a fill): rotation never
-        // deletes them, so they are served below its cut (ADR 0025 PR B).
-        let kept_only = !kinds.is_empty() && kinds.iter().all(|k| KEEP_KINDS.contains(&k.as_str()));
+        // Kept-forever kinds only (phase 0 of a fill), and reacts: rotation
+        // never deletes those kinds, nor erasure labels, so they are served
+        // below its cut (ADR 0025 PR B); among reacts, below it, only the
+        // erasure labels, which it keeps, so that they still travel by sync.
+        let kept_only = !kinds.is_empty()
+            && kinds
+                .iter()
+                .all(|k| KEEP_KINDS.contains(&k.as_str()) || k == "react");
+        let reacts_below = if kept_only && kinds.iter().any(|k| k == "react") {
+            self.store
+                .sync_ranges(net)
+                .unwrap_or_default()
+                .iter()
+                .filter(|r| r.state == RangeState::Cut && r.phase == crate::store::PHASE_ROTATION)
+                .map(|r| r.cursor_ts)
+                .max()
+        } else {
+            None
+        };
         // A `partial` requester takes what is held in a pending range.
         let holes = match (partial, before.is_some()) {
             // A descending page stops at every hole, so that a 0.4.1 peer
@@ -2257,6 +2278,7 @@ impl Node {
             kinds,
             authors,
             limit: limit as usize,
+            reacts_below,
         };
         match self.store.sync_page(&query) {
             Ok(rows) => {

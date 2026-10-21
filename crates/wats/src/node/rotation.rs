@@ -53,6 +53,8 @@ pub const ROTATE_AT_PERCENT: u64 = 95;
 pub const ROTATE_TO_PERCENT: u64 = 85;
 /// Most rows per transaction.
 pub const BATCH: usize = 500;
+/// Bodies per transaction of stage 1, which measures the store after each.
+const BODIES_BATCH: usize = 100;
 /// Stages 0 and 1 leave posts younger than this alone: a new post has not
 /// had the time to earn its signals.
 pub const BODY_GRACE_SECS: u64 = 7 * 24 * 3600;
@@ -77,6 +79,12 @@ const OVERSHOOT: u64 = 2;
 /// the last, unless the store grew by [`REGROW_PERCENT`] of its share.
 const PRODUCTIVE_PERCENT: u64 = 1;
 const BACKOFF_FIRST: Duration = Duration::from_secs(30);
+/// A post kept as a possible last copy is not tried again for this long,
+/// plus up to a quarter more (spread by its id).
+const LAST_COPY_RETRY: Duration = Duration::from_secs(3600);
+/// Most evictions through the node (each may ask peers for proofs) in one
+/// run; the store's own batches have no such cost.
+const MAX_NODE_EVICTIONS: usize = 200;
 const BACKOFF_MAX: Duration = Duration::from_secs(3600);
 const REGROW_PERCENT: u64 = 1;
 
@@ -88,6 +96,23 @@ pub struct Rotation {
     /// The run in progress.
     current: std::sync::Mutex<Option<Value>>,
     backoff: std::sync::Mutex<Backoff>,
+    /// Posts whose eviction was refused (this node may hold the last copy
+    /// of a file), not tried again before then (ADR 0029).
+    kept_last: std::sync::Mutex<HashMap<String, Instant>>,
+    /// Evictions through the node in the run going on.
+    node_evictions: std::sync::atomic::AtomicUsize,
+}
+
+/// What [`Node::evict_through_node`] did with a post.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Eviction {
+    /// The body went.
+    Dropped,
+    /// It stays: protected, a stronger reason, a possible last copy, an
+    /// error (logged).
+    Kept,
+    /// Not tried: the run's evictions through the node are used up.
+    Capped,
 }
 
 #[derive(Debug, Default)]
@@ -537,7 +562,7 @@ impl Node {
         let (Some((at, to)), Some(share)) = (self.rotation_bounds(), self.events_share()) else {
             return Ok(None);
         };
-        let bytes = self.store.store_bytes();
+        let bytes = self.stored_bytes().await;
         if bytes < at {
             if let Ok(mut backoff) = self.rotation.backoff.lock() {
                 *backoff = Backoff::default();
@@ -552,9 +577,35 @@ impl Node {
         }
         let _running = Running(&self.rotation);
         self.rotation_stage("starting");
-        let run = self.rotate(to).await?;
+        self.rotation
+            .node_evictions
+            .store(0, std::sync::atomic::Ordering::Relaxed);
+        let run = match self.rotate(to).await {
+            Ok(run) => run,
+            // A failed run backs off as one that freed nothing.
+            Err(e) => {
+                let after = self.stored_bytes().await;
+                self.rotation_outcome(
+                    &RotationLog {
+                        before: bytes,
+                        after: bytes.max(after),
+                        ..RotationLog::default()
+                    },
+                    to,
+                );
+                return Err(e.context("rotation failed"));
+            }
+        };
         self.rotation_outcome(&run, to);
         Ok(Some(run))
+    }
+
+    /// The store bytes, read on a blocking thread.
+    async fn stored_bytes(&self) -> u64 {
+        let store = Arc::clone(&self.store);
+        tokio::task::spawn_blocking(move || store.store_bytes())
+            .await
+            .unwrap_or(0)
     }
 
     /// How this node judges posts, for the value order: its profiles and
@@ -572,7 +623,7 @@ impl Node {
 
     /// One rotation run, down to `to` store bytes.
     async fn rotate(self: &Arc<Self>, to: u64) -> Result<RotationLog> {
-        let before = self.store.store_bytes();
+        let before = self.stored_bytes().await;
         let now = now_secs();
         let mut run = RotationLog {
             before,
@@ -591,21 +642,33 @@ impl Node {
             target = %crate::node::format_bytes(to),
             "rotation: the store reached {ROTATE_AT_PERCENT} % of its share; freeing space"
         );
-        if self.store.store_bytes() > to {
+        // Rows are deleted only once the node has run a while: a profile
+        // used before 0.4.3 through an MCP session only, and not
+        // configured, is known again once a session uses it (bodies, which
+        // come back on read, may go meanwhile).
+        let deletions = now
+            >= self
+                .started_at()
+                .saturating_add(self.config.history.rotation_start_delay.as_secs());
+        if !deletions {
+            info!("rotation: no row deleted in the first minutes after start, bodies only");
+        }
+        if deletions && self.stored_bytes().await > to {
             self.rotation_stage("keys over their share");
             run.trimmed = self.trim_keys(&keep, &grouping, to, now).await?;
         }
-        if self.store.store_bytes() > to {
+        if self.stored_bytes().await > to {
             self.rotation_stage("bodies");
             run.bodies = self.evict_by_value(&keep, &grouping, to, now).await?;
         }
-        if self.store.store_bytes() > to {
+        if deletions && self.stored_bytes().await > to {
             self.rotation_stage("raising the cut");
             run.rows = self.raise_cuts(&keep, to, now).await?;
         }
         run.at = now_secs();
-        run.after = self.store.store_bytes();
-        self.store.log_rotation(&run)?;
+        run.after = self.stored_bytes().await;
+        let (store, logged) = (Arc::clone(&self.store), run.clone());
+        blocking(move || store.log_rotation(&logged)).await?;
         info!(
             bodies = run.bodies,
             trimmed = run.trimmed,
@@ -625,7 +688,60 @@ impl Node {
     /// never remove from it. Returns whether the body went; a refusal, a
     /// stronger drop reason or a protection (checked again, strictly only
     /// with `strictly`) leaves it.
-    async fn evict_through_node(&self, id: &str, keep: &Arc<Keep>, strictly: bool) -> Result<bool> {
+    async fn evict_through_node(&self, id: &str, keep: &Arc<Keep>, strictly: bool) -> Eviction {
+        let kept_until = self
+            .rotation
+            .kept_last
+            .lock()
+            .ok()
+            .and_then(|k| k.get(id).copied());
+        if kept_until.is_some_and(|until| Instant::now() < until) {
+            return Eviction::Kept;
+        }
+        let tried = self
+            .rotation
+            .node_evictions
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if tried >= MAX_NODE_EVICTIONS {
+            return Eviction::Capped;
+        }
+        match self.try_evict_through_node(id, keep, strictly).await {
+            Ok(true) => Eviction::Dropped,
+            Ok(false) => Eviction::Kept,
+            Err(e)
+                if e.downcast_ref::<super::durability::KeptLastCopy>()
+                    .is_some() =>
+            {
+                debug!(%id, "rotation: {e:#}");
+                // Spread by the id, so that the retries do not come together.
+                let spread = id
+                    .bytes()
+                    .fold(0u64, |h, b| h.wrapping_mul(31).wrapping_add(u64::from(b)))
+                    .checked_rem((LAST_COPY_RETRY.as_secs() / 4).max(1))
+                    .unwrap_or(0);
+                let until = Instant::now()
+                    .checked_add(LAST_COPY_RETRY.saturating_add(Duration::from_secs(spread)));
+                if let (Ok(mut kept), Some(until)) = (self.rotation.kept_last.lock(), until) {
+                    kept.retain(|_, t| Instant::now() < *t);
+                    kept.insert(id.to_string(), until);
+                }
+                Eviction::Kept
+            }
+            Err(e) => {
+                warn!(%id, "rotation: a post not evicted, skipped: {e:#}");
+                Eviction::Kept
+            }
+        }
+    }
+
+    /// [`Node::evict_through_node`]'s work: `Ok(false)` when the post stays
+    /// (protected, a stronger reason, gone), an error for a refusal.
+    async fn try_evict_through_node(
+        &self,
+        id: &str,
+        keep: &Arc<Keep>,
+        strictly: bool,
+    ) -> Result<bool> {
         let (store, keep_for, owned) = (Arc::clone(&self.store), Arc::clone(keep), id.to_string());
         let (rotatable, event) = blocking(move || {
             let rotatable = store.rotatable(&owned, &keep_for, strictly)?;
@@ -646,35 +762,35 @@ impl Node {
                 }
             }
         }
-        match self.drop_body(id, DropReason::Evicted, None, None).await {
-            Ok(outcome) => Ok(outcome.body_dropped),
-            Err(e)
-                if e.downcast_ref::<super::durability::KeptLastCopy>()
-                    .is_some() =>
-            {
-                debug!(%id, "rotation: {e:#}");
-                Ok(false)
-            }
-            Err(e) => Err(e),
-        }
+        Ok(self
+            .drop_body(id, DropReason::Evicted, None, None)
+            .await?
+            .body_dropped)
     }
 
-    /// Before stage 0 or 2 deletes the rows `ids`: evict, through the node,
-    /// those that list blobs ([`Node::evict_through_node`]). A row whose
-    /// eviction is refused stays full, and `delete_rows` leaves it; one
-    /// whose eviction kept replicas stays as a tombstone.
+    /// Before stage 0 or 2 deletes the rows `ids` (oldest first): evict,
+    /// through the node, those that list blobs ([`Node::evict_through_node`]).
+    /// A row whose eviction is refused stays full, and `delete_rows` leaves
+    /// it; one whose eviction kept replicas stays as a tombstone. Once the
+    /// run's evictions through the node are used up, returns how many of
+    /// `ids` may still go (those before the first row not tried), so that
+    /// the cut does not rise past rows never tried.
     async fn evict_listing_blobs(
         &self,
         ids: &[String],
         keep: &Arc<Keep>,
         strictly: bool,
-    ) -> Result<()> {
+    ) -> Result<Option<usize>> {
         let (store, owned) = (Arc::clone(&self.store), ids.to_vec());
         let listing = blocking(move || store.lists_blobs(&owned)).await?;
-        for id in ids.iter().filter(|id| listing.contains(*id)) {
-            self.evict_through_node(id, keep, strictly).await?;
+        for (i, id) in ids.iter().enumerate() {
+            if listing.contains(id)
+                && self.evict_through_node(id, keep, strictly).await == Eviction::Capped
+            {
+                return Ok(Some(i));
+            }
         }
-        Ok(())
+        Ok(None)
     }
 
     /// Why this node keeps a blob left in `unpin_pending` (rotation's
@@ -755,7 +871,7 @@ impl Node {
         let over = blocking(move || keys_over_share(&store, &keep_for)).await?;
         let mut deleted = 0u64;
         for key in over {
-            if self.store.store_bytes() <= to {
+            if self.stored_bytes().await <= to {
                 break;
             }
             let (store, keep_for, grouping_for, key_for) = (
@@ -770,14 +886,17 @@ impl Node {
             let mut bytes = key.bytes;
             let mut trimmed = 0u64;
             let mut rows = order.into_iter().peekable();
-            while bytes > key.limit && rows.peek().is_some() && self.store.store_bytes() > to {
+            while bytes > key.limit && rows.peek().is_some() && self.stored_bytes().await > to {
                 let mut ids = Vec::new();
                 while ids.len() < BATCH && bytes > key.limit {
                     let Some((id, len)) = rows.next() else { break };
                     bytes = bytes.saturating_sub(len);
                     ids.push(id);
                 }
-                self.evict_listing_blobs(&ids, keep, true).await?;
+                let capped = self.evict_listing_blobs(&ids, keep, true).await?;
+                if let Some(n) = capped {
+                    ids.truncate(n);
+                }
                 let (store, keep_for) = (Arc::clone(&self.store), Arc::clone(keep));
                 let rotated = blocking(move || {
                     store.delete_rows(&ids, &keep_for, crate::store::Deletion::Trim, now)
@@ -785,6 +904,9 @@ impl Node {
                 .await?;
                 trimmed = trimmed.saturating_add(rotated.rows as u64);
                 self.after_batch(&rotated).await?;
+                if capped.is_some() {
+                    return Ok(deleted.saturating_add(trimmed));
+                }
             }
             if trimmed > 0 {
                 info!(
@@ -815,27 +937,40 @@ impl Node {
         );
         let plan = blocking(move || plan(&store, &grouping_for, &keep_for, now)).await?;
         let mut dropped = 0u64;
-        for chunk in plan.chunks(BATCH) {
-            if self.store.store_bytes() <= to {
+        let mut capped = false;
+        // Small transactions: the store is measured again after each, so
+        // that stage 1 stops near its target.
+        for chunk in plan.chunks(BODIES_BATCH) {
+            if self.stored_bytes().await <= to {
                 break;
             }
             let ids = chunk.to_vec();
+            // The cheap batch first: the store drops the bodies that list no
+            // blob, and leaves the others.
+            let (store, keep_for, batch) = (Arc::clone(&self.store), Arc::clone(keep), ids.clone());
+            let rotated = blocking(move || store.evict_bodies(&batch, &keep_for, now)).await?;
+            dropped = dropped.saturating_add(rotated.rows as u64);
+            self.after_batch(&rotated).await?;
+            if capped {
+                continue;
+            }
             // Those that list blobs go through the node's eviction, under
-            // ADR 0029's last-copy rule; the store's batch leaves them.
+            // ADR 0029's last-copy rule, at most so many a run.
             let (store, owned) = (Arc::clone(&self.store), ids.clone());
             let listing = blocking(move || store.lists_blobs(&owned)).await?;
             for id in ids.iter().filter(|id| listing.contains(*id)) {
-                if self.store.store_bytes() <= to {
+                if self.stored_bytes().await <= to {
                     break;
                 }
-                if self.evict_through_node(id, keep, false).await? {
-                    dropped = dropped.saturating_add(1);
+                match self.evict_through_node(id, keep, false).await {
+                    Eviction::Dropped => dropped = dropped.saturating_add(1),
+                    Eviction::Kept => {}
+                    Eviction::Capped => {
+                        capped = true;
+                        break;
+                    }
                 }
             }
-            let (store, keep_for) = (Arc::clone(&self.store), Arc::clone(keep));
-            let rotated = blocking(move || store.evict_bodies(&ids, &keep_for, now)).await?;
-            dropped = dropped.saturating_add(rotated.rows as u64);
-            self.after_batch(&rotated).await?;
         }
         Ok(dropped)
     }
@@ -885,7 +1020,7 @@ impl Node {
             Ok((cutter, store.json_bytes()?))
         })
         .await?;
-        let start = self.store.store_bytes();
+        let start = self.stored_bytes().await;
         let ratio = if total > 0 {
             start as f64 / total as f64
         } else {
@@ -909,8 +1044,11 @@ impl Node {
                 w.saturating_add((r.len as f64 * ratio) as u64)
             });
             self.before_last_copy(&batch);
-            let ids: Vec<String> = batch.into_iter().map(|r| r.id).collect();
-            self.evict_listing_blobs(&ids, keep, false).await?;
+            let mut ids: Vec<String> = batch.into_iter().map(|r| r.id).collect();
+            let capped = self.evict_listing_blobs(&ids, keep, false).await?;
+            if let Some(n) = capped {
+                ids.truncate(n);
+            }
             let (store, keep_for) = (Arc::clone(&self.store), Arc::clone(keep));
             let rotated = blocking(move || {
                 store.delete_rows(&ids, &keep_for, crate::store::Deletion::Cut, now)
@@ -921,7 +1059,11 @@ impl Node {
                 info!(%net, cut = %super::history::date(*ts), "rotation: the cut rises");
             }
             self.after_batch(&rotated).await?;
-            if self.store.store_bytes() <= to {
+            if capped.is_some() {
+                info!("rotation: enough evictions through the node for one run; the next goes on");
+                break;
+            }
+            if self.stored_bytes().await <= to {
                 break;
             }
             if weighed >= bound.max(1) {
@@ -1100,7 +1242,8 @@ mod tests {
 
     /// A stage-1 eviction of the posts that give signals changes no
     /// status nor score: a reasoned reply that contests, citations, and
-    /// the post itself (ADR 0025 PR B review).
+    /// the post itself (ADR 0025 PR B review). A retraction, unlike an
+    /// eviction, withdraws the signal.
     #[test]
     fn evicting_signal_sources_changes_no_status_nor_score() {
         let mut g = Graph::new();
@@ -1146,6 +1289,25 @@ mod tests {
         );
         let author_after = g.table(&[]).score(&id_of(2));
         assert!((author_after - author_before).abs() < 1e-9);
+    }
+
+    /// A reasoned reply and a -1 from the same key contest a post; once
+    /// the author retracts the reply, they no longer do (a bare -1 is only
+    /// a vote).
+    #[test]
+    fn a_retracted_reasoned_reply_no_longer_contests() {
+        let mut g = Graph::new();
+        let ask = g.root(1, Kind::Ask, "how?");
+        let answer = long(&mut g, 2, Kind::Answer, "an answer", Some(&ask));
+        let reasoned = long(&mut g, 3, Kind::Answer, "it fails on musl", Some(&answer));
+        g.reply(3, &answer, Kind::React, json!({"value": -1}));
+        assert_eq!(g.signals(&answer).status, Status::Contested);
+        g.store
+            .drop_body(&reasoned.id, DropReason::Retraction, Some("r"), None, g.ts)
+            .unwrap();
+        let after = g.signals(&answer);
+        assert_ne!(after.status, Status::Contested, "{after:?}");
+        assert_eq!(after.contradicts, 0);
     }
 
     /// An evicted post keeps its signals and its author's score: reputation

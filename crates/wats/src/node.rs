@@ -597,6 +597,10 @@ fn revalidate_opaque(store: &Store) -> Result<()> {
 pub const MAX_PROVIDERS_PER_ENVELOPE: usize = 8;
 /// Providers tried, one after the other, for one blob fetch (B7).
 const MAX_PROVIDER_ATTEMPTS: usize = 4;
+/// A fetch on read tries its providers this many times, the next after
+/// this pause, then twice it.
+const READ_FETCH_TRIES: u32 = 3;
+const READ_FETCH_PAUSE: Duration = Duration::from_millis(500);
 /// A provider whose fetch failed is skipped for this long, doubling with
 /// each further failure up to [`PROVIDER_BACKOFF_MAX`] (B7).
 const PROVIDER_BACKOFF: Duration = Duration::from_secs(30);
@@ -3649,8 +3653,27 @@ impl Node {
         }
         let hash: Hash = blob.hash.parse()?;
         if !self.blobs.has(hash).await? || self.blob_unreadable(hash).await {
-            let providers = self.providers_for(blob);
-            if providers.is_empty() || !self.fetch_blob(blob, providers).await {
+            // A read waits for its file: a provider that failed once (a
+            // connection reset, a proof in progress that refuses the blob
+            // meanwhile, ADR 0029) is asked again, after a pause, instead of
+            // giving up on the first miss. The retries do not skip the
+            // providers this read marked as failing.
+            let mut fetched = false;
+            for attempt in 0..READ_FETCH_TRIES {
+                if attempt > 0 {
+                    tokio::time::sleep(READ_FETCH_PAUSE.saturating_mul(attempt)).await;
+                }
+                let providers = self.providers_for(blob);
+                if providers.is_empty() {
+                    break;
+                }
+                if self.fetch_blob_from(blob, providers, attempt > 0).await {
+                    fetched = true;
+                    break;
+                }
+                debug!(hash = %blob.hash, attempt, "blob not fetched on read yet");
+            }
+            if !fetched {
                 return Ok(None);
             }
         }
@@ -4797,6 +4820,17 @@ impl Node {
     /// content match the hash; the content itself stays untrusted data and
     /// is never executed (SPEC §2.15).
     async fn fetch_blob(&self, blob: &BlobRef, providers: Vec<EndpointId>) -> bool {
+        self.fetch_blob_from(blob, providers, false).await
+    }
+
+    /// [`Node::fetch_blob`]; with `again`, the providers backing off are
+    /// asked too (a read retrying the provider its first try marked).
+    async fn fetch_blob_from(
+        &self,
+        blob: &BlobRef,
+        providers: Vec<EndpointId>,
+        again: bool,
+    ) -> bool {
         let Ok(hash) = blob.hash.parse::<Hash>() else {
             return false;
         };
@@ -4817,7 +4851,7 @@ impl Node {
         // B7: one provider at a time, skipping those that failed lately.
         let candidates: Vec<EndpointId> = providers
             .into_iter()
-            .filter(|p| !self.provider_backing_off(p))
+            .filter(|p| again || !self.provider_backing_off(p))
             .take(MAX_PROVIDER_ATTEMPTS)
             .collect();
         if candidates.is_empty() {

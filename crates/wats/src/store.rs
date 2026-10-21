@@ -219,8 +219,9 @@ CREATE TABLE IF NOT EXISTS store_meta (
     value INTEGER NOT NULL
 ) WITHOUT ROWID;
 
--- A key's rows oldest first (rotation's per-key share, 0.4.3).
-CREATE INDEX IF NOT EXISTS events_author_ts ON events (author, ts, id);
+-- A key's rows of a network, oldest first (rotation's per-key share,
+-- 0.4.3).
+CREATE INDEX IF NOT EXISTS events_net_author_ts ON events (net, author, ts, id);
 
 -- The rotations run, newest last (the last 100 are kept).
 CREATE TABLE IF NOT EXISTS rotation_log (
@@ -431,6 +432,18 @@ fn tombstone_sql(alias: &str) -> String {
     )
 }
 
+/// SQL condition: row `alias` may give a signal (ADR 0025 PR B): a full
+/// understood event, or the tombstone of one that no drop record of a
+/// reason other than eviction covers (retracted, erased, labelled or the
+/// human's own drop: no signal).
+fn source_sql(alias: &str) -> String {
+    format!(
+        "({alias}.opaque = 0 OR ({} AND NOT EXISTS (SELECT 1 FROM dropped d
+             WHERE d.id = {alias}.id AND d.reason <> 'evicted')))",
+        tombstone_sql(alias)
+    )
+}
+
 /// SQL condition: row `alias` counts in the opaque quota (B4): an opaque
 /// row that is not a tombstone of an understood version (ADR 0025 §7).
 fn quota_sql(alias: &str) -> String {
@@ -520,6 +533,11 @@ fn drop_body_tx(
             params![id, hash, *k as i64],
         )?;
     }
+    // An eviction drops history: this node no longer says it is full
+    // (`history_full`, ADR 0025 PR B), whatever path evicted.
+    if reason == DropReason::Evicted && inner.body_dropped && !outranked {
+        set_meta(tx, "history_lossy", 1)?;
+    }
     Ok(DropOutcome {
         held: inner.held,
         body_dropped: inner.body_dropped,
@@ -536,9 +554,12 @@ struct DropInner {
 }
 
 /// Drop a body in place, its tags, full-text entry and blob index with it.
-/// Its `refs` stay indexed: they are header fields, kept by the tombstone,
-/// and the signals it gives keep counting (ADR 0025 §7). With `record`,
-/// the drop record is written or updated.
+/// For an eviction, its `refs` stay indexed: they are header fields, kept
+/// by the tombstone, and the signals it gives keep counting (ADR 0025 §7).
+/// For any other reason (a retraction, an erasure, a label, the human's
+/// own drop) they go, on the tombstone of an earlier eviction too: what
+/// its author withdrew, or an operator erased, gives no signal any more.
+/// With `record`, the drop record is written or updated.
 fn drop_body_inner(
     tx: &rusqlite::Transaction<'_>,
     id: &str,
@@ -594,6 +615,12 @@ fn drop_body_inner(
         )?;
         outcome.body_dropped = true;
         outcome.listed = blob_hashes(&full);
+    }
+    if reason != DropReason::Evicted {
+        tx.execute(
+            "DELETE FROM event_refs WHERE seq IN (SELECT seq FROM events WHERE id = ?)",
+            [id],
+        )?;
     }
     if record {
         tx.execute(
@@ -1012,6 +1039,9 @@ pub struct Store {
     new_events: broadcast::Sender<Stored>,
     /// Bytes of JSON held by opaque rows (B4 quota).
     opaque_bytes: AtomicU64,
+    /// Whether the store has `key_first` (a read-only store an older
+    /// release wrote may not), checked once at open.
+    key_first: bool,
 }
 
 impl std::fmt::Debug for Store {
@@ -1142,6 +1172,7 @@ impl Store {
             conn: Mutex::new(conn),
             new_events,
             opaque_bytes: AtomicU64::new(opaque_bytes),
+            key_first: true,
         })
     }
 
@@ -1304,12 +1335,6 @@ impl Store {
                 tx.execute(
                     "INSERT OR IGNORE INTO event_refs (ref, seq) VALUES (?, ?)",
                     params![cited, seq],
-                )?;
-            }
-            for blob in &event.blobs {
-                tx.execute(
-                    "INSERT OR IGNORE INTO event_blobs (hash, seq) VALUES (?, ?)",
-                    params![blob.hash, seq],
                 )?;
             }
             let quota = self
@@ -1878,10 +1903,12 @@ impl Store {
             );
         }
         let (new_events, _) = broadcast::channel(1);
+        let key_first = has_table(&conn, "key_first")?;
         Ok(Self {
             conn: Mutex::new(conn),
             new_events,
             opaque_bytes: AtomicU64::new(0),
+            key_first,
         })
     }
 
@@ -1931,7 +1958,7 @@ impl Store {
             [author],
             |r| r.get(0),
         )?;
-        let deleted: Option<i64> = if has_table(&conn, "key_first")? {
+        let deleted: Option<i64> = if self.key_first {
             conn.query_row(
                 "SELECT MIN(first_seen) FROM key_first WHERE author = ?",
                 [author],
@@ -2417,8 +2444,9 @@ impl Store {
              coalesce(json_extract(e.json, '$.title'), substr(e.text, 1, 200))";
         // A source held as a tombstone still gives its signal: its kind,
         // parent and refs are header fields (ADR 0025 §7). A react's body
-        // is never evicted, so what is lost is only a reply's text.
-        let held = format!("(e.opaque = 0 OR {})", tombstone_sql("e"));
+        // is never evicted, so what is lost is only a reply's text. Not one
+        // dropped for another reason: withdrawn or erased, it gives none.
+        let held = source_sql("e");
         let sql = format!(
             "SELECT e.parent, 1, {columns} FROM events e
                  WHERE e.parent IN ({marks}) AND {held}
@@ -2717,8 +2745,9 @@ impl Store {
         // A target held as a tombstone keeps its head (ADR 0025 §7): an
         // evicted post keeps its signals and its author's score.
         let held = format!("(t.opaque = 0 OR {})", tombstone_sql("t"));
-        // Sources held as tombstones too: their signals keep counting.
-        let source = format!("(e.opaque = 0 OR {})", tombstone_sql("e"));
+        // Sources held as tombstones too: their signals keep counting, but
+        // for one withdrawn or erased.
+        let source = source_sql("e");
         let sql = format!(
             "SELECT e.parent, 1, {columns} FROM events e
                  LEFT JOIN events t ON t.id = e.parent AND {held}
@@ -3035,6 +3064,9 @@ pub struct PageQuery {
     /// Only these authors (empty: all).
     pub authors: Vec<String>,
     pub limit: usize,
+    /// Below this `ts` (a rotation cut), a `react` asked for is served only
+    /// when it is an erasure label: the only reacts rotation keeps there.
+    pub reacts_below: Option<u64>,
 }
 
 /// The JSON of a row, with when this node stored it.
@@ -3107,8 +3139,21 @@ impl Store {
             args.push(sql_ts(above).into());
         }
         if !q.kinds.is_empty() {
-            conds.push(format!("kind IN ({})", marks(q.kinds.len())));
-            args.extend(q.kinds.iter().map(|k| SqlValue::from(k.clone())));
+            match q.reacts_below {
+                Some(cut) => {
+                    conds.push(format!(
+                        "(kind IN ({}) AND (kind <> 'react' OR ts > ?
+                             OR json_extract(json, '$.data.label') IS 'erasure'))",
+                        marks(q.kinds.len())
+                    ));
+                    args.extend(q.kinds.iter().map(|k| SqlValue::from(k.clone())));
+                    args.push(sql_ts(cut).into());
+                }
+                None => {
+                    conds.push(format!("kind IN ({})", marks(q.kinds.len())));
+                    args.extend(q.kinds.iter().map(|k| SqlValue::from(k.clone())));
+                }
+            }
         }
         if !q.authors.is_empty() {
             conds.push(format!("author IN ({})", marks(q.authors.len())));
@@ -3761,6 +3806,7 @@ impl Keep {
                  SELECT EXISTS (SELECT 1 FROM local_keys WHERE author = ?1)
                      OR EXISTS (SELECT 1 FROM ask_notify WHERE ask IN (?2, ?3))
                      OR EXISTS (SELECT 1 FROM events WHERE id = ?3 AND {own})
+                     OR EXISTS (SELECT 1 FROM events WHERE thread = ?2 AND {own})
                      OR EXISTS (SELECT 1 FROM events WHERE id IN
                          (SELECT id FROM below WHERE depth > 0) AND {own})"
             ),
@@ -3791,6 +3837,8 @@ pub struct Rotated {
     pub freed_blobs: Vec<String>,
     /// The cuts raised, per network (stage 2).
     pub cuts: Vec<(String, u64)>,
+    /// Rows skipped because they could not be read or tombstoned (logged).
+    pub skipped: usize,
 }
 
 /// A rotation run, as logged (ADR 0025 §7): what it actually dropped and
@@ -3931,18 +3979,25 @@ impl Store {
         // Walking up starts from the parents of this node's posts.
         let mut up: HashSet<String> = HashSet::new();
         let list: Vec<&String> = authors.iter().collect();
+        // Thread roots kept even when a link up to them is missing.
+        let mut roots: Vec<String> = Vec::new();
         for chunk in list.chunks(500) {
             let mut stmt = conn.prepare(&format!(
-                "SELECT id, parent FROM events WHERE author IN ({})",
+                "SELECT id, parent, thread FROM events WHERE author IN ({})",
                 marks(chunk.len())
             ))?;
             let rows = stmt.query_map(params_from_iter(chunk.iter()), |r| {
-                Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?))
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, Option<String>>(1)?,
+                    r.get::<_, Option<String>>(2)?,
+                ))
             })?;
             for row in rows {
-                let (id, parent) = row?;
+                let (id, parent, thread) = row?;
                 parents.insert(id);
                 up.extend(parent);
+                roots.extend(thread);
             }
         }
         let mut ids: HashSet<String> = HashSet::new();
@@ -3954,6 +4009,7 @@ impl Store {
                 parents.insert(ask);
             }
         }
+        ids.extend(roots);
         // The ancestors, a level at a time.
         for _ in 0..ANCESTOR_DEPTH {
             let next: Vec<String> = up.drain().filter(|id| ids.insert(id.clone())).collect();
@@ -4073,7 +4129,8 @@ impl Store {
     }
 
     /// Rows of `net` by `authors`, oldest first, strictly after `(ts, id)`,
-    /// at most `limit` (index `events_author_ts`).
+    /// at most `limit`: one range of the index `events_net_author_ts` per
+    /// author, merged.
     pub fn author_rows_after(
         &self,
         net: &str,
@@ -4081,27 +4138,28 @@ impl Store {
         after: (u64, &str),
         limit: usize,
     ) -> Result<Vec<RowHead>> {
-        if authors.is_empty() {
-            return Ok(Vec::new());
+        let mut rows: Vec<RowHead> = Vec::new();
+        let conn = self.conn();
+        for author in authors {
+            rows.extend(row_heads(
+                &conn,
+                &format!(
+                    "SELECT {ROW_HEAD} FROM events e WHERE e.net = ?1 AND e.author = ?2
+                         AND (e.ts > ?3 OR (e.ts = ?3 AND e.id > ?4))
+                     ORDER BY e.ts, e.id LIMIT ?5"
+                ),
+                vec![
+                    net.to_string().into(),
+                    author.clone().into(),
+                    sql_ts(after.0).into(),
+                    after.1.to_string().into(),
+                    (limit as i64).into(),
+                ],
+            )?);
         }
-        let mut args: Vec<SqlValue> = vec![
-            net.to_string().into(),
-            sql_ts(after.0).into(),
-            after.1.to_string().into(),
-        ];
-        args.extend(authors.iter().map(|a| SqlValue::from(a.clone())));
-        args.push((limit as i64).into());
-        row_heads(
-            &self.conn(),
-            &format!(
-                "SELECT {ROW_HEAD} FROM events e WHERE e.net = ?1
-                     AND (e.ts > ?2 OR (e.ts = ?2 AND e.id > ?3))
-                     AND e.author IN ({})
-                 ORDER BY e.ts, e.id LIMIT ?",
-                marks(authors.len())
-            ),
-            args,
-        )
+        rows.sort_by(|a, b| (a.ts, &a.id).cmp(&(b.ts, &b.id)));
+        rows.truncate(limit);
+        Ok(rows)
     }
 
     /// The full, understood events among these `seq`s.
@@ -4168,8 +4226,18 @@ impl Store {
             {
                 continue;
             }
-            let full: Value = serde_json::from_str(&json).context("corrupt stored event")?;
-            let tombstone = serde_json::to_string(&crate::wire::tombstone(&full)?.wire)?;
+            let tombstone = serde_json::from_str::<Value>(&json)
+                .map_err(anyhow::Error::from)
+                .and_then(|full| Ok(crate::wire::tombstone(&full)?))
+                .and_then(|t| Ok(serde_json::to_string(&t.wire)?));
+            let tombstone = match tombstone {
+                Ok(t) => t,
+                Err(e) => {
+                    tracing::warn!(%id, "rotation: a row not tombstoned, skipped: {e:#}");
+                    out.skipped += 1;
+                    continue;
+                }
+            };
             if (json.len() as u64) < (tombstone.len() as u64).saturating_add(EVICT_MIN_SAVING) {
                 continue;
             }
@@ -4260,10 +4328,19 @@ impl Store {
                      VALUES ('delete', ?, ?, ?, ?)",
                     params![head.seq, title, text, tags],
                 )?;
-                let full: Value = serde_json::from_str(&json).context("corrupt stored event")?;
-                for hash in blob_hashes(&full) {
-                    if !hashes.contains(&hash) {
-                        hashes.push(hash);
+                match serde_json::from_str::<Value>(&json) {
+                    Ok(full) => {
+                        for hash in blob_hashes(&full) {
+                            if !hashes.contains(&hash) {
+                                hashes.push(hash);
+                            }
+                        }
+                    }
+                    // Unreadable: it may list blobs; kept, and counted.
+                    Err(e) => {
+                        tracing::warn!(id = %head.id, "rotation: a row not read, kept: {e:#}");
+                        out.skipped += 1;
+                        continue;
                     }
                 }
             }
@@ -6511,6 +6588,118 @@ mod tests {
         ));
         assert!(store.evicted_replicas(&event.id).unwrap().is_empty());
         assert!(store.blob_referenced(&hash).unwrap());
+    }
+
+    #[test]
+    fn rotation_never_overrides_a_stronger_reason() {
+        let store = Store::open_in_memory().unwrap();
+        let erased = long(1, 10, "erased");
+        let free = long(2, 11, "anyone's");
+        store.insert(&erased, 10).unwrap();
+        store.insert(&free, 11).unwrap();
+        store
+            .drop_body(&erased.id, DropReason::Erasure, Some("label"), None, 20)
+            .unwrap();
+        let keep = Keep::default();
+        assert!(!store.rotatable(&erased.id, &keep, false).unwrap());
+        assert!(store.rotatable(&free.id, &keep, false).unwrap());
+        // An eviction landing after it changes nothing.
+        store
+            .drop_body_keeping(&erased.id, DropReason::Evicted, None, None, 30, &[])
+            .unwrap();
+        assert_eq!(
+            store.drop_record(&erased.id).unwrap().unwrap().reason,
+            DropReason::Erasure
+        );
+    }
+
+    #[test]
+    fn any_eviction_marks_the_history_lossy() {
+        let store = Store::open_in_memory().unwrap();
+        let post = long(1, 10, "a post");
+        let other = long(2, 11, "another");
+        store.insert(&post, 10).unwrap();
+        store.insert(&other, 11).unwrap();
+        // A drop for another reason: still the full history, as before.
+        store
+            .drop_body(&other.id, DropReason::Own, None, None, 20)
+            .unwrap();
+        assert!(!store.history_lossy().unwrap());
+        // The node's eviction path (`drop_body_keeping`), not rotation's.
+        store
+            .drop_body_keeping(&post.id, DropReason::Evicted, None, None, 30, &[])
+            .unwrap();
+        assert!(store.history_lossy().unwrap());
+    }
+
+    #[test]
+    fn the_thread_root_of_an_own_post_is_kept_without_the_links_up() {
+        let store = Store::open_in_memory().unwrap();
+        let root = long(1, 10, "the question");
+        let middle = long_of(2, 11, Kind::Answer, "an answer", Some(&root));
+        let mine = reply(&middle, 9, 12, "my follow-up");
+        // The middle reply is not held (trimmed, or never fetched).
+        store.insert(&root, 10).unwrap();
+        store.insert(&mine, 12).unwrap();
+        let keep = keep_of(&store, &[9]);
+        assert!(keep.protects(&head_of(&store, &root)), "{keep:?}");
+        let ids = [root.id.clone()];
+        assert_eq!(store.evict_bodies(&ids, &keep, 20).unwrap().rows, 0);
+        // Inside the transaction too, with a plan that knew nothing.
+        let blind = Keep {
+            authors: keep.authors.clone(),
+            ..Keep::default()
+        };
+        assert_eq!(
+            store
+                .delete_rows(&ids, &blind, Deletion::Cut, 20)
+                .unwrap()
+                .rows,
+            0
+        );
+    }
+
+    #[test]
+    fn a_retraction_takes_the_refs_an_eviction_keeps() {
+        let store = Store::open_in_memory().unwrap();
+        let cited = long(1, 10, "a source");
+        let citing = |seed: u8, ts: u64| {
+            Draft {
+                net: "public".into(),
+                kind: Some(Kind::Note),
+                title: Some("citing".into()),
+                text: "see the source".into(),
+                refs: vec![cited.id.clone()],
+                ..Draft::default()
+            }
+            .sign(&key(seed), ts, 0)
+            .unwrap()
+        };
+        let (evicted, retracted) = (citing(2, 11), citing(3, 12));
+        for e in [&cited, &evicted, &retracted] {
+            store.insert(e, e.ts).unwrap();
+        }
+        store
+            .drop_body(&evicted.id, DropReason::Evicted, None, None, 20)
+            .unwrap();
+        store
+            .drop_body(&retracted.id, DropReason::Retraction, Some("r"), None, 20)
+            .unwrap();
+        let rows = store
+            .signal_rows(std::slice::from_ref(&cited.id), 10)
+            .unwrap();
+        let ids: Vec<&str> = rows.iter().map(|r| r.id.as_str()).collect();
+        assert_eq!(ids, [evicted.id.as_str()], "the retracted one gives none");
+        // Retracted after its eviction: none either.
+        store
+            .drop_body(&evicted.id, DropReason::Retraction, Some("r"), None, 30)
+            .unwrap();
+        assert!(
+            store
+                .signal_rows(std::slice::from_ref(&cited.id), 10)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]
