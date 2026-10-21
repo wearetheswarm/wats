@@ -4,13 +4,21 @@
 //! A foreground node (`wats`, `wats node`) that finds no `config.toml` in
 //! its data directory asks them on a terminal ([`setup`]), or writes the
 //! defaults, commented, without one ([`write_default`]: daemons,
-//! containers, services). `wats mcp` and the background node it starts
+//! containers, services). A bare `wats` (no argument at all) on a terminal
+//! runs the whole setup wizard instead (ADR 0026, in `main.rs`): these
+//! choices ([`setup_for_wizard`]), then the MCP hosts found, then the
+//! background or this terminal. `wats mcp` and the background node it starts
 //! never do either: an MCP-only user keeps a data directory without
 //! `config.toml`.
 //!
 //! The choices are existing keys only ([`crate::settings::KEYS`]): the
 //! agent runtime among the agent CLIs found on `PATH`, `storage.max`, the
-//! agent's run time, turn and spend limits, and `nets`.
+//! agent's run time, turn and spend limits, its access level, and `nets`.
+//!
+//! Each question carries the setup revision that added it
+//! ([`SETUP_REVISION`], ADR 0026): `<data dir>/setup-revision` records the
+//! revision the last setup completed, so that a release adding questions
+//! asks only those ([`catch_up`]) instead of the whole setup again.
 
 use std::ffi::OsStr;
 use std::io::{BufRead, Write};
@@ -52,32 +60,116 @@ pub const OPENCLAW_AGENT_NEXT: &str = "`wats` now forwards the agent's runs to O
 gateway. Finish with: wats setup openclaw --agent (the hook token, the restricted `wats` \
 OpenClaw agent and its MCP entry)";
 
-/// Keys OpenClaw does not use: it reports no cost and counts its own
-/// turns (ADR 0017 §2).
-const NOT_FOR_OPENCLAW: [&str; 3] = [
+/// Keys not asked for OpenClaw: it reports no cost and counts its own
+/// turns (ADR 0017 §2), and its access level goes with its allow list and
+/// review (`wats setup openclaw --agent` checks them together).
+const NOT_FOR_OPENCLAW: [&str; 4] = [
     "agent.max_turns",
     "agent.max_usd_per_day",
     "agent.max_usd_per_month",
+    "agent.access",
 ];
 
+/// The revision of setup's questions (ADR 0026). A release bumps it only
+/// when it adds a question, which then carries the new value as its
+/// `since`: `wats` on a terminal asks the questions newer than the
+/// revision a data directory last completed ([`catch_up`]), and says so in
+/// one log line elsewhere. Not tied to the version number.
+pub const SETUP_REVISION: u32 = 1;
+
+/// The revision of a data directory set up before revisions were recorded
+/// (wats 0.4.2 and older), or with `wats setup <tool>` only: a config.toml
+/// without [`REVISION_FILE`].
+pub const BASELINE_REVISION: u32 = 1;
+
+/// The file, in the data directory, that holds the revision the last setup
+/// completed. Not a config.toml key: an older wats refuses unknown keys,
+/// and `wats upgrade --rollback` must keep working.
+pub const REVISION_FILE: &str = "setup-revision";
+
+/// The revision that added the agent runtime question.
+const RUNTIME_SINCE: u32 = 1;
+
+/// The revision that added the desktop notification question.
+const DESKTOP_SINCE: u32 = 1;
+
+/// One question after the agent runtime.
+#[derive(Debug, Clone, Copy)]
+struct Question {
+    key: &'static str,
+    label: &'static str,
+    /// Only asked when the node runs an agent.
+    agent_only: bool,
+    /// The setup revision that added it.
+    since: u32,
+}
+
+const fn question(key: &'static str, label: &'static str, agent_only: bool) -> Question {
+    Question {
+        key,
+        label,
+        agent_only,
+        since: 1,
+    }
+}
+
 /// The questions after the agent runtime, in order: storage, the agent's
-/// limits (only asked when it runs an agent), networks.
-const QUESTIONS: [(&str, &str, bool); 6] = [
-    ("storage.max", "Disk budget of the data directory", false),
-    ("agent.timeout", "Time limit of one agent run", true),
-    ("agent.max_turns", "Turns per agent run", true),
-    (
+/// limits and access (only asked when it runs an agent), networks.
+const QUESTIONS: [Question; 7] = [
+    question("storage.max", "Disk budget of the data directory", false),
+    question("agent.timeout", "Time limit of one agent run", true),
+    question("agent.max_turns", "Turns per agent run", true),
+    question(
         "agent.max_usd_per_day",
         "Agent spend budget per UTC day, in USD",
         true,
     ),
-    (
+    question(
         "agent.max_usd_per_month",
         "Agent spend budget per UTC month, in USD",
         true,
     ),
-    ("nets", "Networks to join, comma-separated", false),
+    question(
+        "agent.access",
+        "What the agent may use besides the wats tools: swarm-only, workspace (its own \
+         directory) or inherit (your whole environment)",
+        true,
+    ),
+    question("nets", "Networks to join, comma-separated", false),
 ];
+
+/// The revision the last setup of `data_dir` completed: `None` without a
+/// config.toml (never set up, or its config.toml deleted to start over),
+/// else its [`REVISION_FILE`], else [`BASELINE_REVISION`] (also for an
+/// unreadable file).
+pub fn stored_revision(data_dir: &Path) -> Option<u32> {
+    if !data_dir.join(FILE_NAME).exists() {
+        return None;
+    }
+    let recorded = std::fs::read_to_string(data_dir.join(REVISION_FILE)).ok();
+    Some(
+        recorded
+            .and_then(|text| text.trim().parse().ok())
+            .unwrap_or(BASELINE_REVISION),
+    )
+}
+
+/// Record that setup completed [`SETUP_REVISION`] in `data_dir`.
+pub fn record_revision(data_dir: &Path) -> Result<()> {
+    let path = data_dir.join(REVISION_FILE);
+    std::fs::write(&path, format!("{SETUP_REVISION}\n"))
+        .with_context(|| format!("write {}", path.display()))
+}
+
+/// How many questions are newer than `revision`, whatever the answers
+/// (the agent's questions count even when it runs none).
+pub fn new_questions(revision: u32) -> usize {
+    [RUNTIME_SINCE, DESKTOP_SINCE]
+        .into_iter()
+        .chain(QUESTIONS.iter().map(|q| q.since))
+        .filter(|since| *since > revision)
+        .count()
+}
 
 /// An agent CLI found on `PATH`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -137,11 +229,14 @@ fn is_executable(path: &Path) -> bool {
 }
 
 /// What setup chose. `values` holds the answered keys only, as typed (e.g.
-/// `10G`, `public,acme`).
+/// `10G`, `public,acme`). `keep_runtime`: the runtime was not asked (a
+/// [`catch_up`]): the agents stay as they are, `runtime` is the current
+/// one's.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Choices {
     pub runtime: Option<String>,
     pub values: Vec<(&'static str, String)>,
+    pub keep_runtime: bool,
 }
 
 /// The value of `key` in `settings`, as `wats config set` takes it.
@@ -155,6 +250,7 @@ fn current(settings: &Settings, key: &str) -> Option<String> {
         "agent.max_turns" => agent.max_turns.map(|n| n.to_string()),
         "agent.max_usd_per_day" => agent.max_usd_per_day.map(|n| n.to_string()),
         "agent.max_usd_per_month" => agent.max_usd_per_month.map(|n| n.to_string()),
+        "agent.access" => agent.access.clone(),
         "nets" => (!settings.nets.is_empty()).then(|| settings.nets.join(",")),
         _ => None,
     }
@@ -306,27 +402,52 @@ pub fn prompt(
         out,
         "wats setup: the node's main choices. Enter accepts the [default]."
     )?;
+    prompt_after(input, out, found, settings, &QUESTIONS, 0)
+}
+
+/// Ask those of `questions` newer than `revision` (0: all of them), after
+/// the agent runtime when it is newer too.
+fn prompt_after(
+    input: &mut impl BufRead,
+    out: &mut impl Write,
+    found: &[Found],
+    settings: &Settings,
+    questions: &[Question],
+    revision: u32,
+) -> Result<Choices> {
     let primary = settings
         .primary_agent()
         .and_then(|(_, table)| table.runtime.clone());
-    let runtime = ask_runtime(input, out, found, primary.as_deref())?;
+    let keep_runtime = RUNTIME_SINCE <= revision;
+    let runtime = if keep_runtime {
+        primary
+    } else {
+        ask_runtime(input, out, found, primary.as_deref())?
+    };
     let openclaw = runtime.as_deref() == Some("openclaw");
-    if openclaw {
+    if openclaw && !keep_runtime {
         writeln!(out, "{}", crate::openclaw::SPEND_CAPS)?;
     }
     let mut values = Vec::new();
-    for (key, label, agent_only) in QUESTIONS {
-        if (agent_only && runtime.is_none()) || (openclaw && NOT_FOR_OPENCLAW.contains(&key)) {
+    for q in questions {
+        if q.since <= revision
+            || (q.agent_only && runtime.is_none())
+            || (openclaw && NOT_FOR_OPENCLAW.contains(&q.key))
+        {
             continue;
         }
-        let default = current(settings, key).unwrap_or_else(|| {
-            settings::find_key(key)
+        let default = current(settings, q.key).unwrap_or_else(|| {
+            settings::find_key(q.key)
                 .map_or("", |k| k.default)
                 .to_string()
         });
-        values.push((key, ask(input, out, key, label, &default)?));
+        values.push((q.key, ask(input, out, q.key, q.label, &default)?));
     }
-    Ok(Choices { runtime, values })
+    Ok(Choices {
+        runtime,
+        values,
+        keep_runtime,
+    })
 }
 
 const HEADER: &str = "\
@@ -379,20 +500,20 @@ pub fn render(choices: &Choices) -> Result<String> {
                 "[agents.{runtime}]\nruntime = {}\n",
                 settings::check_value("agent.runtime", runtime)?
             ));
-            for (key, _, agent_only) in QUESTIONS {
-                if agent_only {
+            for q in QUESTIONS {
+                if q.agent_only {
                     text.push('\n');
-                    line(&mut text, key)?;
+                    line(&mut text, q.key)?;
                 }
             }
         }
         None => {
             // Commented: an example to uncomment.
             let mut example = String::from("[agents.claude]\nruntime = \"claude\"\n");
-            for (key, _, agent_only) in QUESTIONS {
-                if agent_only {
+            for q in QUESTIONS {
+                if q.agent_only {
                     example.push('\n');
-                    line(&mut example, key)?;
+                    line(&mut example, q.key)?;
                 }
             }
             for l in example.lines() {
@@ -437,6 +558,9 @@ pub fn apply(data_dir: &Path, choices: &Choices) -> Result<PathBuf> {
         None => key.to_string(),
     };
     let target = match &choices.runtime {
+        // Not asked: the agents stay as they are, and the agent's keys go
+        // to the one asked about.
+        _ if choices.keep_runtime => primary.map(|(name, _)| name),
         Some(runtime) => {
             // The agent asked about keeps its name when it keeps its
             // runtime; another runtime is the agent named after it.
@@ -528,10 +652,87 @@ pub fn setup_with(
     path: Option<&OsStr>,
     desktop: bool,
 ) -> Result<Choices> {
+    let (choices, found) = ask_and_write(data_dir, input, out, path, desktop, 0)?;
+    next_steps(out, &choices, &found, true)?;
+    Ok(choices)
+}
+
+/// [`setup`] for the setup wizard (ADR 0026), which asks next whether
+/// to register wats in the MCP hosts found: the hints to run `wats setup
+/// <tool> --mcp` are left out. Returns the choices and the agent CLIs found.
+pub fn setup_for_wizard(
+    data_dir: &Path,
+    input: &mut impl BufRead,
+    out: &mut impl Write,
+    path: Option<&OsStr>,
+) -> Result<(Choices, Vec<Found>)> {
+    let (choices, found) = ask_and_write(
+        data_dir,
+        input,
+        out,
+        path,
+        crate::desktop::this_desktop_session(),
+        0,
+    )?;
+    next_steps(out, &choices, &found, false)?;
+    Ok((choices, found))
+}
+
+/// A data directory set up at `revision`, older than [`SETUP_REVISION`]:
+/// ask only the questions added since, write them, record the revision.
+pub fn catch_up(
+    data_dir: &Path,
+    input: &mut impl BufRead,
+    out: &mut impl Write,
+    path: Option<&OsStr>,
+    revision: u32,
+) -> Result<Choices> {
+    catch_up_with(
+        data_dir,
+        input,
+        out,
+        path,
+        revision,
+        crate::desktop::this_desktop_session(),
+    )
+}
+
+/// [`catch_up`], `desktop` as in [`setup_with`].
+pub fn catch_up_with(
+    data_dir: &Path,
+    input: &mut impl BufRead,
+    out: &mut impl Write,
+    path: Option<&OsStr>,
+    revision: u32,
+    desktop: bool,
+) -> Result<Choices> {
+    writeln!(
+        out,
+        "wats setup has new questions since this data directory was set up (setup revision \
+         {revision}, now {SETUP_REVISION}). Enter accepts the [default]."
+    )?;
+    let (choices, _) = ask_and_write(data_dir, input, out, path, desktop, revision)?;
+    Ok(choices)
+}
+
+/// Ask the main choices newer than `revision` (0: all of them), write
+/// them, and record [`SETUP_REVISION`].
+fn ask_and_write(
+    data_dir: &Path,
+    input: &mut impl BufRead,
+    out: &mut impl Write,
+    path: Option<&OsStr>,
+    desktop: bool,
+    revision: u32,
+) -> Result<(Choices, Vec<Found>)> {
     let settings = Settings::load(data_dir)?;
     let found = detect_agents(path);
-    let mut choices = prompt(input, out, &found, &settings)?;
-    if desktop {
+    let mut choices = if revision == 0 {
+        prompt(input, out, &found, &settings)?
+    } else {
+        prompt_after(input, out, &found, &settings, &QUESTIONS, revision)?
+    };
+    if desktop && DESKTOP_SINCE > revision {
         let on = ask_yes_no(
             input,
             out,
@@ -542,22 +743,40 @@ pub fn setup_with(
         choices.values.push(("notify.desktop", on.to_string()));
     }
     let file = apply(data_dir, &choices)?;
+    record_revision(data_dir)?;
     writeln!(out, "Wrote {}", file.display())?;
+    Ok((choices, found))
+}
+
+/// What the node now runs, and with `hints`, how to register wats in the
+/// MCP hosts found.
+fn next_steps(out: &mut impl Write, choices: &Choices, found: &[Found], hints: bool) -> Result<()> {
     match &choices.runtime {
-        Some(runtime) if runtime == "openclaw" => writeln!(out, "{OPENCLAW_AGENT_NEXT}")?,
+        Some(runtime) if runtime == "openclaw" => {
+            if hints {
+                writeln!(out, "{OPENCLAW_AGENT_NEXT}")?;
+            }
+        }
         Some(runtime) => {
             let name = if runtime == "codex" {
                 "Codex"
             } else {
                 "Claude Code"
             };
-            writeln!(
-                out,
-                "`wats` now runs the node with a {name} agent. To reach the swarm from \
-                 your own {name} sessions too: wats setup {runtime} --mcp"
-            )?;
+            write!(out, "`wats` now runs the node with a {name} agent.")?;
+            if hints {
+                write!(
+                    out,
+                    " To reach the swarm from your own {name} sessions too: wats setup \
+                     {runtime} --mcp"
+                )?;
+            }
+            writeln!(out)?;
         }
         None => writeln!(out, "{NO_AGENT_NOTICE}")?,
+    }
+    if !hints {
+        return Ok(());
     }
     if found.iter().any(|f| f.name == "openclaw") && choices.runtime.as_deref() != Some("openclaw")
     {
@@ -566,7 +785,7 @@ pub fn setup_with(
     if found.iter().any(|f| f.name == "vibe") {
         writeln!(out, "{VIBE_MCP_HINT}")?;
     }
-    Ok(choices)
+    Ok(())
 }
 
 #[cfg(test)]
@@ -722,7 +941,7 @@ mod tests {
         let (choices, said) = run(&found(&["claude", "codex"]), &Settings::default(), "");
         assert_eq!(choices.runtime.as_deref(), Some("claude"));
         let keys: Vec<_> = choices.values.iter().map(|(k, _)| *k).collect();
-        assert_eq!(keys, QUESTIONS.map(|q| q.0));
+        assert_eq!(keys, QUESTIONS.map(|q| q.key));
         assert!(said.contains("1) claude"), "{said}");
         assert!(
             said.contains("[10G]") && said.contains("[public]"),
@@ -737,11 +956,13 @@ mod tests {
 
     #[test]
     fn scripted_answers_are_checked() {
-        let input = "7\n2\n20G\n1h\nmany\n5\n1.5\n10\npublic,acme\n";
+        let input = "7\n2\n20G\n1h\nmany\n5\n1.5\n10\nall\nswarm-only\npublic,acme\n";
         let (choices, said) = run(&found(&["claude", "codex"]), &Settings::default(), input);
         assert_eq!(choices.runtime.as_deref(), Some("codex"));
         assert!(said.contains("answer a number above"), "{said}");
         assert!(said.contains("not an integer"), "{said}");
+        assert!(said.contains("(agent.access) [workspace]"), "{said}");
+        assert!(said.contains("swarm-only, workspace, inherit"), "{said}");
         assert_eq!(
             choices.values,
             [
@@ -750,6 +971,7 @@ mod tests {
                 ("agent.max_turns", "5".into()),
                 ("agent.max_usd_per_day", "1.5".into()),
                 ("agent.max_usd_per_month", "10".into()),
+                ("agent.access", "swarm-only".into()),
                 ("nets", "public,acme".into()),
             ]
         );
@@ -762,6 +984,7 @@ mod tests {
         assert_eq!(settings.storage.max.as_deref(), Some("20G"));
         assert_eq!(codex.max_turns, Some(5));
         assert_eq!(codex.max_usd_per_month, Some(10.0));
+        assert_eq!(codex.access.as_deref(), Some("swarm-only"));
         assert_eq!(settings.nets, ["public", "acme"]);
         // Again on the same file: the current values are the defaults, and
         // choosing no agent turns it off, keeping the rest.
@@ -853,5 +1076,125 @@ mod tests {
         std::fs::write(&path, "profile = \"alice\"\n").unwrap();
         assert_eq!(write_default(dir.path()).unwrap(), None);
         assert!(std::fs::read_to_string(&path).unwrap().contains("alice"));
+    }
+
+    /// The setup revision of a data directory: none before a config.toml,
+    /// the baseline for one set up before revisions were recorded (an
+    /// upgraded 0.4.x node: not asked again), the current one after a
+    /// setup; a deleted config.toml is a new start.
+    #[test]
+    fn setup_revision_is_recorded() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(stored_revision(dir.path()), None);
+        write_default(dir.path()).unwrap();
+        assert_eq!(stored_revision(dir.path()), Some(BASELINE_REVISION));
+        // Revision 1 (0.4.3): the questions of 0.4.2, plus agent.access,
+        // whose default every 0.4.x node already runs with.
+        assert_eq!(
+            new_questions(BASELINE_REVISION),
+            0,
+            "0.4.x nodes are asked nothing"
+        );
+        setup_with(dir.path(), &mut "".as_bytes(), &mut Vec::new(), None, false).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join(REVISION_FILE)).unwrap(),
+            format!("{SETUP_REVISION}\n")
+        );
+        assert_eq!(stored_revision(dir.path()), Some(SETUP_REVISION));
+        std::fs::write(dir.path().join(REVISION_FILE), "garbage").unwrap();
+        assert_eq!(stored_revision(dir.path()), Some(BASELINE_REVISION));
+        std::fs::remove_file(dir.path().join(FILE_NAME)).unwrap();
+        assert_eq!(stored_revision(dir.path()), None);
+        // Every question of today is in revision 1: revision 0 has them all.
+        assert_eq!(new_questions(0), QUESTIONS.len() + 2);
+    }
+
+    /// A data directory set up at an older revision: only the questions
+    /// added since are asked (here a made-up revision 2 question), the
+    /// agent runtime is not, and the agents stay as they were.
+    #[test]
+    fn catch_up_asks_only_the_new_questions() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(FILE_NAME),
+            "[agents.reviewer]\nruntime = \"codex\"\nmax_turns = 7\n\n\
+             [agents.claude]\nruntime = \"claude\"\nenabled = false\n",
+        )
+        .unwrap();
+        let settings = Settings::load(dir.path()).unwrap();
+        let questions = [
+            question("storage.max", "Disk budget", false),
+            Question {
+                since: 2,
+                ..question("agent.timeout", "Time limit of one agent run", true)
+            },
+            Question {
+                since: 2,
+                ..question("nets", "Networks", false)
+            },
+        ];
+        let mut out = Vec::new();
+        let choices = prompt_after(
+            &mut "1h\n".as_bytes(),
+            &mut out,
+            &found(&["claude", "codex"]),
+            &settings,
+            &questions,
+            1,
+        )
+        .unwrap();
+        let said = String::from_utf8(out).unwrap();
+        assert!(!said.contains("agent.runtime"), "{said}");
+        assert!(!said.contains("storage.max"), "{said}");
+        assert!(said.contains("(agent.timeout) [10m]"), "{said}");
+        assert!(said.contains("(nets) [public]"), "{said}");
+        assert!(choices.keep_runtime);
+        assert_eq!(choices.runtime.as_deref(), Some("codex"));
+        assert_eq!(
+            choices.values,
+            [("agent.timeout", "1h".into()), ("nets", "public".into())]
+        );
+        apply(dir.path(), &choices).unwrap();
+        let after = Settings::load(dir.path()).unwrap();
+        assert_eq!(after.agents["reviewer"].timeout.as_deref(), Some("1h"));
+        assert_eq!(after.agents["reviewer"].max_turns, Some(7));
+        assert_eq!(after.agents["reviewer"].enabled, None);
+        assert_eq!(after.agents["claude"].enabled, Some(false));
+        assert_eq!(
+            after.enabled_agents(),
+            [("reviewer".to_string(), "codex".to_string())]
+        );
+        // Revision 2 already: nothing is asked.
+        let mut out = Vec::new();
+        let none = prompt_after(&mut "".as_bytes(), &mut out, &[], &after, &questions, 2).unwrap();
+        assert!(none.values.is_empty() && out.is_empty());
+    }
+
+    /// The real catch-up from revision 0 (older than every question): the
+    /// main choices, written, and the revision recorded; no hint to run
+    /// `wats setup <tool> --mcp`.
+    #[test]
+    fn catch_up_records_the_revision() {
+        let dir = tempfile::tempdir().unwrap();
+        write_default(dir.path()).unwrap();
+        std::fs::write(dir.path().join(REVISION_FILE), "0\n").unwrap();
+        let mut out = Vec::new();
+        catch_up_with(
+            dir.path(),
+            &mut "20G\n".as_bytes(),
+            &mut out,
+            None,
+            0,
+            false,
+        )
+        .unwrap();
+        let said = String::from_utf8(out).unwrap();
+        assert!(said.contains("setup revision 0, now 1"), "{said}");
+        assert!(!said.contains("--mcp"), "{said}");
+        assert_eq!(
+            Settings::load(dir.path()).unwrap().storage.max.as_deref(),
+            Some("20G")
+        );
+        assert_eq!(stored_revision(dir.path()), Some(SETUP_REVISION));
     }
 }
