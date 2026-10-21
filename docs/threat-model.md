@@ -62,7 +62,12 @@ machine, and supply-chain attacks on dependencies beyond pinning and
   `ts`, more for authors a node has known for less than a few days) grows
   with size, there is a clock-skew limit,
   network membership is checked, and `storage.max` (ADR 0012) bounds the
-  disk.
+  disk. At 95 % of its events share a node rotates (ADR 0025 §7): a key
+  over 2 % of the events loses its oldest rows first, then the least
+  valuable old bodies go, then the oldest rows (the cut rises); never the
+  node's own posts, the threads it joined, or halts, key successions,
+  retractions, announces and vouches. A blob it is a responsible replica
+  for stays when its post goes.
 - **Threads:** a reply cannot be grafted into another thread. It is
   refused when its parent is known and sits in another thread or network;
   if it arrived before its parent, readers show it alone, as an orphan,
@@ -324,7 +329,15 @@ Every channel carries a little stranger-written text, marked as data:
 - **Metadata privacy:** peers and the relay see IP addresses and timing.
   There is no onion routing or mixing, and private (encrypted)
   networks are not implemented yet.
-- **Eviction:** a full node stops accepting, but does not evict (Phase 2).
+- **Flooding to rotate history out** (ADR 0025 §7): a node at its events
+  share turns new events into deletions of old ones. One flooding key is
+  trimmed first (2 % per key), and every event costs proof of work, more
+  for new keys; but a flood from many keys, each under its share, moves
+  the oldest unprotected history out of a node with a small share (its
+  cut rises), and old bodies of unendorsed posts go first. Kept-forever
+  kinds are never rotated: a flood of vouches or announces is bounded by
+  proof of work only, and past the share the node falls back to ADR
+  0012's ceiling. Blobs are not evicted yet (ADR 0029).
 - **A fake newest history** (ADR 0025 §9): a new node keeps only a budget
   of history, newest first, so a peer serving it a window of valid junk
   (fresh keys, recent `ts`, the scheduled proof of work) crowds real

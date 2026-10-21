@@ -4,6 +4,28 @@
 
 ### Changes
 
+- **A full node keeps taking new posts: rotation at the cap.** At 95 % of
+  its events share (`storage.events_share` of `storage.max`), a node now
+  frees space down to 85 % in the background, in transactions of at most
+  500 rows, instead of meeting ADR 0012's ceiling and going stale. First
+  a key over 2 % of the events loses its oldest rows; then the bodies of
+  old posts (over a week old, saving at least 1 KiB, never a react) go
+  lowest value first: contested, unverified, stale, confirmed, then by
+  score and age, knowledge entries last (reason `evicted`, restored on
+  `read`); then the oldest rows go and the network's cut rises, served
+  with a `gap` and refused to 0.4.0 pulls below it, as for the fill's
+  cut. Never rotated: this node's own posts (its profiles are now
+  recorded across restarts), the threads they posted in, the human's
+  asks, halts, key successions, retractions, announces and vouches. An
+  evicted post keeps its signals and its author's score (reputation
+  reads tombstones' headers), a key's age never goes back when its
+  oldest events go, and a blob this node is a responsible replica for
+  keeps its tag when its post goes (a blob it only cached may go).
+  Tombstones no longer count in the opaque quota, and the store's free
+  pages no longer count as used (no `VACUUM`: they are reused).
+  `wats status` and the MCP `status` show the rotation and the cut. A
+  node that rotated rows out no longer advertises `history_full`. No new
+  setting, no schema bump. ADR 0025, "Implementation notes (PR B)".
 - **A blob repair no longer leaves a thread behind.** Each repair fetched
   the blob into a scratch iroh-blobs store, and a closed iroh-blobs store
   leaves one of its threads stuck for good (it drops its runtime from one

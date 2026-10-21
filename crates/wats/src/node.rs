@@ -37,6 +37,7 @@ use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
 
 pub mod history;
+pub mod rotation;
 
 use crate::bootstrap::BootstrapEntry;
 use crate::event::{BlobRef, Draft, Event, Kind, is_safe_blob_name};
@@ -503,6 +504,16 @@ pub fn dir_size(dir: &Path) -> u64 {
             _ => 0,
         })
         .sum()
+}
+
+/// ADR 0012's measure of a data directory with no node running on it:
+/// [`dir_size`] less the free pages of its event store, which the file
+/// keeps but reuses (ADR 0025 §7).
+pub fn data_usage(dir: &Path) -> u64 {
+    let free = Store::open_read_only_with(&dir.join("events.sqlite"), Duration::from_millis(200))
+        .map(|store| store.free_bytes())
+        .unwrap_or(0);
+    dir_size(dir).saturating_sub(free)
 }
 
 /// How an event reached this node, for the proof-of-work policy.
@@ -1283,6 +1294,8 @@ pub struct Node {
     seed_ids: Vec<EndpointId>,
     /// The history tasks (ADR 0025).
     history: history::History,
+    /// Rotation at the cap (ADR 0025 §7).
+    rotation: rotation::Rotation,
 }
 
 impl std::fmt::Debug for Node {
@@ -1696,8 +1709,36 @@ impl Node {
             network_changed: Default::default(),
             redialing: Default::default(),
             history: Default::default(),
+            rotation: Default::default(),
         });
         node.measure_storage().await;
+        // This node's profiles, recorded so that rotation keeps their posts
+        // across restarts (ADR 0025 §7).
+        for author in node.local_authors() {
+            let profile = node.local_profile(&author).unwrap_or_default();
+            if let Err(e) = node.store.note_local_key(&author, &profile, now_secs()) {
+                warn!("profile key not recorded: {e:#}");
+            }
+        }
+        if node.events_share().is_some() {
+            // Rotation at the cap (ADR 0025 §7): checked at start, then
+            // every 30 s, in the background.
+            let weak = Arc::downgrade(&node);
+            let every = node.config.history.rotation_check;
+            tokio::spawn(supervise("rotation", move || {
+                let weak = weak.clone();
+                async move {
+                    loop {
+                        let Some(node) = weak.upgrade() else { break };
+                        if let Err(e) = node.rotate_if_full().await {
+                            warn!("rotation: {e:#}");
+                        }
+                        drop(node);
+                        tokio::time::sleep(every).await;
+                    }
+                }
+            }));
+        }
         if node.config.storage_max.is_some() {
             let weak = Arc::downgrade(&node);
             tokio::spawn(supervise("storage measure", move || {
@@ -2343,8 +2384,14 @@ impl Node {
             bail!("profile name must be 1-64 chars of [a-z0-9_-]");
         }
         let key = self.root.profile_key(profile);
-        if let Ok(mut local) = self.local_authors.lock() {
-            local.insert(crate::identity::author_id(&key), profile.to_string());
+        let author = crate::identity::author_id(&key);
+        let new = self
+            .local_authors
+            .lock()
+            .is_ok_and(|mut local| local.insert(author.clone(), profile.to_string()).is_none());
+        // Rotation keeps this profile's posts, across restarts (ADR 0025 §7).
+        if new && let Err(e) = self.store.note_local_key(&author, profile, now_secs()) {
+            warn!(profile, "profile key not recorded: {e:#}");
         }
         Ok(key)
     }
@@ -3188,9 +3235,12 @@ impl Node {
 
     async fn measure_storage(&self) {
         let dir = self.config.data_dir.clone();
+        // The store's free pages are free space (ADR 0025 §7): the file
+        // does not shrink, its freed pages are reused.
         let bytes = tokio::task::spawn_blocking(move || dir_size(&dir))
             .await
-            .unwrap_or(0);
+            .unwrap_or(0)
+            .saturating_sub(self.store.free_bytes());
         self.storage_bytes
             .store(bytes, std::sync::atomic::Ordering::Relaxed);
         crate::crash::note_counts(
@@ -3583,6 +3633,21 @@ impl Node {
         Ok(outcome)
     }
 
+    /// Whether this node is one of the k peers responsible for blob `hash`
+    /// (SPEC §2.5, ADR 0005): among the k closest to the hash by XOR,
+    /// itself and the peers it knows counted, k = `replication`. A local
+    /// estimate, as publishers make it. Rotation keeps such a blob when it
+    /// drops the posts that list it (ADR 0025, "Blobs").
+    pub fn blob_responsible(&self, hash: &str) -> bool {
+        let Ok(bytes) = crate::event::parse_hex::<32>(hash, "hash") else {
+            return false;
+        };
+        let me = self.endpoint_id();
+        let mut peers = self.known_peers();
+        peers.push(me);
+        proto::closest(&bytes, &peers, self.config.replication.max(1)).contains(&me)
+    }
+
     /// Whether this node keeps blob `hash` under a tag.
     pub async fn blob_pinned(&self, hash: &str) -> Result<bool> {
         let hash: Hash = hash.parse()?;
@@ -3709,7 +3774,9 @@ impl Node {
             self.log_storage("refusing events from others too");
             bail!("storage full");
         }
-        if matches!(event, AnyEvent::Opaque(_))
+        // Tombstones of understood versions are not opaque content: they
+        // stay out of the quota (ADR 0025 §7).
+        if matches!(&event, AnyEvent::Opaque(r) if crate::store::counts_as_opaque(r))
             && let Some(quota) = self.opaque_quota()
             && self.store.opaque_bytes().saturating_add(size as u64) > quota
             && self.store.get_raw(event.id())?.is_none()

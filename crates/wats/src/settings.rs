@@ -677,7 +677,7 @@ pub const KEYS: &[Key] = &[
         "storage.events_share",
         ValueType::Integer,
         "50",
-        "share of storage.max for events and their index, in percent; the rest is for blobs, transcripts and logs",
+        "share of storage.max for events and their index, in percent; the rest is for blobs, transcripts and logs. At 95 % of it the node rotates old posts out down to 85 %, never its own, its threads or the kept-forever kinds (ADR 0025)",
     ),
     key(
         "sync.initial_max",

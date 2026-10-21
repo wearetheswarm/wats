@@ -119,6 +119,11 @@ pub struct Tuning {
     /// Test only: behave as 0.4.0 on `/wats/1` (no `sync_desc`, no `get`,
     /// no history task, an ascending pull from every new neighbor).
     pub legacy: bool,
+    /// How often the store is checked against its share for rotation (ADR
+    /// 0025 §7).
+    pub rotation_check: Duration,
+    /// A pause after each rotation transaction, so that inserts get in.
+    pub rotation_pause: Duration,
 }
 
 impl Default for Tuning {
@@ -128,6 +133,8 @@ impl Default for Tuning {
             page_pause: Duration::ZERO,
             retry: Duration::from_secs(60),
             legacy: false,
+            rotation_check: Duration::from_secs(30),
+            rotation_pause: Duration::from_millis(5),
         }
     }
 }
@@ -264,7 +271,7 @@ impl Pass {
 }
 
 /// Map every key to the first key of its rotation chain (as held here).
-fn chains(rotations: &[(String, String)]) -> HashMap<String, String> {
+pub(super) fn chains(rotations: &[(String, String)]) -> HashMap<String, String> {
     let previous: HashMap<&str, &str> = rotations
         .iter()
         .map(|(old, new)| (new.as_str(), old.as_str()))
@@ -350,6 +357,12 @@ pub fn line(history: &Value) -> String {
     parts.extend(back);
     parts.extend(size);
     let mut text = parts.join(", ");
+    if let Some(cut) = history["cut_ts"].as_u64() {
+        text.push_str(&format!(" · cut {}", date(cut)));
+        if let Some(at) = history["rotated_ts"].as_u64() {
+            text.push_str(&format!(" (rotation, {})", date(at)));
+        }
+    }
     for range in history["ranges"].as_array().into_iter().flatten() {
         let (Some(lo), Some(hi)) = (range["lo_ts"].as_u64(), range["hi_ts"].as_u64()) else {
             continue;
@@ -432,6 +445,12 @@ fn view(
         .filter(|r| r.state == RangeState::Cut)
         .map(|r| r.cursor_ts)
         .max();
+    // When rotation last raised it (ADR 0025 §7).
+    let rotated = ranges
+        .iter()
+        .filter(|r| r.state == RangeState::Cut && r.phase == crate::store::PHASE_ROTATION)
+        .map(|r| r.opened)
+        .max();
     let shown: Vec<Value> = ranges
         .iter()
         .filter_map(|r| match r.state {
@@ -452,6 +471,7 @@ fn view(
         "state": state,
         "oldest_ts": store.oldest_ts(net).ok().flatten(),
         "cut_ts": cut,
+        "rotated_ts": rotated,
         "ranges": shown,
         "bytes": store.store_bytes(),
         "budget": budget,
@@ -522,11 +542,12 @@ impl Node {
     }
 
     /// Whether this node holds the complete history of every network it
-    /// joined (`history_full`): no budget, a fill done, no hole, and
-    /// nothing unconfirmed.
+    /// joined (`history_full`): no budget, a fill done, no hole, nothing
+    /// unconfirmed, and no row ever deleted by rotation (ADR 0025 §7).
     pub fn history_full(&self) -> bool {
         self.history_budget().is_none()
             && !self.config.history.legacy
+            && !self.store.rotation_deleted_rows().unwrap_or(true)
             && self.joined_nets().iter().all(|net| self.holds_all(net))
     }
 
@@ -658,7 +679,7 @@ impl Node {
     }
 
     /// The current gossip neighbors of `net`: members of it, up now.
-    fn neighbors_of(&self, net: &str) -> Vec<EndpointId> {
+    pub(super) fn neighbors_of(&self, net: &str) -> Vec<EndpointId> {
         let mut peers: Vec<EndpointId> = self
             .neighbors
             .lock()
@@ -672,7 +693,7 @@ impl Node {
         peers
     }
 
-    fn has_feature(&self, peer: &EndpointId, feature: &str) -> bool {
+    pub(super) fn has_feature(&self, peer: &EndpointId, feature: &str) -> bool {
         self.peer_info(peer)
             .is_some_and(|i| i.features.iter().any(|f| f == feature))
     }
@@ -680,7 +701,7 @@ impl Node {
     /// Whether this node takes `peer`'s word that it holds nothing more
     /// (ADR 0025 §9): one of its configured peers or bootstrap nodes.
     /// Anyone else's `history_full` is a hint for the order, no more.
-    fn trusted(&self, peer: &EndpointId) -> bool {
+    pub(super) fn trusted(&self, peer: &EndpointId) -> bool {
         self.seed_ids.contains(peer)
     }
 
@@ -883,6 +904,9 @@ impl Node {
             Some(hi) => hi.saturating_sub(MAX_CLOCK_SKEW_SECS),
             None => watermark.saturating_sub(MAX_CLOCK_SKEW_SECS),
         };
+        // Never below the cut, which rotation may have raised above the
+        // watermark (ADR 0025 §7): what is below it is not held on purpose.
+        let lo = lo.max(self.store.cut_ts(net)?.unwrap_or(0));
         self.store.add_sync_range(&SyncRange {
             id: 0,
             net: net.to_string(),
@@ -2383,7 +2407,7 @@ impl Node {
 
     /// Fails once the node stopped: a pass still running then writes no
     /// cursor (a restarted node may already use the store).
-    fn still_running(&self) -> Result<()> {
+    pub(super) fn still_running(&self) -> Result<()> {
         if self.endpoint().is_closed() {
             bail!("the node stopped");
         }
