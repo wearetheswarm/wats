@@ -4,7 +4,7 @@
 //! (`seq`) that gives a stable cursor for `wait` and incremental reads.
 //! The index is computed locally from the events; nothing here is shared.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -1223,6 +1223,86 @@ impl Store {
         let mut out = Vec::new();
         for row in rows {
             out.extend(row?);
+        }
+        Ok(out)
+    }
+
+    /// Every blob a kept full event lists by hash (not by URL), with the
+    /// id of one such event: what replica repair walks (ADR 0029). One
+    /// row per hash; the event is the oldest that lists it.
+    pub fn blob_listings(&self) -> Result<Vec<(String, String)>> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare(
+            "SELECT json_extract(b.value, '$.hash'), e.id FROM events e,
+                 json_each(e.json, '$.blobs') b
+                 WHERE e.opaque = 0 AND json_extract(b.value, '$.url') IS NULL
+                 ORDER BY e.seq",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok((r.get::<_, Option<String>>(0)?, r.get::<_, String>(1)?))
+        })?;
+        let mut seen = HashSet::new();
+        let mut out = Vec::new();
+        for row in rows {
+            if let (Some(hash), id) = row?
+                && seen.insert(hash.clone())
+            {
+                out.push((hash, id));
+            }
+        }
+        Ok(out)
+    }
+
+    /// The kept full events that list blob `hash`, at most `limit`, oldest
+    /// first.
+    pub fn events_listing_blob(&self, hash: &str, limit: usize) -> Result<Vec<Stored>> {
+        self.query(
+            "SELECT e.seq, e.json FROM events e WHERE e.opaque = 0 AND instr(e.json, ?1) > 0
+                 AND EXISTS (SELECT 1 FROM json_each(e.json, '$.blobs') b
+                             WHERE json_extract(b.value, '$.hash') = ?1)
+                 ORDER BY e.seq LIMIT ?2",
+            vec![hash.to_string().into(), (limit as i64).into()],
+        )
+    }
+
+    /// The blobs a drop of event `id`'s body would free: those it lists
+    /// that no other kept full event lists ([`Store::drop_body`] frees
+    /// the same). Empty when `id` is not held in full.
+    pub fn blobs_freed_by(&self, id: &str) -> Result<Vec<String>> {
+        let conn = self.conn();
+        let json: Option<String> = conn
+            .query_row(
+                "SELECT json FROM events WHERE id = ? AND opaque = 0",
+                [id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let Some(json) = json else {
+            return Ok(Vec::new());
+        };
+        let full: Value = serde_json::from_str(&json).context("corrupt stored event")?;
+        let mut out: Vec<String> = Vec::new();
+        let hashes = full
+            .get("blobs")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|b| b.get("hash").and_then(Value::as_str));
+        for hash in hashes {
+            if out.iter().any(|h| h == hash) {
+                continue;
+            }
+            let elsewhere: bool = conn.query_row(
+                "SELECT EXISTS (SELECT 1 FROM events e WHERE e.opaque = 0 AND e.id <> ?2
+                     AND instr(e.json, ?1) > 0
+                     AND EXISTS (SELECT 1 FROM json_each(e.json, '$.blobs') b
+                                 WHERE json_extract(b.value, '$.hash') = ?1))",
+                params![hash, id],
+                |r| r.get(0),
+            )?;
+            if !elsewhere {
+                out.push(hash.to_string());
+            }
         }
         Ok(out)
     }

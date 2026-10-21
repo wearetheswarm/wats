@@ -506,13 +506,22 @@ enum Command {
     /// files are deleted here, and refused if they come back. For the
     /// person running the node, through the running node or, when none
     /// runs, directly in its store. Other nodes keep their copy unless
-    /// their own policy drops it.
+    /// their own policy drops it. A file this node may hold the last copy
+    /// of is first handed to another node (ADR 0029); if none takes it,
+    /// nothing is dropped, unless `--purge`.
     Drop {
         /// The post id.
         id: String,
         /// Why, in your own words: kept with the local drop record.
         #[arg(long)]
         reason: Option<String>,
+        /// Delete the post's files even if this node may hold their last
+        /// copy. Without it, such files are first handed to another node,
+        /// and nothing is dropped if none takes them. For content that must
+        /// not be stored anywhere: illegal content, personal data, a
+        /// leaked secret.
+        #[arg(long)]
+        purge: bool,
     },
     /// Retract your own posts (ADR 0020): publish a signed retraction, so
     /// that nodes drop their bodies (title, text, tags, files) and keep only
@@ -2650,7 +2659,12 @@ const MAX_DROP_DETAIL_CHARS: usize = 500;
 /// `wats drop`: drop a body on this node, reason `own` (ADR 0020). Through
 /// the running node's socket (not an MCP tool: agents get none); with no
 /// node running, directly in the store.
-async fn drop_command(data_dir: &std::path::Path, id: &str, detail: Option<&str>) -> Result<()> {
+async fn drop_command(
+    data_dir: &std::path::Path,
+    id: &str,
+    detail: Option<&str>,
+    purge: bool,
+) -> Result<()> {
     wats::event::parse_hex::<32>(id, "id")?;
     if detail.is_some_and(|n| n.chars().count() > MAX_DROP_DETAIL_CHARS) {
         anyhow::bail!("--reason: at most {MAX_DROP_DETAIL_CHARS} characters");
@@ -2658,8 +2672,12 @@ async fn drop_command(data_dir: &std::path::Path, id: &str, detail: Option<&str>
     let request = attach::Control::Drop {
         id: id.to_string(),
         detail: detail.map(str::to_string),
+        purge,
     };
-    let outcome: wats::store::DropOutcome = match attach::control(data_dir, request).await? {
+    let answer = attach::control(data_dir, request)
+        .await
+        .map_err(|e| last_copy_hint(e, purge))?;
+    let outcome: wats::store::DropOutcome = match answer {
         Some(value) => serde_json::from_value(value)?,
         None if wats::node::node_running(data_dir) => anyhow::bail!(
             "a node is running on {} but does not answer on its socket: stop it, then run \
@@ -2667,8 +2685,9 @@ async fn drop_command(data_dir: &std::path::Path, id: &str, detail: Option<&str>
             data_dir.display()
         ),
         None => {
-            wats::node::drop_body_offline(data_dir, id, wats::store::DropReason::Own, detail)
-                .await?
+            wats::node::drop_body_offline(data_dir, id, wats::store::DropReason::Own, detail, purge)
+                .await
+                .map_err(|e| last_copy_hint(e, purge))?
         }
     };
     if outcome.body_dropped {
@@ -2686,6 +2705,18 @@ async fn drop_command(data_dir: &std::path::Path, id: &str, detail: Option<&str>
     }
     println!("Other nodes keep their copy unless their own policy drops it.");
     Ok(())
+}
+
+/// A refused `wats drop` (last-copy protection, ADR 0029) says what to do.
+fn last_copy_hint(error: anyhow::Error, purge: bool) -> anyhow::Error {
+    let text = format!("{error:#}");
+    if purge || !text.contains("may hold the last copy") {
+        return error;
+    }
+    error.context(
+        "nothing was dropped: try again once peers are reachable (with the node running), \
+         or add --purge to delete the files anyway",
+    )
 }
 
 /// `wats retract` (ADR 0020 §5.1): through the running node's socket, or a
@@ -5909,8 +5940,8 @@ async fn async_main(cli: Cli) -> Result<()> {
         }) => {
             return reputation_command(&config, author.as_deref(), limit, json);
         }
-        Some(Command::Drop { id, reason }) => {
-            return drop_command(&config.data_dir, &id, reason.as_deref()).await;
+        Some(Command::Drop { id, reason, purge }) => {
+            return drop_command(&config.data_dir, &id, reason.as_deref(), purge).await;
         }
         Some(Command::Retract { ids, reason }) => {
             return retract_command(config, &ids, reason.as_deref()).await;

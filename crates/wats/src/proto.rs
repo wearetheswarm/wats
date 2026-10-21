@@ -34,7 +34,7 @@
 
 use std::sync::{Arc, OnceLock, Weak};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Result, bail};
 use iroh::endpoint::Connection;
 use iroh::protocol::{AcceptError, ProtocolHandler};
 use iroh::{Endpoint, EndpointId};
@@ -263,9 +263,19 @@ impl Request {
 
 /// Send one request to a peer and wait for the response.
 pub async fn call(endpoint: &Endpoint, peer: EndpointId, request: &Request) -> Result<Response> {
+    call_within(endpoint, peer, request, None).await
+}
+
+/// [`call`], giving up when no connection is up within `connect_limit`.
+async fn call_within(
+    endpoint: &Endpoint,
+    peer: EndpointId,
+    request: &Request,
+    connect_limit: Option<std::time::Duration>,
+) -> Result<Response> {
     let mut value = serde_json::to_value(request)?;
     crate::grease::maybe_add_to(&mut value);
-    call_value(endpoint, peer, value).await
+    call_value_within(endpoint, peer, value, connect_limit).await
 }
 
 /// [`call`], solving a load challenge once if the peer answers with one.
@@ -276,7 +286,19 @@ pub async fn call_solving(
     peer: EndpointId,
     request: &Request,
 ) -> Result<Response> {
-    let response = call(endpoint, peer, request).await?;
+    call_solving_within(endpoint, peer, request, None).await
+}
+
+/// [`call_solving`], giving up on a peer with no connection up within
+/// `connect_limit` ([`ConnectFailed`]): replica repair skips a peer that
+/// is gone without waiting for the transport's own timeout.
+pub async fn call_solving_within(
+    endpoint: &Endpoint,
+    peer: EndpointId,
+    request: &Request,
+    connect_limit: Option<std::time::Duration>,
+) -> Result<Response> {
+    let response = call_within(endpoint, peer, request, connect_limit).await?;
     let Response::Challenge {
         alg,
         seed,
@@ -307,16 +329,53 @@ pub async fn call_solving(
         object.insert("solution".into(), serde_json::to_value(solution)?);
     }
     crate::grease::maybe_add_to(&mut value);
-    call_value(endpoint, peer, value).await
+    call_value_within(endpoint, peer, value, connect_limit).await
 }
+
+/// No connection to the peer could be opened (or none within the limit):
+/// the request never reached it.
+#[derive(Debug)]
+pub struct ConnectFailed(pub String);
+
+impl std::fmt::Display for ConnectFailed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for ConnectFailed {}
 
 /// Send a request given as JSON (used for GREASE request types).
 pub async fn call_value(endpoint: &Endpoint, peer: EndpointId, request: Value) -> Result<Response> {
+    call_value_within(endpoint, peer, request, None).await
+}
+
+/// [`call_value`], with a limit on the time to connect.
+async fn call_value_within(
+    endpoint: &Endpoint,
+    peer: EndpointId,
+    request: Value,
+    connect_limit: Option<std::time::Duration>,
+) -> Result<Response> {
     // Newest protocol first; fall back to older ones.
     let mut last_err = None;
     let mut connected = None;
     for alpn in ALPNS {
-        match endpoint.connect(peer, alpn).await {
+        let attempt = endpoint.connect(peer, alpn);
+        let outcome = match connect_limit {
+            Some(limit) => match tokio::time::timeout(limit, attempt).await {
+                Ok(outcome) => outcome.map_err(|e| format!("{e:#}")),
+                Err(_) => {
+                    return Err(ConnectFailed(format!(
+                        "connect to {}: no connection within {limit:?}",
+                        peer.fmt_short()
+                    ))
+                    .into());
+                }
+            },
+            None => attempt.await.map_err(|e| format!("{e:#}")),
+        };
+        match outcome {
             Ok(conn) => {
                 connected = Some(conn);
                 break;
@@ -327,7 +386,7 @@ pub async fn call_value(endpoint: &Endpoint, peer: EndpointId, request: Value) -
     let conn = match (connected, last_err) {
         (Some(conn), _) => conn,
         (None, Some(e)) => {
-            return Err(e).with_context(|| format!("connect to {}", peer.fmt_short()));
+            return Err(ConnectFailed(format!("connect to {}: {e}", peer.fmt_short())).into());
         }
         (None, None) => bail!("no protocol version configured"),
     };

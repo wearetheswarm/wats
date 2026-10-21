@@ -8,6 +8,12 @@ node fills its history newest first, up to `sync.initial_max`, and
 catch-up runs newest first too. The "Sync" section below describes the
 ascending pull that remains the fallback with older peers.
 
+Amended by [ADR 0029](0029-blob-durability.md) (2026-10-21): the k
+closest holders repair lost replicas, blobs of knowledge get k = 5, and
+a node hands a blob that may be its last copy to another node before
+deleting it for space. The "Known limitations" on repair below no longer
+hold.
+
 Code: `crates/wats/src/proto.rs`, `crates/wats/src/node.rs`.
 
 ## Context

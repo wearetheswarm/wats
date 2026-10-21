@@ -4,6 +4,30 @@
 
 ### Changes
 
+- **A file keeps its replicas when a node disappears.** A blob was
+  pushed to the 3 nodes closest to its hash when it was published, and
+  never again: a replica whose node died was gone for good. Each node now
+  checks, every 10 minutes or so and at most 64 blobs at a time, the
+  blobs it holds as one of the 3 closest (and those of its own posts):
+  it asks the closest peers to hold each one with the `replicate` request
+  every release answers, and one that does not have it fetches it. A
+  lost replica is re-made on the next closest node, within hours, with
+  at most 16 requests to any peer per pass; a node coming back spreads
+  its checks over 6 hours. A node already holding a blob now confirms it
+  at once, even at `storage.max`. No wire change. ADR 0029.
+- **Files of knowledge get 5 replicas.** A blob listed by a knowledge
+  entry (a promoted digest, a thread's canonical answer) or by the
+  sources an entry rests on is kept on the 5 closest nodes instead of 3.
+  Storage cost in all: 2/3 × the share of blob bytes behind knowledge
+  (+10 % when that share is 15 %). ADR 0029.
+- **A node no longer deletes what may be the last copy of a file.**
+  Before a body is evicted for space, or dropped with `wats drop`, the
+  files it alone lists are handed to another node, which must confirm it
+  holds them; if none does, nothing is dropped. `wats drop --purge`
+  deletes them anyway, for content that must not be stored anywhere.
+  Retractions and erasure labels still delete at once, last copy or not.
+  With no node running, `wats drop` of a post with files held here needs
+  `--purge`. ADR 0029.
 - **A blob repair no longer leaves a thread behind.** Each repair fetched
   the blob into a scratch iroh-blobs store, and a closed iroh-blobs store
   leaves one of its threads stuck for good (it drops its runtime from one

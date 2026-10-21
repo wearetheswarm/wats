@@ -36,6 +36,7 @@ use n0_future::StreamExt;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
 
+pub mod durability;
 pub mod history;
 
 use crate::bootstrap::BootstrapEntry;
@@ -195,8 +196,12 @@ pub struct NodeConfig {
     /// node records its data directory there while it holds the lock.
     pub registry: Option<PathBuf>,
     /// Replication factor k for blobs: how many peers are asked to hold a
-    /// blob at publish time (SPEC §2.5, §7).
+    /// blob at publish time (SPEC §2.5, §7), and how many replicas repair
+    /// keeps (ADR 0029).
     pub replication: usize,
+    /// Replica repair, knowledge replicas and last-copy protection (ADR
+    /// 0029); tests shorten it.
+    pub durability: durability::Tuning,
     /// Stored v2 `submit` events older than this are dropped, and older
     /// ones refused (`submit.retention`, ADR 0015 §5). `None` keeps them.
     pub submit_retention: Option<Duration>,
@@ -305,6 +310,7 @@ impl NodeConfig {
             report_inbox: None,
             report_auto: false,
             replication: 3,
+            durability: Default::default(),
             submit_retention: Some(DEFAULT_SUBMIT_RETENTION),
             update: Default::default(),
             halt: Default::default(),
@@ -1001,11 +1007,17 @@ async fn unpin_freed(blobs: &FsStore, outcome: &DropOutcome) {
 /// [`Node::drop_body`] with no node running on `data_dir` (`wats drop`):
 /// holds the data directory lock meanwhile. The blobs it frees are deleted
 /// by the next collection of a running node.
+///
+/// With no node running, no blob can be handed to another node first
+/// (last-copy protection, ADR 0029): unless `purge`, or for a retraction or
+/// a label, the drop is refused, and nothing changes, when it would free a
+/// blob this node holds.
 pub async fn drop_body_offline(
     data_dir: &Path,
     id: &str,
     reason: DropReason,
     detail: Option<&str>,
+    purge: bool,
 ) -> Result<DropOutcome> {
     let path = data_dir.join("events.sqlite");
     if !path.exists() {
@@ -1013,11 +1025,40 @@ pub async fn drop_body_offline(
     }
     let lock = lock_data_dir(data_dir, &Holder::role("cli"))?;
     let store = Store::open(&path)?;
-    let outcome = store.drop_body(id, reason, None, detail, now_secs())?;
-    if !outcome.freed_blobs.is_empty() {
+    let freed = store.blobs_freed_by(id)?;
+    let blobs = if freed.is_empty() {
+        None
+    } else {
         let dir = data_dir.join("blobs");
         let options = iroh_blobs::store::fs::options::Options::new(&dir);
-        let blobs = open_blob_store(&dir, options).await?;
+        Some(open_blob_store(&dir, options).await?)
+    };
+    if let Some(blobs) = &blobs
+        && !purge
+        && matches!(reason, DropReason::Own | DropReason::Evicted)
+    {
+        let mut held = Vec::new();
+        for hex in &freed {
+            if let Ok(hash) = hex.parse::<Hash>()
+                && matches!(
+                    blobs.blobs().status(hash).await,
+                    Ok(BlobStatus::Complete { .. })
+                )
+            {
+                held.push(hex.clone());
+            }
+        }
+        if !held.is_empty() {
+            blobs.shutdown().await.ok();
+            return Err(durability::KeptLastCopy {
+                id: id.to_string(),
+                blobs: held,
+            })
+            .context("no node is running to hand them to another node first");
+        }
+    }
+    let outcome = store.drop_body(id, reason, None, detail, now_secs())?;
+    if let Some(blobs) = blobs {
         unpin_freed(&blobs, &outcome).await;
         blobs.shutdown().await.ok();
     }
@@ -1285,6 +1326,8 @@ pub struct Node {
     seed_ids: Vec<EndpointId>,
     /// The history tasks (ADR 0025).
     history: history::History,
+    /// Replica repair and last-copy protection (ADR 0029).
+    durability: durability::State,
 }
 
 impl std::fmt::Debug for Node {
@@ -1698,6 +1741,7 @@ impl Node {
             network_changed: Default::default(),
             redialing: Default::default(),
             history: Default::default(),
+            durability: Default::default(),
         });
         node.measure_storage().await;
         if node.config.storage_max.is_some() {
@@ -1786,6 +1830,7 @@ impl Node {
             }));
         }
         node.spawn_reconnect();
+        node.spawn_repair();
         if !node.config.erasure_labelers.is_empty() {
             node.apply_held_erasures().await;
         }
@@ -3419,6 +3464,7 @@ impl Node {
     }
 
     fn seen(&self, peer: EndpointId) {
+        self.durability.peer_seen(peer);
         if let Ok(mut peers) = self.peers.lock() {
             if peers.len() >= 10_000 && !peers.contains_key(&peer) {
                 // Forget the stalest peer.
@@ -3693,6 +3739,13 @@ impl Node {
     /// Drop the body of event `id` here (ADR 0020 §2): the store keeps its
     /// tombstone and a drop record, and the blobs no kept event lists are
     /// untagged, for the next collection to delete them.
+    ///
+    /// For storage pressure (`evicted`), last-copy protection first (ADR
+    /// 0029): the drop is refused with [`durability::KeptLastCopy`] when
+    /// this node may hold the last copy of a blob it would free and no
+    /// other node takes it ([`Node::hand_off_before_drop`]). `wats drop`
+    /// (`own`) asks for the hand-off itself, unless `--purge`. Retractions
+    /// and labels delete regardless (ADR 0020).
     pub async fn drop_body(
         &self,
         id: &str,
@@ -3700,6 +3753,16 @@ impl Node {
         trigger: Option<&str>,
         detail: Option<&str>,
     ) -> Result<DropOutcome> {
+        if reason == DropReason::Evicted {
+            let stranded = self.hand_off_before_drop(id).await?;
+            if !stranded.is_empty() {
+                return Err(durability::KeptLastCopy {
+                    id: id.to_string(),
+                    blobs: stranded,
+                }
+                .into());
+            }
+        }
         let outcome = self
             .store
             .drop_body(id, reason, trigger, detail, now_secs())?;
@@ -4203,6 +4266,7 @@ impl Node {
                 }
             }
             Request::Replicate { event, hashes } => {
+                self.durability.note_served();
                 let event = match self.accept_value(event, Origin::Pushed).await {
                     Ok(Some((AnyEvent::Known(event), _))) => event,
                     // Opaque events are stored; their blobs are unknown to us.
@@ -4226,6 +4290,21 @@ impl Node {
                         continue;
                     }
                     self.add_hints(&blob.hash, &[peer]);
+                    // Already held: confirmed at once, with no fetch slot
+                    // and whatever the storage state (ADR 0029). Replica
+                    // repair asks the holders of a blob to confirm it.
+                    if !self.config.durability.legacy_replicate && self.holds_blob(blob).await {
+                        match blob.hash.parse::<Hash>() {
+                            Ok(hash) => match self.pin(hash).await {
+                                Ok(()) => {
+                                    stored.push(blob.hash.clone());
+                                    continue;
+                                }
+                                Err(e) => warn!(hash = %blob.hash, "blob not pinned: {e:#}"),
+                            },
+                            Err(_) => continue,
+                        }
+                    }
                     // At most a few fetches at once for one peer, a few more
                     // waiting their turn.
                     let Some(_permit) = self

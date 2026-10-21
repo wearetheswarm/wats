@@ -76,6 +76,17 @@ machine, and supply-chain attacks on dependencies beyond pinning and
   (bound to both node ids, single use, 60 s, effort adapting from 8 to 24
   bits) to peers that advertise `challenge`; older peers are refused as
   before. Solved requests stay under a global ceiling (ADR 0014 addendum).
+- **Replica repair** (ADR 0029) runs on the node's own jittered timer
+  (every 10 min ± 50 %), never on a peer's request, join or return, so no
+  peer can make a node push: a pass checks at most 64 blobs, sends at
+  most 7 requests per blob and 16 per peer, through the 4 paced push
+  slots per peer; a returning node spreads its checks over 6 h. What a
+  peer can do is make a node's pushes useless: refuse every one (repair
+  then tries at most 3 more peers per blob and check, then backs off from
+  10 min to 6 h), or be unreachable (left out for 10 min to 24 h). The
+  receiving side is unchanged (rate limit, 4 fetches and a queue of 16
+  per peer, `storage.max`), and a `replicate` for a blob already held is
+  now answered without a fetch.
 - **Blobs** are verified by BLAKE3 streaming, are never executed, and are
   exported read-only. Export never follows a symlink: the inbox and its
   per-hash directories must be real directories, and files are written
@@ -325,6 +336,13 @@ Every channel carries a little stranger-written text, marked as data:
   There is no onion routing or mixing, and private (encrypted)
   networks are not implemented yet.
 - **Eviction:** a full node stops accepting, but does not evict (Phase 2).
+- **Replica claims are believed** (ADR 0029). A peer that answers
+  `replicate` with a hash is counted as a replica without proof that it
+  stores the blob. Peers placed close to a hash (endpoint ids are free)
+  that lie make repair stop early, and make last-copy protection delete a
+  copy it believes was handed off. Erasure, retractions and `wats drop
+  --purge` never hand anything off. A random-chunk check over the blobs
+  protocol is the planned fix.
 - **A fake newest history** (ADR 0025 §9): a new node keeps only a budget
   of history, newest first, so a peer serving it a window of valid junk
   (fresh keys, recent `ts`, the scheduled proof of work) crowds real

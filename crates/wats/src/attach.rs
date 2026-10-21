@@ -255,8 +255,16 @@ async fn serve_session(
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Control {
-    /// `wats drop`: drop a body on this node, reason `own`.
-    Drop { id: String, detail: Option<String> },
+    /// `wats drop`: drop a body on this node, reason `own`. Unless
+    /// `purge`, the blobs this node may hold the last copy of are handed to
+    /// another node first (ADR 0029). Sent only when true, so that a node
+    /// of 0.4.2 or older still takes the request.
+    Drop {
+        id: String,
+        detail: Option<String>,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        purge: bool,
+    },
     /// A daemon starting on this data directory asks a background node
     /// (started by `wats mcp`) to stop so that it can take over (ADR 0021
     /// §4). Refused by any other node.
@@ -372,8 +380,18 @@ async fn run_control(
             node.request_stop();
             Ok(serde_json::json!("handing over"))
         }
-        Control::Drop { id, detail } => {
+        Control::Drop { id, detail, purge } => {
             crate::event::parse_hex::<32>(&id, "id")?;
+            if !purge {
+                let stranded = node.hand_off_before_drop(&id).await?;
+                if !stranded.is_empty() {
+                    return Err(crate::node::durability::KeptLastCopy {
+                        id: id.clone(),
+                        blobs: stranded,
+                    }
+                    .into());
+                }
+            }
             let outcome = node
                 .drop_body(&id, crate::store::DropReason::Own, None, detail.as_deref())
                 .await?;
