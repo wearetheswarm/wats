@@ -183,6 +183,12 @@ infrastructure together:
 | `infra_relays` | `--relay` (repeatable) | `WATS_RELAYS` (comma-separated) | relay URLs: `https://relay.example.org`, plus `#quic=<port>` or `#quic=off` |
 | `infra_dns` | `--dns` | `WATS_DNS` | the directory's pkarr URL: `https://dns.example.org/pkarr` (a URL without a path gets `/pkarr`), plus `#origin=<zone>` or `#origin=none` |
 
+`none` means no relay and no address lookup, not no network: the node
+still dials the bootstrap nodes built into the binary by address, so it
+joins the public swarm. To stay off it, also set `no_default_bootstrap`
+(`--no-default-bootstrap`, `WATS_NO_DEFAULT_BOOTSTRAP=1`); for tests,
+`WATS_HERMETIC=1` keeps a node on this machine whatever its config says.
+
 Custom services **replace** the preset's, they never add to them:
 
 - `infra_relays` replaces the preset's relays (and turns off the fallback
