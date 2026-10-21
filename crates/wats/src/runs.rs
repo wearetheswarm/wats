@@ -51,6 +51,10 @@ pub struct RunRecord {
     pub turns: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cost_usd: Option<f64>,
+    /// LLM tokens, model input (cached included) and output, reported by
+    /// the agent CLI when it does (Claude Code, Codex).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tokens: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
     /// OpenClaw: the turn's `completion.status`.
@@ -193,10 +197,13 @@ pub fn read_result(transcript: &Path, record: &mut RunRecord) {
         {
             record.model = model.to_string();
         }
-        // Codex: turns and failures, no cost.
+        // Codex: turns, LLM tokens and failures, no cost.
         match value["type"].as_str() {
             Some("turn.completed") => {
                 record.turns = Some(record.turns.unwrap_or(0) + 1);
+                if let Some(n) = codex_tokens(&value["usage"]) {
+                    record.tokens = Some(record.tokens.unwrap_or(0).saturating_add(n));
+                }
                 continue;
             }
             Some("turn.failed") | Some("error") => {
@@ -222,6 +229,9 @@ pub fn read_result(transcript: &Path, record: &mut RunRecord) {
             record.model = model.clone();
         }
         record.cost_usd = value["total_cost_usd"].as_f64();
+        if let Some(n) = claude_tokens(&value["usage"]) {
+            record.tokens = Some(n);
+        }
         if value["is_error"] == true && record.status == "ok" {
             record.status = "error".into();
         }
@@ -229,6 +239,29 @@ pub fn read_result(transcript: &Path, record: &mut RunRecord) {
             record.error = value["subtype"].as_str().map(str::to_string);
         }
     }
+}
+
+/// The LLM tokens of Claude Code's `result.usage`, the whole run: input,
+/// cache writes and reads, output.
+fn claude_tokens(usage: &Value) -> Option<u64> {
+    let fields = [
+        "input_tokens",
+        "cache_creation_input_tokens",
+        "cache_read_input_tokens",
+        "output_tokens",
+    ];
+    let counts: Vec<u64> = fields.iter().filter_map(|f| usage[f].as_u64()).collect();
+    (!counts.is_empty()).then(|| counts.iter().fold(0u64, |a, b| a.saturating_add(*b)))
+}
+
+/// The LLM tokens of a Codex `turn.completed.usage`: `input_tokens`
+/// (cached input included: `cached_input_tokens` is a part of it) and
+/// `output_tokens` (reasoning included).
+fn codex_tokens(usage: &Value) -> Option<u64> {
+    let input = usage["input_tokens"].as_u64();
+    let output = usage["output_tokens"].as_u64();
+    (input.is_some() || output.is_some())
+        .then(|| input.unwrap_or(0).saturating_add(output.unwrap_or(0)))
 }
 
 /// The id of the run in progress, if any.
@@ -457,6 +490,9 @@ pub fn render(line: &str, style: Style) -> Vec<String> {
             }
             if let Some(cost) = value["cost_usd"].as_f64() {
                 parts.push(format!("${cost:.4}"));
+            }
+            if let Some(tokens) = value["tokens"].as_u64() {
+                parts.push(format!("{} LLM tokens", crate::budget::tokens(tokens)));
             }
             if let Some(completion) = value["completion"].as_str() {
                 parts.push(format!("completion {completion}"));
@@ -740,5 +776,42 @@ mod tests {
             "x".repeat(400)
         );
         assert!(render(&long, style)[0].ends_with('…'));
+    }
+
+    /// LLM tokens (ADR 0032): Claude Code's `result.usage` (input, cache
+    /// writes and reads, output) for the run; Codex's `turn.completed`
+    /// usage summed over the turns (its cached input is part of its
+    /// input); none from a transcript without usage (OpenClaw).
+    #[test]
+    fn reads_llm_tokens() {
+        let dir = tempfile::tempdir().unwrap();
+        let read = |lines: &[&str]| {
+            let path = dir.path().join("t.jsonl");
+            std::fs::write(&path, lines.join("\n") + "\n").unwrap();
+            let mut record = RunRecord {
+                status: "ok".into(),
+                ..RunRecord::default()
+            };
+            read_result(&path, &mut record);
+            record
+        };
+        let claude = read(&[
+            r#"{"type":"result","subtype":"success","is_error":false,"num_turns":3,"total_cost_usd":0.05,"usage":{"input_tokens":12,"cache_creation_input_tokens":3000,"cache_read_input_tokens":20000,"output_tokens":800}}"#,
+        ]);
+        assert_eq!(claude.tokens, Some(23_812));
+        assert_eq!(claude.cost_usd, Some(0.05));
+        let codex = read(&[
+            r#"{"type":"turn.completed","usage":{"input_tokens":1000,"cached_input_tokens":900,"output_tokens":50}}"#,
+            r#"{"type":"turn.completed","usage":{"input_tokens":2000,"cached_input_tokens":1800,"output_tokens":70}}"#,
+        ]);
+        assert_eq!(codex.tokens, Some(3_120));
+        assert_eq!(codex.turns, Some(2));
+        let none = read(&[r#"{"type":"openclaw_reply","outcome":"ok"}"#]);
+        assert_eq!(none.tokens, None);
+        let footer = render(
+            r#"{"type":"wats_end","status":"ok","seconds":2.0,"tokens":23812}"#,
+            Style { color: false },
+        );
+        assert!(footer[0].contains("23.8k LLM tokens"), "{footer:?}");
     }
 }

@@ -116,6 +116,24 @@ pub struct AgentConfig {
     pub catchup: Option<Duration>,
 }
 
+/// The budget `status` shows for `info`: its own, without what its
+/// runtime does not report.
+fn spend_budget(info: &AgentInfo) -> budget::Budget {
+    info.budget.for_runtime(info.runtime_name())
+}
+
+/// Default of `agent.timeout` (25 minutes since 0.4.4).
+pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(25 * 60);
+
+/// Default of `agent.max_turns` (50 since 0.4.4).
+pub const DEFAULT_MAX_TURNS: u32 = 50;
+
+/// The defaults of `agent.timeout` and `agent.max_turns` in wats 0.4.3
+/// and older: a config.toml that sets them to these values is told of the
+/// new defaults ([`crate::firstrun::old_defaults_notice`]).
+pub const OLD_DEFAULT_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+pub const OLD_DEFAULT_MAX_TURNS: u32 = 10;
+
 /// Default of `agent.catchup`.
 pub const DEFAULT_CATCHUP: Duration = Duration::from_secs(24 * 3600);
 
@@ -131,7 +149,8 @@ pub struct AgentInfo {
     /// This node runs it now.
     pub running: bool,
     pub work_dir: PathBuf,
-    /// Its budget (USD caps unset for OpenClaw: its own).
+    /// Its budget, without the limits its runtime cannot be held to
+    /// ([`budget::Budget::for_runtime`]).
     pub budget: budget::Budget,
 }
 
@@ -147,34 +166,32 @@ impl AgentInfo {
         }
     }
 
-    /// Today's budget: `$0.23 of $2.00 today, …`, or the runs for
-    /// runtimes that report no cost.
+    /// Today's budget: `$0.23 of $2.00 today, … · 12 of 120 min today ·
+    /// …`, with the runs instead of dollars for runtimes that report no
+    /// cost ([`budget::describe`]).
     pub fn budget_line(&self, now: u64) -> String {
         let spend = budget::spend(&self.work_dir, now);
-        match self.runtime.as_deref() {
-            Some("openclaw") => format!(
-                "{} ({} of {} runs today)",
-                crate::openclaw::BUDGET,
-                spend.uncosted_today,
-                self.budget.max_runs_per_day
-            ),
-            Some("codex") => format!(
-                "{} of {} runs today (Codex reports no cost)",
-                spend.uncosted_today, self.budget.max_runs_per_day
-            ),
-            _ => budget::describe(&self.budget, &spend),
-        }
+        budget::describe(&spend_budget(self), &spend, self.runtime_name())
     }
 
-    /// For `status`: name, runtime, profile, state, last run, budget.
+    fn runtime_name(&self) -> &str {
+        self.runtime.as_deref().unwrap_or("claude")
+    }
+
+    /// For `status`: name, runtime, profile, state, last run, budget (the
+    /// line, and what was used today and this month against the limits:
+    /// dollars, minutes, LLM tokens).
     pub fn status(&self, now: u64) -> serde_json::Value {
+        let spend = budget::spend(&self.work_dir, now);
+        let limits = spend_budget(self);
         json!({
             "name": self.name,
             "runtime": self.runtime,
             "profile": self.profile,
             "state": self.state(),
             "last_run": runs::list(&self.work_dir).last().map(|r| runs::format_time(r.started)),
-            "budget": self.budget_line(now),
+            "budget": budget::describe(&limits, &spend, self.runtime_name()),
+            "usage": budget::status_json(&limits, &spend, self.runtime_name()),
         })
     }
 }
@@ -872,8 +889,9 @@ fn model_args(config: &AgentConfig, flag: &str) -> Vec<String> {
 }
 
 /// Per-run limits for the agent CLI, unless the extra arguments set them:
-/// turns, and the budget left (Claude Code's `--max-budget-usd`).
-fn limit_args(config: &AgentConfig, remaining_usd: f64) -> Vec<String> {
+/// turns, and the budget left (Claude Code's `--max-budget-usd`; none
+/// without a dollar limit).
+fn limit_args(config: &AgentConfig, remaining_usd: Option<f64>) -> Vec<String> {
     let given = |flag: &str| {
         config
             .extra_args
@@ -884,7 +902,9 @@ fn limit_args(config: &AgentConfig, remaining_usd: f64) -> Vec<String> {
     if !given("--max-turns") {
         args.extend(["--max-turns".to_string(), config.max_turns.to_string()]);
     }
-    if !given("--max-budget-usd") {
+    if let Some(remaining_usd) = remaining_usd
+        && !given("--max-budget-usd")
+    {
         args.extend([
             "--max-budget-usd".to_string(),
             format!("{:.2}", remaining_usd.max(0.01)),
@@ -916,7 +936,7 @@ async fn start_run(
     config: &AgentConfig,
     trigger: &Trigger,
     prompt: String,
-    remaining_usd: f64,
+    remaining_usd: Option<f64>,
 ) -> Result<Running> {
     let (record, transcript) = open_run(config, trigger)?;
     let file = std::fs::OpenOptions::new().append(true).open(&transcript)?;
@@ -1183,7 +1203,15 @@ async fn finish_run(
     runs::read_result(&running.transcript, &mut record);
     // A forward the gateway refused ran no turn.
     if record.status != "failed"
-        && let Err(e) = crate::budget::record(&config.work_dir, record.started, record.cost_usd)
+        && let Err(e) = crate::budget::record(
+            &config.work_dir,
+            record.started,
+            crate::budget::Usage {
+                usd: record.cost_usd,
+                secs: record.seconds,
+                tokens: record.tokens,
+            },
+        )
     {
         warn!("agent spend ledger: {e}");
     }
@@ -1953,7 +1981,10 @@ pub async fn run(
                     }
                     budget::Verdict::Go { remaining_usd } => {
                         if paused_until.take().is_some() {
-                            info!("agent budget available again: {}", budget::describe(&config.budget, &spend));
+                            info!(
+                                "agent budget available again: {}",
+                                budget::describe(&config.budget, &spend, &config.runtime)
+                            );
                         }
                         remaining_usd
                     }

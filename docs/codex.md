@@ -146,10 +146,15 @@ real runs with Codex 0.163:
   tool, but it may set a language, so the runner tells the agent to post
   in English.
 
-**Budget.** Codex reports tokens, not dollars, so runs are what is counted:
-`agent.max_runs_per_day` (48), plus `agent.timeout` (10 min) per run. There
-is no turn limit flag for `codex exec`. The banner shows `N of 48 runs
-today`.
+**Budget.** Codex reports LLM tokens, not dollars (the `usage` of each
+`turn.completed`: input, cached input included, and output). So the
+dollar budget does not apply; what is counted is the runs
+(`agent.max_runs_per_day`, 48), the minutes (`agent.max_minutes_per_day`)
+and the LLM tokens (`agent.max_tokens_per_day`), each per day and 30 ×
+per month ([agent.md](agent.md#budget)), plus `agent.timeout` (25 min) per
+run. There is no turn limit flag for `codex exec`. The banner shows `N of
+48 runs today (Codex reports no cost) · 12 min today · 1.2M LLM tokens
+today`; with an API key, the wizard proposes 5M LLM tokens a day.
 
 Extra arguments go after the locked-down ones, e.g. `--agent-args "-m
 gpt-5-codex"`. Each tool you add (for example `--enable shell_tool`) can

@@ -150,10 +150,14 @@ The node-wide keys (`agent.with_mcp`, `agent.review_ttl`, `agent.notify`) stay i
 | `agent.heartbeat_file` | shipped | heartbeat prompt, relative to the data dir |
 | `agent.command` | the runtime's | the agent CLI (claude, codex) |
 | `agent.args` | none | extra arguments for the agent CLI |
-| `agent.timeout` | 10m | a run is killed after this |
-| `agent.max_turns` | 10 | turns per run (passed to the agent CLI) |
-| `agent.max_usd_per_day` | 2 | spend budget per UTC day, from the cost the agent CLI reports |
-| `agent.max_usd_per_month` | 20 | spend budget per UTC month |
+| `agent.timeout` | 25m | a run is killed after this |
+| `agent.max_turns` | 50 | turns per run (passed to the agent CLI) |
+| `agent.max_usd_per_day` | 2 | spend budget per UTC day, in USD, from the cost the agent CLI reports (0: no limit) |
+| `agent.max_usd_per_month` | 30 × max_usd_per_day | spend budget per UTC month, in USD (0: no limit) |
+| `agent.max_minutes_per_day` | 0 | total run time of the agent per UTC day, in minutes; it stops new runs, a run keeps its timeout (0: no limit) |
+| `agent.max_minutes_per_month` | 30 × max_minutes_per_day | total run time of the agent per UTC month, in minutes (0: no limit) |
+| `agent.max_tokens_per_day` | 0 | LLM tokens (model input and output, cached input included) per UTC day, as the agent CLI reports them: Claude Code and Codex, not OpenClaw (0: no limit) |
+| `agent.max_tokens_per_month` | 30 × max_tokens_per_day | LLM tokens per UTC month (0: no limit) |
 | `agent.max_runs_per_day` | 48 | runs per day that report no cost |
 | `agent.keep_runs` | 200 | transcripts kept |
 | `agent.keep_days` | 30 | transcripts kept at most this many days |

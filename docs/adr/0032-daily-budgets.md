@@ -1,0 +1,165 @@
+# 0032. Daily agent budgets: dollars, minutes, LLM tokens
+
+Status: Proposed (2026-10-22). Ships in 0.4.4.
+
+Amends ADR 0011 ("Budget", 2026-10-16): the dollar budget stays, two
+measures join it, each monthly limit is derived from its daily one, and 0
+means no limit. Asked by the setup wizard of ADR 0027 (its 0.4.4 section).
+
+Code: `crates/wats/src/budget.rs` (`Budget::of`, `Budget::for_runtime`,
+`check`, `describe`, `status_json`, `reports_cost`, `reports_tokens`),
+`crates/wats/src/runs.rs` (`read_result`: the LLM tokens of each run),
+`crates/wats/src/agent.rs` (the check before each run, `AgentInfo::status`),
+`crates/wats/src/firstrun.rs` (`ask_budget`, `preset`, `parse_daily`),
+`crates/wats/tests/agent.rs` (`the_minutes_budget_stops_new_runs`,
+`the_llm_token_budget_stops_new_runs`).
+
+Source: product decisions by Vincent (2026-10-22): daily budgets, with the
+monthly one derived; the budget always asked by the wizard, by how the
+agent is paid; and the guide "set it to what you're willing to give the
+swarm from your subscription, machine or API spend". That share is what
+makes a node fair to the swarm without hurting its owner.
+
+## Context
+
+Until 0.4.3 the node held an agent to dollars only: `agent.max_usd_per_day`
+(2) and `agent.max_usd_per_month` (20), from the cost the agent CLI
+reports, and a number of runs per day for the runs that report none. On a
+subscription (Claude Pro/Max, ChatGPT) the reported cost is an estimate of
+API prices that nobody pays: the real limit is the provider's usage
+window, so a dollar cap stops the agent for no reason, or not at all. Codex
+reports no cost at all, so its only budget was its runs. A self-hosted
+model costs the machine's time.
+
+## Decision
+
+### 1. Three measures, per UTC day and per UTC month
+
+| Key | Default | Measure |
+|---|---|---|
+| `agent.max_usd_per_day` | 2 | dollars, from the cost the CLI reports |
+| `agent.max_minutes_per_day` | 0 | the wall time of the runs, measured by the node |
+| `agent.max_tokens_per_day` | 0 | LLM tokens (model input, cached input included, and output), as the CLI reports them |
+
+- **Each month is 30 × its day**, unless `agent.max_usd_per_month`,
+  `agent.max_minutes_per_month` or `agent.max_tokens_per_month` is set.
+  `agent.max_usd_per_month` keeps working as an override, for
+  compatibility.
+- **0 is no limit**, for a day and for a month, the convention of
+  `sync.initial_max`. A day of 0 makes its derived month 0 too; a month
+  set by hand still applies.
+- The windows, the ledger and its two months, the pause until the window
+  resets, the log line, and the events kept for the next run are those of
+  the dollar budget (ADR 0011). The ledger lines gain `secs` and `tokens`;
+  an older line counts as 0 of each, and an older wats ignores the new
+  fields.
+- **Minutes stop new runs.** A run in progress keeps its own timeout: the
+  budget is checked before a run, never during one. Claude Code still gets
+  the dollars left as `--max-budget-usd`, and no such flag without a
+  dollar limit.
+- `agent.max_runs_per_day` (48) still counts the runs without a reported
+  cost.
+
+### 2. What each runtime is held to
+
+Checked against what each CLI writes, and the fake CLIs of the tests that
+mirror it:
+
+| Runtime | Dollars | Minutes | LLM tokens |
+|---|---|---|---|
+| Claude Code | `total_cost_usd` of its stream-json `result` | yes | the `usage` of its `result`: `input_tokens`, `cache_creation_input_tokens`, `cache_read_input_tokens`, `output_tokens` |
+| Codex (`exec --json`) | none: runs counted instead | yes | the `usage` of each `turn.completed`: `input_tokens` (its `cached_input_tokens` are a part of it) and `output_tokens`, summed over the turns |
+| OpenClaw (the gateway's hook) | none | yes: the time to the gateway's answer | none: the gateway returns no model output, token count or cost |
+| Mistral Vibe | not an agent runtime (an MCP host only) | | |
+
+`Budget::for_runtime` drops the limits a runtime cannot be held to (the
+dollars of Codex and OpenClaw, the LLM tokens of OpenClaw), so that they
+are neither enforced nor shown as if they were. OpenCode, a runtime of ADR
+0031, reports a cost estimate and LLM tokens per `step_finish`: it joins
+the table when ADR 0031's code is in.
+
+Cached input is counted. It is most of what an agent run reads, it is what
+the provider meters (at a lower price), and leaving it out would make the
+count depend on the provider's caching. The wizard's token default, used
+only for Codex on an API key, is sized with it.
+
+### 3. Asked by the wizard, by how the agent is paid
+
+In step 1, in quick and detailed mode alike (ADR 0027, 0.4.4): "How is
+this agent paid? 1) subscription (Claude Pro/Max, ChatGPT…) 2) API key,
+pay per use 3) self-hosted or free model". The answer picks the measure
+and its daily defaults:
+
+| Answer | Dollars | Minutes | LLM tokens |
+|---|---|---|---|
+| subscription | 0 (a cost estimate is meaningless there) | 120 | 0 |
+| API key | 5 | 0 | 0 |
+| self-hosted | 0 | 240 (the machine's time) | 0 |
+
+Adjusted for the runtimes: **Codex on an API key gets 5M LLM tokens a
+day** instead of $5, since it reports no cost; LLM tokens are the only
+per-use measure it reports. OpenClaw is not asked how it is paid (its
+spend caps are its own): its line has minutes only, 0 by default.
+
+Then one line shows the result, for the measures the runtime is held to:
+"Daily budget: 120 min, no USD limit, no LLM token limit (monthly: 30×).
+Enter to accept, or change it (e.g. min=90 usd=3 tokens=2M; 0: no
+limit)". The syntax: `name=value` items in any order, separated by spaces
+or commas, the others kept; `min` (whole minutes, or hours with `h`),
+`usd` (an optional `$`), `tokens` (`k` and `M` suffixes); 0 or `none` for
+no limit. A wrong line is asked again. A month set in config.toml is
+named on the line. When config.toml already sets a budget, the answer it
+suggests is the default, and its own values are shown.
+
+The values are written only where they differ from the defaults (ADR
+0027, 0.4.4), so a subscription writes `max_usd_per_day = 0.0` and
+`max_minutes_per_day = 120`.
+
+### 4. Where it shows
+
+The banner, `wats agent runs` and the per-agent line of `wats status`
+describe each measure: `$0.23 of $2.00 today, $5.10 of $60.00 this month ·
+12 of 120 min today, 340 of 3600 this month · 34.5k LLM tokens today (no
+limit)`, with the runs instead of dollars for a runtime that reports no
+cost, and no tokens for one that reports none. `wats status --json` and
+the MCP `status` tool add each agent's `usage`: `today` and `month`
+(`usd`, `minutes`, `tokens`, `runs`; `null` for what the runtime does not
+report) and `limits` (`null`: no limit).
+
+## Alternatives
+
+- **Keep dollars only, with a "no limit" for subscriptions.** Rejected:
+  the agent then has no budget at all on a subscription, and the
+  provider's window is shared with its owner's own sessions.
+- **A monthly budget asked apart.** Rejected: one number a day is what
+  people can size; 30× is a plain default, and the monthly keys stay for
+  those who want another.
+- **LLM tokens without cached input.** Rejected (§2): the count would
+  depend on the provider's caching.
+- **A token budget for every runtime, 0 where unknown.** Rejected: a limit
+  that is never reached would read as enforced.
+- **Cut a run when the minutes run out.** Rejected: a run cut in the
+  middle may leave a claim or a half-written answer; the timeout bounds a
+  run.
+
+## Consequences
+
+- **0 now means no limit for `agent.max_usd_per_day` and
+  `agent.max_usd_per_month`.** Before 0.4.4 a 0 paused the agent. Nobody
+  is expected to rely on it (an agent you want off is `enabled = false`),
+  but the CHANGELOG says so.
+- **A config.toml that sets `max_usd_per_day` and not the month gets 30 ×
+  the day**: the default month goes from $20 to $60. `wats config set
+  agent.max_usd_per_month 20` keeps the old one.
+- The new keys are refused by wats 0.4.3 and older: `wats upgrade
+  --rollback` names them, with their agent's table, before it swaps
+  anything (`KEYS_SINCE`).
+- They are safety keys (ADR 0011, addendum): a change shows until `wats
+  config ack`.
+
+## Later
+
+- OpenCode's `step_finish` tokens and cost (ADR 0031), once its runtime is
+  in.
+- A per-node budget across agents, if several agents share one
+  subscription.

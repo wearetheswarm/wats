@@ -1,5 +1,76 @@
 # Changelog
 
+## Unreleased
+
+### Upgrading
+
+- **New defaults for agent runs**: `agent.timeout` is 25m (was 10m) and
+  `agent.max_turns` 50 (was 10). A `config.toml` that sets them keeps its
+  values: one that sets exactly `10m` or `10`, the old defaults (as files
+  written by 0.4.3 often do), is not rewritten, but `wats status` and the
+  node's start say so in one line, with the new defaults and the command
+  to use them: `wats setup`, or `wats config unset agent.timeout
+  agent.max_turns` (`config unset` now takes several keys). `wats setup`
+  offers to drop them.
+- **Monthly budgets are 30 × the daily ones** unless set: with
+  `agent.max_usd_per_day` at its default of $2 and no
+  `agent.max_usd_per_month`, the month goes from $20 to $60. `wats config
+  set agent.max_usd_per_month 20` keeps the old one.
+- **0 is no limit** for every budget key, `agent.max_usd_per_day` and
+  `agent.max_usd_per_month` included, as for `sync.initial_max`. Before,
+  a 0 paused the agent: turn an agent off with `agents.<name>.enabled =
+  false` instead.
+- **One new setup question** (revision 2): a node with an agent is asked
+  its budget once, at its next bare `wats` on a terminal. A node without
+  an agent is asked nothing.
+- **Rolling back to 0.4.3** with a budget in minutes or LLM tokens set:
+  0.4.3 refuses those keys, so `wats upgrade --rollback` names them (with
+  their agent's table) and the `wats config unset` commands to run first.
+
+### Keys in this release
+
+New: `agent.max_minutes_per_day`, `agent.max_minutes_per_month`,
+`agent.max_tokens_per_day`, `agent.max_tokens_per_month`. Changed
+defaults: `agent.timeout` 25m, `agent.max_turns` 50,
+`agent.max_usd_per_month` 30 × `agent.max_usd_per_day`. See
+docs/config.md.
+
+### Changes
+
+- **Daily budgets in dollars, minutes and LLM tokens** ([ADR
+  0032](docs/adr/0032-daily-budgets.md), docs/agent.md "Budget"). Next to
+  `agent.max_usd_per_day`, `agent.max_minutes_per_day` caps the agent's
+  total run time per UTC day (new runs stop once it is used; a run in
+  progress keeps its timeout), and `agent.max_tokens_per_day` its LLM
+  tokens (model input, cached input included, and output) for the
+  runtimes that report them: Claude Code and Codex, not OpenClaw. Each
+  month is 30 × its day unless `agent.max_*_per_month` is set; 0 is no
+  limit. `wats status`, the banner, `wats agent runs` and the MCP
+  `status` tool (`agents[].usage`) show the dollars, minutes and LLM
+  tokens used today and this month; transcripts and `wats agent logs`
+  show each run's LLM tokens.
+- **The setup wizard asks the budget by how the agent is paid**:
+  subscription (120 minutes a day, no dollar limit), API key ($5 a day;
+  5M LLM tokens for Codex, which reports no cost) or self-hosted (240
+  minutes), then shows it on one line that Enter accepts or that you
+  edit (`min=90 usd=3 tokens=2M`). "Set it to what you're willing to give
+  the swarm from your subscription, machine or API spend."
+- **Quick or detailed, at each step of the wizard** ([ADR
+  0027](docs/adr/0027-setup-wizard.md) §5 to §8). Step 1: "Recommended
+  settings, or choose each one?"; quick asks only the budget. Step 2:
+  "Set up wats in all the agent CLIs found (MCP + session hook)? [Y = all
+  / d = one by one / n = none]". Step 3: the background is now the
+  recommended answer (Enter); `d` offers this terminal or not now.
+- **`wats setup` restarts a running node** with the new setup when you
+  say yes ("Restart it now with this setup?"), instead of only printing
+  `wats stop; wats --detach`.
+- **An older node is named**: a node of wats 0.3.2 or older showed as
+  `unknown` in `wats ps` and in setup's messages (it records no role); it
+  now shows as `older wats, v0.3.2`.
+- **The wizard writes only what changed**: a value equal to its default
+  is left out of `config.toml`, and one already set keeps its line and
+  comments, so that new defaults apply.
+
 ## 0.4.3 (2026-10-21)
 
 The robustness release. A full node keeps working: at the cap it rotates

@@ -609,19 +609,40 @@ pub const KEYS_SINCE: &[(&str, Version)] = &[
     ("storage.events_share", Version(0, 4, 1)),
     ("sync.initial_max", Version(0, 4, 1)),
     ("update.security_auto", Version(0, 4, 3)),
+    ("agent.max_minutes_per_day", Version(0, 4, 4)),
+    ("agent.max_minutes_per_month", Version(0, 4, 4)),
+    ("agent.max_tokens_per_day", Version(0, 4, 4)),
+    ("agent.max_tokens_per_month", Version(0, 4, 4)),
 ];
 
 /// The keys set in `data_dir`'s config.toml that wats `version` does not
 /// know ([`KEYS_SINCE`]). None when config.toml is absent or unreadable.
-pub fn keys_unknown_to(data_dir: &Path, version: Version) -> Vec<&'static str> {
+/// A key of one agent (`agent.<leaf>`) is looked for in each
+/// `[agents.<name>]` table, and named so.
+pub fn keys_unknown_to(data_dir: &Path, version: Version) -> Vec<String> {
     let Ok(file) = crate::settings::ConfigFile::open(data_dir) else {
         return Vec::new();
     };
-    KEYS_SINCE
-        .iter()
-        .filter(|(key, since)| version < *since && file.get(key).is_some())
-        .map(|(key, _)| *key)
-        .collect()
+    let agents = file.agent_names();
+    let mut keys = Vec::new();
+    for (key, since) in KEYS_SINCE {
+        if version >= *since {
+            continue;
+        }
+        match key.strip_prefix("agent.") {
+            Some(leaf) if crate::settings::is_agent_leaf(leaf) && !agents.is_empty() => {
+                for name in &agents {
+                    let named = format!("agents.{name}.{leaf}");
+                    if file.get(&named).is_some() {
+                        keys.push(named);
+                    }
+                }
+            }
+            _ if file.get(key).is_some() => keys.push(key.to_string()),
+            _ => {}
+        }
+    }
+    keys
 }
 
 /// How long `<binary> --version` may take.
@@ -2399,6 +2420,30 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("config unset sync.initial_max"), "{err}");
+        // The budget keys of 0.4.4 (ADR 0032), in an agent's table: named
+        // with the table.
+        std::fs::write(
+            &config,
+            "[agents.claude]\nruntime = \"claude\"\nmax_minutes_per_day = 120\n\n\
+             [agents.codex]\nruntime = \"codex\"\nmax_tokens_per_day = 5000000\n",
+        )
+        .unwrap();
+        assert_eq!(
+            keys_unknown_to(&data, Version(0, 4, 3)),
+            [
+                "agents.claude.max_minutes_per_day",
+                "agents.codex.max_tokens_per_day"
+            ]
+        );
+        fake("0.4.3");
+        let err = check_rollback(&old, &data, Version(0, 4, 4))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("config unset agents.claude.max_minutes_per_day"),
+            "{err}"
+        );
+        fake("0.4.0");
         // No such key set, no config.toml, or an old binary that does not
         // say its version: go ahead.
         std::fs::write(&config, "[update]\nauto = true\n").unwrap();

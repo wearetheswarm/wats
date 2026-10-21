@@ -1086,7 +1086,7 @@ async fn budget_pauses_the_agent() -> anyhow::Result<()> {
         max_turns: 4,
         // Each fake run reports $0.0125: two runs exhaust it.
         budget: wats::budget::Budget {
-            max_usd_per_day: 0.02,
+            max_usd_per_day: Some(0.02),
             ..Default::default()
         },
         wakes: wats::wake::WakeLimits::unlimited(),
@@ -1309,6 +1309,8 @@ echo '{{"type":"turn.completed","usage":{{"input_tokens":10,"output_tokens":2}}}
         .unwrap();
     assert_eq!(record.turns, Some(1));
     assert_eq!(record.cost_usd, None);
+    // Codex reports LLM tokens (ADR 0032): 10 in, 2 out.
+    assert_eq!(record.tokens, Some(12));
     let mut rendered = Vec::new();
     wats::runs::print_runs(
         &work,
@@ -1322,7 +1324,9 @@ echo '{{"type":"turn.completed","usage":{{"input_tokens":10,"output_tokens":2}}}
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)?
         .as_secs();
-    assert!(wats::budget::spend(&work, now).uncosted_today >= 1);
+    let spend = wats::budget::spend(&work, now);
+    assert!(spend.uncosted_today >= 1);
+    assert!(spend.tokens_today >= 12, "{spend:?}");
     a.shutdown().await?;
     Ok(())
 }
@@ -3354,6 +3358,207 @@ async fn local_agents_wake_each_other_but_not_on_the_humans_posts() -> anyhow::R
     for runner in runners {
         runner.await??;
     }
+    a.shutdown().await?;
+    Ok(())
+}
+
+/// A fake Claude Code that takes `secs` seconds and reports `tokens` LLM
+/// tokens (half input, half output) and no dollar cost limit to hit.
+fn metered_agent(dir: &Path, secs: &str, tokens: u64) -> std::path::PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let out = dir.join("runs");
+    std::fs::create_dir_all(&out).unwrap();
+    let script = dir.join("fake-metered-claude");
+    let (input, output) = (tokens / 2, tokens - tokens / 2);
+    std::fs::write(
+        &script,
+        format!(
+            "#!/bin/sh\n[ \"$1\" = mcp ] && exit 0\nn=$(ls {out} | grep -c prompt)\ncat > {out}/run-$n.tmp\necho \"$@\" > {out}/run-$n.args\nmv {out}/run-$n.tmp {out}/run-$n.prompt\nsleep {secs}\necho '{{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"num_turns\":1,\"total_cost_usd\":0.001,\"usage\":{{\"input_tokens\":{input},\"output_tokens\":{output}}}}}'\n",
+            out = out.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    script
+}
+
+fn budget_config(
+    dir: &Path,
+    command: std::path::PathBuf,
+    budget: wats::budget::Budget,
+) -> AgentConfig {
+    AgentConfig {
+        runtime: "claude".into(),
+        profile: "agent".into(),
+        user: "alice".into(),
+        about: String::new(),
+        caps: vec![],
+        every: Duration::from_secs(1),
+        heartbeat: Duration::from_secs(1),
+        max_runs_per_hour: 100,
+        allow: vec![],
+        ignore_local: true,
+        heartbeat_text: DEFAULT_HEARTBEAT.into(),
+        command,
+        mcp_command: "/usr/bin/true".into(),
+        mcp_args: vec![],
+        extra_args: vec![],
+        run_timeout: Duration::from_secs(30),
+        max_turns: 4,
+        budget,
+        wakes: wats::wake::WakeLimits::unlimited(),
+        codex_disable: vec![],
+        codex_enable: vec![],
+        access: wats::access::Access::SwarmOnly,
+        workdir: std::path::PathBuf::from("/nonexistent"),
+        tools: vec![],
+        model: None,
+        work_dir: dir.join("work"),
+        data_dir: dir.to_path_buf(),
+        keep_runs: 100,
+        keep_days: 30,
+        openclaw: Default::default(),
+        catchup: None,
+    }
+}
+
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+}
+
+/// The minutes budget (ADR 0032): the wall time of the runs. The day has
+/// one minute, 58.5 s of it used already: a run goes, keeps its own
+/// timeout past the budget (it is not cut), and no new run starts once
+/// the minute is used. No dollar limit: no `--max-budget-usd` either.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_minutes_budget_stops_new_runs() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let a = node(&dir.path().join("a"), &[]).await?;
+    let work = dir.path().join("work");
+    std::fs::create_dir_all(&work)?;
+    wats::budget::record(
+        &work,
+        unix_now(),
+        wats::budget::Usage {
+            usd: Some(0.0),
+            secs: Some(58.5),
+            tokens: None,
+        },
+    )?;
+    let budget = wats::budget::Budget::of(&wats::settings::AgentSettings {
+        max_usd_per_day: Some(0.0),
+        max_minutes_per_day: Some(1),
+        ..Default::default()
+    });
+    assert_eq!(budget.max_usd_per_day, None);
+    let config = budget_config(dir.path(), metered_agent(dir.path(), "3", 10), budget);
+    let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+    let runner = tokio::spawn(wats::agent::run(Arc::clone(&a), config, async {
+        let _ = stopped.await;
+    }));
+    eventually("a run is indexed", || {
+        wats::runs::list(&work).iter().any(|r| r.status == "ok")
+    })
+    .await;
+    tokio::time::sleep(Duration::from_secs(4)).await;
+    let all = runs(dir.path());
+    assert_eq!(all.len(), 1, "paused once the minute is used");
+    assert!(!all[0].1.contains("--max-budget-usd"), "{}", all[0].1);
+    let record = wats::runs::list(&work)
+        .into_iter()
+        .find(|r| r.status == "ok")
+        .unwrap();
+    // Past the budget's 1.5 s left: its own timeout applies, not cut.
+    assert!(record.seconds.unwrap_or(0.0) >= 2.9, "{record:?}");
+    let spend = wats::budget::spend(&work, unix_now());
+    assert!(spend.minutes_today() >= 1.0, "{spend:?}");
+    match wats::budget::check(&budget, &spend, unix_now()) {
+        wats::budget::Verdict::Paused { why, .. } => {
+            assert_eq!(why, "1 min of agent runs today, budget 1 min")
+        }
+        go => panic!("{go:?}"),
+    }
+    let _ = stop.send(());
+    runner.await??;
+    a.shutdown().await?;
+    Ok(())
+}
+
+/// The LLM token budget (ADR 0032), for a runtime that reports them: each
+/// fake run reports 1100 tokens, so a day of 2000 takes two runs, then
+/// none; `status` shows the tokens and minutes used today.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_llm_token_budget_stops_new_runs() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let a = node(&dir.path().join("a"), &[]).await?;
+    let work = dir.path().join("work");
+    let budget = wats::budget::Budget::of(&wats::settings::AgentSettings {
+        max_tokens_per_day: Some(2000),
+        ..Default::default()
+    });
+    let config = budget_config(dir.path(), metered_agent(dir.path(), "0", 1100), budget);
+    let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+    let runner = tokio::spawn(wats::agent::run(Arc::clone(&a), config, async {
+        let _ = stopped.await;
+    }));
+    eventually("two runs", || {
+        wats::runs::list(&work)
+            .iter()
+            .filter(|r| r.status == "ok")
+            .count()
+            >= 2
+    })
+    .await;
+    tokio::time::sleep(Duration::from_secs(4)).await;
+    assert_eq!(
+        runs(dir.path()).len(),
+        2,
+        "paused after 2200 of 2000 tokens"
+    );
+    let spend = wats::budget::spend(&work, unix_now());
+    assert_eq!(spend.tokens_today, 2200);
+    let info = wats::agent::AgentInfo {
+        name: "claude".into(),
+        runtime: Some("claude".into()),
+        profile: "agent".into(),
+        enabled: true,
+        running: true,
+        work_dir: work.clone(),
+        budget,
+    };
+    let status = info.status(unix_now());
+    assert_eq!(status["usage"]["today"]["tokens"], 2200, "{status}");
+    assert_eq!(
+        status["usage"]["limits"]["tokens_per_day"], 2000,
+        "{status}"
+    );
+    assert_eq!(
+        status["usage"]["limits"]["tokens_per_month"], 60000,
+        "{status}"
+    );
+    assert!(status["usage"]["today"]["minutes"].is_number(), "{status}");
+    let line = status["budget"].as_str().unwrap();
+    assert!(
+        line.contains("2.2k of 2k LLM tokens today, 2.2k of 60k this month"),
+        "{line}"
+    );
+    // OpenClaw reports none: its budget has no token limit, and says so.
+    let openclaw = wats::agent::AgentInfo {
+        runtime: Some("openclaw".into()),
+        budget: budget.for_runtime("openclaw"),
+        ..info
+    };
+    let status = openclaw.status(unix_now());
+    assert_eq!(status["usage"]["today"]["tokens"], serde_json::Value::Null);
+    assert!(
+        !status["budget"].as_str().unwrap().contains("tokens"),
+        "{status}"
+    );
+    let _ = stop.send(());
+    runner.await??;
     a.shutdown().await?;
     Ok(())
 }
