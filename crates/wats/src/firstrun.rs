@@ -27,6 +27,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 
 use crate::settings::{self, ConfigFile, FILE_NAME, RUNTIMES, Settings};
+use crate::update::Install;
 
 /// The agent CLIs looked for on `PATH`. Only [`RUNTIMES`] can run; the
 /// others (Mistral Vibe) are listed as MCP hosts.
@@ -92,6 +93,46 @@ const RUNTIME_SINCE: u32 = 1;
 
 /// The revision that added the desktop notification question.
 const DESKTOP_SINCE: u32 = 1;
+
+/// The revision that added the security updates question (ADR 0030):
+/// part of revision 1, which no release had shipped yet when it was added.
+const SECURITY_AUTO_SINCE: u32 = 1;
+
+/// Shown before the security updates question (ADR 0030).
+pub const SECURITY_AUTO_ABOUT: &str = "Security updates: the node can install a release \
+marked security by itself, signature checked, once it is update.security_delay old (a day, \
+unless you set another delay). It never restarts itself: restart wats to use it. Other \
+releases are only announced (update.auto installs them).";
+
+/// The security updates question (ADR 0030); Yes is its default.
+pub const SECURITY_AUTO_QUESTION: &str =
+    "Install security updates automatically? (update.security_auto)";
+
+/// Shown instead of the security updates question for a Homebrew install,
+/// which the node never upgrades.
+pub const SECURITY_AUTO_HOMEBREW: &str = "Security updates: Homebrew installed this wats, so \
+`brew upgrade wats` installs its updates; wats tells you when a security release is out.";
+
+/// Shown instead of the security updates question on a platform with no
+/// prebuilt release, which the node never upgrades.
+pub const SECURITY_AUTO_SOURCE: &str = "Security updates: there is no prebuilt release for \
+this platform, so the node cannot install them; build new releases from source. wats tells \
+you when a security release is out.";
+
+/// Shown instead of the security updates question when stdin is not a
+/// terminal: turning on auto-install takes a person's answer.
+pub const SECURITY_AUTO_NO_TERMINAL: &str = "Security updates: not asked without a terminal, \
+so update.security_auto stays as it is (off unless set). Run `wats setup` on a terminal to \
+choose.";
+
+/// The `update.security_delay` a Yes sets when none is set.
+pub const SECURITY_DELAY: &str = "1d";
+
+/// The file, in the data directory, of the setup answers kept outside
+/// config.toml (ADR 0030): `security_auto=no` remembers a No, which leaves
+/// the key unset so that an older wats still loads config.toml.
+/// `name=value` lines.
+pub const ANSWERS_FILE: &str = "setup-answers";
 
 /// One question after the agent runtime.
 #[derive(Debug, Clone, Copy)]
@@ -164,7 +205,7 @@ pub fn record_revision(data_dir: &Path) -> Result<()> {
 /// How many questions are newer than `revision`, whatever the answers
 /// (the agent's questions count even when it runs none).
 pub fn new_questions(revision: u32) -> usize {
-    [RUNTIME_SINCE, DESKTOP_SINCE]
+    [RUNTIME_SINCE, DESKTOP_SINCE, SECURITY_AUTO_SINCE]
         .into_iter()
         .chain(QUESTIONS.iter().map(|q| q.since))
         .filter(|since| *since > revision)
@@ -532,6 +573,24 @@ pub fn render(choices: &Choices) -> Result<String> {
             settings::check_value("notify.desktop", on)?
         ));
     }
+    // Only a Yes is written: absent is false, and a wats older than 0.4.3
+    // refuses the key (ADR 0030).
+    if let Some(on) =
+        chosen("update.security_auto").filter(|v| !is_default("update.security_auto", v))
+    {
+        text.push_str(&format!(
+            "\n[update]\n# {}\nsecurity_auto = {}\n",
+            settings::find_key("update.security_auto")?.help,
+            settings::check_value("update.security_auto", on)?
+        ));
+        if let Some(delay) = chosen("update.security_delay") {
+            text.push_str(&format!(
+                "# {}\nsecurity_delay = {}\n",
+                settings::find_key("update.security_delay")?.help,
+                settings::check_value("update.security_delay", delay)?
+            ));
+        }
+    }
     toml::from_str::<Settings>(&text).context("the generated config.toml does not load")?;
     Ok(text)
 }
@@ -626,25 +685,32 @@ pub fn write_default(data_dir: &Path) -> Result<Option<PathBuf>> {
 }
 
 /// `wats setup` with no tool: detect the agent CLIs on `path`, ask the
-/// main choices on `input`/`out`, write them. Returns the choices.
+/// main choices on `input`/`out`, write them. Returns the choices. The
+/// security updates question is asked only when stdin is a terminal
+/// (ADR 0030).
 pub fn setup(
     data_dir: &Path,
     input: &mut impl BufRead,
     out: &mut impl Write,
     path: Option<&OsStr>,
 ) -> Result<Choices> {
-    setup_with(
+    use std::io::IsTerminal;
+    setup_asking(
         data_dir,
         input,
         out,
         path,
         crate::desktop::this_desktop_session(),
+        Asker {
+            install: Install::detect(),
+            terminal: std::io::stdin().is_terminal(),
+        },
     )
 }
 
 /// [`setup`], `desktop` telling whether this machine has a desktop session
 /// ([`crate::desktop::desktop_session`]): only then is `notify.desktop`
-/// asked (default yes).
+/// asked (default yes). As if a person answered on a terminal.
 pub fn setup_with(
     data_dir: &Path,
     input: &mut impl BufRead,
@@ -652,7 +718,18 @@ pub fn setup_with(
     path: Option<&OsStr>,
     desktop: bool,
 ) -> Result<Choices> {
-    let (choices, found) = ask_and_write(data_dir, input, out, path, desktop, 0, true)?;
+    setup_asking(data_dir, input, out, path, desktop, Asker::person())
+}
+
+fn setup_asking(
+    data_dir: &Path,
+    input: &mut impl BufRead,
+    out: &mut impl Write,
+    path: Option<&OsStr>,
+    desktop: bool,
+    asker: Asker,
+) -> Result<Choices> {
+    let (choices, found) = ask_and_write(data_dir, input, out, path, desktop, asker, 0, true)?;
     next_steps(out, &choices, &found, true)?;
     Ok(choices)
 }
@@ -660,6 +737,8 @@ pub fn setup_with(
 /// [`setup`] for the setup wizard (ADR 0027), which asks next whether
 /// to register wats in the MCP hosts found: the hints to run `wats setup
 /// <tool> --mcp` are left out. Returns the choices and the agent CLIs found.
+/// The wizard runs on a terminal only (or `WATS_TEST_INTERACTIVE=1` under
+/// `--hermetic`), so a person answers.
 pub fn setup_for_wizard(
     data_dir: &Path,
     input: &mut impl BufRead,
@@ -672,6 +751,7 @@ pub fn setup_for_wizard(
         out,
         path,
         crate::desktop::this_desktop_session(),
+        Asker::person(),
         0,
         false,
     )?;
@@ -681,6 +761,7 @@ pub fn setup_for_wizard(
 
 /// A data directory set up at `revision`, older than [`SETUP_REVISION`]:
 /// ask only the questions added since, write them, record the revision.
+/// Run by a bare `wats` on a terminal only.
 pub fn catch_up(
     data_dir: &Path,
     input: &mut impl BufRead,
@@ -712,18 +793,49 @@ pub fn catch_up_with(
         "wats setup has new questions since this data directory was set up (setup revision \
          {revision}, now {SETUP_REVISION}). Enter accepts the [default]."
     )?;
-    let (choices, _) = ask_and_write(data_dir, input, out, path, desktop, revision, false)?;
+    let (choices, _) = ask_and_write(
+        data_dir,
+        input,
+        out,
+        path,
+        desktop,
+        Asker::person(),
+        revision,
+        false,
+    )?;
     Ok(choices)
 }
 
+/// Who answers the security updates question, and for which install
+/// (ADR 0030): asked only of a person (stdin a terminal) and only for an
+/// [`Install::Release`], which the node can update by itself.
+#[derive(Debug, Clone, Copy)]
+struct Asker {
+    install: Install,
+    terminal: bool,
+}
+
+impl Asker {
+    /// A person on a terminal, with this binary's install.
+    fn person() -> Asker {
+        Asker {
+            install: Install::detect(),
+            terminal: true,
+        }
+    }
+}
+
 /// Ask the main choices newer than `revision` (0: all of them), write
-/// them, and record [`SETUP_REVISION`].
+/// them, and record [`SETUP_REVISION`] (and the security updates answer,
+/// in [`ANSWERS_FILE`]).
+#[allow(clippy::too_many_arguments)]
 fn ask_and_write(
     data_dir: &Path,
     input: &mut impl BufRead,
     out: &mut impl Write,
     path: Option<&OsStr>,
     desktop: bool,
+    asker: Asker,
     revision: u32,
     header: bool,
 ) -> Result<(Choices, Vec<Found>)> {
@@ -744,10 +856,98 @@ fn ask_and_write(
         )?;
         choices.values.push(("notify.desktop", on.to_string()));
     }
+    let security = if SECURITY_AUTO_SINCE > revision {
+        ask_security_auto(input, out, &settings, data_dir, asker, &mut choices)?
+    } else {
+        None
+    };
     let file = apply(data_dir, &choices)?;
+    if let Some(on) = security {
+        record_answer(data_dir, "security_auto", if on { "yes" } else { "no" })?;
+    }
     record_revision(data_dir)?;
     writeln!(out, "Wrote {}", file.display())?;
     Ok((choices, found))
+}
+
+/// The security updates question (ADR 0030). Its default: the current
+/// value when config.toml sets the key, else the answer recorded in
+/// [`ANSWERS_FILE`], else Yes (never answered). Yes sets
+/// `update.security_auto` and, when none is set, `update.security_delay`
+/// to [`SECURITY_DELAY`]. No unsets a `true` (absent is false, and a wats
+/// older than 0.4.3 refuses the key) and keeps a `false` set by hand; the
+/// No is remembered in [`ANSWERS_FILE`]. Not asked without a terminal (an
+/// opt-in to auto-install needs a person's answer: the key stays as it
+/// is), nor for a Homebrew install or a platform with no prebuilt release,
+/// which the node never updates. Returns the answer, if asked.
+fn ask_security_auto(
+    input: &mut impl BufRead,
+    out: &mut impl Write,
+    settings: &Settings,
+    data_dir: &Path,
+    asker: Asker,
+    choices: &mut Choices,
+) -> Result<Option<bool>> {
+    match asker.install {
+        Install::Homebrew => {
+            writeln!(out, "{SECURITY_AUTO_HOMEBREW}")?;
+            return Ok(None);
+        }
+        Install::Source => {
+            writeln!(out, "{SECURITY_AUTO_SOURCE}")?;
+            return Ok(None);
+        }
+        Install::Release => {}
+    }
+    if !asker.terminal {
+        writeln!(out, "{SECURITY_AUTO_NO_TERMINAL}")?;
+        return Ok(None);
+    }
+    writeln!(out, "{SECURITY_AUTO_ABOUT}")?;
+    let current = settings.update.security_auto;
+    let default = current
+        .or_else(|| recorded_answer(data_dir, "security_auto").map(|a| a == "yes"))
+        .unwrap_or(true);
+    let on = ask_yes_no(input, out, SECURITY_AUTO_QUESTION, default)?;
+    if on {
+        choices
+            .values
+            .push(("update.security_auto", "true".to_string()));
+        if settings.update.security_delay.is_none() {
+            choices
+                .values
+                .push(("update.security_delay", SECURITY_DELAY.to_string()));
+        }
+    } else if current == Some(true) {
+        // `false` is the default: `apply` unsets the key.
+        choices
+            .values
+            .push(("update.security_auto", "false".to_string()));
+    }
+    Ok(Some(on))
+}
+
+/// The answer `name` recorded in `data_dir`'s [`ANSWERS_FILE`], if any.
+pub fn recorded_answer(data_dir: &Path, name: &str) -> Option<String> {
+    let text = std::fs::read_to_string(data_dir.join(ANSWERS_FILE)).ok()?;
+    text.lines().find_map(|line| {
+        let (k, v) = line.split_once('=')?;
+        (k.trim() == name).then(|| v.trim().to_string())
+    })
+}
+
+/// Record `name=value` in `data_dir`'s [`ANSWERS_FILE`], keeping the other
+/// answers.
+fn record_answer(data_dir: &Path, name: &str, value: &str) -> Result<()> {
+    let path = data_dir.join(ANSWERS_FILE);
+    let old = std::fs::read_to_string(&path).unwrap_or_default();
+    let mut text: String = old
+        .lines()
+        .filter(|line| line.split_once('=').is_none_or(|(k, _)| k.trim() != name))
+        .map(|line| format!("{line}\n"))
+        .collect();
+    text.push_str(&format!("{name}={value}\n"));
+    std::fs::write(&path, text).with_context(|| format!("write {}", path.display()))
 }
 
 /// What the node now runs, and with `hints`, how to register wats in the
@@ -890,6 +1090,268 @@ mod tests {
         assert!(!String::from_utf8(out).unwrap().contains("notify.desktop"));
         assert!(choices.values.iter().all(|(k, _)| *k != "notify.desktop"));
         assert_eq!(Settings::load(other.path()).unwrap().notify.desktop, None);
+    }
+
+    /// The security updates question (ADR 0030): Enter is Yes, which sets
+    /// `update.security_auto` and a one-day `update.security_delay`; a
+    /// delay already set is kept.
+    #[test]
+    fn setup_asks_security_updates() {
+        let data = tempfile::tempdir().unwrap();
+        let mut out = Vec::new();
+        // No agent CLI: storage, networks, then this question (Enter).
+        let choices = setup_with(data.path(), &mut "".as_bytes(), &mut out, None, false).unwrap();
+        let said = String::from_utf8(out).unwrap();
+        assert!(said.contains(SECURITY_AUTO_ABOUT), "{said}");
+        assert!(
+            said.contains("Install security updates automatically? (update.security_auto) [Y/n]"),
+            "{said}"
+        );
+        assert!(
+            choices
+                .values
+                .contains(&("update.security_auto", "true".into()))
+        );
+        let text = std::fs::read_to_string(data.path().join(FILE_NAME)).unwrap();
+        assert!(text.contains("\n[update]\n"), "{text}");
+        assert!(text.contains("\nsecurity_auto = true\n"), "{text}");
+        assert!(text.contains("\nsecurity_delay = \"1d\"\n"), "{text}");
+        let policy = Settings::load(data.path())
+            .unwrap()
+            .update
+            .policy()
+            .unwrap();
+        assert!(policy.security_auto && !policy.auto);
+        assert_eq!(
+            policy.security_delay,
+            Some(std::time::Duration::from_secs(86400))
+        );
+        assert_eq!(
+            recorded_answer(data.path(), "security_auto").as_deref(),
+            Some("yes")
+        );
+        // Yes with a delay of the user's own: kept.
+        let other = tempfile::tempdir().unwrap();
+        std::fs::write(
+            other.path().join(FILE_NAME),
+            "[update]\nsecurity_delay = \"12h\"\n",
+        )
+        .unwrap();
+        setup_with(
+            other.path(),
+            &mut "\n\ny\n".as_bytes(),
+            &mut Vec::new(),
+            None,
+            false,
+        )
+        .unwrap();
+        let settings = Settings::load(other.path()).unwrap();
+        assert_eq!(settings.update.security_auto, Some(true));
+        assert_eq!(settings.update.security_delay.as_deref(), Some("12h"));
+    }
+
+    /// A No sticks (ADR 0030): it unsets the key (absent is false, and an
+    /// older wats refuses it), is remembered in `setup-answers`, and is the
+    /// default of the next run, so Enter keeps it off.
+    #[test]
+    fn a_no_to_security_updates_sticks() {
+        let data = tempfile::tempdir().unwrap();
+        // Yes first, then No: the key is unset, the delay kept.
+        setup_with(
+            data.path(),
+            &mut "".as_bytes(),
+            &mut Vec::new(),
+            None,
+            false,
+        )
+        .unwrap();
+        let mut out = Vec::new();
+        setup_with(
+            data.path(),
+            &mut "\n\nn\n".as_bytes(),
+            &mut out,
+            None,
+            false,
+        )
+        .unwrap();
+        let said = String::from_utf8(out).unwrap();
+        assert!(said.contains("(update.security_auto) [Y/n]"), "{said}");
+        let text = std::fs::read_to_string(data.path().join(FILE_NAME)).unwrap();
+        assert!(!text.contains("security_auto ="), "{text}");
+        let settings = Settings::load(data.path()).unwrap();
+        assert_eq!(settings.update.security_auto, None);
+        assert!(!settings.update.policy().unwrap().security_auto);
+        assert_eq!(settings.update.security_delay.as_deref(), Some("1d"));
+        assert_eq!(
+            recorded_answer(data.path(), "security_auto").as_deref(),
+            Some("no")
+        );
+        // Re-run with Enter: the recorded No is the default; still off.
+        let mut out = Vec::new();
+        setup_with(data.path(), &mut "".as_bytes(), &mut out, None, false).unwrap();
+        let said = String::from_utf8(out).unwrap();
+        assert!(said.contains("(update.security_auto) [y/N]"), "{said}");
+        let settings = Settings::load(data.path()).unwrap();
+        assert_eq!(settings.update.security_auto, None);
+        // No on a new data directory: nothing in config.toml.
+        let other = tempfile::tempdir().unwrap();
+        setup_with(
+            other.path(),
+            &mut "\n\nno\n".as_bytes(),
+            &mut Vec::new(),
+            None,
+            false,
+        )
+        .unwrap();
+        let text = std::fs::read_to_string(other.path().join(FILE_NAME)).unwrap();
+        assert!(!text.contains("security_auto"), "{text}");
+        assert!(!text.contains("security_delay = "), "{text}");
+        assert_eq!(
+            recorded_answer(other.path(), "security_auto").as_deref(),
+            Some("no")
+        );
+        // Other answers of the file are kept.
+        std::fs::write(
+            other.path().join(ANSWERS_FILE),
+            "future=1\nsecurity_auto=no\n",
+        )
+        .unwrap();
+        setup_with(
+            other.path(),
+            &mut "\n\ny\n".as_bytes(),
+            &mut Vec::new(),
+            None,
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(other.path().join(ANSWERS_FILE)).unwrap(),
+            "future=1\nsecurity_auto=yes\n"
+        );
+    }
+
+    /// A `security_auto = false` set by hand is the default and is kept
+    /// as it is by a No (not unset).
+    #[test]
+    fn a_false_set_by_hand_is_kept() {
+        let data = tempfile::tempdir().unwrap();
+        std::fs::write(
+            data.path().join(FILE_NAME),
+            "[update]\nsecurity_auto = false\n",
+        )
+        .unwrap();
+        let mut out = Vec::new();
+        setup_with(data.path(), &mut "".as_bytes(), &mut out, None, false).unwrap();
+        let said = String::from_utf8(out).unwrap();
+        assert!(said.contains("(update.security_auto) [y/N]"), "{said}");
+        let text = std::fs::read_to_string(data.path().join(FILE_NAME)).unwrap();
+        assert!(text.contains("security_auto = false"), "{text}");
+        assert_eq!(
+            Settings::load(data.path()).unwrap().update.security_auto,
+            Some(false)
+        );
+    }
+
+    /// Without a terminal (`wats setup </dev/null`, or an agent piping
+    /// answers), the question is not asked: the end of the input never
+    /// opts in, and even a piped "y" is not taken. The key stays as it is.
+    #[test]
+    fn no_terminal_never_opts_in() {
+        let data = tempfile::tempdir().unwrap();
+        let piped = Asker {
+            install: Install::Release,
+            terminal: false,
+        };
+        for input in ["", "\n\ny\n"] {
+            let mut out = Vec::new();
+            let (choices, _) = ask_and_write(
+                data.path(),
+                &mut input.as_bytes(),
+                &mut out,
+                None,
+                false,
+                piped,
+                0,
+                true,
+            )
+            .unwrap();
+            let said = String::from_utf8(out).unwrap();
+            assert!(said.contains(SECURITY_AUTO_NO_TERMINAL), "{said}");
+            assert!(!said.contains(SECURITY_AUTO_QUESTION), "{said}");
+            assert!(
+                choices
+                    .values
+                    .iter()
+                    .all(|(k, _)| !k.starts_with("update."))
+            );
+            let settings = Settings::load(data.path()).unwrap();
+            assert_eq!(settings.update.security_auto, None);
+            assert!(!settings.update.policy().unwrap().security_auto);
+            assert_eq!(recorded_answer(data.path(), "security_auto"), None);
+        }
+        // A Yes set before stays as it is.
+        let mut file = ConfigFile::open(data.path()).unwrap();
+        file.set("update.security_auto", "true").unwrap();
+        file.save().unwrap();
+        ask_and_write(
+            data.path(),
+            &mut "".as_bytes(),
+            &mut Vec::new(),
+            None,
+            false,
+            piped,
+            0,
+            true,
+        )
+        .unwrap();
+        assert_eq!(
+            Settings::load(data.path()).unwrap().update.security_auto,
+            Some(true)
+        );
+    }
+
+    /// A Homebrew install, or a platform with no prebuilt release, is not
+    /// asked about security updates: the node never upgrades it. Nor is a
+    /// data directory already at revision 1 asked again (part of revision
+    /// 1, ADR 0030).
+    #[test]
+    fn security_updates_question_skips_homebrew_source_and_catch_up() {
+        for (install, line) in [
+            (Install::Homebrew, SECURITY_AUTO_HOMEBREW),
+            (Install::Source, SECURITY_AUTO_SOURCE),
+        ] {
+            let data = tempfile::tempdir().unwrap();
+            let mut out = Vec::new();
+            let asker = Asker {
+                install,
+                terminal: true,
+            };
+            let (choices, _) = ask_and_write(
+                data.path(),
+                &mut "".as_bytes(),
+                &mut out,
+                None,
+                false,
+                asker,
+                0,
+                true,
+            )
+            .unwrap();
+            let said = String::from_utf8(out).unwrap();
+            assert!(said.contains(line), "{said}");
+            assert!(!said.contains(SECURITY_AUTO_QUESTION), "{said}");
+            assert!(
+                choices
+                    .values
+                    .iter()
+                    .all(|(k, _)| !k.starts_with("update."))
+            );
+            assert_eq!(
+                Settings::load(data.path()).unwrap().update.security_auto,
+                None
+            );
+        }
+        assert_eq!(new_questions(BASELINE_REVISION), 0);
     }
 
     /// Mistral Vibe on PATH: listed, not offered as the agent, its MCP
@@ -1108,7 +1570,7 @@ mod tests {
         std::fs::remove_file(dir.path().join(FILE_NAME)).unwrap();
         assert_eq!(stored_revision(dir.path()), None);
         // Every question of today is in revision 1: revision 0 has them all.
-        assert_eq!(new_questions(0), QUESTIONS.len() + 2);
+        assert_eq!(new_questions(0), QUESTIONS.len() + 3);
     }
 
     /// A data directory set up at an older revision: only the questions

@@ -179,13 +179,16 @@ pub struct HaltSettings {
 pub struct UpdateSettings {
     pub check: Option<bool>,
     pub auto: Option<bool>,
+    /// Install security releases by itself (ADR 0030).
+    pub security_auto: Option<bool>,
     pub delay: Option<String>,
     pub security_delay: Option<String>,
     pub url: Option<String>,
 }
 
 impl UpdateSettings {
-    /// The configured policy over the defaults (check on, auto off, 7 days).
+    /// The configured policy over the defaults (check on, auto and
+    /// security_auto off, 7 days).
     pub fn policy(&self) -> Result<crate::update::UpdatePolicy> {
         let duration = |value: &Option<String>, what: &str| -> Result<Option<Duration>> {
             value
@@ -197,6 +200,7 @@ impl UpdateSettings {
         Ok(crate::update::UpdatePolicy {
             check: self.check.unwrap_or(true),
             auto: self.auto.unwrap_or(false),
+            security_auto: self.security_auto.unwrap_or(false),
             delay: match duration(&self.delay, "delay")? {
                 Some(d) => d,
                 None => parse_duration(crate::update::DEFAULT_DELAY).map_err(anyhow::Error::msg)?,
@@ -752,6 +756,12 @@ pub const KEYS: &[Key] = &[
         "install a newer release by itself (signature checked) once it is update.delay old; restart to use it",
     ),
     key(
+        "update.security_auto",
+        ValueType::Bool,
+        "false",
+        "install a release marked security by itself (signature checked) once it is update.security_delay old, even with update.auto off; restart to use it; never for a Homebrew install nor a platform without a prebuilt release",
+    ),
+    key(
         "update.delay",
         ValueType::Duration,
         "7d",
@@ -761,7 +771,7 @@ pub const KEYS: &[Key] = &[
         "update.security_delay",
         ValueType::Duration,
         "update.delay",
-        "the same for a release marked security; unset: update.delay",
+        "the same for a release marked security, for update.auto and update.security_auto (the setup wizard sets 1d); unset: update.delay",
     ),
     key(
         "update.url",
@@ -2009,7 +2019,7 @@ mod tests {
     #[test]
     fn update_policy() {
         let p = UpdateSettings::default().policy().unwrap();
-        assert!(p.check && !p.auto);
+        assert!(p.check && !p.auto && !p.security_auto);
         assert_eq!(p.delay, Duration::from_secs(7 * 86400));
         assert_eq!(p.security_delay, None);
         let dir = tempfile::tempdir().unwrap();
@@ -2019,9 +2029,24 @@ mod tests {
         )
         .unwrap();
         let p = Settings::load(dir.path()).unwrap().update.policy().unwrap();
-        assert!(p.check && p.auto);
+        // update.security_auto (ADR 0030): false when absent.
+        assert!(p.check && p.auto && !p.security_auto);
         assert_eq!(p.delay, Duration::from_secs(3 * 86400));
         assert_eq!(p.security_delay, Some(Duration::from_secs(12 * 3600)));
+        std::fs::write(
+            dir.path().join(FILE_NAME),
+            "[update]\nsecurity_auto = true\nsecurity_delay = \"1d\"\n",
+        )
+        .unwrap();
+        let p = Settings::load(dir.path()).unwrap().update.policy().unwrap();
+        assert!(p.security_auto && !p.auto);
+        assert_eq!(p.security_delay, Some(Duration::from_secs(86400)));
+        let mut file = ConfigFile::open(dir.path()).unwrap();
+        file.set("update.security_auto", "false").unwrap();
+        assert!(file.set("update.security_auto", "sometimes").is_err());
+        file.save().unwrap();
+        let p = Settings::load(dir.path()).unwrap().update.policy().unwrap();
+        assert!(!p.security_auto);
         std::fs::write(dir.path().join(FILE_NAME), "[update]\ndelay = \"soon\"\n").unwrap();
         assert!(Settings::load(dir.path()).is_err());
         let mut file = ConfigFile::open(dir.path()).unwrap();

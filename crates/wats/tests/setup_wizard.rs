@@ -193,9 +193,10 @@ fn first_bare_wats_runs_the_wizard_then_the_node_in_the_background() {
     for name in ["claude", "codex", "vibe"] {
         machine.fake_cli(name);
     }
-    // No agent, the default disk budget and networks; Claude Code: yes,
-    // its hook: yes; Codex: no; Vibe: yes (Enter); the background: yes.
-    let child = machine.spawn(machine.wats(&[], true), "0\n\n\ny\ny\nn\n\ny\n");
+    // No agent, the default disk budget and networks; security updates:
+    // yes; Claude Code: yes, its hook: yes; Codex: no; Vibe: yes (Enter);
+    // the background: yes.
+    let child = machine.spawn(machine.wats(&[], true), "0\n\n\ny\ny\ny\nn\n\ny\n");
     let out = child.wait_with_output().unwrap();
     let (said, err) = (text(&out.stdout), text(&out.stderr));
     assert!(out.status.success(), "{out:?}");
@@ -233,6 +234,11 @@ fn first_bare_wats_runs_the_wizard_then_the_node_in_the_background() {
         "{said}"
     );
     assert!(said.contains("(storage.max) [10G]"), "{said}");
+    // ADR 0030: asked in the main choices, Yes by default.
+    assert!(
+        said.contains("Install security updates automatically? (update.security_auto) [Y/n]"),
+        "{said}"
+    );
     // The hints to run `wats setup <tool> --mcp` are questions here.
     assert!(
         !said.contains("wats setup vibe --mcp (running it"),
@@ -266,6 +272,8 @@ fn first_bare_wats_runs_the_wizard_then_the_node_in_the_background() {
     // configs of the throwaway HOME, nothing for Codex.
     let config = std::fs::read_to_string(machine.data().join("config.toml")).unwrap();
     assert!(config.contains("# [agents.claude]"), "{config}");
+    assert!(config.contains("\nsecurity_auto = true\n"), "{config}");
+    assert!(config.contains("\nsecurity_delay = \"1d\"\n"), "{config}");
     assert_eq!(machine.revision().as_deref(), Some("1\n"));
     let calls = machine.calls();
     assert!(
@@ -342,6 +350,8 @@ fn bare_wats_without_a_terminal_runs_the_node_as_before() {
     // Defaults: no agent, and no revision (never asked).
     let config = std::fs::read_to_string(machine.data().join("config.toml")).unwrap();
     assert!(config.contains("# [agents.claude]"), "{config}");
+    // Not asked, so update.security_auto is not set: off (ADR 0030).
+    assert!(!config.contains("security_auto"), "{config}");
     assert_eq!(machine.revision(), None);
     // The very first start of a node here: the headline, on stderr, once.
     assert!(text(&out.stderr).contains(FIRST_START), "{out:?}");
@@ -405,7 +415,7 @@ fn an_older_revision_asks_only_the_new_questions() {
     let older = |machine: &Machine| {
         std::fs::write(machine.data().join("setup-revision"), "0\n").unwrap();
     };
-    let hint = "`wats setup` has 9 new question(s) since this data directory was set up";
+    let hint = "`wats setup` has 10 new question(s) since this data directory was set up";
     for (args, terminal) in [(&[][..], false), (&["--infra", "none"][..], true)] {
         older(&machine);
         let child = machine.spawn(machine.wats(args, terminal), "20G\n");

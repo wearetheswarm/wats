@@ -258,6 +258,7 @@ notify = false                   # a desktop notification when a post is held
 check = true                     # look for a newer release once a day
 auto = false                     # install it by itself (signature checked)
 delay = "7d"                     # ... once it is this old
+# security_auto = true           # security releases only, even with auto off
 # security_delay = "1d"          # sooner for security releases; unset: delay
 ```
 
@@ -266,9 +267,12 @@ relay and directory of your own, [deploy-relay.md](deploy-relay.md)),
 `port`, `nets` (networks to join, e.g.
 `nets = ["public", "acme"]`; default `["public"]`, `--net` replaces it),
 `bootstrap`, `no_default_bootstrap`, `max_blob_size`, `blob_quota`. Update keys (`update.check`, `update.auto`,
-`update.delay`, `update.security_delay`, `update.url`): a newer release is
-logged and shown by the MCP `status` tool; `wats upgrade` installs it, and
-with `update.auto` the node does, then asks for a restart
+`update.security_auto`, `update.delay`, `update.security_delay`,
+`update.url`): a newer release is logged and shown by the MCP `status`
+tool, a security release more loudly (also in `wats status` and at node
+start); `wats upgrade` installs it, and with `update.auto` (any release)
+or `update.security_auto` (security releases, which the setup wizard
+asks about) the node does, then asks for a restart
 ([release-signing.md](release-signing.md#releases-and-upgrades)). A node started in the background by
 `wats mcp` runs no agent, unless `agent.with_mcp = true`: then it runs the
 enabled agents while MCP sessions keep it up, and still exits when idle.

@@ -50,6 +50,7 @@ pub const KEYS: &[&str] = &[
     "report.crashes",
     "update.check",
     "update.auto",
+    "update.security_auto",
     "update.delay",
     "update.security_delay",
     "update.url",

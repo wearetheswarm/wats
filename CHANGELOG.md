@@ -2,8 +2,55 @@
 
 ## Unreleased
 
+### Upgrading from 0.4.2
+
+- **Rolling back to 0.4.2** keeps working unless you answered yes to
+  security updates: 0.4.2 refuses unknown keys in `config.toml`, so
+  `wats upgrade --rollback` now checks the previous binary's version and,
+  when `config.toml` sets a key it does not know (here
+  `update.security_auto`), stops before swapping anything and prints the
+  command to run first: `wats --dir <data dir> config unset
+  update.security_auto`. Then run the rollback again. ADR 0030.
+
 ### Changes
 
+- **Security updates, installed automatically if you say so.** A new
+  key, `update.security_auto` (off when absent), makes the node install
+  releases marked security by itself once they are
+  `update.security_delay` old, with every check of `wats upgrade`
+  (signatures, SHA-256, the new binary runs), even with `update.auto`
+  off; normal releases still follow `update.auto`. It never restarts the
+  node (restart wats to use the new binary) and never applies to a
+  Homebrew install or a platform without a prebuilt release. The setup
+  wizard and `wats setup` on a terminal ask "Install security updates
+  automatically?" (default yes, or your previous answer): yes sets
+  `security_auto = true` and, unless a delay is set, `security_delay =
+  "1d"` (which also applies to `update.auto` for security releases); no
+  leaves the key unset (off) and is remembered in `<data
+  dir>/setup-answers`. Without a terminal (`wats setup </dev/null`, an
+  agent piping answers) the question is not asked and nothing turns on.
+  Nodes set up before are not asked (it is part of setup revision 1) and
+  keep running as they do. A pending security release now gets a louder
+  notice, without installing anything: a `SECURITY RELEASE: wats X.Y.Z
+  …` line with the command to update in `wats status`, `update.notice`
+  in the MCP `status` tool (for the agent to tell its user), and once at
+  node start, in the log and the banner; `wats status` no longer shows a
+  stale `update.json` when `update.check` is off. Not on by default for
+  every node: one release key, a bad or rogue release would reach every
+  node at once, and nothing can pull a release yet; to be revisited at
+  beta. ADR 0030.
+- **A security release is not hidden by the release after it.** Each
+  release now ships a signed `security.json` naming its security floor:
+  the newest version, up to that release, whose CHANGELOG section has a
+  `### Security` heading (0.4.2 today), computed by the release workflow
+  (`scripts/security-floor.sh`) and signed with the release key like the
+  archives. The daily check verifies it (signature, trusted comment, and
+  that it names the latest release, so an older file cannot be replayed),
+  and a node older than the floor treats the latest release as a security
+  release: the louder notice and, if you opted in, `update.security_auto`.
+  Without a valid `security.json` (older releases, a bad signature), the
+  notes' `Security:` line decides, as before; the workflow now adds that
+  line by itself to a release with a `### Security` section. ADR 0030.
 - **A full node keeps taking new posts: rotation at the cap.** At 95 % of
   its events share (`storage.events_share` of `storage.max`), a node now
   frees space down to 85 % in the background, in transactions of at most

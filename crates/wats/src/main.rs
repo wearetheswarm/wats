@@ -3397,7 +3397,11 @@ async fn status_command(config: &NodeConfig, json: bool) -> Result<()> {
                 "nets": config.nets,
                 "version": env!("CARGO_PKG_VERSION"),
             });
-            if let Some(update) = wats::update::status_json(&config.data_dir) {
+            // Not from a stale update.json when the node does not look for
+            // releases (`update.check` off, hermetic, loopback).
+            if wats::update::shows_status(&config.update)
+                && let Some(update) = wats::update::status_json(&config.data_dir, &config.update)
+            {
                 status["update"] = update;
             }
             status["halt"] = wats::halt::offline_status(&config.data_dir, config.halt.accept);
@@ -3474,6 +3478,12 @@ async fn status_command(config: &NodeConfig, json: bool) -> Result<()> {
         // One line per network: "swarm: 3 neighbors, 17 nodes seen in 24
         // h" (ADR 0026).
         let swarm = status.as_object_mut().and_then(|map| map.remove("swarm"));
+        // A pending security release (ADR 0030): its own line, last, where
+        // it is seen.
+        let security = status
+            .get_mut("update")
+            .and_then(|u| u.as_object_mut())
+            .and_then(|u| u.remove("notice"));
         let running = status["node"] == "running";
         for line in status_lines("", &status) {
             println!("{line}");
@@ -3523,6 +3533,9 @@ async fn status_command(config: &NodeConfig, json: bool) -> Result<()> {
             if let Some(notice) = ask["notice"].as_str() {
                 println!("unanswered: {notice}");
             }
+        }
+        if let Some(notice) = security.as_ref().and_then(|n| n.as_str()) {
+            println!("{notice}");
         }
     }
     Ok(())
@@ -4686,6 +4699,7 @@ impl NodeArgs {
         if self.hermetic || self.loopback {
             config.update.check = false;
             config.update.auto = false;
+            config.update.security_auto = false;
         }
         config.report_auto = file.report.crashes.unwrap_or(false);
         config.report_collector = match &file.report.collector {
@@ -5472,6 +5486,10 @@ fn banner_lines(config: &NodeConfig, agents: &[(String, wats::agent::AgentConfig
     }
     if agents.is_empty() {
         lines.push(format!("agent: off · {}", wats::firstrun::NO_AGENT_NOTICE));
+    }
+    // ADR 0030: the terminal line of a pending security release.
+    if let Some(notice) = wats::update::start_notice(&config.data_dir, &config.update) {
+        lines.push(notice);
     }
     if agents.len() > 1 {
         lines.push(format!(
@@ -6360,6 +6378,12 @@ async fn async_main(cli: Cli) -> Result<()> {
         Ok(Some(notice)) => tracing::warn!("{}", notice.message()),
         Ok(None) => {}
         Err(e) => tracing::warn!("safety settings could not be checked: {e:#}"),
+    }
+    // A security release this node does not run yet, from the cache of the
+    // daily check (ADR 0030): once per start, in the log (and in the
+    // banner, `banner_lines`). Nothing is checked or installed here.
+    if let Some(notice) = wats::update::start_notice(&data_dir, &config.update) {
+        tracing::warn!("{notice}");
     }
     for (member, (_, agent)) in members.iter().zip(&agents) {
         if member.settings.review == Some(true) && !config.review_profiles.contains(&agent.profile)

@@ -96,6 +96,13 @@ jobs:
         run: |
           shellcheck scripts/homebrew-formula.sh scripts/homebrew-release.sh scripts/test-homebrew.sh
           sh scripts/test-homebrew.sh
+      # The security floor of release.yml (ADR 0030): shellcheck, and its
+      # results on the CHANGELOG and on made-up ones.
+      - name: Security floor script
+        if: runner.os == 'Linux'
+        run: |
+          shellcheck scripts/security-floor.sh scripts/test-security-floor.sh
+          sh scripts/test-security-floor.sh
       # The rendered formula passes Homebrew's own style checks.
       - name: Homebrew formula style
         if: runner.os == 'macOS'

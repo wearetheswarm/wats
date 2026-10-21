@@ -16,7 +16,8 @@ name: release
 # MINISIGN_SECRET_KEY secret; without it the run fails
 # (docs/release-signing.md). Download: gh release download vX.Y.Z -R wearetheswarm/wats
 # The Linux leg also attaches install.sh and its .minisig, so that
-# releases/latest/download/install.sh is the latest release's installer.
+# releases/latest/download/install.sh is the latest release's installer,
+# and security.json and its .minisig: the security floor (ADR 0030).
 # Windows native comes once the node supports it.
 #
 # No `latest` tag: deployments pin a version (WATS_VERSION in the router .env).
@@ -106,6 +107,22 @@ jobs:
           cat "$name.tar.gz.sha256"
           echo "name=$name" >> "$GITHUB_OUTPUT"
 
+      # The security floor (ADR 0030): the newest version <= this one whose
+      # CHANGELOG section, read at this tag, has a "### Security" heading
+      # (0.0.0 if none), in security.json, signed below with the archives.
+      # A node older than the floor counts this release as a security
+      # release. No state: the CHANGELOG at the tag is enough.
+      - name: Security floor
+        id: floor
+        if: matrix.target == env.IMAGE_TARGET
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          floor="$(sh scripts/security-floor.sh "$VERSION" CHANGELOG.md)"
+          printf '{"version":"%s","security_floor":"%s"}\n' "$VERSION" "$floor" > security.json
+          cat security.json
+          echo "floor=$floor" >> "$GITHUB_OUTPUT"
+
       # Signing (docs/release-signing.md): the archive and its .sha256 get a
       # minisign .minisig each. The key is a password-less minisign secret
       # key held only in the MINISIGN_SECRET_KEY repo secret. Without it the
@@ -154,7 +171,8 @@ jobs:
       # a password fails here: stdin is closed, so minisign cannot prompt.
       # The Linux leg also signs install.sh, attached to the release so that
       # releases/latest/download/install.sh is the installer of the latest
-      # release (README).
+      # release (README), and security.json (its trusted comment names
+      # file:security.json, as the archives' name theirs).
       - name: Sign
         env:
           MINISIGN_SECRET_KEY: ${{ secrets.MINISIGN_SECRET_KEY }}
@@ -171,7 +189,7 @@ jobs:
           fi
           pub="$(tail -n 1 "$pubfile")"
           files=("$NAME.tar.gz" "$NAME.tar.gz.sha256")
-          if [ "$INSTALLER" = true ]; then files+=(install.sh); fi
+          if [ "$INSTALLER" = true ]; then files+=(install.sh security.json); fi
           for f in "${files[@]}"; do
             minisign -S -s "$key" -m "$f" < /dev/null
             minisign -V -P "$pub" -m "$f"
@@ -201,8 +219,31 @@ jobs:
           for f in "$NAME.tar.gz.minisig" "$NAME.tar.gz.sha256.minisig"; do
             if [ -f "$f" ]; then files+=("$f"); fi
           done
-          if [ "$INSTALLER" = true ]; then files+=(install.sh install.sh.minisig); fi
+          if [ "$INSTALLER" = true ]; then
+            files+=(install.sh install.sh.minisig security.json security.json.minisig)
+          fi
           gh release upload "$TAG" "${files[@]}" --clobber
+
+      # The notes' "Security:" line, which older nodes (and nodes that
+      # cannot read security.json) go by: added when this release is its
+      # own floor (its CHANGELOG section has "### Security") and the notes
+      # do not mark it already (ADR 0030).
+      - name: Mark a security release
+        if: github.event_name == 'release' && matrix.target == env.IMAGE_TARGET && steps.floor.outputs.floor == steps.version.outputs.version
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.event.release.tag_name }}
+        run: |
+          name="$(gh release view "$TAG" --json name -q .name)"
+          gh release view "$TAG" --json body -q .body > notes.md
+          if printf '%s\n' "$name" | grep -qiF '[security]' \
+            || grep -qiE '\[security\]|^[[:space:]]*security:' notes.md; then
+            echo "the release notes already mark a security release"
+            exit 0
+          fi
+          printf '\nSecurity: this release fixes security issues (the Security section of CHANGELOG.md).\n' >> notes.md
+          gh release edit "$TAG" --notes-file notes.md
+          echo "### Marked as a security release" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Keep as a workflow artifact (manual runs)
         if: github.event_name != 'release'
@@ -214,6 +255,8 @@ jobs:
             ${{ steps.package.outputs.name }}.tar.gz.sha256
             ${{ steps.package.outputs.name }}.tar.gz*.minisig
             install.sh.minisig
+            security.json
+            security.json.minisig
           retention-days: 7
 
       # Image: the static Linux binary built above, on distroless static.
