@@ -54,9 +54,13 @@ default is the way out (ADR 0018 §3).
 ## First run: `wats setup`
 
 The first `wats`, alone (no argument at all), on a terminal, with no
-`config.toml` in its data directory, runs the setup wizard (ADR 0026),
-then starts the node. `wats setup` with no tool runs it again. It asks,
-each with a default that Enter accepts:
+`config.toml` in its data directory, runs the setup wizard (ADR 0027),
+then starts the node. `wats setup` with no tool runs it again. It opens
+with a short welcome ("Every node is the swarm."), what wats is and the
+three steps, and ends with what was set up and how to talk to the node
+(`wats status`, `wats attach`, your MCP sessions); plain ASCII unless the
+locale is UTF-8, no color with `NO_COLOR`. It asks, each with a default
+that Enter accepts:
 
 1. The node's main choices, written to `config.toml`:
 

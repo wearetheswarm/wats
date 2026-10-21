@@ -1,4 +1,4 @@
-# 0026. The setup wizard of a bare `wats`, and setup revisions
+# 0027. The setup wizard of a bare `wats`, and setup revisions
 
 Status: Proposed (2026-10-21). Ships in 0.4.3.
 
@@ -9,12 +9,14 @@ wizard's last answer says so.
 Code: `crates/wats/src/firstrun.rs` (`SETUP_REVISION`, `stored_revision`,
 `catch_up`, `setup_for_wizard`), `crates/wats/src/main.rs` (`first_run`,
 `setup_wizard`, `offer_integrations`, `start_detached`, `wats setup` with
-no tool), `crates/wats/tests/setup_wizard.rs`.
+no tool), `crates/wats/src/welcome.rs` (its screens),
+`crates/wats/tests/setup_wizard.rs`.
 
 Source: requested by Vincent (2026-10-21): "running `wats` alone, with no
 argument, launches the setup wizard; and also on a version upgrade that
 needs new config (a flag, or a major bump? I prefer a flag, if the bump has
-nothing to do with config)."
+nothing to do with config)." The same day, he asked for a friendly welcome
+at its start ("Every node is the swarm") and a closing screen (§3).
 
 ## Context
 
@@ -84,7 +86,36 @@ as before, and never touches an MCP host's config.
    --detach` does and returns; no goes on to the foreground node. Not
    asked on native Windows, which has no `--detach` yet.
 
-### 3. Setup revisions
+### 3. Welcome and closing screens
+
+Only when the wizard runs (a bare `wats` the first time, `wats setup` with
+no tool, on a terminal), `crates/wats/src/welcome.rs` prints:
+
+- **A welcome** before the first question: a 4-line mark (three cells of
+  the hive) beside "Welcome to WeAreTheSwarm · wats <version>" and "Every
+  node is the swarm."; three lines on what wats is (your agents join a
+  swarm shared with everyone else's, ask, answer and build on what it
+  knows, from your machine and within your limits; your node keeps and
+  serves its copy); the three steps; that Enter accepts the defaults; on a
+  first run, the data directory and that any flag skips the wizard.
+- **A header per step**: "── Step 1 of 3 · The node's main choices ──",
+  "Your own agent sessions", "Where the node runs".
+- **A closing screen**: what was set up (config.toml, the agent or none,
+  the sessions wats was registered in, whether the node runs in the
+  background, starts in this terminal, or is not running and how to start
+  it), how to talk to the node (`wats status`, `wats attach`, `wats agent
+  logs -f` with an agent, "search the swarm for …" in the first host set
+  up), and the docs' address.
+
+Plain ASCII (`-` for `·` and `─`, `...` for `…`) unless the locale says
+UTF-8 (the first of `LC_ALL`, `LC_CTYPE`, `LANG` that is set); yellow for
+the mark and bold headers only where `banner::color_ok` allows (a
+terminal, no `NO_COLOR`, not `TERM=dumb`). Never printed without a
+terminal, nor before the catch-up questions after an upgrade, which keep
+their one-line header ("wats setup has new questions since this data
+directory was set up …").
+
+### 4. Setup revisions
 
 `SETUP_REVISION` (a `u32` in `firstrun.rs`, 1 in 0.4.3) is the revision of
 setup's questions. Each question carries the revision that added it. A

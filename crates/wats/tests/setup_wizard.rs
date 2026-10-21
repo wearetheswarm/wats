@@ -1,4 +1,4 @@
-//! The setup wizard of a bare `wats` (ADR 0026): run with no argument at
+//! The setup wizard of a bare `wats` (ADR 0027): run with no argument at
 //! all on a terminal, for a data directory never set up, and the setup
 //! revision. Hermetic: everything through WATS_* variables (an argument
 //! would skip the wizard), WATS_INFRA=none, a throwaway HOME, VIBE_HOME and
@@ -78,6 +78,10 @@ impl Machine {
             .env("USER", "alice")
             // No desktop session: no notify.desktop question.
             .env("SSH_CONNECTION", "test")
+            // A UTF-8 locale unless a test says otherwise.
+            .env("LANG", "en_US.UTF-8")
+            .env_remove("LC_ALL")
+            .env_remove("LC_CTYPE")
             .env_remove("CLAUDE_CONFIG_DIR")
             .env_remove("CODEX_HOME")
             .env_remove("WATS_CLAUDE")
@@ -174,6 +178,8 @@ fn text(bytes: &[u8]) -> String {
 }
 
 const BACKGROUND: &str = "Run the node in the background (`wats --detach`";
+/// The welcome screen, shown only by the wizard.
+const WELCOME: &str = "Every node is the swarm.";
 
 /// The first bare `wats` on a terminal: the main choices, then each MCP
 /// host found on PATH (Claude Code: registered through its CLI, with the
@@ -191,7 +197,32 @@ fn first_bare_wats_runs_the_wizard_then_the_node_in_the_background() {
     let out = child.wait_with_output().unwrap();
     let (said, err) = (text(&out.stdout), text(&out.stderr));
     assert!(out.status.success(), "{out:?}");
-    assert!(said.contains("first run, the setup wizard"), "{said}");
+    // The welcome, then the three steps, then the closing screen.
+    assert!(said.contains("Welcome to WeAreTheSwarm · wats "), "{said}");
+    assert!(said.contains(WELCOME), "{said}");
+    assert!(said.contains("This setup takes three steps:"), "{said}");
+    assert!(said.contains("First run in "), "{said}");
+    for header in [
+        "── Step 1 of 3 · The node's main choices ──",
+        "── Step 2 of 3 · Your own agent sessions ──",
+        "── Step 3 of 3 · Where the node runs ──",
+    ] {
+        assert!(said.contains(header), "{header}: {said}");
+    }
+    assert!(
+        !said.contains("wats setup: the node's main choices"),
+        "{said}"
+    );
+    assert!(said.contains("All set."), "{said}");
+    assert!(
+        said.contains("sessions   Claude Code, Mistral Vibe"),
+        "{said}"
+    );
+    assert!(said.contains("node       runs in the background"), "{said}");
+    assert!(
+        said.contains("from Claude Code    \"search the swarm for …\""),
+        "{said}"
+    );
     assert!(
         said.contains("Agent the node runs (agent.runtime) [claude]"),
         "{said}"
@@ -247,19 +278,34 @@ fn first_bare_wats_runs_the_wizard_then_the_node_in_the_background() {
     let child = machine.spawn(machine.wats(&[], true), "y\n");
     let (out, node) = machine.foreground(child);
     assert!(!text(&out.stdout).contains("]: "), "{out:?}");
+    assert!(!text(&out.stdout).contains(WELCOME), "{out:?}");
     assert_eq!(node["mode"], "foreground", "{node}");
 }
 
 /// Enter for every question: no agent CLI it can run (Vibe only: an MCP
 /// host), Vibe registered, the node in this terminal, as a bare `wats`
-/// always ran.
+/// always ran. Not a UTF-8 locale, and NO_COLOR: the screens in plain
+/// ASCII.
 #[test]
 fn wizard_defaults_run_the_node_in_the_foreground() {
     let machine = Machine::new();
     machine.fake_cli("vibe");
-    let child = machine.spawn(machine.wats(&[], true), "");
+    let mut command = machine.wats(&[], true);
+    command.env("LANG", "C").env("NO_COLOR", "1");
+    let child = machine.spawn(command, "");
     let (out, node) = machine.foreground(child);
     let said = text(&out.stdout);
+    assert!(said.contains("Welcome to WeAreTheSwarm - wats "), "{said}");
+    assert!(
+        said.contains("-- Step 2 of 3 - Your own agent sessions --"),
+        "{said}"
+    );
+    assert!(
+        said.contains("node       starts in this terminal now"),
+        "{said}"
+    );
+    let screens = &said[..said.find("Agent CLIs found").unwrap()];
+    assert!(screens.is_ascii() && !said.contains('\x1b'), "{said}");
     assert!(said.contains("No agent CLI found"), "{said}");
     assert!(
         said.contains("Mistral Vibe: wats MCP server added to"),
@@ -280,6 +326,7 @@ fn bare_wats_without_a_terminal_runs_the_node_as_before() {
     let (out, node) = machine.foreground(child);
     let said = text(&out.stdout);
     assert!(!said.contains("]: "), "{said}");
+    assert!(!said.contains(WELCOME), "{said}");
     assert!(
         text(&out.stderr).contains("first run: wrote the default config"),
         "{out:?}"
@@ -301,6 +348,7 @@ fn any_argument_skips_the_wizard() {
     let child = machine.spawn(machine.wats(&["--infra", "none"], true), "y\ny\ny\n");
     let (out, _) = machine.foreground(child);
     assert!(!text(&out.stdout).contains("]: "), "{out:?}");
+    assert!(!text(&out.stdout).contains(WELCOME), "{out:?}");
     assert!(machine.calls().is_empty(), "{}", machine.calls());
     assert!(!machine.path("vibe/config.toml").exists());
 }
@@ -316,6 +364,7 @@ fn a_configured_data_dir_without_a_revision_is_not_asked_again() {
     let (out, _) = machine.foreground(child);
     assert!(!text(&out.stdout).contains("]: "), "{out:?}");
     assert!(!text(&out.stderr).contains("new question"), "{out:?}");
+    assert!(!text(&out.stdout).contains(WELCOME), "{out:?}");
     assert_eq!(machine.revision(), None);
 }
 
@@ -339,6 +388,7 @@ fn an_older_revision_asks_only_the_new_questions() {
         let child = machine.spawn(machine.wats(args, terminal), "20G\n");
         let (out, _) = machine.foreground(child);
         assert!(!text(&out.stdout).contains("]: "), "{args:?}: {out:?}");
+        assert!(!text(&out.stdout).contains(WELCOME), "{args:?}: {out:?}");
         assert!(text(&out.stderr).contains(hint), "{args:?}: {out:?}");
         assert_eq!(machine.revision().as_deref(), Some("0\n"));
     }
@@ -352,6 +402,11 @@ fn an_older_revision_asks_only_the_new_questions() {
     );
     assert!(said.contains("(storage.max) [10G]"), "{said}");
     assert!(!said.contains("Mistral Vibe"), "{said}");
+    // A one-line header, not the welcome.
+    assert!(
+        !said.contains(WELCOME) && !said.contains("All set."),
+        "{said}"
+    );
     assert!(!said.contains(BACKGROUND), "{said}");
     assert_eq!(node["mode"], "foreground", "{node}");
     assert_eq!(machine.revision().as_deref(), Some("1\n"));
@@ -372,8 +427,14 @@ fn wats_setup_with_no_tool_is_the_wizard() {
         .unwrap();
     let said = text(&out.stdout);
     assert!(out.status.success(), "{out:?}");
+    assert!(said.contains(WELCOME), "{said}");
     assert!(
-        said.contains("wats setup: the node's main choices"),
+        said.contains("3. The node: whether to start it now, in the background."),
+        "{said}"
+    );
+    assert!(!said.contains("First run in "), "{said}");
+    assert!(
+        said.contains("── Step 1 of 3 · The node's main choices ──"),
         "{said}"
     );
     assert!(
@@ -384,13 +445,26 @@ fn wats_setup_with_no_tool_is_the_wizard() {
         said.contains("Start the node in the background now (`wats --detach`)? [y/N]"),
         "{said}"
     );
+    assert!(said.contains("All set."), "{said}");
+    assert!(
+        said.contains("node       not running: start it with wats --dir "),
+        "{said}"
+    );
     assert!(machine.running().is_none());
     assert_eq!(machine.revision().as_deref(), Some("1\n"));
-    // Without a terminal: the main choices only, and the hint.
+    // Without a terminal: the main choices only, and the hint; no screens.
     std::fs::remove_file(machine.path("vibe/config.toml")).unwrap();
     let out = machine.wats(&["setup"], false).output().unwrap();
     let said = text(&out.stdout);
     assert!(out.status.success(), "{out:?}");
+    assert!(
+        said.contains("wats setup: the node's main choices"),
+        "{said}"
+    );
     assert!(said.contains("wats setup vibe --mcp (running it"), "{said}");
+    assert!(
+        !said.contains(WELCOME) && !said.contains("All set."),
+        "{said}"
+    );
     assert!(!machine.path("vibe/config.toml").exists());
 }

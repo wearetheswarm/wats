@@ -5,7 +5,7 @@
 //! its data directory asks them on a terminal ([`setup`]), or writes the
 //! defaults, commented, without one ([`write_default`]: daemons,
 //! containers, services). A bare `wats` (no argument at all) on a terminal
-//! runs the whole setup wizard instead (ADR 0026, in `main.rs`): these
+//! runs the whole setup wizard instead (ADR 0027, in `main.rs`): these
 //! choices ([`setup_for_wizard`]), then the MCP hosts found, then the
 //! background or this terminal. `wats mcp` and the background node it starts
 //! never do either: an MCP-only user keeps a data directory without
@@ -16,7 +16,7 @@
 //! agent's run time, turn and spend limits, its access level, and `nets`.
 //!
 //! Each question carries the setup revision that added it
-//! ([`SETUP_REVISION`], ADR 0026): `<data dir>/setup-revision` records the
+//! ([`SETUP_REVISION`], ADR 0027): `<data dir>/setup-revision` records the
 //! revision the last setup completed, so that a release adding questions
 //! asks only those ([`catch_up`]) instead of the whole setup again.
 
@@ -70,7 +70,7 @@ const NOT_FOR_OPENCLAW: [&str; 4] = [
     "agent.access",
 ];
 
-/// The revision of setup's questions (ADR 0026). A release bumps it only
+/// The revision of setup's questions (ADR 0027). A release bumps it only
 /// when it adds a question, which then carries the new value as its
 /// `since`: `wats` on a terminal asks the questions newer than the
 /// revision a data directory last completed ([`catch_up`]), and says so in
@@ -652,12 +652,12 @@ pub fn setup_with(
     path: Option<&OsStr>,
     desktop: bool,
 ) -> Result<Choices> {
-    let (choices, found) = ask_and_write(data_dir, input, out, path, desktop, 0)?;
+    let (choices, found) = ask_and_write(data_dir, input, out, path, desktop, 0, true)?;
     next_steps(out, &choices, &found, true)?;
     Ok(choices)
 }
 
-/// [`setup`] for the setup wizard (ADR 0026), which asks next whether
+/// [`setup`] for the setup wizard (ADR 0027), which asks next whether
 /// to register wats in the MCP hosts found: the hints to run `wats setup
 /// <tool> --mcp` are left out. Returns the choices and the agent CLIs found.
 pub fn setup_for_wizard(
@@ -673,6 +673,7 @@ pub fn setup_for_wizard(
         path,
         crate::desktop::this_desktop_session(),
         0,
+        false,
     )?;
     next_steps(out, &choices, &found, false)?;
     Ok((choices, found))
@@ -711,7 +712,7 @@ pub fn catch_up_with(
         "wats setup has new questions since this data directory was set up (setup revision \
          {revision}, now {SETUP_REVISION}). Enter accepts the [default]."
     )?;
-    let (choices, _) = ask_and_write(data_dir, input, out, path, desktop, revision)?;
+    let (choices, _) = ask_and_write(data_dir, input, out, path, desktop, revision, false)?;
     Ok(choices)
 }
 
@@ -724,10 +725,11 @@ fn ask_and_write(
     path: Option<&OsStr>,
     desktop: bool,
     revision: u32,
+    header: bool,
 ) -> Result<(Choices, Vec<Found>)> {
     let settings = Settings::load(data_dir)?;
     let found = detect_agents(path);
-    let mut choices = if revision == 0 {
+    let mut choices = if revision == 0 && header {
         prompt(input, out, &found, &settings)?
     } else {
         prompt_after(input, out, &found, &settings, &QUESTIONS, revision)?
