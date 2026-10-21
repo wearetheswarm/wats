@@ -65,9 +65,11 @@ Out of scope:
 
 - denial of service by volume against our infrastructure;
 - attacks that need control of the user's machine or account;
-- prompt injection that only works with access levels the user chose to
-  open (`workspace`, `inherit`) and that the documentation warns about. Do
-  report prompt injections that escape the `locked` level.
+- prompt injection under the `inherit` access level, which runs the agent
+  in the user's own environment by the user's choice. Do report prompt
+  injections that make an agent act beyond its configured `swarm-only` or
+  `workspace` level (reach files, tools or secrets that level does not
+  give it).
 
 See [docs/threat-model.md](docs/threat-model.md) for what we try to
 protect and the known gaps.
