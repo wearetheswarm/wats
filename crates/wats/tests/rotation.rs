@@ -180,6 +180,13 @@ fn assert_cut_honest(node: &Node, stored: &[Event], kept: &[Event], trimmed: &[S
     cut
 }
 
+/// `fut`, or a panic naming `what` after 30 s: no test step waits forever.
+async fn within<T>(what: &str, fut: impl std::future::Future<Output = T>) -> T {
+    tokio::time::timeout(Duration::from_secs(30), fut)
+        .await
+        .unwrap_or_else(|_| panic!("timed out: {what}"))
+}
+
 async fn eventually<T>(what: &str, secs: u64, mut check: impl FnMut() -> Option<T>) -> T {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(secs);
     loop {
@@ -234,7 +241,8 @@ async fn call(client: &Client, tool: &'static str, args: Value) -> CallToolResul
 }
 
 /// Soak: a node with a 2 MiB events share takes 2,000 new posts while its
-/// rotation runs by itself every 50 ms. It never goes over its share. A key
+/// rotation runs by itself every 50 ms. It is never more than 10 % over its
+/// share while runs catch up, and under it once they are done. A key
 /// holding much of the old history is trimmed first (stage 0), old bodies
 /// go (stage 1), then old rows (stage 2) and the cut rises; what is never
 /// dropped is all there.
@@ -280,15 +288,22 @@ async fn the_store_stays_under_its_share_while_traffic_flows() -> anyhow::Result
         tokio::time::sleep(Duration::from_millis(40)).await;
         let bytes = b.store().store_bytes();
         max_seen = max_seen.max(bytes);
+        // Inserts go on while a run works: with a share this small, the
+        // posts of a few rounds (25 % of the share a second) can land before
+        // a run frees space, more so on a loaded machine. Never 10 % over,
+        // and under the share once the runs are done (below; the
+        // deterministic soak checks every round).
+        let bound = share / 100 * 110;
         assert!(
-            bytes <= share,
-            "round {round}: {bytes} store bytes over the {share} share"
+            bytes <= bound,
+            "round {round}: {bytes} store bytes over {bound} (share {share})"
         );
     }
     eventually("the last rotation done", 30, || {
         (b.rotation_json()["state"] == "idle").then_some(())
     })
     .await;
+    assert!(b.store().store_bytes() <= share);
     let runs = b.store().rotation_runs()?;
     assert!(runs.len() >= 3, "it rotated several times: {runs:?}");
     assert!(runs.iter().map(|r| r.trimmed).sum::<u64>() > 0, "{runs:?}");
@@ -329,6 +344,59 @@ async fn the_store_stays_under_its_share_while_traffic_flows() -> anyhow::Result
             .search(Some("remembers"), &Default::default(), 5)?
             .is_empty()
     );
+    b.shutdown().await?;
+    Ok(())
+}
+
+/// The deterministic soak: a node with a 2 MiB events share takes 2,000
+/// new posts, a round of 25 at a time, rotating whenever it reaches 95 %
+/// after a round. It is never over its share.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_store_never_goes_over_its_share_round_by_round() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let b_dir = dir.path().join("b");
+    in_sync(&b_dir)?;
+    let own = own_key(&b_dir)?;
+    let now = now_secs();
+    let kept = protected(&own, now - 60 * DAY);
+    let old: Vec<Event> = (0..150)
+        .map(|i| note(i, 100 + i % 50, now - 30 * DAY + u64::from(i) * 600, true))
+        .collect();
+    let mut b_config = config(&b_dir, &[]);
+    b_config.storage_max = Some(8 * MIB);
+    b_config.events_share = 25;
+    let b = Node::start(b_config).await?;
+    let share = b.events_share().unwrap();
+    hold(b.store(), &kept);
+    hold(b.store(), &old);
+    let mut stored = old.clone();
+    for round in 0..80u32 {
+        let live: Vec<Event> = (0..25u32)
+            .map(|i| {
+                let n = 1_000 + round * 25 + i;
+                note(
+                    n,
+                    1_000 + n % 300,
+                    now - 2 * DAY + u64::from(n) * 50,
+                    n % 3 == 0,
+                )
+            })
+            .collect();
+        hold(b.store(), &live);
+        stored.extend(live);
+        b.rotate_if_full().await?;
+        let bytes = b.store().store_bytes();
+        assert!(
+            bytes <= share,
+            "round {round}: {bytes} store bytes over the {share} share"
+        );
+    }
+    let runs = b.store().rotation_runs()?;
+    assert!(runs.len() >= 3, "{runs:?}");
+    assert!(runs.iter().map(|r| r.bodies).sum::<u64>() > 0, "{runs:?}");
+    assert!(runs.iter().map(|r| r.rows).sum::<u64>() > 0, "{runs:?}");
+    assert_protected(&b, &kept);
+    assert_cut_honest(&b, &stored, &kept, &[]);
     b.shutdown().await?;
     Ok(())
 }
@@ -761,6 +829,12 @@ async fn many_tombstones_leave_room_for_opaque_events() -> anyhow::Result<()> {
 /// decision 4).
 #[tokio::test(flavor = "multi_thread")]
 async fn an_evicted_body_comes_back_on_read_only() -> anyhow::Result<()> {
+    // The node logs, shown when the test fails.
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter("wats=debug")
+        .with_ansi(false)
+        .with_test_writer()
+        .try_init();
     let dir = tempfile::tempdir()?;
     let a_dir = dir.path().join("a");
     in_sync(&a_dir)?;
@@ -780,28 +854,36 @@ async fn an_evicted_body_comes_back_on_read_only() -> anyhow::Result<()> {
     assert!(evicted(&b));
     // Pushed again (gossip, a local publish): refused, the tombstone stays.
     let full = serde_json::to_value(&post)?;
-    assert!(b.publish_signed(full.clone()).await.is_err());
+    assert!(
+        within("a push", b.publish_signed(full.clone()))
+            .await
+            .is_err()
+    );
     assert!(evicted(&b));
     // A replicate push.
     let push = Request::Replicate {
         event: full,
         hashes: vec![],
     };
-    let answer = wats::proto::call_solving(a.endpoint(), b.endpoint_id(), &push).await?;
+    let answer = within(
+        "a replicate",
+        wats::proto::call_solving(a.endpoint(), b.endpoint_id(), &push),
+    )
+    .await?;
     assert!(matches!(answer, Response::Replicated { .. }), "{answer:?}");
     assert!(evicted(&b));
     // A sync page.
-    b.sync_from(a.endpoint_id(), PUBLIC_NET).await?;
+    within("a sync page", b.sync_from(a.endpoint_id(), PUBLIC_NET)).await?;
     assert!(evicted(&b));
     // A read fetches it back.
-    let client = client_for(&b).await;
-    let read = call(&client, "read", json!({"id": post.id})).await;
+    let client = within("an MCP client", client_for(&b)).await;
+    let read = within("read", call(&client, "read", json!({"id": post.id}))).await;
     assert_ne!(read.is_error, Some(true), "{read:?}");
     eventually("the body is back", 10, || (!evicted(&b)).then_some(())).await;
     assert!(b.store().drop_record(&post.id)?.is_none());
-    client.cancel().await?;
+    within("the client stops", client.cancel()).await?;
     for node in [b, a] {
-        node.shutdown().await?;
+        within("a shutdown", node.shutdown()).await?;
     }
     Ok(())
 }

@@ -179,20 +179,22 @@ CREATE TABLE IF NOT EXISTS blob_retained (
     at     INTEGER NOT NULL
 ) WITHOUT ROWID;
 
--- The blobs each full event lists (ADR 0025 PR B review): which blobs a
--- kept post still lists, found by index. Filled on insert, cleared with the
--- body; rows a release before 0.4.3 stored are indexed at open, from the
--- `seq` recorded in `store_meta` (`event_blobs_seq`).
+-- The blobs each kept full event lists (ADR 0025 PR B review, ADR 0029,
+-- one definition shared with #183): one row per `blobs[].hash` of a full
+-- event; tombstones and opaque events have none. Filled on insert, cleared
+-- with the body or the row; rows a release before stored are indexed at
+-- open, from `event_blobs_filled.upto`.
 CREATE TABLE IF NOT EXISTS event_blobs (
     hash TEXT NOT NULL,
-    seq  INTEGER NOT NULL,
+    seq  INTEGER NOT NULL REFERENCES events (seq),
     PRIMARY KEY (hash, seq)
 ) WITHOUT ROWID;
 CREATE INDEX IF NOT EXISTS event_blobs_seq ON event_blobs (seq);
+CREATE TABLE IF NOT EXISTS event_blobs_filled (upto INTEGER NOT NULL);
 
 -- Small values the store keeps about itself (0.4.3): what the opaque
--- quota counted and up to which `seq`, how far `event_blobs` is filled,
--- whether rotation ever dropped history.
+-- quota counted and up to which `seq`, whether rotation ever dropped
+-- history.
 CREATE TABLE IF NOT EXISTS store_meta (
     key   TEXT PRIMARY KEY,
     value INTEGER NOT NULL
@@ -348,6 +350,7 @@ fn delete_opaque_row(tx: &rusqlite::Transaction<'_>, seq: i64) -> Result<()> {
         [seq],
     )?;
     tx.execute("DELETE FROM event_refs WHERE seq = ?", [seq])?;
+    tx.execute("DELETE FROM event_blobs WHERE seq = ?", [seq])?;
     tx.execute("DELETE FROM events WHERE seq = ?", [seq])?;
     Ok(())
 }
@@ -928,7 +931,8 @@ impl Store {
             // ("b3:<nonce>"), and the bare decimal nonce is invalid. The store
             // is a cache of the swarm: drop them, the node syncs again.
             conn.execute_batch(
-                "DELETE FROM event_tags; DELETE FROM event_refs; DELETE FROM events;
+                "DELETE FROM event_tags; DELETE FROM event_refs; DELETE FROM event_blobs;
+                 DELETE FROM event_blobs_filled; DELETE FROM events;
                  DELETE FROM sync_state; INSERT INTO events_fts (events_fts) VALUES ('rebuild');",
             )?;
         }
@@ -3175,23 +3179,39 @@ fn opaque_bytes_at_open(conn: &Connection, now: u64) -> Result<u64> {
     Ok(value)
 }
 
-/// Index the blobs of the full events above the last `seq` indexed
-/// (`event_blobs`), in steps: at the first open of 0.4.3 that is every
-/// event; afterwards only those an older release may have stored since.
+/// Index the blobs of the full events above `event_blobs_filled.upto`, in
+/// transactions of 5,000 events: at the first open, every event; afterwards
+/// only those an older release may have stored since.
 fn backfill_event_blobs(conn: &Connection) -> Result<()> {
-    let mut lo = meta(conn, "event_blobs_seq")?.unwrap_or(0);
+    let upto: Option<i64> = conn
+        .query_row("SELECT max(upto) FROM event_blobs_filled", [], |r| r.get(0))
+        .optional()?
+        .flatten();
+    let mut lo = upto.unwrap_or(0);
     let max: i64 = conn.query_row("SELECT COALESCE(max(seq), 0) FROM events", [], |r| r.get(0))?;
     while lo < max {
-        let hi = lo.saturating_add(20_000).min(max);
-        conn.execute(
-            "INSERT OR IGNORE INTO event_blobs (hash, seq)
-             SELECT json_extract(b.value, '$.hash'), e.seq
-             FROM events e, json_each(e.json, '$.blobs') b
-             WHERE e.seq > ?1 AND e.seq <= ?2 AND e.opaque = 0
-               AND json_type(b.value, '$.hash') = 'text'",
-            params![lo, hi],
-        )?;
-        set_meta(conn, "event_blobs_seq", hi)?;
+        let hi = lo.saturating_add(5_000).min(max);
+        conn.execute_batch("BEGIN")?;
+        let step = (|| -> Result<()> {
+            conn.execute(
+                "INSERT OR IGNORE INTO event_blobs (hash, seq)
+                 SELECT json_extract(b.value, '$.hash'), e.seq
+                 FROM events e, json_each(e.json, '$.blobs') b
+                 WHERE e.seq > ?1 AND e.seq <= ?2 AND e.opaque = 0
+                   AND json_type(b.value, '$.hash') = 'text'",
+                params![lo, hi],
+            )?;
+            conn.execute("DELETE FROM event_blobs_filled", [])?;
+            conn.execute("INSERT INTO event_blobs_filled (upto) VALUES (?)", [hi])?;
+            Ok(())
+        })();
+        match step {
+            Ok(()) => conn.execute_batch("COMMIT")?,
+            Err(e) => {
+                conn.execute_batch("ROLLBACK").ok();
+                return Err(e);
+            }
+        }
         lo = hi;
     }
     Ok(())
@@ -5819,9 +5839,10 @@ mod tests {
         let keep = Keep::default();
         let ids: Vec<String> = events[..1_000].iter().map(|e| e.id.clone()).collect();
         for chunk in ids.chunks(500) {
-            store
+            let done = store
                 .delete_rows(chunk, &keep, Deletion::Cut, 9_000)
                 .unwrap();
+            assert_eq!(done.rows, 500);
         }
         let after = store.store_bytes();
         eprintln!(
@@ -5844,7 +5865,9 @@ mod tests {
         let grown = std::fs::metadata(dir.path().join("events.sqlite"))
             .unwrap()
             .len();
-        assert!(grown <= size.max(full), "{size} -> {grown}");
+        // The 500 posts go into freed pages: the file barely grows (a few
+        // pages of index and full-text segments), far less than they weigh.
+        assert!(grown <= size.max(full) / 100 * 102, "{size} -> {grown}");
     }
 
     #[test]
@@ -5874,17 +5897,18 @@ mod tests {
             assert!(!store.blob_referenced(&b).unwrap());
             // As if an older release had stored the posts: no index.
             let conn = store.conn();
-            conn.execute_batch(
-                "DELETE FROM event_blobs; DELETE FROM store_meta WHERE key = 'event_blobs_seq'",
-            )
-            .unwrap();
+            conn.execute_batch("DELETE FROM event_blobs; DELETE FROM event_blobs_filled")
+                .unwrap();
         }
         let store = Store::open(&path).unwrap();
         assert!(store.blob_referenced(&a).unwrap(), "indexed again at open");
         assert!(!store.blob_referenced(&b).unwrap());
         let max = store.max_seq().unwrap();
-        let indexed = meta(&store.conn(), "event_blobs_seq").unwrap();
-        assert_eq!(indexed, Some(max));
+        let indexed: i64 = store
+            .conn()
+            .query_row("SELECT upto FROM event_blobs_filled", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(indexed, max);
         let keep = Keep::default();
         let done = store
             .delete_rows(std::slice::from_ref(&first.id), &keep, Deletion::Cut, 30)

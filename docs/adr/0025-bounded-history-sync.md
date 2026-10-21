@@ -1231,15 +1231,16 @@ backoff), `crates/wats/src/store.rs` (`Keep`, `evict_bodies`,
 effect)
 
 - **Which blobs a kept post lists** is an index, `event_blobs (hash,
-  seq)`, filled on insert of a full event, cleared when its body is
-  dropped or its row deleted (like `event_tags`). The rows of a release
-  before 0.4.3, or of a downgraded node meanwhile, are indexed at open,
-  from the `seq` recorded in `store_meta` (`event_blobs_seq`), in steps
-  of 20,000. An entry whose row is gone or no longer full counts for
-  nothing. A batch's hashes are checked in one query. The blob
-  collection still reads every kept event (`referenced_blobs`), as
-  before. (ADR 0029, PR #183, needs the same lookup: one table, one
-  definition, aligned with it.)
+  seq)`, one definition shared with ADR 0029 (#183): one row per
+  `blobs[].hash` of a kept full event, none for tombstones and opaque
+  events; filled on insert, cleared when a body is dropped or a row
+  deleted (`drop_body`, `delete_opaque_row`, rotation's `delete_rows`,
+  the v1–v3 wipe). The rows of an older release, or of a downgraded node
+  meanwhile, are indexed at open from `event_blobs_filled.upto`, in
+  transactions of 5,000 events. An entry whose row is gone or no longer
+  full counts for nothing. A batch's hashes are checked in one query. The
+  blob collection still reads every kept event (`referenced_blobs`), as
+  before.
 - When rotation drops or deletes the last full post that lists a blob,
   the blob goes to `unpin_pending`, in the same transaction. After it, or
   at the next run after a crash, each one is settled, on blocking threads:
@@ -1284,7 +1285,8 @@ effect)
   node advertises.
 - Every new table and index is created on open (`CREATE ... IF NOT
   EXISTS`): `local_keys`, `key_first`, `unpin_pending`, `blob_retained`,
-  `rotation_log`, `event_blobs`, `store_meta`, and the index
+  `rotation_log`, `event_blobs` and `event_blobs_filled`, `store_meta`,
+  and the index
   `events_author_ts (author, ts, id)`. No schema bump; 0.4.2 still opens
   the store (it then ignores them; the next 0.4.3 open catches up on the
   rows it stored).
