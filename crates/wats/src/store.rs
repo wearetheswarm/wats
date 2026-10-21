@@ -139,7 +139,96 @@ CREATE TABLE IF NOT EXISTS seen_peers (
     peer         TEXT PRIMARY KEY,
     history_full INTEGER NOT NULL
 ) WITHOUT ROWID;
+
+-- The blobs each kept full event lists by hash (ADR 0029, 0.4.3): which
+-- events list a blob, found without reading every event. One row per
+-- (hash, event); a tombstone or an opaque event has none. Filled on
+-- insert, emptied on drop and delete, and backfilled at open from
+-- `event_blobs_filled` on: no schema bump, so 0.4.2 still opens the store,
+-- and what an older release inserted meanwhile is filled at the next open.
+CREATE TABLE IF NOT EXISTS event_blobs (
+    hash TEXT NOT NULL,
+    seq  INTEGER NOT NULL REFERENCES events (seq),
+    PRIMARY KEY (hash, seq)
+) WITHOUT ROWID;
+CREATE INDEX IF NOT EXISTS event_blobs_seq ON event_blobs (seq);
+-- The highest `seq` the backfill of `event_blobs` covered (one row).
+CREATE TABLE IF NOT EXISTS event_blobs_filled (
+    upto INTEGER NOT NULL
+);
+
+-- Blobs kept as replicas when the body that listed them was evicted (ADR
+-- 0029 §5): a later retraction, erasure, label or `wats drop` of that
+-- post releases them, unless a kept event lists them. `k`: the replicas
+-- the blob wanted when evicted (5 for knowledge; the post is a tombstone
+-- since, so knowledge cannot be computed again). `due`: when repair looks
+-- at it next (Unix seconds).
+CREATE TABLE IF NOT EXISTS evicted_replicas (
+    id   TEXT NOT NULL,
+    hash TEXT NOT NULL,
+    k    INTEGER NOT NULL DEFAULT 0,
+    due  INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (id, hash)
+) WITHOUT ROWID;
+CREATE INDEX IF NOT EXISTS evicted_replicas_due ON evicted_replicas (due);
 "#;
+
+/// Events whose blobs one backfill transaction of `event_blobs` indexes.
+const EVENT_BLOBS_BATCH: i64 = 5_000;
+
+/// Index the blobs of the full event at `seq` (`json`) in `event_blobs`.
+fn index_blobs(tx: &Connection, seq: i64, json: &str) -> Result<()> {
+    tx.execute(
+        "INSERT OR IGNORE INTO event_blobs (hash, seq)
+         SELECT json_extract(b.value, '$.hash'), ?1 FROM json_each(?2, '$.blobs') b
+         WHERE json_extract(b.value, '$.hash') IS NOT NULL",
+        params![seq, json],
+    )?;
+    Ok(())
+}
+
+/// Fill `event_blobs` for the full events above its backfill mark, in
+/// transactions of [`EVENT_BLOBS_BATCH`] events.
+fn backfill_event_blobs(conn: &Connection) -> Result<()> {
+    let mut upto: i64 = conn
+        .query_row("SELECT upto FROM event_blobs_filled", [], |r| r.get(0))
+        .optional()?
+        .unwrap_or(0);
+    let last: i64 = conn.query_row("SELECT COALESCE(MAX(seq), 0) FROM events", [], |r| r.get(0))?;
+    if conn
+        .query_row("SELECT 1 FROM event_blobs_filled", [], |_| Ok(()))
+        .optional()?
+        .is_none()
+    {
+        conn.execute("INSERT INTO event_blobs_filled (upto) VALUES (?)", [upto])?;
+    }
+    while upto < last {
+        let next = upto.saturating_add(EVENT_BLOBS_BATCH).min(last);
+        conn.execute_batch("BEGIN")?;
+        let done = (|| -> Result<()> {
+            conn.execute(
+                "INSERT OR IGNORE INTO event_blobs (hash, seq)
+                 SELECT json_extract(b.value, '$.hash'), e.seq FROM events e,
+                     json_each(e.json, '$.blobs') b
+                 WHERE e.seq > ?1 AND e.seq <= ?2 AND e.opaque = 0
+                     AND json_extract(b.value, '$.hash') IS NOT NULL",
+                params![upto, next],
+            )?;
+            conn.execute("DELETE FROM event_blobs_filled", [])?;
+            conn.execute("INSERT INTO event_blobs_filled (upto) VALUES (?)", [next])?;
+            Ok(())
+        })();
+        match done {
+            Ok(()) => conn.execute_batch("COMMIT")?,
+            Err(e) => {
+                conn.execute_batch("ROLLBACK").ok();
+                return Err(e);
+            }
+        }
+        upto = next;
+    }
+    Ok(())
+}
 
 /// SQL condition on a row `e` of the thread rooted at `?1`: not grafted
 /// (B9). A reply belongs to the thread only if its network is the root's
@@ -158,7 +247,7 @@ fn insert_opaque_row(
     json: &str,
     received_at: u64,
 ) -> Result<usize> {
-    Ok(conn.execute(
+    let changed = conn.execute(
         "INSERT OR IGNORE INTO events (id, author, ts, net, thread, parent, kind, text, tags, json, received_at, v, opaque)
          VALUES (?, ?, ?, ?, ?, ?, ?, '', '', ?, ?, ?, 1)",
         params![
@@ -173,18 +262,44 @@ fn insert_opaque_row(
             received_at as i64,
             raw.v as i64,
         ],
-    )?)
+    )?;
+    if changed > 0 {
+        // An opaque row lists no blob: the backfill mark moves past it.
+        // `last_insert_rowid` stays the insert's.
+        advance_filled(conn, conn.last_insert_rowid())?;
+    }
+    Ok(changed)
 }
 
 /// Whether a kept full event lists blob `hash`.
 fn blob_referenced(conn: &Connection, hash: &str) -> Result<bool> {
     Ok(conn.query_row(
-        "SELECT EXISTS (SELECT 1 FROM events e WHERE e.opaque = 0 AND instr(e.json, ?1) > 0
-             AND EXISTS (SELECT 1 FROM json_each(e.json, '$.blobs') b
-                         WHERE json_extract(b.value, '$.hash') = ?1))",
+        "SELECT EXISTS (SELECT 1 FROM event_blobs b JOIN events e ON e.seq = b.seq
+             WHERE b.hash = ?1 AND e.opaque = 0)",
         [hash],
         |r| r.get(0),
     )?)
+}
+
+/// Whether a replica kept through the eviction of a post other than
+/// `id` holds blob `hash` (ADR 0029 §4).
+fn blob_retained_elsewhere(conn: &Connection, hash: &str, id: &str) -> Result<bool> {
+    Ok(conn.query_row(
+        "SELECT EXISTS (SELECT 1 FROM evicted_replicas WHERE hash = ?1 AND id <> ?2)",
+        params![hash, id],
+        |r| r.get(0),
+    )?)
+}
+
+/// Advance the backfill mark of `event_blobs` past `seq` when it is the
+/// next one (N7): a restart then re-scans only what an older release
+/// inserted meanwhile.
+fn advance_filled(conn: &Connection, seq: i64) -> Result<()> {
+    conn.execute(
+        "UPDATE event_blobs_filled SET upto = ?1 WHERE upto = ?1 - 1",
+        [seq],
+    )?;
+    Ok(())
 }
 
 /// Most keys walked back along a rotation chain (ADR 0010 A5): enough
@@ -252,6 +367,7 @@ fn delete_opaque_row(tx: &rusqlite::Transaction<'_>, seq: i64) -> Result<()> {
         [seq],
     )?;
     tx.execute("DELETE FROM event_refs WHERE seq = ?", [seq])?;
+    tx.execute("DELETE FROM event_blobs WHERE seq = ?", [seq])?;
     tx.execute("DELETE FROM events WHERE seq = ?", [seq])?;
     Ok(())
 }
@@ -720,6 +836,25 @@ impl Store {
                  DROP TABLE IF EXISTS events_fts;",
             )?;
         }
+        // `evicted_replicas` from a build that had no `k` or `due` (never
+        // released, but cheap to bring along).
+        for column in ["k", "due"] {
+            let has: bool = conn.query_row(
+                "SELECT EXISTS (SELECT 1 FROM pragma_table_info('evicted_replicas') WHERE name = ?)",
+                [column],
+                |r| r.get(0),
+            )?;
+            let table: bool = conn.query_row(
+                "SELECT EXISTS (SELECT 1 FROM sqlite_master WHERE name = 'evicted_replicas')",
+                [],
+                |r| r.get(0),
+            )?;
+            if table && !has {
+                conn.execute_batch(&format!(
+                    "ALTER TABLE evicted_replicas ADD COLUMN {column} INTEGER NOT NULL DEFAULT 0;"
+                ))?;
+            }
+        }
         conn.execute_batch(SCHEMA)?;
         if (1..4).contains(&version) {
             // v2 -> v3: the event format was hardened before the freeze (ADR
@@ -728,7 +863,8 @@ impl Store {
             // ("b3:<nonce>"), and the bare decimal nonce is invalid. The store
             // is a cache of the swarm: drop them, the node syncs again.
             conn.execute_batch(
-                "DELETE FROM event_tags; DELETE FROM event_refs; DELETE FROM events;
+                "DELETE FROM event_tags; DELETE FROM event_refs; DELETE FROM event_blobs;
+                 DELETE FROM events;
                  DELETE FROM sync_state; INSERT INTO events_fts (events_fts) VALUES ('rebuild');",
             )?;
         }
@@ -754,6 +890,7 @@ impl Store {
             )?;
         }
         conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+        backfill_event_blobs(&conn)?;
         let opaque_bytes: i64 = conn.query_row(
             "SELECT COALESCE(SUM(LENGTH(json)), 0) FROM events WHERE opaque = 1",
             [],
@@ -895,6 +1032,11 @@ impl Store {
                 ],
             )?;
             let seq = tx.last_insert_rowid();
+            index_blobs(&tx, seq, &String::from_utf8(event.to_json())?)?;
+            advance_filled(&tx, seq)?;
+            // A body taken back (an evicted one) lists its blobs again:
+            // the eviction's record of kept replicas is moot.
+            tx.execute("DELETE FROM evicted_replicas WHERE id = ?", [&event.id])?;
             for tag in event.tags.iter().take(INDEXED_TAGS) {
                 tx.execute(
                     "INSERT OR IGNORE INTO event_tags (seq, tag) VALUES (?, ?)",
@@ -984,8 +1126,37 @@ impl Store {
         detail: Option<&str>,
         now: u64,
     ) -> Result<DropOutcome> {
+        self.drop_body_keeping(id, reason, trigger, detail, now, &[])
+    }
+
+    /// [`Store::drop_body`], recording in the same transaction that the
+    /// replicas `keep` (hashes) stay with the post (ADR 0029 §4, N8): they
+    /// are not in `freed_blobs`, and a later drop of the post for another
+    /// reason releases them.
+    pub fn drop_body_keeping(
+        &self,
+        id: &str,
+        reason: DropReason,
+        trigger: Option<&str>,
+        detail: Option<&str>,
+        now: u64,
+        keep: &[(String, usize)],
+    ) -> Result<DropOutcome> {
         let mut conn = self.conn();
         let tx = conn.transaction()?;
+        // A stronger reason recorded meanwhile (an erasure or retraction
+        // landing while an eviction was planned) wins: an eviction never
+        // downgrades it, and keeps no replica under it.
+        let recorded: Option<String> = tx
+            .query_row("SELECT reason FROM dropped WHERE id = ?", [id], |r| {
+                r.get(0)
+            })
+            .optional()?;
+        let outranked = reason == DropReason::Evicted
+            && recorded
+                .as_deref()
+                .is_some_and(|r| r != DropReason::Evicted.as_str());
+        let keep: &[(String, usize)] = if outranked { &[] } else { keep };
         let row: Option<(i64, bool, String, String, String, String)> = tx
             .query_row(
                 "SELECT seq, opaque, title, text, tags, json FROM events WHERE id = ?",
@@ -1024,6 +1195,7 @@ impl Store {
             )?;
             tx.execute("DELETE FROM event_tags WHERE seq = ?", [seq])?;
             tx.execute("DELETE FROM event_refs WHERE seq = ?", [seq])?;
+            tx.execute("DELETE FROM event_blobs WHERE seq = ?", [seq])?;
             // Which of the human's clients posted it goes with the body.
             tx.execute("DELETE FROM ask_notify WHERE ask = ?", [id])?;
             tx.execute(
@@ -1039,23 +1211,54 @@ impl Store {
                 .flatten()
                 .filter_map(|b| b.get("hash").and_then(Value::as_str));
             for hash in hashes {
-                if !outcome.freed_blobs.iter().any(|h| h == hash) && !blob_referenced(&tx, hash)? {
+                if !outcome.freed_blobs.iter().any(|h| h == hash)
+                    && !keep.iter().any(|(h, _)| h == hash)
+                    && !blob_referenced(&tx, hash)?
+                    && !blob_retained_elsewhere(&tx, hash, id)?
+                {
                     outcome.freed_blobs.push(hash.to_string());
                 }
             }
         }
-        tx.execute(
-            "INSERT INTO dropped (id, reason, at, trigger, detail) VALUES (?1, ?2, ?3, ?4, ?5)
-             ON CONFLICT (id) DO UPDATE SET reason = excluded.reason, at = excluded.at,
-                 trigger = excluded.trigger, detail = excluded.detail",
-            params![
-                id,
-                reason.as_str(),
-                now.min(i64::MAX as u64) as i64,
-                trigger,
-                detail
-            ],
-        )?;
+        // Replicas kept when this body was evicted (ADR 0029 §5): any other
+        // reason releases them, unless a kept event lists them.
+        if reason != DropReason::Evicted {
+            let kept: Vec<String> = {
+                let mut stmt = tx.prepare("SELECT hash FROM evicted_replicas WHERE id = ?")?;
+                let rows = stmt.query_map([id], |r| r.get::<_, String>(0))?;
+                rows.collect::<rusqlite::Result<_>>()?
+            };
+            tx.execute("DELETE FROM evicted_replicas WHERE id = ?", [id])?;
+            for hash in kept {
+                if !outcome.freed_blobs.contains(&hash)
+                    && !blob_referenced(&tx, &hash)?
+                    && !blob_retained_elsewhere(&tx, &hash, id)?
+                {
+                    outcome.freed_blobs.push(hash);
+                }
+            }
+        }
+        for (hash, k) in keep {
+            tx.execute(
+                "INSERT INTO evicted_replicas (id, hash, k, due) VALUES (?, ?, ?, 0)
+                 ON CONFLICT (id, hash) DO UPDATE SET k = MAX(k, excluded.k)",
+                params![id, hash, *k as i64],
+            )?;
+        }
+        if !outranked {
+            tx.execute(
+                "INSERT INTO dropped (id, reason, at, trigger, detail) VALUES (?1, ?2, ?3, ?4, ?5)
+                 ON CONFLICT (id) DO UPDATE SET reason = excluded.reason, at = excluded.at,
+                     trigger = excluded.trigger, detail = excluded.detail",
+                params![
+                    id,
+                    reason.as_str(),
+                    now.min(i64::MAX as u64) as i64,
+                    trigger,
+                    detail
+                ],
+            )?;
+        }
         tx.commit()?;
         self.opaque_bytes.fetch_add(added, Ordering::Relaxed);
         Ok(outcome)
@@ -1223,6 +1426,174 @@ impl Store {
         let mut out = Vec::new();
         for row in rows {
             out.extend(row?);
+        }
+        Ok(out)
+    }
+
+    /// Every blob a kept full event lists, with the ids of at most
+    /// `per_blob` such events, oldest first: what replica repair walks (ADR
+    /// 0029), from `event_blobs`.
+    pub fn blob_listings(&self, per_blob: usize) -> Result<Vec<(String, Vec<String>)>> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare(
+            "SELECT b.hash, e.id FROM event_blobs b JOIN events e ON e.seq = b.seq
+                 WHERE e.opaque = 0 ORDER BY b.hash, b.seq",
+        )?;
+        let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+        let mut out: Vec<(String, Vec<String>)> = Vec::new();
+        for row in rows {
+            let (hash, id) = row?;
+            match out.last_mut() {
+                Some((last, ids)) if *last == hash => {
+                    if ids.len() < per_blob {
+                        ids.push(id);
+                    }
+                }
+                _ => out.push((hash, vec![id])),
+            }
+        }
+        Ok(out)
+    }
+
+    /// The kept full events that list blob `hash`, at most `limit`, oldest
+    /// first.
+    pub fn events_listing_blob(&self, hash: &str, limit: usize) -> Result<Vec<Stored>> {
+        self.query(
+            "SELECT e.seq, e.json FROM event_blobs b JOIN events e ON e.seq = b.seq
+                 WHERE b.hash = ?1 AND e.opaque = 0 ORDER BY e.seq LIMIT ?2",
+            vec![hash.to_string().into(), (limit as i64).into()],
+        )
+    }
+
+    /// The blobs a drop of event `id`'s body would free: those it lists
+    /// that no other kept full event lists ([`Store::drop_body`] frees
+    /// the same). Empty when `id` is not held in full.
+    pub fn blobs_freed_by(&self, id: &str) -> Result<Vec<String>> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare_cached(
+            "SELECT DISTINCT b.hash FROM events e JOIN event_blobs b ON b.seq = e.seq
+                 WHERE e.id = ?1 AND e.opaque = 0
+                     AND NOT EXISTS (SELECT 1 FROM event_blobs o JOIN events f ON f.seq = o.seq
+                         WHERE o.hash = b.hash AND f.opaque = 0 AND f.id <> ?1)",
+        )?;
+        let rows = stmt.query_map([id], |r| r.get::<_, String>(0))?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    /// Whether a kept full event lists blob `hash`.
+    pub fn blob_listed(&self, hash: &str) -> Result<bool> {
+        blob_referenced(&self.conn(), hash)
+    }
+
+    /// Whether this node keeps blob `hash` for a post: a kept full event
+    /// lists it, or a replica kept through an eviction holds it (N13).
+    pub fn blob_kept(&self, hash: &str) -> Result<bool> {
+        let conn = self.conn();
+        Ok(blob_referenced(&conn, hash)? || blob_retained_elsewhere(&conn, hash, "")?)
+    }
+
+    /// Replicas kept through an eviction that are due at `now`, `(id, hash,
+    /// net, k)`, the most overdue first, at most `limit` (N4): each review
+    /// moves a row's `due` on ([`Store::set_evicted_due`]), so no row pins
+    /// the head.
+    pub fn evicted_replica_rows(
+        &self,
+        now: u64,
+        limit: usize,
+    ) -> Result<Vec<(String, String, String, usize)>> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare_cached(
+            "SELECT r.id, r.hash, e.net, r.k FROM evicted_replicas r JOIN events e ON e.id = r.id
+                 WHERE r.due <= ?1 ORDER BY r.due LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(
+            params![now.min(i64::MAX as u64) as i64, limit as i64],
+            |r| {
+                Ok((
+                    r.get(0)?,
+                    r.get(1)?,
+                    r.get(2)?,
+                    r.get::<_, i64>(3)?.max(0) as usize,
+                ))
+            },
+        )?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    /// When repair looks at the replica `hash` kept for post `id` next.
+    pub fn set_evicted_due(&self, id: &str, hash: &str, due: u64) -> Result<()> {
+        self.conn().execute(
+            "UPDATE evicted_replicas SET due = ? WHERE id = ? AND hash = ?",
+            params![due.min(i64::MAX as u64) as i64, id, hash],
+        )?;
+        Ok(())
+    }
+
+    /// The replicas kept for post `id`, with the k each wanted and when it
+    /// is due.
+    pub fn evicted_replica_details(&self, id: &str) -> Result<Vec<(String, usize, u64)>> {
+        let conn = self.conn();
+        let mut stmt =
+            conn.prepare_cached("SELECT hash, k, due FROM evicted_replicas WHERE id = ?")?;
+        let rows = stmt.query_map([id], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, i64>(1)?.max(0) as usize,
+                r.get::<_, i64>(2)?.max(0) as u64,
+            ))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    /// Forget the replica `hash` kept for post `id`; true when nothing keeps
+    /// the blob any more (no kept event lists it, no other eviction holds
+    /// it): the node then untags it.
+    pub fn release_evicted_replica(&self, id: &str, hash: &str) -> Result<bool> {
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        tx.execute(
+            "DELETE FROM evicted_replicas WHERE id = ? AND hash = ?",
+            params![id, hash],
+        )?;
+        let free = !blob_referenced(&tx, hash)? && !blob_retained_elsewhere(&tx, hash, id)?;
+        tx.commit()?;
+        Ok(free)
+    }
+
+    /// Record that the replicas `hashes` were kept when the body of `id`
+    /// was evicted (ADR 0029 §5).
+    pub fn record_evicted_replicas(&self, id: &str, hashes: &[(String, usize)]) -> Result<()> {
+        let conn = self.conn();
+        for (hash, k) in hashes {
+            conn.execute(
+                "INSERT INTO evicted_replicas (id, hash, k, due) VALUES (?, ?, ?, 0)
+                 ON CONFLICT (id, hash) DO UPDATE SET k = MAX(k, excluded.k)",
+                params![id, hash, *k as i64],
+            )?;
+        }
+        Ok(())
+    }
+
+    /// The replicas kept when the body of `id` was evicted.
+    pub fn evicted_replicas(&self, id: &str) -> Result<Vec<String>> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare_cached("SELECT hash FROM evicted_replicas WHERE id = ?")?;
+        let rows = stmt.query_map([id], |r| r.get::<_, String>(0))?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
         }
         Ok(out)
     }
@@ -3531,6 +3902,102 @@ mod tests {
             .unwrap();
         assert_eq!(outcome.freed_blobs, vec![alone]);
         assert_eq!(store.referenced_blobs().unwrap(), vec![shared]);
+    }
+
+    #[test]
+    fn event_blobs_follow_inserts_drops_and_older_releases() {
+        let store = Store::open_in_memory().unwrap();
+        let (a, b) = ("aa".repeat(32), "bb".repeat(32));
+        let first = with_blobs(1, 10, "two files", &[&a, &b]);
+        let second = with_blobs(2, 11, "one of them", &[&a]);
+        store.insert(&first, 10).unwrap();
+        store.insert(&second, 11).unwrap();
+        let listed = store.blob_listings(8).unwrap();
+        assert_eq!(
+            listed,
+            vec![
+                (a.clone(), vec![first.id.clone(), second.id.clone()]),
+                (b.clone(), vec![first.id.clone()]),
+            ]
+        );
+        assert_eq!(store.events_listing_blob(&a, 8).unwrap().len(), 2);
+        assert_eq!(store.blobs_freed_by(&first.id).unwrap(), vec![b.clone()]);
+        assert!(store.blob_listed(&b).unwrap());
+        store
+            .drop_body(&first.id, DropReason::Own, None, None, 20)
+            .unwrap();
+        assert!(!store.blob_listed(&b).unwrap(), "a tombstone lists nothing");
+        assert_eq!(store.blobs_freed_by(&second.id).unwrap(), vec![a.clone()]);
+        // Inserted by an older release, which keeps no index: filled at
+        // the next open.
+        let third = with_blobs(3, 12, "inserted by 0.4.2", &[&b]);
+        store.insert(&third, 12).unwrap();
+        let conn = store.conn.into_inner().unwrap();
+        conn.execute_batch("DELETE FROM event_blobs WHERE hash = 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb';
+                            UPDATE event_blobs_filled SET upto = 2;")
+            .unwrap();
+        let store = Store::init(conn).unwrap();
+        assert!(store.blob_listed(&b).unwrap(), "backfilled");
+    }
+
+    #[test]
+    fn an_eviction_never_overrides_an_erasure() {
+        let store = Store::open_in_memory().unwrap();
+        let hash = "dd".repeat(32);
+        let event = with_blobs(1, 10, "erased while an eviction was planned", &[&hash]);
+        store.insert(&event, 10).unwrap();
+        // The erasure lands first; the eviction planned before it comes after.
+        store
+            .drop_body(&event.id, DropReason::Erasure, Some("label"), None, 20)
+            .unwrap();
+        let late = store
+            .drop_body_keeping(
+                &event.id,
+                DropReason::Evicted,
+                None,
+                None,
+                30,
+                &[(hash.clone(), 3)],
+            )
+            .unwrap();
+        assert!(late.freed_blobs.is_empty());
+        let record = store.drop_record(&event.id).unwrap().unwrap();
+        assert_eq!(record.reason, DropReason::Erasure, "the erasure wins");
+        assert_eq!(record.trigger.as_deref(), Some("label"));
+        assert!(
+            store.evicted_replicas(&event.id).unwrap().is_empty(),
+            "no record"
+        );
+    }
+
+    #[test]
+    fn a_replica_kept_through_eviction_is_freed_by_a_later_drop() {
+        let store = Store::open_in_memory().unwrap();
+        let hash = "cc".repeat(32);
+        let event = with_blobs(1, 10, "a replica", &[&hash]);
+        store.insert(&event, 10).unwrap();
+        let evicted = store
+            .drop_body(&event.id, DropReason::Evicted, None, None, 20)
+            .unwrap();
+        assert_eq!(evicted.freed_blobs, vec![hash.clone()]);
+        // The node kept it: recorded.
+        store
+            .record_evicted_replicas(&event.id, &[(hash.clone(), 3)])
+            .unwrap();
+        assert_eq!(
+            store.evicted_replicas(&event.id).unwrap(),
+            vec![hash.clone()]
+        );
+        let erased = store
+            .drop_body(&event.id, DropReason::Erasure, None, None, 30)
+            .unwrap();
+        assert!(!erased.body_dropped, "already a tombstone");
+        assert_eq!(erased.freed_blobs, vec![hash], "released");
+        assert!(store.evicted_replicas(&event.id).unwrap().is_empty());
+        assert_eq!(
+            store.drop_record(&event.id).unwrap().unwrap().reason,
+            DropReason::Erasure
+        );
     }
 
     #[test]

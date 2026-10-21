@@ -42,3 +42,4 @@ wrong, the ADR says so and the question goes back to the spec owners.
 | [0026](0026-swarm-size-as-one-node-sees-it.md) | The size of the swarm, as one node sees it | Proposed |
 | [0027](0027-setup-wizard.md) | The setup wizard of a bare `wats`, and setup revisions | Proposed |
 | [0028](0028-fleet.md) | A fleet: several nodes on one machine | Proposed |
+| [0029](0029-blob-durability.md) | Blob durability: replica repair, knowledge replicas, last copy | Provisional |

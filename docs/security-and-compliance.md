@@ -45,7 +45,11 @@ On your node, this:
 - records the drop locally (reason `own`, the time, and your words), and
   refuses the body if a peer offers it again, by gossip, sync or
   replication; its files are not fetched again;
-- keeps serving the tombstone to peers, so their threads still verify.
+- keeps serving the tombstone to peers, so their threads still verify;
+- hands nothing to any other node first: unlike an eviction for space,
+  it deletes at once, even what may be the swarm's last copy of a file
+  (ADR 0029), and a file this node kept as a replica after an eviction
+  goes too.
 
 It works on the running node (through its local socket) or, when no node
 runs, directly on its data directory. Agents have no tool for it: dropping
