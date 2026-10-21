@@ -1482,7 +1482,8 @@ async fn review5_quiet_claims_and_an_older_holder_that_fails() -> anyhow::Result
 /// key's events since a minute, but three peers, one with full history,
 /// saw it 40 days ago. The fill reads one peer; the announces asked of
 /// each neighbor afterwards bring the others' `seen`, and the key's age
-/// floor counts from their median, not from this node's first sight.
+/// floor counts from their median, not from this node's first sight. The
+/// probe stores nothing it does not hold.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_new_node_takes_an_old_keys_age_from_its_peers() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
@@ -1515,18 +1516,25 @@ async fn a_new_node_takes_an_old_keys_age_from_its_peers() -> anyhow::Result<()>
         hold(peer, &events);
         hold(peer, &traffic);
     }
-    // An announce only p2 holds, older than what the union check reads:
-    // the probe reads it but stores nothing new (the fill's per-key share
-    // and budget would not apply).
+    // An announce only p2 holds, older than what the check of a neighbor
+    // that comes up later reads: the probe reads it but stores nothing new
+    // (the fill's per-key share and budget would not apply).
     let only_p2 = root(Kind::Announce, "only p2 has it", &key(78), now - 30 * DAY);
     hold(&p2, std::slice::from_ref(&only_p2));
     assert!(p1.history_full(), "the reference with full history");
     assert!(!p2.history_full());
-    let mut n_config = config(&dir.path().join("n"), &[&p1, &p2, &p3]);
+    // The fill walks p1, its only neighbor: whichever neighbor is up first
+    // is walked, and phase 0 rightly stores the announces it serves. p2
+    // and p3 come up once the fill is done, so that only the probe and the
+    // cheap check of a new neighbor (since the watermark) read them.
+    let mut n_config = config(&dir.path().join("n"), &[&p1]);
     n_config.reputation.ttl = Duration::ZERO;
     n_config.reputation.max_age = Duration::ZERO;
     let n = Node::start(n_config).await?;
     done(&n).await;
+    for peer in [&p2, &p3] {
+        n.add_peer(peer.endpoint().addr()).await?;
+    }
     let author = events[0].author.clone();
     let first = n.store().author_first_seen(&author)?.unwrap_or(0);
     assert!(first + 600 > now, "stored here just now");
@@ -1542,8 +1550,9 @@ async fn a_new_node_takes_an_old_keys_age_from_its_peers() -> anyhow::Result<()>
     let reports = &reports[&author];
     assert_eq!(reports.len(), 3, "{reports:?}");
     assert_eq!(reports.iter().filter(|(_, full)| *full).count(), 1);
-    // p2 was probed (its report is there); what it alone holds was not
-    // stored, and no report came for it.
+    // p2's report came only from the probe, after the page that also held
+    // `only_p2` (newer, so before the old key's announce): that was read,
+    // and neither stored nor reported.
     assert!(seq(&n, &only_p2.id).is_none(), "the probe stored an event");
     assert!(!n.store().seen_reports()?.contains_key(&only_p2.author));
     for node in [n, p1, p2, p3] {
