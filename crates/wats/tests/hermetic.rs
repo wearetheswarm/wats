@@ -95,6 +95,65 @@ fn hermetic_never_looks_for_releases() {
     assert!(!data.join("update.json").exists());
 }
 
+/// A pending security release (ADR 0030), from the cache of an earlier
+/// daily check: `wats status` says so on a line of its own, with the
+/// version and the command, and its JSON carries `update.notice`; a
+/// normal release gets no such line. Nothing is checked or downloaded.
+#[test]
+fn status_shows_a_pending_security_release() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("d");
+    std::fs::create_dir_all(&data).unwrap();
+    let status = |args: &[&str]| {
+        let out = std::process::Command::new(env!("CARGO_BIN_EXE_wats"))
+            .env("WATS_HERMETIC", "1")
+            .env("HOME", dir.path().join("home"))
+            .env("WATS_RUN_DIR", dir.path().join("run"))
+            .env_remove("WATS_INFRA")
+            .env_remove("WATS_BOOTSTRAP")
+            .env_remove("WATS_PEERS")
+            .env_remove("WATS_UPDATE_URL")
+            .arg("--dir")
+            .arg(&data)
+            .args(["--infra", "none", "status"])
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{out:?}");
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    };
+    let cache = |security: bool| {
+        serde_json::json!({
+            "checked_at": 1_792_326_896u64,
+            "latest": "999.0.0",
+            "security": security,
+            "published_at": 1_792_326_896u64,
+        })
+        .to_string()
+    };
+    std::fs::write(data.join("update.json"), cache(true)).unwrap();
+    let text = status(&[]);
+    let line = text
+        .lines()
+        .find(|l| l.starts_with("SECURITY RELEASE: wats 999.0.0"))
+        .unwrap_or_else(|| panic!("{text}"));
+    assert!(line.contains("`wats upgrade`"), "{line}");
+    assert!(
+        line.contains(&format!("this node runs {}", env!("CARGO_PKG_VERSION"))),
+        "{line}"
+    );
+    // On its own line only, not also as `update.notice: …`.
+    assert!(!text.contains("update.notice"), "{text}");
+    let json: serde_json::Value = serde_json::from_str(&status(&["--json"])).unwrap();
+    assert_eq!(json["update"]["security"], true, "{json}");
+    assert_eq!(json["update"]["notice"].as_str(), Some(line), "{json}");
+    // A normal release: announced as before, without the notice.
+    std::fs::write(data.join("update.json"), cache(false)).unwrap();
+    let text = status(&[]);
+    assert!(text.contains("update.available: true"), "{text}");
+    assert!(!text.contains("SECURITY RELEASE"), "{text}");
+}
+
 /// A fake agent CLI: never run by these tests, only found on PATH.
 fn fake_cli(dir: &std::path::Path, name: &str) {
     use std::os::unix::fs::PermissionsExt;

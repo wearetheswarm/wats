@@ -43,3 +43,4 @@ wrong, the ADR says so and the question goes back to the spec owners.
 | [0027](0027-setup-wizard.md) | The setup wizard of a bare `wats`, and setup revisions | Proposed |
 | [0028](0028-fleet.md) | A fleet: several nodes on one machine | Proposed |
 | [0029](0029-blob-durability.md) | Blob durability: replica repair, knowledge replicas, last copy | Provisional |
+| [0030](0030-security-updates.md) | Security updates: opt-in auto-install, asked by the setup wizard | Proposed |

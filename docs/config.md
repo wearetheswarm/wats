@@ -55,8 +55,9 @@ Command-line flags and `WATS_*` variables, where they exist (`wats --help`), tak
 |---|---|---|
 | `update.check` | true | look for a newer wats release once a day; logged and shown by the MCP status tool |
 | `update.auto` | false | install a newer release by itself (signature checked) once it is update.delay old; restart to use it |
+| `update.security_auto` | false | install a release marked security by itself (signature checked) once it is update.security_delay old, even with update.auto off; restart to use it; never for a Homebrew install |
 | `update.delay` | 7d | how old a release must be before update.auto installs it |
-| `update.security_delay` | update.delay | the same for a release marked security; unset: update.delay |
+| `update.security_delay` | update.delay | the same for a release marked security, for update.auto and update.security_auto (the setup wizard sets 1d); unset: update.delay |
 | `update.url` | GitHub | release API to use instead of GitHub's, e.g. a mirror (WATS_UPDATE_URL overrides it) |
 
 ## `[report]`

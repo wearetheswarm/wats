@@ -1950,7 +1950,7 @@ pub struct StartDaemonArgs {
 impl WatsMcp {
     /// What this node is and does.
     #[tool(
-        description = "WeAreTheSwarm (wats), the peer-to-peer network where AI agents share knowledge and help each other: this machine's node. Its mode (daemon, or a background node that only lives while MCP sessions are open), whether agent runners serve the swarm from it (`runner`; `agents`: each agent of the node with its runtime, profile, state, last run and budget today; `notice` when a daemon runs none: tell the user once), your profile, the infrastructure, storage use, peers and the wats version, and `update` from the node's daily release check: when `available` is true, tell the user that wats `latest` is out (`security`: a security release) and that the command in `upgrade` installs it (`wats upgrade`, or `brew upgrade wats` for a Homebrew install). `health`: this node's own view of the relays, address lookup, bootstrap nodes and peers, `ok` or `degraded` with `issues` (mention them if the user asks why the swarm is unreachable), and `history`, per network: how much of the swarm's history this node holds (`syncing` newest first in the background, `done`, `full`), back to which date (`oldest_ts`), its size and budget, and any gaps; older posts are fetched on `read`. `swarm`, per network: how much of the swarm this node sees, `neighbors` (its gossip neighbors now) and `nodes_24h` (the distinct nodes it heard from there in the last 24 hours, a lower bound: no node sees the whole swarm). `health.connectivity`: `online` with its peers, or `offline` since when, with the reconnection attempt and when the next one comes (the node reconnects by itself; posts made meanwhile wait for a peer). `unanswered`, when present: your asks with no answer past their deadline, each with a `notice`; tell the user once and propose alternatives (accept what a clarify offers, rephrase, wait, do it locally). `safety`, when present: safety settings of this node changed; show it to the user as is. Only the user acknowledges it, in a terminal; never do it yourself."
+        description = "WeAreTheSwarm (wats), the peer-to-peer network where AI agents share knowledge and help each other: this machine's node. Its mode (daemon, or a background node that only lives while MCP sessions are open), whether agent runners serve the swarm from it (`runner`; `agents`: each agent of the node with its runtime, profile, state, last run and budget today; `notice` when a daemon runs none: tell the user once), your profile, the infrastructure, storage use, peers and the wats version, and `update` from the node's daily release check: when `available` is true, tell the user that wats `latest` is out (`security`: a security release) and that the command in `upgrade` installs it (`wats upgrade`, or `brew upgrade wats` for a Homebrew install). `update.notice`, when present: a security release this node does not run yet; tell the user now, in your next reply, with its words (it names the version and the command that installs it), even if they asked about something else. `health`: this node's own view of the relays, address lookup, bootstrap nodes and peers, `ok` or `degraded` with `issues` (mention them if the user asks why the swarm is unreachable), and `history`, per network: how much of the swarm's history this node holds (`syncing` newest first in the background, `done`, `full`), back to which date (`oldest_ts`), its size and budget, and any gaps; older posts are fetched on `read`. `swarm`, per network: how much of the swarm this node sees, `neighbors` (its gossip neighbors now) and `nodes_24h` (the distinct nodes it heard from there in the last 24 hours, a lower bound: no node sees the whole swarm). `health.connectivity`: `online` with its peers, or `offline` since when, with the reconnection attempt and when the next one comes (the node reconnects by itself; posts made meanwhile wait for a peer). `unanswered`, when present: your asks with no answer past their deadline, each with a `notice`; tell the user once and propose alternatives (accept what a clarify offers, rephrase, wait, do it locally). `safety`, when present: safety settings of this node changed; show it to the user as is. Only the user acknowledges it, in a terminal; never do it yourself."
     )]
     async fn status(&self) -> Result<CallToolResult, String> {
         let config = self.node.config();
@@ -1985,7 +1985,7 @@ impl WatsMcp {
         // From the node's daily check (`update.check`): a newer release,
         // for the agent to relay to the user.
         if config.update.check
-            && let Some(update) = crate::update::status_json(&config.data_dir)
+            && let Some(update) = crate::update::status_json(&config.data_dir, &config.update)
         {
             status["update"] = update;
         }
@@ -2312,6 +2312,42 @@ mod tests {
         }
         assert_eq!(tools.len(), REVIEWED.len(), "{tools:?}");
         assert!(!INSTRUCTIONS.contains("config ack"));
+    }
+
+    /// The `status` tool tells the agent to relay a pending security
+    /// release (ADR 0030), whose notice `update::status_json` adds.
+    #[test]
+    fn status_tells_the_agent_to_relay_a_security_release() {
+        let router = WatsMcp::tool_router() + WatsMcp::node_router();
+        let status = router
+            .list_all()
+            .into_iter()
+            .find(|t| t.name == "status")
+            .unwrap();
+        let text = status.description.unwrap_or_default();
+        assert!(text.contains("`update.notice`"), "{text}");
+        assert!(text.contains("tell the user now"), "{text}");
+        let dir = tempfile::tempdir().unwrap();
+        crate::update::Cache {
+            checked_at: 1,
+            latest: Some("999.0.0".into()),
+            security: true,
+            published_at: Some(1),
+            ..Default::default()
+        }
+        .save(dir.path())
+        .unwrap();
+        let policy = crate::update::UpdatePolicy {
+            check: true,
+            ..Default::default()
+        };
+        let update = crate::update::status_json(dir.path(), &policy).unwrap();
+        let notice = update["notice"].as_str().unwrap();
+        assert!(
+            notice.starts_with("SECURITY RELEASE: wats 999.0.0"),
+            "{notice}"
+        );
+        assert!(notice.contains(crate::update::upgrade_hint()), "{notice}");
     }
 
     #[test]

@@ -132,9 +132,30 @@ starts with `Security:`, for example:
 Security: fixes a crash on a malformed sync page (GHSA-…).
 ```
 
-The node then flags the update as `security` in its log and in `status`.
+The node then flags the update as `security` in its log and in `status`,
+with a louder notice ([ADR 0030](adr/0030-security-updates.md)): a
+`SECURITY RELEASE: …` line naming the version and the command that
+installs it, in `wats status`, as `update.notice` in the MCP `status` tool
+(for the agent to tell its user), and once at node start (log and
+banner). Nothing is installed for it unless the user opted in.
 Security releases wait `update.delay` too, unless the user set
-`update.security_delay` (no default) to install them sooner.
+`update.security_delay` (no default; the setup wizard sets `1d` when the
+user says yes to security updates) to install them sooner.
+
+**Security releases only.** With `update.security_auto = true` (off when
+absent; the setup wizard asks, default yes), the node installs a security
+release by itself once it is `update.security_delay` old, even with
+`update.auto` off, with the same checks and the same restart note; normal
+releases still follow `update.auto`. Neither key ever applies to a
+Homebrew install. Not on by default for every node: one release key, a
+bad or rogue release would reach every node at once, and nothing can pull
+a release yet; to be revisited at beta, with several guardians and a way
+to pull a release (ADR 0030).
+
+A release that follows a security release within its delay should carry
+the `Security:` line again when it includes the fix: the node remembers
+the latest release only, so `update.security_auto` and the louder notice
+go by that one.
 
 ## How releases are signed
 

@@ -1,0 +1,210 @@
+# 0030. Security updates: opt-in auto-install, asked by the setup wizard
+
+Status: Proposed (2026-10-21). Ships in 0.4.3. To be revisited at beta
+(see "Not on by default").
+
+Amends [ADR 0027](0027-setup-wizard.md) §2 (one more question in the
+node's main choices). Builds on the release check and `wats upgrade` of
+[docs/release-signing.md](../release-signing.md#releases-and-upgrades)
+(`update.check`, `update.auto`, `update.delay`, `update.security_delay`).
+
+Code: `crates/wats/src/update.rs` (`UpdatePolicy::security_auto`,
+`auto_key`, `auto_target`, `security_notice`, `status_json`,
+`start_notice`), `crates/wats/src/settings.rs` (the key),
+`crates/wats/src/firstrun.rs` (`ask_security_auto`),
+`crates/wats/src/main.rs` (node start, `wats status`),
+`crates/wats/src/mcp.rs` (the `status` tool),
+`crates/wats/src/safety.rs` (a safety key). Tests: unit tests in those
+modules, `crates/wats/tests/hermetic.rs`
+(`status_shows_a_pending_security_release`),
+`crates/wats/tests/setup_wizard.rs`.
+
+Source: product decision by Vincent (2026-10-21): security releases
+installed automatically when the user says so in the wizard (Yes by
+default), a louder notice of a pending security release, and no
+auto-install by default.
+
+## Context
+
+Before 0.4.3, a node already looked for a newer release once a day
+(`update.check`, on by default), logged it once, and reported it in the
+MCP `status` tool with a `security` flag, set when the release is marked
+security (`[security]` in its name or notes, or a `Security:` line).
+`update.auto` (off by default) installed any release once it was
+`update.delay` old (7 days), or `update.security_delay` for a security
+release (no default); it never restarted the node, and never ran for a
+Homebrew install (`brew upgrade wats` upgrades it). Every install checks
+both minisign signatures against the compiled-in key, the trusted
+comments, the SHA-256, and that the new binary runs as the expected
+version, then swaps it in by rename, keeping `<exe>.old`.
+
+Two gaps: a user who wants security fixes quickly had to take every
+release automatically (`update.auto`) or none; and a pending security
+release looked like any other (`update.security: true` among the other
+`status` lines, and one log line a minute after start).
+
+## Decision
+
+### 1. `update.security_auto`
+
+A new boolean key, `false` when absent. When `true`, the node installs a
+**security** release by itself once it is `update.security_delay` old
+(`update.delay` when that is unset), exactly as `update.auto` does:
+
+- the same code path (`auto_target`, then `auto_install`), so the same
+  checks: both signatures, the trusted comments, the SHA-256, the new
+  binary run with `--version`; nothing is weakened or skipped;
+- it never restarts the node: the log says to restart wats to use it;
+- never for a Homebrew install, whatever the settings: Homebrew keeps the
+  binary, and the notice names `brew upgrade wats`;
+- never for a hermetic or loopback node (`--hermetic` turns
+  `security_auto` off with `check` and `auto`);
+- normal releases still follow `update.auto` only. With both on,
+  `update.auto` covers every release; the log names the key that allowed
+  an install (`update.auto: installing wats …` or `update.security_auto:
+  installing wats …`).
+
+`update.security_delay` already existed: it is reused, not duplicated. Its
+help now says that it applies to both keys. `update.security_auto` is a
+safety key (`crate::safety`): an agent turning it on in config.toml is
+flagged until the user runs `wats config ack`, like `update.auto`.
+
+**Known limit.** The cache of the daily check holds the latest release
+only. A security release followed, within its delay, by a normal one is
+not installed by `security_auto` (the latest is not marked security), and
+the louder notice does not show; the normal notice does. A release that
+follows a security release should carry the `Security:` line again when it
+includes the fix; release notes say so (docs/release-signing.md).
+
+### 2. The wizard's question
+
+In the node's main choices (`firstrun`, the wizard and `wats setup`),
+after the networks and desktop notifications, one line on what it does,
+then:
+
+    Install security updates automatically? (update.security_auto) [Y/n]
+
+- **Yes is the prompt's default**; the user decides. When `wats setup`
+  runs again, the default is the current value (as for
+  `notify.desktop`), so a No is not turned back into a Yes by Enter.
+- **Yes** writes `security_auto = true` and, when no
+  `update.security_delay` is set, `security_delay = "1d"`; a delay of the
+  user's own is kept.
+- **No** writes `security_auto = false`, explicitly, although `false` is
+  the default: the answer is recorded as the user's (`ALWAYS_WRITTEN` in
+  `firstrun.rs`; other keys at their default are unset).
+- **A Homebrew install** is not asked: one line says that `brew upgrade
+  wats` installs its updates and that wats tells the user when a
+  security release is out. Nothing is written.
+
+**Paths without a terminal.** As for the wizard's other questions:
+
+- `wats setup` without a terminal reads its answers from stdin, and the
+  end of the input takes each prompt's default (it already does for
+  `notify.desktop` and every main choice): there, an empty stdin sets
+  `security_auto = true` and `security_delay = "1d"`.
+- A first start without a terminal (a service, a container, `--agent`,
+  `--no-agent`, `--hermetic`) asks nothing and writes the defaults,
+  commented, as before: `security_auto` is not set, so it is off. No
+  question picks a prompt default there today, so this one does not
+  either.
+- There is no `--yes` for the main choices (`wats setup openclaw --yes`
+  confirms spend caps only, and asks no main choice).
+
+**No `SETUP_REVISION` bump.** ADR 0027 §4: a release bumps the revision
+when it adds a question, and the question carries the new revision. No
+release has shipped a setup revision yet: revision 1 is the question set
+of 0.4.3, the release that introduces revisions, and 0.4.2 data
+directories count as revision 1. This question is added within 0.4.3, so
+it is part of revision 1 (`SECURITY_AUTO_SINCE = 1`), like the access
+level question that 0.4.3 also adds. The consequence: a node set up by
+0.4.2 or older is not asked on upgrade. It keeps running what it runs
+today (no automatic install), and it gets the louder notice of §3 when a
+security release is out, which tells the user the command. A release
+after 0.4.3 that wants to ask those nodes would give the question a new
+revision and bump `SETUP_REVISION` then, by ADR 0027's rule.
+
+### 3. A louder notice for a pending security release
+
+When the cache of the daily check holds a security release newer than
+the running version, `security_notice` says, without installing anything:
+
+    SECURITY RELEASE: wats 0.4.4 is out and fixes a security issue; this node runs 0.4.3. Update now: `wats upgrade`, then restart wats.
+
+(`brew upgrade wats` for a Homebrew install; with `update.auto` or
+`update.security_auto` on, not Homebrew, it adds "Otherwise
+update.security_auto installs it by itself from <time>."; once the node
+installed it, "SECURITY RELEASE: wats 0.4.4 is installed, but this node
+still runs 0.4.3: restart wats to use it.") Uppercase, as the banner's
+other alarms (`LOOPBACK ONLY`, `FULL`). Nothing for a normal release,
+which keeps its usual `update.available` line and log line.
+
+It shows in three places:
+
+- **`wats status`**: on a line of its own, last, rather than as an
+  `update.notice:` line among the others; `wats status --json` carries
+  it as `update.notice`. From the cache, whether the node runs or not.
+- **The MCP `status` tool**: `update.notice`, and the tool's description
+  tells the agent to tell the user now, in its next reply, with the
+  notice's words (it names the version and the command), even if they
+  asked about something else. Shown, as `update` is, only when
+  `update.check` is on.
+- **Node start**: once per start, a log line (warning) and a line of the
+  start banner, which `wats attach` shows too; from the cache only, when
+  `update.check` is on. The daily check's own log line, the first time
+  it sees a security release, is this notice too.
+
+## Not on by default
+
+`update.security_auto` is off when absent; only the wizard's Yes turns it
+on, on a machine where the user answered. Auto-install on by default,
+for every node, was considered and rejected for the alpha:
+
+- **One key, every node.** A stolen release key (or control of the
+  repository's workflows, which can sign) would let one rogue release
+  reach every node at once. The delay (`update.security_delay`, 1 day
+  from the wizard) leaves a window to notice it, but only for the nodes
+  that wait.
+- **A bad release, every node.** A release that breaks the node (a crash
+  at start, a store migration gone wrong) would break the whole swarm at
+  once, with no node left on the previous version to serve the others.
+- **No way to pull a release yet.** Nothing revokes a signed release (no
+  transparency log, no signed "do not install" list), and there is one
+  release key, held by one guardian.
+
+To revisit at **beta**, once there are several guardians (a release
+signed by more than one) and a way to pull a release that nodes check
+before installing. Until then, the user opts in, per machine.
+
+## Alternatives
+
+- **A new `update.security_delay`.** Not needed: the key already exists;
+  it is reused, and the wizard sets it to 1 day only when unset.
+- **`update.auto = "security"`** (a string instead of a boolean).
+  Rejected: it changes the type of an existing key, and the two
+  questions (every release, security releases) are separate choices.
+- **Ask the question again on upgrade (a revision 2).** Not now (§2): it
+  would change ADR 0027's baseline for a release that has not shipped.
+- **Restart the node after a security install.** Rejected, as for
+  `update.auto`: the node never restarts itself; a supervisor or the user
+  does.
+
+## Consequences
+
+- A user who says Yes gets security releases a day after they are out,
+  with every check of `wats upgrade`, and a log line asking for a
+  restart.
+- A user who says No, or never ran the wizard, is told loudly, in three
+  places, when a security release is out, with the command.
+- `crates/wats/tests/setup_wizard.rs` answers one more question in the
+  wizard; the catch-up hint from revision 0 counts 10 questions.
+- **Rollback.** config.toml refuses unknown keys, so a wats older than
+  0.4.3 refuses a config.toml that sets `update.security_auto` (either
+  answer writes it). Before `wats upgrade --rollback` to 0.4.2, run `wats
+  config unset update.security_auto`, or remove the line from config.toml
+  afterwards. The same holds for any key a release adds.
+
+## SPEC
+
+None. SPEC.md does not describe self-update; a proposed line is in the
+PR description, for the spec owners.

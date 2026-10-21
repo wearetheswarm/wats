@@ -93,6 +93,32 @@ const RUNTIME_SINCE: u32 = 1;
 /// The revision that added the desktop notification question.
 const DESKTOP_SINCE: u32 = 1;
 
+/// The revision that added the security updates question (ADR 0030):
+/// part of revision 1, which no release had shipped yet when it was added.
+const SECURITY_AUTO_SINCE: u32 = 1;
+
+/// Shown before the security updates question (ADR 0030).
+pub const SECURITY_AUTO_ABOUT: &str = "Security updates: the node can install a release \
+marked security by itself, signature checked, once it is update.security_delay old (a day, \
+unless you set another delay). It never restarts itself: restart wats to use it. Other \
+releases are only announced (update.auto installs them).";
+
+/// The security updates question (ADR 0030); Yes is its default.
+pub const SECURITY_AUTO_QUESTION: &str =
+    "Install security updates automatically? (update.security_auto)";
+
+/// Shown instead of the security updates question for a Homebrew install,
+/// which the node never upgrades.
+pub const SECURITY_AUTO_HOMEBREW: &str = "Security updates: Homebrew installed this wats, so \
+`brew upgrade wats` installs its updates; wats tells you when a security release is out.";
+
+/// The `update.security_delay` a Yes sets when none is set.
+pub const SECURITY_DELAY: &str = "1d";
+
+/// Keys written even at their default value: the user's answer, recorded
+/// as such.
+const ALWAYS_WRITTEN: [&str; 1] = ["update.security_auto"];
+
 /// One question after the agent runtime.
 #[derive(Debug, Clone, Copy)]
 struct Question {
@@ -164,7 +190,7 @@ pub fn record_revision(data_dir: &Path) -> Result<()> {
 /// How many questions are newer than `revision`, whatever the answers
 /// (the agent's questions count even when it runs none).
 pub fn new_questions(revision: u32) -> usize {
-    [RUNTIME_SINCE, DESKTOP_SINCE]
+    [RUNTIME_SINCE, DESKTOP_SINCE, SECURITY_AUTO_SINCE]
         .into_iter()
         .chain(QUESTIONS.iter().map(|q| q.since))
         .filter(|since| *since > revision)
@@ -532,6 +558,20 @@ pub fn render(choices: &Choices) -> Result<String> {
             settings::check_value("notify.desktop", on)?
         ));
     }
+    if let Some(on) = chosen("update.security_auto") {
+        text.push_str(&format!(
+            "\n[update]\n# {}\nsecurity_auto = {}\n",
+            settings::find_key("update.security_auto")?.help,
+            settings::check_value("update.security_auto", on)?
+        ));
+        if let Some(delay) = chosen("update.security_delay") {
+            text.push_str(&format!(
+                "# {}\nsecurity_delay = {}\n",
+                settings::find_key("update.security_delay")?.help,
+                settings::check_value("update.security_delay", delay)?
+            ));
+        }
+    }
     toml::from_str::<Settings>(&text).context("the generated config.toml does not load")?;
     Ok(text)
 }
@@ -594,7 +634,7 @@ pub fn apply(data_dir: &Path, choices: &Choices) -> Result<PathBuf> {
             Some(name) => agent_key(name, key),
             None => key.to_string(),
         };
-        if is_default(&key, value) {
+        if is_default(&key, value) && !ALWAYS_WRITTEN.contains(&key.as_str()) {
             file.unset(&key)?;
         } else {
             file.set(&key, value)?;
@@ -727,6 +767,25 @@ fn ask_and_write(
     revision: u32,
     header: bool,
 ) -> Result<(Choices, Vec<Found>)> {
+    let homebrew = crate::update::homebrew_install();
+    ask_and_write_with(
+        data_dir, input, out, path, desktop, homebrew, revision, header,
+    )
+}
+
+/// [`ask_and_write`], `homebrew` telling whether Homebrew installed this
+/// wats ([`crate::update::homebrew_install`]).
+#[allow(clippy::too_many_arguments)]
+fn ask_and_write_with(
+    data_dir: &Path,
+    input: &mut impl BufRead,
+    out: &mut impl Write,
+    path: Option<&OsStr>,
+    desktop: bool,
+    homebrew: bool,
+    revision: u32,
+    header: bool,
+) -> Result<(Choices, Vec<Found>)> {
     let settings = Settings::load(data_dir)?;
     let found = detect_agents(path);
     let mut choices = if revision == 0 && header {
@@ -744,10 +803,47 @@ fn ask_and_write(
         )?;
         choices.values.push(("notify.desktop", on.to_string()));
     }
+    if SECURITY_AUTO_SINCE > revision {
+        ask_security_auto(input, out, &settings, homebrew, &mut choices)?;
+    }
     let file = apply(data_dir, &choices)?;
     record_revision(data_dir)?;
     writeln!(out, "Wrote {}", file.display())?;
     Ok((choices, found))
+}
+
+/// The security updates question (ADR 0030), default Yes (or the current
+/// value, when `wats setup` runs again): Yes sets `update.security_auto`
+/// and, when none is set, `update.security_delay` to [`SECURITY_DELAY`];
+/// No writes `update.security_auto = false`. Not asked for a Homebrew
+/// install (`homebrew`), which the node never upgrades.
+fn ask_security_auto(
+    input: &mut impl BufRead,
+    out: &mut impl Write,
+    settings: &Settings,
+    homebrew: bool,
+    choices: &mut Choices,
+) -> Result<()> {
+    if homebrew {
+        writeln!(out, "{SECURITY_AUTO_HOMEBREW}")?;
+        return Ok(());
+    }
+    writeln!(out, "{SECURITY_AUTO_ABOUT}")?;
+    let on = ask_yes_no(
+        input,
+        out,
+        SECURITY_AUTO_QUESTION,
+        settings.update.security_auto.unwrap_or(true),
+    )?;
+    choices
+        .values
+        .push(("update.security_auto", on.to_string()));
+    if on && settings.update.security_delay.is_none() {
+        choices
+            .values
+            .push(("update.security_delay", SECURITY_DELAY.to_string()));
+    }
+    Ok(())
 }
 
 /// What the node now runs, and with `hints`, how to register wats in the
@@ -890,6 +986,126 @@ mod tests {
         assert!(!String::from_utf8(out).unwrap().contains("notify.desktop"));
         assert!(choices.values.iter().all(|(k, _)| *k != "notify.desktop"));
         assert_eq!(Settings::load(other.path()).unwrap().notify.desktop, None);
+    }
+
+    /// The security updates question (ADR 0030): Enter is Yes, which sets
+    /// `update.security_auto` and a one-day `update.security_delay`; No
+    /// writes `security_auto = false`; a delay already set is kept.
+    #[test]
+    fn setup_asks_security_updates() {
+        let data = tempfile::tempdir().unwrap();
+        let mut out = Vec::new();
+        // No agent CLI: storage, networks, then this question (Enter).
+        let choices = setup_with(data.path(), &mut "".as_bytes(), &mut out, None, false).unwrap();
+        let said = String::from_utf8(out).unwrap();
+        assert!(said.contains(SECURITY_AUTO_ABOUT), "{said}");
+        assert!(
+            said.contains("Install security updates automatically? (update.security_auto) [Y/n]"),
+            "{said}"
+        );
+        assert!(
+            choices
+                .values
+                .contains(&("update.security_auto", "true".into()))
+        );
+        let text = std::fs::read_to_string(data.path().join(FILE_NAME)).unwrap();
+        assert!(text.contains("\n[update]\n"), "{text}");
+        assert!(text.contains("\nsecurity_auto = true\n"), "{text}");
+        assert!(text.contains("\nsecurity_delay = \"1d\"\n"), "{text}");
+        let policy = Settings::load(data.path())
+            .unwrap()
+            .update
+            .policy()
+            .unwrap();
+        assert!(policy.security_auto && !policy.auto);
+        assert_eq!(
+            policy.security_delay,
+            Some(std::time::Duration::from_secs(86400))
+        );
+        // Again: the current value is the default; "n" writes false (not
+        // unset, though false is the default) and keeps the delay.
+        let mut out = Vec::new();
+        setup_with(
+            data.path(),
+            &mut "\n\nn\n".as_bytes(),
+            &mut out,
+            None,
+            false,
+        )
+        .unwrap();
+        let said = String::from_utf8(out).unwrap();
+        assert!(said.contains("(update.security_auto) [Y/n]"), "{said}");
+        let settings = Settings::load(data.path()).unwrap();
+        assert_eq!(settings.update.security_auto, Some(false));
+        assert_eq!(settings.update.security_delay.as_deref(), Some("1d"));
+        let mut out = Vec::new();
+        setup_with(data.path(), &mut "".as_bytes(), &mut out, None, false).unwrap();
+        let said = String::from_utf8(out).unwrap();
+        assert!(said.contains("(update.security_auto) [y/N]"), "{said}");
+        // No on a new data directory: written as false, no delay.
+        let other = tempfile::tempdir().unwrap();
+        setup_with(
+            other.path(),
+            &mut "\n\nno\n".as_bytes(),
+            &mut Vec::new(),
+            None,
+            false,
+        )
+        .unwrap();
+        let text = std::fs::read_to_string(other.path().join(FILE_NAME)).unwrap();
+        assert!(text.contains("\nsecurity_auto = false\n"), "{text}");
+        assert!(!text.contains("security_delay = "), "{text}");
+        let settings = Settings::load(other.path()).unwrap();
+        assert_eq!(settings.update.security_auto, Some(false));
+        // Yes with a delay of the user's own: kept.
+        let mut file = ConfigFile::open(other.path()).unwrap();
+        file.set("update.security_delay", "12h").unwrap();
+        file.save().unwrap();
+        setup_with(
+            other.path(),
+            &mut "\n\ny\n".as_bytes(),
+            &mut Vec::new(),
+            None,
+            false,
+        )
+        .unwrap();
+        let settings = Settings::load(other.path()).unwrap();
+        assert_eq!(settings.update.security_auto, Some(true));
+        assert_eq!(settings.update.security_delay.as_deref(), Some("12h"));
+    }
+
+    /// A Homebrew install is not asked about security updates: the node
+    /// never upgrades it. Nor is a data directory already at revision 1
+    /// asked again (part of revision 1, ADR 0030).
+    #[test]
+    fn security_updates_question_skips_homebrew_and_catch_up() {
+        let data = tempfile::tempdir().unwrap();
+        let mut out = Vec::new();
+        let (choices, _) = ask_and_write_with(
+            data.path(),
+            &mut "".as_bytes(),
+            &mut out,
+            None,
+            false,
+            true,
+            0,
+            true,
+        )
+        .unwrap();
+        let said = String::from_utf8(out).unwrap();
+        assert!(said.contains(SECURITY_AUTO_HOMEBREW), "{said}");
+        assert!(!said.contains(SECURITY_AUTO_QUESTION), "{said}");
+        assert!(
+            choices
+                .values
+                .iter()
+                .all(|(k, _)| !k.starts_with("update."))
+        );
+        assert_eq!(
+            Settings::load(data.path()).unwrap().update.security_auto,
+            None
+        );
+        assert_eq!(new_questions(BASELINE_REVISION), 0);
     }
 
     /// Mistral Vibe on PATH: listed, not offered as the agent, its MCP
@@ -1108,7 +1324,7 @@ mod tests {
         std::fs::remove_file(dir.path().join(FILE_NAME)).unwrap();
         assert_eq!(stored_revision(dir.path()), None);
         // Every question of today is in revision 1: revision 0 has them all.
-        assert_eq!(new_questions(0), QUESTIONS.len() + 2);
+        assert_eq!(new_questions(0), QUESTIONS.len() + 3);
     }
 
     /// A data directory set up at an older revision: only the questions

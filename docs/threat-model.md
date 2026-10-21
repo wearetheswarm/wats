@@ -381,5 +381,11 @@ Every channel carries a little stranger-written text, marked as data:
   trusted-comment check refuses, but not forge one. `update.auto` is off by
   default and waits `update.delay` (7 days) after publication, which leaves
   time to notice a rogue release, pull it and rotate the key before nodes
-  install it; a short `update.security_delay` shrinks that window. Nothing
+  install it; a short `update.security_delay` shrinks that window.
+  `update.security_auto` (security releases only) is off when absent too;
+  the setup wizard asks (default yes) and sets a 1-day
+  `update.security_delay`, so a rogue release marked security reaches
+  those nodes after a day. It is not on for every node by default for
+  that reason (ADR 0030), to be revisited at beta with several guardians
+  and a way to pull a release. Nothing
   revokes a signed release yet (no transparency log).

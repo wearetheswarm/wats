@@ -69,9 +69,12 @@ as before, and never touches an MCP host's config.
    and spend budgets per day and month (with an agent; not the turns and
    budgets for OpenClaw), **its access level (`agent.access`: swarm-only,
    workspace or inherit; new in 0.4.3, not asked for OpenClaw, whose access
-   goes with its allow list and review)**, the networks (`nets`), and
-   desktop notifications on a desktop session (`notify.desktop`). Written
-   to `config.toml` as `wats setup` writes them.
+   goes with its allow list and review)**, the networks (`nets`),
+   desktop notifications on a desktop session (`notify.desktop`), and
+   whether to install security updates automatically
+   (`update.security_auto`, default yes; not asked for a Homebrew install;
+   [ADR 0030](0030-security-updates.md), part of revision 1). Written to
+   `config.toml` as `wats setup` writes them.
 2. The MCP hosts: for each of `claude`, `codex`, `openclaw` and `vibe`
    found on PATH (found by looking at PATH only, never by running them),
    "Use the swarm from your own <host> sessions: register wats as its MCP

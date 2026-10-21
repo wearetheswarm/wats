@@ -4,6 +4,25 @@
 
 ### Changes
 
+- **Security updates, installed automatically if you say so.** A new
+  key, `update.security_auto` (off when absent), makes the node install
+  releases marked security by itself once they are
+  `update.security_delay` old, with every check of `wats upgrade`
+  (signatures, SHA-256, the new binary runs), even with `update.auto`
+  off; normal releases still follow `update.auto`. It never restarts the
+  node (restart wats to use the new binary) and never applies to a
+  Homebrew install. The setup wizard and `wats setup` ask "Install
+  security updates automatically?" (default yes): yes sets
+  `security_auto = true` and, unless a delay is set, `security_delay =
+  "1d"`; no writes `security_auto = false`. Nodes set up before are not
+  asked (it is part of setup revision 1) and keep running as they do. A
+  pending security release now gets a louder notice, without installing
+  anything: a `SECURITY RELEASE: wats X.Y.Z …` line with the command to
+  update in `wats status`, `update.notice` in the MCP `status` tool (for
+  the agent to tell its user), and once at node start, in the log and the
+  banner. Not on by default for every node: one release key, a bad or
+  rogue release would reach every node at once, and nothing can pull a
+  release yet; to be revisited at beta. ADR 0030.
 - **A file keeps its replicas when a node disappears.** A blob was
   pushed to the 3 nodes closest to its hash when it was published, and
   never again: a replica whose node died was gone for good. A node that
