@@ -3844,8 +3844,18 @@ impl Node {
         trigger: Option<&str>,
         detail: Option<&str>,
     ) -> Result<DropOutcome> {
+        // Replicas stay when their body is evicted (decided by Vincent,
+        // 2026-10-21: "keep the file if responsible").
+        let mut replicas: Vec<String> = Vec::new();
         if reason == DropReason::Evicted {
-            let stranded = self.hand_off_before_drop(id).await?;
+            for hex in self.store.blobs_freed_by(id)? {
+                if let Ok(hash) = hex.parse::<Hash>()
+                    && self.has_replica_intent(&hash).await
+                {
+                    replicas.push(hex);
+                }
+            }
+            let stranded = self.hand_off_before_drop_except(id, &replicas).await?;
             if !stranded.is_empty() {
                 return Err(durability::KeptLastCopy {
                     id: id.to_string(),
@@ -3854,9 +3864,13 @@ impl Node {
                 .into());
             }
         }
-        let outcome = self
+        let mut outcome = self
             .store
             .drop_body(id, reason, trigger, detail, now_secs())?;
+        if !replicas.is_empty() {
+            info!(%id, blobs = replicas.len(), "body evicted, its replicas kept");
+            outcome.freed_blobs.retain(|h| !replicas.contains(h));
+        }
         unpin_freed(&self.blobs, &outcome).await;
         // A freed blob no longer needs repairing: no kept post lists it.
         if let Ok(mut unreadable) = self.blob_keep.unreadable.lock() {
@@ -4386,19 +4400,21 @@ impl Node {
                         continue;
                     }
                     self.add_hints(&blob.hash, &[peer]);
+                    let Ok(hash) = blob.hash.parse::<Hash>() else {
+                        continue;
+                    };
+                    let legacy = self.config.durability.legacy_replicate;
                     // Already held: confirmed at once, with no fetch slot
                     // and whatever the storage state (ADR 0029). Replica
                     // repair asks the holders of a blob to confirm it.
-                    if !self.config.durability.legacy_replicate && self.holds_blob(blob).await {
-                        match blob.hash.parse::<Hash>() {
-                            Ok(hash) => match self.pin(hash).await {
-                                Ok(()) => {
-                                    stored.push(blob.hash.clone());
-                                    continue;
-                                }
-                                Err(e) => warn!(hash = %blob.hash, "blob not pinned: {e:#}"),
-                            },
-                            Err(_) => continue,
+                    if !legacy && self.holds_blob(blob).await {
+                        match self.pin(hash).await {
+                            Ok(()) => {
+                                self.record_replica_intent(hash).await;
+                                stored.push(blob.hash.clone());
+                                continue;
+                            }
+                            Err(e) => warn!(hash = %blob.hash, "blob not pinned: {e:#}"),
                         }
                     }
                     // At most a few fetches at once for one peer, a few more
@@ -4411,6 +4427,10 @@ impl Node {
                         continue;
                     };
                     if self.fetch_blob(blob, vec![peer]).await {
+                        // A replica by intent (ADR 0029 §1).
+                        if !legacy {
+                            self.record_replica_intent(hash).await;
+                        }
                         stored.push(blob.hash.clone());
                     }
                 }

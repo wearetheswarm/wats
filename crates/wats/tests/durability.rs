@@ -334,14 +334,17 @@ async fn a_blob_of_knowledge_reaches_five_replicas() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Last-copy protection: a node that holds the only copy it knows of
-/// refuses to evict it, and the collection keeps it; once another node
-/// takes it, the eviction goes through and the collection deletes it.
+/// Last-copy protection. A copy fetched on read, evicted while no other
+/// holder is reachable: refused, and the collection keeps it; once a
+/// holder is back, it confirms, and the eviction goes through. A replica
+/// (it came by `replicate`) stays when its body is evicted. `wats drop`
+/// with no node running is refused while it may lose a copy, done with
+/// `--purge`.
 #[tokio::test(flavor = "multi_thread")]
 async fn the_last_copy_is_handed_off_before_it_is_deleted() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     let gc = |name: &str| {
-        let mut c = config(&dir.path().join(name), 3, manual());
+        let mut c = config(&dir.path().join(name), 1, manual());
         c.blob_gc_interval = Duration::from_millis(200);
         c
     };
@@ -349,47 +352,66 @@ async fn the_last_copy_is_handed_off_before_it_is_deleted() -> anyhow::Result<()
     let holder = Node::start(gc("b")).await?;
     mesh(&[&publisher, &holder]).await?;
     let event = publish(&publisher, dir.path(), &content(1)).await?;
-    let hash = event.blobs[0].hash.clone();
+    let blob = event.blobs[0].clone();
+    let hash = blob.hash.clone();
     eventually("the replica arrives", async || holds(&holder, &hash).await).await;
+    assert!(holder.has_replica_intent(&hash.parse()?).await, "recorded");
+    // A reader fetches it on read: a copy, not a replica.
+    let reader = Node::start(gc("r")).await?;
+    mesh(&[&publisher, &holder, &reader]).await?;
+    eventually("the post reaches the reader", async || {
+        reader.store().get(&event.id).ok().flatten().is_some()
+    })
+    .await;
+    reader.fetch_and_export(&blob).await?.expect("fetched");
+    assert!(!reader.has_replica_intent(&hash.parse()?).await);
     publisher.shutdown().await?;
+    holder.shutdown().await?;
 
-    // The only other holder is gone: refused, nothing changes.
-    let refused = holder
+    // No other holder reachable: refused, nothing changes.
+    let refused = reader
         .drop_body(&event.id, DropReason::Evicted, None, None)
         .await
         .expect_err("may be the last copy");
     let kept = refused.downcast_ref::<KeptLastCopy>().expect("typed");
     assert_eq!(kept.blobs, std::slice::from_ref(&hash));
-    assert!(holder.store().get(&event.id)?.is_some(), "body kept");
-    let runs = holder.blob_collections();
+    assert!(reader.store().get(&event.id)?.is_some(), "body kept");
+    let runs = reader.blob_collections();
     eventually("two collections run", async || {
-        holder.blob_collections() >= runs + 2
+        reader.blob_collections() >= runs + 2
     })
     .await;
-    assert!(holds(&holder, &hash).await, "the collection kept it");
-    assert_eq!(holder.repair_stats().kept, 1);
+    assert!(holds(&reader, &hash).await, "the collection kept it");
+    assert_eq!(reader.repair_stats().kept, 1);
 
-    // Another node appears: it takes the blob, then the eviction proceeds.
-    let taker = Node::start(gc("c")).await?;
-    mesh(&[&holder, &taker]).await?;
-    let outcome = holder
+    // The replica's node comes back: it confirms, the eviction proceeds.
+    let holder = Node::start(gc("b")).await?;
+    mesh(&[&reader, &holder]).await?;
+    let outcome = reader
         .drop_body(&event.id, DropReason::Evicted, None, None)
         .await?;
     assert!(outcome.body_dropped);
     assert_eq!(outcome.freed_blobs, std::slice::from_ref(&hash));
-    assert!(holds(&taker, &hash).await, "handed off first");
-    assert_eq!(holder.repair_stats().handed_off, 1);
+    assert_eq!(reader.repair_stats().handed_off, 1);
     // Untagged, for the next collection. (Not waited for: an `evicted`
-    // body is taken back from the next sync with the taker, ADR 0020, and
-    // its blob is kept again with it.)
-    assert!(!holder.blob_pinned(&hash).await?, "released here");
+    // body is taken back from the next sync, ADR 0020, and its blob is
+    // kept again with it.)
+    assert!(!reader.blob_pinned(&hash).await?, "released here");
+
+    // The replica stays when its body is evicted.
+    let outcome = holder
+        .drop_body(&event.id, DropReason::Evicted, None, None)
+        .await?;
+    assert!(outcome.body_dropped && outcome.freed_blobs.is_empty());
+    assert!(holder.blob_pinned(&hash).await?, "the replica is kept");
+    assert!(holder.has_replica_intent(&hash.parse()?).await);
 
     // `wats drop` with no node running: refused while it may lose a copy,
     // done with --purge.
-    let mine = publish(&taker, dir.path(), &content(2)).await?;
-    taker.shutdown().await?;
+    let mine = publish(&reader, dir.path(), &content(2)).await?;
+    reader.shutdown().await?;
     holder.shutdown().await?;
-    let data = dir.path().join("c");
+    let data = dir.path().join("r");
     let refused = wats::node::drop_body_offline(&data, &mine.id, DropReason::Own, None, false)
         .await
         .expect_err("no node to hand it to");

@@ -48,30 +48,45 @@ Vincent's decisions, the baseline of this ADR:
 
 ## Decision
 
-### 1. Who is responsible, and how replicas are counted
+### 1. Who is a replica, and how replicas are counted
 
-- **The responsible set** R(H) of blob H is the k closest nodes to H by
-  XOR distance (ADR 0005) **among the peers this node knows, plus
-  itself**. Known peers are those in `Node::known_peers`: gossip
-  neighbors, configured and bootstrap peers, peers that contacted this
-  node, at most 10,000. Peers found unreachable lately are left out (§2),
-  so a node that disappeared is replaced in R(H) by the next closest.
+**Intent at fetch time is the source of truth.** A node is a replica of
+blob H when H came to it by `replicate`: a publisher's push, a repair or
+a hand-off (§2, §4). The receiver records it then, durably: a
+`wats/replica/<hash>` tag in its blob store, written when it confirms the
+blob (`Node::record_replica_intent`). Deleting the blob for any reason
+deletes the record with its other tags.
+
+Why not recompute "the k closest" later? The pusher chose the replicas
+from **its own view** of the swarm: the peers it knew at that moment
+(gossip neighbors, configured and bootstrap peers, peers that contacted
+it, at most 10,000). The receiver's view differs: it knows other peers,
+peers come and go, and a node that knows few peers sees itself among the
+"k closest" of almost everything, one that knows many of almost nothing.
+A recomputed XOR set would make a replica forget it is one, or a reader
+believe it is one. So:
+
+- **The record decides.** The XOR estimate (the k closest of this node's
+  known, reachable peers plus itself, `Node::is_responsible`) may only
+  add: a node that holds a blob and finds itself among the k closest
+  treats it as a replica too. It never removes a record. When unsure, a
+  node keeps the blob.
 - **k** is `replication` (3), or 5 when the blob is knowledge (§3).
 - **A node watches** a blob it holds whole (complete, of its declared
-  size, readable) when it is in R(H), or when a post of its own lists it
-  (the publisher keeps an eye on its own files whether or not it is one
-  of the k closest).
-- **A replica counts** when a node of the walk (below) answers that it
-  holds the blob. The watcher counts itself when it is in R(H). So a
-  blob is complete when the watcher (if responsible) plus the confirming
-  peers make k.
-- **Honest limits.** This node does not know the whole swarm. Two nodes
-  with different views compute different sets: each pushes to its own,
-  which costs an extra replica, never fewer. A peer that comes back after
-  its replicas were re-made keeps its copy too: repair never deletes a
-  replica, so the excess is at most one copy per node that came back.
-  Holders outside R(H) (readers that fetched a blob, a publisher not
-  among the closest) are sources, not counted replicas.
+  size, readable) when it is a replica (record or estimate), or when a
+  post of its own lists it (the publisher keeps an eye on its own files).
+  A copy fetched on read is neither: a source for others, not watched.
+- **Replicas are counted** from confirmations: the watcher counts itself
+  when it is a replica, plus every peer that answers, during the check,
+  that it holds the blob (§2). The blob is complete when they make k.
+- **Where a missing replica goes** is the one place XOR distance still
+  decides: the closest peers this node knows that do not hold the blob,
+  as the publisher chose. The receiver records intent the same way.
+- **Honest limits.** This node does not know the whole swarm. Two
+  watchers with different views may push to different peers: an extra
+  replica, never fewer. A replica that comes back after it was replaced
+  keeps its copy too: repair never deletes a replica, so the excess is at
+  most one copy per node that came back.
 
 ### 2. Replica repair
 
@@ -95,15 +110,17 @@ to the next peer (an extra replica at worst).
 
 **One check of blob H** (the event that lists it comes from the store):
 
-1. Compute R(H) and k. If this node is neither in R(H) nor the author,
-   reschedule (it may become responsible later) and stop.
-2. Walk the known peers in XOR order from H, nearest first, asking each
-   to hold H, until k replicas are counted, or `need + 3` peers were asked
-   (`need` is k, minus one when this node is in R(H)): room to replace 3
-   gone, full or refusing peers per check.
+1. Compute k. If this node is neither a replica of H (§1) nor its
+   author, reschedule and stop.
+2. Ask peers to hold H, first the holders that confirmed at the last
+   check, then the known peers in XOR order from H, nearest first, until
+   k replicas are counted, or `need + 3` peers were asked (`need` is k,
+   minus one when this node is a replica): room to replace 3 gone, full
+   or refusing peers per check. A holder confirms; a peer that does not
+   hold H fetches it from this node and records itself as a replica.
 3. A peer with no connection within 5 s (`REPAIR_CONNECT_LIMIT`) is
-   unreachable: left out of R(H) for 10 min, doubling to 24 h, until it
-   contacts this node again (any request, any gossip message).
+   unreachable: left out for 10 min, doubling to 24 h, until it contacts
+   this node again (any request, any gossip message).
 4. Complete: checked again after `recheck` (6 h, ±50 %). Short: after
    `retry` (10 min), doubling with each short check, up to `recheck`;
    logged at INFO ("blob short of replicas"). A check that adds a peer to
@@ -139,7 +156,7 @@ pass is bounded as above whatever the number of blobs due.
 
 **What repair cannot do.** It pushes a blob with the event that lists it,
 held in full here. A blob whose body this node dropped (kept because it
-is responsible, §5) is still served to readers, but this node does not
+is a replica, §5) is still served to readers, but this node does not
 push it: ADR 0020 §3, "a node never pushes a body it dropped". The other
 holders, which still hold the body, repair it.
 
@@ -203,8 +220,8 @@ holds the blob, or take it first (`Node::hand_off_before_drop`):
 
 | Deletion | Last-copy protection |
 |---|---|
-| `evicted` (storage pressure: `Node::drop_body`, rotation) | yes: a stranded blob refuses the whole drop (`KeptLastCopy`), body and blob stay; eviction picks something else |
-| `wats drop` with a running node (`own`) | yes: refused if a blob is stranded, nothing dropped; `--purge` skips the hand-off |
+| `evicted` (storage pressure: `Node::drop_body`, rotation) | a replica (record) is not deleted at all: the body goes, the blob stays (§5). Any other copy: a stranded blob refuses the whole drop (`KeptLastCopy`), body and blob stay; eviction picks something else |
+| `wats drop` with a running node (`own`) | yes, replicas included: refused if a blob is stranded, nothing dropped; `--purge` skips the hand-off |
 | `wats drop` with no node running | nothing can be handed off: refused when the drop would free a blob held here, unless `--purge` |
 | the blob collection (`storage.gc`) | by construction: it deletes only blobs with no tag and no kept event listing them, and every untagging for the reasons above goes through the hand-off |
 | `retraction`, `erasure`, `label` | **no: they delete regardless, last copy or not** (ADR 0020 is unchanged) |
@@ -222,16 +239,18 @@ per freed blob when a responsible peer still holds it.
 
 ### 5. Interaction with rotation (ADR 0025 PR B)
 
-- **Responsible blobs are not evicted by rotation.** Rotation drops a
-  body to free store bytes; a blob listed by that body, which this node is
-  responsible for, keeps its tag (Vincent's "keep the file if
-  responsible"). The shared helpers: `Node::is_responsible(hash, k)`,
-  `Node::blob_target_k(hash)` (5 when a kept event listing the blob is
-  knowledge, else `replication`) and `Node::responsible_blobs(event)`.
-  The rotation PR's `Node::blob_responsible(hash)` becomes
-  `is_responsible(hash, blob_target_k(hash))` when the two meet: one
-  definition of "responsible" (k closest of the known peers and this
-  node, unreachable peers left out).
+- **Replicas are not evicted by rotation.** Rotation drops a body to
+  free store bytes; a blob listed by that body that this node holds as a
+  replica keeps its tags (Vincent's "keep the file if responsible").
+  `Node::drop_body(.., Evicted, ..)` does so here.
+- **One record.** The rotation PR (#182) records replica intent at fetch
+  time too, as a `blob_retained` row with reason `replica`. Whichever PR
+  lands second makes `record_replica_intent` and `has_replica_intent`
+  read and write that row (the `wats/replica/` tags of nodes already
+  running are read once, or kept as a second source: either only adds
+  retention). The XOR estimate (`Node::is_responsible(hash, k)`, with
+  `Node::blob_target_k(hash)` for k: 5 when a kept event listing the blob
+  is knowledge, else `replication`) may add retention, never remove it.
 - **Other blobs a rotation drop frees** go through last-copy protection:
   rotation calls `Node::drop_body(.., Evicted, ..)`, or
   `Node::hand_off_before_drop` before its own drop, and skips the post
@@ -280,11 +299,13 @@ true: an older running node still takes `wats drop` without `--purge`.
   (looped 20+ times, some under CPU load, before merging).
 - `a_blob_of_knowledge_reaches_five_replicas`: a digest accepted by the
   asker reaches the 5 closest of 7 nodes; a plain blob stays at 3.
-- `the_last_copy_is_handed_off_before_it_is_deleted`: eviction refused
-  and the collection keeps the blob while no other node is reachable;
-  once one appears, it takes the blob, the eviction goes through and the
-  blob is untagged here; an offline `wats drop` is refused, then done
-  with `--purge`.
+- `the_last_copy_is_handed_off_before_it_is_deleted`: a pushed replica
+  records intent; a copy fetched on read does not. Evicting the read copy
+  is refused, and the collection keeps it, while no other holder is
+  reachable; once the replica's node is back, it confirms, the eviction
+  goes through and the copy is untagged. Evicting the replica's body keeps
+  the replica. An offline `wats drop` is refused, then done with
+  `--purge`.
 - `erasure_and_retraction_delete_the_last_copy`: both delete the only
   copy, and nobody is asked to take it.
 - `a_node_that_rejoins_starts_no_repair_storm`: 40 blobs; a node coming

@@ -2,13 +2,14 @@
 //! knowledge, and last-copy protection.
 //!
 //! - **Replica repair.** Every node walks, at a low and jittered rate, the
-//!   blobs it holds and is responsible for (or that its own posts list).
-//!   For each one it asks the peers closest to the hash, nearest first, to
-//!   hold it, with the `replicate` request every release answers: a peer
-//!   that holds the blob confirms at once, one that does not fetches it
-//!   from this node. It stops once the blob has its k replicas, counting
-//!   itself when it is one of the k closest. A peer that is gone, full or
-//!   refuses is replaced by the next closest. No wire change.
+//!   blobs it holds as a replica (or that its own posts list). For each
+//!   one it asks the holders it last confirmed, then the peers closest to
+//!   the hash, to hold it, with the `replicate` request every release
+//!   answers: a peer that holds the blob confirms at once, one that does
+//!   not fetches it from this node and records itself as a replica. It
+//!   stops once the blob has its k replicas, itself included. A peer that
+//!   is gone, full or refuses is replaced by the next closest. No wire
+//!   change.
 //! - **Knowledge replicas.** A blob listed by a knowledge entry (ADR 0019
 //!   §5.2: a promoted digest, a thread's canonical answer), or by one of
 //!   the sources an entry rests on, wants [`KNOWLEDGE_REPLICATION`] (5)
@@ -19,11 +20,14 @@
 //!   Retractions, erasure labels and moderation labels delete regardless
 //!   (ADR 0020): those are reasons why the content must not be kept.
 //!
-//! "The k closest" are the k closest by XOR distance among the peers this
-//! node knows (gossip neighbors, configured and bootstrap peers, peers
-//! that contacted it) plus itself, leaving out peers found unreachable.
-//! Two nodes with different views may disagree on the set: each pushes to
-//! its own, which costs at most an extra replica.
+//! A node is a replica of a blob when the blob came to it by `replicate`:
+//! the receiver records that intent at fetch time (a `wats/replica/` tag),
+//! because the pusher chose it from its own view of the swarm, which no
+//! other node can recompute. The XOR estimate (the k closest among the
+//! peers this node knows and can reach, plus itself) may only add to it.
+//! Where a missing replica goes is the closest peers that do not hold it;
+//! two nodes with different views may push to different peers, which
+//! costs at most an extra replica.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -239,6 +243,13 @@ impl State {
     }
 }
 
+/// The tag that records a blob held as a replica, followed by its hash.
+pub const REPLICA_TAG: &str = "wats/replica/";
+
+fn replica_tag(hash: &Hash) -> String {
+    format!("{REPLICA_TAG}{}", hash.to_hex())
+}
+
 /// The `k` nodes responsible for `hash`: the `k` closest to it by XOR
 /// distance among `peers` and `me` (ADR 0005, ADR 0029).
 pub fn responsible_set(
@@ -325,10 +336,10 @@ impl Node {
         }
     }
 
-    /// Whether this node is one of the `k` nodes responsible for blob
-    /// `hash` (hex), among the peers it knows and can reach. The helper
-    /// event rotation (ADR 0025 PR B) shares: a node keeps a blob it is
-    /// responsible for, even when the body listing it is dropped.
+    /// Whether this node is one of the `k` closest to blob `hash` (hex),
+    /// among the peers it knows and can reach: an estimate that may only
+    /// add to the replica record ([`Node::has_replica_intent`]), never
+    /// remove it (ADR 0029 §1).
     pub fn is_responsible(&self, hash: &str, k: usize) -> bool {
         let Ok(hash) = crate::event::parse_hex::<32>(hash, "hash") else {
             return false;
@@ -412,6 +423,26 @@ impl Node {
             .filter(|e| listed.contains(&e.id))
             .map(|e| e.id.clone())
             .collect()
+    }
+
+    /// Record that this node holds blob `hash` as a replica: it came by
+    /// `replicate` (a publisher's push or a repair). Intent at fetch time is
+    /// the source of truth for "this node is a replica" (ADR 0029 §1): the
+    /// pusher chose this node from its own view of the swarm, which this
+    /// node cannot recompute. Durable: a tag in the blob store
+    /// ([`REPLICA_TAG`]), which also keeps the blob from the collection.
+    /// Deleting the blob deletes the record ([`super::unpin_blob`] drops
+    /// every tag of a hash).
+    pub(super) async fn record_replica_intent(&self, hash: Hash) {
+        if let Err(e) = self.blobs.tags().set(replica_tag(&hash), hash).await {
+            warn!(%hash, "replica not recorded: {e:#}");
+        }
+    }
+
+    /// Whether this node recorded blob `hash` as a replica
+    /// ([`Node::record_replica_intent`]).
+    pub async fn has_replica_intent(&self, hash: &Hash) -> bool {
+        matches!(self.blobs.tags().get(replica_tag(hash)).await, Ok(Some(_)))
     }
 
     /// Whether this node holds `blob` whole: complete, of its declared
@@ -614,16 +645,17 @@ impl Node {
             return;
         }
         let me = self.endpoint_id();
-        let target = responsible_set(hash.as_bytes(), me, peers, k);
-        let responsible = target.contains(&me);
-        if !responsible && !self.is_local_author(&event.author) {
-            // Someone else's to watch; this node may become one of the k
-            // closest later.
+        // A replica by intent (it came by `replicate`), or by this node's
+        // XOR estimate, which may only add (ADR 0029 §1).
+        let replica = self.has_replica_intent(&hash).await
+            || responsible_set(hash.as_bytes(), me, peers, k).contains(&me);
+        if !replica && !self.is_local_author(&event.author) {
+            // Someone else's to watch (a copy fetched on read).
             self.reschedule(hash, true, Vec::new());
             return;
         }
         bump(&self.durability.stats.checked);
-        let need = k.saturating_sub(usize::from(responsible));
+        let need = k.saturating_sub(usize::from(replica));
         let previous: Vec<EndpointId> = self
             .durability
             .checks
@@ -631,9 +663,21 @@ impl Node {
             .ok()
             .and_then(|c| c.get(&hash).map(|c| c.holders.clone()))
             .unwrap_or_default();
+        // The holders confirmed last time first, then the closest peers:
+        // where a replica is pushed when one is missing.
+        let mut order: Vec<EndpointId> = previous
+            .iter()
+            .filter(|p| peers.contains(p))
+            .copied()
+            .collect();
+        for peer in proto::closest(hash.as_bytes(), peers, peers.len()) {
+            if !order.contains(&peer) {
+                order.push(peer);
+            }
+        }
         let mut holders = Vec::new();
         let mut asked = 0usize;
-        for peer in proto::closest(hash.as_bytes(), peers, peers.len()) {
+        for peer in order {
             if holders.len() >= need || asked >= need.saturating_add(EXTRA_TRIES) {
                 break;
             }
@@ -663,7 +707,7 @@ impl Node {
             if !previous.is_empty() && !added.is_empty() {
                 info!(
                     %hash,
-                    replicas = holders.len().saturating_add(usize::from(responsible)),
+                    replicas = holders.len().saturating_add(usize::from(replica)),
                     k,
                     "replica repaired"
                 );
@@ -674,7 +718,7 @@ impl Node {
             bump(&self.durability.stats.short);
             info!(
                 %hash,
-                replicas = holders.len().saturating_add(usize::from(responsible)),
+                replicas = holders.len().saturating_add(usize::from(replica)),
                 k,
                 asked,
                 "blob short of replicas: no more peer took it this time"
@@ -720,9 +764,21 @@ impl Node {
     /// the closest to the blob (those responsible for it), then
     /// `history_full` peers (durable nodes), then the rest, at most
     /// [`HANDOFF_TRIES`]. Returns the blobs no other node took: deleting
-    /// them may lose their last copy.
+    /// them may lose their last copy. Replicas (a replica record) are
+    /// handed off like any other copy.
     pub async fn hand_off_before_drop(&self, id: &str) -> Result<Vec<String>> {
-        let freed = self.store.blobs_freed_by(id)?;
+        self.hand_off_before_drop_except(id, &[]).await
+    }
+
+    /// [`Node::hand_off_before_drop`], leaving out the blobs in `kept`
+    /// (hex), which the drop will not delete.
+    pub(super) async fn hand_off_before_drop_except(
+        &self,
+        id: &str,
+        kept: &[String],
+    ) -> Result<Vec<String>> {
+        let mut freed = self.store.blobs_freed_by(id)?;
+        freed.retain(|h| !kept.contains(h));
         if freed.is_empty() {
             return Ok(Vec::new());
         }

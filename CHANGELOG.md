@@ -8,9 +8,11 @@
   pushed to the 3 nodes closest to its hash when it was published, and
   never again: a replica whose node died was gone for good. Each node now
   checks, every 10 minutes or so and at most 64 blobs at a time, the
-  blobs it holds as one of the 3 closest (and those of its own posts):
-  it asks the closest peers to hold each one with the `replicate` request
-  every release answers, and one that does not have it fetches it. A
+  blobs it holds as a replica (recorded when the blob was pushed to it)
+  and those of its own posts: it asks the holders, then the closest
+  peers, to hold each one with the `replicate` request every release
+  answers, and one that does not have it fetches it. A replica stays when
+  its post's body is evicted. A
   lost replica is re-made on the next closest node, within hours, with
   at most 16 requests to any peer per pass; a node coming back spreads
   its checks over 6 hours. A node already holding a blob now confirms it
