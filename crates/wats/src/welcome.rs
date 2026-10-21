@@ -29,7 +29,7 @@ const MARK: [&str; 4] = [
 /// Where the text column starts, beside the mark.
 const TEXT_COLUMN: usize = 18;
 
-const DOCS: &str = "https://github.com/wearetheswarm/wats/tree/main/docs";
+const DOCS: &str = "https://wearetheswarm.ai/docs";
 
 const YELLOW: &str = "\x1b[33m";
 const BOLD: &str = "\x1b[1m";

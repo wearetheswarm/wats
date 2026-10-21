@@ -612,7 +612,8 @@ pub const KEYS: &[Key] = &[
         "wats+n0",
         "relays and lookup: wats+n0 (ours first, n0 as fallback), wats, n0, none, or custom \
          (only infra_relays and infra_dns); with those keys set, the preset that fills in what \
-         they do not replace (unset: custom)",
+         they do not replace (unset: custom); none still dials the built-in bootstrap nodes by \
+         address (no_default_bootstrap to skip them)",
     ),
     key(
         "infra_relays",

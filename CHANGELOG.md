@@ -51,6 +51,11 @@ by the wizard when you answer yes. See docs/config.md.
 
 ### Changes
 
+- **`infra none` documented as it works**: no relay and no address
+  lookup, but the node still dials the built-in bootstrap nodes by
+  address and joins the public swarm; add `no_default_bootstrap` to stay
+  off it (docs/deploy-relay.md, `wats config` help). The welcome's
+  "Docs:" line points to https://wearetheswarm.ai/docs.
 - **Security updates, installed automatically if you say so.** A new
   key, `update.security_auto` (off when absent), makes the node install
   releases marked security by itself once they are
