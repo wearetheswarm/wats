@@ -84,6 +84,24 @@ machine, and supply-chain attacks on dependencies beyond pinning and
   (bound to both node ids, single use, 60 s, effort adapting from 8 to 24
   bits) to peers that advertise `challenge`; older peers are refused as
   before. Solved requests stay under a global ceiling (ADR 0014 addendum).
+- **Replica repair** (ADR 0029) runs on the node's own jittered timer
+  (every 10 min ± 50 %), never on a peer's request, join or return, so no
+  peer can make a node push: a pass checks at most 64 blobs, sends at
+  most 7 requests per blob and 16 per peer, through the 4 paced push
+  slots per peer; a returning node spreads its checks over 6 h. A peer
+  that is busy, throttled or slow only delays a check (it ends, and comes
+  back within 10 minutes); one that refuses for good, or misses twice an
+  hour apart, is replaced, which costs one push to the next peer. A
+  peer's claim to hold a blob counts only after a possession proof: this
+  node fetches from it alone a random chunk and the last one, BAO-verified,
+  and meanwhile refuses that blob to every requester, unknown connections
+  included: neither the peer nor a second identity of it can fetch the
+  chunks from this node and relay them. Readers of that blob from this
+  node are refused for those seconds and try another provider or again.
+  The receiving side keeps its limits (rate
+  limit, 4 fetches and a queue of 16 per peer, `storage.max`); a peer can
+  make it a replica only of blobs it is among the 6 closest to, and
+  replicas take at most 60 % of the blob part of `storage.max`.
 - **Blobs** are verified by BLAKE3 streaming, are never executed, and are
   exported read-only. Export never follows a symlink: the inbox and its
   per-hash directories must be real directories, and files are written
@@ -343,7 +361,16 @@ Every channel carries a little stranger-written text, marked as data:
   them are kept, and a key over its share loses even those. Kept-forever
   kinds and erasure labels are never rotated: a flood of them is bounded
   by proof of work only, and past the share the node backs off and falls
-  back to ADR 0012's ceiling. Blobs are not evicted yet (ADR 0029).
+  back to ADR 0012's ceiling. The files of the posts it rotates out
+  follow ADR 0029's last-copy rule (next item).
+- **Possession proofs are snapshots, and may be relayed** (ADR 0029).
+  A peer proves it holds a blob at one moment, and may delete it right
+  after; it may also fetch the chunks asked for from a third holder
+  (this node's own copy is refused to everyone meanwhile). Peers placed
+  close to a hash (endpoint ids are free) can so make an eviction release
+  a copy while fewer real copies exist than counted. Eviction needs two
+  proven holders when k > 1, and erasure, retractions and `wats drop`
+  never hand anything off.
 - **A fake newest history** (ADR 0025 §9): a new node keeps only a budget
   of history, newest first, so a peer serving it a window of valid junk
   (fresh keys, recent `ts`, the scheduled proof of work) crowds real

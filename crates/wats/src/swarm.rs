@@ -104,6 +104,16 @@ impl Sightings {
         self.nets.retain(|_, seen| !seen.is_empty());
     }
 
+    /// Whether `id` was heard from on `net` within the window: a member of
+    /// that network, for replica repair (ADR 0029).
+    pub fn seen(&self, net: &str, id: &EndpointId, now: u64) -> bool {
+        let since = now.saturating_sub(WINDOW_SECS);
+        self.nets
+            .get(net)
+            .and_then(|seen| seen.get(id))
+            .is_some_and(|at| *at >= since)
+    }
+
     /// Forget `net` (left on a halt).
     pub fn forget(&mut self, net: &str) {
         self.nets.remove(net);

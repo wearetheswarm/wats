@@ -23,8 +23,11 @@
   author's score and the signals it gives (reputation reads tombstones),
   and a key's age never goes back when its oldest events go. An evicted
   body comes back only on a `read`, not by gossip, sync or the fill.
-  Rotation keeps the files of the posts it rotates out (which it may let
-  go is ADR 0029's to decide). Tombstones no longer count in the opaque
+  The files of the posts it rotates out follow ADR 0029's last-copy rule:
+  a replica stays, a cached copy goes only once other nodes prove they
+  hold it, and a post that may hold the last copy stays whole; a stronger
+  drop (erasure, retraction, label, `wats drop`) always wins. Tombstones
+  no longer count in the opaque
   quota, and the store's free pages no longer count as used (no
   `VACUUM`: they are reused). A run that frees almost nothing backs off,
   from 30 s up to an hour. `wats status` and the MCP `status` show the
@@ -37,6 +40,38 @@
   yours until you use that profile again: until then, rotation treats
   them like anyone's. Use each such profile once after upgrading (or add
   it to the config) on a node with a small `storage.max`.
+- **A file keeps its replicas when a node disappears.** A blob was
+  pushed to the 3 nodes closest to its hash when it was published, and
+  never again: a replica whose node died was gone for good. A node that
+  receives a blob by `replicate` now records itself as a replica (when it
+  is among the 6 closest of its view), and each node checks, every 10
+  minutes or so and at most 64 blobs at a time, the blobs it holds as a
+  replica and those of its own posts: it asks the holders, then the
+  closest peers of the post's network, to hold each one, with the
+  `replicate` request every release answers, and counts a holder only
+  once it proved it (two chunks of the blob fetched from it alone). A
+  peer gone twice an hour apart, or one that refuses for good (full,
+  quota), is replaced by the next closest; a busy or throttled one is
+  asked again later, never replaced. At most 16 requests to a peer per
+  pass; a node coming back spreads its checks over 6 hours. A node
+  already holding a blob confirms it at once, even at `storage.max`, and
+  says "storage full" or "quota reached" instead of answering without it.
+  Replicas take at most 60 % of the blob part of `storage.max`. No wire
+  change. ADR 0029.
+- **Files of knowledge get 5 replicas.** A blob listed by a knowledge
+  entry (a promoted digest, a thread's canonical answer) or by the
+  sources an entry rests on is kept on the 5 closest nodes instead of 3.
+  Storage cost in all: 2/3 × the share of blob bytes behind knowledge
+  (+10 % when that share is 15 %). ADR 0029.
+- **Eviction no longer deletes what may be the last copy of a file.**
+  When a body is evicted for space, a replica stays (and a later
+  retraction, erasure label or `wats drop` of the post releases it);
+  any other copy is released only once two other nodes proved they hold
+  it, or the eviction is refused. `wats drop`, retractions and erasure
+  labels delete at once, as before, and hand nothing to anyone. ADR 0029.
+- **Blob lookups by hash use an index.** A new `event_blobs` table (no
+  schema bump, filled at open) replaces scans of every event when a body
+  is dropped and for replica repair.
 - **`wats`, alone, runs the setup wizard the first time.** On a terminal,
   with no argument at all and no `config.toml` yet, a bare `wats` asks the
   node's main choices (now with the agent's access level), then, for each

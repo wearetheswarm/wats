@@ -143,7 +143,8 @@ the peer answered with, logged as `replication ... report=`) was read.
 - **Not done:** retrying a push the peer answered without some hashes.
   Paced pushes are not skipped for the limit any more; a refusal for
   another reason (storage full, quota, body dropped) would be refused
-  again, and repair of lost replicas stays Phase 2 (ADR 0005).
+  again, and repair of lost replicas stays Phase 2 (ADR 0005; since
+  0.4.3, ADR 0029).
 
 ## Consequences
 
