@@ -31,7 +31,7 @@ use crate::update::Install;
 
 /// The agent CLIs looked for on `PATH`. Only [`RUNTIMES`] can run; the
 /// others (Mistral Vibe) are listed as MCP hosts.
-pub const AGENT_CLIS: [&str; 4] = ["claude", "codex", "openclaw", "vibe"];
+pub const AGENT_CLIS: [&str; 5] = ["claude", "codex", "openclaw", "opencode", "vibe"];
 
 /// Shown when the node runs no agent (startup, `status`). A future
 /// policy: no quota is enforced today.
@@ -41,8 +41,20 @@ enables one.";
 
 /// Shown by setup when no supported agent CLI is on `PATH`.
 pub const NO_AGENT_FOUND: &str = "No agent CLI found: install Claude Code \
-(https://claude.com/claude-code) or Codex (https://github.com/openai/codex), then run \
-`wats setup` again.";
+(https://claude.com/claude-code), Codex (https://github.com/openai/codex) or OpenCode \
+(https://opencode.ai, for your own model or cloud credits), then run `wats setup` again.";
+
+/// Shown before the model question when OpenCode is the node's agent
+/// (ADR 0031 §2).
+pub const OPENCODE_MODEL_ABOUT: &str = "OpenCode runs with the models you set up in \
+OpenCode (`opencode auth login`, your provider's environment). Its runs do not read \
+~/.config/opencode: a custom provider goes in the agent's own OpenCode directory, which \
+`wats setup opencode --agent` creates.";
+
+/// The model question for OpenCode: `provider/model`, empty for
+/// OpenCode's own choice.
+pub const OPENCODE_MODEL_QUESTION: &str =
+    "The agent's model, as provider/model, e.g. azure/gpt-5 (empty: OpenCode's default)";
 
 /// Shown by setup when OpenClaw is on `PATH` and not the node's agent: its
 /// agents can use the wats tools.
@@ -292,6 +304,7 @@ fn current(settings: &Settings, key: &str) -> Option<String> {
         "agent.max_usd_per_day" => agent.max_usd_per_day.map(|n| n.to_string()),
         "agent.max_usd_per_month" => agent.max_usd_per_month.map(|n| n.to_string()),
         "agent.access" => agent.access.clone(),
+        "agent.model" => agent.model.clone(),
         "nets" => (!settings.nets.is_empty()).then(|| settings.nets.join(",")),
         _ => None,
     }
@@ -470,6 +483,21 @@ fn prompt_after(
         writeln!(out, "{}", crate::openclaw::SPEND_CAPS)?;
     }
     let mut values = Vec::new();
+    // OpenCode reaches many providers: its model is asked when it is
+    // chosen (ADR 0031 §2). Not a revision question: nothing is asked of
+    // existing setups.
+    if runtime.as_deref() == Some("opencode") && !keep_runtime {
+        writeln!(out, "{OPENCODE_MODEL_ABOUT}")?;
+        let default = current(settings, "agent.model").unwrap_or_default();
+        write!(out, "{OPENCODE_MODEL_QUESTION} (agent.model) [{default}]: ")?;
+        let model = match read_answer(input, out)? {
+            Some(answer) if !answer.is_empty() => answer,
+            _ => default,
+        };
+        if !model.is_empty() {
+            values.push(("agent.model", model));
+        }
+    }
     for q in questions {
         if q.since <= revision
             || (q.agent_only && runtime.is_none())
@@ -532,7 +560,7 @@ pub fn render(choices: &Choices) -> Result<String> {
     line(&mut text, "storage.max")?;
     text.push_str(
         "\n# The agents the node runs, one [agents.<name>] table each (ADR 0021); the\n\
-         # name defaults to the runtime: claude, codex or openclaw.\n",
+         # name defaults to the runtime: claude, codex, openclaw or opencode.\n",
     );
     match &choices.runtime {
         Some(runtime) => {
@@ -541,6 +569,13 @@ pub fn render(choices: &Choices) -> Result<String> {
                 "[agents.{runtime}]\nruntime = {}\n",
                 settings::check_value("agent.runtime", runtime)?
             ));
+            if let Some(model) = chosen("agent.model") {
+                text.push_str(&format!(
+                    "# {}\nmodel = {}\n",
+                    settings::find_key("agent.model")?.help,
+                    settings::check_value("agent.model", model)?
+                ));
+            }
             for q in QUESTIONS {
                 if q.agent_only {
                     text.push('\n');
@@ -960,12 +995,19 @@ fn next_steps(out: &mut impl Write, choices: &Choices, found: &[Found], hints: b
             }
         }
         Some(runtime) => {
-            let name = if runtime == "codex" {
-                "Codex"
-            } else {
-                "Claude Code"
+            let name = match runtime.as_str() {
+                "codex" => "Codex",
+                "opencode" => "OpenCode",
+                _ => "Claude Code",
             };
             write!(out, "`wats` now runs the node with a {name} agent.")?;
+            if runtime == "opencode" {
+                write!(
+                    out,
+                    " Its runs read the agent's own OpenCode directory, not ~/.config/opencode \
+                     (`wats setup opencode --agent` creates it and says where)."
+                )?;
+            }
             if hints {
                 write!(
                     out,
@@ -1061,6 +1103,50 @@ mod tests {
         setup(data.path(), &mut "".as_bytes(), &mut out, Some(&path)).unwrap();
         let said = String::from_utf8(out).unwrap();
         assert!(!said.contains("openclaw"), "{said}");
+    }
+
+    /// OpenCode on PATH (looked up, never run) is a runtime (ADR 0031):
+    /// choosing it asks its model as provider/model, written to its table.
+    #[cfg(unix)]
+    #[test]
+    fn opencode_is_a_runtime_with_a_model_question() {
+        let bin = tempfile::tempdir().unwrap();
+        let opencode = fake_cli(bin.path(), "opencode");
+        let path = std::env::join_paths([bin.path()]).unwrap();
+        let found = detect_agents(Some(&path));
+        assert_eq!(
+            found,
+            [Found {
+                name: "opencode",
+                path: opencode
+            }]
+        );
+        assert!(found[0].supported());
+        let data = tempfile::tempdir().unwrap();
+        let mut out = Vec::new();
+        let choices = setup(
+            data.path(),
+            &mut "opencode\namazon-bedrock/claude-test\n".as_bytes(),
+            &mut out,
+            Some(&path),
+        )
+        .unwrap();
+        let said = String::from_utf8(out).unwrap();
+        assert_eq!(choices.runtime.as_deref(), Some("opencode"));
+        assert!(said.contains(OPENCODE_MODEL_QUESTION), "{said}");
+        assert!(said.contains("wats setup opencode --mcp"), "{said}");
+        let config = std::fs::read_to_string(data.path().join(FILE_NAME)).unwrap();
+        assert!(config.contains("[agents.opencode]"), "{config}");
+        assert!(
+            config.contains("model = \"amazon-bedrock/claude-test\""),
+            "{config}"
+        );
+        // Enter keeps OpenCode's own default: no model written.
+        let other = tempfile::tempdir().unwrap();
+        let mut out = Vec::new();
+        setup(other.path(), &mut "\n\n".as_bytes(), &mut out, Some(&path)).unwrap();
+        let config = std::fs::read_to_string(other.path().join(FILE_NAME)).unwrap();
+        assert!(!config.contains("\nmodel = "), "{config}");
     }
 
     /// On a desktop session, setup asks notify.desktop (default yes) and

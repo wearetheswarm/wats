@@ -29,6 +29,7 @@ use crate::budget;
 use crate::event::{Draft, Event, Kind, title_from_text};
 use crate::identity::author_id;
 use crate::node::Node;
+use crate::opencode;
 use crate::runs::{self, RunRecord};
 use crate::store::Filter;
 use crate::wake::{Hold, WakeLimits, WakeState, loop_turns};
@@ -161,6 +162,14 @@ impl AgentInfo {
             Some("codex") => format!(
                 "{} of {} runs today (Codex reports no cost)",
                 spend.uncosted_today, self.budget.max_runs_per_day
+            ),
+            Some("opencode") if !opencode::ENFORCE_USD_BUDGET => format!(
+                "{} of {} runs today (OpenCode's costs not enforced)",
+                spend.uncosted_today, self.budget.max_runs_per_day
+            ),
+            Some("opencode") => format!(
+                "{} (OpenCode's cost estimate)",
+                budget::describe(&self.budget, &spend)
             ),
             _ => budget::describe(&self.budget, &spend),
         }
@@ -932,7 +941,51 @@ async fn start_run(
     // The human's session hook (`wats notify --hook`) stays quiet in an
     // agent's run, even one that inherits the user's settings.
     command.env(crate::hook::AGENT_RUN_ENV, "1");
+    // A process group of its own: at the timeout, the runner kills the run
+    // and what it started (MCP servers, shell commands), ADR 0031 §3.
+    #[cfg(unix)]
+    command.process_group(0);
     match config.runtime.as_str() {
+        "opencode" => {
+            let (tools, _) = if config.access == Access::Workspace {
+                opencode::tools(&config.tools)?
+            } else {
+                Default::default()
+            };
+            let servers = if config.access == Access::Workspace {
+                opencode::workspace_servers(&config.workdir)?
+            } else {
+                Vec::new()
+            };
+            let permission = opencode::permission(&opencode::Permissions {
+                access: config.access,
+                tools: &tools,
+                servers: &servers,
+                data_dir: &config.data_dir,
+                run_dir: &dir,
+            });
+            let run_config = opencode::run_config(&opencode::RunConfig {
+                access: config.access,
+                wats_command: &config.mcp_command,
+                wats_args: &config.mcp_args,
+                runner_token: &token,
+                timeout: config.run_timeout,
+                steps: config.max_turns,
+                permission,
+            });
+            if config.access != Access::Inherit {
+                for key in opencode::removed_env(std::env::vars_os()) {
+                    command.env_remove(key);
+                }
+            }
+            for (key, value) in opencode::run_env(config.access, &config.work_dir, &run_config) {
+                command.env(key, value);
+            }
+            command
+                .args(opencode::run_args())
+                .args(model_args(config, "--model"))
+                .args(&config.extra_args);
+        }
         "codex" => {
             let (_, workspace_overrides) = if config.access == Access::Workspace {
                 access::workspace_codex_overrides(&config.workdir)?
@@ -1104,6 +1157,12 @@ async fn finish_run(
     match running.work {
         Work::Child(mut child, output) => {
             if !matches!(outcome, Outcome::Exited(_)) {
+                // Its whole process group first (the CLI is the group's
+                // leader, not yet reaped: the id is still its own).
+                #[cfg(unix)]
+                if let Some(pid) = child.id() {
+                    let _ = crate::background::signal_group(pid, "KILL");
+                }
                 let _ = child.kill().await;
             }
             // The transcript is complete before the footer goes in.
@@ -1654,6 +1713,50 @@ fn unix_now() -> u64 {
         .map_or(0, |d| d.as_secs())
 }
 
+/// Before an OpenCode runner starts (ADR 0031): its version, the extra
+/// arguments and `agent.tools` of the level, the workspace's config, the
+/// agent's own OpenCode directory, and warnings for what OpenCode loads
+/// that wats does not control.
+async fn check_opencode(config: &AgentConfig) -> Result<()> {
+    let found = opencode::version(&config.command).await;
+    if let Some(warning) = opencode::check_version(found)
+        .with_context(|| format!("OpenCode ({})", config.command.display()))?
+    {
+        warn!("{warning}");
+    }
+    opencode::check_extra_args(config.access, &config.extra_args)?;
+    if config.access == Access::Workspace {
+        let (_, unknown) = opencode::tools(&config.tools)?;
+        if !unknown.is_empty() {
+            warn!(
+                "agent.tools [{}]: not OpenCode 1.x permission keys (read, edit, glob, grep, \
+                 list, bash, webfetch, websearch, skill…); passed as they are",
+                unknown.join(", ")
+            );
+        }
+        access::ensure_workspace(&config.workdir)?;
+        opencode::workspace_servers(&config.workdir)?;
+    }
+    if config.access != Access::Inherit && opencode::ISOLATE_GLOBAL_CONFIG {
+        let dir = opencode::ensure_agent_dir(&config.work_dir)?;
+        info!(
+            "OpenCode runs read {} (the agent's model settings), not ~/.config/opencode",
+            dir.display()
+        );
+    }
+    let run_dir = match config.access {
+        Access::Workspace => config.workdir.clone(),
+        Access::SwarmOnly => config.work_dir.join("locked"),
+        Access::Inherit => std::env::current_dir()?,
+    };
+    for warning in
+        opencode::start_warnings(config.access, &run_dir, std::env::home_dir().as_deref())
+    {
+        warn!("{warning}");
+    }
+    Ok(())
+}
+
 /// Run the agent loop until `shutdown` resolves. A run in progress is then
 /// killed.
 pub async fn run(
@@ -1702,6 +1805,9 @@ pub async fn run(
         }
         config.codex_disable = features.disable;
         config.codex_enable = features.enable;
+    }
+    if config.runtime == "opencode" {
+        check_opencode(&config).await?;
     }
     announce_if_changed(&node, &config).await;
     // A marker left by a run that did not finish (crash, kill -9).

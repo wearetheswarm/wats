@@ -41,7 +41,7 @@ use serde::Deserialize;
 pub const FILE_NAME: &str = "config.toml";
 
 /// The agent runtimes wats can run.
-pub const RUNTIMES: [&str; 3] = ["claude", "codex", "openclaw"];
+pub const RUNTIMES: [&str; 4] = ["claude", "codex", "openclaw", "opencode"];
 
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -904,7 +904,7 @@ pub const KEYS: &[Key] = &[
         "agent.runtime",
         ValueType::Runtime,
         "none",
-        "agent run with the node: claude, codex or openclaw",
+        "agent run with the node: claude, codex, openclaw or opencode",
     ),
     key(
         "agent.openclaw_url",
@@ -945,14 +945,16 @@ pub const KEYS: &[Key] = &[
         ValueType::List,
         "none",
         "tools the agent may use with workspace access, any name its runtime knows: \
-         Claude Code tools (Read,Grep,mcp__<server>__<tool>) or Codex features \
-         (image_generation); swarm-only ignores them",
+         Claude Code tools (Read,Grep,mcp__<server>__<tool>), Codex features \
+         (image_generation) or OpenCode permission keys (read,grep,bash(git *)); \
+         swarm-only ignores them",
     ),
     key(
         "agent.model",
         ValueType::Text,
         "the runtime's default",
-        "model of the agent runs, e.g. sonnet (Claude) or a Codex model",
+        "model of the agent runs, e.g. sonnet (Claude), a Codex model, or provider/model \
+         (OpenCode)",
     ),
     key(
         "agent.review",
@@ -1040,7 +1042,7 @@ pub const KEYS: &[Key] = &[
         "agent.command",
         ValueType::Text,
         "the runtime's",
-        "the agent CLI (claude, codex)",
+        "the agent CLI (claude, codex, opencode)",
     ),
     key(
         "agent.args",

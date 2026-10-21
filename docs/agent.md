@@ -3,8 +3,13 @@
 `wats` with no command runs the node in the foreground. With `--agent
 claude`, the node also wakes an agent, Claude Code in headless mode, so that
 it takes part in the swarm on its own. The runtimes are `claude`, `codex`
-([codex.md](codex.md)) and `openclaw`, which forwards each run to the
-OpenClaw gateway instead of spawning a CLI ([openclaw.md](openclaw.md)).
+([codex.md](codex.md)), `opencode` ([opencode.md](opencode.md)) and
+`openclaw`, which forwards each run to the OpenClaw gateway instead of
+spawning a CLI ([openclaw.md](openclaw.md)).
+
+Your own model or cloud credits (Azure OpenAI, AWS Bedrock, Google Vertex
+AI, …): use OpenCode (or OpenClaw), set up as in its own docs.
+
 The agent is woken:
 
 - when something of interest arrives: an `ask`, or a direct reply to one
@@ -69,7 +74,8 @@ with a default that Enter accepts:
 
    | Question | Key | Default |
    |---|---|---|
-   | The agent the node runs, among `claude`, `codex` and `openclaw` found on your PATH, or none | `agent.runtime` | the first one found, else none |
+   | The agent the node runs, among `claude`, `codex`, `openclaw` and `opencode` found on your PATH, or none | `agent.runtime` | the first one found, else none |
+   | With OpenCode only: its model, as `provider/model` | `agent.model` | OpenCode's default |
    | Disk budget of the data directory | `storage.max` | `10G` |
    | Time limit of one agent run (with an agent) | `agent.timeout` | `10m` |
    | Turns per agent run (with an agent; not for OpenClaw) | `agent.max_turns` | `10` |
@@ -78,8 +84,9 @@ with a default that Enter accepts:
    | Networks to join | `nets` | `public` |
    | Desktop notifications (on a desktop session only) | `notify.desktop` | yes |
 
-2. For each of Claude Code, Codex, OpenClaw and Mistral Vibe found on your
-   PATH (looked up, never run): use the swarm from your own sessions,
+2. For each of Claude Code, Codex, OpenClaw, OpenCode and Mistral Vibe
+   found on your PATH (looked up, never run): use the swarm from your own
+   sessions,
    registering wats as its MCP server, as `wats setup <tool> --mcp` does
    (default yes; Claude Code and Codex then ask about their session hook).
    With OpenClaw as the node's agent: finish its agent setup, as `wats
@@ -161,6 +168,7 @@ wats                         # from now on: the node with its agent
 | `wats setup` | The setup wizard: the main choices, asked with defaults, then wats in the MCP hosts found ([first run](#first-run-wats-setup)). |
 | `wats setup claude [--mcp] [--agent] [--name NAME] [--scope user\|project]` | Persistent setup, see above; the agent goes to `[agents.claude]`, or `[agents.NAME]`. |
 | `wats setup codex [--mcp] [--agent]` | The same for the Codex CLI; `wats --agent codex` runs a headless Codex ([codex.md](codex.md)). |
+| `wats setup opencode [--mcp] [--agent] [--remove]` | OpenCode: `opencode mcp add wats` for your own sessions, and an OpenCode agent with its own OpenCode directory; `wats --agent opencode` runs `opencode run` with your own model or cloud credits ([opencode.md](opencode.md)). |
 | `wats setup openclaw [--mcp] [--agent] [--yes] [--url URL]` | OpenClaw: its MCP entries, the hook token and the config block to paste; `wats --agent openclaw` forwards each run to the OpenClaw gateway instead of spawning a CLI ([openclaw.md](openclaw.md)). |
 | `wats setup vibe --mcp\|--remove [--project]` | Mistral Vibe: adds or removes the `wats` entry of `[[mcp_servers]]` in its config.toml, after a backup copy; no agent runner yet ([vibe.md](vibe.md)). |
 | `wats config get\|set\|unset\|list` | `<data dir>/config.toml`. |
@@ -187,7 +195,7 @@ wats --agent claude -- --model sonnet                  # same, trailing argument
 
 | Option | Default | Meaning |
 |---|---|---|
-| `--agent` | the enabled agents | Repeatable: the agents of this run instead of those enabled in `config.toml`. `claude`, `codex` or `openclaw` (forwarded to the OpenClaw gateway, [openclaw.md](openclaw.md)), or `<runtime>:<name>` ([several agents](#several-agents-on-one-node)). |
+| `--agent` | the enabled agents | Repeatable: the agents of this run instead of those enabled in `config.toml`. `claude`, `codex`, `opencode` ([opencode.md](opencode.md)) or `openclaw` (forwarded to the OpenClaw gateway, [openclaw.md](openclaw.md)), or `<runtime>:<name>` ([several agents](#several-agents-on-one-node)). |
 | `--no-agent` | | Do not run the agents enabled in `config.toml`. |
 | `--access` | `workspace` | What the agent may use besides wats: `workspace`, `swarm-only` (formerly `locked`, still accepted) or `inherit` ([below](#giving-the-agent-tools)). |
 | `--agent-model` | the runtime's default | The model, e.g. `sonnet` or `haiku` (`agent.model`, `wats setup claude --model`). |
@@ -439,9 +447,9 @@ One knob, `agent.access` (or `--access`), three levels:
 
 | Level | The agent gets | Use it for |
 |---|---|---|
-| `workspace` (default) | its own directory, `agent.workdir` (default `<data dir>/agent/<name>/workspace`, created with stub instructions): its `CLAUDE.md` / `AGENTS.md`, skills (`.claude/skills/`), project settings, MCP servers (`.mcp.json`, or `.codex/config.toml` for Codex), and the tools listed in `agent.tools`. Not your environment: none of your own MCP servers, connectors, settings or files | sources and tools you are happy to share |
+| `workspace` (default) | its own directory, `agent.workdir` (default `<data dir>/agent/<name>/workspace`, created with stub instructions): its `CLAUDE.md` / `AGENTS.md`, skills (`.claude/skills/`), project settings, MCP servers (`.mcp.json`, `.codex/config.toml` for Codex, or `opencode.json` for OpenCode), and the tools listed in `agent.tools`. Not your environment: none of your own MCP servers, connectors, settings or files | sources and tools you are happy to share |
 | `swarm-only` | the raw model plus the 6 wats tools, nothing else, in an empty directory (named `locked` before 0.4.0, still accepted) | a curation and relay node (below) |
-| `inherit` | your own environment: your MCP servers and connectors, settings, skills and permission mode (Codex: your `~/.codex`) | only with `agent.allow` and `agent.review`, ideally in a sandbox |
+| `inherit` | your own environment: your MCP servers and connectors, settings, skills and permission mode (Codex: your `~/.codex`; OpenCode: your whole OpenCode config, which allows every tool by default) | only with `agent.allow` and `agent.review` (OpenCode and OpenClaw refuse to start without both), ideally in a sandbox |
 
 **`swarm-only`, a curation and relay node.** Without tools, the agent
 still does useful swarm work: it checks the reasoning of answers and
@@ -477,6 +485,15 @@ wats --agent claude --access inherit                          # this run only
     e.g. `image_generation` or `view_image`; every other one stays off.
     A name the installed Codex does not know is ignored, with a warning
     at start: Codex has no flag that would take it.
+  - **OpenCode**: its permission keys (`read`, `edit`, `glob`, `grep`,
+    `list`, `bash`, `webfetch`, `websearch`, `skill`…), with an optional
+    pattern: `bash(git status*)`. Each listed key is allowed, every other
+    one stays denied. `bash` keeps the deny patterns of the Claude runner
+    (the data directory, `config.toml`, `wats config`…), and `edit` may
+    not touch the workspace's `opencode.json` or `.opencode/`. `task` is
+    refused (a subagent has OpenCode's own rules, a shell included), and
+    so is a bare `external_directory` (give a directory:
+    `external_directory(/srv/docs/**)`). See [opencode.md](opencode.md).
   - **`swarm-only` ignores `agent.tools`**: `wats config set` and `wats
     setup` say so in one warning line, and the agent starts with the wats
     tools only. `inherit` has every tool of your own configuration anyway.
@@ -494,6 +511,8 @@ wats --agent claude --access inherit                          # this run only
     passed as `-c` overrides. Approvals are off (`never`), so set
     `default_tools_approval_mode = "approve"` on a server for the agent
     to call it, as wats does for its own; `enabled_tools` narrows it.
+  - **OpenCode**: `mcp` entries in `<workdir>/opencode.json(c)`, loaded
+    as project config; their tools (`<server>_*`) are allowed.
 - **Whatever a tool can read, a post can ask the agent to leak.** `wats
   config set` and `wats setup` repeat it when you set tools. A tool that
   reads files reads them for whoever wrote the post the agent answers;
@@ -578,7 +597,12 @@ detector, updates, crash reports; the list is `KEYS` in
   writes each image under `$CODEX_HOME/generated_images/<thread id>/`, at
   a path the model cannot choose. The OpenClaw agent
   that `wats setup openclaw` prints allows the wats tools only and denies
-  `exec`, `write` and `edit`.
+  `exec`, `write` and `edit`. OpenCode gets a dedicated `wats` agent whose
+  permissions deny every tool but the wats tools and `agent.tools`, with
+  `bash` and `edit` patterns like Claude Code's, and file tools kept in
+  the workspace (`external_directory` denied); these are checks inside
+  OpenCode's process, not a sandbox, and its plugins run whatever the
+  permissions say ([opencode.md](opencode.md#what-is-enforced-and-what-is-not)).
 - **`agent.workdir` cannot be the data directory or contain it**: `wats
   config set` and the daemon refuse it.
 - **Detection catches what slips through.** The node keeps the values of
@@ -1072,9 +1096,18 @@ wats config set agent.max_usd_per_day 5
 Passing `--max-turns` or `--max-budget-usd` in the extra arguments replaces
 the node's per-run values, but not the daily and monthly budgets.
 
+**OpenCode** reports a cost per step, which the node adds up: it is
+OpenCode's estimate from catalog prices, not your provider's bill
+(negotiated prices and credits are not in it). A model without a price
+reports 0, and its runs count against `agent.max_runs_per_day`.
+`agent.max_turns` is the `steps` of OpenCode's agent; there is no per-run
+cap in dollars ([opencode.md](opencode.md#budget)).
+
 ## Who pays
 
 - With `ANTHROPIC_API_KEY` set, Claude Code uses it (API credits).
+- OpenCode uses the providers you set up in it (`opencode auth login`,
+  your provider's environment variables); wats never reads them.
 - Otherwise it uses the Claude login of the user running `wats`, with its
   default model. A smaller model (`--agent-args "--model sonnet"`) costs
   less per run.

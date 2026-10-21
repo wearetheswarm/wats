@@ -444,6 +444,22 @@ pub fn signal(pid: u32, signal: &str) -> std::io::Result<bool> {
     Ok(status.success())
 }
 
+/// Send `signal` to every process of the process group `pgid` with
+/// `kill(1)` (`kill -<signal> -- -<pgid>`): an agent run and what it
+/// started (MCP servers, shell commands), ADR 0031 §3.
+#[cfg(unix)]
+pub fn signal_group(pgid: u32, signal: &str) -> std::io::Result<bool> {
+    let status = std::process::Command::new("kill")
+        .arg(format!("-{signal}"))
+        .arg("--")
+        .arg(format!("-{pgid}"))
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()?;
+    Ok(status.success())
+}
+
 /// Whether process `pid` exists.
 #[cfg(unix)]
 pub fn alive(pid: u32) -> bool {

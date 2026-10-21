@@ -175,6 +175,16 @@ pub fn append_index(work_dir: &Path, record: &RunRecord) -> std::io::Result<()> 
     write_line(&mut file, &serde_json::to_value(record)?)
 }
 
+/// The message of an error event: Codex's `error.message` or `message`,
+/// OpenCode's `error.data.message`, else its `error.name`.
+fn error_message(value: &Value) -> Option<&str> {
+    value["error"]["message"]
+        .as_str()
+        .or(value["message"].as_str())
+        .or(value["error"]["data"]["message"].as_str())
+        .or(value["error"]["name"].as_str())
+}
+
 /// Fill turns, cost and errors from the agent CLI's final `result` line
 /// (Claude Code stream-json).
 pub fn read_result(transcript: &Path, record: &mut RunRecord) {
@@ -193,20 +203,30 @@ pub fn read_result(transcript: &Path, record: &mut RunRecord) {
         {
             record.model = model.to_string();
         }
-        // Codex: turns and failures, no cost.
+        // Codex: turns and failures, no cost. OpenCode (`run --format
+        // json`, ADR 0031): a turn and its estimated cost per
+        // `step_finish`, and `error` events.
         match value["type"].as_str() {
             Some("turn.completed") => {
                 record.turns = Some(record.turns.unwrap_or(0) + 1);
+                continue;
+            }
+            Some("step_finish") => {
+                record.turns = Some(record.turns.unwrap_or(0) + 1);
+                // A cost of 0 (a model without a price) is no cost: the run
+                // then counts against the runs per day.
+                if crate::opencode::ENFORCE_USD_BUDGET
+                    && let Some(cost) = value["part"]["cost"].as_f64().filter(|c| *c > 0.0)
+                {
+                    record.cost_usd = Some(record.cost_usd.unwrap_or(0.0) + cost);
+                }
                 continue;
             }
             Some("turn.failed") | Some("error") => {
                 if record.status == "ok" {
                     record.status = "error".into();
                 }
-                record.error = value["error"]["message"]
-                    .as_str()
-                    .or(value["message"].as_str())
-                    .map(|m| m.chars().take(200).collect());
+                record.error = error_message(&value).map(|m| m.chars().take(200).collect());
                 continue;
             }
             _ => {}
@@ -593,10 +613,45 @@ pub fn render(line: &str, style: Style) -> Vec<String> {
             "✗ {}",
             value["error"]["message"].as_str().unwrap_or("turn failed")
         ))),
-        "error" => out.push(style.red(&format!(
-            "✗ {}",
-            value["message"].as_str().unwrap_or("error")
-        ))),
+        "error" => out.push(style.red(&format!("✗ {}", error_message(&value).unwrap_or("error")))),
+        // OpenCode (`opencode run --format json`).
+        "text" => {
+            for line in value["part"]["text"].as_str().unwrap_or("").trim().lines() {
+                out.push(format!("  {line}"));
+            }
+        }
+        "tool_use" => {
+            let part = &value["part"];
+            let state = &part["state"];
+            out.push(format!(
+                "{} {}",
+                style.cyan(&format!("→ {}", part["tool"].as_str().unwrap_or("?"))),
+                style.dim(&preview(&state["input"].to_string(), TOOL_PREVIEW)),
+            ));
+            if state["status"] == "error" {
+                out.push(style.red(&format!(
+                    "← ✗ {}",
+                    preview(state["error"].as_str().unwrap_or("error"), TOOL_PREVIEW)
+                )));
+            } else {
+                let mut text = preview(state["output"].as_str().unwrap_or(""), TOOL_PREVIEW);
+                if text.is_empty() {
+                    text = "(no text)".into();
+                }
+                out.push(style.dim(&format!("← {text}")));
+            }
+        }
+        "step_finish" => {
+            let part = &value["part"];
+            out.push(style.green(&format!(
+                "✓ step done{}",
+                part["cost"]
+                    .as_f64()
+                    .filter(|c| *c > 0.0)
+                    .map(|c| format!(" · ${c:.4} (estimate)"))
+                    .unwrap_or_default()
+            )));
+        }
         "result" => {
             let ok = value["is_error"] != true;
             let label = if ok {

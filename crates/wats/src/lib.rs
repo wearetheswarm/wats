@@ -31,6 +31,7 @@ pub mod limits;
 pub mod mcp;
 pub mod node;
 pub mod openclaw;
+pub mod opencode;
 pub mod peer_cache;
 pub mod proto;
 pub mod reconnect;

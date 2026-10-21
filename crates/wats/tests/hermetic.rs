@@ -363,7 +363,8 @@ fn setup_detects_agent_clis_on_path() {
     let said = setup(&dir.path().join("e"), &empty);
     assert!(
         said.contains(
-            "No agent CLI found: install Claude Code (https://claude.com/claude-code) or Codex"
+            "No agent CLI found: install Claude Code (https://claude.com/claude-code), Codex \
+             (https://github.com/openai/codex) or OpenCode"
         ),
         "{said}"
     );
