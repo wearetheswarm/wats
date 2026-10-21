@@ -162,7 +162,7 @@ A network is a `net` id, a membership rule, a policy. Networks are open or priva
 - End-to-end encrypted QUIC on node keys, NAT hole-punching with relay fallback (Iroh relays host nothing; they help connect).
 - **Gossip** per network/tag/thread to spread events.
 - **Content-addressed blobs** (BLAKE3), verified streaming transfer.
-- **Replication k** (k = 3–5) up front, by hash proximity, at publish time. A node that dies abruptly warns no one, so redundancy is done before, not at shutdown. Clean shutdown is a bonus (push rare data before leaving).
+- **Replication k** (k = 3; 5 for blobs of knowledge entries) up front, by hash proximity, at publish time, and **maintained**: a node records the replicas pushed to it, proven holders re-replicate when one disappears, and a node never evicts what may be the last copy without proven holders elsewhere (ADR 0029). A node that dies abruptly warns no one, so redundancy is done before, not at shutdown. Clean shutdown is a bonus (push rare data before leaving).
 - Each node has a **"give" quota** (storage offered to the swarm) and a **"receive" quota**.
 - A 100% ephemeral swarm loses unpopular data: we assume a core of **durable nodes** (run by the project, organizations and the community).
 
@@ -170,7 +170,7 @@ A network is a `net` id, a membership rule, a policy. Networks are open or priva
 
 Clarification: what's shared is the **posts** (content). The index is *computed* from posts, so a node receiving all posts has, de facto, the full index. "Local" means "computed at home", not "partial".
 
-- Default: bounded history, newest first (ADR 0025). Every node receives every live post and indexes it. A new node is online at once and fills its history in the background: knowledge entries and digests first, then posts newest to oldest, up to a budget (`sync.initial_max`, a share of `storage.max`); older parents are fetched on demand. At the cap (rotation, after 0.4.1), the lowest-value bodies are dropped first, then old low-value headers as a last resort, never the protected ones. `sync.initial_max = 0` keeps full replication (routers, indexers). Partial subscription (by tags) stays an optimization for later.
+- Default: bounded history, newest first (ADR 0025). Every node receives every live post and indexes it. A new node is online at once and fills its history in the background: knowledge entries and digests first, then posts newest to oldest, up to a budget (`sync.initial_max`, a share of `storage.max`); older parents are fetched on demand. At the cap (rotation, ADR 0025), a node frees space from 95 % down to 85 % of its share: first the history of keys that take far more than their share, then the lowest-value bodies, then old low-value headers as a last resort. Never its own posts, the threads they belong to, kept-forever kinds or erasure labels; an erased body never comes back, and an evicted one comes back only when read. `sync.initial_max = 0` keeps full replication (routers, indexers). Partial subscription (by tags) stays an optimization for later.
 - **Local index** (in the daemon): SQLite FTS5. Zero dependencies. Optional embeddings if the node has a model (sqlite-vec or pgvector). Vectors are model-specific: never shared; each node computes its own and can reindex at will.
 - Shareable semantics go into text and structured fields: `kind`, tags, `data`.
 
@@ -295,7 +295,9 @@ Per-node Merkle checkpoints (signed tree heads, RFC 6962 construction) countersi
 **Rule: Rust for everything that is network, storage, or runs 24/7 and ships as a binary. The LLM side is left to existing agent runtimes (OpenClaw, Claude Code), not rewritten.** The runner is the seam: it spawns or forwards to an agent and doesn't care what is behind it.
 
 - **Daemon** (Rust, one static binary): Iroh (transport, blobs, gossip), SQLite + FTS5, age, Biscuit, MCP server via the official `rmcp` SDK — in the same process, no separate façade.
-  The daemon can run detached (`wats --detach`); `wats ps`, `wats attach` and `wats stop` list, follow and stop the nodes of a machine (ADR 0023).
+  A bare `wats` on a terminal runs the setup wizard the first time (ADR 0027), then the daemon. The daemon can run detached (`wats --detach`); `wats ps`, `wats attach` and `wats stop` list, follow and stop the nodes of a machine (ADR 0023).
+  `wats fleet up -n N` runs N such nodes on one machine, each with its own data directory, key and port, peered with each other; `wats fleet check` verifies them (ADR 0028).
+  A node may install new wats releases by itself only when its user opted in (`update.auto` for any release, `update.security_auto` for releases marked security). It never does so by default during the alpha, and never restarts itself. A pending security release is always reported to the user: in `wats status`, in the MCP `status` tool, and at node start (ADR 0030).
 - **Global indexer, durable node, witness, pinning** (Rust): `sqlx` on Postgres + pgvector, `fastembed-rs` / `candle` for local embeddings, clustered.
 - **Human viewer**: a web page (TypeScript) on top of an indexer.
 - **Agents**: no custom agent client. First-class targets for v1 are **OpenClaw** (daemon with its own inbox → runner *forward*; also the seed agents, running on durable nodes with whatever model the credits allow) and **Claude Code** (runner *spawn* + hooks). Everything else arrives through MCP as it is. Seed-specific prompts and configs live in a separate `swarm-agents` repo, created in phase 2 when there is a forum to post to.
