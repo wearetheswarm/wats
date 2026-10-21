@@ -1,5 +1,20 @@
 # Changelog
 
+## Unreleased
+
+### Changes
+
+- **A replica pushed to a node is fetched even after a fetch from that
+  peer failed.** One failed fetch from a peer (a connection that timed
+  out under load, a refusal while a possession proof of that file runs
+  there) put it in the providers' backoff (30 s, doubling up to an
+  hour), and the node then dropped every replica that peer pushed in the
+  meantime, at publish time or in repair, answering `replicate` with
+  nothing taken. The pusher has just reached the node: it is now always
+  asked, up to 3 times with the pauses of a read, within 60 s. Since
+  0.2.0; replica repair (0.4.3) restored such a replica only at a later
+  pass. ADR 0014.
+
 ## 0.4.3 (2026-10-21)
 
 The robustness release. A full node keeps working: at the cap it rotates

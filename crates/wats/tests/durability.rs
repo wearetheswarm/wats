@@ -90,6 +90,16 @@ async fn holds(node: &Node, hash: &str) -> bool {
     node.blob_bytes(hash).await.ok().flatten().is_some()
 }
 
+/// Holds `hash` as a replica: the blob, and its replica record, written
+/// once the blob is in (`serve_replicate`). An eviction in between would
+/// free what is not recorded yet.
+async fn holds_replica(node: &Node, hash: &str) -> bool {
+    let Ok(parsed) = hash.parse() else {
+        return false;
+    };
+    holds(node, hash).await && node.has_replica_intent(&parsed).await
+}
+
 fn note(text: &str) -> Draft {
     Draft {
         net: PUBLIC_NET.into(),
@@ -514,7 +524,10 @@ async fn an_evicted_replica_is_released_by_erasure_or_retraction() -> anyhow::Re
     let retracted = publish_as(&publisher, Some(&author), dir.path(), &content(12)).await?;
     for e in [&erased, &retracted] {
         let hash = e.blobs[0].hash.clone();
-        eventually("the replica arrives", async || holds(&holder, &hash).await).await;
+        eventually("the replica arrives", async || {
+            holds_replica(&holder, &hash).await
+        })
+        .await;
         let outcome = holder
             .drop_body(&e.id, DropReason::Evicted, None, None)
             .await?;
@@ -647,6 +660,12 @@ async fn erasure_retraction_and_wats_drop_delete_at_once() -> anyhow::Result<()>
 /// sends at most 16 requests to any one peer, and adds no copy.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_node_that_rejoins_starts_no_repair_storm() -> anyhow::Result<()> {
+    // The nodes' logs, shown when the test fails.
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter("wats=debug")
+        .with_ansi(false)
+        .with_test_writer()
+        .try_init();
     let dir = tempfile::tempdir()?;
     let mut nodes = Vec::new();
     for i in 0..6 {
@@ -863,6 +882,66 @@ async fn a_proof_refuses_the_blob_to_every_requester() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// A pushed replica is fetched from its pusher even after a fetch from
+/// that peer failed: it just reached this node, so the providers' backoff
+/// (B7, for providers named by others) does not skip it. Otherwise one
+/// failed fetch (a refusal during a proof, a connection that timed out
+/// under load) made the node drop every replica that peer pushed for the
+/// next 30 s, doubling up to an hour.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_push_is_fetched_after_a_failed_fetch_from_its_pusher() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let publisher = start(&dir.path().join("p"), 3, manual()).await?;
+    let replica = start(&dir.path().join("r"), 3, manual()).await?;
+    mesh(&[&publisher, &replica]).await?;
+    // The first push fails: the publisher refuses its blob meanwhile, as
+    // during a possession proof.
+    let first = content(41);
+    let proof =
+        publisher.block_blob_requests_for_tests(iroh_blobs::Hash::from_bytes(hash_of(&first)));
+    let event = publish(&publisher, dir.path(), &first).await?;
+    let report = publisher.replicate(&event).await;
+    assert!(report.is_empty(), "refused during the proof: {report:?}");
+    // The push `publish` made too, refused before the proof ends.
+    eventually("both pushes arrive", async || {
+        replica.repair_stats().served >= 2
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(!holds(&replica, &event.blobs[0].hash).await);
+    drop(proof);
+    // The next one is fetched at once, from the same pusher.
+    let event = publish(&publisher, dir.path(), &content(42)).await?;
+    let report = publisher.replicate(&event).await;
+    let hash = &event.blobs[0].hash;
+    assert_eq!(
+        report.get(hash).map(Vec::as_slice),
+        Some(&[replica.endpoint_id()][..]),
+        "taken right after the failure"
+    );
+    assert!(holds(&replica, hash).await);
+    // A refusal that ends while the push waits: tried again, taken.
+    let third = content(43);
+    let proof =
+        publisher.block_blob_requests_for_tests(iroh_blobs::Hash::from_bytes(hash_of(&third)));
+    let event = publish(&publisher, dir.path(), &third).await?;
+    let push = publisher.replicate(&event);
+    let lift = async {
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        drop(proof);
+    };
+    let (report, ()) = tokio::join!(push, lift);
+    let hash = &event.blobs[0].hash;
+    assert_eq!(
+        report.get(hash).map(Vec::as_slice),
+        Some(&[replica.endpoint_id()][..]),
+        "tried again once the refusal ended"
+    );
+    publisher.shutdown().await?;
+    replica.shutdown().await?;
+    Ok(())
+}
+
 /// Two holders that prove each other at the same moment refuse each
 /// other's requests: a failed proof is a miss, never an exclusion, and
 /// the checks converge (N5).
@@ -928,7 +1007,10 @@ async fn a_held_erasure_releases_an_evicted_replica_at_start() -> anyhow::Result
     mesh(&[&publisher, &holder]).await?;
     let post = publish_as(&publisher, Some(&author), dir.path(), &content(41)).await?;
     let hash = post.blobs[0].hash.clone();
-    eventually("the replica arrives", async || holds(&holder, &hash).await).await;
+    eventually("the replica arrives", async || {
+        holds_replica(&holder, &hash).await
+    })
+    .await;
     let outcome = holder
         .drop_body(&post.id, DropReason::Evicted, None, None)
         .await?;
@@ -987,7 +1069,10 @@ async fn wats_drop_releases_an_evicted_replica() -> anyhow::Result<()> {
     mesh(&[&publisher, &holder]).await?;
     let post = publish(&publisher, dir.path(), &content(61)).await?;
     let hash = post.blobs[0].hash.clone();
-    eventually("the replica arrives", async || holds(&holder, &hash).await).await;
+    eventually("the replica arrives", async || {
+        holds_replica(&holder, &hash).await
+    })
+    .await;
     holder
         .drop_body(&post.id, DropReason::Evicted, None, None)
         .await?;
@@ -1047,7 +1132,10 @@ async fn an_evicted_replica_is_released_once_others_are_closer() -> anyhow::Resu
     let post = publish(&publisher, dir.path(), &bytes).await?;
     let blob = post.blobs[0].clone();
     let hash = blob.hash.clone();
-    eventually("the replica arrives", async || holds(&holder, &hash).await).await;
+    eventually("the replica arrives", async || {
+        holds_replica(&holder, &hash).await
+    })
+    .await;
     // The publisher goes first, and its gossip copy of the post settles:
     // an evicted body is taken back by any insert until #182, which would
     // undo the eviction below.
@@ -1160,7 +1248,10 @@ async fn the_evicted_replica_review_reaches_every_row() -> anyhow::Result<()> {
     for seed in 0..3 {
         let post = publish(&publisher, dir.path(), &content(800 + seed)).await?;
         let hash = post.blobs[0].hash.clone();
-        eventually("the replica arrives", async || holds(&holder, &hash).await).await;
+        eventually("the replica arrives", async || {
+            holds_replica(&holder, &hash).await
+        })
+        .await;
         posts.push(post);
     }
     // No gossip copy may come back after the evictions.

@@ -601,6 +601,12 @@ const MAX_PROVIDER_ATTEMPTS: usize = 4;
 /// this pause, then twice it.
 const READ_FETCH_TRIES: u32 = 3;
 const READ_FETCH_PAUSE: Duration = Duration::from_millis(500);
+/// A blob pushed to this node (`replicate`) is fetched from its pusher up
+/// to this many times, with the pauses of a read, all tries within
+/// [`PUSH_FETCH_BUDGET`]: the 60 s one try may take, so that the answer
+/// still comes within [`PUSH_TIMEOUT`] after a wait for a fetch slot.
+const PUSH_FETCH_TRIES: u32 = 3;
+const PUSH_FETCH_BUDGET: Duration = Duration::from_secs(60);
 /// A provider whose fetch failed is skipped for this long, doubling with
 /// each further failure up to [`PROVIDER_BACKOFF_MAX`] (B7).
 const PROVIDER_BACKOFF: Duration = Duration::from_secs(30);
@@ -4593,7 +4599,14 @@ impl Node {
             else {
                 continue;
             };
-            if self.fetch_blob(blob, vec![peer]).await {
+            // 0.4.2 (tests: `legacy_replicate`) asked the pusher once,
+            // and not while it backed off.
+            let fetched = if legacy {
+                self.fetch_blob(blob, vec![peer]).await
+            } else {
+                self.fetch_pushed(blob, peer).await
+            };
+            if fetched {
                 if replica {
                     self.record_replica_intent(hash, blob.size).await;
                 }
@@ -4821,6 +4834,36 @@ impl Node {
     /// is never executed (SPEC §2.15).
     async fn fetch_blob(&self, blob: &BlobRef, providers: Vec<EndpointId>) -> bool {
         self.fetch_blob_from(blob, providers, false).await
+    }
+
+    /// Fetch a blob `pusher` asked this node to hold (`replicate`), from
+    /// that peer. It just reached this node, so its backoff as a provider
+    /// (B7, for providers others name) does not skip it: one failed fetch
+    /// from it (a connection that timed out under load, a refusal while a
+    /// possession proof of that blob runs there) would otherwise drop every
+    /// replica it pushes for the next 30 s, doubling up to an hour, without
+    /// telling it. A failed try is tried again after a pause, as a read is,
+    /// within [`PUSH_FETCH_BUDGET`] for all tries.
+    async fn fetch_pushed(&self, blob: &BlobRef, pusher: EndpointId) -> bool {
+        let started = tokio::time::Instant::now();
+        for attempt in 0..PUSH_FETCH_TRIES {
+            if attempt > 0 {
+                tokio::time::sleep(READ_FETCH_PAUSE.saturating_mul(attempt)).await;
+            }
+            let left = PUSH_FETCH_BUDGET.saturating_sub(started.elapsed());
+            if left.is_zero() {
+                break;
+            }
+            match tokio::time::timeout(left, self.fetch_blob_from(blob, vec![pusher], true)).await {
+                Ok(true) => return true,
+                Ok(false) => {
+                    debug!(hash = %blob.hash, pusher = %pusher.fmt_short(), attempt, "pushed blob not fetched yet");
+                }
+                Err(_) => break,
+            }
+        }
+        warn!(hash = %blob.hash, pusher = %pusher.fmt_short(), "pushed blob not fetched from its pusher: replica not taken");
+        false
     }
 
     /// [`Node::fetch_blob`]; with `again`, the providers backing off are
