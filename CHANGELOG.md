@@ -1,5 +1,38 @@
 # Changelog
 
+## Unreleased
+
+### Upgrading
+
+- **Homebrew users who ran `wats setup <tool> --mcp` with 0.4.3 or
+  older**: your agent tools run wats from a versioned Cellar path
+  (`/opt/homebrew/Cellar/wats/0.4.3/bin/wats`), which `brew cleanup`
+  removes after an upgrade. 0.4.4 repairs those entries at its first start
+  (or at your first `wats status`) and prints which file it fixed. Until
+  then, if `brew cleanup` has already run, run `wats setup <tool> --mcp`
+  again (`claude`, `codex`, `openclaw` or `vibe`).
+
+### Changes
+
+- **The wats path written into the agent tools survives upgrades.** `wats
+  setup <tool> --mcp` (Claude Code, Codex, OpenClaw, Mistral Vibe), the
+  session hooks (`wats notify --hook`) and each agent run's MCP config now
+  use Homebrew's link (`$(brew --prefix)/bin/wats`) for a Homebrew install,
+  found without running `brew`, else the path you started wats by. Before,
+  they used the versioned Cellar path, and after `brew upgrade` plus `brew
+  cleanup` every agent tool lost the swarm without a word. Installs by
+  install.sh are unchanged. The background node is also respawned through
+  Homebrew's link once the running binary is gone. ADR 0032.
+- **Stale registrations are found and repaired.** At each node start and
+  in `wats status`, wats checks its own entries in each tool's config: the
+  `wats` (and `wats-agent`) MCP servers and the wats session hooks. A path
+  that is gone, or in a versioned Cellar directory, is rewritten to
+  Homebrew's link, after a backup copy, and nothing else in the file
+  changes. OpenClaw's entries go through `openclaw mcp set`. When there is
+  no such link, wats warns with the exact `wats setup <tool> --mcp` command
+  that fixes it, in the log, in `wats status` and in the MCP `status` tool
+  (`registrations`). Entries that are not wats's are never touched.
+
 ## 0.4.3 (2026-10-21)
 
 The robustness release. A full node keeps working: at the cap it rotates

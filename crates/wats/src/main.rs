@@ -1088,7 +1088,7 @@ fn human_profile(args: &NodeArgs, settings: &Settings) -> Result<String> {
 /// The `wats mcp` command line an MCP host should run: this binary, the
 /// data directory when given, and the profile.
 fn mcp_server_command(args: &NodeArgs, profile: &str) -> Result<(String, Vec<String>)> {
-    let exe = std::env::current_exe()?.canonicalize()?;
+    let exe = wats::update::stable_exe()?;
     let mut server_args = Vec::new();
     if let Some(dir) = &args.dir {
         server_args.push("--dir".into());
@@ -1848,7 +1848,7 @@ fn hook_command(
     event: wats::hook::HookEvent,
     profile: &str,
 ) -> Result<String> {
-    let exe = std::env::current_exe()?.canonicalize()?;
+    let exe = wats::update::stable_exe()?;
     let dir = match &args.dir {
         Some(dir) => Some(std::path::absolute(dir)?.to_string_lossy().into_owned()),
         None => None,
@@ -3382,7 +3382,21 @@ fn browse_lines(map: &serde_json::Value) -> String {
     out
 }
 
-async fn status_command(config: &NodeConfig, json: bool) -> Result<()> {
+/// Check wats's own entries in the agent tools' configs, repairing a stale
+/// path where Homebrew's link replaces it (ADR 0032); never in hermetic
+/// mode unless asked ([`wats::registrations::enabled`]).
+fn check_registrations(
+    data_dir: &std::path::Path,
+    hermetic: bool,
+) -> Vec<wats::registrations::Finding> {
+    if !wats::registrations::enabled(hermetic) {
+        return Vec::new();
+    }
+    let at = wats::registrations::Locations::from_env();
+    wats::registrations::check(&at, data_dir, true, unix_now())
+}
+
+async fn status_command(config: &NodeConfig, json: bool, hermetic: bool) -> Result<()> {
     let mut status = match attach::call_tool(&config.data_dir, "status", serde_json::json!({}))
         .await?
     {
@@ -3440,6 +3454,18 @@ async fn status_command(config: &NodeConfig, json: bool) -> Result<()> {
             status
         }
     };
+    // wats's entries in the agent tools, checked (and repaired) here: a
+    // fresher view than the running node's, from its start.
+    let registrations = check_registrations(&config.data_dir, hermetic);
+    if let Some(map) = status.as_object_mut() {
+        map.remove("registrations");
+        if json && !registrations.is_empty() {
+            map.insert(
+                "registrations".into(),
+                registrations.iter().map(|f| f.to_json()).collect(),
+            );
+        }
+    }
     if json {
         println!("{}", serde_json::to_string_pretty(&status)?);
     } else {
@@ -3533,6 +3559,10 @@ async fn status_command(config: &NodeConfig, json: bool) -> Result<()> {
             if let Some(notice) = ask["notice"].as_str() {
                 println!("unanswered: {notice}");
             }
+        }
+        for finding in &registrations {
+            let warning = if finding.repaired() { "" } else { "warning: " };
+            println!("{warning}{}", finding.line());
         }
         if let Some(notice) = security.as_ref().and_then(|n| n.as_str()) {
             println!("{notice}");
@@ -5351,7 +5381,7 @@ fn agent_config(
         allow,
         heartbeat_text,
         command,
-        mcp_command: std::env::current_exe()?,
+        mcp_command: wats::update::stable_exe()?,
         mcp_args,
         extra_args,
         run_timeout: args
@@ -6221,7 +6251,9 @@ async fn async_main(cli: Cli) -> Result<()> {
             return result;
         }
         Some(Command::Id { host }) => return print_id(&config, &host),
-        Some(Command::Status { json }) => return status_command(&config, json).await,
+        Some(Command::Status { json }) => {
+            return status_command(&config, json, cli.node.hermetic).await;
+        }
         Some(Command::Browse {
             tag_dir,
             tag,
@@ -6493,8 +6525,23 @@ async fn async_main(cli: Cli) -> Result<()> {
         && !config.halt.serve
         && config.nets.iter().any(|n| n == wats::node::PUBLIC_NET)
         && wats::halt::read_marker(&config.data_dir).is_some();
+    let registrations_dir = config.data_dir.clone();
     let node = Node::start(config).await?;
     wats::crash::set_own_id(node.endpoint_id().to_string());
+    // wats's entries in the agent tools (ADR 0032): a stale path repaired,
+    // or a warning, logged and kept for the MCP `status` tool.
+    let hermetic = cli.node.hermetic;
+    tokio::task::spawn_blocking(move || {
+        let found = check_registrations(&registrations_dir, hermetic);
+        for finding in &found {
+            if finding.repaired() {
+                tracing::info!("{}", finding.line());
+            } else {
+                tracing::warn!("{}", finding.line());
+            }
+        }
+        wats::registrations::remember(&found);
+    });
     // Stopped on a guardian halt before (ADR 0016 §3): a bounded sync looks
     // for an unhalt, with no agent, no MCP and no publishing.
     if check_marker && node.check_halt_marker(wats::halt::STARTUP_CHECK).await {
