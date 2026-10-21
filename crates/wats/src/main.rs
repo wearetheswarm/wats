@@ -29,7 +29,10 @@ use wats::node::{Attachment, NetworkMode, Node, NodeConfig};
 /// With no command, runs the node in the foreground: it serves the MCP
 /// sessions of `wats mcp`, and runs the agents enabled in
 /// `<data dir>/config.toml`, or those chosen with `--agent`. Quick start:
-/// `wats --agent claude`.
+/// `wats` alone, on a terminal, the first time: the setup wizard (the
+/// node's main choices, wats in the agent CLIs found, background or
+/// foreground), then the node; or `wats --agent claude`, which asks
+/// nothing.
 #[derive(Debug, Parser)]
 #[command(name = "wats", version)]
 struct Cli {
@@ -338,9 +341,11 @@ enum Command {
         #[command(flatten)]
         daemon: Box<DaemonArgs>,
     },
-    /// With no tool, ask the node's main choices (agent among the CLIs
-    /// found on PATH, storage, the agent's limits, networks) and write them
-    /// to config.toml; a first `wats` on a terminal does it. With a tool,
+    /// With no tool, the setup wizard: ask the node's main choices (agent
+    /// among the CLIs found on PATH, storage, the agent's limits and
+    /// access, networks) and write them to config.toml, then, on a
+    /// terminal, offer to register wats as the MCP server of each agent CLI
+    /// found; a first bare `wats` on a terminal does it too. With a tool,
     /// set it up once: register wats as its MCP server and/or enable its
     /// agent runner in config.toml.
     Setup {
@@ -818,7 +823,7 @@ enum AgentAction {
 
 /// Agent keys `wats setup` can write to config.toml, in
 /// `[agents.<name>]`.
-#[derive(Debug, Clone, Args)]
+#[derive(Debug, Clone, Default, Args)]
 struct SetupKeys {
     /// The agent's name [default: the runtime]: another name adds a
     /// second agent of the same runtime, with its own profile
@@ -2271,6 +2276,37 @@ async fn setup_command(
     let yes = matches!(tool, Some(SetupTool::Openclaw { yes: true, .. }));
     let config = data_dir.join(wats::settings::FILE_NAME);
     let before = std::fs::read(&config).ok();
+    // No tool, on a terminal: the wizard (ADR 0027), with its screens.
+    if tool.is_none() && interactive(node) {
+        use wats::welcome;
+        let style = welcome::Style::detect();
+        print!(
+            "{}",
+            welcome::welcome(env!("CARGO_PKG_VERSION"), &welcome::Kind::Setup, style)
+        );
+        welcome::record_greeting(data_dir);
+        print!("{}", welcome::step(1, style));
+        let (choices, found) = wats::firstrun::setup_for_wizard(
+            data_dir,
+            &mut std::io::stdin().lock(),
+            &mut std::io::stdout(),
+            std::env::var_os("PATH").as_deref(),
+        )?;
+        print!("{}", welcome::step(2, style));
+        let mcp = offer_integrations(node, data_dir, &choices, &found)?;
+        print!("{}", welcome::step(3, style));
+        let changed = std::fs::read(&config).ok() != before;
+        offer_background(node, data_dir, detach, false, changed).await?;
+        let running = wats::node::node_running(&std::path::absolute(data_dir)?);
+        print!(
+            "{}",
+            welcome::closing(
+                &wizard_summary(data_dir, &choices, mcp, running, false)?,
+                style
+            )
+        );
+        return Ok(());
+    }
     setup_tool_command(node, data_dir, tool)?;
     if !offer {
         return Ok(());
@@ -2286,6 +2322,7 @@ fn setup_tool_command(
     tool: Option<SetupTool>,
 ) -> Result<()> {
     let Some(tool) = tool else {
+        // Without a terminal (on one, `setup_command` runs the wizard).
         wats::firstrun::setup(
             data_dir,
             &mut std::io::stdin().lock(),
@@ -2459,7 +2496,13 @@ async fn offer_background(
     if !start {
         return Ok(());
     }
-    // The child is `wats --detach` with this command's global options.
+    start_detached(args, &dir).await
+}
+
+/// Start the node of `data_dir` in the background, as `wats --detach`
+/// with this command's global options does.
+async fn start_detached(args: &NodeArgs, data_dir: &std::path::Path) -> Result<()> {
+    let dir = std::path::absolute(data_dir)?;
     let mut child_args = args.to_args(&dir);
     if let Some(profile) = &args.profile {
         child_args.push(format!("--profile={profile}").into());
@@ -2467,6 +2510,175 @@ async fn offer_background(
     child_args.push("--detach".into());
     let settings = Settings::load(&dir)?;
     detach_command(&dir, &settings, false, child_args).await
+}
+
+/// The MCP hosts step of the setup wizard (ADR 0027), on a terminal: for
+/// each agent CLI found on PATH (`found`: the path where it was found,
+/// never run to find it), whether to register wats as its MCP server
+/// (default yes), through the code of `wats setup <tool> --mcp`; with
+/// OpenClaw as the node's agent, whether to finish its agent setup
+/// (`wats setup openclaw --agent`). A failed step is a warning: the next
+/// ones still run. Returns the names of the hosts set up.
+fn offer_integrations(
+    node: &NodeArgs,
+    data_dir: &std::path::Path,
+    choices: &wats::firstrun::Choices,
+    found: &[wats::firstrun::Found],
+) -> Result<Vec<String>> {
+    let mut registered = Vec::new();
+    if found.is_empty() {
+        println!(
+            "None of Claude Code, Codex, OpenClaw or Mistral Vibe is on your PATH: once one is, \
+             `wats setup <tool> --mcp` connects it."
+        );
+    }
+    for f in found {
+        let openclaw_agent = f.name == "openclaw" && choices.runtime.as_deref() == Some("openclaw");
+        let (label, command) = match f.name {
+            "claude" => ("Claude Code", "wats setup claude --mcp"),
+            "codex" => ("Codex", "wats setup codex --mcp"),
+            "openclaw" if openclaw_agent => ("OpenClaw", "wats setup openclaw --agent"),
+            "openclaw" => ("OpenClaw", "wats setup openclaw --mcp"),
+            "vibe" => ("Mistral Vibe", "wats setup vibe --mcp"),
+            _ => continue,
+        };
+        let question = if openclaw_agent {
+            format!(
+                "Finish OpenClaw's agent setup now: the hook token, the `wats` OpenClaw agent \
+                 and its MCP entries, OpenClaw's config (`{command}`)?"
+            )
+        } else {
+            format!(
+                "Use the swarm from your own {label} sessions: register wats as its MCP server \
+                 (`{command}`)?"
+            )
+        };
+        if !wats::firstrun::ask_yes_no(
+            &mut std::io::stdin().lock(),
+            &mut std::io::stdout(),
+            &question,
+            true,
+        )? {
+            println!("{label}: skipped (later: {command})");
+            continue;
+        }
+        let path = f.path.as_path();
+        let done = match f.name {
+            "claude" => setup_tool(
+                node,
+                data_dir,
+                "claude",
+                (true, false),
+                &SetupKeys::default(),
+                |profile| register_in_claude(node, profile, "user", path),
+                Some(Box::new(move |profile: &str| {
+                    install_claude_hooks(node, profile, "user")
+                })),
+            ),
+            "codex" => setup_tool(
+                node,
+                data_dir,
+                "codex",
+                (true, false),
+                &SetupKeys::default(),
+                |profile| register_in_codex(node, profile, path),
+                Some(Box::new(move |profile: &str| {
+                    install_codex_hooks(node, profile, path)
+                })),
+            ),
+            "openclaw" => setup_openclaw(
+                node,
+                data_dir,
+                OpenclawSetup {
+                    mcp: !openclaw_agent,
+                    agent: openclaw_agent,
+                    remove: false,
+                    apply: false,
+                    print: false,
+                    yes: false,
+                    url: None,
+                    name: None,
+                },
+                path,
+            ),
+            _ => setup_vibe(node, data_dir, (true, false, false)),
+        };
+        match done {
+            Ok(()) => registered.push(label.to_string()),
+            Err(e) => eprintln!("warning: {label}: {e:#} (try again: {command})"),
+        }
+    }
+    Ok(registered)
+}
+
+/// The setup wizard of a bare `wats` on a terminal, for a data directory
+/// never set up (ADR 0027): the main choices (those of `wats setup`), the
+/// MCP hosts found on PATH, then where the node runs: in the background
+/// (`wats --detach`) or in this terminal (the default, as a bare `wats`
+/// always did). Returns whether it started the node in the background.
+async fn setup_wizard(node: &NodeArgs, data_dir: &std::path::Path) -> Result<bool> {
+    use wats::welcome;
+    let style = welcome::Style::detect();
+    let kind = welcome::Kind::FirstRun {
+        dir: tilde(&std::path::absolute(data_dir)?),
+    };
+    print!(
+        "{}",
+        welcome::welcome(env!("CARGO_PKG_VERSION"), &kind, style)
+    );
+    welcome::record_greeting(data_dir);
+    print!("{}", welcome::step(1, style));
+    let (choices, found) = wats::firstrun::setup_for_wizard(
+        data_dir,
+        &mut std::io::stdin().lock(),
+        &mut std::io::stdout(),
+        std::env::var_os("PATH").as_deref(),
+    )?;
+    print!("{}", welcome::step(2, style));
+    let mcp = offer_integrations(node, data_dir, &choices, &found)?;
+    print!("{}", welcome::step(3, style));
+    let background = cfg!(unix)
+        && wats::firstrun::ask_yes_no(
+            &mut std::io::stdin().lock(),
+            &mut std::io::stdout(),
+            "Run the node in the background (`wats --detach`: it keeps running when this \
+             terminal closes; `wats attach` follows it, `wats stop` stops it)? Otherwise it runs \
+             here until Ctrl-C",
+            false,
+        )?;
+    let summary = wizard_summary(data_dir, &choices, mcp, background, !background)?;
+    if background {
+        start_detached(node, data_dir).await?;
+    }
+    print!("{}", welcome::closing(&summary, style));
+    if !background {
+        println!();
+    }
+    Ok(background)
+}
+
+/// What the wizard set up, for its closing screen: `running`, the node
+/// runs in the background; `foreground`, it starts in this terminal.
+fn wizard_summary(
+    data_dir: &std::path::Path,
+    choices: &wats::firstrun::Choices,
+    mcp: Vec<String>,
+    running: bool,
+    foreground: bool,
+) -> Result<wats::welcome::Summary> {
+    use wats::welcome::NodeState;
+    let dir = std::path::absolute(data_dir)?;
+    Ok(wats::welcome::Summary {
+        config: tilde(&dir.join(wats::settings::FILE_NAME)),
+        agent: choices.runtime.clone(),
+        mcp,
+        node: match (foreground, running) {
+            (true, _) => NodeState::Foreground,
+            (false, true) => NodeState::Running,
+            (false, false) => NodeState::Stopped,
+        },
+        dir_flag: dir_flag(&dir),
+    })
 }
 
 #[cfg(not(unix))]
@@ -2480,20 +2692,55 @@ async fn offer_background(
     Ok(())
 }
 
-/// The first run of a foreground node (`wats`, `wats node`) without
-/// config.toml: `wats setup` on a terminal, else the defaults written,
-/// commented. Never for `wats mcp` or the background node it starts
-/// (`--idle-exit`), nor with `--hermetic` (tests) or an `--agent` /
-/// `--no-agent` flag, which write the defaults without asking.
-fn first_run(cli: &Cli, data_dir: &std::path::Path) -> Result<()> {
+/// The setup of a foreground node (`wats`, `wats node`) before it starts.
+/// Never for `wats mcp` or the background node it starts (`--idle-exit`).
+///
+/// - A bare `wats` (`bare`: no argument at all; WATS_* variables are not
+///   arguments) asking on a terminal ([`interactive`]): the setup wizard
+///   for a data directory never set up (no config.toml), or only the
+///   questions added since the setup revision it recorded (ADR 0027).
+/// - Otherwise, without config.toml: `wats setup` on a terminal, else the
+///   defaults written, commented; never asked with `--hermetic` (tests) or
+///   an `--agent` / `--no-agent` flag, which write the defaults. With an
+///   older setup revision: one log line says that `wats setup` has new
+///   questions.
+///
+/// Returns whether the wizard started the node in the background (nothing
+/// left to run).
+async fn first_run(cli: &Cli, data_dir: &std::path::Path, bare: bool) -> Result<bool> {
     use std::io::IsTerminal;
     let daemon = match &cli.command {
         None => &cli.daemon,
         Some(Command::Node { daemon }) => daemon,
-        _ => return Ok(()),
+        _ => return Ok(false),
     };
-    if daemon.idle_exit.is_some() || data_dir.join(wats::settings::FILE_NAME).exists() {
-        return Ok(());
+    if daemon.idle_exit.is_some() {
+        return Ok(false);
+    }
+    let wizard = bare && cli.command.is_none() && interactive(&cli.node);
+    match wats::firstrun::stored_revision(data_dir) {
+        None if wizard => return setup_wizard(&cli.node, data_dir).await,
+        None => {}
+        Some(revision) if revision < wats::firstrun::SETUP_REVISION => {
+            if wizard {
+                wats::firstrun::catch_up(
+                    data_dir,
+                    &mut std::io::stdin().lock(),
+                    &mut std::io::stdout(),
+                    std::env::var_os("PATH").as_deref(),
+                    revision,
+                )?;
+                println!();
+            } else {
+                tracing::info!(
+                    "`wats setup` has {} new question(s) since this data directory was set up: \
+                     run `wats` alone, or `wats setup`, on a terminal",
+                    wats::firstrun::new_questions(revision)
+                );
+            }
+            return Ok(false);
+        }
+        Some(_) => return Ok(false),
     }
     let flags = !daemon.agent.agents.is_empty() || daemon.agent.no_agent;
     if std::io::stdin().is_terminal()
@@ -2515,7 +2762,7 @@ fn first_run(cli: &Cli, data_dir: &std::path::Path) -> Result<()> {
             path.display()
         );
     }
-    Ok(())
+    Ok(false)
 }
 
 /// Record the safety baseline before `wats config set|unset` changes a
@@ -3474,11 +3721,17 @@ impl NodeEntry {
 
     /// `--dir <dir>` to name it in a command, unless it is the default.
     fn dir_flag(&self) -> String {
-        if default_dir().is_ok_and(|d| same_dir(&d, &self.dir)) {
-            String::new()
-        } else {
-            format!(" --dir {}", tilde(&self.dir))
-        }
+        dir_flag(&self.dir)
+    }
+}
+
+/// ` --dir <dir>` for the commands shown about `dir`, unless it is the
+/// default data directory.
+fn dir_flag(dir: &std::path::Path) -> String {
+    if default_dir().is_ok_and(|d| same_dir(&d, dir)) {
+        String::new()
+    } else {
+        format!(" --dir {}", tilde(dir))
     }
 }
 
@@ -5921,7 +6174,10 @@ async fn async_main(cli: Cli) -> Result<()> {
         }
         _ => {}
     }
-    first_run(&cli, &data_dir)?;
+    // A bare `wats`, no argument at all, may run the setup wizard.
+    if first_run(&cli, &data_dir, std::env::args_os().len() <= 1).await? {
+        return Ok(());
+    }
     let settings = Settings::load(&data_dir)?;
     let mut config = cli.node.config(&settings)?;
     let (daemon, json_lines) = match cli.command {
@@ -6032,6 +6288,15 @@ async fn async_main(cli: Cli) -> Result<()> {
             unreachable!("handled above")
         }
     };
+    // The very first start of a node in this data directory: the headline,
+    // once ever (the wizard's welcome counts), on stderr. Before `--detach`
+    // hands over, so that a detached node shows it in this terminal.
+    if !daemon.quiet && wats::welcome::first_start(&data_dir) {
+        eprintln!(
+            "{}",
+            wats::welcome::first_start_line(&tilde(&std::path::absolute(&data_dir)?))
+        );
+    }
     // `wats --detach` (ADR 0023): start this same command in the
     // background, and return once it is up. The child is the process with
     // `--log-file`.
