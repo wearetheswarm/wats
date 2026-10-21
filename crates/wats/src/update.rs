@@ -377,14 +377,58 @@ pub fn homebrew_install() -> bool {
     current_exe().is_ok_and(|exe| homebrew_managed(&exe))
 }
 
-/// The command that upgrades this binary: `brew upgrade wats` for a
-/// Homebrew install, `wats upgrade` otherwise.
-pub fn upgrade_hint() -> &'static str {
-    if homebrew_install() {
-        "brew upgrade wats"
-    } else {
-        "wats upgrade"
+/// Where releases are published, for a platform with no prebuilt one.
+pub const RELEASES_PAGE: &str = "https://github.com/wearetheswarm/wats/releases";
+
+/// How this binary is updated: by `wats upgrade` (a prebuilt release of
+/// this platform), by Homebrew, or by a build from source (no prebuilt
+/// release for this platform, [`target`]). Only the first one lets the
+/// node install a release by itself (ADR 0030).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Install {
+    Release,
+    Homebrew,
+    Source,
+}
+
+impl Install {
+    /// This binary's.
+    pub fn detect() -> Install {
+        if homebrew_install() {
+            Install::Homebrew
+        } else if target().is_none() {
+            Install::Source
+        } else {
+            Install::Release
+        }
     }
+
+    /// What updates it, for `status` (`upgrade`): a command, or how to
+    /// build one.
+    pub fn hint(self) -> &'static str {
+        match self {
+            Install::Release => "wats upgrade",
+            Install::Homebrew => "brew upgrade wats",
+            Install::Source => "build it from source",
+        }
+    }
+
+    /// The end of "wats X is available, this is Y: …".
+    fn how(self) -> String {
+        match self {
+            Install::Source => format!(
+                "no prebuilt release for this platform: build it from source ({RELEASES_PAGE})"
+            ),
+            install => format!("`{}` installs it", install.hint()),
+        }
+    }
+}
+
+/// The command that upgrades this binary: `brew upgrade wats` for a
+/// Homebrew install, `wats upgrade` otherwise, or that it is built from
+/// source ([`Install::hint`]).
+pub fn upgrade_hint() -> &'static str {
+    Install::detect().hint()
 }
 
 /// `<exe>.old`: the previous binary, kept for `wats upgrade --rollback`.
@@ -466,10 +510,15 @@ pub fn rollback(exe: &Path) -> Result<PathBuf> {
     Ok(old)
 }
 
-/// Keys of config.toml with the first release that knows them, from 0.4.1
-/// on: an older wats refuses a config.toml that sets one (unknown keys are
-/// errors). A release adding a key lists it here.
+/// Keys of config.toml added after 0.3.3, with the first release that
+/// knows them: an older wats refuses a config.toml that sets one (unknown
+/// keys are errors). A release adding a key lists it here; a test checks
+/// that every key not in `tests/fixtures/keys-0.3.3.txt` is listed.
 pub const KEYS_SINCE: &[(&str, Version)] = &[
+    ("ask.cap_grace", Version(0, 4, 0)),
+    ("ask.max_responders", Version(0, 4, 0)),
+    ("reputation.threshold", Version(0, 4, 0)),
+    ("limits.get_per_min", Version(0, 4, 1)),
     ("infra_relays", Version(0, 4, 1)),
     ("infra_dns", Version(0, 4, 1)),
     ("storage.events_share", Version(0, 4, 1)),
@@ -490,16 +539,70 @@ pub fn keys_unknown_to(data_dir: &Path, version: Version) -> Vec<&'static str> {
         .collect()
 }
 
-/// The version `<binary> --version` prints (`wats X.Y.Z`), if it runs.
-pub fn binary_version(binary: &Path) -> Option<Version> {
-    let out = std::process::Command::new(binary)
+/// How long `<binary> --version` may take.
+const VERSION_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Run `<binary> --version` with no environment and stdin closed, for at
+/// most [`VERSION_TIMEOUT`] (then it is killed): its exit status and
+/// stdout.
+fn run_version(binary: &Path) -> Result<(std::process::ExitStatus, String)> {
+    use std::process::Stdio;
+    let mut child = std::process::Command::new(binary)
         .arg("--version")
-        .stdin(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .output()
-        .ok()?;
-    let text = String::from_utf8_lossy(&out.stdout);
-    Version::parse(text.trim().strip_prefix("wats ")?)
+        .env_clear()
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .with_context(|| format!("run {}", binary.display()))?;
+    let deadline = std::time::Instant::now() + VERSION_TIMEOUT;
+    let status = loop {
+        if let Some(status) = child.try_wait()? {
+            break status;
+        }
+        if std::time::Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            bail!(
+                "`{} --version` did not answer within {} s",
+                binary.display(),
+                VERSION_TIMEOUT.as_secs()
+            );
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    let mut stdout = String::new();
+    if let Some(mut out) = child.stdout.take() {
+        out.read_to_string(&mut stdout)?;
+    }
+    Ok((status, stdout))
+}
+
+/// The version `<binary> --version` prints (`wats X.Y.Z`), run as
+/// [`check_version_output`] runs a new binary. None, logged, when it does
+/// not run, fails or prints something else.
+pub fn binary_version(binary: &Path) -> Option<Version> {
+    match run_version(binary) {
+        Ok((status, stdout)) if status.success() => {
+            let version = stdout.trim().strip_prefix("wats ").and_then(Version::parse);
+            if version.is_none() {
+                tracing::warn!(
+                    "{} --version printed {:?}, not `wats X.Y.Z`",
+                    binary.display(),
+                    stdout.trim()
+                );
+            }
+            version
+        }
+        Ok((status, _)) => {
+            tracing::warn!("{} --version failed ({status})", binary.display());
+            None
+        }
+        Err(e) => {
+            tracing::warn!("{e:#}");
+            None
+        }
+    }
 }
 
 /// Before `wats upgrade --rollback`: when the previous binary (`old`) is
@@ -546,14 +649,9 @@ fn shell_word(s: &str) -> String {
 /// Run `<binary> --version` and expect `wats <version>`: the new binary
 /// runs on this machine before it replaces the current one.
 pub fn check_version_output(binary: &Path, version: Version) -> Result<()> {
-    let out = std::process::Command::new(binary)
-        .arg("--version")
-        .env_clear()
-        .output()
-        .context("run the new binary")?;
-    let stdout = String::from_utf8_lossy(&out.stdout);
+    let (status, stdout) = run_version(binary).context("run the new binary")?;
     ensure!(
-        out.status.success() && stdout.split_whitespace().nth(1) == Some(&version.to_string()),
+        status.success() && stdout.split_whitespace().nth(1) == Some(&version.to_string()),
         "the new binary does not run as wats {version} on this machine (got {:?})",
         stdout.trim()
     );
@@ -975,16 +1073,17 @@ fn hermetic_env() -> bool {
 /// The version the node should install by itself now, if any: one that
 /// `update.auto` (any release) or `update.security_auto` (a security
 /// release) allows ([`UpdatePolicy::auto_key`]), newer than this one, not
-/// installed already, and old enough. Never for a Homebrew install
-/// (`homebrew`, [`homebrew_install`]): Homebrew upgrades it.
+/// installed already, and old enough. Only for an [`Install::Release`]:
+/// never for a Homebrew install (Homebrew upgrades it) nor a platform
+/// with no prebuilt release.
 pub fn auto_target(
     policy: &UpdatePolicy,
     cache: &Cache,
     current: Version,
     now: u64,
-    homebrew: bool,
+    install: Install,
 ) -> Option<Version> {
-    if homebrew || policy.auto_key(cache.security).is_none() {
+    if install != Install::Release || policy.auto_key(cache.security).is_none() {
         return None;
     }
     let latest = cache.latest()?;
@@ -1034,12 +1133,14 @@ where
 /// release, its version and the command that installs it; or, once the
 /// node installed it by itself, that a restart is needed. When the node
 /// will install it by itself (`update.auto` or `update.security_auto`,
-/// never for Homebrew), from when. Nothing for a normal release.
+/// an [`Install::Release`] only), from when. Without a prebuilt release
+/// for this platform, where to get the source. Nothing for a normal
+/// release.
 pub fn security_notice(
     cache: &Cache,
     current: Version,
     policy: &UpdatePolicy,
-    homebrew: bool,
+    install: Install,
 ) -> Option<String> {
     let latest = cache.latest()?;
     if latest <= current || !cache.security {
@@ -1051,16 +1152,20 @@ pub fn security_notice(
              restart wats to use it."
         ));
     }
-    let how = if homebrew {
-        "brew upgrade wats"
-    } else {
-        "wats upgrade"
+    let how = match install {
+        Install::Source => format!(
+            "build wats {latest} from source (no prebuilt release for this platform: \
+             {RELEASES_PAGE})"
+        ),
+        install => format!("`{}`", install.hint()),
     };
     let mut notice = format!(
         "SECURITY RELEASE: wats {latest} is out and fixes a security issue; this node runs \
-         {current}. Update now: `{how}`, then restart wats."
+         {current}. Update now: {how}, then restart wats."
     );
-    if let Some(key) = policy.auto_key(true).filter(|_| policy.check && !homebrew)
+    if let Some(key) = policy
+        .auto_key(true)
+        .filter(|_| policy.check && install == Install::Release)
         && let Some(published) = cache.published_at
     {
         let from = published.saturating_add(policy.delay_for(true).as_secs());
@@ -1076,7 +1181,17 @@ pub fn security_notice(
 /// the cache; with `notice` for a security release ([`security_notice`]).
 pub fn status_json(data_dir: &Path, policy: &UpdatePolicy) -> Option<serde_json::Value> {
     let cache = Cache::load(data_dir)?;
-    status_json_of(&cache, Version::current(), policy, homebrew_install())
+    status_json_of(&cache, Version::current(), policy, Install::detect())
+}
+
+/// Whether `wats status` and the MCP `status` tool show the cache of the
+/// daily check: only when the node looks for releases (`update.check`;
+/// off for hermetic and loopback nodes), so that a stale `update.json`
+/// says nothing. `WATS_TEST_UPDATE_STATUS=1` shows it anyway, for tests,
+/// and only with `WATS_HERMETIC` set (which never checks or downloads).
+pub fn shows_status(policy: &UpdatePolicy) -> bool {
+    policy.check
+        || (hermetic_env() && std::env::var("WATS_TEST_UPDATE_STATUS").as_deref() == Ok("1"))
 }
 
 /// [`status_json`] of a given cache, version and install.
@@ -1084,7 +1199,7 @@ fn status_json_of(
     cache: &Cache,
     current: Version,
     policy: &UpdatePolicy,
-    homebrew: bool,
+    install: Install,
 ) -> Option<serde_json::Value> {
     let latest = cache.latest()?;
     let mut status = serde_json::json!({
@@ -1093,9 +1208,9 @@ fn status_json_of(
         "available": latest > current,
         "security": latest > current && cache.security,
         "checked_at": format_timestamp(cache.checked_at),
-        "upgrade": if homebrew { "brew upgrade wats" } else { "wats upgrade" },
+        "upgrade": install.hint(),
     });
-    if let Some(notice) = security_notice(cache, current, policy, homebrew) {
+    if let Some(notice) = security_notice(cache, current, policy, install) {
         status["notice"] = notice.into();
     }
     Some(status)
@@ -1112,7 +1227,7 @@ pub fn start_notice(data_dir: &Path, policy: &UpdatePolicy) -> Option<String> {
         &Cache::load(data_dir)?,
         Version::current(),
         policy,
-        homebrew_install(),
+        Install::detect(),
     )
 }
 
@@ -1131,18 +1246,17 @@ pub async fn run(policy: UpdatePolicy, data_dir: PathBuf) {
                     && latest > current
                     && cache.notified.as_deref() != Some(&latest.to_string())
                 {
-                    match security_notice(&cache, current, &policy, homebrew_install()) {
+                    match security_notice(&cache, current, &policy, Install::detect()) {
                         Some(notice) => tracing::warn!("{notice}"),
                         None => tracing::warn!(
-                            "wats {latest} is available, this is {current}: `{}` installs it",
-                            upgrade_hint()
+                            "wats {latest} is available, this is {current}: {}",
+                            Install::detect().how()
                         ),
                     }
                     cache.notified = Some(latest.to_string());
                     let _ = cache.save(&data_dir);
                 }
-                if let Some(version) =
-                    auto_target(&policy, &cache, current, now, homebrew_install())
+                if let Some(version) = auto_target(&policy, &cache, current, now, Install::detect())
                     && let Some(key) = policy.auto_key(cache.security)
                     && failed_auto
                         .is_none_or(|(v, at)| v != version || now >= at + CHECK_EVERY_SECS)
@@ -1463,11 +1577,11 @@ mod tests {
         let t0 = 1_000 * DAY;
         let normal = cache("1.1.0", false, t0);
         assert_eq!(
-            auto_target(&on, &normal, current, t0 + 6 * DAY, false),
+            auto_target(&on, &normal, current, t0 + 6 * DAY, Install::Release),
             None
         );
         assert_eq!(
-            auto_target(&on, &normal, current, t0 + 7 * DAY, false),
+            auto_target(&on, &normal, current, t0 + 7 * DAY, Install::Release),
             Some(Version(1, 1, 0))
         );
         // Off by default.
@@ -1476,7 +1590,7 @@ mod tests {
             ..on.clone()
         };
         assert_eq!(
-            auto_target(&off, &normal, current, t0 + 30 * DAY, false),
+            auto_target(&off, &normal, current, t0 + 30 * DAY, Install::Release),
             None
         );
         // Not older, not twice.
@@ -1486,7 +1600,7 @@ mod tests {
                 &cache("1.0.0", false, t0),
                 current,
                 t0 + 30 * DAY,
-                false
+                Install::Release
             ),
             None
         );
@@ -1495,15 +1609,18 @@ mod tests {
             ..normal.clone()
         };
         assert_eq!(
-            auto_target(&on, &installed, current, t0 + 30 * DAY, false),
+            auto_target(&on, &installed, current, t0 + 30 * DAY, Install::Release),
             None
         );
         // A security release waits update.delay too, unless security_delay
         // is set.
         let security = cache("1.1.0", true, t0);
-        assert_eq!(auto_target(&on, &security, current, t0 + DAY, false), None);
         assert_eq!(
-            auto_target(&on, &security, current, t0 + 7 * DAY, false),
+            auto_target(&on, &security, current, t0 + DAY, Install::Release),
+            None
+        );
+        assert_eq!(
+            auto_target(&on, &security, current, t0 + 7 * DAY, Install::Release),
             Some(Version(1, 1, 0))
         );
         let fast = UpdatePolicy {
@@ -1511,22 +1628,25 @@ mod tests {
             ..on.clone()
         };
         assert_eq!(
-            auto_target(&fast, &security, current, t0 + DAY, false),
+            auto_target(&fast, &security, current, t0 + DAY, Install::Release),
             Some(Version(1, 1, 0))
         );
         assert_eq!(
-            auto_target(&fast, &security, current, t0 + DAY - 1, false),
+            auto_target(&fast, &security, current, t0 + DAY - 1, Install::Release),
             None
         );
         // security_delay does not shorten a normal release.
-        assert_eq!(auto_target(&fast, &normal, current, t0 + DAY, false), None);
+        assert_eq!(
+            auto_target(&fast, &normal, current, t0 + DAY, Install::Release),
+            None
+        );
         // Unknown publication time: never.
         let unknown = Cache {
             published_at: None,
             ..normal
         };
         assert_eq!(
-            auto_target(&on, &unknown, current, t0 + 30 * DAY, false),
+            auto_target(&on, &unknown, current, t0 + 30 * DAY, Install::Release),
             None
         );
     }
@@ -1547,8 +1667,14 @@ mod tests {
         };
         assert!(!off.security_auto);
         assert_eq!(off.auto_key(true), None);
-        assert_eq!(auto_target(&off, &security, current, late, false), None);
-        assert_eq!(auto_target(&off, &normal, current, late, false), None);
+        assert_eq!(
+            auto_target(&off, &security, current, late, Install::Release),
+            None
+        );
+        assert_eq!(
+            auto_target(&off, &normal, current, late, Install::Release),
+            None
+        );
         // On, update.auto off: the security release, not the normal one.
         let sec = UpdatePolicy {
             security_auto: true,
@@ -1558,25 +1684,28 @@ mod tests {
         assert_eq!(sec.auto_key(true), Some("update.security_auto"));
         assert_eq!(sec.auto_key(false), None);
         assert_eq!(
-            auto_target(&sec, &security, current, t0 + DAY - 1, false),
+            auto_target(&sec, &security, current, t0 + DAY - 1, Install::Release),
             None
         );
         assert_eq!(
-            auto_target(&sec, &security, current, t0 + DAY, false),
+            auto_target(&sec, &security, current, t0 + DAY, Install::Release),
             Some(Version(1, 1, 0))
         );
-        assert_eq!(auto_target(&sec, &normal, current, late, false), None);
+        assert_eq!(
+            auto_target(&sec, &normal, current, late, Install::Release),
+            None
+        );
         // Without security_delay: update.delay.
         let slow = UpdatePolicy {
             security_delay: None,
             ..sec.clone()
         };
         assert_eq!(
-            auto_target(&slow, &security, current, t0 + DAY, false),
+            auto_target(&slow, &security, current, t0 + DAY, Install::Release),
             None
         );
         assert_eq!(
-            auto_target(&slow, &security, current, t0 + 7 * DAY, false),
+            auto_target(&slow, &security, current, t0 + 7 * DAY, Install::Release),
             Some(Version(1, 1, 0))
         );
         // Both on: update.auto covers normal releases, and names the key.
@@ -1586,7 +1715,7 @@ mod tests {
         };
         assert_eq!(both.auto_key(false), Some("update.auto"));
         assert_eq!(
-            auto_target(&both, &normal, current, t0 + 7 * DAY, false),
+            auto_target(&both, &normal, current, t0 + 7 * DAY, Install::Release),
             Some(Version(1, 1, 0))
         );
         // Not twice, not older.
@@ -1594,9 +1723,12 @@ mod tests {
             installed: Some("1.1.0".into()),
             ..security.clone()
         };
-        assert_eq!(auto_target(&sec, &installed, current, late, false), None);
         assert_eq!(
-            auto_target(&sec, &security, Version(1, 1, 0), late, false),
+            auto_target(&sec, &installed, current, late, Install::Release),
+            None
+        );
+        assert_eq!(
+            auto_target(&sec, &security, Version(1, 1, 0), late, Install::Release),
             None
         );
     }
@@ -1616,17 +1748,50 @@ mod tests {
         };
         for security in [false, true] {
             let c = cache("1.1.0", security, t0);
-            assert_eq!(auto_target(&all, &c, current, late, true), None);
             assert_eq!(
-                auto_target(&all, &c, current, late, false),
+                auto_target(&all, &c, current, late, Install::Homebrew),
+                None
+            );
+            assert_eq!(
+                auto_target(&all, &c, current, late, Install::Release),
                 Some(Version(1, 1, 0))
             );
         }
-        let notice = security_notice(&cache("1.1.0", true, t0), current, &all, true).unwrap();
+        let notice =
+            security_notice(&cache("1.1.0", true, t0), current, &all, Install::Homebrew).unwrap();
         assert!(notice.contains("`brew upgrade wats`"), "{notice}");
         assert!(!notice.contains("installs it by itself"), "{notice}");
-        let status = status_json_of(&cache("1.1.0", true, t0), current, &all, true).unwrap();
+        let status =
+            status_json_of(&cache("1.1.0", true, t0), current, &all, Install::Homebrew).unwrap();
         assert_eq!(status["upgrade"], "brew upgrade wats");
+    }
+
+    /// A platform with no prebuilt release: never installed by the node,
+    /// and the notice points to the source instead of `wats upgrade`.
+    #[test]
+    fn no_prebuilt_release_is_never_auto_upgraded() {
+        let current = Version(1, 0, 0);
+        let t0 = 1_000 * DAY;
+        let all = UpdatePolicy {
+            check: true,
+            auto: true,
+            security_auto: true,
+            ..Default::default()
+        };
+        let security = cache("1.1.0", true, t0);
+        assert_eq!(
+            auto_target(&all, &security, current, t0 + 30 * DAY, Install::Source),
+            None
+        );
+        let notice = security_notice(&security, current, &all, Install::Source).unwrap();
+        assert!(notice.contains("build wats 1.1.0 from source"), "{notice}");
+        assert!(notice.contains(RELEASES_PAGE), "{notice}");
+        assert!(!notice.contains("wats upgrade"), "{notice}");
+        assert!(!notice.contains("by itself"), "{notice}");
+        let status = status_json_of(&security, current, &all, Install::Source).unwrap();
+        assert_eq!(status["upgrade"], "build it from source");
+        assert!(Install::Source.how().contains(RELEASES_PAGE));
+        assert_eq!(Install::Release.how(), "`wats upgrade` installs it");
     }
 
     /// The louder notice: a security release only, with its version and
@@ -1640,7 +1805,7 @@ mod tests {
             ..Default::default()
         };
         let security = cache("1.1.0", true, t0);
-        let notice = security_notice(&security, current, &off, false).unwrap();
+        let notice = security_notice(&security, current, &off, Install::Release).unwrap();
         assert!(
             notice.starts_with("SECURITY RELEASE: wats 1.1.0"),
             "{notice}"
@@ -1648,17 +1813,20 @@ mod tests {
         assert!(notice.contains("this node runs 1.0.0"), "{notice}");
         assert!(notice.contains("`wats upgrade`"), "{notice}");
         assert!(!notice.contains("by itself"), "{notice}");
-        let status = status_json_of(&security, current, &off, false).unwrap();
+        let status = status_json_of(&security, current, &off, Install::Release).unwrap();
         assert_eq!(status["security"], true);
         assert_eq!(status["notice"], notice.as_str());
         // A normal release, or none newer: no notice.
         let normal = cache("1.1.0", false, t0);
-        assert_eq!(security_notice(&normal, current, &off, false), None);
-        let status = status_json_of(&normal, current, &off, false).unwrap();
+        assert_eq!(
+            security_notice(&normal, current, &off, Install::Release),
+            None
+        );
+        let status = status_json_of(&normal, current, &off, Install::Release).unwrap();
         assert_eq!(status["available"], true);
         assert!(status.get("notice").is_none(), "{status}");
         assert_eq!(
-            security_notice(&security, Version(1, 1, 0), &off, false),
+            security_notice(&security, Version(1, 1, 0), &off, Install::Release),
             None
         );
         // With security_auto: when the node installs it by itself.
@@ -1667,7 +1835,7 @@ mod tests {
             security_delay: Some(Duration::from_secs(DAY)),
             ..off.clone()
         };
-        let notice = security_notice(&security, current, &sec, false).unwrap();
+        let notice = security_notice(&security, current, &sec, Install::Release).unwrap();
         assert!(
             notice.ends_with(&format!(
                 "Otherwise update.security_auto installs it by itself from {}.",
@@ -1680,7 +1848,7 @@ mod tests {
             installed: Some("1.1.0".into()),
             ..security
         };
-        let notice = security_notice(&installed, current, &sec, false).unwrap();
+        let notice = security_notice(&installed, current, &sec, Install::Release).unwrap();
         assert!(notice.contains("restart wats to use it"), "{notice}");
     }
 
@@ -1795,6 +1963,40 @@ mod tests {
             KEYS_SINCE.contains(&("update.security_auto", Version(0, 4, 3))),
             "ADR 0030"
         );
+    }
+
+    /// `KEYS_SINCE` is complete: every key that wats 0.3.3 did not know
+    /// (the committed list of its keys) is in it, with a version after
+    /// 0.3.3, and no key of 0.3.3 is. A new key without an entry fails
+    /// here.
+    #[test]
+    fn keys_since_is_complete() {
+        let old: Vec<&str> = include_str!("../tests/fixtures/keys-0.3.3.txt")
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty() && !l.starts_with('#'))
+            .collect();
+        assert_eq!(old.len(), 69);
+        let now: Vec<&str> = crate::settings::KEYS
+            .iter()
+            .chain(crate::settings::HIDDEN_KEYS)
+            .map(|k| k.name)
+            .collect();
+        for key in &old {
+            assert!(now.contains(key), "{key}: a key of 0.3.3 was removed");
+            assert!(
+                !KEYS_SINCE.iter().any(|(k, _)| k == key),
+                "{key} is a key of 0.3.3"
+            );
+        }
+        for key in now.iter().filter(|k| !old.contains(k)) {
+            let since = KEYS_SINCE
+                .iter()
+                .find(|(k, _)| k == key)
+                .map(|(_, v)| *v)
+                .unwrap_or_else(|| panic!("{key} is new since 0.3.3: add it to KEYS_SINCE"));
+            assert!(since > Version(0, 3, 3), "{key}");
+        }
     }
 
     /// `wats upgrade --rollback` to an older binary refuses while

@@ -21,16 +21,21 @@
   (signatures, SHA-256, the new binary runs), even with `update.auto`
   off; normal releases still follow `update.auto`. It never restarts the
   node (restart wats to use the new binary) and never applies to a
-  Homebrew install. The setup wizard and `wats setup` ask "Install
-  security updates automatically?" (default yes): yes sets
+  Homebrew install or a platform without a prebuilt release. The setup
+  wizard and `wats setup` on a terminal ask "Install security updates
+  automatically?" (default yes, or your previous answer): yes sets
   `security_auto = true` and, unless a delay is set, `security_delay =
-  "1d"`; no leaves the key unset (off). Nodes set up before are not
-  asked (it is part of setup revision 1) and keep running as they do. A
-  pending security release now gets a louder notice, without installing
-  anything: a `SECURITY RELEASE: wats X.Y.Z …` line with the command to
-  update in `wats status`, `update.notice` in the MCP `status` tool (for
-  the agent to tell its user), and once at node start, in the log and the
-  banner. Not on by default for every node: one release key, a bad or
+  "1d"` (which also applies to `update.auto` for security releases); no
+  leaves the key unset (off) and is remembered in `<data
+  dir>/setup-answers`. Without a terminal (`wats setup </dev/null`, an
+  agent piping answers) the question is not asked and nothing turns on.
+  Nodes set up before are not asked (it is part of setup revision 1) and
+  keep running as they do. A pending security release now gets a louder
+  notice, without installing anything: a `SECURITY RELEASE: wats X.Y.Z
+  …` line with the command to update in `wats status`, `update.notice`
+  in the MCP `status` tool (for the agent to tell its user), and once at
+  node start, in the log and the banner; `wats status` no longer shows a
+  stale `update.json` when `update.check` is off. Not on by default for every node: one release key, a bad or
   rogue release would reach every node at once, and nothing can pull a
   release yet; to be revisited at beta. ADR 0030.
 - **A file keeps its replicas when a node disappears.** A blob was

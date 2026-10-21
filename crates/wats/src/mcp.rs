@@ -1984,7 +1984,7 @@ impl WatsMcp {
         }
         // From the node's daily check (`update.check`): a newer release,
         // for the agent to relay to the user.
-        if config.update.check
+        if crate::update::shows_status(&config.update)
             && let Some(update) = crate::update::status_json(&config.data_dir, &config.update)
         {
             status["update"] = update;

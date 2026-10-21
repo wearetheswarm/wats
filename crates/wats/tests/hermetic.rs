@@ -5,9 +5,20 @@
 
 use std::time::Duration;
 
+/// A throwaway HOME and run directory next to the data directory, so that
+/// no test reaches the real ~/.wats (its MCP socket, its run directory).
+fn throwaway(data: &std::path::Path) -> [(&'static str, std::path::PathBuf); 2] {
+    let base = data.parent().unwrap_or(data);
+    [
+        ("HOME", base.join("home")),
+        ("WATS_RUN_DIR", base.join("run")),
+    ]
+}
+
 fn wats(data: &std::path::Path, args: &[&str]) -> std::process::Output {
     std::process::Command::new(env!("CARGO_BIN_EXE_wats"))
         .env("WATS_HERMETIC", "1")
+        .envs(throwaway(data))
         .env_remove("WATS_INFRA")
         .env_remove("WATS_BOOTSTRAP")
         .env_remove("WATS_PEERS")
@@ -59,16 +70,43 @@ fn hermetic_daemon_is_loopback_only() {
     std::fs::write(data.join("config.toml"), "infra = \"wats\"\n").unwrap();
     let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_wats"))
         .env("WATS_HERMETIC", "1")
+        .envs(throwaway(&data))
         .arg("--dir")
         .arg(&data)
         .stderr(std::process::Stdio::piped())
         .stdout(std::process::Stdio::null())
         .spawn()
         .unwrap();
-    std::thread::sleep(Duration::from_secs(2));
+    // Its stderr until its banner, then 2 s more for any bootstrap line (a
+    // loaded machine can take longer than 2 s to start it).
+    let stderr = child.stderr.take().unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        use std::io::BufRead;
+        for line in std::io::BufReader::new(stderr).lines() {
+            let Ok(line) = line else { break };
+            if tx.send(line).is_err() {
+                break;
+            }
+        }
+    });
+    let mut err = String::new();
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    while !err.contains("LOOPBACK ONLY") && std::time::Instant::now() < deadline {
+        if let Ok(line) = rx.recv_timeout(Duration::from_millis(200)) {
+            err.push_str(&line);
+            err.push('\n');
+        }
+    }
+    let more = std::time::Instant::now() + Duration::from_secs(2);
+    while let Some(left) = more.checked_duration_since(std::time::Instant::now()) {
+        if let Ok(line) = rx.recv_timeout(left) {
+            err.push_str(&line);
+            err.push('\n');
+        }
+    }
     child.kill().unwrap();
-    let out = child.wait_with_output().unwrap();
-    let err = String::from_utf8_lossy(&out.stderr);
+    child.wait().unwrap();
     assert!(
         err.contains("infra none") && err.contains("LOOPBACK ONLY"),
         "{err}"
@@ -104,9 +142,12 @@ fn status_shows_a_pending_security_release() {
     let dir = tempfile::tempdir().unwrap();
     let data = dir.path().join("d");
     std::fs::create_dir_all(&data).unwrap();
-    let status = |args: &[&str]| {
+    // `show`: WATS_TEST_UPDATE_STATUS=1, the test seam that shows the
+    // cache although a hermetic node never looks for releases.
+    let status_with = |args: &[&str], show: bool| {
         let out = std::process::Command::new(env!("CARGO_BIN_EXE_wats"))
             .env("WATS_HERMETIC", "1")
+            .env("WATS_TEST_UPDATE_STATUS", if show { "1" } else { "0" })
             .env("HOME", dir.path().join("home"))
             .env("WATS_RUN_DIR", dir.path().join("run"))
             .env_remove("WATS_INFRA")
@@ -122,6 +163,7 @@ fn status_shows_a_pending_security_release() {
         assert!(out.status.success(), "{out:?}");
         String::from_utf8_lossy(&out.stdout).into_owned()
     };
+    let status = |args: &[&str]| status_with(args, true);
     let cache = |security: bool| {
         serde_json::json!({
             "checked_at": 1_792_326_896u64,
@@ -132,6 +174,11 @@ fn status_shows_a_pending_security_release() {
         .to_string()
     };
     std::fs::write(data.join("update.json"), cache(true)).unwrap();
+    // A node that does not look for releases (here hermetic) says nothing
+    // from a stale update.json.
+    let text = status_with(&[], false);
+    assert!(!text.contains("SECURITY RELEASE"), "{text}");
+    assert!(!text.contains("update."), "{text}");
     let text = status(&[]);
     let line = text
         .lines()
@@ -804,6 +851,7 @@ esac
     // --apply belongs to the agent half.
     let out = std::process::Command::new(env!("CARGO_BIN_EXE_wats"))
         .env("WATS_HERMETIC", "1")
+        .envs(throwaway(&data))
         .env("PATH", &path)
         .arg("--dir")
         .arg(&data)
@@ -818,6 +866,7 @@ fn wats_stdin(data: &std::path::Path, args: &[&str], stdin: &[u8]) -> std::proce
     use std::io::Write;
     let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_wats"))
         .env("WATS_HERMETIC", "1")
+        .envs(throwaway(data))
         .arg("--dir")
         .arg(data)
         .args(args)
@@ -967,6 +1016,7 @@ fn resume_clears_the_halt_marker_and_status_shows_it() {
     // Its daemon warns at every start.
     let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_wats"))
         .env("WATS_HERMETIC", "1")
+        .envs(throwaway(&data))
         .arg("--dir")
         .arg(&data)
         .arg("--quiet")
@@ -1063,6 +1113,7 @@ fn safety_changes_are_flagged_until_acked() {
     // The daemon warns at startup.
     let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_wats"))
         .env("WATS_HERMETIC", "1")
+        .envs(throwaway(&data))
         .arg("--dir")
         .arg(&data)
         .arg("--quiet")

@@ -72,7 +72,9 @@ as before, and never touches an MCP host's config.
    goes with its allow list and review)**, the networks (`nets`),
    desktop notifications on a desktop session (`notify.desktop`), and
    whether to install security updates automatically
-   (`update.security_auto`, default yes; not asked for a Homebrew install;
+   (`update.security_auto`, default yes; asked of a person on a terminal
+   only, not for a Homebrew install nor a platform without a prebuilt
+   release;
    [ADR 0030](0030-security-updates.md), part of revision 1). Written to
    `config.toml` as `wats setup` writes them.
 2. The MCP hosts: for each of `claude`, `codex`, `openclaw` and `vibe`

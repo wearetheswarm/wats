@@ -57,6 +57,10 @@ A new boolean key, `false` when absent. When `true`, the node installs a
 - it never restarts the node: the log says to restart wats to use it;
 - never for a Homebrew install, whatever the settings: Homebrew keeps the
   binary, and the notice names `brew upgrade wats`;
+- never on a platform with no prebuilt release (`update::target()` is
+  none): the notice points to a build from source and the releases page
+  instead of `wats upgrade`, and never says the node installs it by
+  itself (`update::Install`: `Release`, `Homebrew` or `Source`);
 - never for a hermetic or loopback node (`--hermetic` turns
   `security_auto` off with `check` and `auto`);
 - normal releases still follow `update.auto` only. With both on,
@@ -68,6 +72,15 @@ A new boolean key, `false` when absent. When `true`, the node installs a
 help now says that it applies to both keys. `update.security_auto` is a
 safety key (`crate::safety`): an agent turning it on in config.toml is
 flagged until the user runs `wats config ack`, like `update.auto`.
+Accepted (review, 2026-10-21): as for any safety key a release adds, the
+first start of 0.4.3 records the key's current value as the baseline
+silently; a node whose config.toml already set it before that start (by
+hand, before upgrading) is not flagged.
+
+A Yes also shortens `update.auto`'s wait for **security** releases to one
+day, since `update.security_delay` applies to both keys; a later No leaves
+the delay in place (it is harmless with both keys off, and a user's own
+delay is never removed).
 
 **Known limit: a normal release can hide a security release.** The cache
 of the daily check holds the latest release only. A security release
@@ -106,33 +119,43 @@ then:
 
     Install security updates automatically? (update.security_auto) [Y/n]
 
-- **Yes is the prompt's default**; the user decides. When `wats setup`
-  runs again, the default is the current value when the key is set (as
-  for `notify.desktop`): Yes after a Yes, No after a `security_auto =
-  false` set by hand; with the key absent, Yes again.
+- **The default:** the current value when config.toml sets the key (a
+  `false` set by hand gives No); else the answer recorded in
+  `<data dir>/setup-answers`; else Yes, for a question never answered.
+  Yes is the prompt's default only then; the user decides.
 - **Yes** writes `security_auto = true` and, when no
   `update.security_delay` is set, `security_delay = "1d"`; a delay of the
   user's own is kept.
 - **No** leaves `update.security_auto` unset (it unsets it after an
-  earlier Yes): absent is false, and a wats older than 0.4.3 refuses the
-  key (Consequences, "Rollback"), so most users keep a working rollback. The cost:
-  a No is not remembered, so a later `wats setup` asks with Yes as the
-  default again. (Revised 2026-10-21; the first version wrote `false`.)
-- **A Homebrew install** is not asked: one line says that `brew upgrade
-  wats` installs its updates and that wats tells the user when a
-  security release is out. Nothing is written.
+  earlier Yes; a `false` set by hand stays): absent is false, and a wats
+  older than 0.4.3 refuses the key (Consequences, "Rollback"), so most
+  users keep a working rollback.
+- **The answer is remembered outside config.toml**, in
+  `<data dir>/setup-answers` (`security_auto=yes` or `security_auto=no`,
+  `name=value` lines, other lines kept), like `setup-revision` (ADR 0027
+  §4): a file an older wats ignores. So a No sticks: the next `wats
+  setup` defaults to No, and Enter keeps it off. (Revised twice on
+  2026-10-21: the first version wrote `false`, which broke rollbacks; the
+  second unset the key and forgot the No.)
+- **A Homebrew install, or a platform with no prebuilt release,** is not
+  asked: one line says how it is updated (`brew upgrade wats`, or a build
+  from source) and that wats tells the user when a security release is
+  out. Nothing is written.
 
-**Paths without a terminal.** As for the wizard's other questions:
+**Paths without a terminal.** Unlike the wizard's other questions:
 
-- `wats setup` without a terminal reads its answers from stdin, and the
-  end of the input takes each prompt's default (it already does for
-  `notify.desktop` and every main choice): there, an empty stdin sets
-  `security_auto = true` and `security_delay = "1d"`.
+- `wats setup` without a terminal reads its other answers from stdin, and
+  the end of the input takes each of their defaults, as before. **This
+  question is not asked there** (stdin is not a terminal): turning on
+  automatic installs takes an explicit answer from a person, and `wats
+  setup </dev/null`, or an agent piping answers, must not opt in. A
+  piped `y` is not taken either. The key stays as it is (unset: off), and
+  one line says to run `wats setup` on a terminal to choose. The wizard
+  and the catch-up only run on a terminal (or with `WATS_TEST_INTERACTIVE`
+  under `--hermetic`), so they ask it.
 - A first start without a terminal (a service, a container, `--agent`,
   `--no-agent`, `--hermetic`) asks nothing and writes the defaults,
-  commented, as before: `security_auto` is not set, so it is off. No
-  question picks a prompt default there today, so this one does not
-  either.
+  commented, as before: `security_auto` is not set, so it is off.
 - There is no `--yes` for the main choices (`wats setup openclaw --yes`
   confirms spend caps only, and asks no main choice).
 
@@ -168,7 +191,11 @@ It shows in three places:
 
 - **`wats status`**: on a line of its own, last, rather than as an
   `update.notice:` line among the others; `wats status --json` carries
-  it as `update.notice`. From the cache, whether the node runs or not.
+  it as `update.notice`. From the cache, whether the node runs or not,
+  but only when the node looks for releases (`update.check` on, not
+  hermetic nor loopback: `update::shows_status`), so that a stale
+  `update.json` says nothing. `WATS_TEST_UPDATE_STATUS=1` shows it
+  anyway, for tests, and only with `WATS_HERMETIC` set.
 - **The MCP `status` tool**: `update.notice`, and the tool's description
   tells the agent to tell the user now, in its next reply, with the
   notice's words (it names the version and the command), even if they
@@ -227,11 +254,12 @@ before installing. Until then, the user opts in, per machine.
   0.4.3 refuses a config.toml that sets `update.security_auto` (only a
   Yes writes it), and its `wats config unset` refuses the unknown key
   too. So `wats upgrade --rollback` now checks first (`check_rollback`):
-  it runs `<binary>.old --version` (cheap: the previous binary, run as
-  the upgrade path already runs the new one), and when that version is
-  older than this one and config.toml sets a key it does not know
-  (`KEYS_SINCE` in `update.rs`: the 0.4.1 keys and
-  `update.security_auto`), it refuses before swapping anything, naming
+  it runs `<binary>.old --version` (cheap, and as the upgrade path runs
+  a new binary: no environment, stdin closed, killed after 10 s, exit
+  status checked; a failure is logged and the check skipped), and when
+  that version is older than this one and config.toml sets a key it does
+  not know (`KEYS_SINCE` in `update.rs`: the three 0.4.0 keys, the five
+  of 0.4.1 and `update.security_auto`), it refuses before swapping anything, naming
   the keys and the exact commands to run first with the current binary,
   `wats --dir <data dir> config unset update.security_auto`, then the
   rollback again. A warning after the swap would leave the user with a
@@ -239,7 +267,10 @@ before installing. Until then, the user opts in, per machine.
   checks the data directory of the command (`--dir`, `WATS_DIR` or the
   default) only; other data directories (a fleet) are not looked at. A
   previous binary that does not print its version is not checked. A
-  release adding a key adds it to `KEYS_SINCE`.
+  release adding a key adds it to `KEYS_SINCE`: a test compares the keys
+  of today with the committed list of the keys of 0.3.3
+  (`crates/wats/tests/fixtures/keys-0.3.3.txt`, from the v0.3.3 tag) and
+  fails on a new key without an entry.
 
 ## SPEC
 

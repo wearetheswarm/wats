@@ -3397,7 +3397,11 @@ async fn status_command(config: &NodeConfig, json: bool) -> Result<()> {
                 "nets": config.nets,
                 "version": env!("CARGO_PKG_VERSION"),
             });
-            if let Some(update) = wats::update::status_json(&config.data_dir, &config.update) {
+            // Not from a stale update.json when the node does not look for
+            // releases (`update.check` off, hermetic, loopback).
+            if wats::update::shows_status(&config.update)
+                && let Some(update) = wats::update::status_json(&config.data_dir, &config.update)
+            {
                 status["update"] = update;
             }
             status["halt"] = wats::halt::offline_status(&config.data_dir, config.halt.accept);

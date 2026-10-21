@@ -759,7 +759,7 @@ pub const KEYS: &[Key] = &[
         "update.security_auto",
         ValueType::Bool,
         "false",
-        "install a release marked security by itself (signature checked) once it is update.security_delay old, even with update.auto off; restart to use it; never for a Homebrew install",
+        "install a release marked security by itself (signature checked) once it is update.security_delay old, even with update.auto off; restart to use it; never for a Homebrew install nor a platform without a prebuilt release",
     ),
     key(
         "update.delay",
