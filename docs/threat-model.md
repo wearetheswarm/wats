@@ -80,13 +80,17 @@ machine, and supply-chain attacks on dependencies beyond pinning and
   (every 10 min ± 50 %), never on a peer's request, join or return, so no
   peer can make a node push: a pass checks at most 64 blobs, sends at
   most 7 requests per blob and 16 per peer, through the 4 paced push
-  slots per peer; a returning node spreads its checks over 6 h. What a
-  peer can do is make a node's pushes useless: refuse every one (repair
-  then tries at most 3 more peers per blob and check, then backs off from
-  10 min to 6 h), or be unreachable (left out for 10 min to 24 h). The
-  receiving side is unchanged (rate limit, 4 fetches and a queue of 16
-  per peer, `storage.max`), and a `replicate` for a blob already held is
-  now answered without a fetch.
+  slots per peer; a returning node spreads its checks over 6 h. A peer
+  that is busy, throttled or slow only delays a check (it ends, and comes
+  back within 10 minutes); one that refuses for good, or misses twice an
+  hour apart, is replaced, which costs one push to the next peer. A
+  peer's claim to hold a blob counts only after a possession proof: this
+  node fetches from it alone a random chunk and the last one, BAO-verified,
+  while refusing that peer's own requests for the blob, so it cannot
+  relay this node's copy. The receiving side keeps its limits (rate
+  limit, 4 fetches and a queue of 16 per peer, `storage.max`); a peer can
+  make it a replica only of blobs it is among the 6 closest to, and
+  replicas take at most 60 % of the blob part of `storage.max`.
 - **Blobs** are verified by BLAKE3 streaming, are never executed, and are
   exported read-only. Export never follows a symlink: the inbox and its
   per-hash directories must be real directories, and files are written
@@ -336,13 +340,14 @@ Every channel carries a little stranger-written text, marked as data:
   There is no onion routing or mixing, and private (encrypted)
   networks are not implemented yet.
 - **Eviction:** a full node stops accepting, but does not evict (Phase 2).
-- **Replica claims are believed** (ADR 0029). A peer that answers
-  `replicate` with a hash is counted as a replica without proof that it
-  stores the blob. Peers placed close to a hash (endpoint ids are free)
-  that lie make repair stop early, and make last-copy protection delete a
-  copy it believes was handed off. Erasure, retractions and `wats drop
-  --purge` never hand anything off. A random-chunk check over the blobs
-  protocol is the planned fix.
+- **Possession proofs are snapshots, and may be relayed** (ADR 0029).
+  A peer proves it holds a blob at one moment, and may delete it right
+  after; it may also fetch the chunks asked for from a third holder
+  (only this node's own copy is refused to it meanwhile). Peers placed
+  close to a hash (endpoint ids are free) can so make an eviction release
+  a copy while fewer real copies exist than counted. Eviction needs two
+  proven holders when k > 1, and erasure, retractions and `wats drop`
+  never hand anything off.
 - **A fake newest history** (ADR 0025 §9): a new node keeps only a budget
   of history, newest first, so a peer serving it a window of valid junk
   (fresh keys, recent `ts`, the scheduled proof of work) crowds real

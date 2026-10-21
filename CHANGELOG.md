@@ -6,30 +6,36 @@
 
 - **A file keeps its replicas when a node disappears.** A blob was
   pushed to the 3 nodes closest to its hash when it was published, and
-  never again: a replica whose node died was gone for good. Each node now
-  checks, every 10 minutes or so and at most 64 blobs at a time, the
-  blobs it holds as a replica (recorded when the blob was pushed to it)
-  and those of its own posts: it asks the holders, then the closest
-  peers, to hold each one with the `replicate` request every release
-  answers, and one that does not have it fetches it. A replica stays when
-  its post's body is evicted. A
-  lost replica is re-made on the next closest node, within hours, with
-  at most 16 requests to any peer per pass; a node coming back spreads
-  its checks over 6 hours. A node already holding a blob now confirms it
-  at once, even at `storage.max`. No wire change. ADR 0029.
+  never again: a replica whose node died was gone for good. A node that
+  receives a blob by `replicate` now records itself as a replica (when it
+  is among the 6 closest of its view), and each node checks, every 10
+  minutes or so and at most 64 blobs at a time, the blobs it holds as a
+  replica and those of its own posts: it asks the holders, then the
+  closest peers of the post's network, to hold each one, with the
+  `replicate` request every release answers, and counts a holder only
+  once it proved it (two chunks of the blob fetched from it alone). A
+  peer gone twice an hour apart, or one that refuses for good (full,
+  quota), is replaced by the next closest; a busy or throttled one is
+  asked again later, never replaced. At most 16 requests to a peer per
+  pass; a node coming back spreads its checks over 6 hours. A node
+  already holding a blob confirms it at once, even at `storage.max`, and
+  says "storage full" or "quota reached" instead of answering without it.
+  Replicas take at most 60 % of the blob part of `storage.max`. No wire
+  change. ADR 0029.
 - **Files of knowledge get 5 replicas.** A blob listed by a knowledge
   entry (a promoted digest, a thread's canonical answer) or by the
   sources an entry rests on is kept on the 5 closest nodes instead of 3.
   Storage cost in all: 2/3 × the share of blob bytes behind knowledge
   (+10 % when that share is 15 %). ADR 0029.
-- **A node no longer deletes what may be the last copy of a file.**
-  Before a body is evicted for space, or dropped with `wats drop`, the
-  files it alone lists are handed to another node, which must confirm it
-  holds them; if none does, nothing is dropped. `wats drop --purge`
-  deletes them anyway, for content that must not be stored anywhere.
-  Retractions and erasure labels still delete at once, last copy or not.
-  With no node running, `wats drop` of a post with files held here needs
-  `--purge`. ADR 0029.
+- **Eviction no longer deletes what may be the last copy of a file.**
+  When a body is evicted for space, a replica stays (and a later
+  retraction, erasure label or `wats drop` of the post releases it);
+  any other copy is released only once two other nodes proved they hold
+  it, or the eviction is refused. `wats drop`, retractions and erasure
+  labels delete at once, as before, and hand nothing to anyone. ADR 0029.
+- **Blob lookups by hash use an index.** A new `event_blobs` table (no
+  schema bump, filled at open) replaces scans of every event when a body
+  is dropped and for replica repair.
 - **`wats fleet`: several support nodes on one machine** (ADR 0028).
   `wats fleet up -n 6` creates six data directories under `--base`
   (default `~/.wats-fleet`), each with its own key, port and agent

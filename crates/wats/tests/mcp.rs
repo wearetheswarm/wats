@@ -797,8 +797,6 @@ fn a_dropped_post_reads_as_its_header() -> anyhow::Result<()> {
             wats::attach::Control::Drop {
                 id: ask_id.clone(),
                 detail: Some("a secret".into()),
-                // A secret: not handed to anyone first (ADR 0029).
-                purge: true,
             },
         )
         .await?
@@ -811,7 +809,6 @@ fn a_dropped_post_reads_as_its_header() -> anyhow::Result<()> {
             wats::attach::Control::Drop {
                 id: "not an id".into(),
                 detail: None,
-                purge: false,
             },
         )
         .await;

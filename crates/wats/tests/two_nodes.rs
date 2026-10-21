@@ -491,15 +491,14 @@ async fn a_body_dropped_offline_stays_dropped() -> anyhow::Result<()> {
         .await?;
     // Not while the node holds the data directory.
     assert!(
-        wats::node::drop_body_offline(&data, &event.id, DropReason::Own, None, false)
+        wats::node::drop_body_offline(&data, &event.id, DropReason::Own, None)
             .await
             .is_err()
     );
     a.shutdown().await?;
     drop(a);
     let outcome =
-        wats::node::drop_body_offline(&data, &event.id, DropReason::Own, Some("why"), false)
-            .await?;
+        wats::node::drop_body_offline(&data, &event.id, DropReason::Own, Some("why")).await?;
     assert!(outcome.held && outcome.body_dropped);
     let a = Node::start(config(&data)).await?;
     assert!(a.store().get(&event.id)?.is_none());

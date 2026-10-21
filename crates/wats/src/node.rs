@@ -38,6 +38,7 @@ use tracing::{debug, info, warn};
 
 pub mod durability;
 pub mod history;
+mod proof;
 
 use crate::bootstrap::BootstrapEntry;
 use crate::event::{BlobRef, Draft, Event, Kind, is_safe_blob_name};
@@ -1007,17 +1008,11 @@ async fn unpin_freed(blobs: &FsStore, outcome: &DropOutcome) {
 /// [`Node::drop_body`] with no node running on `data_dir` (`wats drop`):
 /// holds the data directory lock meanwhile. The blobs it frees are deleted
 /// by the next collection of a running node.
-///
-/// With no node running, no blob can be handed to another node first
-/// (last-copy protection, ADR 0029): unless `purge`, or for a retraction or
-/// a label, the drop is refused, and nothing changes, when it would free a
-/// blob this node holds.
 pub async fn drop_body_offline(
     data_dir: &Path,
     id: &str,
     reason: DropReason,
     detail: Option<&str>,
-    purge: bool,
 ) -> Result<DropOutcome> {
     let path = data_dir.join("events.sqlite");
     if !path.exists() {
@@ -1025,40 +1020,11 @@ pub async fn drop_body_offline(
     }
     let lock = lock_data_dir(data_dir, &Holder::role("cli"))?;
     let store = Store::open(&path)?;
-    let freed = store.blobs_freed_by(id)?;
-    let blobs = if freed.is_empty() {
-        None
-    } else {
+    let outcome = store.drop_body(id, reason, None, detail, now_secs())?;
+    if !outcome.freed_blobs.is_empty() {
         let dir = data_dir.join("blobs");
         let options = iroh_blobs::store::fs::options::Options::new(&dir);
-        Some(open_blob_store(&dir, options).await?)
-    };
-    if let Some(blobs) = &blobs
-        && !purge
-        && matches!(reason, DropReason::Own | DropReason::Evicted)
-    {
-        let mut held = Vec::new();
-        for hex in &freed {
-            if let Ok(hash) = hex.parse::<Hash>()
-                && matches!(
-                    blobs.blobs().status(hash).await,
-                    Ok(BlobStatus::Complete { .. })
-                )
-            {
-                held.push(hex.clone());
-            }
-        }
-        if !held.is_empty() {
-            blobs.shutdown().await.ok();
-            return Err(durability::KeptLastCopy {
-                id: id.to_string(),
-                blobs: held,
-            })
-            .context("no node is running to hand them to another node first");
-        }
-    }
-    let outcome = store.drop_body(id, reason, None, detail, now_secs())?;
-    if let Some(blobs) = blobs {
+        let blobs = open_blob_store(&dir, options).await?;
         unpin_freed(&blobs, &outcome).await;
         blobs.shutdown().await.ok();
     }
@@ -1333,6 +1299,8 @@ pub struct Node {
     history: history::History,
     /// Replica repair and last-copy protection (ADR 0029).
     durability: durability::State,
+    /// Possession proofs: the blob requests refused meanwhile (ADR 0029).
+    proof_guard: Arc<proof::Guard>,
 }
 
 impl std::fmt::Debug for Node {
@@ -1676,11 +1644,15 @@ impl Node {
             .max_message_size(GOSSIP_MAX_MESSAGE_BYTES)
             .spawn(endpoint.clone());
         let downloader = blobs.downloader(&endpoint);
+        let proof_guard = Arc::new(proof::Guard::default());
         let protocol = WatsProtocol::default();
         let endpoint_id = endpoint.id();
         let mut router = Router::builder(endpoint)
             .accept(iroh_gossip::ALPN, gossip.clone())
-            .accept(iroh_blobs::ALPN, BlobsProtocol::new(&blobs, None));
+            .accept(
+                iroh_blobs::ALPN,
+                BlobsProtocol::new(&blobs, Some(proof_guard.event_sender())),
+            );
         for alpn in proto::ALPNS {
             router = router.accept(alpn, protocol.clone());
         }
@@ -1755,6 +1727,7 @@ impl Node {
             redialing: Default::default(),
             history: Default::default(),
             durability: Default::default(),
+            proof_guard,
         });
         node.measure_storage().await;
         if node.config.storage_max.is_some() {
@@ -3832,11 +3805,14 @@ impl Node {
     /// untagged, for the next collection to delete them.
     ///
     /// For storage pressure (`evicted`), last-copy protection first (ADR
-    /// 0029): the drop is refused with [`durability::KeptLastCopy`] when
-    /// this node may hold the last copy of a blob it would free and no
-    /// other node takes it ([`Node::hand_off_before_drop`]). `wats drop`
-    /// (`own`) asks for the hand-off itself, unless `--purge`. Retractions
-    /// and labels delete regardless (ADR 0020).
+    /// 0029 §4): a replica stays (the body goes, the blob is kept and
+    /// recorded, so that a later retraction, erasure, label or `wats drop`
+    /// releases it); any other copy is released only once other nodes
+    /// proved they hold it, else the eviction is refused with
+    /// [`durability::KeptLastCopy`]. Every other reason deletes at once,
+    /// replicas kept by an earlier eviction included: `wats drop` is a
+    /// human's compliance tool, and retractions and labels mean the content
+    /// must not be kept.
     pub async fn drop_body(
         &self,
         id: &str,
@@ -3844,32 +3820,46 @@ impl Node {
         trigger: Option<&str>,
         detail: Option<&str>,
     ) -> Result<DropOutcome> {
-        // Replicas stay when their body is evicted (decided by Vincent,
-        // 2026-10-21: "keep the file if responsible").
-        let mut replicas: Vec<String> = Vec::new();
-        if reason == DropReason::Evicted {
-            for hex in self.store.blobs_freed_by(id)? {
-                if let Ok(hash) = hex.parse::<Hash>()
-                    && self.has_replica_intent(&hash).await
-                {
-                    replicas.push(hex);
-                }
-            }
-            let stranded = self.hand_off_before_drop_except(id, &replicas).await?;
-            if !stranded.is_empty() {
+        let mut kept: Vec<String> = Vec::new();
+        let mut planned: Vec<String> = Vec::new();
+        let before = if reason == DropReason::Evicted {
+            self.store.get(id)?.map(|s| s.event)
+        } else {
+            None
+        };
+        if let Some(event) = &before {
+            let plan = self.plan_eviction(id, event).await?;
+            if !plan.stranded.is_empty() {
                 return Err(durability::KeptLastCopy {
                     id: id.to_string(),
-                    blobs: stranded,
+                    blobs: plan.stranded,
                 }
                 .into());
             }
+            planned.extend(plan.released);
+            planned.extend(plan.kept.iter().cloned());
+            kept = plan.kept;
         }
         let mut outcome = self
             .store
             .drop_body(id, reason, trigger, detail, now_secs())?;
-        if !replicas.is_empty() {
-            info!(%id, blobs = replicas.len(), "body evicted, its replicas kept");
-            outcome.freed_blobs.retain(|h| !replicas.contains(h));
+        if let Some(event) = &before {
+            // Freed now but not planned: another event that listed them
+            // went meanwhile (S7).
+            let late: Vec<String> = outcome
+                .freed_blobs
+                .iter()
+                .filter(|h| !planned.contains(h))
+                .cloned()
+                .collect();
+            if !late.is_empty() {
+                kept.extend(self.cover_late(event, &late).await);
+            }
+            if !kept.is_empty() {
+                info!(%id, blobs = kept.len(), "body evicted, its replicas kept");
+                outcome.freed_blobs.retain(|h| !kept.contains(h));
+                self.store.record_evicted_replicas(id, &kept)?;
+            }
         }
         unpin_freed(&self.blobs, &outcome).await;
         // A freed blob no longer needs repairing: no kept post lists it.
@@ -4136,13 +4126,15 @@ impl Node {
                 continue;
             };
             for stored in found {
+                // Not applied yet, or only an eviction (whose kept
+                // replicas the erasure releases, ADR 0029 §5).
                 if self.is_erasure_label(&stored.event)
                     && self
                         .store
                         .drop_record(stored.event.parent.as_deref().unwrap_or_default())
                         .ok()
                         .flatten()
-                        .is_none()
+                        .is_none_or(|record| record.reason == DropReason::Evicted)
                 {
                     self.apply_erasure(&stored.event).await;
                 }
@@ -4377,66 +4369,158 @@ impl Node {
             }
             Request::Replicate { event, hashes } => {
                 self.durability.note_served();
-                let event = match self.accept_value(event, Origin::Pushed).await {
-                    Ok(Some((AnyEvent::Known(event), _))) => event,
-                    // Opaque events are stored; their blobs are unknown to us.
-                    Ok(Some((AnyEvent::Opaque(_), _))) => {
-                        return Response::Replicated { hashes: vec![] };
-                    }
-                    Ok(None) => {
-                        return Response::Refused {
-                            reason: "rejected by node policy".into(),
-                        };
-                    }
-                    Err(e) => {
-                        return Response::Refused {
-                            reason: format!("{e:#}"),
-                        };
-                    }
-                };
-                let mut stored = Vec::new();
-                for blob in event.blobs.iter().filter(|b| hashes.contains(&b.hash)) {
-                    if blob.url.is_some() || blob.size > self.config.max_blob_bytes {
-                        continue;
-                    }
-                    self.add_hints(&blob.hash, &[peer]);
-                    let Ok(hash) = blob.hash.parse::<Hash>() else {
-                        continue;
-                    };
-                    let legacy = self.config.durability.legacy_replicate;
-                    // Already held: confirmed at once, with no fetch slot
-                    // and whatever the storage state (ADR 0029). Replica
-                    // repair asks the holders of a blob to confirm it.
-                    if !legacy && self.holds_blob(blob).await {
-                        match self.pin(hash).await {
-                            Ok(()) => {
-                                self.record_replica_intent(hash).await;
-                                stored.push(blob.hash.clone());
-                                continue;
-                            }
-                            Err(e) => warn!(hash = %blob.hash, "blob not pinned: {e:#}"),
-                        }
-                    }
-                    // At most a few fetches at once for one peer, a few more
-                    // waiting their turn.
-                    let Some(_permit) = self
-                        .limiter
-                        .blob_fetch(peer, crate::limits::BLOB_FETCH_WAIT)
-                        .await
-                    else {
-                        continue;
-                    };
-                    if self.fetch_blob(blob, vec![peer]).await {
-                        // A replica by intent (ADR 0029 §1).
-                        if !legacy {
-                            self.record_replica_intent(hash).await;
-                        }
-                        stored.push(blob.hash.clone());
-                    }
-                }
-                Response::Replicated { hashes: stored }
+                self.serve_replicate(peer, event, hashes).await
             }
         }
+    }
+
+    /// Serve `replicate` (ADR 0005, ADR 0029): accept the event, then
+    /// hold each blob asked for that it lists. A blob already held under a
+    /// tag is confirmed at once (no fetch slot, whatever the storage
+    /// state); another is fetched from the requester. A replica is recorded
+    /// when this node is among the 2k closest of its view. A refusal for
+    /// good (storage full, quota, replica share) is said as such when no
+    /// blob was taken, so repair moves on.
+    async fn serve_replicate(
+        &self,
+        peer: EndpointId,
+        event: serde_json::Value,
+        hashes: Vec<String>,
+    ) -> Response {
+        let tuning = &self.config.durability;
+        if tuning.lie_replicate {
+            return Response::Replicated { hashes };
+        }
+        // A body evicted here (ADR 0029 S6): its blobs held under a tag
+        // are confirmed without taking the body back.
+        if let Some(id) = event.get("id").and_then(serde_json::Value::as_str)
+            && matches!(
+                self.store.drop_record(id),
+                Ok(Some(record)) if record.reason == DropReason::Evicted
+            )
+        {
+            let mut stored = Vec::new();
+            let blobs = event
+                .get("blobs")
+                .and_then(serde_json::Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            for blob in blobs {
+                let Ok(blob) = serde_json::from_value::<BlobRef>(blob) else {
+                    continue;
+                };
+                let Ok(hash) = blob.hash.parse::<Hash>() else {
+                    continue;
+                };
+                if hashes.contains(&blob.hash)
+                    && self.blob_tagged(&hash).await
+                    && self.holds_blob(&blob).await
+                {
+                    stored.push(blob.hash.clone());
+                }
+            }
+            return Response::Replicated { hashes: stored };
+        }
+        let event = match self.accept_value(event, Origin::Pushed).await {
+            Ok(Some((AnyEvent::Known(event), _))) => event,
+            // Opaque events are stored; their blobs are unknown to us.
+            Ok(Some((AnyEvent::Opaque(_), _))) => {
+                return Response::Replicated { hashes: vec![] };
+            }
+            Ok(None) => {
+                return Response::Refused {
+                    reason: "rejected by node policy".into(),
+                };
+            }
+            Err(e) => {
+                return Response::Refused {
+                    reason: format!("{e:#}"),
+                };
+            }
+        };
+        let legacy = tuning.legacy_replicate;
+        let mut stored = Vec::new();
+        let mut refusal: Option<&str> = None;
+        for blob in event.blobs.iter().filter(|b| hashes.contains(&b.hash)) {
+            if blob.url.is_some() || blob.size > self.config.max_blob_bytes {
+                continue;
+            }
+            self.add_hints(&blob.hash, &[peer]);
+            let Ok(hash) = blob.hash.parse::<Hash>() else {
+                continue;
+            };
+            let replica = !legacy && self.takes_as_replica(&hash, &event.net);
+            // Already held under a tag: confirmed at once. The tag existed
+            // before this request, so every blob collection keeps the blob:
+            // one past its mark read it then, a later one reads it now (a
+            // blob held but untagged takes the fetch path below).
+            if !legacy && self.blob_tagged(&hash).await && self.holds_blob(blob).await {
+                if let Err(e) = self.pin(hash).await {
+                    warn!(hash = %blob.hash, "blob not pinned: {e:#}");
+                    continue;
+                }
+                if replica {
+                    self.record_replica_intent(hash, blob.size).await;
+                }
+                stored.push(blob.hash.clone());
+                continue;
+            }
+            if !legacy {
+                if self.storage_state() != StorageState::Ok {
+                    refusal = Some("storage full: not taking replicas");
+                    continue;
+                }
+                if let Some(quota) = self.config.blob_quota
+                    && self.blob_usage().await.saturating_add(blob.size) > quota
+                {
+                    refusal = Some("blob quota reached: not taking replicas");
+                    continue;
+                }
+                if replica && !self.replica_fits(blob.size) {
+                    refusal = Some("replica share of storage.max reached: not taking replicas");
+                    continue;
+                }
+            }
+            // At most a few fetches at once for one peer, a few more
+            // waiting their turn.
+            let Some(_permit) = self
+                .limiter
+                .blob_fetch(peer, crate::limits::BLOB_FETCH_WAIT)
+                .await
+            else {
+                continue;
+            };
+            if self.fetch_blob(blob, vec![peer]).await {
+                if replica {
+                    self.record_replica_intent(hash, blob.size).await;
+                }
+                stored.push(blob.hash.clone());
+            }
+        }
+        // A retraction or an erasure that landed while the blobs came in
+        // (S8): what it would have freed is released again.
+        if !stored.is_empty() && !legacy && !self.event_still_full(&event.id) {
+            for hex in &stored {
+                if let Ok(hash) = hex.parse::<Hash>()
+                    && !self.store.blob_listed(hex).unwrap_or(true)
+                    && let Err(e) = unpin_blob(&self.blobs, hash).await
+                {
+                    warn!(hash = %hex, "blob of a dropped body not untagged: {e:#}");
+                }
+            }
+            return Response::Replicated { hashes: vec![] };
+        }
+        match refusal {
+            Some(reason) if stored.is_empty() => Response::Refused {
+                reason: reason.to_string(),
+            },
+            _ => Response::Replicated { hashes: stored },
+        }
+    }
+
+    /// Whether event `id` is held in full with no drop record.
+    fn event_still_full(&self, id: &str) -> bool {
+        matches!(self.store.get(id), Ok(Some(_))) && matches!(self.store.drop_record(id), Ok(None))
     }
 
     /// Rate limits and load challenge: `None` lets the request through,
