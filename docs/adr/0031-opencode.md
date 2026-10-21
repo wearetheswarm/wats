@@ -688,7 +688,13 @@ change:
   SIGHUP as a graceful stop (review of #191: the CLI is no longer in the
   terminal's process group, so the hangup would no longer reach it). A
   detached node (`--log-file`) still ignores SIGHUP, and a background
-  node of MCP sessions (`--idle-exit`) keeps the default action.
+  node of MCP sessions (`--idle-exit`) keeps the default action. A
+  foreground node started with SIGHUP ignored (`nohup wats`) keeps it
+  ignored: registering a handler would replace the inherited `SIG_IGN`,
+  so `main` reads the disposition before tokio registers any signal
+  handler (sigaction(2) with a null new action, in the new
+  `crates/wats-sys`: the `wats` crate stays `#![forbid(unsafe_code)]`,
+  and that one audited call lives apart; CONTRIBUTING.md says so).
 - **Q5.** Warn only: the runner warns when an ancestor of the workspace
   has `opencode.json(c)` or `.opencode/`. No `git init`.
 - **Q6.** `--remove` only prints the key to delete and its file.
@@ -763,7 +769,13 @@ change:
     `tools` with a small reader of its own (no YAML dependency) and
     **fails closed**: an unterminated block, a tab, a top-level line that
     is no `key: value`, or a flow collection, anchor, alias, tag or block
-    scalar in those keys, refuses the file;
+    scalar in those keys, refuses the file. It also follows gray-matter
+    4.0.3, which OpenCode uses: a leading byte order mark is stripped
+    first; a first line that starts with `---` but is not exactly `---`
+    (`---json`, `--- yaml`: another engine) is refused; and any `\` in a
+    double-quoted key, or in a double-quoted value of a key wats reads,
+    is refused, since YAML decodes escapes there (`"wa\x74s"` is
+    `wats`);
   - a wildcard allow in `permission` (`"b*": "allow"`) or in the
     legacy `tools` (`"ba?h": true`), in a config file or a Markdown
     agent: OpenCode keeps a key where the config put it, so such a rule

@@ -5127,6 +5127,10 @@ fn shutdown_signal() -> Shutdown {
     })
 }
 
+/// Whether this process started with SIGHUP ignored (`nohup`), read in
+/// `main` before tokio registers any signal handler.
+static SIGHUP_INHERITED_IGNORED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
 /// `shutdown`, or SIGHUP: the terminal of a foreground node was closed.
 /// The node then stops as on Ctrl-C, and its agent runs, each in a
 /// process group of its own (ADR 0031 §3), are killed with what they
@@ -5134,6 +5138,12 @@ fn shutdown_signal() -> Shutdown {
 /// itself: a command that does not wait for its shutdown keeps the
 /// default action.
 fn with_hangup(shutdown: Shutdown) -> Shutdown {
+    // Started with SIGHUP ignored (`nohup wats`): it stays ignored, since
+    // a handler would replace the inherited SIG_IGN.
+    if SIGHUP_INHERITED_IGNORED.get() == Some(&true) {
+        tracing::debug!("SIGHUP ignored, as inherited (nohup): not a stop");
+        return shutdown;
+    }
     #[cfg(unix)]
     if let Ok(mut hangup) = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup()) {
         return Box::pin(async move {
@@ -6335,6 +6345,8 @@ fn main() -> Result<()> {
     if let Some(Command::Notify { hook, host, event }) = &cli.command {
         return notify_command(&cli.node, *hook, host, event);
     }
+    // Before any tokio signal handler replaces it (`nohup wats`).
+    let _ = SIGHUP_INHERITED_IGNORED.set(wats_sys::sighup_ignored() == Some(true));
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?

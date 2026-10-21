@@ -57,6 +57,9 @@ tar = { version = "=0.4.46", default-features = false }
 # The sealed inbox (src/inbox.rs, ADR 0015 §5): HPKE with X-Wing,
 # HKDF-SHA256 and ChaCha20-Poly1305.
 hpke = { version = "=0.14.1", default-features = false, features = ["alloc", "getrandom", "x25519", "mlkem", "chacha"] }
+# The OS calls that need `unsafe` (this crate forbids it): whether SIGHUP
+# is inherited ignored (`nohup`), ADR 0031 §3.
+wats-sys = { path = "../wats-sys" }
 
 # Killing an agent run's process group (src/background.rs, ADR 0031 §3):
 # a safe killpg(2), the version already in the tree.

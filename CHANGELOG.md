@@ -21,7 +21,7 @@
   with everything it started (MCP servers, shell commands), for every
   spawned runtime. A foreground `wats` whose terminal closes (SIGHUP) now
   stops gracefully, as on Ctrl-C, and takes its runs with it (a detached
-  node still ignores SIGHUP).
+  node still ignores SIGHUP, and so does `nohup wats`).
 
 ## 0.4.3 (2026-10-21)
 

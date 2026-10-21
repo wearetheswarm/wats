@@ -752,6 +752,10 @@ fn yaml_scalar(raw: &str) -> Result<String> {
     let raw = raw.trim();
     if let Some(rest) = raw.strip_prefix('"') {
         let end = rest.find('"').context("an unterminated \" string")?;
+        // YAML decodes escapes there ("wa\x74s" is wats): not read.
+        if rest[..end].contains('\\') {
+            bail!("{raw:?}: an escape in a double-quoted string");
+        }
         return Ok(rest[..end].to_string());
     }
     if let Some(rest) = raw.strip_prefix('\'') {
@@ -774,6 +778,11 @@ fn yaml_entry(line: &str) -> Option<(String, &str)> {
     let line = line.trim();
     let (key, rest) = if let Some(after) = line.strip_prefix('"') {
         let end = after.find('"')?;
+        // YAML decodes escapes in a double-quoted key ("n\x61me" is
+        // name): not read, so the line is refused.
+        if after[..end].contains('\\') {
+            return None;
+        }
         (
             after[..end].to_string(),
             after[end + 1..].strip_prefix(':')?,
@@ -829,9 +838,17 @@ fn yaml_rules(children: &[&str], allow: &str) -> Result<Vec<(String, bool)>> {
 /// the keys wats reads.
 fn front_matter(text: &str) -> Result<FrontMatter> {
     let mut out = FrontMatter::default();
+    // gray-matter strips a byte order mark first.
+    let text = text.strip_prefix('\u{feff}').unwrap_or(text);
     let mut lines = text.lines();
-    if lines.next().map(str::trim_end) != Some("---") {
-        return Ok(out);
+    match lines.next().map(str::trim_end) {
+        Some("---") => {}
+        // `---yaml`, `--- json`…: gray-matter reads the rest as the name of
+        // another engine (JSON, …), which wats does not read.
+        Some(first) if first.starts_with("---") => {
+            bail!("{first:?}: a front matter in a language wats does not read");
+        }
+        _ => return Ok(out),
     }
     let mut block = Vec::new();
     let mut closed = false;
@@ -1612,8 +1629,50 @@ mod tests {
             "---\nname: |\n  wats\n---\n",         // block scalar
             "---\n\tname: wats\n---\n",            // tab
             "---\ntools: true\n---\n",             // not rules
+            // gray-matter 4.0.3: a language after `---` names another engine.
+            "---json\n{\"name\": \"wats\"}\n---\n",
+            "--- yaml\nname: wats\n---\n",
+            "---yaml\nname: helper\n---\n",
+            "----\nname: wats\n---\n",
+            // YAML escapes in double quotes: "wa\x74s" is wats.
+            "---\nname: \"wa\\x74s\"\n---\n",
+            "---\n\"n\\x61me\": wats\n---\n",
+            "---\npermission:\n  \"b\\x2a\": allow\n---\n",
         ] {
             assert!(front_matter(bad).is_err(), "{bad:?}");
+        }
+        // gray-matter strips a byte order mark: the front matter is read.
+        let bom = front_matter("\u{feff}---\nname: wats\n---\n").unwrap();
+        assert_eq!(bom.name.as_deref(), Some("wats"));
+        // Escapes in single quotes are no escapes, and other keys are not read.
+        assert_eq!(
+            front_matter("---\nname: 'wa\\x74s'\ndescription: \"a\\tb\"\n---\n")
+                .unwrap()
+                .name
+                .as_deref(),
+            Some("wa\\x74s")
+        );
+    }
+
+    /// The three gray-matter cases end in a refusal when scanned: a BOM
+    /// before `---`, `---json`, and an escaped name.
+    #[test]
+    fn gray_matter_cases_are_refused_when_scanned() {
+        let root = tempfile::tempdir().unwrap();
+        let work = root.path().join("data/agent/opencode");
+        let workspace = work.join("workspace");
+        let agents = workspace.join(".opencode/agent");
+        std::fs::create_dir_all(&agents).unwrap();
+        for text in [
+            "\u{feff}---\nname: wats\n---\n",
+            "---json\n{\"name\": \"wats\"}\n---\n",
+            "---\nname: \"wa\\x74s\"\n---\n",
+        ] {
+            std::fs::write(agents.join("helper.md"), text).unwrap();
+            assert!(
+                check_config_sources(Access::Workspace, &workspace, &work, None).is_err(),
+                "{text:?}"
+            );
         }
     }
 

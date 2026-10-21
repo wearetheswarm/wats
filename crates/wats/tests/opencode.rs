@@ -744,3 +744,79 @@ fn a_detached_node_survives_sighup() {
     assert!(still, "the detached node stopped on SIGHUP");
     assert!(stop.status.success(), "{stop:?}");
 }
+
+/// `nohup wats`: a foreground node started with SIGHUP ignored keeps it
+/// ignored (read before tokio registers any handler), and survives
+/// `kill -HUP`.
+#[test]
+fn a_nohup_foreground_node_survives_sighup() {
+    let dir = tempfile::tempdir().unwrap();
+    for d in ["home", "xdg-config", "xdg-data", "run"] {
+        std::fs::create_dir_all(dir.path().join(d)).unwrap();
+    }
+    let fake = fake(dir.path(), "1.19.3", "sleep 300");
+    let data = dir.path().join("data");
+    let nohup = ["/usr/bin/nohup", "/bin/nohup"]
+        .into_iter()
+        .find(|p| Path::new(p).exists())
+        .expect("nohup(1)");
+    let mut node = std::process::Command::new(nohup)
+        .arg(env!("CARGO_BIN_EXE_wats"))
+        .env("WATS_HERMETIC", "1")
+        .env("WATS_RUN_DIR", dir.path().join("run"))
+        .env("HOME", dir.path().join("home"))
+        .env("XDG_CONFIG_HOME", dir.path().join("xdg-config"))
+        .env("XDG_DATA_HOME", dir.path().join("xdg-data"))
+        .env("USER", "alice")
+        .env_remove("WATS_PROFILE")
+        .env_remove("WATS_DIR")
+        .args([
+            "--infra",
+            "none",
+            "--no-default-bootstrap",
+            "--loopback",
+            "--dir",
+        ])
+        .arg(&data)
+        .args([
+            "--agent",
+            "opencode",
+            "--access",
+            "swarm-only",
+            "--heartbeat",
+            "1h",
+            "--agent-command",
+        ])
+        .arg(&fake)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    while !wats::attach::socket_path(&data).exists() {
+        if let Some(status) = node.try_wait().unwrap() {
+            panic!("the node exited: {status}: {:?}", node.wait_with_output());
+        }
+        assert!(std::time::Instant::now() < deadline, "the node is not up");
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    // nohup execs wats: the same process.
+    let pid = node.id().to_string();
+    let hup = std::process::Command::new("kill")
+        .args(["-HUP", &pid])
+        .status()
+        .unwrap();
+    assert!(hup.success());
+    std::thread::sleep(Duration::from_secs(3));
+    let survived = node.try_wait().unwrap().is_none();
+    let _ = std::process::Command::new("kill")
+        .args(["-TERM", &pid])
+        .status();
+    let out = node.wait_with_output().unwrap();
+    assert!(
+        survived,
+        "nohup wats stopped on SIGHUP: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}

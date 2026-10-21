@@ -100,8 +100,9 @@ differs:
 - **Timeout**: past `agent.timeout`, the runner kills the run's whole
   process group: OpenCode and what it started (MCP servers, shell
   commands). So does a stop, Ctrl-C, or closing the terminal of a
-  foreground `wats` (SIGHUP stops it gracefully; a `wats --detach` node
-  ignores SIGHUP, as before). Every spawned runtime works this way.
+  foreground `wats` (SIGHUP stops it gracefully, unless started with
+  `nohup`; a `wats --detach` node ignores SIGHUP, as before). Every
+  spawned runtime works this way.
 - **Version**: the runner reads `opencode --version` at start. It refuses
   OpenCode older than 1.17.0, and warns from 2.0 on (not checked yet).
 

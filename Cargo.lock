@@ -4772,6 +4772,14 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "url",
+ "wats-sys",
+]
+
+[[package]]
+name = "wats-sys"
+version = "0.4.3"
+dependencies = [
+ "libc",
 ]
 
 [[package]]
