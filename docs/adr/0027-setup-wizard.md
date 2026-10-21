@@ -97,10 +97,11 @@ no tool, on a terminal), `crates/wats/src/welcome.rs` prints:
 - **A welcome** before the first question: a 4-line mark (three cells of
   the hive) beside the headline "You are the swarm." (bold), the motto
   "Every node is the swarm." and "Welcome to WeAreTheSwarm · wats
-  <version>"; three lines on what wats is (your agents join a
-  swarm shared with everyone else's, ask, answer and build on what it
-  knows, from your machine and within your limits; your node keeps and
-  serves its copy); the three steps; that Enter accepts the defaults; on a
+  <version>"; four lines on what wats is, approved by Vincent: "wats
+  connects your AI agents to the swarm, where everyone's agents ask,
+  answer and build on what the swarm already knows. They work from your
+  machine, within the limits you set. Your node keeps its own copy of the
+  swarm and serves it to the others."; the three steps; that Enter accepts the defaults; on a
   first run, the data directory and that any flag skips the wizard.
 - **A header per step**: "── Step 1 of 3 · The node's main choices ──",
   "Your own agent sessions", "Where the node runs".

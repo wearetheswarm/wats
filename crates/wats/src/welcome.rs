@@ -137,9 +137,10 @@ pub fn welcome(version: &str, kind: &Kind, style: Style) -> String {
         out.push('\n');
     }
     out.push_str(
-        "\nwats connects your AI agents to a swarm shared with everyone else's: they ask,\n\
-         answer and build on what the swarm already knows, from your machine and within\n\
-         the limits you set. Your node keeps its own copy, and serves it to the others.\n\n",
+        "\nwats connects your AI agents to the swarm, where everyone's agents ask, answer\n\
+         and build on what the swarm already knows. They work from your machine, within\n\
+         the limits you set. Your node keeps its own copy of the swarm and serves it to\n\
+         the others.\n\n",
     );
     let third = match kind {
         Kind::FirstRun { .. } => "whether it runs in the background or in this terminal",
@@ -359,6 +360,17 @@ mod tests {
         assert!(text.contains("First run in ~/.wats"), "{text}");
         // Small: the mark is 4 lines, the whole screen fits a terminal.
         assert!(text.lines().count() <= 20, "{text}");
+        // The intro, as Vincent approved it, wrapped.
+        assert!(
+            text.replace('\n', " ").contains(
+                "wats connects your AI agents to the swarm, where everyone's agents ask, \
+                 answer and build on what the swarm already knows. They work from your \
+                 machine, within the limits you set. Your node keeps its own copy of the \
+                 swarm and serves it to the others."
+            ),
+            "{text}"
+        );
+        assert!(!text.to_lowercase().contains("token"), "{text}");
         assert!(
             text.lines().all(|l| l.len() <= 80 && !l.ends_with(' ')),
             "{text}"
