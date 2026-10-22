@@ -1,0 +1,12 @@
+# cargo-nextest, used by CI (.github/workflows/ci.yml) so that a test that
+# hangs fails on its own, by name, instead of holding the job until its
+# 20-minute timeout cancels it with no log. `cargo test` still works
+# locally; `cargo nextest run --profile ci` reproduces CI.
+
+[profile.ci]
+# A test is reported slow after 60 s and killed after 5 periods (5 min).
+# The slowest tests take well under a minute.
+slow-timeout = { period = "60s", terminate-after = 5 }
+# Run every test, and list the failed and slow ones again at the end.
+fail-fast = false
+final-status-level = "slow"

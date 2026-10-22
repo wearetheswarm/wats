@@ -46,8 +46,17 @@ jobs:
         run: cargo fmt --all --check
       - name: cargo clippy
         run: cargo clippy --all-targets -- -D warnings
+      # cargo-nextest: each test in its own process, with a per-test
+      # timeout (.config/nextest.toml), so a hang names the test. Doctests
+      # are not run by nextest: cargo test --doc runs them.
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest
       - name: cargo test
-        run: cargo test
+        run: cargo nextest run --profile ci
+      - name: cargo test (doctests)
+        run: cargo test --doc
       # Second, independent event verifier (Python, standard library only)
       # against the published vectors: a prerequisite of the format freeze
       # (ADR 0010). Linux only, it is platform-independent.
