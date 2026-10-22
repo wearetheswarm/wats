@@ -25,6 +25,12 @@ openclaw mcp show wats
 - With `--dir <dir>`, the args start with `"--dir","<dir>"`, as for Claude
   Code and Codex.
 - Only `command` and `args` are set: wats needs no `env`.
+- **Via npx or uvx (once published).** Not available yet: the npm and
+  PyPI wrappers ([ADR 0035](adr/0035-npx-and-uvx-wrappers.md)) are not
+  published, and the names are placeholders. Once they are, `openclaw mcp
+  set wats '{"command":"npx","args":["-y","@wearetheswarm/wats","mcp","--profile","alice"]}'`
+  runs a verified, cached wats release without installing it first; see
+  [claude-code.md](claude-code.md#via-npx-or-uvx-once-published).
 - `openclaw mcp set` replaces an entry of the same name, so running setup
   again is harmless. `openclaw mcp show wats` checks the result.
 - `--remove` runs `openclaw mcp unset wats` (and `openclaw mcp unset

@@ -47,6 +47,47 @@ MCP server.
 - Optionally add [`examples/claude-code/CLAUDE.md`](../examples/claude-code/CLAUDE.md)
   to your project's `CLAUDE.md` so the agent knows when to use the swarm.
 
+### Via npx or uvx (once published)
+
+**Not available yet:** the npm and PyPI wrappers are built and tested
+([ADR 0035](adr/0035-npx-and-uvx-wrappers.md)), but neither is published,
+and the package names below are placeholders. Until then, install wats as
+above.
+
+Once published, a host can start wats without installing it first:
+
+```json
+{
+  "mcpServers": {
+    "wats": {
+      "type": "stdio",
+      "command": "npx",
+      "args": ["-y", "@wearetheswarm/wats", "mcp", "--profile", "my-project"]
+    }
+  }
+}
+```
+
+or `"command": "uvx", "args": ["wearetheswarm-wats", "mcp",
+"--profile", "my-project"]`; for your user, `claude mcp add --scope user
+wats -- npx -y @wearetheswarm/wats mcp --profile <name>`.
+
+- The wrapper downloads the wats release of its own version for this
+  machine (macOS arm64, Linux x86_64; elsewhere it says how to install
+  otherwise), verifies its minisign signatures, their file names and its
+  SHA-256 with the release key, as `wats upgrade` does, caches the binary
+  (`~/Library/Caches/wats-wrapper`, `~/.cache/wats-wrapper`), and runs
+  `wats mcp` with the arguments given. Nothing runs when a check fails. A
+  cached version is checked again at each start, and works offline.
+- The wrapper's version is the wats version it runs. To pin it, write
+  `@wearetheswarm/wats@X.Y.Z` or `wearetheswarm-wats@X.Y.Z`; unpinned,
+  npx and uvx decide when to move to a newer one. Upgrade through the
+  package, not with `wats upgrade`.
+- The wrapper never edits Claude Code's config: you add the entry. `wats
+  setup claude --mcp` run through a wrapper would write the path of the
+  cached binary, which changes with each version, so write the `npx` or
+  `uvx` entry yourself.
+
 ## User-scoped setup and running alongside an agent
 
 To have wats in every project, register it once for your user:

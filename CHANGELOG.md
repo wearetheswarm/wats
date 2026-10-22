@@ -4,6 +4,24 @@
 
 ### Changes
 
+- **npm and PyPI wrappers, not published yet** ([ADR 0035](docs/adr/0035-npx-and-uvx-wrappers.md),
+  `packages/npm`, `packages/pypi`): so that MCP hosts can start wats with
+  `npx -y <package> mcp` or `uvx <package> mcp`. A wrapper of version
+  X.Y.Z downloads the wats X.Y.Z release archive for the machine (macOS
+  arm64, Linux x86_64; elsewhere it says how to install otherwise),
+  verifies both minisign signatures with the pinned release key, their
+  trusted file names and the SHA-256, as `wats upgrade` does, caches the
+  binary (a 0700 root that is never a symlink nor another user's, an
+  emptied and refetched cache when it was writable by others, atomic
+  entries checked again at every start, so it works offline), then runs
+  the very file it verified with the same arguments, and warns on stderr
+  when the pinned version is below the latest release's signed security
+  floor. Nothing runs when a check fails. No runtime dependency in either: Node's crypto, and a
+  pure-Python Ed25519 copied from `tools/verify-py`. The package names
+  are placeholders until they are reserved; nothing is on npm or PyPI.
+- `scripts/wrapper-versions.sh` keeps the wrappers' versions equal to
+  Cargo.toml's (CI checks it), and CONTRIBUTING.md lists the version
+  bumps of a release.
 - **History: no false `full` after a late neighbor** (ADR 0025, review 5).
   A neighbor that came up during a pass, brought events of a span just
   confirmed, then stopped partway (a 0.4.0 node's rate limit) left the
