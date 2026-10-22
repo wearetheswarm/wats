@@ -18,7 +18,15 @@ Each node of a fleet is an ordinary node in its own data directory,
 The nodes run in the background, each as `wats --detach` would, and list
 each other as bootstrap peers on `127.0.0.1`, so they connect even with
 `--infra none`. `wats ps` lists them; `wats attach`, `wats stop`, `wats
-status` and the other commands work on one with `--dir <base>/node-<i>`.
+status` and the other commands work on one with `-n node-<i>` (`-n
+<fleet>-<i>` for a second fleet, below), or `--dir <base>/node-<i>`.
+
+**Names.** A fleet's nodes keep their directory's name as their node name
+(ADR 0023 §8): `node-1`, `node-2`… in `wats ps`, and `-n node-2` picks one.
+When another node of the machine already has that name (a second fleet
+under another `--base`), a node is named after its fleet's directory
+instead: `support-2` for `--base ~/support`. The name is in
+`<node>/node-name`; the template's own `node.name`, if set, is not copied.
 
 macOS, Linux and WSL only, like `wats --detach`.
 
@@ -116,8 +124,8 @@ From cron, as the same user, with the agent CLI on `PATH`:
 wats fleet logs              # the last 10 lines of every node, prefixed
 wats fleet logs -f           # and what they log, live (Ctrl-C)
 wats fleet logs --node 3 -n 50
-wats attach --dir ~/.wats-fleet/node-3   # one node, with its banner
-wats --dir ~/.wats-fleet/node-3 agent logs -f   # its agent's runs
+wats attach -n node-3                    # one node, with its banner
+wats agent logs -f --name node-3/claude  # its agent's runs (or -n node-3)
 ```
 
 ## One MCP client on one node, for a test
@@ -126,7 +134,7 @@ Support nodes register nothing in any MCP host. To use the swarm through
 one of them, point an MCP client at its data directory:
 
 ```sh
-claude mcp add wats-fleet -- wats mcp --dir ~/.wats-fleet/node-1
+claude mcp add wats-fleet -- wats mcp -n node-1
 ```
 
 The session attaches to node-1 through its socket, as `wats mcp` does
@@ -137,7 +145,8 @@ with any running node. Remove it with `claude mcp remove wats-fleet`.
 ```sh
 wats fleet stop                        # every node, gracefully
 wats fleet up                          # start again what is not running
-wats stop --dir ~/.wats-fleet/node-2   # one node
+wats stop -n node-2                    # one node
+wats stop --all                        # every node of the machine, ~/.wats too
 ```
 
 After a reboot, `wats fleet up` starts them all again with the same keys,
@@ -149,7 +158,7 @@ wats fleet stop && wats fleet up --check
 ```
 
 `check` fails on a node that still runs the old version. For a rolling
-restart, one node at a time: `wats stop --dir ~/.wats-fleet/node-1 &&
+restart, one node at a time: `wats stop -n node-1 &&
 wats fleet up --check`, then node-2, and so on.
 
 A node's `config.toml` is read at its start only: after editing one (or

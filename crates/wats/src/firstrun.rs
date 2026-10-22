@@ -784,6 +784,7 @@ pub fn setup(
         Asker {
             install: Install::detect(),
             terminal: std::io::stdin().is_terminal(),
+            machine: None,
         },
     )
 }
@@ -798,7 +799,11 @@ pub fn setup_with(
     path: Option<&OsStr>,
     desktop: bool,
 ) -> Result<Choices> {
-    setup_asking(data_dir, input, out, path, desktop, Asker::person())
+    let asker = Asker {
+        machine: Some(crate::naming::Machine::default()),
+        ..Asker::person()
+    };
+    setup_asking(data_dir, input, out, path, desktop, asker)
 }
 
 fn setup_asking(
@@ -889,10 +894,13 @@ pub fn catch_up_with(
 /// Who answers the security updates question, and for which install
 /// (ADR 0030): asked only of a person (stdin a terminal) and only for an
 /// [`Install::Release`], which the node can update by itself.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct Asker {
     install: Install,
     terminal: bool,
+    /// The nodes whose names the node name question refuses (ADR 0023
+    /// §8); None: this user's, looked up when asked.
+    machine: Option<crate::naming::Machine>,
 }
 
 impl Asker {
@@ -901,6 +909,7 @@ impl Asker {
         Asker {
             install: Install::detect(),
             terminal: true,
+            machine: None,
         }
     }
 }
@@ -937,10 +946,14 @@ fn ask_and_write(
         choices.values.push(("notify.desktop", on.to_string()));
     }
     let security = if SECURITY_AUTO_SINCE > revision {
-        ask_security_auto(input, out, &settings, data_dir, asker, &mut choices)?
+        ask_security_auto(input, out, &settings, data_dir, asker.clone(), &mut choices)?
     } else {
         None
     };
+    // Last, so that the answers before it keep their order (ADR 0023 §8).
+    if revision == 0 {
+        ask_node_name(input, out, data_dir, asker.machine.as_ref(), &mut choices)?;
+    }
     let file = apply(data_dir, &choices)?;
     if let Some(on) = security {
         record_answer(data_dir, "security_auto", if on { "yes" } else { "no" })?;
@@ -1005,6 +1018,67 @@ fn ask_security_auto(
             .push(("update.security_auto", "false".to_string()));
     }
     Ok(Some(on))
+}
+
+/// This user's nodes, for the node name question: the registry (none in a
+/// hermetic process without `WATS_RUN_DIR`) and `~/.wats`.
+#[cfg(not(test))]
+fn users_machine() -> crate::naming::Machine {
+    crate::naming::Machine::of_user(crate::background::registry_dir(
+        crate::update::hermetic_env(),
+    ))
+}
+
+/// Unit tests never look at this user's nodes (the real ~/.wats): none.
+#[cfg(test)]
+fn users_machine() -> crate::naming::Machine {
+    crate::naming::Machine::default()
+}
+
+/// The node name question (ADR 0023 §8).
+pub const NODE_NAME_QUESTION: &str = "Name of this node";
+
+/// Ask the node's name (ADR 0023 §8), its current one by default, else one
+/// drawn now; another node of this machine's name is refused. Written to
+/// `<data dir>/node-name`, which older releases ignore (so a rollback still
+/// starts), unless config.toml sets `node.name`: then there.
+fn ask_node_name(
+    input: &mut impl BufRead,
+    out: &mut impl Write,
+    data_dir: &Path,
+    machine: Option<&crate::naming::Machine>,
+    choices: &mut Choices,
+) -> Result<()> {
+    use crate::naming;
+    let taken = match machine {
+        Some(machine) => machine.taken(data_dir),
+        None => users_machine().taken(data_dir),
+    };
+    let current = naming::stored(data_dir);
+    let default = current
+        .clone()
+        .unwrap_or_else(|| naming::draw_random(&taken));
+    let name = loop {
+        write!(out, "{NODE_NAME_QUESTION} (node.name) [{default}]: ")?;
+        let answer = match read_answer(input, out)? {
+            Some(answer) if !answer.is_empty() => answer,
+            _ => break default.clone(),
+        };
+        if let Err(why) = naming::check(&answer) {
+            writeln!(out, "  {why}")?;
+        } else if taken.contains(&answer) {
+            writeln!(out, "  another node of this machine is named {answer}")?;
+        } else {
+            break answer;
+        }
+    };
+    if naming::configured(data_dir).is_some() {
+        choices.values.push(("node.name", name));
+    } else if current.as_deref() != Some(name.as_str()) {
+        naming::write(data_dir, &name)
+            .with_context(|| format!("write {}", data_dir.join(naming::FILE).display()))?;
+    }
+    Ok(())
 }
 
 /// The answer `name` recorded in `data_dir`'s [`ANSWERS_FILE`], if any.
@@ -1303,6 +1377,94 @@ mod tests {
         assert_eq!(settings.update.security_delay.as_deref(), Some("12h"));
     }
 
+    /// The node's name (ADR 0023 §8), asked last: a drawn default, kept in
+    /// `node-name` (never config.toml, which 0.4.4 would refuse); an answer
+    /// is checked; with `node.name` already in config.toml, it goes there.
+    #[test]
+    fn setup_asks_the_node_name() {
+        let data = tempfile::tempdir().unwrap();
+        let mut out = Vec::new();
+        setup_with(data.path(), &mut "".as_bytes(), &mut out, None, false).unwrap();
+        let said = String::from_utf8(out).unwrap();
+        let drawn = crate::naming::generated(data.path()).expect("written");
+        assert!(
+            said.contains(&format!("{NODE_NAME_QUESTION} (node.name) [{drawn}]: ")),
+            "{said}"
+        );
+        let config = std::fs::read_to_string(data.path().join(FILE_NAME)).unwrap();
+        assert!(!config.contains(&drawn), "{config}");
+        // Again: the current name is the default. Storage, networks,
+        // security updates, then the name: an invalid one, then another.
+        let mut out = Vec::new();
+        setup_with(
+            data.path(),
+            &mut "\n\n\nNot Valid\nhive_test\n".as_bytes(),
+            &mut out,
+            None,
+            false,
+        )
+        .unwrap();
+        let said = String::from_utf8(out).unwrap();
+        assert!(said.contains(&format!("(node.name) [{drawn}]")), "{said}");
+        assert!(said.contains("node name \"Not Valid\""), "{said}");
+        assert_eq!(
+            crate::naming::generated(data.path()).as_deref(),
+            Some("hive_test")
+        );
+        assert!(Settings::load(data.path()).unwrap().node.name.is_none());
+        // Set in config.toml by hand: the answer goes there.
+        let mut file = ConfigFile::open(data.path()).unwrap();
+        file.set("node.name", "by_hand").unwrap();
+        file.save().unwrap();
+        setup_with(
+            data.path(),
+            &mut "\n\n\nrenamed\n".as_bytes(),
+            &mut Vec::new(),
+            None,
+            false,
+        )
+        .unwrap();
+        let settings = Settings::load(data.path()).unwrap();
+        assert_eq!(settings.node.name.as_deref(), Some("renamed"));
+        assert_eq!(
+            crate::naming::stored(data.path()).as_deref(),
+            Some("renamed")
+        );
+    }
+
+    /// The node name question refuses another node's name, among the
+    /// machine's directories it is given (temporary ones here: a unit test
+    /// never reads the real ~/.wats).
+    #[test]
+    fn the_node_name_question_refuses_another_nodes_name() {
+        let tmp = tempfile::tempdir().unwrap();
+        let registry = tmp.path().join("run");
+        let other = tmp.path().join("other");
+        crate::naming::write(&other, "busy_bee").unwrap();
+        crate::background::register(&registry, &other).unwrap();
+        let machine = crate::naming::Machine {
+            registry: Some(registry),
+            default_dir: Some(tmp.path().join("home/.wats")),
+        };
+        let data = tmp.path().join("data");
+        let mut out = Vec::new();
+        let mut choices = Choices::default();
+        ask_node_name(
+            &mut "busy_bee\ncalm_bee\n".as_bytes(),
+            &mut out,
+            &data,
+            Some(&machine),
+            &mut choices,
+        )
+        .unwrap();
+        let said = String::from_utf8(out).unwrap();
+        assert!(
+            said.contains("another node of this machine is named busy_bee"),
+            "{said}"
+        );
+        assert_eq!(crate::naming::generated(&data).as_deref(), Some("calm_bee"));
+    }
+
     /// A No sticks (ADR 0030): it unsets the key (absent is false, and an
     /// older wats refuses it), is remembered in `setup-answers`, and is the
     /// default of the next run, so Enter keeps it off.
@@ -1414,6 +1576,7 @@ mod tests {
         let piped = Asker {
             install: Install::Release,
             terminal: false,
+            machine: Some(crate::naming::Machine::default()),
         };
         for input in ["", "\n\ny\n"] {
             let mut out = Vec::new();
@@ -1423,7 +1586,7 @@ mod tests {
                 &mut out,
                 None,
                 false,
-                piped,
+                piped.clone(),
                 0,
                 true,
             )
@@ -1478,6 +1641,7 @@ mod tests {
             let asker = Asker {
                 install,
                 terminal: true,
+                machine: Some(crate::naming::Machine::default()),
             };
             let (choices, _) = ask_and_write(
                 data.path(),

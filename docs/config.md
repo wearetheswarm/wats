@@ -20,6 +20,7 @@ Command-line flags and `WATS_*` variables, where they exist (`wats --help`), tak
 | `no_default_bootstrap` | false | skip the bootstrap nodes built into the binary |
 | `max_blob_size` | built in | largest blob published or fetched, e.g. 1G |
 | `blob_quota` | unlimited | disk budget for others' blobs, e.g. 20G |
+| `node.name` | drawn at first start | this node's name on this machine: wats ps shows it, -n/--node NAME picks the node (NAME/AGENT an agent); 1-32 chars of [a-z0-9_-]. Local only: never posted nor announced. Unset: the adjective_creature name drawn at its first start, kept in &lt;data dir&gt;/node-name |
 
 ## `[storage]`
 

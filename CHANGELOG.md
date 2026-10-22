@@ -4,6 +4,38 @@
 
 ### Changes
 
+- **Node names, and `-n NAME` for every command about one node** (ADR
+  0023 §8, [docs/agent.md](docs/agent.md#node-names-and-several-nodes)).
+  - Each node of the machine gets a random `adjective_creature` name at
+    its first start (`cheeky_starling`, `sleepy_krill`), never one another
+    node of the machine has. The setup wizard shows it as a default
+    (`Name of this node (node.name) [cheeky_starling]`); `wats config set
+    node.name hive` renames it. A fleet's nodes keep `node-<i>`.
+  - The name is local only: never posted, announced or sent to a peer.
+  - `wats ps` shows a `NAME` column and the start of each node's
+    endpoint id (`ENDPOINT`); `--json` has `name` and `endpoint_id`.
+    `--all` also lists the stopped nodes this machine ran.
+  - `-n/--node NAME` picks the node in `wats attach`, `stop`, `status`,
+    `mcp`, `config` and `agent logs|runs|attach|pending|approve|reject|retracted`;
+    `--dir` still works (both together must name the same node). An agent
+    of another node is `NODE/AGENT` in `wats agent --name`:
+    `wats agent logs --name codex/reviewer`.
+  - Without `-n` or `--dir`, they act on `~/.wats`'s node, as before.
+    With `-n`, `--dir` or several nodes on the machine, they say which
+    first, on stderr: `node cheeky_starling (~/.wats), agent claude`.
+  - `wats config unset` removes a table left empty (its comments kept),
+    and `wats upgrade --rollback` also refuses a table the older wats does
+    not know, even empty.
+  - `wats stop --all` stops every node of the machine.
+  - **`-n` changes meaning**: it was the count of `wats attach` and `wats
+    agent logs|runs`, which is now `--lines` and `--last` only. `wats fleet
+    up -n` is unchanged.
+  - Upgrading: a node of an older wats shows as `default` (`~/.wats`) or
+    its directory's name until it restarts. The drawn name is kept in
+    `<data dir>/node-name`, which older releases ignore, so a rollback to
+    0.4.4 still starts. `node.name` in config.toml (set by `wats config
+    set`) is new in 0.4.5: `wats upgrade --rollback` asks you to unset it
+    first.
 - **Mistral Vibe as an agent runtime** (`wats --agent vibe`, ADR 0033).
   Each run is Vibe's headless mode, `vibe --prompt=` with the prompt on
   stdin, `--output streaming` and `--max-turns`; Vibe 3.0.0 or later.

@@ -1565,10 +1565,17 @@ impl Node {
         // hand-over, is over. MCP sessions that said so reconnect.
         crate::background::clear_stop_record(&config.data_dir);
         // For `wats ps` (ADR 0023): where to look for this node.
-        if let Some(registry) = &config.registry
-            && let Err(e) = crate::background::register(registry, &config.data_dir)
-        {
-            debug!("could not record this node in {}: {e}", registry.display());
+        if let Some(registry) = &config.registry {
+            if let Err(e) = crate::background::register(registry, &config.data_dir) {
+                debug!("could not record this node in {}: {e}", registry.display());
+            }
+            crate::background::prune_known(registry, crate::background::KNOWN_KEEP);
+        }
+        // Its name on this machine, drawn at its first start (ADR 0023
+        // §8): local only, in nothing it sends.
+        let machine = crate::naming::Machine::of_user(config.registry.clone());
+        if let Err(e) = crate::naming::ensure(&config.data_dir, &machine) {
+            debug!("could not name this node: {e}");
         }
         let root = match &config.secret_file {
             Some(path) => RootSecret::load(path)?,

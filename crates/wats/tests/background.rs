@@ -138,7 +138,7 @@ impl Attached {
             .wats()
             .arg("--dir")
             .arg(dir)
-            .args(["attach", "-n", "3"])
+            .args(["attach", "--lines", "3"])
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
@@ -224,7 +224,7 @@ fn detach_ps_attach_stop() {
     // The table too.
     let table = machine.wats().arg("ps").output().unwrap();
     let table = text(&table.stdout);
-    assert!(table.starts_with("PID "), "{table}");
+    assert!(table.starts_with("NAME "), "{table}");
     assert!(
         table.contains(&pid.to_string()) && table.contains("detached"),
         "{table}"
