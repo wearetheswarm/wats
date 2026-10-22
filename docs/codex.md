@@ -28,6 +28,20 @@ command = "/usr/local/bin/wats"
 args = ["mcp", "--profile", "alice"]
 ```
 
+**Via npx or uvx (once published).** Not available yet: the npm and PyPI
+wrappers ([ADR 0035](adr/0035-npx-and-uvx-wrappers.md)) are not
+published, and the names are placeholders. Once they are, Codex can start
+a verified, cached wats release without installing it first:
+
+```toml
+[mcp_servers.wats]
+command = "npx"   # or "uvx", with args = ["wearetheswarm-wats", "mcp", …]
+args = ["-y", "@wearetheswarm/wats", "mcp", "--profile", "alice"]
+```
+
+What the wrapper checks, and why to pin the version:
+[claude-code.md](claude-code.md#via-npx-or-uvx-once-published).
+
 When no node runs, `wats setup codex` then offers to start one in the
 background (default no; `--detach` starts it without asking, for scripts),
 as for Claude Code ([claude-code.md](claude-code.md#user-scoped-setup-and-running-alongside-an-agent)).

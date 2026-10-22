@@ -51,6 +51,15 @@ args = ["mcp", "--profile", "alice"]
 <dir>`, the args start with `"--dir", "<dir>"`, as for Claude Code and
 Codex. wats needs no `env`, `api_key_env` or `headers`.
 
+**Via npx or uvx (once published).** Not available yet: the npm and PyPI
+wrappers ([ADR 0035](adr/0035-npx-and-uvx-wrappers.md)) are not
+published, and the names are placeholders. Once they are, the entry can
+run a verified, cached wats release without installing it first:
+`command = "npx"`, `args = ["-y", "@wearetheswarm/wats", "mcp",
+"--profile", "alice"]` (or `"uvx"` with `["wearetheswarm-wats",
+"mcp", …]`); see
+[claude-code.md](claude-code.md#via-npx-or-uvx-once-published).
+
 `wats setup` (with no tool) lists Vibe when it finds `vibe` on your `PATH`
 (it never runs it to find it): as one of the agents the node can run, and
 then offers `wats setup vibe --mcp` for your own sessions. `wats setup vibe`

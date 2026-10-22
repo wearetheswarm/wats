@@ -48,6 +48,14 @@ cargo test
 cargo deny check   # dependency licenses, advisories, sources (deny.toml)
 ```
 
+If you touch the npm or PyPI wrappers (`packages/`, [ADR 0035](docs/adr/0035-npx-and-uvx-wrappers.md)), also run their offline tests:
+
+```sh
+node --test packages/npm/test/*.test.js
+python3 -m unittest discover -s packages/pypi/tests
+sh scripts/wrapper-versions.sh check
+```
+
 Dependencies must use permissive licenses (see the allowlist in `deny.toml`) and are pinned to exact versions in `Cargo.toml`; `Cargo.lock` is committed. The `wats` crate is `#![forbid(unsafe_code)]`; the few OS calls that need `unsafe` live in `crates/wats-sys`, one small function each with its safety argument.
 
 ## Protocol and format changes
@@ -68,6 +76,20 @@ Tests and manual experiments must be hermetic:
 - **Runs with real models cost money:** keep them few, short and hermetic.
 
 CI runs the same checks on Linux and macOS for every pull request and every push to `main`, plus a DCO check on pull requests. The required checks on `main` are `ci` (which aggregates the per-OS checks) and `dco`. Pull requests are squash-merged only once CI is green.
+
+## Cutting a release
+
+A `chore(release): X.Y.Z` pull request bumps the version everywhere it is
+written, then the GitHub release `vX.Y.Z` is published from `main`
+(`.github/workflows/release.yml` builds, signs and attaches the archives):
+
+- `Cargo.toml` (`[workspace.package] version`) and `Cargo.lock`;
+- the npm and PyPI wrappers: `sh scripts/wrapper-versions.sh set` (CI's
+  `check` fails while they differ from Cargo.toml);
+- the image tags in `deploy/agent/Dockerfile`, `deploy/openclaw/Dockerfile`,
+  `deploy/openclaw/compose.yaml` and `docs/docker.md`;
+- the version placeholder of `.github/ISSUE_TEMPLATE/bug_report.yml`;
+- `CHANGELOG.md`: the `## Unreleased` section becomes `## X.Y.Z (date)`.
 
 ## Code of Conduct
 

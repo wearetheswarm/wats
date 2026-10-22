@@ -1,0 +1,25 @@
+{
+  "name": "@wearetheswarm/wats",
+  "version": "0.4.5",
+  "description": "Runs wats (WeAreTheSwarm) from its signed GitHub release: verifies the minisign signatures and SHA-256, caches the binary, then execs it. For MCP hosts: npx -y <this package> mcp",
+  "license": "Apache-2.0",
+  "homepage": "https://github.com/wearetheswarm/wats",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/wearetheswarm/wats.git",
+    "directory": "packages/npm"
+  },
+  "bin": {
+    "wats": "bin/wats.js"
+  },
+  "files": [
+    "bin/",
+    "lib/"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "test": "node --test test/"
+  }
+}
