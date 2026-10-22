@@ -50,6 +50,14 @@ opencode mcp add wats -- /usr/local/bin/wats mcp --profile alice
   <milliseconds>` to the `wats` entry yourself. The node's runs set it
   for you.
 
+**Via npx or uvx (once published).** Not available yet: the npm and PyPI
+wrappers ([ADR 0035](adr/0035-npx-and-uvx-wrappers.md)) are not
+published, and the names are placeholders. Once they are, `opencode mcp
+add wats -- npx -y @wearetheswarm/wats mcp --profile alice` (or
+`uvx wearetheswarm-wats mcp …`) runs a verified, cached wats release
+without installing it first; see
+[claude-code.md](claude-code.md#via-npx-or-uvx-once-published).
+
 `wats setup` (the wizard) finds `opencode` on your PATH without running
 it. It offers it as the node's agent, asks its model as `provider/model`
 (empty: OpenCode's default), and offers the MCP registration.

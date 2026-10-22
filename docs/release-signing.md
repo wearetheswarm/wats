@@ -219,7 +219,12 @@ back, so the backup is the only way to keep the same key when moving CI.
 
 Generate a new key pair, replace `MINISIGN_SECRET_KEY`, publish the new public
 key here and in the README in the same pull request, and say in the release
-notes from which version the new key applies. Old releases keep verifying
+notes from which version the new key applies. The same pull request changes
+`RELEASE_PUBLIC_KEY` in `crates/wats/src/update.rs`, `PUBKEY` in
+`install.sh`, and the npm and PyPI wrappers' constants
+(`packages/npm/lib/verify.js`, `packages/pypi/src/wats_wrapper/verify.py`,
+[ADR 0035](adr/0035-npx-and-uvx-wrappers.md)), whose tests fail until they
+match `update.rs`. Old releases keep verifying
 with the old key, so list the previous public keys below with the versions
 they signed.
 
