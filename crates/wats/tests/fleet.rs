@@ -131,8 +131,9 @@ fn up_check_logs_restart_and_stop_a_fleet_of_three() {
     std::fs::write(
         template.join("config.toml"),
         format!(
-            "# the template\n[agents.claude]\nruntime = \"claude\"\ncommand = \"{}\"\n\
-             heartbeat = \"1h\"\nworkdir = \"/nonexistent/shared\"\n",
+            "# the template\n[node]\nname = \"the_template\"\n[agents.claude]\n\
+             runtime = \"claude\"\ncommand = \"{}\"\nheartbeat = \"1h\"\n\
+             workdir = \"/nonexistent/shared\"\n",
             agent.display()
         ),
     )
@@ -191,6 +192,14 @@ fn up_check_logs_restart_and_stop_a_fleet_of_three() {
         assert!(config.contains("# the template"), "{config}");
         assert!(!config.contains("workdir"), "{config}");
         assert!(config.contains("max = \"1G\""), "{config}");
+        // Its own name, node-<i> (ADR 0023 §8), not the template's.
+        assert!(!config.contains("the_template"), "{config}");
+        // Not even an empty `[node]`, which wats 0.4.4 would refuse.
+        assert!(!config.contains("[node]"), "{config}");
+        assert_eq!(
+            std::fs::read_to_string(dir.join("node-name")).unwrap(),
+            format!("node-{i}\n")
+        );
         assert_eq!(config.matches("@127.0.0.1:").count(), 2, "{config}");
         assert!(dir.join("secret.key").exists());
     }
@@ -201,6 +210,9 @@ fn up_check_logs_restart_and_stop_a_fleet_of_three() {
     let listed = machine.ps();
     assert_eq!(listed.len(), 3, "{listed:?}");
     assert!(listed.iter().all(|n| n["mode"] == "detached"), "{listed:?}");
+    let mut names: Vec<&str> = listed.iter().map(|n| n["name"].as_str().unwrap()).collect();
+    names.sort();
+    assert_eq!(names, ["node-1", "node-2", "node-3"], "{listed:?}");
 
     // `check --json`, as cron would read it.
     let out = machine.fleet(&["check", "--json"]);
@@ -231,15 +243,14 @@ fn up_check_logs_restart_and_stop_a_fleet_of_three() {
     );
 
     // One node down: the check fails, with a non-zero exit code.
-    let node2 = machine.base().join("node-2");
+    // By its name.
     let out = machine
         .wats()
-        .arg("--dir")
-        .arg(&node2)
-        .args(["stop"])
+        .args(["stop", "-n", "node-2"])
         .output()
         .unwrap();
     assert!(out.status.success(), "{out:?}");
+    assert!(text(&out.stderr).starts_with("node node-2 ("), "{out:?}");
     let out = machine.fleet(&["check"]);
     let said = text(&out.stdout);
     assert!(!out.status.success(), "{said}");

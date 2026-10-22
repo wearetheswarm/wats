@@ -80,7 +80,8 @@ pub enum FleetAction {
         timeout: Duration,
     },
     /// The last log lines of every node, each prefixed with its name; -f
-    /// follows them. One node in full: `wats attach --dir <base>/node-<i>`.
+    /// follows them. One node in full: `wats attach -n node-<i>` (or
+    /// `-n <fleet>-<i>` for a second fleet, as `wats ps` shows it).
     Logs {
         /// How many of the last lines of each node's log.
         #[arg(short = 'n', long, default_value_t = 10)]
@@ -402,6 +403,8 @@ fn write_new_config(dir: &Path, template: &Path, text: &str) -> Result<Vec<Strin
     let mut notes = Vec::new();
     let settings = Settings::parse(text)?;
     let mut file = ConfigFile::open(dir)?;
+    // The template's name is its own: each node has its own (ADR 0023 §8).
+    file.unset("node.name")?;
     let tables = std::iter::once(("agent".to_string(), &settings.agent)).chain(
         settings
             .agents
@@ -677,6 +680,15 @@ async fn up(ctx: &Options, base: &Path, args: UpArgs) -> Result<()> {
         .with_context(|| format!("{}: config.toml", node.name))?;
     }
     manifest.save(base)?;
+    // Their names (ADR 0023 §8): node-<i>, or <fleet>-<i> when another
+    // node of this machine has it.
+    let machine = crate::naming::Machine::of_user(crate::background::registry_dir(ctx.hermetic));
+    for node in &manifest.nodes {
+        let dir = base.join(&node.name);
+        if let Err(e) = crate::naming::ensure(&dir, &machine) {
+            eprintln!("note: {}: no name: {e}", node.name);
+        }
+    }
 
     // Start those that do not run, one after the other.
     let exe = std::env::current_exe()?;

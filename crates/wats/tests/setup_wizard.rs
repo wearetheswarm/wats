@@ -197,9 +197,9 @@ fn first_bare_wats_runs_the_wizard_then_the_node_in_the_background() {
         machine.fake_cli(name);
     }
     // No agent, the default disk budget and networks; security updates:
-    // yes; Claude Code: yes, its hook: yes; Codex: no; Vibe: yes (Enter);
-    // the background: yes.
-    let child = machine.spawn(machine.wats(&[], true), "0\n\n\ny\ny\ny\nn\n\ny\n");
+    // yes; the node's name: the drawn one (Enter); Claude Code: yes, its
+    // hook: yes; Codex: no; Vibe: yes (Enter); the background: yes.
+    let child = machine.spawn(machine.wats(&[], true), "0\n\n\ny\n\ny\ny\nn\n\ny\n");
     let out = child.wait_with_output().unwrap();
     let (said, err) = (text(&out.stdout), text(&out.stderr));
     assert!(out.status.success(), "{out:?}");
@@ -242,6 +242,15 @@ fn first_bare_wats_runs_the_wizard_then_the_node_in_the_background() {
         said.contains("Install security updates automatically? (update.security_auto) [Y/n]"),
         "{said}"
     );
+    // The node's name (ADR 0023 §8): a drawn one as the default, kept in
+    // node-name (not config.toml, which wats 0.4.4 would refuse).
+    let name = std::fs::read_to_string(machine.data().join("node-name")).unwrap();
+    let name = name.trim();
+    assert!(
+        said.contains(&format!("Name of this node (node.name) [{name}]: ")),
+        "{said}"
+    );
+    assert_eq!(machine.running().unwrap()["name"], name);
     // The hints to run `wats setup <tool> --mcp` are questions here.
     assert!(
         !said.contains("wats setup vibe --mcp (running it"),
