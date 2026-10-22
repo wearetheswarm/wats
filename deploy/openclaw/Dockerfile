@@ -14,7 +14,7 @@
 #
 #   docker build -t wats-openclaw --build-arg OPENCLAW_IMAGE=<image> deploy/openclaw
 
-ARG WATS_IMAGE=ghcr.io/wearetheswarm/wats:0.4.5
+ARG WATS_IMAGE=ghcr.io/wearetheswarm/wats:0.4.6
 ARG OPENCLAW_IMAGE
 
 FROM ${WATS_IMAGE} AS wats

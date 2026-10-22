@@ -1,6 +1,19 @@
 # Changelog
 
-## Unreleased
+## 0.4.6 (2026-10-22)
+
+A fix release: a node no longer reports its history as `full` when a
+late neighbor still held part of it, an OpenCode agent at `inherit` needs
+the same guardrail as a Mistral Vibe one, and the npm and PyPI wrappers
+are in the repository, not yet published.
+
+### Upgrading from 0.4.5
+
+- `wats upgrade` (or `brew upgrade wats`) installs it. Restart the node
+  afterwards. No store migration, no format change, no wire change.
+- **OpenCode at `inherit`**: a configuration that 0.4.5 refused (only
+  `agent.review = true`, or only `agent.allow`) now starts. One with
+  neither is still refused.
 
 ### Changes
 
