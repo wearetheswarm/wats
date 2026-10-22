@@ -194,6 +194,8 @@ fn up_check_logs_restart_and_stop_a_fleet_of_three() {
         assert!(config.contains("max = \"1G\""), "{config}");
         // Its own name, node-<i> (ADR 0023 §8), not the template's.
         assert!(!config.contains("the_template"), "{config}");
+        // Not even an empty `[node]`, which wats 0.4.4 would refuse.
+        assert!(!config.contains("[node]"), "{config}");
         assert_eq!(
             std::fs::read_to_string(dir.join("node-name")).unwrap(),
             format!("node-{i}\n")

@@ -18,8 +18,8 @@ Each node of a fleet is an ordinary node in its own data directory,
 The nodes run in the background, each as `wats --detach` would, and list
 each other as bootstrap peers on `127.0.0.1`, so they connect even with
 `--infra none`. `wats ps` lists them; `wats attach`, `wats stop`, `wats
-status` and the other commands work on one with `-n node-<i>`, or `--dir
-<base>/node-<i>`.
+status` and the other commands work on one with `-n node-<i>` (`-n
+<fleet>-<i>` for a second fleet, below), or `--dir <base>/node-<i>`.
 
 **Names.** A fleet's nodes keep their directory's name as their node name
 (ADR 0023 §8): `node-1`, `node-2`… in `wats ps`, and `-n node-2` picks one.

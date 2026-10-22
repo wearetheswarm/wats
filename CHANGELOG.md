@@ -20,9 +20,12 @@
     `--dir` still works (both together must name the same node). An agent
     of another node is `NODE/AGENT` in `wats agent --name`:
     `wats agent logs --name codex/reviewer`.
-  - Without `-n` or `--dir`, they act on `~/.wats`'s node, as before, and
-    now say which first, on stderr: `node cheeky_starling (~/.wats), agent
-    claude`.
+  - Without `-n` or `--dir`, they act on `~/.wats`'s node, as before.
+    With `-n`, `--dir` or several nodes on the machine, they say which
+    first, on stderr: `node cheeky_starling (~/.wats), agent claude`.
+  - `wats config unset` removes a table left empty (its comments kept),
+    and `wats upgrade --rollback` also refuses a table the older wats does
+    not know, even empty.
   - `wats stop --all` stops every node of the machine.
   - **`-n` changes meaning**: it was the count of `wats attach` and `wats
     agent logs|runs`, which is now `--lines` and `--last` only. `wats fleet

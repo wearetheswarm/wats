@@ -708,16 +708,48 @@ pub const KEYS_SINCE: &[(&str, Version)] = &[
 ];
 
 /// The keys set in `data_dir`'s config.toml that wats `version` does not
-/// know ([`KEYS_SINCE`]). None when config.toml is absent or unreadable.
+/// know ([`KEYS_SINCE`]), and for a table it does not know at all, even
+/// empty (`[node]` before 0.4.5), one of its keys: unsetting it removes
+/// the table. None when config.toml is absent or unreadable.
 pub fn keys_unknown_to(data_dir: &Path, version: Version) -> Vec<&'static str> {
     let Ok(file) = crate::settings::ConfigFile::open(data_dir) else {
         return Vec::new();
     };
-    KEYS_SINCE
+    let mut keys: Vec<&'static str> = KEYS_SINCE
         .iter()
         .filter(|(key, since)| version < *since && file.get(key).is_some())
         .map(|(key, _)| *key)
-        .collect()
+        .collect();
+    for (key, since) in KEYS_SINCE {
+        let Some((table, _)) = key.split_once('.') else {
+            continue;
+        };
+        let prefix = format!("{table}.");
+        if version < *since
+            && file.has_top(table)
+            && table_unknown_to(table, version)
+            && !keys.iter().any(|k| k.starts_with(&prefix))
+        {
+            keys.push(key);
+        }
+    }
+    keys
+}
+
+/// Whether wats `version` knows no key of the top-level table `table`:
+/// each of its keys is in [`KEYS_SINCE`], newer than `version` (a key not
+/// in it is one of 0.3.3).
+fn table_unknown_to(table: &str, version: Version) -> bool {
+    let prefix = format!("{table}.");
+    crate::settings::KEYS
+        .iter()
+        .chain(crate::settings::HIDDEN_KEYS)
+        .filter(|k| k.name.starts_with(&prefix))
+        .all(|k| {
+            KEYS_SINCE
+                .iter()
+                .any(|(name, since)| *name == k.name && version < *since)
+        })
 }
 
 /// How long `<binary> --version` may take.
@@ -2526,7 +2558,7 @@ mod tests {
             "profile = \"alice\"\n",
         )
         .unwrap();
-        let drawn = crate::naming::ensure(&data, None).unwrap();
+        let drawn = crate::naming::ensure(&data, &crate::naming::Machine::default()).unwrap();
         let current = Version(0, 4, 5);
         // The drawn name: config.toml is as 0.4.4 knows it.
         let text = std::fs::read_to_string(data.join(crate::settings::FILE_NAME)).unwrap();
@@ -2544,12 +2576,35 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("config unset node.name"), "{err}");
-        // Unset: the drawn name is back, and the rollback goes ahead.
+        // Unset: the drawn name is back, no `[node]` header is left (0.4.4
+        // refuses even an empty one), and the rollback goes ahead.
         let mut file = crate::settings::ConfigFile::open(&data).unwrap();
         file.unset("node.name").unwrap();
         file.save().unwrap();
         assert_eq!(crate::naming::stored(&data), Some(drawn));
+        let text = std::fs::read_to_string(data.join(crate::settings::FILE_NAME)).unwrap();
+        assert_eq!(text, "profile = \"alice\"\n");
         check_rollback(&old, &data, current).unwrap();
+        // An empty `[node]` (by hand, or an older 0.4.5 build): refused,
+        // and the command given removes it.
+        std::fs::write(
+            data.join(crate::settings::FILE_NAME),
+            "profile = \"alice\"\n\n[node]\n",
+        )
+        .unwrap();
+        assert_eq!(keys_unknown_to(&data, Version(0, 4, 4)), ["node.name"]);
+        assert!(keys_unknown_to(&data, Version(0, 4, 5)).is_empty());
+        let err = check_rollback(&old, &data, current)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("config unset node.name"), "{err}");
+        let mut file = crate::settings::ConfigFile::open(&data).unwrap();
+        assert!(file.unset("node.name").unwrap());
+        file.save().unwrap();
+        check_rollback(&old, &data, current).unwrap();
+        // A table older releases know, empty: nothing to say.
+        std::fs::write(data.join(crate::settings::FILE_NAME), "[ask]\n").unwrap();
+        assert!(keys_unknown_to(&data, Version(0, 4, 0)).is_empty());
     }
 
     #[test]

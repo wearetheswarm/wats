@@ -80,7 +80,8 @@ pub enum FleetAction {
         timeout: Duration,
     },
     /// The last log lines of every node, each prefixed with its name; -f
-    /// follows them. One node in full: `wats attach -n node-<i>`.
+    /// follows them. One node in full: `wats attach -n node-<i>` (or
+    /// `-n <fleet>-<i>` for a second fleet, as `wats ps` shows it).
     Logs {
         /// How many of the last lines of each node's log.
         #[arg(short = 'n', long, default_value_t = 10)]
@@ -681,10 +682,10 @@ async fn up(ctx: &Options, base: &Path, args: UpArgs) -> Result<()> {
     manifest.save(base)?;
     // Their names (ADR 0023 §8): node-<i>, or <fleet>-<i> when another
     // node of this machine has it.
-    let registry = crate::background::registry_dir(ctx.hermetic);
+    let machine = crate::naming::Machine::of_user(crate::background::registry_dir(ctx.hermetic));
     for node in &manifest.nodes {
         let dir = base.join(&node.name);
-        if let Err(e) = crate::naming::ensure(&dir, registry.as_deref()) {
+        if let Err(e) = crate::naming::ensure(&dir, &machine) {
             eprintln!("note: {}: no name: {e}", node.name);
         }
     }

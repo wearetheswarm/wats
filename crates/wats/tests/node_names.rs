@@ -130,6 +130,12 @@ fn names_in_ps_and_n_targets_a_node() {
     let home = machine.home_wats();
     let a = machine.dir("a");
     machine.detach(None);
+    // One node on the machine, and neither -n nor --dir: no header line, so
+    // that `2>&1` output stays as it was.
+    let out = machine.run(&["config", "get", "profile"]);
+    assert!(out.status.success(), "{out:?}");
+    assert!(out.stderr.is_empty(), "{out:?}");
+    assert_eq!(text(&out.stdout), "default (default)\n");
     machine.detach(Some(&a));
 
     // Drawn at the first start, stored in the data directory, different.
@@ -247,6 +253,16 @@ fn names_in_ps_and_n_targets_a_node() {
     let out = machine.run(&["attach", "-n", "50"]);
     assert!(!out.status.success());
     assert!(text(&out.stderr).contains("--lines"), "{out:?}");
+    for command in ["logs", "runs"] {
+        let out = machine.run(&["agent", command, "-n", "5"]);
+        assert!(!out.status.success(), "{out:?}");
+        assert!(text(&out.stderr).contains("--last"), "{out:?}");
+    }
+    // --all is every node: no -n with it.
+    let out = machine.run(&["stop", "--all", "-n", &a_name]);
+    assert!(!out.status.success());
+    assert!(text(&out.stderr).contains("cannot be used with"), "{out:?}");
+    assert_eq!(machine.ps(false).len(), 2, "nothing stopped");
 
     // Renamed: unique on the machine, effective at once.
     let out = machine.run(&["config", "set", "node.name", &a_name]);
@@ -415,6 +431,41 @@ async fn the_name_never_leaves_its_node() -> anyhow::Result<()> {
         assert!(tokio::time::Instant::now() < deadline, "event on b");
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
+    // An agent of A announces itself: B gets the announce, without the name.
+    let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+    let runner = tokio::spawn(wats::agent::run(
+        std::sync::Arc::clone(&a),
+        agent_config(&a_dir),
+        async {
+            let _ = stopped.await;
+        },
+    ));
+    let agent_id = wats::identity::author_id(&a.author_key("helper")?);
+    let announces = || {
+        b.store()
+            .search(
+                None,
+                &wats::store::Filter {
+                    kinds: vec![Kind::Announce],
+                    author: Some(agent_id.clone()),
+                    ..Default::default()
+                },
+                10,
+            )
+            .unwrap()
+    };
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    while announces().is_empty() {
+        assert!(tokio::time::Instant::now() < deadline, "announce on b");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let _ = stop.send(());
+    runner.await??;
+    let announce = serde_json::to_vec(&announces()[0].event)?;
+    assert!(contains(&announce, b"I answer questions about bees."));
+    for needle in names {
+        assert!(!contains(&announce, needle), "the announce holds the name");
+    }
     a.shutdown().await?;
     b.shutdown().await?;
     for needle in names {
@@ -441,4 +492,42 @@ async fn the_name_never_leaves_its_node() -> anyhow::Result<()> {
         }
     }
     Ok(())
+}
+
+/// An agent that never runs (no heartbeat within the test), but announces
+/// itself at its start.
+fn agent_config(data_dir: &Path) -> wats::agent::AgentConfig {
+    wats::agent::AgentConfig {
+        runtime: "claude".into(),
+        profile: "helper".into(),
+        user: "alice".into(),
+        about: "I answer questions about bees.".into(),
+        caps: vec!["bees".into()],
+        every: Duration::from_secs(3600),
+        heartbeat: Duration::from_secs(3600),
+        max_runs_per_hour: 1,
+        allow: vec![],
+        ignore_local: true,
+        heartbeat_text: wats::agent::DEFAULT_HEARTBEAT.into(),
+        command: "/usr/bin/false".into(),
+        mcp_command: "/usr/bin/true".into(),
+        mcp_args: vec!["mcp".into()],
+        extra_args: vec![],
+        run_timeout: Duration::from_secs(5),
+        max_turns: 1,
+        budget: wats::budget::Budget::default(),
+        wakes: wats::wake::WakeLimits::unlimited(),
+        codex_disable: vec![],
+        codex_enable: vec![],
+        access: wats::access::Access::SwarmOnly,
+        workdir: std::path::PathBuf::from("/nonexistent"),
+        tools: vec![],
+        model: None,
+        work_dir: data_dir.join("agent/helper"),
+        data_dir: data_dir.to_path_buf(),
+        keep_runs: 2,
+        keep_days: 30,
+        openclaw: Default::default(),
+        catchup: None,
+    }
 }

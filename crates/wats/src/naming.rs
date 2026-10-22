@@ -176,7 +176,53 @@ pub fn display(data_dir: &Path, default_dir: Option<&Path>) -> String {
 
 /// `~/.wats`, the default data directory.
 pub fn default_dir() -> Option<PathBuf> {
-    std::env::home_dir().map(|h| h.join(".wats"))
+    let home = std::env::home_dir()?;
+    #[cfg(test)]
+    assert_test_home(&home);
+    Some(home.join(".wats"))
+}
+
+/// Unit tests never resolve the real home (its `~/.wats`, its registry):
+/// they pass their own directories ([`Machine`]). A home outside the
+/// temporary directory is a test bug.
+#[cfg(test)]
+pub(crate) fn assert_test_home(home: &Path) {
+    let key = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+    assert!(
+        key(home).starts_with(key(&std::env::temp_dir())),
+        "a unit test resolved the real home {}: pass its own directories instead",
+        home.display()
+    );
+}
+
+/// Where the nodes of this machine are found: the registry (ADR 0023 §4)
+/// and `~/.wats`. Given by the caller, so that a test gives its own.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Machine {
+    pub registry: Option<PathBuf>,
+    pub default_dir: Option<PathBuf>,
+}
+
+impl Machine {
+    /// This user's: `registry`, and `~/.wats` with a registry only (a
+    /// hermetic process without one reads nothing of the home).
+    pub fn of_user(registry: Option<PathBuf>) -> Machine {
+        let default_dir = registry.as_ref().and_then(|_| default_dir());
+        Machine {
+            registry,
+            default_dir,
+        }
+    }
+
+    /// Its data directories ([`machine_dirs`]).
+    pub fn dirs(&self) -> Vec<PathBuf> {
+        machine_dirs(self.registry.as_deref(), self.default_dir.as_deref())
+    }
+
+    /// The names of its nodes but `except`'s.
+    pub fn taken(&self, except: &Path) -> Vec<String> {
+        taken(&self.dirs(), except, self.default_dir.as_deref())
+    }
 }
 
 /// Whether two paths are the same directory.
@@ -260,16 +306,12 @@ pub fn write(data_dir: &Path, name: &str) -> std::io::Result<()> {
 
 /// The name of `data_dir`'s node, drawn and written now if it has none
 /// (its first start): a fleet's node name, else an `adjective_creature`
-/// that no other data directory of this machine has. The machine's
-/// directories are those of `registry`, and `~/.wats` with a registry only
-/// (a hermetic process without one reads nothing of the home).
-pub fn ensure(data_dir: &Path, registry: Option<&Path>) -> std::io::Result<String> {
+/// that no other data directory of `machine` has.
+pub fn ensure(data_dir: &Path, machine: &Machine) -> std::io::Result<String> {
     if let Some(name) = stored(data_dir) {
         return Ok(name);
     }
-    let default = registry.and(default_dir());
-    let dirs = machine_dirs(registry, default.as_deref());
-    let taken = taken(&dirs, data_dir, default.as_deref());
+    let taken = machine.taken(data_dir);
     let name = fleet_name(data_dir, &taken).unwrap_or_else(|| draw_random(&taken));
     std::fs::create_dir_all(data_dir)?;
     // Another process drawing at the same time: the first name stays.
@@ -390,7 +432,7 @@ mod tests {
         assert_eq!(stored(&dir), None);
         assert_eq!(fallback(&dir, None), "data");
         assert_eq!(fallback(&dir, Some(&dir)), "default");
-        let name = ensure(&dir, None).unwrap();
+        let name = ensure(&dir, &Machine::default()).unwrap();
         check(&name).unwrap();
         assert_eq!(
             std::fs::read_to_string(dir.join(FILE)).unwrap(),
@@ -398,12 +440,12 @@ mod tests {
         );
         // Every later start keeps it.
         for _ in 0..3 {
-            assert_eq!(ensure(&dir, None).unwrap(), name);
+            assert_eq!(ensure(&dir, &Machine::default()).unwrap(), name);
         }
         // config.toml's node.name wins; unset, the drawn one is back.
         std::fs::write(dir.join("config.toml"), "[node]\nname = \"hive-1\"\n").unwrap();
         assert_eq!(stored(&dir).as_deref(), Some("hive-1"));
-        assert_eq!(ensure(&dir, None).unwrap(), "hive-1");
+        assert_eq!(ensure(&dir, &Machine::default()).unwrap(), "hive-1");
         std::fs::write(dir.join("config.toml"), "").unwrap();
         assert_eq!(display(&dir, None), name);
         // An invalid file is no name.
@@ -421,13 +463,25 @@ mod tests {
             crate::background::register(&registry, dir).unwrap();
             crate::background::unregister(&registry, dir);
         }
-        let dirs = machine_dirs(Some(&registry), None);
-        assert_eq!(dirs.len(), 3, "stopped nodes are still known: {dirs:?}");
+        // ~/.wats, a throwaway one: unnamed yet, it is `default`.
+        let home = tmp.path().join("home/.wats");
+        let machine = Machine {
+            registry: Some(registry),
+            default_dir: Some(home.clone()),
+        };
+        let dirs = machine.dirs();
+        assert_eq!(dirs.len(), 4, "stopped nodes are still known: {dirs:?}");
         let mine = tmp.path().join("mine");
-        let taken = taken(&dirs, &mine, None);
-        assert_eq!(taken, ["taken_0", "taken_1", "taken_2"]);
-        let name = ensure(&mine, Some(&registry)).unwrap();
+        let taken = machine.taken(&mine);
+        assert_eq!(taken, ["default", "taken_0", "taken_1", "taken_2"]);
+        let name = ensure(&mine, &machine).unwrap();
         assert!(!taken.contains(&name));
+        // ~/.wats's own name counts once it has one.
+        write(&home, "named_home").unwrap();
+        assert!(machine.taken(&mine).contains(&"named_home".to_string()));
+        assert!(!machine.taken(&home).contains(&"named_home".to_string()));
+        // Without a registry, nothing of the home is read.
+        assert_eq!(Machine::of_user(None), Machine::default());
     }
 
     #[test]
@@ -448,7 +502,7 @@ mod tests {
             fleet_name(&node, &taken).as_deref(),
             Some("support-fleet-2")
         );
-        assert_eq!(ensure(&node, None).unwrap(), "node-2");
+        assert_eq!(ensure(&node, &Machine::default()).unwrap(), "node-2");
         // Not in the manifest: no fleet name.
         assert_eq!(fleet_name(&base.join("node-3"), &[]), None);
         assert_eq!(fleet_name(&tmp.path().join("node-1"), &[]), None);

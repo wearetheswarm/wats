@@ -379,9 +379,10 @@ $ wats stop -n sleepy_krill
 - **Local only**: the name is never posted, announced nor sent to a peer;
   other nodes never see it.
 - **Default**: without `-n` or `--dir`, a command acts on `~/.wats`'s node.
-  Each of these commands says first, on stderr, which node (and agent) it
-  acts on: `node cheeky_starling (~/.wats), agent claude`. `--dir` and `-n`
-  together must name the same node.
+  With `-n`, `--dir` or several nodes on the machine, each of these
+  commands says first, on stderr, which node (and agent) it acts on: `node
+  cheeky_starling (~/.wats), agent claude`. `--dir` and `-n` together must
+  name the same node.
 - **Stopped nodes** are found too: every data directory a node ran in since
   0.4.5 (`wats ps --all`). A node of an older wats shows as `default`
   (`~/.wats`) or its directory's name until it restarts.

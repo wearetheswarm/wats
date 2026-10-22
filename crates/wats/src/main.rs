@@ -453,9 +453,10 @@ enum Command {
     /// 0028): `wats fleet up -n 6` creates six data directories under
     /// --base, each with its own key, port and agent workspace and the
     /// config.toml of --from, and starts them in the background, peered
-    /// with each other, each named node-<i>. `wats ps`, `wats attach -n
-    /// node-<i>` and `wats mcp -n node-<i>` (or `--dir <base>/node-<i>`)
-    /// work on each node as on any other.
+    /// with each other. Each is named node-<i> (`<fleet>-<i>`, after the
+    /// --base directory, when another node of the machine has that name):
+    /// `wats ps`, `wats attach -n node-<i>` and `wats mcp -n node-<i>` (or
+    /// `--dir <base>/node-<i>`) work on each node as on any other.
     Fleet(wats::fleet::FleetCommand),
     /// Show the node: running or not, networks, peers, the swarm it sees
     /// (gossip neighbors and nodes heard from in 24 h, per network),
@@ -4390,7 +4391,7 @@ fn print_art(settings: &Settings, stdout: bool) {
 /// only ends this command) or until it stops.
 async fn attach_command(node: &NodeArgs, lines: usize, mut shutdown: Shutdown) -> Result<()> {
     let entry = chosen_node(node).await?;
-    eprintln!("{}", node_header(&entry.dir, None));
+    say_node(&entry.dir, None);
     let flag = entry.dir_flag();
     if !entry.running {
         anyhow::bail!(
@@ -4501,6 +4502,10 @@ async fn attach_command(node: &NodeArgs, lines: usize, mut shutdown: Shutdown) -
 /// lock to be free, then SIGKILL it.
 #[cfg(unix)]
 async fn stop_command(node: &NodeArgs, all: bool, timeout: Duration) -> Result<()> {
+    // The known data directories that are gone for good (ADR 0023 §8).
+    if let Some(registry) = wats::background::registry_dir(node.hermetic) {
+        wats::background::prune_known(&registry, wats::background::KNOWN_KEEP);
+    }
     let targets: Vec<NodeEntry> = if all {
         let profile = node.profile.as_deref();
         node_entries(node)
@@ -4512,7 +4517,7 @@ async fn stop_command(node: &NodeArgs, all: bool, timeout: Duration) -> Result<(
     } else {
         let entry = chosen_node(node).await?;
         if !entry.running {
-            eprintln!("{}", node_header(&entry.dir, None));
+            say_node(&entry.dir, None);
             if let Some(registry) = wats::background::registry_dir(node.hermetic) {
                 wats::background::unregister(&registry, &entry.dir);
             }
@@ -4526,7 +4531,7 @@ async fn stop_command(node: &NodeArgs, all: bool, timeout: Duration) -> Result<(
     }
     let mut failed = 0;
     for entry in targets {
-        eprintln!("{}", node_header(&entry.dir, None));
+        say_node(&entry.dir, None);
         let by = if all {
             "`wats stop --all`"
         } else {
@@ -4792,10 +4797,56 @@ fn resolve_target(cli: &mut Cli) -> Result<()> {
         ) => node.clone(),
         _ => None,
     };
+    let targeted = matches!(
+        cli.command,
+        Some(
+            Command::Agent { .. }
+                | Command::Config { .. }
+                | Command::Mcp { .. }
+                | Command::Attach { .. }
+                | Command::Stop { .. }
+                | Command::Status { .. }
+        )
+    );
+    // The header line names the node when it may not be the one meant:
+    // -n or --dir given, `stop --all`, or several nodes on this machine
+    // (ADR 0023 §8). Otherwise `2>&1` stays as it was.
+    if targeted {
+        let explicit = wanted.is_some()
+            || cli.node.dir.is_some()
+            || matches!(cli.command, Some(Command::Stop { all: true, .. }));
+        let _ = SAY_NODE.set(explicit || several_nodes(&cli.node));
+    }
     if let Some(wanted) = wanted {
         cli.node.dir = Some(resolve_node(&cli.node, &wanted)?);
     }
     Ok(())
+}
+
+/// Whether the commands about one node print which one first.
+static SAY_NODE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
+/// Print [`node_header`] on stderr, when [`SAY_NODE`].
+fn say_node(dir: &std::path::Path, agent: Option<&str>) {
+    if SAY_NODE.get().copied().unwrap_or(true) {
+        eprintln!("{}", node_header(dir, agent));
+    }
+}
+
+/// Whether this machine has more than one data directory with a node
+/// (`~/.wats` and the registry's).
+fn several_nodes(node: &NodeArgs) -> bool {
+    let registry = wats::background::registry_dir(node.hermetic);
+    let data = |dir: &std::path::Path| {
+        ["secret.key", "config.toml", wats::naming::FILE]
+            .iter()
+            .any(|f| dir.join(f).exists())
+    };
+    wats::naming::machine_dirs(registry.as_deref(), default_dir().ok().as_deref())
+        .iter()
+        .filter(|d| data(d))
+        .count()
+        > 1
 }
 
 /// The data directory of the node of this machine named `wanted`: among
@@ -6146,10 +6197,7 @@ async fn agent_watch(
         AgentAction::Runs { .. } | AgentAction::Logs { .. } | AgentAction::Attach
     );
     let member = watched_agent(data_dir, &settings, name, needed)?;
-    eprintln!(
-        "{}",
-        node_header(data_dir, member.as_ref().map(|m| m.name.as_str()))
-    );
+    say_node(data_dir, member.as_ref().map(|m| m.name.as_str()));
     let work_dir = member
         .as_ref()
         .map_or_else(|| data_dir.join("agent"), |m| m.work_dir.clone());
@@ -6626,7 +6674,7 @@ async fn async_main(mut cli: Cli) -> Result<()> {
     // Commands that work even when config.toml does not load.
     match cli.command {
         Some(Command::Config { action, .. }) => {
-            eprintln!("{}", node_header(&data_dir, None));
+            say_node(&data_dir, None);
             return config_command(&cli.node, &data_dir, action);
         }
         // Works with a broken config.toml: a newer version may fix it.
@@ -6697,11 +6745,11 @@ async fn async_main(mut cli: Cli) -> Result<()> {
             in_process: false,
             ..
         }) => {
-            eprintln!("{}", node_header(&data_dir, None));
+            say_node(&data_dir, None);
             return mcp_attached(&cli.node, &config, idle_exit).await;
         }
         Some(Command::Mcp { .. }) => {
-            eprintln!("{}", node_header(&data_dir, None));
+            say_node(&data_dir, None);
             if let Some(marker) = halted_marker(&config) {
                 tracing::warn!("{}", marker.message());
                 return serve_halted_mcp(&marker).await;
@@ -6718,7 +6766,7 @@ async fn async_main(mut cli: Cli) -> Result<()> {
         }
         Some(Command::Id { host }) => return print_id(&config, &host),
         Some(Command::Status { json, .. }) => {
-            eprintln!("{}", node_header(&data_dir, None));
+            say_node(&data_dir, None);
             return status_command(&config, json, cli.node.hermetic || cli.node.loopback).await;
         }
         Some(Command::Browse {
@@ -6973,7 +7021,8 @@ async fn async_main(mut cli: Cli) -> Result<()> {
         // Its name for the banner, drawn now at a first start, unless
         // another node holds the data directory (ADR 0023 §8).
         if !wats::node::node_running(&config.data_dir) {
-            let _ = wats::naming::ensure(&config.data_dir, config.registry.as_deref());
+            let machine = wats::naming::Machine::of_user(config.registry.clone());
+            let _ = wats::naming::ensure(&config.data_dir, &machine);
         }
         let lines = banner_lines(&config, &agents);
         for line in &lines {

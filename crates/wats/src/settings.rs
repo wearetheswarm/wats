@@ -1392,6 +1392,71 @@ impl ConfigFile {
         &self.path
     }
 
+    /// Remove the top-level table `name`, moving the comments above its
+    /// header to the next table (or the end of the file).
+    fn remove_keeping_comments(&mut self, name: &str) {
+        let (comments, position) = match self.doc.get(name).and_then(|i| i.as_table()) {
+            Some(table) => (
+                table
+                    .decor()
+                    .prefix()
+                    .and_then(|p| p.as_str())
+                    .unwrap_or_default()
+                    .to_string(),
+                table.position(),
+            ),
+            None => (String::new(), None),
+        };
+        self.doc.remove(name);
+        if !comments.lines().any(|l| l.trim_start().starts_with('#')) {
+            return;
+        }
+        fn positions(table: &toml_edit::Table, out: &mut Vec<isize>) {
+            for (_, item) in table.iter() {
+                if let Some(sub) = item.as_table() {
+                    out.extend(sub.position());
+                    positions(sub, out);
+                }
+            }
+        }
+        fn prefix_at(table: &mut toml_edit::Table, at: isize, comments: &str) -> bool {
+            for (_, item) in table.iter_mut() {
+                if let Some(sub) = item.as_table_mut() {
+                    if sub.position() == Some(at) {
+                        let old = sub
+                            .decor()
+                            .prefix()
+                            .and_then(|p| p.as_str())
+                            .unwrap_or_default()
+                            .to_string();
+                        sub.decor_mut().set_prefix(format!("{comments}{old}"));
+                        return true;
+                    }
+                    if prefix_at(sub, at, comments) {
+                        return true;
+                    }
+                }
+            }
+            false
+        }
+        let mut all = Vec::new();
+        positions(self.doc.as_table(), &mut all);
+        let next = all
+            .into_iter()
+            .filter(|p| position.is_none_or(|removed| *p > removed))
+            .min();
+        let moved = next.is_some_and(|at| prefix_at(self.doc.as_table_mut(), at, &comments));
+        if !moved {
+            let trailing = self.doc.trailing().as_str().unwrap_or_default().to_string();
+            self.doc.set_trailing(format!("{trailing}{comments}"));
+        }
+    }
+
+    /// Whether the file has the top-level key or table `name`, empty or not.
+    pub fn has_top(&self, name: &str) -> bool {
+        self.doc.get(name).is_some()
+    }
+
     /// The names of the `[agents.<name>]` tables.
     pub fn agent_names(&self) -> Vec<String> {
         self.doc
@@ -1689,12 +1754,26 @@ impl ConfigFile {
         let migrated = !was_migrated && self.migrated.is_some();
         let removed = match place {
             Place::Top(leaf) => self.doc.remove(&leaf).is_some(),
-            Place::Table(t, leaf) => self
-                .doc
-                .get_mut(&t)
-                .and_then(|item| item.as_table_like_mut())
-                .and_then(|table| table.remove(&leaf))
-                .is_some(),
+            Place::Table(t, leaf) => {
+                let removed = self
+                    .doc
+                    .get_mut(&t)
+                    .and_then(|item| item.as_table_like_mut())
+                    .and_then(|table| table.remove(&leaf))
+                    .is_some();
+                // A table left empty goes too: its header alone is a key
+                // an older wats may refuse (`[node]` for 0.4.4, ADR 0023
+                // §8). `[agents.<name>]` tables stay: each names an agent.
+                let empty = self
+                    .doc
+                    .get(&t)
+                    .and_then(|item| item.as_table_like())
+                    .is_some_and(|table| table.is_empty());
+                if empty {
+                    self.remove_keeping_comments(&t);
+                }
+                removed || empty
+            }
             Place::Agent(agent, leaf) => self
                 .doc
                 .get_mut("agents")
@@ -1921,6 +2000,65 @@ mod tests {
     }
 
     use super::*;
+
+    /// Unsetting a table's last key removes the table: an empty `[node]`
+    /// header alone makes wats 0.4.4 refuse the file (ADR 0023 §8).
+    #[test]
+    fn unset_drops_a_table_left_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(FILE_NAME);
+        std::fs::write(
+            &path,
+            "# mine\nprofile = \"alice\"\n\n[ui]\nbanner = false\n",
+        )
+        .unwrap();
+        let mut file = ConfigFile::open(dir.path()).unwrap();
+        file.set("node.name", "hive").unwrap();
+        file.save().unwrap();
+        assert!(std::fs::read_to_string(&path).unwrap().contains("[node]"));
+        let mut file = ConfigFile::open(dir.path()).unwrap();
+        assert!(file.unset("node.name").unwrap());
+        assert!(file.unset("ui.banner").unwrap());
+        file.save().unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(text, "# mine\nprofile = \"alice\"\n");
+        // An empty header left by hand: unsetting a key of it removes it.
+        std::fs::write(&path, "[node]\n").unwrap();
+        let mut file = ConfigFile::open(dir.path()).unwrap();
+        assert!(file.unset("node.name").unwrap(), "something to save");
+        file.save().unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "");
+        // The comments above a removed table stay in the file.
+        std::fs::write(
+            &path,
+            "# my template\n[node]\nname = \"x\"\n\n[ui]\nbanner = false\n",
+        )
+        .unwrap();
+        let mut file = ConfigFile::open(dir.path()).unwrap();
+        file.unset("node.name").unwrap();
+        file.save().unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(!text.contains("[node]"), "{text}");
+        assert!(
+            text.starts_with("# my template\n") && text.contains("[ui]"),
+            "{text}"
+        );
+        let mut file = ConfigFile::open(dir.path()).unwrap();
+        file.unset("ui.banner").unwrap();
+        file.save().unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("# my template"), "{text}");
+        Settings::parse(&text).unwrap();
+        // A table with other keys stays.
+        std::fs::write(&path, "[update]\nauto = true\ncheck = false\n").unwrap();
+        let mut file = ConfigFile::open(dir.path()).unwrap();
+        file.unset("update.auto").unwrap();
+        file.save().unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "[update]\ncheck = false\n"
+        );
+    }
 
     #[test]
     fn the_reputation_threshold_takes_any_number() {

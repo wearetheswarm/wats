@@ -340,10 +340,27 @@ them by data directory only, and every command needed the full `--dir`.
   directory's name. The template's `node.name` is not copied.
 - **Which nodes the machine knows.** The registry (§4) lists the nodes
   that run. Since 0.4.5 `register` also writes the entry to
-  `~/.wats/run/known/`, which a stop leaves: every data directory a node
-  ran in, so that a name finds a stopped node and a draw avoids its name.
-  An entry goes once its directory holds neither `secret.key`, nor
-  `config.toml`, nor `node-name`. `wats ps --all` lists them.
+  `~/.wats/run/known/` (best effort, after the running entry), which a
+  stop leaves: every data directory a node ran in, so that a name finds a
+  stopped node and a draw avoids its name. `wats ps --all` lists those that
+  are still data directories (a `secret.key`, `config.toml` or
+  `node-name`). Reading commands (`ps`, `-n`, `status`) never remove an
+  entry; a node's start and `wats stop` remove those whose data directory
+  is certainly gone (not found; any other error keeps it) and whose node
+  last started more than 30 days ago, so that a volume unmounted for a
+  while keeps its nodes.
+- **The machine is given, never guessed, in tests.** The names of the
+  machine come from a registry and a default data directory the caller
+  passes (`naming::Machine`); a node, `wats fleet up` and the wizard pass
+  this user's, which includes `~/.wats` only with a registry (a hermetic
+  process without `WATS_RUN_DIR` reads nothing of the home). Unit tests
+  pass temporary ones, and resolving the real home in a unit test panics.
+- **Empty tables.** `wats config unset` removes a table left empty, keeping
+  the comments above its header: an empty `[node]` alone is refused by
+  0.4.4. `wats upgrade --rollback` also refuses, with the same `unset`
+  command, a table its target knows no key of (`[node]` before 0.4.5), and
+  `wats fleet up` copies a template without its `node.name` nor an empty
+  `[node]`.
 - **`wats ps`** shows a `NAME` column first, and `ENDPOINT`, the first 12
   hex digits of the endpoint id (as `wats fleet` shows it), after
   `AGENTS`; `--json` has `name` and the full `endpoint_id`. The `info`
@@ -367,8 +384,10 @@ them by data directory only, and every command needed the full `--dir`.
 - **Default target**: without `-n` nor `--dir`, `~/.wats`'s node, as
   before. Each of those commands prints first, on stderr, the node it acts
   on: `node cheeky_starling (~/.wats), agent claude` (stdout and `--json`
-  stay clean for scripts). `wats stop --all` prints it for each node it
-  stops.
+  stay clean for scripts), when it may not be the one meant: `-n` or
+  `--dir` given, or more than one node on the machine. With one node and
+  neither, it says nothing, so that `2>&1` output is as before. `wats stop
+  --all` prints it for each node it stops.
 
 ## Alternatives
 
