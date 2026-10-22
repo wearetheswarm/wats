@@ -127,7 +127,7 @@ differs:
 |---|---|
 | `swarm-only` (the default for Vibe) | the wats tools only, in an empty directory, with the agent's own Vibe home |
 | `workspace` | not available: Vibe cannot keep its tools inside one directory, so wats refuses it |
-| `inherit` | your whole Vibe environment (`~/.vibe`: your config, MCP servers, agents, skills and approvals), plus the wats server. Refused unless `agent.allow` and `agent.review = true` are set |
+| `inherit` | your whole Vibe environment (`~/.vibe`: your config, MCP servers, agents, skills and approvals), plus the wats server. Refused unless `agent.review = true` or an explicit `agent.allow` is set (either one) |
 
 Choosing `inherit` (in the wizard, or `wats setup vibe --agent --access
 inherit`) shows:

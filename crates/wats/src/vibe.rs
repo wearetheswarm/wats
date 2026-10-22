@@ -195,9 +195,15 @@ pub const MIN_VERSION: Version = Version(3, 0, 0);
 /// runs, with a warning.
 pub const CHECKED_MAJOR: u64 = 3;
 
-/// As OpenCode's (ADR 0031 open question 10): `inherit` needs
-/// `agent.allow` and `agent.review`. `false` would only warn.
+/// `inherit` needs a guardrail: `agent.review`, or an explicit
+/// `agent.allow`. `false` would only warn.
 pub const INHERIT_NEEDS_GUARDRAILS: bool = true;
+
+/// The product owner's rule for Vibe (ADR 0033 §2): either guardrail is
+/// enough (`agent.review = true`, or a non-empty `agent.allow`). `true`
+/// would need both, as OpenCode does today (ADR 0031 open question 10);
+/// aligning the two runtimes is pending the product owner's call.
+pub const INHERIT_NEEDS_BOTH: bool = false;
 
 /// The USD budgets are enforced from the cost Vibe writes to its run
 /// export (its estimate from the model's prices). `false` would count runs
@@ -289,17 +295,24 @@ pub fn access(value: Option<&str>) -> Result<Access> {
 }
 
 /// `inherit` hands swarm posts to the user's whole Vibe environment, whose
-/// tools Vibe runs itself: refused without `agent.allow` and
-/// `agent.review` ([`INHERIT_NEEDS_GUARDRAILS`]). `workspace` is refused.
+/// tools Vibe runs itself: refused without `agent.review` or an explicit
+/// `agent.allow` ([`INHERIT_NEEDS_GUARDRAILS`]; both with
+/// [`INHERIT_NEEDS_BOTH`]). `workspace` is refused.
 pub fn check_access(access: Access, allow: &[String], review: bool) -> Result<()> {
     if access == Access::Workspace {
         bail!("{WORKSPACE_REFUSED}");
     }
-    if INHERIT_NEEDS_GUARDRAILS && access == Access::Inherit && (allow.is_empty() || !review) {
+    let guarded = if INHERIT_NEEDS_BOTH {
+        !allow.is_empty() && review
+    } else {
+        !allow.is_empty() || review
+    };
+    if INHERIT_NEEDS_GUARDRAILS && access == Access::Inherit && !guarded {
         bail!(
             "agent.access = inherit with Mistral Vibe hands swarm posts to your own Vibe \
-             environment ({INHERIT_WARNING}): set agent.allow (the authors who may wake it) \
-             and agent.review = true first, or use swarm-only"
+             environment ({INHERIT_WARNING}): set agent.review = true (its posts wait for \
+             you) {} agent.allow (the authors who may wake it) first, or use swarm-only",
+            if INHERIT_NEEDS_BOTH { "and" } else { "or" }
         );
     }
     Ok(())
@@ -818,14 +831,15 @@ mod tests {
         );
     }
 
-    /// `inherit` needs `agent.allow` and `agent.review`, as for OpenCode.
+    /// `inherit` needs `agent.review` or an explicit `agent.allow` (either
+    /// one, unlike OpenCode's both).
     #[test]
-    fn inherit_needs_allow_and_review() {
+    fn inherit_needs_review_or_allow() {
         let allow = s(&["ab"]);
         assert!(check_access(Access::SwarmOnly, &[], false).is_ok());
         assert!(check_access(Access::Workspace, &allow, true).is_err());
-        assert!(check_access(Access::Inherit, &[], true).is_err());
-        assert!(check_access(Access::Inherit, &allow, false).is_err());
+        assert!(check_access(Access::Inherit, &[], true).is_ok());
+        assert!(check_access(Access::Inherit, &allow, false).is_ok());
         assert!(check_access(Access::Inherit, &allow, true).is_ok());
         let e = check_access(Access::Inherit, &[], false).unwrap_err();
         assert!(format!("{e:#}").contains(INHERIT_WARNING), "{e:#}");

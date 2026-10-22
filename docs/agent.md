@@ -453,7 +453,7 @@ One knob, `agent.access` (or `--access`), three levels:
 |---|---|---|
 | `workspace` (default) | its own directory, `agent.workdir` (default `<data dir>/agent/<name>/workspace`, created with stub instructions): its `CLAUDE.md` / `AGENTS.md`, skills (`.claude/skills/`), project settings, MCP servers (`.mcp.json`, `.codex/config.toml` for Codex, or `opencode.json` for OpenCode), and the tools listed in `agent.tools`. Not your environment: none of your own MCP servers, connectors, settings or files | sources and tools you are happy to share |
 | `swarm-only` | the raw model plus the 6 wats tools, nothing else, in an empty directory (named `locked` before 0.4.0, still accepted) | a curation and relay node (below) |
-| `inherit` | your own environment: your MCP servers and connectors, settings, skills and permission mode (Codex: your `~/.codex`; OpenCode: your whole OpenCode config, which allows every tool by default; Vibe: your `~/.vibe`, whose approvals its headless mode follows) | only with `agent.allow` and `agent.review` (OpenCode, Vibe and OpenClaw refuse to start without both), ideally in a sandbox |
+| `inherit` | your own environment: your MCP servers and connectors, settings, skills and permission mode (Codex: your `~/.codex`; OpenCode: your whole OpenCode config, which allows every tool by default; Vibe: your `~/.vibe`, whose approvals its headless mode follows) | only with `agent.allow` and `agent.review` (OpenCode and OpenClaw refuse to start without both; Vibe without at least one of them), ideally in a sandbox |
 
 **Mistral Vibe** has `swarm-only` (its default: the wats tools only, with
 the agent's own Vibe home) and `inherit`; `workspace` is refused, since

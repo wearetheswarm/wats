@@ -135,9 +135,17 @@ vibe --prompt= --output=streaming --output-dir=<work dir>/vibe-run \
 - **`workspace` is refused** by the runner, `wats --agent vibe --access
   workspace`, `wats setup vibe --agent --access workspace` (before any
   write) and the wizard, with the same message.
-- **`inherit` needs `agent.allow` and `agent.review = true`**, as for
-  OpenCode (ADR 0031 open question 10) and OpenClaw: the runner refuses
-  to start without both (`vibe::INHERIT_NEEDS_GUARDRAILS`, one constant).
+- **`inherit` needs `agent.review = true` or an explicit `agent.allow`**,
+  either one: the product owner's words for Vibe were "`inherit` requires
+  `agent.review` or an explicit `agent.allow`". The runner refuses to
+  start with neither, and `wats setup vibe --agent --access inherit`
+  warns. Two constants: `vibe::INHERIT_NEEDS_GUARDRAILS` (refuse, or only
+  warn) and `vibe::INHERIT_NEEDS_BOTH` (`false`: either one is enough).
+  - **This differs from OpenCode**, which needs both (ADR 0031 open
+    question 10, `opencode::INHERIT_NEEDS_GUARDRAILS`), as OpenClaw's
+    setup does. OpenCode is left as it is. Whether to align the two
+    runtimes, and which way, is **pending the product owner's call**;
+    either side is a one-constant change.
   The wizard and `wats setup vibe --agent --access inherit` show one line:
   "Vibe approves its own tools: with inherit, a post can make it read or
   run anything you can".
@@ -311,6 +319,9 @@ installed Vibe. No agent runs it, and no session copies credentials.
 
 ## Alternatives
 
+- **Both guardrails for `inherit`, as for OpenCode.** Stricter, but not
+  the product owner's rule for Vibe; kept as `INHERIT_NEEDS_BOTH = true`,
+  one constant away (§2).
 - **`--auto-approve` at `swarm-only`** instead of `permission = "always"`
   on the wats tools. Simpler and robust to new wats tools, but it
   approves whatever the filter lets through: one filter bug and the shell

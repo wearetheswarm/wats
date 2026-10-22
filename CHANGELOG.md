@@ -15,7 +15,8 @@
     node's environment reaches the run.
   - **No `workspace` level**: Vibe cannot keep its tools inside one
     directory, so wats refuses it. `inherit` (your whole Vibe environment)
-    needs `agent.allow` and `agent.review = true`, as for OpenCode.
+    needs `agent.review = true` or an explicit `agent.allow` (either one;
+    OpenCode needs both).
   - **Budget.** Vibe's run export (`--output-dir`) gives the cost, Vibe's
     estimate from the model's prices, and the daily and monthly USD
     budgets apply; `--max-price` is what is left of them. A run with no

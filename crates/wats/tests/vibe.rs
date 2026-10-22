@@ -531,6 +531,18 @@ fn setup_enables_a_swarm_only_agent() {
     assert!(text(&out.stderr).contains("agent.review = true"), "{out:?}");
     let config = std::fs::read_to_string(m.path("data/config.toml")).unwrap();
     assert!(config.contains("access = \"inherit\""), "{config}");
+    // Either guardrail is enough for Vibe (ADR 0033 §2): review alone.
+    let set = m
+        .wats(&["config", "set", "agents.vibe.review", "true"])
+        .output()
+        .unwrap();
+    assert!(set.status.success(), "{set:?}");
+    let out = m.setup(&["--agent", "--access", "inherit"]);
+    assert!(out.status.success(), "{out:?}");
+    assert!(
+        !text(&out.stderr).contains("agent.review = true"),
+        "{out:?}"
+    );
 }
 
 /// `wats --agent vibe`: the node starts the runner with the agent's

@@ -1055,9 +1055,9 @@ fn next_steps(out: &mut impl Write, choices: &Choices, found: &[Found], hints: b
                 if inherit {
                     write!(
                         out,
-                        " With inherit, its runner starts only once agent.allow and \
-                         agent.review = true are set (wats config set agents.vibe.allow <ids>; \
-                         wats config set agents.vibe.review true)."
+                        " With inherit, its runner starts only once agent.review = true or \
+                         agent.allow is set (wats config set agents.vibe.review true, or wats \
+                         config set agents.vibe.allow <ids>)."
                     )?;
                 } else {
                     write!(
