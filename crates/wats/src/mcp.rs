@@ -2324,6 +2324,24 @@ mod tests {
         assert!(!INSTRUCTIONS.contains("config ack"));
     }
 
+    /// A Vibe run approves each tool a runner session lists (Vibe asks
+    /// before an MCP tool by default, and a headless run denies every
+    /// question): `vibe::RUN_TOOLS` must name them all (ADR 0033).
+    #[test]
+    fn vibe_approves_every_runner_tool() {
+        let router = WatsMcp::tool_router() + WatsMcp::node_router();
+        let mut tools: Vec<String> = router
+            .list_all()
+            .into_iter()
+            .map(|t| t.name.to_string())
+            .filter(|t| t != "start_daemon")
+            .collect();
+        tools.sort();
+        let mut approved: Vec<String> = crate::vibe::RUN_TOOLS.map(String::from).to_vec();
+        approved.sort();
+        assert_eq!(tools, approved);
+    }
+
     /// The `status` tool tells the agent to relay a pending security
     /// release (ADR 0030), whose notice `update::status_json` adds.
     #[test]

@@ -63,6 +63,22 @@ impl Machine {
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
     }
 
+    /// A fake `vibe` that answers `--version` (3.0.1), for a node that
+    /// runs it as its agent; otherwise as [`Machine::fake_cli`].
+    fn fake_vibe(&self) {
+        let path = self.path("bin").join("vibe");
+        std::fs::write(
+            &path,
+            format!(
+                "#!/bin/sh\nif [ \"$1\" = --version ]; then echo 'vibe 3.0.1'; exit 0; fi\n\
+                 printf 'vibe %s\\n' \"$*\" >> {}\n",
+                self.path("calls.log").display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
     /// `wats` with this machine's environment and `args` (none: a bare
     /// `wats`); `terminal`: as if on one.
     fn wats(&self, args: &[&str], terminal: bool) -> Command {
@@ -308,14 +324,14 @@ fn first_bare_wats_runs_the_wizard_then_the_node_in_the_background() {
     assert_eq!(node["mode"], "foreground", "{node}");
 }
 
-/// Enter for every question: no agent CLI it can run (Vibe only: an MCP
-/// host), Vibe registered, the node in this terminal, as a bare `wats`
-/// always ran. Not a UTF-8 locale, and NO_COLOR: the screens in plain
-/// ASCII.
+/// Enter for every question: Vibe only on PATH, so a Vibe agent
+/// (swarm-only, ADR 0033), Vibe registered for your own sessions, the node
+/// in this terminal, as a bare `wats` always ran. Not a UTF-8 locale, and
+/// NO_COLOR: the screens in plain ASCII.
 #[test]
 fn wizard_defaults_run_the_node_in_the_foreground() {
     let machine = Machine::new();
-    machine.fake_cli("vibe");
+    machine.fake_vibe();
     let mut command = machine.wats(&[], true);
     command.env("LANG", "C").env("NO_COLOR", "1");
     let child = machine.spawn(command, "");
@@ -332,7 +348,11 @@ fn wizard_defaults_run_the_node_in_the_foreground() {
     );
     let screens = &said[..said.find("Agent CLIs found").unwrap()];
     assert!(screens.is_ascii() && !said.contains('\x1b'), "{said}");
-    assert!(said.contains("No agent CLI found"), "{said}");
+    assert!(
+        said.contains("Agent the node runs (agent.runtime) [vibe]"),
+        "{said}"
+    );
+    assert!(said.contains("(agent.access) [swarm-only]"), "{said}");
     assert!(
         said.contains("Mistral Vibe: wats MCP server added to"),
         "{said}"
@@ -438,9 +458,11 @@ fn an_older_revision_asks_only_the_new_questions() {
         assert_eq!(machine.revision().as_deref(), Some("0\n"));
     }
 
-    let child = machine.spawn(machine.wats(&[], true), "20G\n\n");
+    // No agent (Vibe, on PATH, is offered), then the disk budget.
+    let child = machine.spawn(machine.wats(&[], true), "0\n20G\n\n");
     let (out, node) = machine.foreground(child);
     let said = text(&out.stdout);
+    assert!(!said.contains("Use the swarm from your own"), "{said}");
     assert!(
         said.contains("wats setup has new questions since this data directory was set up"),
         "{said}"
@@ -506,7 +528,7 @@ fn wats_setup_with_no_tool_is_the_wizard() {
         said.contains("wats setup: the node's main choices"),
         "{said}"
     );
-    assert!(said.contains("wats setup vibe --mcp (running it"), "{said}");
+    assert!(said.contains("wats setup vibe --mcp"), "{said}");
     assert!(
         !said.contains(WELCOME) && !said.contains("All set."),
         "{said}"
@@ -551,4 +573,45 @@ fn the_wizard_offers_opencode() {
     let config = std::fs::read_to_string(machine.data().join("config.toml")).unwrap();
     assert!(config.contains("runtime = \"opencode\""), "{config}");
     assert!(config.contains("model = \"azure/gpt-test\""), "{config}");
+}
+
+/// Mistral Vibe on PATH (ADR 0033): the wizard offers it as the node's
+/// agent, asks its own access question (no workspace: refused), shows the
+/// warning when inherit is chosen, and registers wats in the user's own
+/// Vibe sessions (the throwaway VIBE_HOME).
+#[test]
+fn the_wizard_offers_vibe_without_workspace() {
+    let machine = Machine::new();
+    machine.fake_vibe();
+    let input = "\n\n\n\n\n\nworkspace\ninherit\n";
+    let out = machine
+        .spawn(machine.wats(&["setup"], true), input)
+        .wait_with_output()
+        .unwrap();
+    let said = text(&out.stdout);
+    assert!(out.status.success(), "{out:?}");
+    assert!(
+        said.contains("Agent the node runs (agent.runtime) [vibe]"),
+        "{said}"
+    );
+    assert!(said.contains("(agent.access) [swarm-only]"), "{said}");
+    assert!(said.contains("Vibe cannot keep its tools"), "{said}");
+    assert!(
+        said.contains(
+            "Vibe approves its own tools: with inherit, a post can make it read or run \
+             anything you can"
+        ),
+        "{said}"
+    );
+    assert!(
+        said.contains("Use the swarm from your own Mistral Vibe sessions"),
+        "{said}"
+    );
+    let config = std::fs::read_to_string(machine.data().join("config.toml")).unwrap();
+    assert!(config.contains("runtime = \"vibe\""), "{config}");
+    assert!(config.contains("access = \"inherit\""), "{config}");
+    let vibe = std::fs::read_to_string(machine.path("vibe/config.toml")).unwrap();
+    assert!(vibe.contains("name = \"wats\""), "{vibe}");
+    // Detection never ran it.
+    assert!(!machine.calls().contains("vibe "), "{}", machine.calls());
 }

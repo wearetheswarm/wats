@@ -46,3 +46,4 @@ wrong, the ADR says so and the question goes back to the spec owners.
 | [0030](0030-security-updates.md) | Security updates: opt-in auto-install, asked by the setup wizard | Proposed |
 | [0031](0031-opencode.md) | OpenCode as an agent runtime | Proposed |
 | [0032](0032-stable-exe-path.md) | A stable wats path in the agent tools, and repairing stale ones | Accepted |
+| [0033](0033-mistral-vibe.md) | Mistral Vibe as an agent runtime | Proposed |

@@ -542,6 +542,23 @@ pub fn kill_group(pgid: u32) {
     }
 }
 
+/// Ask process `pid` to stop (SIGTERM). A process gone already is fine.
+#[cfg(unix)]
+pub fn terminate(pid: u32) {
+    use nix::sys::signal::{Signal, kill};
+    use nix::unistd::Pid;
+    let Ok(raw) = i32::try_from(pid) else {
+        return;
+    };
+    if raw <= 1 {
+        return;
+    }
+    match kill(Pid::from_raw(raw), Signal::SIGTERM) {
+        Ok(()) | Err(nix::errno::Errno::ESRCH) => {}
+        Err(e) => tracing::warn!("agent run: cannot stop process {raw}: {e}"),
+    }
+}
+
 /// Whether process `pid` exists.
 #[cfg(unix)]
 pub fn alive(pid: u32) -> bool {

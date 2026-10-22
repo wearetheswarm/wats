@@ -29,8 +29,8 @@ use anyhow::{Context, Result};
 use crate::settings::{self, ConfigFile, FILE_NAME, RUNTIMES, Settings};
 use crate::update::Install;
 
-/// The agent CLIs looked for on `PATH`. Only [`RUNTIMES`] can run; the
-/// others (Mistral Vibe) are listed as MCP hosts.
+/// The agent CLIs looked for on `PATH`. Only [`RUNTIMES`] can run; any
+/// other would be listed as an MCP host only.
 pub const AGENT_CLIS: [&str; 5] = ["claude", "codex", "openclaw", "opencode", "vibe"];
 
 /// Shown when the node runs no agent (startup, `status`). A future
@@ -41,8 +41,9 @@ enables one.";
 
 /// Shown by setup when no supported agent CLI is on `PATH`.
 pub const NO_AGENT_FOUND: &str = "No agent CLI found: install Claude Code \
-(https://claude.com/claude-code), Codex (https://github.com/openai/codex) or OpenCode \
-(https://opencode.ai, for your own model or cloud credits), then run `wats setup` again.";
+(https://claude.com/claude-code), Codex (https://github.com/openai/codex), OpenCode \
+(https://opencode.ai, for your own model or cloud credits) or Mistral Vibe \
+(https://github.com/mistralai/mistral-vibe), then run `wats setup` again.";
 
 /// Shown before the model question when OpenCode is the node's agent
 /// (ADR 0031 §2).
@@ -61,11 +62,14 @@ pub const OPENCODE_MODEL_QUESTION: &str =
 pub const OPENCLAW_MCP_HINT: &str = "OpenClaw found: to reach the swarm from your OpenClaw \
 agents, register wats as its MCP server: wats setup openclaw --mcp";
 
-/// Shown by setup when Mistral Vibe is on `PATH`: not an agent runtime
-/// yet, but an MCP host.
+/// Shown by setup when Mistral Vibe is on `PATH` and not the node's agent:
+/// an MCP host too.
 pub const VIBE_MCP_HINT: &str = "Mistral Vibe found: to reach the swarm from your Vibe \
-sessions, add wats as its MCP server: wats setup vibe --mcp (running it as the node's agent \
-comes next)";
+sessions, add wats as its MCP server: wats setup vibe --mcp";
+
+/// The access question for Mistral Vibe (ADR 0033): no `workspace`.
+pub const VIBE_ACCESS_QUESTION: &str = "What the agent may use besides the wats tools: \
+swarm-only, or inherit (your whole Vibe environment; Vibe has no workspace level)";
 
 /// Shown by setup when OpenClaw is the node's agent: the gateway side is
 /// set up apart (tokens, MCP entries, the config block to paste).
@@ -419,6 +423,36 @@ fn ask(
     }
 }
 
+/// The access level of a Vibe agent: swarm-only (the default, or the
+/// current level) or inherit, which is followed by its warning.
+fn ask_vibe_access(
+    input: &mut impl BufRead,
+    out: &mut impl Write,
+    settings: &Settings,
+) -> Result<String> {
+    let key = "agent.access";
+    let default = current(settings, key)
+        .filter(|v| crate::vibe::access(Some(v)).is_ok())
+        .unwrap_or_else(|| "swarm-only".to_string());
+    let answer = loop {
+        write!(out, "{VIBE_ACCESS_QUESTION} ({key}) [{default}]: ")?;
+        let answer = match read_answer(input, out)? {
+            Some(answer) if !answer.is_empty() => answer,
+            _ => break default.clone(),
+        };
+        match settings::check_value(key, &answer)
+            .and_then(|_| crate::vibe::access(Some(&answer)).map(|_| ()))
+        {
+            Ok(()) => break answer,
+            Err(e) => writeln!(out, "  {e:#}")?,
+        }
+    };
+    if crate::vibe::access(Some(&answer))? == crate::access::Access::Inherit {
+        writeln!(out, "{}", crate::vibe::INHERIT_WARNING)?;
+    }
+    Ok(answer)
+}
+
 /// A yes/no question; Enter (or the end of the input) keeps `default`.
 pub fn ask_yes_no(
     input: &mut impl BufRead,
@@ -504,7 +538,12 @@ fn prompt_after(
             values.push(("agent.model", model));
         }
     }
+    let vibe = runtime.as_deref() == Some("vibe");
     for q in questions {
+        if vibe && q.key == "agent.access" && q.since > revision {
+            values.push((q.key, ask_vibe_access(input, out, settings)?));
+            continue;
+        }
         if q.since <= revision
             || (q.agent_only && runtime.is_none())
             || (openclaw && NOT_FOR_OPENCLAW.contains(&q.key))
@@ -566,7 +605,7 @@ pub fn render(choices: &Choices) -> Result<String> {
     line(&mut text, "storage.max")?;
     text.push_str(
         "\n# The agents the node runs, one [agents.<name>] table each (ADR 0021); the\n\
-         # name defaults to the runtime: claude, codex, openclaw or opencode.\n",
+         # name defaults to the runtime: claude, codex, openclaw, opencode or vibe.\n",
     );
     match &choices.runtime {
         Some(runtime) => {
@@ -1078,9 +1117,31 @@ fn next_steps(out: &mut impl Write, choices: &Choices, found: &[Found], hints: b
             let name = match runtime.as_str() {
                 "codex" => "Codex",
                 "opencode" => "OpenCode",
+                "vibe" => "Mistral Vibe",
                 _ => "Claude Code",
             };
             write!(out, "`wats` now runs the node with a {name} agent.")?;
+            if runtime == "vibe" {
+                let inherit = choices
+                    .values
+                    .iter()
+                    .any(|(k, v)| *k == "agent.access" && v.trim() == "inherit");
+                if inherit {
+                    write!(
+                        out,
+                        " With inherit, its runner starts only once agent.review = true or \
+                         agent.allow is set (wats config set agents.vibe.review true, or wats \
+                         config set agents.vibe.allow <ids>)."
+                    )?;
+                } else {
+                    write!(
+                        out,
+                        " Its runs have the wats tools only, with their own Vibe home (not \
+                         ~/.vibe); your API key comes from your OS keyring (`vibe --setup`) \
+                         or MISTRAL_API_KEY."
+                    )?;
+                }
+            }
             if runtime == "opencode" {
                 write!(
                     out,
@@ -1106,7 +1167,7 @@ fn next_steps(out: &mut impl Write, choices: &Choices, found: &[Found], hints: b
     {
         writeln!(out, "{OPENCLAW_MCP_HINT}")?;
     }
-    if found.iter().any(|f| f.name == "vibe") {
+    if found.iter().any(|f| f.name == "vibe") && choices.runtime.as_deref() != Some("vibe") {
         writeln!(out, "{VIBE_MCP_HINT}")?;
     }
     Ok(())
@@ -1610,11 +1671,12 @@ mod tests {
         assert_eq!(new_questions(BASELINE_REVISION), 0);
     }
 
-    /// Mistral Vibe on PATH: listed, not offered as the agent, its MCP
-    /// setup suggested.
+    /// Mistral Vibe on PATH (looked up, never run) is a runtime (ADR
+    /// 0033): offered as the agent, with its own access question (no
+    /// workspace, swarm-only by default, inherit with its warning).
     #[cfg(unix)]
     #[test]
-    fn vibe_is_listed_as_mcp_only() {
+    fn vibe_is_a_runtime_without_workspace() {
         let bin = tempfile::tempdir().unwrap();
         let vibe = fake_cli(bin.path(), "vibe");
         let path = std::env::join_paths([bin.path()]).unwrap();
@@ -1626,18 +1688,39 @@ mod tests {
                 path: vibe
             }]
         );
-        assert!(!found[0].supported());
+        assert!(found[0].supported());
+        // Enter everywhere: Vibe, swarm-only.
         let data = tempfile::tempdir().unwrap();
         let mut out = Vec::new();
         let choices = setup(data.path(), &mut "".as_bytes(), &mut out, Some(&path)).unwrap();
         let said = String::from_utf8(out).unwrap();
-        assert_eq!(choices.runtime, None);
+        assert_eq!(choices.runtime.as_deref(), Some("vibe"));
+        assert!(said.contains("1) vibe"), "{said}");
+        assert!(!said.contains("not supported yet"), "{said}");
         assert!(
-            said.contains("(agent: not supported yet; MCP: wats setup vibe --mcp)"),
+            said.contains(&format!(
+                "{VIBE_ACCESS_QUESTION} (agent.access) [swarm-only]"
+            )),
             "{said}"
         );
-        assert!(said.contains(NO_AGENT_FOUND), "{said}");
-        assert!(said.contains(VIBE_MCP_HINT), "{said}");
+        assert!(!said.contains(crate::vibe::INHERIT_WARNING), "{said}");
+        assert!(said.contains("wats setup vibe --mcp"), "{said}");
+        assert!(!said.contains(VIBE_MCP_HINT), "{said}");
+        let config = std::fs::read_to_string(data.path().join(FILE_NAME)).unwrap();
+        assert!(config.contains("[agents.vibe]"), "{config}");
+        assert!(config.contains("access = \"swarm-only\""), "{config}");
+        // workspace is refused, inherit is taken, with its warning.
+        let data = tempfile::tempdir().unwrap();
+        let mut out = Vec::new();
+        let input = "vibe\n\n\n\n\n\nworkspace\ninherit\n";
+        let choices = setup(data.path(), &mut input.as_bytes(), &mut out, Some(&path)).unwrap();
+        let said = String::from_utf8(out).unwrap();
+        assert_eq!(choices.runtime.as_deref(), Some("vibe"));
+        assert!(said.contains("Vibe cannot keep its tools"), "{said}");
+        assert!(said.contains(crate::vibe::INHERIT_WARNING), "{said}");
+        assert!(said.contains("agent.review = true"), "{said}");
+        let config = std::fs::read_to_string(data.path().join(FILE_NAME)).unwrap();
+        assert!(config.contains("access = \"inherit\""), "{config}");
     }
 
     fn run(found: &[Found], settings: &Settings, input: &str) -> (Choices, String) {

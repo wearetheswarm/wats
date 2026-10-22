@@ -32,6 +32,7 @@ use crate::node::Node;
 use crate::opencode;
 use crate::runs::{self, RunRecord};
 use crate::store::Filter;
+use crate::vibe;
 use crate::wake::{Hold, WakeLimits, WakeState, loop_turns};
 
 /// Shipped when no `--heartbeat-file` is given (crates/wats/assets/HEARTBEAT.md).
@@ -169,6 +170,14 @@ impl AgentInfo {
             ),
             Some("opencode") => format!(
                 "{} (OpenCode's cost estimate)",
+                budget::describe(&self.budget, &spend)
+            ),
+            Some("vibe") if !vibe::ENFORCE_USD_BUDGET => format!(
+                "{} of {} runs today (Vibe's costs not enforced)",
+                spend.uncosted_today, self.budget.max_runs_per_day
+            ),
+            Some("vibe") => format!(
+                "{} (Vibe's cost estimate)",
                 budget::describe(&self.budget, &spend)
             ),
             _ => budget::describe(&self.budget, &spend),
@@ -753,6 +762,9 @@ struct Running {
     feedback: Vec<String>,
     /// The spawned CLI's process group, killed if the run is dropped.
     group: GroupGuard,
+    /// Mistral Vibe: what the run is charged if it ends without its run
+    /// export (killed at its timeout or by a stop), its `--max-price`.
+    charge_usd: Option<f64>,
 }
 
 /// Ends a run's runner token on drop unless the run started: an early
@@ -915,6 +927,7 @@ fn start_forward(
         woke: Vec::new(),
         feedback: Vec::new(),
         group: GroupGuard(None),
+        charge_usd: None,
     })
 }
 
@@ -992,6 +1005,12 @@ async fn start_run(
         token: Some(token.clone()),
     };
     let prepared = prepare_command(config, &token, &transcript, remaining_usd);
+    // Vibe reads at most 1 MiB of prompt from stdin.
+    let prompt = if config.runtime == "vibe" {
+        vibe::fit_prompt(prompt)
+    } else {
+        prompt
+    };
     let (mut command, file) = match prepared {
         Ok(prepared) => prepared,
         Err(e) => {
@@ -1043,6 +1062,9 @@ async fn start_run(
         woke: Vec::new(),
         feedback: Vec::new(),
         group,
+        charge_usd: (config.runtime == "vibe" && vibe::ENFORCE_USD_BUDGET)
+            .then(|| vibe::charge_without_export(&config.extra_args, remaining_usd))
+            .flatten(),
     })
 }
 
@@ -1066,6 +1088,48 @@ fn prepare_command(
     #[cfg(unix)]
     command.process_group(0);
     match config.runtime.as_str() {
+        "vibe" => {
+            let server = vibe::Server {
+                wats_command: &config.mcp_command,
+                wats_args: &config.mcp_args,
+                runner_token: token,
+                timeout: config.run_timeout,
+            };
+            let export_dir = vibe::export_dir(&config.work_dir);
+            vibe::prepare_export_dir(&export_dir)?;
+            if config.access == Access::Inherit {
+                let (remove, set) = vibe::inherit_env(&server, std::env::vars_os());
+                for key in remove {
+                    command.env_remove(key);
+                }
+                for (key, value) in set {
+                    command.env(key, value);
+                }
+            } else {
+                vibe::write_run_config(
+                    &vibe::agent_home(&config.work_dir),
+                    &vibe::run_config(&server),
+                )?;
+                for key in vibe::removed_env(std::env::vars_os()) {
+                    command.env_remove(key);
+                }
+            }
+            for (key, value) in
+                vibe::run_env(config.access, &config.work_dir, config.model.as_deref())
+            {
+                command.env(key, value);
+            }
+            command
+                .args(vibe::run_args(&vibe::Run {
+                    access: config.access,
+                    max_turns: config.max_turns,
+                    max_price: vibe::ENFORCE_USD_BUDGET.then_some(remaining_usd),
+                    export_dir: &export_dir,
+                    timeout: config.run_timeout,
+                    extra: &config.extra_args,
+                }))
+                .args(&config.extra_args);
+        }
         "opencode" => {
             // Checked again before every run: a config may have changed.
             opencode::check_config_sources(
@@ -1248,13 +1312,35 @@ async fn finish_run(
     if let Some(token) = &running.token {
         node.end_runner_token(token);
     }
+    let killed = matches!(outcome, Outcome::TimedOut | Outcome::Stopped);
     match running.work {
         Work::Child(mut child, output) => {
             if matches!(outcome, Outcome::Exited(_)) {
                 running.group.disarm();
             } else {
-                // Its whole process group first (the CLI is the group's
-                // leader, not yet reaped: the id is still its own).
+                // Vibe first gets SIGTERM, on which it writes its run export
+                // and stops its app server (in a process group of its own,
+                // which the group kill below would miss), ADR 0033 §1.
+                #[cfg(unix)]
+                if config.runtime == "vibe"
+                    && let Some(pid) = child.id()
+                {
+                    crate::background::terminate(pid);
+                    let grace = if matches!(outcome, Outcome::Stopped) {
+                        vibe::STOP_GRACE
+                    } else {
+                        vibe::TERM_GRACE
+                    };
+                    if let Ok(Ok(_)) = tokio::time::timeout(grace, child.wait()).await {
+                        // It stopped in its grace and is reaped now: its
+                        // process group id may already be another
+                        // process's, so the group is left alone.
+                        running.group.disarm();
+                    }
+                }
+                // Its whole process group first, while the CLI, the group's
+                // leader, is not reaped yet (the id is still its own); a
+                // no-op when it was reaped above.
                 running.group.kill();
                 let _ = child.kill().await;
             }
@@ -1331,6 +1417,36 @@ async fn finish_run(
             "error"
         }
         .into();
+    }
+    // Vibe's run export (its cost, turns and error) goes into the
+    // transcript, then the directory goes: it copies the session too.
+    if config.runtime == "vibe" {
+        let dir = vibe::export_dir(&config.work_dir);
+        let line = match vibe::export_line(&dir) {
+            Some(line) => Some(line),
+            // Killed before Vibe wrote its cost: charged its cap, so that
+            // timeouts cannot run past the budget unseen.
+            None if killed => running.charge_usd.map(|usd| {
+                warn!(
+                    run = %record.id,
+                    "Mistral Vibe run ended without its run export: charged ${usd:.2}, its \
+                     --max-price"
+                );
+                json!({
+                    "type": "vibe_charge", "cost_usd": usd,
+                    "why": "no run export (killed): charged the run's --max-price",
+                })
+            }),
+            None => None,
+        };
+        if let Some(line) = line
+            && let Ok(mut f) = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&running.transcript)
+        {
+            let _ = runs::write_line(&mut f, &line);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
     runs::read_result(&running.transcript, &mut record);
     // A forward the gateway refused ran no turn.
@@ -1859,6 +1975,56 @@ async fn check_opencode(config: &AgentConfig) -> Result<()> {
     Ok(())
 }
 
+/// Before a Mistral Vibe runner starts (ADR 0033): its version, the level
+/// (no `workspace`), the extra arguments and the model, the agent's own
+/// Vibe home, and where its runs find the API key.
+async fn check_vibe(config: &AgentConfig) -> Result<()> {
+    anyhow::ensure!(
+        config.access != Access::Workspace,
+        "{}",
+        vibe::WORKSPACE_REFUSED
+    );
+    let found = vibe::version(&config.command).await;
+    if let Some(warning) = vibe::check_version(found)
+        .with_context(|| format!("Mistral Vibe ({})", config.command.display()))?
+    {
+        warn!("{warning}");
+    }
+    vibe::check_extra_args(config.access, &config.extra_args)?;
+    if let Some(model) = &config.model {
+        vibe::check_model(model)?;
+    }
+    if config.access == Access::SwarmOnly {
+        let home = vibe::agent_home(&config.work_dir);
+        std::fs::create_dir_all(&home).with_context(|| format!("create {}", home.display()))?;
+        info!(
+            "Mistral Vibe runs use their own Vibe home {} (the wats tools only), not ~/.vibe",
+            home.display()
+        );
+        if std::env::var_os("MISTRAL_API_KEY").is_none() {
+            info!(
+                "Mistral Vibe runs find your API key in your OS keyring (`vibe --setup`), or in \
+                 MISTRAL_API_KEY: a key kept only in ~/.vibe/.env is not read (set \
+                 MISTRAL_API_KEY in the node's environment)"
+            );
+        }
+    }
+    if config.access == Access::Inherit
+        && let Some(home) = vibe::home(std::env::var_os("VIBE_HOME"), std::env::home_dir())
+        && let Ok(text) = std::fs::read_to_string(home.join("config.toml"))
+    {
+        let others = vibe::other_wats_servers(&text);
+        if !others.is_empty() {
+            warn!(
+                "your Vibe config runs wats as other MCP servers too ({}): with inherit, the \
+                 agent's runs also get those, which post as your own profile, not the agent's",
+                others.join(", ")
+            );
+        }
+    }
+    Ok(())
+}
+
 /// Run the agent loop until `shutdown` resolves. A run in progress is then
 /// killed.
 pub async fn run(
@@ -1910,6 +2076,9 @@ pub async fn run(
     }
     if config.runtime == "opencode" {
         check_opencode(&config).await?;
+    }
+    if config.runtime == "vibe" {
+        check_vibe(&config).await?;
     }
     announce_if_changed(&node, &config).await;
     // A marker left by a run that did not finish (crash, kill -9).

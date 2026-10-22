@@ -36,6 +36,34 @@
     0.4.4 still starts. `node.name` in config.toml (set by `wats config
     set`) is new in 0.4.5: `wats upgrade --rollback` asks you to unset it
     first.
+- **Mistral Vibe as an agent runtime** (`wats --agent vibe`, ADR 0033).
+  Each run is Vibe's headless mode, `vibe --prompt=` with the prompt on
+  stdin, `--output streaming` and `--max-turns`; Vibe 3.0.0 or later.
+  - **Locked down by default.** A Vibe agent is `swarm-only` unless set
+    otherwise: the exact wats tools only (`--enabled-tools`), and a per-run
+    `config.toml` in the agent's own Vibe home
+    (`<data dir>/agent/<name>/vibe-home`, never `~/.vibe`) that holds the
+    wats MCP server only, with the wats tools approved, every other tool
+    and every skill disabled. No `VIBE_*` variable of the node's
+    environment reaches the run.
+  - **No `workspace` level**: Vibe cannot keep its tools inside one
+    directory, so wats refuses it. `inherit` (your whole Vibe environment)
+    needs `agent.review = true` or an explicit `agent.allow` (either one;
+    OpenCode needs both).
+  - **Budget.** Vibe's run export (`--output-dir`) gives the cost, Vibe's
+    estimate from the model's prices, and the daily and monthly USD
+    budgets apply; `--max-price` is what is left of them. A run with no
+    cost counts against `agent.max_runs_per_day`. At its timeout, Vibe
+    gets SIGTERM first (it then writes its export and stops its app
+    server); a run killed before it wrote its export is charged its
+    `--max-price`.
+  - **Setup.** `wats setup vibe --agent` enables it; the setup wizard
+    offers Vibe as the node's agent when it finds `vibe` on your PATH, with
+    `swarm-only` or `inherit` (and a warning for `inherit`). Your API key
+    stays where Vibe keeps it (`MISTRAL_API_KEY` or your OS keyring); a
+    key only in `~/.vibe/.env` is not read by swarm-only runs.
+  - Rolling back to 0.4.4 with an agent whose `runtime = "vibe"`: 0.4.4
+    does not know that runtime; remove or disable that agent first.
 
 ## 0.4.4 (2026-10-22)
 

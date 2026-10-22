@@ -222,6 +222,42 @@ pub fn read_result(transcript: &Path, record: &mut RunRecord) {
                 }
                 continue;
             }
+            // Mistral Vibe (ADR 0033): its run export, which the runner
+            // adds once the run ended: steps, cost (Vibe's estimate) and
+            // how it ended.
+            Some("vibe_export") => {
+                if let Some(steps) = value["steps"].as_u64() {
+                    record.turns = Some(steps);
+                }
+                if crate::vibe::ENFORCE_USD_BUDGET
+                    && let Some(cost) = value["cost_usd"].as_f64().filter(|c| *c > 0.0)
+                {
+                    record.cost_usd = Some(cost);
+                }
+                if record.model.is_empty()
+                    && let Some(model) = value["model"].as_str()
+                {
+                    record.model = model.to_string();
+                }
+                if value["outcome"].as_str().is_some_and(|o| o != "finished") {
+                    if record.status == "ok" {
+                        record.status = "error".into();
+                    }
+                    record.error = error_message(&value)
+                        .or(value["outcome"].as_str())
+                        .map(|m| m.chars().take(200).collect());
+                }
+                continue;
+            }
+            // A Vibe run killed before it wrote its export: charged its cap.
+            Some("vibe_charge") => {
+                if crate::vibe::ENFORCE_USD_BUDGET
+                    && let Some(cost) = value["cost_usd"].as_f64().filter(|c| *c > 0.0)
+                {
+                    record.cost_usd = Some(cost);
+                }
+                continue;
+            }
             Some("turn.failed") | Some("error") => {
                 if record.status == "ok" {
                     record.status = "error".into();
@@ -641,6 +677,66 @@ pub fn render(line: &str, style: Style) -> Vec<String> {
                 out.push(style.dim(&format!("← {text}")));
             }
         }
+        // Mistral Vibe (`vibe -p --output streaming`): one history entry
+        // per line, then the runner's `vibe_export`.
+        "message" if value["role"] == "assistant" => {
+            for part in value["content"].as_array().into_iter().flatten() {
+                for line in part["text"].as_str().unwrap_or("").trim().lines() {
+                    out.push(format!("  {line}"));
+                }
+            }
+        }
+        "effect" => {
+            let state = &value["state"];
+            out.push(style.cyan(&format!(
+                "→ {}",
+                preview(value["title"].as_str().unwrap_or("?"), TOOL_PREVIEW)
+            )));
+            match state["status"].as_str() {
+                Some("failed") => out.push(style.red(&format!(
+                    "← ✗ {}",
+                    preview(
+                        state["error"]["message"].as_str().unwrap_or("failed"),
+                        TOOL_PREVIEW
+                    )
+                ))),
+                Some("completed") => {
+                    let mut text =
+                        preview(state["outputText"].as_str().unwrap_or(""), TOOL_PREVIEW);
+                    if text.is_empty() {
+                        text = "(no text)".into();
+                    }
+                    out.push(style.dim(&format!("← {text}")));
+                }
+                Some(other) => out.push(style.dim(&format!("← {other}"))),
+                None => {}
+            }
+        }
+        "notice" => out.push(style.dim(&format!(
+            "● {}",
+            preview(value["message"].as_str().unwrap_or(""), TOOL_PREVIEW)
+        ))),
+        "vibe_export" => {
+            let cost = value["cost_usd"]
+                .as_f64()
+                .map(|c| format!(" · ${c:.4} (Vibe's estimate)"))
+                .unwrap_or_default();
+            let steps = value["steps"]
+                .as_u64()
+                .map(|n| format!(" · {n} steps"))
+                .unwrap_or_default();
+            match value["outcome"].as_str() {
+                Some("finished") => out.push(style.green(&format!("✓ done{steps}{cost}"))),
+                outcome => out.push(style.red(&format!(
+                    "✗ {}{steps}{cost}",
+                    error_message(&value).or(outcome).unwrap_or("ended")
+                ))),
+            }
+        }
+        "vibe_charge" => out.push(style.red(&format!(
+            "✗ no run export: charged ${:.2} (the run's --max-price)",
+            value["cost_usd"].as_f64().unwrap_or(0.0)
+        ))),
         "step_finish" => {
             let part = &value["part"];
             out.push(style.green(&format!(
