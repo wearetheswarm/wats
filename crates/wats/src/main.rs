@@ -3382,21 +3382,23 @@ fn browse_lines(map: &serde_json::Value) -> String {
     out
 }
 
-/// Check wats's own entries in the agent tools' configs, repairing a stale
-/// path where Homebrew's link replaces it (ADR 0032); never in hermetic
-/// mode unless asked ([`wats::registrations::enabled`]).
+/// Check wats's own entries in the agent tools' configs, and with `repair`
+/// (the node's start only) repair a stale path where Homebrew's link
+/// replaces it (ADR 0032). Never for a local node (hermetic or loopback)
+/// unless asked ([`wats::registrations::enabled`]).
 fn check_registrations(
     data_dir: &std::path::Path,
-    hermetic: bool,
+    local: bool,
+    repair: bool,
 ) -> Vec<wats::registrations::Finding> {
-    if !wats::registrations::enabled(hermetic) {
+    if !wats::registrations::enabled(local) {
         return Vec::new();
     }
     let at = wats::registrations::Locations::from_env();
-    wats::registrations::check(&at, data_dir, true, unix_now())
+    wats::registrations::check(&at, data_dir, repair, unix_now())
 }
 
-async fn status_command(config: &NodeConfig, json: bool, hermetic: bool) -> Result<()> {
+async fn status_command(config: &NodeConfig, json: bool, local: bool) -> Result<()> {
     let mut status = match attach::call_tool(&config.data_dir, "status", serde_json::json!({}))
         .await?
     {
@@ -3454,9 +3456,9 @@ async fn status_command(config: &NodeConfig, json: bool, hermetic: bool) -> Resu
             status
         }
     };
-    // wats's entries in the agent tools, checked (and repaired) here: a
-    // fresher view than the running node's, from its start.
-    let registrations = check_registrations(&config.data_dir, hermetic);
+    // wats's entries in the agent tools, only checked here (the node
+    // repairs them at its start): fresher than the running node's view.
+    let registrations = check_registrations(&config.data_dir, local, false);
     if let Some(map) = status.as_object_mut() {
         map.remove("registrations");
         if json && !registrations.is_empty() {
@@ -6252,7 +6254,7 @@ async fn async_main(cli: Cli) -> Result<()> {
         }
         Some(Command::Id { host }) => return print_id(&config, &host),
         Some(Command::Status { json }) => {
-            return status_command(&config, json, cli.node.hermetic).await;
+            return status_command(&config, json, cli.node.hermetic || cli.node.loopback).await;
         }
         Some(Command::Browse {
             tag_dir,
@@ -6530,9 +6532,9 @@ async fn async_main(cli: Cli) -> Result<()> {
     wats::crash::set_own_id(node.endpoint_id().to_string());
     // wats's entries in the agent tools (ADR 0032): a stale path repaired,
     // or a warning, logged and kept for the MCP `status` tool.
-    let hermetic = cli.node.hermetic;
+    let local = cli.node.hermetic || cli.node.loopback;
     tokio::task::spawn_blocking(move || {
-        let found = check_registrations(&registrations_dir, hermetic);
+        let found = check_registrations(&registrations_dir, local, true);
         for finding in &found {
             if finding.repaired() {
                 tracing::info!("{}", finding.line());

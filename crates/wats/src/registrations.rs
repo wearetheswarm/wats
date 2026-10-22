@@ -20,20 +20,32 @@ use std::collections::HashMap;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
 
 use crate::update::{homebrew_managed, homebrew_relink};
 
-/// Set to 1, the check runs in hermetic mode too (tests, with a throwaway
-/// HOME). Otherwise hermetic mode never reads the tools' configs.
+/// Set to 1, the check runs whatever the mode (tests, with a throwaway
+/// HOME). Otherwise only a node on the real network checks.
 pub const CHECK_ENV: &str = "WATS_CHECK_REGISTRATIONS";
 
-/// Whether this process checks the registrations: never in hermetic mode,
-/// unless [`CHECK_ENV`] is 1.
-pub fn enabled(hermetic: bool) -> bool {
-    !hermetic || std::env::var(CHECK_ENV).is_ok_and(|v| v.trim() == "1")
+/// How long one `openclaw` command may take before it is killed.
+const OPENCLAW_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// Backups kept per file by repairs.
+const MAX_BACKUPS: usize = 3;
+
+/// Whether this process checks the registrations: only a node on the real
+/// network does, never in hermetic or loopback mode (`local`: tests and
+/// local demos) nor under `cargo test` or `cargo run` of wats itself
+/// (`CARGO_PKG_NAME=wats` in the environment), unless [`CHECK_ENV`] is 1.
+pub fn enabled(local: bool) -> bool {
+    if std::env::var(CHECK_ENV).is_ok_and(|v| v.trim() == "1") {
+        return true;
+    }
+    !local && std::env::var_os("CARGO_PKG_NAME").is_none_or(|name| name != "wats")
 }
 
 /// An agent tool wats registers itself in.
@@ -150,8 +162,13 @@ pub enum Outcome {
         backup: Option<PathBuf>,
     },
     /// Left as it is: `fix` is the command that fixes it; `error`, why the
-    /// repair failed, if it was tried.
-    Left { fix: String, error: Option<String> },
+    /// repair failed, if it was tried; `auto`, the node repairs it at its
+    /// next start (only checked, as by `wats status`).
+    Left {
+        fix: String,
+        error: Option<String>,
+        auto: bool,
+    },
 }
 
 /// A wats entry with a stale path.
@@ -205,13 +222,18 @@ impl Finding {
                     to.display()
                 )
             }
-            Outcome::Left { fix, error } => {
+            Outcome::Left { fix, error, auto } => {
                 let error = error
                     .as_ref()
                     .map(|e| format!(" (the repair failed: {e})"))
                     .unwrap_or_default();
+                let what = if *auto {
+                    format!("the node repairs it at its next start, or run `{fix}`")
+                } else {
+                    format!("run `{fix}` to fix it")
+                };
                 format!(
-                    "{tool}: {entry} in {file} runs {path}, {}{error}: run `{fix}` to fix it",
+                    "{tool}: {entry} in {file} runs {path}, {}{error}: {what}",
                     self.why()
                 )
             }
@@ -234,7 +256,10 @@ impl Finding {
                     value["backup"] = json!(backup.display().to_string());
                 }
             }
-            Outcome::Left { fix, .. } => value["fix"] = json!(fix),
+            Outcome::Left { fix, auto, .. } => {
+                value["fix"] = json!(fix);
+                value["repaired_at_next_start"] = json!(auto);
+            }
         }
         value
     }
@@ -251,7 +276,7 @@ pub fn remember(findings: &[Finding]) {
 }
 
 /// What [`remember`] kept, but for the entries fixed since (their file no
-/// longer has the stale path: `wats setup`, `wats status`).
+/// longer has the stale path: `wats setup`).
 pub fn remembered() -> Vec<Finding> {
     let mut left = LEFT.lock().unwrap_or_else(|e| e.into_inner());
     left.retain(|f| read(&f.file).is_some_and(|text| text.contains(&f.path)));
@@ -399,30 +424,30 @@ fn first_word(line: &str) -> Option<(String, &str)> {
     (rest.is_empty() || rest.starts_with(char::is_whitespace)).then_some((word, rest))
 }
 
-/// Repair `sites` of `file` (when `repair` and Homebrew's link replaces
-/// each), with `rewrite` making the new text from the map of old values to
-/// new ones; one finding per entry.
+/// Repair `sites` of `file`, read as `text` (when `repair` and Homebrew's
+/// link replaces each), with `rewrite` making the new text from a text and
+/// the map of old values to new ones ([`commit`]); one finding per entry.
 fn settle(
     tool: Tool,
     file: &Path,
+    text: &str,
     sites: Vec<Site>,
     repair: bool,
     now: u64,
-    rewrite: impl FnOnce(&HashMap<String, String>) -> Result<String>,
+    rewrite: impl Fn(&str, &HashMap<String, String>) -> Result<String>,
 ) -> Vec<Finding> {
     if sites.is_empty() {
         return Vec::new();
     }
+    let all = sites.iter().all(|s| s.relink.is_some());
     let mut result = None;
-    if repair && sites.iter().all(|s| s.relink.is_some()) {
+    if repair && all {
         let map: HashMap<String, String> = sites
             .iter()
             .filter_map(|s| Some((s.value.clone(), s.relink.as_ref()?.1.clone())))
             .collect();
         result = Some(
-            rewrite(&map)
-                .and_then(|text| crate::vibe::write_with_backup(file, &text, now))
-                .map_err(|e| format!("{e:#}")),
+            commit(file, text, &|base| rewrite(base, &map), now).map_err(|e| format!("{e:#}")),
         );
     }
     let mut out: Vec<Finding> = Vec::new();
@@ -438,6 +463,7 @@ fn settle(
             (result, _) => Outcome::Left {
                 fix: site.fix,
                 error: result.as_ref().and_then(|r| r.as_ref().err().cloned()),
+                auto: all && result.is_none(),
             },
         };
         out.push(Finding {
@@ -454,6 +480,130 @@ fn settle(
 /// A config file's text; None when missing or unreadable.
 fn read(file: &Path) -> Option<String> {
     std::fs::read_to_string(file).ok()
+}
+
+/// Replace `file`, read as `text`, with `edit(text)`, atomically: a backup
+/// ([`backup`]), then a temporary file next to it (same mode and owner,
+/// synced) renamed over it. A symlinked file is resolved first, so that the
+/// rename replaces its target, not the link. When the file changed since it
+/// was read (Claude Code rewrites `~/.claude.json` often), the edit is
+/// redone once on the fresh text; a second change gives up. Returns the
+/// backup.
+fn commit(
+    file: &Path,
+    text: &str,
+    edit: &dyn Fn(&str) -> Result<String>,
+    now: u64,
+) -> Result<Option<PathBuf>> {
+    let target = file.canonicalize().unwrap_or_else(|_| file.to_path_buf());
+    let mut base = text.to_string();
+    for _ in 0..2 {
+        let new = edit(&base)?;
+        if new == base {
+            // Nothing left to change: fixed meanwhile.
+            return Ok(None);
+        }
+        let backup = backup(&target, &base, now)?;
+        let temp = write_temp(&target, &new)?;
+        let current = std::fs::read_to_string(&target);
+        match current {
+            Ok(current) if current == base => {
+                let renamed = std::fs::rename(&temp, &target);
+                if renamed.is_err() {
+                    let _ = std::fs::remove_file(&temp);
+                }
+                renamed.with_context(|| format!("replace {}", target.display()))?;
+                return Ok(backup);
+            }
+            Ok(current) => {
+                let _ = std::fs::remove_file(&temp);
+                base = current;
+            }
+            Err(e) => {
+                let _ = std::fs::remove_file(&temp);
+                return Err(e).with_context(|| format!("read {}", target.display()));
+            }
+        }
+    }
+    bail!("{} kept changing while being repaired", file.display())
+}
+
+/// `text` in a new temporary file next to `target`, with its mode (and
+/// owner, when allowed), synced to disk.
+fn write_temp(target: &Path, text: &str) -> Result<PathBuf> {
+    use std::io::Write;
+    let name = target
+        .file_name()
+        .context("no file name")?
+        .to_string_lossy()
+        .into_owned();
+    let temp = target.with_file_name(format!(".{name}.wats-{}.tmp", std::process::id()));
+    let _ = std::fs::remove_file(&temp);
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+    let written = (|| -> std::io::Result<()> {
+        let mut out = options.open(&temp)?;
+        if let Ok(meta) = std::fs::metadata(target) {
+            out.set_permissions(meta.permissions())?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::MetadataExt;
+                let _ = std::os::unix::fs::fchown(&out, Some(meta.uid()), Some(meta.gid()));
+            }
+        }
+        out.write_all(text.as_bytes())?;
+        out.sync_all()
+    })();
+    if let Err(e) = written {
+        let _ = std::fs::remove_file(&temp);
+        return Err(e).with_context(|| format!("write {}", temp.display()));
+    }
+    Ok(temp)
+}
+
+/// A copy of `text`, the content of `target` before a repair, as
+/// `<target>.wats-repair.bak-<UTC timestamp>` with its mode: none when the
+/// newest such copy already holds it, and only the newest
+/// [`MAX_BACKUPS`] are kept. Backups by `wats setup` (`<target>.bak-…`) are
+/// never touched.
+fn backup(target: &Path, text: &str, now: u64) -> Result<Option<PathBuf>> {
+    let name = target
+        .file_name()
+        .context("no file name")?
+        .to_string_lossy()
+        .into_owned();
+    let stem = target.with_file_name(format!("{name}.wats-repair"));
+    let prefix = format!("{name}.wats-repair.bak-");
+    let dir = target.parent().context("no directory")?;
+    let mut existing: Vec<PathBuf> = std::fs::read_dir(dir)
+        .map(|entries| {
+            entries
+                .filter_map(|e| e.ok().map(|e| e.path()))
+                .filter(|p| {
+                    p.file_name()
+                        .is_some_and(|n| n.to_string_lossy().starts_with(&prefix))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    existing.sort();
+    if let Some(newest) = existing.last()
+        && std::fs::read_to_string(newest).is_ok_and(|t| t == text)
+    {
+        return Ok(Some(newest.clone()));
+    }
+    let path = crate::openclaw::backup_path(&stem, now);
+    let temp = write_temp(target, text)?;
+    std::fs::rename(&temp, &path)
+        .with_context(|| format!("back up {} to {}", target.display(), path.display()))?;
+    existing.push(path.clone());
+    let extra = existing.len().saturating_sub(MAX_BACKUPS);
+    for old in existing.drain(..extra) {
+        let _ = std::fs::remove_file(old);
+    }
+    Ok(Some(path))
 }
 
 // ---------------------------------------------------------------------
@@ -482,9 +632,15 @@ fn claude_json(file: &Path, repair: bool, now: u64) -> Vec<Finding> {
         matches!(path, [Seg::Key(a), Seg::Key(b), Seg::Key(c)]
             if a == "mcpServers" && b == "wats" && c == "command")
     };
-    settle(Tool::Claude, file, sites, repair, now, |map| {
-        replace_json_strings(&text, &at, map)
-    })
+    settle(
+        Tool::Claude,
+        file,
+        &text,
+        sites,
+        repair,
+        now,
+        |text, map| replace_json_strings(text, &at, map),
+    )
 }
 
 /// Claude Code's settings.json: our `hooks.<event>[].hooks[].command`.
@@ -507,9 +663,15 @@ fn claude_settings(file: &Path, repair: bool, now: u64) -> Vec<Finding> {
         .filter(|(_, command)| crate::hook::is_ours(command))
         .filter_map(|(_, command)| hook_site(Tool::Claude, command))
         .collect();
-    settle(Tool::Claude, file, sites, repair, now, |map| {
-        replace_json_strings(&text, &at, map)
-    })
+    settle(
+        Tool::Claude,
+        file,
+        &text,
+        sites,
+        repair,
+        now,
+        |text, map| replace_json_strings(text, &at, map),
+    )
 }
 
 /// A step of a path into a JSON document.
@@ -708,7 +870,8 @@ fn codex(file: &Path, repair: bool, now: u64) -> Vec<Finding> {
             site.fix = fix_command(Tool::Codex, "--mcp", Some(&dir));
         }
     }
-    settle(Tool::Codex, file, sites, repair, now, |map| {
+    settle(Tool::Codex, file, &text, sites, repair, now, |text, map| {
+        let mut doc: toml_edit::DocumentMut = text.parse().context("not valid TOML")?;
         codex_visit(&mut doc, &mut |_, value| {
             if let Some(new) = value.as_str().and_then(|v| map.get(v)).cloned() {
                 set_str(value, &new);
@@ -784,7 +947,7 @@ fn vibe(file: &Path, repair: bool, now: u64) -> Vec<Finding> {
     let Some(text) = read(file) else {
         return Vec::new();
     };
-    let Ok(mut doc) = text.parse::<toml_edit::DocumentMut>() else {
+    let Ok(doc) = text.parse::<toml_edit::DocumentMut>() else {
         return Vec::new();
     };
     let ours = |table: &toml_edit::Table| {
@@ -809,7 +972,8 @@ fn vibe(file: &Path, repair: bool, now: u64) -> Vec<Finding> {
             }
         }
     }
-    settle(Tool::Vibe, file, sites, repair, now, |map| {
+    settle(Tool::Vibe, file, &text, sites, repair, now, |text, map| {
+        let mut doc: toml_edit::DocumentMut = text.parse().context("not valid TOML")?;
         let servers = doc
             .get_mut("mcp_servers")
             .and_then(|s| s.as_array_of_tables_mut())
@@ -865,8 +1029,65 @@ fn shown_entry(output: &str) -> Option<serde_json::Map<String, Value>> {
     }
 }
 
-/// OpenClaw's `wats` and `wats-agent` entries. Looked at through its CLI
-/// only when openclaw.json has a stale wats path at all.
+/// Whether a value of an entry `openclaw mcp show` printed looks redacted
+/// (`***`, `<redacted>`…): setting such an entry again would write the
+/// mask instead of the secret.
+fn redacted(value: &Value) -> bool {
+    match value {
+        Value::String(s) => {
+            let lower = s.to_ascii_lowercase();
+            s.contains("***") || s.contains('•') || lower.contains("redacted")
+        }
+        Value::Array(items) => items.iter().any(redacted),
+        Value::Object(map) => map.values().any(redacted),
+        _ => false,
+    }
+}
+
+/// Run `cli args`, stdin closed, stderr dropped; killed after `limit`
+/// (None then, or when it cannot start), so that a hung OpenClaw never
+/// holds up the node or `wats status`.
+fn run_for(cli: &Path, args: &[&str], limit: Duration) -> Option<std::process::Output> {
+    use std::io::Read;
+    let mut child = std::process::Command::new(cli)
+        .args(args)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .ok()?;
+    let mut stdout = child.stdout.take()?;
+    let reader = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = stdout.read_to_end(&mut buf);
+        buf
+    });
+    let deadline = Instant::now() + limit;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(25));
+            }
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+        }
+    };
+    let stdout = reader.join().ok()?;
+    Some(std::process::Output {
+        status,
+        stdout,
+        stderr: Vec::new(),
+    })
+}
+
+/// OpenClaw's `wats` and `wats-agent` entries, when openclaw.json has a
+/// stale wats path at all. Only checked (`repair` false): from the file
+/// alone, no CLI is run. Repaired: through `openclaw mcp show` and `mcp
+/// set` ([`OPENCLAW_TIMEOUT`] each), when the entry shows no redacted value.
 fn openclaw(
     file: &Path,
     cli: Option<&Path>,
@@ -891,26 +1112,24 @@ fn openclaw(
         path,
         outcome,
     };
-    let Some(cli) = cli else {
-        return vec![finding(
-            "a wats MCP server",
-            any,
-            Outcome::Left {
-                fix: fix_command(Tool::OpenClaw, "--mcp", None),
-                error: repair.then(|| "no openclaw CLI on PATH".to_string()),
-            },
-        )];
+    let cli = match cli {
+        Some(cli) if repair => cli,
+        cli => {
+            let auto = cli.is_some() && homebrew_relink(Path::new(&any)).is_some();
+            return vec![finding(
+                "a wats MCP server",
+                any,
+                Outcome::Left {
+                    fix: fix_command(Tool::OpenClaw, "--mcp", None),
+                    error: repair.then(|| "no openclaw CLI on PATH".to_string()),
+                    auto: auto && !repair,
+                },
+            )];
+        }
     };
-    let run = |args: &[&str]| {
-        std::process::Command::new(cli)
-            .args(args)
-            .stdin(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .output()
-            .ok()
-    };
+    let run = |args: &[&str]| run_for(cli, args, OPENCLAW_TIMEOUT);
     let mut out = Vec::new();
-    let mut backup: Option<Option<PathBuf>> = None;
+    let mut copied: Option<Option<PathBuf>> = None;
     for (name, flag) in [("wats", "--mcp"), (oc::AGENT_SERVER, "--agent")] {
         let Some(shown) = run(&["mcp", "show", name]).filter(|o| o.status.success()) else {
             continue;
@@ -941,9 +1160,9 @@ fn openclaw(
         let dir = dir_arg(args.iter().map(String::as_str));
         let label = format!("the {name} MCP server");
         let fix = fix_command(Tool::OpenClaw, flag, dir.as_deref());
-        let relink = homebrew_relink(Path::new(&command));
-        // The agent's entry carries the runner token: re-set only when
-        // `mcp show` shows it as it is (not redacted).
+        // Set again only what `mcp show` shows in full: no masked value,
+        // and for the agent's entry, the runner token wats keeps.
+        let masked = entry.values().any(redacted);
         let token_ok = name != oc::AGENT_SERVER || {
             let own = dir
                 .as_deref()
@@ -956,33 +1175,57 @@ fn openclaw(
             oc::read_token(&oc::runner_token_path(&own))
                 .is_ok_and(|t| Some(t.as_str()) == shown_token)
         };
-        let (Some(link), true, true) = (relink, repair, token_ok) else {
-            let error = (repair && !token_ok)
-                .then(|| "`openclaw mcp show` does not show its runner token".to_string());
-            out.push(finding(&label, command, Outcome::Left { fix, error }));
+        let Some(link) = homebrew_relink(Path::new(&command)) else {
+            out.push(finding(
+                &label,
+                command,
+                Outcome::Left {
+                    fix,
+                    error: None,
+                    auto: false,
+                },
+            ));
             continue;
         };
+        if masked || !token_ok {
+            let error = if masked {
+                "`openclaw mcp show` masks a value of it"
+            } else {
+                "`openclaw mcp show` does not show its runner token"
+            };
+            out.push(finding(
+                &label,
+                command,
+                Outcome::Left {
+                    fix,
+                    error: Some(error.into()),
+                    auto: false,
+                },
+            ));
+            continue;
+        }
         // A copy of openclaw.json first, once.
-        let copied = backup
-            .get_or_insert_with(|| {
-                let path = oc::backup_path(file, now);
-                std::fs::copy(file, &path).ok().map(|_| path)
-            })
+        let target = file.canonicalize().unwrap_or_else(|_| file.to_path_buf());
+        let backup = copied
+            .get_or_insert_with(|| backup(&target, &text, now).ok().flatten())
             .clone();
         entry.insert("command".into(), json!(link.to_string_lossy()));
         let set = run(&["mcp", "set", name, &Value::Object(entry).to_string()]);
         let outcome = match set {
-            Some(o) if o.status.success() => Outcome::Repaired {
-                to: link,
-                backup: copied,
-            },
+            Some(o) if o.status.success() => Outcome::Repaired { to: link, backup },
             Some(o) => Outcome::Left {
                 fix,
                 error: Some(format!("`openclaw mcp set {name}` failed ({})", o.status)),
+                auto: false,
             },
             None => Outcome::Left {
                 fix,
-                error: Some(format!("could not run {}", cli.display())),
+                error: Some(format!(
+                    "{} did not answer within {}s",
+                    cli.display(),
+                    OPENCLAW_TIMEOUT.as_secs()
+                )),
+                auto: false,
             },
         };
         out.push(finding(&label, command, outcome));
@@ -1057,7 +1300,7 @@ mod tests {
                     p.file_name()
                         .unwrap()
                         .to_string_lossy()
-                        .starts_with(&format!("{name}.bak-"))
+                        .starts_with(&format!("{name}.wats-repair.bak-"))
                 })
                 .collect()
         }
@@ -1213,7 +1456,8 @@ mod tests {
             found[0].outcome,
             Outcome::Left {
                 fix: "wats --dir '/my data' setup claude --mcp".into(),
-                error: None
+                error: None,
+                auto: false
             }
         );
         assert!(found[0].line().contains("which no longer exists"));
@@ -1242,7 +1486,7 @@ mod tests {
         std::fs::write(
             &cli,
             format!(
-                "#!/bin/sh\ncase \"$1 $2\" in\n'mcp show') [ -f {d}/entry-$3.json ] || exit 1; \
+                "#!/bin/sh\necho \"$*\" >> {d}/calls\ncase \"$1 $2\" in\n'mcp show') [ -f {d}/entry-$3.json ] || exit 1; \
                  cat {d}/entry-$3.json;;\n'mcp set') printf '%s\\n' \"$4\" > {d}/entry-$3.json;;\n\
                  *) exit 2;;\nesac\n",
                 d = state.display()
@@ -1277,14 +1521,42 @@ mod tests {
         );
 
         at.openclaw_cli = Some(cli);
+        // Only checked: from the file alone, the CLI never runs.
+        let found = check(&at, &data, false, 0);
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert!(
+            found[0]
+                .line()
+                .contains("the node repairs it at its next start")
+        );
+        assert!(!state.join("calls").exists());
+
+        // A token that is not wats's, shown in full: left to setup.
+        let mut other = agent.clone();
+        other["env"]["WATS_RUNNER_TOKEN"] = json!("someone-else");
+        std::fs::write(state.join("entry-wats-agent.json"), other.to_string()).unwrap();
+        let found = check(&at, &data, true, 0);
+        let Outcome::Left { error, .. } = &found[1].outcome else {
+            panic!("{found:?}")
+        };
+        assert!(
+            error.as_deref().unwrap().contains("runner token"),
+            "{error:?}"
+        );
+        std::fs::write(state.join("entry-wats.json"), entry.to_string()).unwrap();
+        std::fs::write(state.join("entry-wats-agent.json"), agent.to_string()).unwrap();
+
         let found = check(&at, &data, true, 0);
         assert_eq!(found.len(), 2, "{found:?}");
         assert!(found[0].repaired(), "{found:?}");
-        let Outcome::Left { fix, error } = &found[1].outcome else {
+        let Outcome::Left { fix, error, .. } = &found[1].outcome else {
             panic!("{found:?}")
         };
         assert_eq!(fix, "wats setup openclaw --agent");
-        assert!(error.as_deref().unwrap().contains("runner token"));
+        assert!(
+            error.as_deref().unwrap().contains("masks a value"),
+            "{error:?}"
+        );
         let set: Value =
             serde_json::from_str(&std::fs::read_to_string(state.join("entry-wats.json")).unwrap())
                 .unwrap();
@@ -1305,6 +1577,110 @@ mod tests {
         assert_eq!(found.len(), 1, "{found:?}");
         assert!(found[0].repaired(), "{found:?}");
         assert_eq!(found[0].entry, "the wats-agent MCP server");
+        // openclaw.json did not change: no second backup.
+        assert_eq!(f.backups(".openclaw/openclaw.json").len(), 1);
+    }
+
+    #[test]
+    fn a_hung_cli_is_killed() {
+        let started = Instant::now();
+        let out = run_for(Path::new("/bin/sleep"), &["10"], Duration::from_millis(200));
+        assert!(out.is_none());
+        assert!(started.elapsed() < Duration::from_secs(5));
+        let out = run_for(Path::new("/bin/echo"), &["hi"], Duration::from_secs(5)).unwrap();
+        assert_eq!(out.stdout, b"hi\n");
+    }
+
+    #[test]
+    fn redacted_values_are_seen() {
+        assert!(redacted(&json!({"env": {"T": "***"}})));
+        assert!(redacted(&json!(["<REDACTED>"])));
+        assert!(!redacted(&json!({"env": {"T": "abc"}, "args": ["mcp"]})));
+    }
+
+    #[test]
+    fn repairs_write_atomically_and_keep_few_backups() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        // A symlinked dotfile (a dotfiles repo): the target is replaced,
+        // the link stays.
+        let real = dir.join("dotfiles/claude.json");
+        std::fs::create_dir_all(real.parent().unwrap()).unwrap();
+        std::fs::write(&real, "one").unwrap();
+        std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o640)).unwrap();
+        let link = dir.join(".claude.json");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let backups = || -> Vec<PathBuf> {
+            let mut found: Vec<PathBuf> = std::fs::read_dir(real.parent().unwrap())
+                .unwrap()
+                .map(|e| e.unwrap().path())
+                .filter(|p| p.to_string_lossy().contains(".wats-repair.bak-"))
+                .collect();
+            found.sort();
+            found
+        };
+        let upper = |t: &str| Ok(t.to_uppercase());
+        let backup = commit(&link, "one", &upper, 0).unwrap().unwrap();
+        assert!(
+            std::fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(std::fs::read_to_string(&real).unwrap(), "ONE");
+        assert_eq!(
+            std::fs::metadata(&real).unwrap().permissions().mode() & 0o777,
+            0o640
+        );
+        assert_eq!(std::fs::read_to_string(&backup).unwrap(), "one");
+        assert_eq!(
+            std::fs::metadata(&backup).unwrap().permissions().mode() & 0o777,
+            0o640
+        );
+        // No temporary file left.
+        assert!(
+            std::fs::read_dir(real.parent().unwrap())
+                .unwrap()
+                .all(|e| !e.unwrap().path().to_string_lossy().ends_with(".tmp"))
+        );
+
+        // The same content again: the newest backup serves; at most 3.
+        for (i, text) in ["one", "two", "three", "four", "five"].iter().enumerate() {
+            std::fs::write(&real, text).unwrap();
+            commit(&link, text, &upper, i as u64 * 60).unwrap();
+            std::fs::write(&real, text).unwrap();
+            commit(&link, text, &upper, i as u64 * 60 + 1).unwrap();
+        }
+        let kept = backups();
+        assert_eq!(kept.len(), MAX_BACKUPS, "{kept:?}");
+        assert_eq!(
+            std::fs::read_to_string(kept.last().unwrap()).unwrap(),
+            "five"
+        );
+
+        // Changed under us once: redone on the fresh text.
+        std::fs::write(&real, "six").unwrap();
+        let changed = std::cell::Cell::new(false);
+        let edit = |t: &str| {
+            if !changed.replace(true) {
+                std::fs::write(&real, "seven").unwrap();
+            }
+            Ok(t.to_uppercase())
+        };
+        commit(&link, "six", &edit, 1000).unwrap();
+        assert_eq!(std::fs::read_to_string(&real).unwrap(), "SEVEN");
+        // Changed under us every time: given up, the file as the other
+        // writer left it.
+        let n = std::cell::Cell::new(0);
+        let edit = |t: &str| {
+            n.set(n.get() + 1);
+            std::fs::write(&real, format!("w{}", n.get())).unwrap();
+            Ok(format!("{t}!"))
+        };
+        let err = commit(&link, "SEVEN", &edit, 2000).unwrap_err();
+        assert!(format!("{err:#}").contains("kept changing"), "{err:#}");
+        assert_eq!(std::fs::read_to_string(&real).unwrap(), "w2");
     }
 
     #[test]

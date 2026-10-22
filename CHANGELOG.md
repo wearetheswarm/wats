@@ -7,10 +7,10 @@
 - **Homebrew users who ran `wats setup <tool> --mcp` with 0.4.3 or
   older**: your agent tools run wats from a versioned Cellar path
   (`/opt/homebrew/Cellar/wats/0.4.3/bin/wats`), which `brew cleanup`
-  removes after an upgrade. 0.4.4 repairs those entries at its first start
-  (or at your first `wats status`) and prints which file it fixed. Until
-  then, if `brew cleanup` has already run, run `wats setup <tool> --mcp`
-  again (`claude`, `codex`, `openclaw` or `vibe`).
+  removes after an upgrade. A 0.4.4 node repairs those entries at its
+  first start and logs which file it fixed; `wats status` warns about them
+  before. Until then, if `brew cleanup` has already run, run `wats setup
+  <tool> --mcp` again (`claude`, `codex`, `openclaw` or `vibe`).
 
 ### Changes
 
@@ -23,15 +23,17 @@
   cleanup` every agent tool lost the swarm without a word. Installs by
   install.sh are unchanged. The background node is also respawned through
   Homebrew's link once the running binary is gone. ADR 0032.
-- **Stale registrations are found and repaired.** At each node start and
-  in `wats status`, wats checks its own entries in each tool's config: the
-  `wats` (and `wats-agent`) MCP servers and the wats session hooks. A path
-  that is gone, or in a versioned Cellar directory, is rewritten to
-  Homebrew's link, after a backup copy, and nothing else in the file
-  changes. OpenClaw's entries go through `openclaw mcp set`. When there is
-  no such link, wats warns with the exact `wats setup <tool> --mcp` command
-  that fixes it, in the log, in `wats status` and in the MCP `status` tool
-  (`registrations`). Entries that are not wats's are never touched.
+- **Stale registrations are found and repaired.** At each start, a node
+  checks wats's own entries in each tool's config: the `wats` (and
+  `wats-agent`) MCP servers and the wats session hooks. A path that is
+  gone, or in a versioned Cellar directory, is rewritten to Homebrew's
+  link, and nothing else in the file changes. The write is atomic, after a
+  backup (`<file>.wats-repair.bak-<time>`, at most 3 kept). OpenClaw's
+  entries go through `openclaw mcp set`. `wats status` only checks: it
+  says the node repairs the entry at its next start, or gives the exact
+  `wats setup <tool> --mcp` command when there is no such link; so does
+  the MCP `status` tool (`registrations`). Entries that are not wats's are
+  never touched.
 
 ## 0.4.3 (2026-10-21)
 

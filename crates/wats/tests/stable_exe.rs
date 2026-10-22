@@ -105,11 +105,27 @@ fn setup_registers_homebrews_link() {
     }
 }
 
-/// `wats status` repairs a stale path Homebrew's link replaces (only that
-/// string changes, after a backup), and warns with the fix for one it
-/// cannot. In hermetic mode it reads no config unless asked.
+/// The `.wats-repair.bak-*` copies of `file`.
+fn repair_backups(file: &Path) -> usize {
+    let name = file.file_name().unwrap().to_string_lossy().into_owned();
+    std::fs::read_dir(file.parent().unwrap())
+        .unwrap()
+        .filter(|e| {
+            e.as_ref()
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(&format!("{name}.wats-repair.bak-"))
+        })
+        .count()
+}
+
+/// `wats status` only checks: it warns, saying whether the node repairs
+/// the entry at its next start. The node's start repairs a stale path
+/// Homebrew's link replaces (only that string changes, after a backup);
+/// setup fixes the rest. In hermetic mode nothing is read unless asked.
 #[test]
-fn status_repairs_stale_registrations() {
+fn stale_registrations_are_reported_then_repaired_at_node_start() {
     let brew = Brew::new();
     let home = brew.home();
     // Registered by 0.4.2, removed by `brew cleanup`.
@@ -121,25 +137,29 @@ fn status_repairs_stale_registrations() {
         old.display(),
         old.display()
     );
-    std::fs::write(home.join(".claude.json"), &claude).unwrap();
+    let claude_file = home.join(".claude.json");
+    std::fs::write(&claude_file, &claude).unwrap();
     std::fs::create_dir_all(home.join(".vibe")).unwrap();
     let vibe = "[[mcp_servers]]\nname = \"wats\"\ntransport = \"stdio\"\n\
                 command = \"/gone/bin/wats\"\nargs = [\"mcp\"]\n";
     std::fs::write(home.join(".vibe/config.toml"), vibe).unwrap();
+    let asked = |args: &[&str]| {
+        let mut command = brew.wats(&brew.link, args);
+        command.env("WATS_CHECK_REGISTRATIONS", "1");
+        command
+    };
 
-    // Hermetic, not asked: nothing read, nothing changed.
+    // Hermetic, not asked: nothing read.
     let said = brew.run(brew.wats(&brew.link, &["status"]));
     assert!(!said.contains("wats MCP server"), "{said}");
-    assert_eq!(
-        std::fs::read_to_string(home.join(".claude.json")).unwrap(),
-        claude
-    );
 
-    let mut command = brew.wats(&brew.link, &["status"]);
-    command.env("WATS_CHECK_REGISTRATIONS", "1");
-    let said = brew.run(command);
+    // `wats status`: warnings only, nothing written.
+    let said = brew.run(asked(&["status"]));
     assert!(
-        said.contains("Claude Code: fixed the wats MCP server in "),
+        said.contains("warning: Claude Code: the wats MCP server in ")
+            && said.contains(
+                "the node repairs it at its next start, or run `wats setup claude --mcp`"
+            ),
         "{said}"
     );
     assert!(
@@ -147,45 +167,52 @@ fn status_repairs_stale_registrations() {
             && said.contains("run `wats setup vibe --mcp` to fix it"),
         "{said}"
     );
+    assert_eq!(std::fs::read_to_string(&claude_file).unwrap(), claude);
+    assert_eq!(repair_backups(&claude_file), 0);
+    let status: serde_json::Value =
+        serde_json::from_str(&brew.run(asked(&["status", "--json"]))).unwrap();
+    let left = status["registrations"].as_array().unwrap();
+    assert_eq!(left.len(), 2, "{status}");
+    assert_eq!(left[0]["tool"], "claude");
+    assert_eq!(left[0]["repaired_at_next_start"], true);
+    assert_eq!(left[1]["fix"], "wats setup vibe --mcp");
+    assert_eq!(left[1]["repaired_at_next_start"], false);
+
+    // The node's start repairs the Claude Code entry.
+    let mut node = asked(&["node"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
     let wanted = claude.replacen(
         &format!("\"command\": \"{}\",", old.display()),
         &format!("\"command\": \"{}\",", brew.link.display()),
         1,
     );
     assert_ne!(wanted, claude);
-    assert_eq!(
-        std::fs::read_to_string(home.join(".claude.json")).unwrap(),
-        wanted
-    );
-    let backups = std::fs::read_dir(&home)
-        .unwrap()
-        .filter(|e| {
-            e.as_ref()
-                .unwrap()
-                .file_name()
-                .to_string_lossy()
-                .starts_with(".claude.json.bak-")
-        })
-        .count();
-    assert_eq!(backups, 1);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    while std::fs::read_to_string(&claude_file).unwrap() != wanted {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "not repaired: {}",
+            std::fs::read_to_string(&claude_file).unwrap()
+        );
+        if let Some(status) = node.try_wait().unwrap() {
+            panic!("the node exited: {status}");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    let _ = node.kill();
+    let _ = node.wait();
+    assert_eq!(repair_backups(&claude_file), 1);
     assert_eq!(
         std::fs::read_to_string(home.join(".vibe/config.toml")).unwrap(),
         vibe
     );
 
-    // --json: the one left, with its fix.
-    let mut command = brew.wats(&brew.link, &["status", "--json"]);
-    command.env("WATS_CHECK_REGISTRATIONS", "1");
-    let status: serde_json::Value = serde_json::from_str(&brew.run(command)).unwrap();
-    let left = status["registrations"].as_array().unwrap();
-    assert_eq!(left.len(), 1, "{status}");
-    assert_eq!(left[0]["tool"], "vibe");
-    assert_eq!(left[0]["fix"], "wats setup vibe --mcp");
-
-    // Setup fixes that one.
+    // Setup fixes the other one.
     brew.run(brew.wats(&brew.link, &["setup", "vibe", "--mcp"]));
-    let mut command = brew.wats(&brew.link, &["status", "--json"]);
-    command.env("WATS_CHECK_REGISTRATIONS", "1");
-    let status: serde_json::Value = serde_json::from_str(&brew.run(command)).unwrap();
+    let status: serde_json::Value =
+        serde_json::from_str(&brew.run(asked(&["status", "--json"]))).unwrap();
     assert!(status.get("registrations").is_none(), "{status}");
 }

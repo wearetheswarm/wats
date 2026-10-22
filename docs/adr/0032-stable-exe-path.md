@@ -32,20 +32,37 @@ to start wats, and its sessions lose the swarm without saying so.
 2. **Check wats's own entries** at each start of the node and in `wats
    status`. An entry is stale when its wats path no longer exists, or is
    in a versioned Cellar directory (gone at the next cleanup).
-3. **Repair automatically only the path of wats's own entry, and only to
-   Homebrew's link of the same prefix**, when that link exists and leads
-   into the Cellar of wats. The file is copied to `<file>.bak-<UTC
-   timestamp>` first, and only the bytes of that one string change: JSON
-   is edited in place, TOML through `toml_edit`, and OpenClaw's config only
-   through `openclaw mcp set`, with the entry `openclaw mcp show` printed.
-   One line names the file fixed: in the node's log, and printed by `wats
-   status`.
-4. **Otherwise, warn** with the command that fixes it (`wats setup <tool>
+3. **The node's start is the only automatic repair.** `wats status` only
+   checks and warns: its line says that the node repairs the entry at its
+   next start, or gives the `wats setup` command.
+4. **Repair only the path of wats's own entry, and only to Homebrew's link
+   of the same prefix**, when that link exists and leads into the Cellar
+   of wats. Only the bytes of that one string change: JSON is edited in
+   place, TOML through `toml_edit`, and OpenClaw's config only through
+   `openclaw mcp set`, with the entry `openclaw mcp show` printed. One
+   line in the node's log names the file fixed.
+   - **A backup first**: `<file>.wats-repair.bak-<UTC timestamp>`, with
+     the file's mode. None when the newest one already holds the same
+     content, and only the newest 3 are kept. Setup's own backups
+     (`<file>.bak-…`) are never touched.
+   - **An atomic write**: a temporary file next to the target (same mode,
+     and owner when allowed), synced, then renamed over it. A symlinked
+     dotfile is resolved first, so that the target is replaced, not the
+     link. Just before the rename the file is read again: when it changed
+     (Claude Code rewrites `~/.claude.json` often), the edit is redone
+     once on the fresh content; a second change gives up with a warning.
+   - **A bounded OpenClaw**: each `openclaw` command is killed after 3
+     seconds, so a hung OpenClaw holds up neither the node's exit nor
+     `wats status`. `wats status` never runs it: it reads openclaw.json
+     only.
+5. **Otherwise, warn** with the command that fixes it (`wats setup <tool>
    --mcp`, with `--dir` when the entry has one): in the log, in `wats
    status`, and in the MCP `status` tool (`registrations`). Running setup
    again always fixes it, since it writes the stable path.
 
-Hermetic mode (tests) never reads the tools' configs, unless
+Only a node on the real network checks. Hermetic and loopback modes
+(tests, local demos) never read the tools' configs, nor does a wats run by
+`cargo test` or `cargo run` of wats itself (`CARGO_PKG_NAME=wats`), unless
 `WATS_CHECK_REGISTRATIONS=1` asks it to, with a throwaway HOME.
 
 ## Why the repair is this narrow
@@ -63,19 +80,20 @@ Hermetic mode (tests) never reads the tools' configs, unless
 - **Entries that are not ours are never touched**, even when they run the
   same stale path. Only the `wats` and `wats-agent` MCP entries and the
   hooks with `notify --hook` are ours.
-- **Secrets are not round-tripped blindly.** OpenClaw's `wats-agent` entry
-  carries the runner token. It is set again only when `openclaw mcp show`
-  shows the very token wats keeps (not a redacted one). Otherwise wats
-  warns.
+- **Secrets are not round-tripped blindly.** An OpenClaw entry is set
+  again only when `openclaw mcp show` shows no masked value anywhere in
+  it (`***`, `<redacted>`…), and the `wats-agent` entry only when it shows
+  the very runner token wats keeps. Otherwise wats warns.
 
 ## Consequences
 
 - Users who registered with 0.4.3 or older are repaired at the first start
-  of 0.4.4 (or at their first `wats status`). Until then, after a `brew
+  of a 0.4.4 node; `wats status` says so before. Until then, after a `brew
   cleanup`, `wats setup <tool> --mcp` fixes it.
 - Codex may ask to review a repaired hook again (`/hooks`): the notice
   says so.
-- Not covered yet: Claude Code's project and local scopes (`.mcp.json`,
+- Follow-ups, not covered yet: project-scoped Claude Code entries (a
+  project's `.mcp.json` and `.claude/settings.json`, and the local scope,
   `projects.*` in `~/.claude.json`), project-level Vibe configs, and
   OpenClaw configs at a path other than the default or the `OPENCLAW_*`
   variables. Setup fixes those.
