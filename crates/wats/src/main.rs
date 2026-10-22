@@ -2402,6 +2402,7 @@ fn setup_tool(
         {
             let access = wats::access::level(member.settings.access.as_deref())?;
             if access == wats::access::Access::Inherit {
+                println!("{}", wats::opencode::INHERIT_WARNING);
                 // The runner refuses to start so; setup says it now.
                 if let Err(e) = wats::opencode::check_access(
                     access,

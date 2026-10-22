@@ -4,6 +4,11 @@
 
 ### Changes
 
+- **OpenCode `inherit` follows Vibe's rule** (ADR 0031, question 10):
+  `agent.review = true` or an explicit `agent.allow` is enough, where
+  0.4.4 and 0.4.5 needed both. `wats setup opencode --agent --access
+  inherit` and `wats access` say that OpenCode allows every tool by
+  default.
 - **npm and PyPI wrappers, not published yet** ([ADR 0035](docs/adr/0035-npx-and-uvx-wrappers.md),
   `packages/npm`, `packages/pypi`): so that MCP hosts can start wats with
   `npx -y <package> mcp` or `uvx <package> mcp`. A wrapper of version

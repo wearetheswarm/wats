@@ -43,19 +43,24 @@ pub const MIN_VERSION: Version = Version(1, 17, 0);
 /// source). A later one runs, with a warning.
 pub const CHECKED_MAJOR: u64 = 1;
 
-/// ADR 0031 open question 1, default pending confirmation: the agent's
+/// ADR 0031 question 1, confirmed by the product owner: the agent's
 /// provider settings live in its own OpenCode directory, filled by the
 /// user, and the user's global config never loads at `swarm-only` and
 /// `workspace`. `false` would leave `XDG_CONFIG_HOME` alone (the user's
 /// MCP servers and plugins would run with every swarm run).
 pub const ISOLATE_GLOBAL_CONFIG: bool = true;
 
-/// ADR 0031 open question 10, default pending confirmation: `inherit`
-/// needs `agent.allow` and `agent.review`, as for OpenClaw. `false` would
-/// only warn, as for Claude Code and Codex.
+/// `inherit` needs a guardrail, `agent.review` or an explicit
+/// `agent.allow`, as for Vibe (ADR 0031 question 10, superseded by the
+/// product owner's rule for both runtimes). `false` would only warn.
 pub const INHERIT_NEEDS_GUARDRAILS: bool = true;
 
-/// ADR 0031 open question 11, default pending confirmation: the USD
+/// Shown when `inherit` is chosen for OpenCode (`wats setup opencode
+/// --agent`, `wats access`).
+pub const INHERIT_WARNING: &str = "OpenCode allows every tool by default: with inherit, a post \
+     can make it read, edit or run anything you can";
+
+/// ADR 0031 question 11, confirmed by the product owner: the USD
 /// budgets are enforced from OpenCode's cost estimate (`step_finish`
 /// costs). `false` would count runs only, as for Codex.
 pub const ENFORCE_USD_BUDGET: bool = true;
@@ -266,15 +271,14 @@ pub fn check_extra_args(access: Access, extra: &[String]) -> Result<()> {
 }
 
 /// `inherit` hands swarm posts to the user's whole OpenCode environment,
-/// which allows every tool by default: refused without `agent.allow` and
-/// `agent.review` ([`INHERIT_NEEDS_GUARDRAILS`]).
+/// which allows every tool by default: refused without `agent.review` or
+/// an explicit `agent.allow` ([`INHERIT_NEEDS_GUARDRAILS`]).
 pub fn check_access(access: Access, allow: &[String], review: bool) -> Result<()> {
-    if INHERIT_NEEDS_GUARDRAILS && access == Access::Inherit && (allow.is_empty() || !review) {
+    if INHERIT_NEEDS_GUARDRAILS && access == Access::Inherit && allow.is_empty() && !review {
         bail!(
             "agent.access = inherit with OpenCode hands swarm posts to your own OpenCode \
-             environment, which allows every tool by default (shell, edits, web): set \
-             agent.allow (the authors who may wake it) and agent.review = true first, or use \
-             swarm-only or workspace"
+             environment ({INHERIT_WARNING}): set agent.review = true (its posts wait for you) \
+             or agent.allow (the authors who may wake it) first, or use swarm-only or workspace"
         );
     }
     Ok(())
@@ -1507,13 +1511,17 @@ mod tests {
         );
     }
 
+    /// `inherit` needs `agent.review` or an explicit `agent.allow`, as
+    /// for Vibe.
     #[test]
-    fn inherit_needs_allow_and_review() {
+    fn inherit_needs_review_or_allow() {
         let allow = s(&["ab"]);
-        assert!(check_access(Access::Inherit, &[], true).is_err());
-        assert!(check_access(Access::Inherit, &allow, false).is_err());
+        assert!(check_access(Access::Inherit, &[], true).is_ok());
+        assert!(check_access(Access::Inherit, &allow, false).is_ok());
         assert!(check_access(Access::Inherit, &allow, true).is_ok());
         assert!(check_access(Access::SwarmOnly, &[], false).is_ok());
+        let e = check_access(Access::Inherit, &[], false).unwrap_err();
+        assert!(format!("{e:#}").contains(INHERIT_WARNING), "{e:#}");
     }
 
     #[test]

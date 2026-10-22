@@ -817,9 +817,11 @@ pub fn describe(d: &Describe) -> Summary {
             true,
         ),
         Access::Inherit if d.runtime == "opencode" => (
-            "inherit: your full OpenCode environment: your config, MCP servers, plugins and \
-             permissions (OpenCode allows every tool by default)"
-                .to_string(),
+            format!(
+                "inherit: your full OpenCode environment: your config, MCP servers, plugins and \
+                 permissions ({})",
+                crate::opencode::INHERIT_WARNING
+            ),
             true,
             true,
         ),

@@ -199,12 +199,6 @@ pub const CHECKED_MAJOR: u64 = 3;
 /// `agent.allow`. `false` would only warn.
 pub const INHERIT_NEEDS_GUARDRAILS: bool = true;
 
-/// The product owner's rule for Vibe (ADR 0033 §2): either guardrail is
-/// enough (`agent.review = true`, or a non-empty `agent.allow`). `true`
-/// would need both, as OpenCode does today (ADR 0031 open question 10);
-/// aligning the two runtimes is pending the product owner's call.
-pub const INHERIT_NEEDS_BOTH: bool = false;
-
 /// The USD budgets are enforced from the cost Vibe writes to its run
 /// export (its estimate from the model's prices). `false` would count runs
 /// only, as for Codex.
@@ -341,23 +335,17 @@ pub fn access(value: Option<&str>) -> Result<Access> {
 
 /// `inherit` hands swarm posts to the user's whole Vibe environment, whose
 /// tools Vibe runs itself: refused without `agent.review` or an explicit
-/// `agent.allow` ([`INHERIT_NEEDS_GUARDRAILS`]; both with
-/// [`INHERIT_NEEDS_BOTH`]). `workspace` is refused.
+/// `agent.allow` ([`INHERIT_NEEDS_GUARDRAILS`], the same rule as
+/// OpenCode's). `workspace` is refused.
 pub fn check_access(access: Access, allow: &[String], review: bool) -> Result<()> {
     if access == Access::Workspace {
         bail!("{WORKSPACE_REFUSED}");
     }
-    let guarded = if INHERIT_NEEDS_BOTH {
-        !allow.is_empty() && review
-    } else {
-        !allow.is_empty() || review
-    };
-    if INHERIT_NEEDS_GUARDRAILS && access == Access::Inherit && !guarded {
+    if INHERIT_NEEDS_GUARDRAILS && access == Access::Inherit && allow.is_empty() && !review {
         bail!(
             "agent.access = inherit with Mistral Vibe hands swarm posts to your own Vibe \
              environment ({INHERIT_WARNING}): set agent.review = true (its posts wait for \
-             you) {} agent.allow (the authors who may wake it) first, or use swarm-only",
-            if INHERIT_NEEDS_BOTH { "and" } else { "or" }
+             you) or agent.allow (the authors who may wake it) first, or use swarm-only"
         );
     }
     Ok(())
@@ -1024,7 +1012,7 @@ mod tests {
     }
 
     /// `inherit` needs `agent.review` or an explicit `agent.allow` (either
-    /// one, unlike OpenCode's both).
+    /// one, as for OpenCode).
     #[test]
     fn inherit_needs_review_or_allow() {
         let allow = s(&["ab"]);

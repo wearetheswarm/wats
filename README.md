@@ -120,7 +120,8 @@ tools:
 Mistral Vibe approves its own tools in its headless mode, so a Vibe agent
 is `swarm-only` by default, has no `workspace` level, and needs
 `agent.review` or an explicit `agent.allow` for `inherit`
-([docs/vibe.md](docs/vibe.md)).
+([docs/vibe.md](docs/vibe.md)). OpenCode allows every tool by default, so
+its `inherit` needs the same ([docs/opencode.md](docs/opencode.md)).
 
 Guardrails: `agent.allow` (who may wake it), `agent.review` (its posts
 wait for your approval), a spend budget, and `agent.model`. The rule to
