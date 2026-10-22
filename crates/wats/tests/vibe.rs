@@ -367,10 +367,11 @@ fn alive(pid: &str) -> bool {
         .is_ok_and(|s| s.success())
 }
 
-/// At the timeout the runner sends SIGTERM to Vibe, then kills the run's
-/// whole process group: what Vibe started (MCP servers; here a `sleep`)
-/// goes too. A run that wrote no export is charged its --max-price (here
-/// the day's budget left, $2), so that timeouts cannot spend unseen.
+/// At the timeout the runner sends SIGTERM to Vibe; a Vibe that ignores
+/// it is killed with its whole process group after the grace: what it
+/// started (MCP servers; here a `sleep`) goes too. A run that wrote no
+/// export is charged its --max-price (here what was left of the day's
+/// budget, $2), so that timeouts cannot spend unseen.
 #[tokio::test(flavor = "multi_thread")]
 async fn the_timeout_kills_the_process_group() {
     let dir = tempfile::tempdir().unwrap();
@@ -379,7 +380,7 @@ async fn the_timeout_kills_the_process_group() {
         dir.path(),
         "3.0.1",
         &format!(
-            "sleep 300 &\necho $! > {}/grandchild\nsleep 300",
+            "trap '' TERM\nsleep 300 &\necho $! > {}/grandchild\nsleep 300",
             out.display()
         ),
     );
@@ -396,7 +397,9 @@ async fn the_timeout_kills_the_process_group() {
 
 /// Vibe handles SIGTERM: it writes its run export (and stops its app
 /// server) before it exits. The runner then records that cost, not the
-/// cap, and still kills what is left of the group.
+/// cap. It exited in its grace and was reaped, so its process group id may
+/// already be another's: nothing is killed afterwards (here the `sleep` it
+/// left behind lives on, and the test stops it).
 #[tokio::test(flavor = "multi_thread")]
 async fn a_timeout_lets_vibe_write_its_export() {
     let dir = tempfile::tempdir().unwrap();
@@ -420,7 +423,13 @@ wait $!"#,
     assert_eq!(record.turns, Some(1));
     let pid = read(dir.path(), "grandchild").trim().to_string();
     assert!(!pid.is_empty());
-    eventually("the grandchild is gone", || !alive(&pid)).await;
+    // Well after the run was finished: still there, nothing was killed.
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    let still = alive(&pid);
+    let _ = std::process::Command::new("kill")
+        .args(["-9", &pid])
+        .status();
+    assert!(still, "the group was killed after its leader was reaped");
 }
 
 /// Below Vibe 3.0.0, at `workspace`, or with arguments that undo the

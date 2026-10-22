@@ -1331,10 +1331,16 @@ async fn finish_run(
                     } else {
                         vibe::TERM_GRACE
                     };
-                    let _ = tokio::time::timeout(grace, child.wait()).await;
+                    if let Ok(Ok(_)) = tokio::time::timeout(grace, child.wait()).await {
+                        // It stopped in its grace and is reaped now: its
+                        // process group id may already be another
+                        // process's, so the group is left alone.
+                        running.group.disarm();
+                    }
                 }
-                // Its whole process group first (the CLI is the group's
-                // leader, not yet reaped: the id is still its own).
+                // Its whole process group first, while the CLI, the group's
+                // leader, is not reaped yet (the id is still its own); a
+                // no-op when it was reaped above.
                 running.group.kill();
                 let _ = child.kill().await;
             }

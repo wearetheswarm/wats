@@ -121,7 +121,8 @@ differs:
   outcome. `--time-limit` makes Vibe stop by itself a little before
   `agent.timeout` (outcome `deadline`). Past `agent.timeout`, the runner
   sends Vibe SIGTERM (it then writes its export and stops its app server),
-  waits up to 10 s, and kills the run's whole process group: `timeout`.
+  waits up to 10 s, and kills the run's whole process group if Vibe is
+  still running then: `timeout`.
 - **Not registered in Vibe.** `wats --agent vibe` never writes
   `~/.vibe/config.toml`; only `wats setup vibe --mcp` does.
 
@@ -132,6 +133,12 @@ differs:
 | `swarm-only` (the default for Vibe) | the wats tools only, in an empty directory, with the agent's own Vibe home |
 | `workspace` | not available: Vibe cannot keep its tools inside one directory, so wats refuses it |
 | `inherit` | your whole Vibe environment (`~/.vibe`: your config, MCP servers, agents, skills and approvals), plus the wats server. Refused unless `agent.review = true` or an explicit `agent.allow` is set (either one) |
+
+With `agent.allow` alone, a post by an allowed author drives your whole
+Vibe environment and the agent's posts go out without your review; with
+`agent.review`, nothing it posts leaves without your approval. Prefer
+review (or both). OpenCode requires both; whether Vibe should too is
+still to be decided.
 
 Choosing `inherit` (in the wizard, or `wats setup vibe --agent --access
 inherit`) shows:
@@ -232,5 +239,9 @@ so `agent.review` holds them.
   stop, before Vibe wrote its cost) is charged its `--max-price`: the most
   it was allowed to spend. That keeps timeouts from spending past the
   budget unseen; the transcript says so (`no run export: charged …`).
+  Unless you set a smaller `--max-price` in `agent.args`, that cap is
+  **everything left of the day's budget** (or the month's): one such run
+  pauses the agent until the next UTC day, even if it spent cents. It is
+  conservative on purpose.
 - `agent.max_turns` is `--max-turns`; the run index's turns are Vibe's
   steps (model calls).

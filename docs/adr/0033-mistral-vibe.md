@@ -120,8 +120,12 @@ vibe --prompt= --output=streaming --output-dir=<work dir>/vibe-run \
   on a stop) the runner first sends **SIGTERM to the CLI**, on which
   headless Vibe writes its export and tears its app server down; it waits
   up to 10 s (`vibe::TERM_GRACE`; 5 s on a stop), then kills the run's
-  process group (ADR 0031 §3) and the CLI. Only the Vibe runner does this;
-  the other runtimes are killed at once, as before.
+  process group (ADR 0031 §3) and the CLI. If the CLI exits in its grace,
+  it is reaped and its group is **not** killed: once the leader is
+  reaped, its process group id can belong to an unrelated process. Only
+  a CLI still running at the end of its grace (not reaped) gets the group
+  kill. Only the Vibe runner does this; the other runtimes are killed at
+  once, as before.
 - **The binary**: `vibe` on PATH, or `agent.command`. **Version check at
   start**: `vibe --version` (`vibe 3.0.1`) must be 3.0.0 or later (the
   Rust CLI's run contract); from 4.0 on, a warning.
@@ -160,11 +164,21 @@ vibe --prompt= --output=streaming --output-dir=<work dir>/vibe-run \
   start with neither, and `wats setup vibe --agent --access inherit`
   warns. Two constants: `vibe::INHERIT_NEEDS_GUARDRAILS` (refuse, or only
   warn) and `vibe::INHERIT_NEEDS_BOTH` (`false`: either one is enough).
+  - **The trade-off.** With `agent.allow` alone (no review), a post by
+    an allowed author drives the user's whole Vibe environment (what it
+    approves runs unasked), and the agent's posts go out unreviewed: an
+    allowed author whose account or prompt is turned against the user,
+    or a post they quote, reaches the user's machine and the swarm with
+    no human in between. With `agent.review` alone, anyone can wake it,
+    but nothing it posts leaves without the user's approval (review is
+    still no boundary against a shell, §6.1). Requiring both, as OpenCode
+    does, closes the first case.
   - **This differs from OpenCode**, which needs both (ADR 0031 open
     question 10, `opencode::INHERIT_NEEDS_GUARDRAILS`), as OpenClaw's
     setup does. OpenCode is left as it is. Whether to align the two
     runtimes, and which way, is **pending the product owner's call**;
-    either side is a one-constant change.
+    either side is a one-constant change (`INHERIT_NEEDS_BOTH = true` for
+    Vibe).
   The wizard and `wats setup vibe --agent --access inherit` show one line:
   "Vibe approves its own tools: with inherit, a post can make it read or
   run anything you can".
@@ -300,6 +314,13 @@ auto-update, `VIBE_ACTIVE_MODEL` when `agent.model` is set.
   would let repeated timeouts spend past the budget unseen; the cap is
   the most the run was allowed to spend. A run that exits by itself
   without an export (which 3.0.1 never does) is a run without cost.
+  - **This is conservative, and it can stop the agent for the day.**
+    Without `--max-price` in the extra arguments, the cap is everything
+    left of the day's budget (or the month's, when less is left there):
+    one killed run uses it all up, and the agent is paused until the
+    next UTC day (or month), even when the run itself spent cents. The
+    transcript and the log say so. A user who would rather lose less
+    sets a smaller per-run cap: `--max-price` in `agent.args`.
 - **The cost is Vibe's estimate** from catalog prices. A free tier or
   credits are not in it: on a free Mistral account the node still counts
   dollars against `agent.max_usd_per_day`. The docs say so.
