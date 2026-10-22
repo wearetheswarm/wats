@@ -25,15 +25,7 @@ struct Machine {
 impl Machine {
     fn new() -> Self {
         let tmp = tempfile::tempdir().unwrap();
-        for dir in [
-            "home",
-            "bin",
-            "vibe",
-            "xdg/config",
-            "xdg/data",
-            "xdg/state",
-            "xdg/cache",
-        ] {
+        for dir in ["home", "bin", "vibe", "xdg/state", "xdg/cache"] {
             std::fs::create_dir_all(tmp.path().join(dir)).unwrap();
         }
         // `wats stop` signals with kill(1): the only real command on PATH.
@@ -72,6 +64,22 @@ impl Machine {
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
     }
 
+    /// A fake `vibe` that answers `--version` (3.0.1), for a node that
+    /// runs it as its agent; otherwise as [`Machine::fake_cli`].
+    fn fake_vibe(&self) {
+        let path = self.path("bin").join("vibe");
+        std::fs::write(
+            &path,
+            format!(
+                "#!/bin/sh\nif [ \"$1\" = --version ]; then echo 'vibe 3.0.1'; exit 0; fi\n\
+                 printf 'vibe %s\\n' \"$*\" >> {}\n",
+                self.path("calls.log").display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
     /// `wats` with this machine's environment and `args` (none: a bare
     /// `wats`); `terminal`: as if on one.
     fn wats(&self, args: &[&str], terminal: bool) -> Command {
@@ -83,9 +91,10 @@ impl Machine {
             .env("WATS_DIR", self.data())
             .env("WATS_RUN_DIR", self.path("run"))
             .env("HOME", self.path("home"))
+            .env("XDG_CONFIG_HOME", self.path("home/.config"))
+            .env("XDG_DATA_HOME", self.path("home/.local/share"))
+            .env_remove("WATS_OPENCODE")
             .env("VIBE_HOME", self.path("vibe"))
-            .env("XDG_CONFIG_HOME", self.path("xdg/config"))
-            .env("XDG_DATA_HOME", self.path("xdg/data"))
             .env("XDG_STATE_HOME", self.path("xdg/state"))
             .env("XDG_CACHE_HOME", self.path("xdg/cache"))
             .env("PATH", self.path("bin"))
@@ -215,9 +224,25 @@ fn first_bare_wats_runs_the_wizard_then_the_node_in_the_background() {
         machine.fake_cli(name);
     }
     // No agent, detailed: the default disk budget and networks; security
-    // updates: yes; one by one: Claude Code: yes, its hook: yes; Codex:
-    // no; Vibe: yes (Enter); the background: Enter.
-    let child = machine.spawn(machine.wats(&[], true), "0\nd\n\n\ny\nd\ny\ny\nn\n\n\n");
+    // updates: yes; the node's name: the drawn one (Enter); one by one:
+    // Claude Code: yes, its hook: yes; Codex: no; Vibe: yes (Enter); the
+    // background: Enter.
+    let child = machine.spawn(
+        machine.wats(&[], true),
+        "0
+d
+
+
+y
+
+d
+y
+y
+n
+
+
+",
+    );
     let out = child.wait_with_output().unwrap();
     let (said, err) = (text(&out.stdout), text(&out.stderr));
     assert!(out.status.success(), "{out:?}");
@@ -262,6 +287,15 @@ fn first_bare_wats_runs_the_wizard_then_the_node_in_the_background() {
         said.contains("Install security updates automatically? (update.security_auto) [Y/n]"),
         "{said}"
     );
+    // The node's name (ADR 0023 §8): a drawn one as the default, kept in
+    // node-name (not config.toml, which wats 0.4.4 would refuse).
+    let name = std::fs::read_to_string(machine.data().join("node-name")).unwrap();
+    let name = name.trim();
+    assert!(
+        said.contains(&format!("Name of this node (node.name) [{name}]: ")),
+        "{said}"
+    );
+    assert_eq!(machine.running().unwrap()["name"], name);
     // The hints to run `wats setup <tool> --mcp` are questions here.
     assert!(
         !said.contains("wats setup vibe --mcp (running it"),
@@ -319,14 +353,15 @@ fn first_bare_wats_runs_the_wizard_then_the_node_in_the_background() {
     assert_eq!(node["mode"], "foreground", "{node}");
 }
 
-/// Enter for every question: no agent CLI it can run (Vibe only: an MCP
-/// host), quick, Vibe registered with the others (all), and the node in
-/// the background, recommended (ADR 0027, 0.4.5). Not a UTF-8 locale, and
+/// Enter for every question: Vibe only on PATH, so a Vibe agent (ADR
+/// 0033), quick (swarm-only, the budget of a subscription, the drawn
+/// name), Vibe registered for your own sessions (all), and the node in the
+/// background, recommended (ADR 0027, 0.4.5). Not a UTF-8 locale, and
 /// NO_COLOR: the screens in plain ASCII.
 #[test]
 fn wizard_defaults_run_the_node_in_the_background() {
     let machine = Machine::new();
-    machine.fake_cli("vibe");
+    machine.fake_vibe();
     let mut command = machine.wats(&[], true);
     command.env("LANG", "C").env("NO_COLOR", "1");
     let out = machine.spawn(command, "").wait_with_output().unwrap();
@@ -340,10 +375,19 @@ fn wizard_defaults_run_the_node_in_the_background() {
     assert!(said.contains("node       runs in the background"), "{said}");
     let screens = &said[..said.find("Agent CLIs found").unwrap()];
     assert!(screens.is_ascii() && !said.contains('\x1b'), "{said}");
-    assert!(said.contains("No agent CLI found"), "{said}");
+    assert!(
+        said.contains("Agent the node runs (agent.runtime) [vibe]"),
+        "{said}"
+    );
     assert!(said.contains(MODE), "{said}");
-    // Quick: neither the disk budget nor the networks are asked.
+    assert!(said.contains("swarm-only access"), "{said}");
+    // Quick: neither the disk budget, the networks, the access nor the
+    // name are asked; the budget is.
     assert!(!said.contains("(storage.max)"), "{said}");
+    assert!(!said.contains("(agent.access)"), "{said}");
+    assert!(!said.contains("(node.name)"), "{said}");
+    assert!(said.contains("Node name: "), "{said}");
+    assert!(said.contains("How is this agent paid? [1]: "), "{said}");
     assert!(
         said.contains("Set up wats in all the agent CLIs found (Mistral Vibe)"),
         "{said}"
@@ -356,8 +400,12 @@ fn wizard_defaults_run_the_node_in_the_background() {
     let node = machine.running().expect("ps lists it");
     assert_eq!(node["mode"], "detached", "{node}");
     assert_eq!(machine.revision().as_deref(), Some("2\n"));
-    // Quick wrote the recommended security updates, nothing else set.
+    // Quick wrote the agent, its budget and the recommended security
+    // updates, nothing else.
     let config = std::fs::read_to_string(machine.data().join("config.toml")).unwrap();
+    assert!(config.contains("\nruntime = \"vibe\"\n"), "{config}");
+    assert!(config.contains("\nmax_minutes_per_day = 120\n"), "{config}");
+    assert!(!config.contains("\naccess = "), "{config}");
     assert!(config.contains("\nsecurity_auto = true\n"), "{config}");
     assert!(config.contains("# max = \"10G\""), "{config}");
     machine.stop();
@@ -368,9 +416,9 @@ fn wizard_defaults_run_the_node_in_the_background() {
 #[test]
 fn step_three_detailed_runs_the_node_here_or_not_now() {
     let machine = Machine::new();
-    machine.fake_cli("vibe");
-    // Quick (Enter), all (Enter), choose (d), here (2).
-    let child = machine.spawn(machine.wats(&[], true), "\n\nd\n2\n");
+    machine.fake_vibe();
+    // No agent (0), quick (Enter), all (Enter), choose (d), here (2).
+    let child = machine.spawn(machine.wats(&[], true), "0\n\n\nd\n2\n");
     let (out, node) = machine.foreground(child);
     let said = text(&out.stdout);
     assert!(
@@ -766,9 +814,11 @@ fn an_older_revision_asks_only_the_new_questions() {
         assert_eq!(machine.revision().as_deref(), Some("0\n"));
     }
 
-    let child = machine.spawn(machine.wats(&[], true), "20G\n\n");
+    // No agent (Vibe, on PATH, is offered), then the disk budget.
+    let child = machine.spawn(machine.wats(&[], true), "0\n20G\n\n");
     let (out, node) = machine.foreground(child);
     let said = text(&out.stdout);
+    assert!(!said.contains("Use the swarm from your own"), "{said}");
     assert!(
         said.contains("wats setup has new questions since this data directory was set up"),
         "{said}"
@@ -794,9 +844,10 @@ fn an_older_revision_asks_only_the_new_questions() {
 #[test]
 fn wats_setup_with_no_tool_is_the_wizard() {
     let machine = Machine::new();
-    machine.fake_cli("vibe");
+    machine.fake_vibe();
+    // No agent (0), quick, all (Enter), then not now.
     let out = machine
-        .spawn(machine.wats(&["setup"], true), "\n\nn\n")
+        .spawn(machine.wats(&["setup"], true), "0\n\n\nn\n")
         .wait_with_output()
         .unwrap();
     let said = text(&out.stdout);
@@ -832,7 +883,7 @@ fn wats_setup_with_no_tool_is_the_wizard() {
         said.contains("wats setup: the node's main choices"),
         "{said}"
     );
-    assert!(said.contains("wats setup vibe --mcp (running it"), "{said}");
+    assert!(said.contains("wats setup vibe --mcp"), "{said}");
     assert!(
         !said.contains(WELCOME) && !said.contains("All set."),
         "{said}"
@@ -844,7 +895,7 @@ fn wats_setup_with_no_tool_is_the_wizard() {
 /// paused the agent then and means no limit since: after the upgrade the
 /// agent stays paused (no run), with one loud line in `wats status`, the
 /// node's start and the MCP status, until the budget question of `wats`
-/// (the catch-up) settles it and records revision 2 (ADR 0032 §5).
+/// (the catch-up) settles it and records revision 2 (ADR 0034 §5).
 #[test]
 fn a_usd_budget_of_zero_from_before_stays_paused() {
     let machine = Machine::new();
@@ -912,4 +963,101 @@ fn a_usd_budget_of_zero_from_before_stays_paused() {
     let config = std::fs::read_to_string(machine.data().join("config.toml")).unwrap();
     assert!(config.contains("max_usd_per_day = 3.0"), "{config}");
     assert!(!status(&machine).contains("budget_paused"));
+}
+
+/// OpenCode on PATH (ADR 0031): the wizard offers it as the node's agent,
+/// asks its model, and registers wats in the user's own OpenCode sessions
+/// through `opencode mcp add` (a fake: it answers `--version` and records
+/// its arguments).
+#[test]
+fn the_wizard_offers_opencode() {
+    let machine = Machine::new();
+    let fake = machine.path("bin").join("opencode");
+    std::fs::write(
+        &fake,
+        format!(
+            "#!/bin/sh\nif [ \"$1\" = --version ]; then echo 1.19.3; exit 0; fi\nprintf 'opencode %s\\n' \"$*\" >> {}\n",
+            machine.path("calls.log").display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let out = machine
+        .spawn(
+            machine.wats(&["setup"], true),
+            // OpenCode, its model, quick, a subscription, the budget as
+            // offered, all, not now.
+            "\nazure/gpt-test\n\n\n\n\nn\n",
+        )
+        .wait_with_output()
+        .unwrap();
+    let said = text(&out.stdout);
+    assert!(out.status.success(), "{out:?}");
+    assert!(said.contains("provider/model"), "{said}");
+    // The model goes with the agent: asked before quick or detailed.
+    assert!(
+        said.find("provider/model").unwrap() < said.find(MODE).unwrap(),
+        "{said}"
+    );
+    assert!(
+        said.contains("Daily budget: 120 min, no USD limit, no LLM token limit"),
+        "{said}"
+    );
+    assert!(
+        said.contains("Set up wats in all the agent CLIs found (OpenCode)"),
+        "{said}"
+    );
+    assert!(
+        said.contains("OpenCode: wats MCP server registered"),
+        "{said}"
+    );
+    let calls = machine.calls();
+    assert!(calls.contains("opencode mcp add wats -- "), "{calls}");
+    let config = std::fs::read_to_string(machine.data().join("config.toml")).unwrap();
+    assert!(config.contains("runtime = \"opencode\""), "{config}");
+    assert!(config.contains("model = \"azure/gpt-test\""), "{config}");
+}
+
+/// Mistral Vibe on PATH (ADR 0033): the wizard offers it as the node's
+/// agent, asks its own access question (no workspace: refused), shows the
+/// warning when inherit is chosen, and registers wats in the user's own
+/// Vibe sessions (the throwaway VIBE_HOME).
+#[test]
+fn the_wizard_offers_vibe_without_workspace() {
+    let machine = Machine::new();
+    machine.fake_vibe();
+    // Vibe, detailed: storage, timeout, turns, the budget (paid, line),
+    // then its access (workspace refused, inherit), networks, security
+    // updates, name; one by one: Vibe yes; not now.
+    let input = "\nd\n\n\n\n\n\nworkspace\ninherit\n\n\n\nd\n\nn\n";
+    let out = machine
+        .spawn(machine.wats(&["setup"], true), input)
+        .wait_with_output()
+        .unwrap();
+    let said = text(&out.stdout);
+    assert!(out.status.success(), "{out:?}");
+    assert!(
+        said.contains("Agent the node runs (agent.runtime) [vibe]"),
+        "{said}"
+    );
+    assert!(said.contains("(agent.access) [swarm-only]"), "{said}");
+    assert!(said.contains("Vibe cannot keep its tools"), "{said}");
+    assert!(
+        said.contains(
+            "Vibe approves its own tools: with inherit, a post can make it read or run \
+             anything you can"
+        ),
+        "{said}"
+    );
+    assert!(
+        said.contains("Use the swarm from your own Mistral Vibe sessions"),
+        "{said}"
+    );
+    let config = std::fs::read_to_string(machine.data().join("config.toml")).unwrap();
+    assert!(config.contains("runtime = \"vibe\""), "{config}");
+    assert!(config.contains("access = \"inherit\""), "{config}");
+    let vibe = std::fs::read_to_string(machine.path("vibe/config.toml")).unwrap();
+    assert!(vibe.contains("name = \"wats\""), "{vibe}");
+    // Detection never ran it.
+    assert!(!machine.calls().contains("vibe "), "{}", machine.calls());
 }

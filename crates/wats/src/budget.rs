@@ -1,12 +1,12 @@
-//! The agent's budget (ADR 0011, ADR 0032), enforced by the node before
+//! The agent's budget (ADR 0011, ADR 0034), enforced by the node before
 //! each run, per UTC day and per UTC month:
 //!
 //! - **dollars**, summed from the cost the agent CLI reports (Claude Code:
 //!   `total_cost_usd`);
 //! - **minutes**, the wall time of the runs, measured by the node (every
 //!   runtime);
-//! - **LLM tokens**, as the agent CLI reports them (Claude Code and Codex;
-//!   [`reports_tokens`]).
+//! - **LLM tokens**, as the agent CLI reports them (Claude Code, Codex,
+//!   OpenCode, Mistral Vibe; [`reports_tokens`]).
 //!
 //! Each monthly limit is 30 × its daily one ([`MONTH_DAYS`]) unless
 //! config.toml sets it, and 0 is no limit, for the day and the month alike.
@@ -53,12 +53,12 @@ pub struct Budget {
     /// `max_usd_per_month = 0` (`.1`), which paused the agent before
     /// 0.4.5, and the data directory's setup has not been confirmed since
     /// (its revision is below [`ZERO_CONFIRMED_REVISION`]): the agent stays
-    /// paused ([`Budget::legacy_zero`], ADR 0032 §5).
+    /// paused ([`Budget::legacy_zero`], ADR 0034 §5).
     pub legacy_zero: (bool, bool),
 }
 
 /// The setup revision from which a USD budget of 0 means no limit: the
-/// one whose budget question settles it (ADR 0032 §5).
+/// one whose budget question settles it (ADR 0034 §5).
 pub const ZERO_CONFIRMED_REVISION: u32 = 2;
 
 impl Default for Budget {
@@ -132,7 +132,7 @@ impl Budget {
     }
 
     /// The one-line notice of an agent paused by a USD budget of 0 from
-    /// before 0.4.5 (ADR 0032 §5), for `wats status`, the node's start
+    /// before 0.4.5 (ADR 0034 §5), for `wats status`, the node's start
     /// and the MCP `status` tool.
     pub fn zero_notice(&self, agent: &str) -> Option<String> {
         self.paused_by_zero().then(|| {
@@ -178,14 +178,30 @@ pub fn legacy_zero(file: &AgentSettings, revision: Option<u32>) -> (bool, bool) 
     (zero(file.max_usd_per_day), zero(file.max_usd_per_month))
 }
 
-/// Whether the agent CLI of `runtime` reports a run's cost: Claude Code
-/// (`total_cost_usd`). Codex and OpenClaw do not.
+/// Whether the node holds `runtime` to a dollar budget, from the cost
+/// its CLI reports: Claude Code (`total_cost_usd`), OpenCode (the `cost`
+/// of each `step_finish`, ADR 0031) and Mistral Vibe (its export's
+/// `cost_usd`, ADR 0033), these two estimates while their
+/// `ENFORCE_USD_BUDGET` is on. Codex and OpenClaw report none.
 pub fn reports_cost(runtime: &str) -> bool {
-    !matches!(runtime, "codex" | "openclaw")
+    match runtime {
+        "codex" | "openclaw" => false,
+        "opencode" => crate::opencode::ENFORCE_USD_BUDGET,
+        "vibe" => crate::vibe::ENFORCE_USD_BUDGET,
+        _ => true,
+    }
+}
+
+/// Whether the cost `runtime` reports is its own estimate from the
+/// model's catalog prices, not the bill: OpenCode and Mistral Vibe.
+pub fn estimates_cost(runtime: &str) -> bool {
+    matches!(runtime, "opencode" | "vibe")
 }
 
 /// Whether the agent CLI of `runtime` reports a run's LLM tokens: Claude
-/// Code (the `usage` of its `result`) and Codex (the `usage` of each
+/// Code (the `usage` of its `result`), OpenCode (the `tokens` of each
+/// `step_finish`), Mistral Vibe (its export's `usage`; not a run killed
+/// before it) and Codex (the `usage` of each
 /// `turn.completed`). OpenClaw's gateway returns none.
 pub fn reports_tokens(runtime: &str) -> bool {
     runtime != "openclaw"
@@ -490,19 +506,34 @@ pub fn describe(budget: &Budget, spend: &Spend, runtime: &str) -> String {
             spend.uncosted_today,
             budget.max_runs_per_day
         )),
+        _ if !reports_cost(runtime) && estimates_cost(runtime) => parts.push(format!(
+            "{} of {} runs today ({}'s costs not enforced)",
+            spend.uncosted_today,
+            budget.max_runs_per_day,
+            runtime_name(runtime)
+        )),
         _ if !reports_cost(runtime) => parts.push(format!(
             "{} of {} runs today ({} reports no cost)",
             spend.uncosted_today,
             budget.max_runs_per_day,
             runtime_name(runtime)
         )),
-        _ => parts.push(metric(
-            format!("${:.2}", spend.usd_today),
-            budget.max_usd_per_day.map(|m| format!("${m:.2}")),
-            format!("${:.2}", spend.usd_month),
-            budget.max_usd_per_month.map(|m| format!("${m:.2}")),
-            "",
-        )),
+        _ => {
+            let mut usd = metric(
+                format!("${:.2}", spend.usd_today),
+                budget.max_usd_per_day.map(|m| format!("${m:.2}")),
+                format!("${:.2}", spend.usd_month),
+                budget.max_usd_per_month.map(|m| format!("${m:.2}")),
+                "",
+            );
+            if estimates_cost(runtime) {
+                usd.push_str(&format!(
+                    " ({}'s cost estimate, not the bill)",
+                    runtime_name(runtime)
+                ));
+            }
+            parts.push(usd)
+        }
     }
     parts.push(metric(
         minutes(spend.minutes_today()),
@@ -561,6 +592,8 @@ fn runtime_name(runtime: &str) -> &str {
         "codex" => "Codex",
         "claude" => "Claude Code",
         "openclaw" => "OpenClaw",
+        "opencode" => "OpenCode",
+        "vibe" => "Mistral Vibe",
         other => other,
     }
 }
@@ -828,7 +861,7 @@ mod tests {
         )
         .unwrap();
         let s = spend(dir.path(), NOW);
-        for runtime in ["claude", "codex"] {
+        for runtime in ["claude", "codex", "opencode", "vibe"] {
             let budget = Budget::of(&file).for_runtime(runtime);
             match check(&budget, &s, NOW) {
                 Verdict::Paused { why, .. } => {
@@ -979,5 +1012,53 @@ mod tests {
                 remaining_usd: None
             }
         );
+    }
+
+    /// OpenCode and Mistral Vibe: held to dollars from their own cost
+    /// estimate while their `ENFORCE_USD_BUDGET` is on (said so), and to
+    /// minutes and LLM tokens.
+    #[test]
+    fn opencode_and_vibe_estimate_their_cost() {
+        let file = AgentSettings {
+            max_minutes_per_day: Some(60),
+            max_tokens_per_day: Some(1_000_000),
+            ..AgentSettings::default()
+        };
+        let spend = Spend {
+            usd_today: 0.5,
+            usd_month: 0.5,
+            tokens_today: 1_500,
+            tokens_month: 1_500,
+            ..Spend::default()
+        };
+        for (runtime, name, enforced) in [
+            ("opencode", "OpenCode", crate::opencode::ENFORCE_USD_BUDGET),
+            ("vibe", "Mistral Vibe", crate::vibe::ENFORCE_USD_BUDGET),
+        ] {
+            assert_eq!(reports_cost(runtime), enforced);
+            assert!(reports_tokens(runtime));
+            let budget = Budget::of(&file).for_runtime(runtime);
+            let said = describe(&budget, &spend, runtime);
+            if enforced {
+                assert_eq!(budget.max_usd_per_day, Some(2.0));
+                assert!(
+                    said.starts_with(&format!(
+                        "$0.50 of $2.00 today, $0.50 of $60.00 this month ({name}'s cost \
+                         estimate, not the bill) · 0 of 60 min today"
+                    )),
+                    "{said}"
+                );
+            } else {
+                assert_eq!(budget.max_usd_per_day, None);
+                assert!(
+                    said.contains(&format!("({name}'s costs not enforced)")),
+                    "{said}"
+                );
+            }
+            assert!(
+                said.ends_with("1.5k of 1M LLM tokens today, 1.5k of 30M this month"),
+                "{said}"
+            );
+        }
     }
 }

@@ -1,4 +1,4 @@
-# 0032. Daily agent budgets: dollars, minutes, LLM tokens
+# 0034. Daily agent budgets: dollars, minutes, LLM tokens
 
 Status: Proposed (2026-10-22). Ships in 0.4.5.
 
@@ -70,13 +70,14 @@ mirror it:
 | Claude Code | `total_cost_usd` of its stream-json `result` | yes | the `usage` of its `result`: `input_tokens`, `cache_creation_input_tokens`, `cache_read_input_tokens`, `output_tokens` |
 | Codex (`exec --json`) | none: runs counted instead | yes | the `usage` of each `turn.completed`: `input_tokens` (its `cached_input_tokens` are a part of it) and `output_tokens`, summed over the turns |
 | OpenClaw (the gateway's hook) | none | yes: the time to the gateway's answer | none: the gateway returns no model output, token count or cost |
-| Mistral Vibe | not an agent runtime (an MCP host only) | | |
+| OpenCode (`run --format json`, ADR 0031) | the `cost` of each `step_finish`: OpenCode's estimate from catalog prices, while `opencode::ENFORCE_USD_BUDGET` is on (a cost of 0 is no cost) | yes | the `tokens` of each `step_finish`: `input`, `output`, `reasoning`, `cache.read`, `cache.write` (OpenCode keeps each apart), summed over the steps |
+| Mistral Vibe (`-p`, ADR 0033) | its export's `cost_usd` (its own and its subagents'), Vibe's estimate, while `vibe::ENFORCE_USD_BUDGET` is on; a run killed before its export is charged the dollars it was allowed (its `--max-price`, ADR 0033) | yes | its export's `usage`: `total_tokens`, else `input_tokens` (`cached_input_tokens` a part of it) + `output_tokens`; none for a run killed before its export |
 
 `Budget::for_runtime` drops the limits a runtime cannot be held to (the
-dollars of Codex and OpenClaw, the LLM tokens of OpenClaw), so that they
-are neither enforced nor shown as if they were. OpenCode, a runtime of ADR
-0031, reports a cost estimate and LLM tokens per `step_finish`: it joins
-the table when ADR 0031's code is in.
+dollars of Codex and OpenClaw, and of OpenCode or Vibe when their
+`ENFORCE_USD_BUDGET` is off; the LLM tokens of OpenClaw), so that they are
+neither enforced nor shown as if they were. The cost of OpenCode and Vibe
+is shown as their estimate, not the bill.
 
 Cached input is counted. It is most of what an agent run reads, it is what
 the provider meters (at a lower price), and leaving it out would make the
@@ -188,7 +189,7 @@ was spent, and no run starts.
 
 ## Later
 
-- OpenCode's `step_finish` tokens and cost (ADR 0031), once its runtime is
-  in.
+- Pass the LLM tokens left today as Vibe's `--max-tokens` per run, as
+  the dollars left go to `--max-price`.
 - A per-node budget across agents, if several agents share one
   subscription.

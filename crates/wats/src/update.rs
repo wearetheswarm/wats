@@ -462,6 +462,99 @@ pub fn homebrew_install() -> bool {
     current_exe().is_ok_and(|exe| homebrew_managed(&exe))
 }
 
+/// The links Homebrew keeps to a binary of its Cellar
+/// (`<prefix>/Cellar/wats/<version>/bin/wats`): `<prefix>/bin/wats`, then
+/// `<prefix>/opt/wats/bin/wats`. None for a path outside a Cellar.
+pub fn homebrew_links(exe: &Path) -> Vec<PathBuf> {
+    let parts: Vec<_> = exe.components().collect();
+    let Some(cellar) = parts
+        .windows(2)
+        .position(|w| w[0].as_os_str() == "Cellar" && w[1].as_os_str() == "wats")
+    else {
+        return Vec::new();
+    };
+    let Some(name) = exe.file_name() else {
+        return Vec::new();
+    };
+    let prefix: PathBuf = parts.iter().take(cellar).collect();
+    vec![
+        prefix.join("bin").join(name),
+        prefix.join("opt").join("wats").join("bin").join(name),
+    ]
+}
+
+/// The Homebrew link that replaces `cellar_exe`, a path into a versioned
+/// Cellar directory that an upgrade and `brew cleanup` remove (or have
+/// removed): the first of [`homebrew_links`] that exists and leads into
+/// the Cellar of wats, whatever its version now.
+pub fn homebrew_relink(cellar_exe: &Path) -> Option<PathBuf> {
+    homebrew_links(cellar_exe).into_iter().find(|link| {
+        link.canonicalize()
+            .is_ok_and(|target| homebrew_managed(&target) && target.is_file())
+    })
+}
+
+/// The path to write for this binary into what outlives this process (an
+/// MCP server entry, a session hook, an agent run's MCP config): one that
+/// still leads to wats after an upgrade (ADR 0032). [`stable_exe_for`]
+/// this binary, its argv[0] and PATH.
+pub fn stable_exe() -> Result<PathBuf> {
+    let exe = current_exe()?;
+    let argv0 = std::env::args_os().next();
+    let path = std::env::var_os("PATH");
+    Ok(stable_exe_for(&exe, argv0.as_deref(), path.as_deref()))
+}
+
+/// The stable path of `exe` (symlinks resolved), started as `argv0` with
+/// `path` as PATH:
+/// 1. a Homebrew install (`<prefix>/Cellar/wats/<version>/bin/wats`, which
+///    `brew cleanup` removes after an upgrade): Homebrew's link
+///    ([`homebrew_links`]) when it leads to `exe`;
+/// 2. else the path it was started by (argv[0], or the PATH entry it names)
+///    when that leads to `exe` and is not in a Cellar;
+/// 3. else `exe`: an install that is no symlink (install.sh's copy in
+///    `~/.local/bin`) is stable as it is.
+pub fn stable_exe_for(
+    exe: &Path,
+    argv0: Option<&std::ffi::OsStr>,
+    path: Option<&std::ffi::OsStr>,
+) -> PathBuf {
+    let same = |p: &Path| p.canonicalize().is_ok_and(|c| c == exe);
+    if let Some(link) = homebrew_links(exe).into_iter().find(|l| same(l)) {
+        return link;
+    }
+    if let Some(argv0) = argv0.map(Path::new).filter(|a| !a.as_os_str().is_empty()) {
+        let invoked = if argv0.components().count() > 1 {
+            std::path::absolute(argv0).ok()
+        } else {
+            // A bare name: the first PATH entry that has it.
+            path.into_iter()
+                .flat_map(std::env::split_paths)
+                .filter(|dir| dir.is_absolute())
+                .map(|dir| dir.join(argv0))
+                .find(|p| p.is_file())
+        };
+        if let Some(invoked) = invoked.filter(|p| same(p) && !homebrew_managed(p)) {
+            return invoked;
+        }
+    }
+    exe.to_path_buf()
+}
+
+/// The binary to start another process of this wats with (the background
+/// node): this one, or, once an upgrade has removed it (`brew cleanup`),
+/// Homebrew's link to the new one.
+pub fn spawn_exe() -> std::io::Result<PathBuf> {
+    let exe = std::env::current_exe()?;
+    if exe.exists() {
+        return Ok(exe);
+    }
+    // Linux names a deleted binary `<path> (deleted)`.
+    let shown = exe.to_string_lossy();
+    let gone = Path::new(shown.strip_suffix(" (deleted)").unwrap_or(&shown));
+    Ok(homebrew_relink(gone).unwrap_or(exe))
+}
+
 /// Where releases are published, for a platform with no prebuilt one.
 pub const RELEASES_PAGE: &str = "https://github.com/wearetheswarm/wats/releases";
 
@@ -609,6 +702,9 @@ pub const KEYS_SINCE: &[(&str, Version)] = &[
     ("storage.events_share", Version(0, 4, 1)),
     ("sync.initial_max", Version(0, 4, 1)),
     ("update.security_auto", Version(0, 4, 3)),
+    // Set only by `wats config set node.name`: a drawn name goes to
+    // <data dir>/node-name, which older releases ignore (ADR 0023 §8).
+    ("node.name", Version(0, 4, 5)),
     ("agent.max_minutes_per_day", Version(0, 4, 5)),
     ("agent.max_minutes_per_month", Version(0, 4, 5)),
     ("agent.max_tokens_per_day", Version(0, 4, 5)),
@@ -616,15 +712,17 @@ pub const KEYS_SINCE: &[(&str, Version)] = &[
 ];
 
 /// The keys set in `data_dir`'s config.toml that wats `version` does not
-/// know ([`KEYS_SINCE`]). None when config.toml is absent or unreadable.
-/// A key of one agent (`agent.<leaf>`) is looked for in each
-/// `[agents.<name>]` table, and named so.
+/// know ([`KEYS_SINCE`]), and for a table it does not know at all, even
+/// empty (`[node]` before 0.4.5), one of its keys: unsetting it removes
+/// the table. A key of one agent (`agent.<leaf>`) is looked for in each
+/// `[agents.<name>]` table, and named so. None when config.toml is absent
+/// or unreadable.
 pub fn keys_unknown_to(data_dir: &Path, version: Version) -> Vec<String> {
     let Ok(file) = crate::settings::ConfigFile::open(data_dir) else {
         return Vec::new();
     };
     let agents = file.agent_names();
-    let mut keys = Vec::new();
+    let mut keys: Vec<String> = Vec::new();
     for (key, since) in KEYS_SINCE {
         if version >= *since {
             continue;
@@ -642,7 +740,36 @@ pub fn keys_unknown_to(data_dir: &Path, version: Version) -> Vec<String> {
             _ => {}
         }
     }
+    for (key, since) in KEYS_SINCE {
+        let Some((table, _)) = key.split_once('.') else {
+            continue;
+        };
+        let prefix = format!("{table}.");
+        if version < *since
+            && file.has_top(table)
+            && table_unknown_to(table, version)
+            && !keys.iter().any(|k| k.starts_with(&prefix))
+        {
+            keys.push(key.to_string());
+        }
+    }
     keys
+}
+
+/// Whether wats `version` knows no key of the top-level table `table`:
+/// each of its keys is in [`KEYS_SINCE`], newer than `version` (a key not
+/// in it is one of 0.3.3).
+fn table_unknown_to(table: &str, version: Version) -> bool {
+    let prefix = format!("{table}.");
+    crate::settings::KEYS
+        .iter()
+        .chain(crate::settings::HIDDEN_KEYS)
+        .filter(|k| k.name.starts_with(&prefix))
+        .all(|k| {
+            KEYS_SINCE
+                .iter()
+                .any(|(name, since)| *name == k.name && version < *since)
+        })
 }
 
 /// How long `<binary> --version` may take.
@@ -1194,7 +1321,7 @@ pub fn may_check(policy: &UpdatePolicy, loopback: bool) -> bool {
     policy.check && !loopback && !hermetic_env()
 }
 
-fn hermetic_env() -> bool {
+pub(crate) fn hermetic_env() -> bool {
     std::env::var("WATS_HERMETIC").is_ok_and(|v| {
         matches!(
             v.trim().to_ascii_lowercase().as_str(),
@@ -2420,7 +2547,7 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("config unset sync.initial_max"), "{err}");
-        // The budget keys of 0.4.5 (ADR 0032), in an agent's table: named
+        // The budget keys of 0.4.5 (ADR 0034), in an agent's table: named
         // with the table.
         std::fs::write(
             &config,
@@ -2457,6 +2584,73 @@ mod tests {
         assert_eq!(shell_word("it's"), r"'it'\''s'");
     }
 
+    /// Node names (ADR 0023 §8): a drawn name lives in `node-name`, which
+    /// 0.4.4 ignores, so a rollback goes ahead and 0.4.4 still loads
+    /// config.toml; `node.name` set in config.toml makes it refuse first.
+    #[cfg(unix)]
+    #[test]
+    fn a_drawn_node_name_never_blocks_a_rollback() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let old = dir.path().join("wats.old");
+        std::fs::write(&old, "#!/bin/sh\necho 'wats 0.4.4'\n").unwrap();
+        std::fs::set_permissions(&old, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let data = dir.path().join("data");
+        std::fs::create_dir_all(&data).unwrap();
+        std::fs::write(
+            data.join(crate::settings::FILE_NAME),
+            "profile = \"alice\"\n",
+        )
+        .unwrap();
+        let drawn = crate::naming::ensure(&data, &crate::naming::Machine::default()).unwrap();
+        let current = Version(0, 4, 5);
+        // The drawn name: config.toml is as 0.4.4 knows it.
+        let text = std::fs::read_to_string(data.join(crate::settings::FILE_NAME)).unwrap();
+        assert_eq!(text, "profile = \"alice\"\n");
+        assert!(keys_unknown_to(&data, Version(0, 4, 4)).is_empty());
+        check_rollback(&old, &data, current).unwrap();
+        // Renamed in config.toml: refused, with the command to run first.
+        let mut file = crate::settings::ConfigFile::open(&data).unwrap();
+        file.set("node.name", "hive").unwrap();
+        file.save().unwrap();
+        assert_eq!(crate::naming::stored(&data).as_deref(), Some("hive"));
+        assert_eq!(keys_unknown_to(&data, Version(0, 4, 4)), ["node.name"]);
+        assert!(keys_unknown_to(&data, Version(0, 4, 5)).is_empty());
+        let err = check_rollback(&old, &data, current)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("config unset node.name"), "{err}");
+        // Unset: the drawn name is back, no `[node]` header is left (0.4.4
+        // refuses even an empty one), and the rollback goes ahead.
+        let mut file = crate::settings::ConfigFile::open(&data).unwrap();
+        file.unset("node.name").unwrap();
+        file.save().unwrap();
+        assert_eq!(crate::naming::stored(&data), Some(drawn));
+        let text = std::fs::read_to_string(data.join(crate::settings::FILE_NAME)).unwrap();
+        assert_eq!(text, "profile = \"alice\"\n");
+        check_rollback(&old, &data, current).unwrap();
+        // An empty `[node]` (by hand, or an older 0.4.5 build): refused,
+        // and the command given removes it.
+        std::fs::write(
+            data.join(crate::settings::FILE_NAME),
+            "profile = \"alice\"\n\n[node]\n",
+        )
+        .unwrap();
+        assert_eq!(keys_unknown_to(&data, Version(0, 4, 4)), ["node.name"]);
+        assert!(keys_unknown_to(&data, Version(0, 4, 5)).is_empty());
+        let err = check_rollback(&old, &data, current)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("config unset node.name"), "{err}");
+        let mut file = crate::settings::ConfigFile::open(&data).unwrap();
+        assert!(file.unset("node.name").unwrap());
+        file.save().unwrap();
+        check_rollback(&old, &data, current).unwrap();
+        // A table older releases know, empty: nothing to say.
+        std::fs::write(data.join(crate::settings::FILE_NAME), "[ask]\n").unwrap();
+        assert!(keys_unknown_to(&data, Version(0, 4, 0)).is_empty());
+    }
+
     #[test]
     fn homebrew_installs_are_left_to_homebrew() {
         assert!(homebrew_managed(Path::new(
@@ -2469,6 +2663,100 @@ mod tests {
         assert!(!homebrew_managed(Path::new(
             "/opt/homebrew/Cellar/other/1/bin/wats"
         )));
+    }
+
+    /// A fake Homebrew prefix: `Cellar/wats/<version>/bin/wats`, and the
+    /// `bin/wats` and `opt/wats` links to it. Returns the binary, symlinks
+    /// resolved.
+    #[cfg(unix)]
+    fn fake_brew(prefix: &Path, version: &str) -> PathBuf {
+        let bin = prefix.join("Cellar/wats").join(version).join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::write(bin.join("wats"), "#!/bin/sh\n").unwrap();
+        std::fs::create_dir_all(prefix.join("bin")).unwrap();
+        std::fs::create_dir_all(prefix.join("opt")).unwrap();
+        for (link, target) in [
+            ("bin/wats", format!("../Cellar/wats/{version}/bin/wats")),
+            ("opt/wats", format!("../Cellar/wats/{version}")),
+        ] {
+            let _ = std::fs::remove_file(prefix.join(link));
+            std::os::unix::fs::symlink(target, prefix.join(link)).unwrap();
+        }
+        bin.join("wats").canonicalize().unwrap()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_homebrew_install_registers_its_link_not_its_cellar() {
+        let tmp = tempfile::tempdir().unwrap();
+        let prefix = tmp.path().canonicalize().unwrap().join("homebrew");
+        let exe = fake_brew(&prefix, "0.4.3");
+        let link = prefix.join("bin/wats");
+        // Started through the link, through the Cellar path, or by name.
+        for argv0 in [link.as_os_str(), exe.as_os_str(), "wats".as_ref()] {
+            let path = std::env::join_paths([prefix.join("bin")]).unwrap();
+            assert_eq!(stable_exe_for(&exe, Some(argv0), Some(&path)), link);
+        }
+        assert_eq!(stable_exe_for(&exe, None, None), link);
+        // No bin/wats (`brew unlink`): opt/wats/bin/wats.
+        std::fs::remove_file(&link).unwrap();
+        assert_eq!(
+            stable_exe_for(&exe, None, None),
+            prefix.join("opt/wats/bin/wats")
+        );
+        // Neither: the Cellar path, as before.
+        std::fs::remove_file(prefix.join("opt/wats")).unwrap();
+        assert_eq!(stable_exe_for(&exe, None, None), exe);
+        // A link to another version is not this binary.
+        let newer = fake_brew(&prefix, "0.4.4");
+        assert_eq!(stable_exe_for(&exe, None, None), exe);
+        assert_eq!(stable_exe_for(&newer, None, None), link);
+
+        // The stale 0.4.3 path, once 0.4.4 is linked: its link.
+        assert_eq!(homebrew_relink(&exe), Some(link.clone()));
+        std::fs::remove_dir_all(prefix.join("Cellar/wats/0.4.3")).unwrap();
+        assert_eq!(homebrew_relink(&exe), Some(link));
+        assert_eq!(homebrew_relink(Path::new("/usr/local/bin/wats")), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn other_installs_register_the_path_they_were_started_by() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        // install.sh: a copy, no symlink.
+        let local = root.join(".local/bin");
+        std::fs::create_dir_all(&local).unwrap();
+        let exe = local.join("wats");
+        std::fs::write(&exe, "#!/bin/sh\n").unwrap();
+        let path = std::env::join_paths([&local]).unwrap();
+        assert_eq!(
+            stable_exe_for(&exe, Some("wats".as_ref()), Some(&path)),
+            exe
+        );
+        assert_eq!(stable_exe_for(&exe, None, None), exe);
+        // A symlink of the user's own: kept.
+        let bin = root.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::os::unix::fs::symlink(&exe, bin.join("wats")).unwrap();
+        let path = std::env::join_paths([&bin, &local]).unwrap();
+        assert_eq!(
+            stable_exe_for(&exe, Some("wats".as_ref()), Some(&path)),
+            bin.join("wats")
+        );
+        assert_eq!(
+            stable_exe_for(&exe, Some(bin.join("wats").as_os_str()), None),
+            bin.join("wats")
+        );
+        // A PATH entry that is another binary: this one.
+        let other = root.join("other");
+        std::fs::create_dir_all(&other).unwrap();
+        std::fs::write(other.join("wats"), "#!/bin/sh\n").unwrap();
+        let path = std::env::join_paths([&other, &bin]).unwrap();
+        assert_eq!(
+            stable_exe_for(&exe, Some("wats".as_ref()), Some(&path)),
+            exe
+        );
     }
 
     #[test]

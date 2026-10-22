@@ -173,7 +173,7 @@ In the same session: "Call the wats status tool again."
 `wats ps` shows a new pid in mode `mcp-background`, with 1 session.
 
 ```sh
-wats attach -n 50
+wats attach --lines 50
 ```
 
 **Expect:** a WARN line ``respawn: the node (pid <old pid>) exited

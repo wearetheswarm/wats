@@ -14,7 +14,7 @@
 //! The choices are existing keys only ([`crate::settings::KEYS`]): the
 //! agent runtime among the agent CLIs found on `PATH`, `storage.max`, the
 //! agent's run time and turn limits, its daily budget (how it is paid,
-//! then dollars, minutes and LLM tokens per day: ADR 0032), its access
+//! then dollars, minutes and LLM tokens per day: ADR 0034), its access
 //! level, and `nets`. Right after the agent, "quick" keeps the
 //! recommended (or current) settings and asks only the budget; "detailed"
 //! asks each one (ADR 0027, 0.4.5).
@@ -33,9 +33,9 @@ use anyhow::{Context, Result};
 use crate::settings::{self, ConfigFile, FILE_NAME, RUNTIMES, Settings};
 use crate::update::Install;
 
-/// The agent CLIs looked for on `PATH`. Only [`RUNTIMES`] can run; the
-/// others (Mistral Vibe) are listed as MCP hosts.
-pub const AGENT_CLIS: [&str; 4] = ["claude", "codex", "openclaw", "vibe"];
+/// The agent CLIs looked for on `PATH`. Only [`RUNTIMES`] can run; any
+/// other would be listed as an MCP host only.
+pub const AGENT_CLIS: [&str; 5] = ["claude", "codex", "openclaw", "opencode", "vibe"];
 
 /// Shown when the node runs no agent (startup, `status`). A future
 /// policy: no quota is enforced today.
@@ -45,19 +45,35 @@ enables one.";
 
 /// Shown by setup when no supported agent CLI is on `PATH`.
 pub const NO_AGENT_FOUND: &str = "No agent CLI found: install Claude Code \
-(https://claude.com/claude-code) or Codex (https://github.com/openai/codex), then run \
-`wats setup` again.";
+(https://claude.com/claude-code), Codex (https://github.com/openai/codex), OpenCode \
+(https://opencode.ai, for your own model or cloud credits) or Mistral Vibe \
+(https://github.com/mistralai/mistral-vibe), then run `wats setup` again.";
+
+/// Shown before the model question when OpenCode is the node's agent
+/// (ADR 0031 §2).
+pub const OPENCODE_MODEL_ABOUT: &str = "OpenCode runs with the models you set up in \
+OpenCode (`opencode auth login`, your provider's environment). Its runs do not read \
+~/.config/opencode: a custom provider goes in the agent's own OpenCode directory, which \
+`wats setup opencode --agent` creates.";
+
+/// The model question for OpenCode: `provider/model`, empty for
+/// OpenCode's own choice.
+pub const OPENCODE_MODEL_QUESTION: &str =
+    "The agent's model, as provider/model, e.g. azure/gpt-5 (empty: OpenCode's default)";
 
 /// Shown by setup when OpenClaw is on `PATH` and not the node's agent: its
 /// agents can use the wats tools.
 pub const OPENCLAW_MCP_HINT: &str = "OpenClaw found: to reach the swarm from your OpenClaw \
 agents, register wats as its MCP server: wats setup openclaw --mcp";
 
-/// Shown by setup when Mistral Vibe is on `PATH`: not an agent runtime
-/// yet, but an MCP host.
+/// Shown by setup when Mistral Vibe is on `PATH` and not the node's agent:
+/// an MCP host too.
 pub const VIBE_MCP_HINT: &str = "Mistral Vibe found: to reach the swarm from your Vibe \
-sessions, add wats as its MCP server: wats setup vibe --mcp (running it as the node's agent \
-comes next)";
+sessions, add wats as its MCP server: wats setup vibe --mcp";
+
+/// The access question for Mistral Vibe (ADR 0033): no `workspace`.
+pub const VIBE_ACCESS_QUESTION: &str = "What the agent may use besides the wats tools: \
+swarm-only, or inherit (your whole Vibe environment; Vibe has no workspace level)";
 
 /// Shown by setup when OpenClaw is the node's agent: the gateway side is
 /// set up apart (tokens, MCP entries, the config block to paste).
@@ -99,15 +115,15 @@ const DESKTOP_SINCE: u32 = 1;
 const SECURITY_AUTO_SINCE: u32 = 1;
 
 /// The revision that added the budget question (how the agent is paid,
-/// then its daily budget: ADR 0032), in 0.4.5. It replaces the two USD
+/// then its daily budget: ADR 0034), in 0.4.5. It replaces the two USD
 /// questions of revision 1.
 const BUDGET_SINCE: u32 = 2;
 
-/// Shown with the budget question (ADR 0032): what to set it to.
+/// Shown with the budget question (ADR 0034): what to set it to.
 pub const BUDGET_GUIDE: &str = "The agent's budget: set it to what you're willing to give \
 the swarm from your subscription, machine or API spend.";
 
-/// The budget question (ADR 0032).
+/// The budget question (ADR 0034).
 pub const PAID_QUESTION: &str = "How is this agent paid?";
 
 /// The mode question, right after the agent (ADR 0027, 0.4.5).
@@ -336,6 +352,7 @@ fn current(settings: &Settings, key: &str) -> Option<String> {
         "agent.max_minutes_per_day" => agent.max_minutes_per_day.map(|n| n.to_string()),
         "agent.max_tokens_per_day" => agent.max_tokens_per_day.map(|n| n.to_string()),
         "agent.access" => agent.access.clone(),
+        "agent.model" => agent.model.clone(),
         "nets" => (!settings.nets.is_empty()).then(|| settings.nets.join(",")),
         _ => None,
     }
@@ -448,6 +465,36 @@ fn ask(
             Err(e) => writeln!(out, "  {e:#}")?,
         }
     }
+}
+
+/// The access level of a Vibe agent: swarm-only (the default, or the
+/// current level) or inherit, which is followed by its warning.
+fn ask_vibe_access(
+    input: &mut impl BufRead,
+    out: &mut impl Write,
+    settings: &Settings,
+) -> Result<String> {
+    let key = "agent.access";
+    let default = current(settings, key)
+        .filter(|v| crate::vibe::access(Some(v)).is_ok())
+        .unwrap_or_else(|| "swarm-only".to_string());
+    let answer = loop {
+        write!(out, "{VIBE_ACCESS_QUESTION} ({key}) [{default}]: ")?;
+        let answer = match read_answer(input, out)? {
+            Some(answer) if !answer.is_empty() => answer,
+            _ => break default.clone(),
+        };
+        match settings::check_value(key, &answer)
+            .and_then(|_| crate::vibe::access(Some(&answer)).map(|_| ()))
+        {
+            Ok(()) => break answer,
+            Err(e) => writeln!(out, "  {e:#}")?,
+        }
+    };
+    if crate::vibe::access(Some(&answer))? == crate::access::Access::Inherit {
+        writeln!(out, "{}", crate::vibe::INHERIT_WARNING)?;
+    }
+    Ok(answer)
 }
 
 /// A yes/no question; Enter (or the end of the input) keeps `default`.
@@ -598,7 +645,7 @@ const SETUP_HEADER: &str = "wats setup: the node's main choices. Enter accepts t
 /// the agent runtime when it is newer too. `full`: the whole setup, which
 /// asks quick or detailed first; a catch-up asks its few questions.
 /// `stored`: the data directory's setup revision, which tells whether a
-/// USD budget of 0 is one from before 0.4.5 (ADR 0032 §5).
+/// USD budget of 0 is one from before 0.4.5 (ADR 0034 §5).
 #[allow(clippy::too_many_arguments)]
 fn prompt_after(
     input: &mut impl BufRead,
@@ -623,10 +670,32 @@ fn prompt_after(
     if openclaw && !keep_runtime {
         writeln!(out, "{}", crate::openclaw::SPEND_CAPS)?;
     }
+    let mut values = Vec::new();
+    // OpenCode reaches many providers: its model is asked when it is
+    // chosen (ADR 0031 §2), in quick mode too (it goes with the agent's
+    // choice). Not a revision question: nothing is asked of existing
+    // setups.
+    if runtime.as_deref() == Some("opencode") && !keep_runtime {
+        writeln!(out, "{OPENCODE_MODEL_ABOUT}")?;
+        let default = current(settings, "agent.model").unwrap_or_default();
+        let model = loop {
+            write!(out, "{OPENCODE_MODEL_QUESTION} (agent.model) [{default}]: ")?;
+            let model = match read_answer(input, out)? {
+                Some(answer) if !answer.is_empty() => answer,
+                _ => break default.clone(),
+            };
+            match crate::opencode::check_model(&model) {
+                Ok(()) => break model,
+                Err(e) => writeln!(out, "  {e:#}")?,
+            }
+        };
+        if !model.is_empty() {
+            values.push(("agent.model", model));
+        }
+    }
     // Quick or detailed: asked with the whole setup only (a catch-up asks
     // its few new questions).
     let quick = full && ask_mode(input, out, settings, runtime.as_deref())?;
-    let mut values = Vec::new();
     // Values of the old defaults would pin them (ADR 0027, 0.4.5): offered
     // to drop, in both modes, for the agent asked about.
     let mut dropped = Vec::new();
@@ -655,7 +724,15 @@ fn prompt_after(
             }
         }
     }
+    let vibe = runtime.as_deref() == Some("vibe");
     for q in questions {
+        if vibe && q.key == "agent.access" && q.since > revision {
+            // Quick: unset is swarm-only for Vibe (it refuses workspace).
+            if !quick {
+                values.push((q.key, ask_vibe_access(input, out, settings)?));
+            }
+            continue;
+        }
         if q.since <= revision
             || (q.agent_only && runtime.is_none())
             || (openclaw && NOT_FOR_OPENCLAW.contains(&q.key))
@@ -725,7 +802,13 @@ fn ask_mode(
                 format!(" and {} turns", value("agent.max_turns"))
             }
         ));
-        if runtime != Some("openclaw") {
+        if runtime == Some("vibe") {
+            // Vibe refuses workspace: unset is swarm-only.
+            let access = current(settings, "agent.access")
+                .filter(|v| crate::vibe::access(Some(v)).is_ok())
+                .unwrap_or_else(|| "swarm-only".to_string());
+            kept.push(format!("{access} access"));
+        } else if runtime != Some("openclaw") {
             kept.push(format!("{} access", value("agent.access")));
         }
     }
@@ -762,7 +845,7 @@ fn ask_mode(
     }
 }
 
-/// How an agent's model is paid (ADR 0032): it picks the budget's metric
+/// How an agent's model is paid (ADR 0034): it picks the budget's metric
 /// and its defaults ([`preset`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Paid {
@@ -784,7 +867,7 @@ pub struct Daily {
     pub tokens: u64,
 }
 
-/// The daily budget offered for `paid` and `runtime` (ADR 0032): a
+/// The daily budget offered for `paid` and `runtime` (ADR 0034): a
 /// subscription, 120 minutes; an API key, $5 (Codex, which reports no
 /// cost: 5M LLM tokens); self-hosted, 240 minutes of the machine.
 /// OpenClaw: no limit (its spend caps are its own).
@@ -936,7 +1019,7 @@ fn current_daily(table: &settings::AgentSettings) -> (Daily, Option<Paid>) {
     (daily, set.then_some(paid))
 }
 
-/// The budget question (ADR 0032), asked in both modes: how the agent is
+/// The budget question (ADR 0034), asked in both modes: how the agent is
 /// paid, which picks the metric and its defaults, then the daily budget
 /// on one line that Enter accepts or the user edits ([`parse_daily`]).
 /// Each month is 30 × its day unless config.toml sets it. Returns the
@@ -953,7 +1036,7 @@ fn ask_budget(
     writeln!(out, "{BUDGET_GUIDE}")?;
     // A USD budget of 0 from before 0.4.5 paused the agent: said, and not
     // offered as is (it now means no limit). The answer here confirms the
-    // budget (ADR 0032 §5).
+    // budget (ADR 0034 §5).
     let zero = crate::budget::legacy_zero(table, stored);
     if runtime != "openclaw" && (zero.0 || zero.1) {
         writeln!(out, "{}", zero_line(zero, "agent"))?;
@@ -1074,7 +1157,7 @@ fn zero_line(zero: (bool, bool), prefix: &str) -> String {
 
 /// The agents' tables, other than the one setup asked about (`asked`),
 /// whose USD budget of 0 from before 0.4.5 will mean no limit once setup
-/// records its revision: one warning line each (ADR 0032 §5).
+/// records its revision: one warning line each (ADR 0034 §5).
 fn other_zero_warnings(
     settings: &Settings,
     stored: Option<u32>,
@@ -1238,7 +1321,7 @@ pub fn render(choices: &Choices) -> Result<String> {
     line(&mut text, "storage.max")?;
     text.push_str(
         "\n# The agents the node runs, one [agents.<name>] table each (ADR 0021); the\n\
-         # name defaults to the runtime: claude, codex or openclaw.\n",
+         # name defaults to the runtime: claude, codex, openclaw, opencode or vibe.\n",
     );
     match &choices.runtime {
         Some(runtime) => {
@@ -1247,6 +1330,13 @@ pub fn render(choices: &Choices) -> Result<String> {
                 "[agents.{runtime}]\nruntime = {}\n",
                 settings::check_value("agent.runtime", runtime)?
             ));
+            if let Some(model) = chosen("agent.model") {
+                text.push_str(&format!(
+                    "# {}\nmodel = {}\n",
+                    settings::find_key("agent.model")?.help,
+                    settings::check_value("agent.model", model)?
+                ));
+            }
             for key in AGENT_TABLE_KEYS {
                 text.push('\n');
                 line(&mut text, key)?;
@@ -1416,6 +1506,7 @@ pub fn setup(
         Asker {
             install: Install::detect(),
             terminal: std::io::stdin().is_terminal(),
+            machine: None,
         },
     )
 }
@@ -1430,7 +1521,11 @@ pub fn setup_with(
     path: Option<&OsStr>,
     desktop: bool,
 ) -> Result<Choices> {
-    setup_asking(data_dir, input, out, path, desktop, Asker::person())
+    let asker = Asker {
+        machine: Some(crate::naming::Machine::default()),
+        ..Asker::person()
+    };
+    setup_asking(data_dir, input, out, path, desktop, asker)
 }
 
 fn setup_asking(
@@ -1503,7 +1598,7 @@ pub fn catch_up_with(
 ) -> Result<Choices> {
     // Only questions for an agent, and it runs none: nothing to ask. Not
     // with a USD budget of 0 from before 0.4.5 in a table: that pause
-    // waits for `wats setup` (ADR 0032 §5).
+    // waits for `wats setup` (ADR 0034 §5).
     let settings = Settings::load(data_dir)?;
     if pending_questions(&settings, revision) == 0 {
         if !any_legacy_zero(&settings, stored_revision(data_dir)) {
@@ -1545,10 +1640,13 @@ enum Run {
 /// Who answers the security updates question, and for which install
 /// (ADR 0030): asked only of a person (stdin a terminal) and only for an
 /// [`Install::Release`], which the node can update by itself.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct Asker {
     install: Install,
     terminal: bool,
+    /// The nodes whose names the node name question refuses (ADR 0023
+    /// §8); None: this user's, looked up when asked.
+    machine: Option<crate::naming::Machine>,
 }
 
 impl Asker {
@@ -1557,6 +1655,7 @@ impl Asker {
         Asker {
             install: Install::detect(),
             terminal: true,
+            machine: None,
         }
     }
 }
@@ -1604,10 +1703,14 @@ fn ask_and_write(
         choices.values.push(("notify.desktop", on.to_string()));
     }
     let security = if SECURITY_AUTO_SINCE > revision {
-        ask_security_auto(input, out, &settings, data_dir, asker, &mut choices)?
+        ask_security_auto(input, out, &settings, data_dir, asker.clone(), &mut choices)?
     } else {
         None
     };
+    // Last, so that the answers before it keep their order (ADR 0023 §8).
+    if revision == 0 {
+        ask_node_name(input, out, data_dir, asker.machine.as_ref(), &mut choices)?;
+    }
     // The other agents' USD budgets of 0 from before 0.4.5 mean no limit
     // once the revision is recorded: said.
     let asked = choices
@@ -1696,6 +1799,77 @@ fn ask_security_auto(
     Ok(Some(on))
 }
 
+/// This user's nodes, for the node name question: the registry (none in a
+/// hermetic process without `WATS_RUN_DIR`) and `~/.wats`.
+#[cfg(not(test))]
+fn users_machine() -> crate::naming::Machine {
+    crate::naming::Machine::of_user(crate::background::registry_dir(
+        crate::update::hermetic_env(),
+    ))
+}
+
+/// Unit tests never look at this user's nodes (the real ~/.wats): none.
+#[cfg(test)]
+fn users_machine() -> crate::naming::Machine {
+    crate::naming::Machine::default()
+}
+
+/// The node name question (ADR 0023 §8).
+pub const NODE_NAME_QUESTION: &str = "Name of this node";
+
+/// Ask the node's name (ADR 0023 §8), its current one by default, else one
+/// drawn now; another node of this machine's name is refused. Written to
+/// `<data dir>/node-name`, which older releases ignore (so a rollback still
+/// starts), unless config.toml sets `node.name`: then there.
+fn ask_node_name(
+    input: &mut impl BufRead,
+    out: &mut impl Write,
+    data_dir: &Path,
+    machine: Option<&crate::naming::Machine>,
+    choices: &mut Choices,
+) -> Result<()> {
+    use crate::naming;
+    let taken = match machine {
+        Some(machine) => machine.taken(data_dir),
+        None => users_machine().taken(data_dir),
+    };
+    let current = naming::stored(data_dir);
+    let default = current
+        .clone()
+        .unwrap_or_else(|| naming::draw_random(&taken));
+    // Quick: the current name, or the one drawn, said in one line
+    // (ADR 0027 §5).
+    let name = if choices.quick {
+        writeln!(
+            out,
+            "Node name: {default} (`wats setup`, detailed, to change)"
+        )?;
+        default.clone()
+    } else {
+        loop {
+            write!(out, "{NODE_NAME_QUESTION} (node.name) [{default}]: ")?;
+            let answer = match read_answer(input, out)? {
+                Some(answer) if !answer.is_empty() => answer,
+                _ => break default.clone(),
+            };
+            if let Err(why) = naming::check(&answer) {
+                writeln!(out, "  {why}")?;
+            } else if taken.contains(&answer) {
+                writeln!(out, "  another node of this machine is named {answer}")?;
+            } else {
+                break answer;
+            }
+        }
+    };
+    if naming::configured(data_dir).is_some() {
+        choices.values.push(("node.name", name));
+    } else if current.as_deref() != Some(name.as_str()) {
+        naming::write(data_dir, &name)
+            .with_context(|| format!("write {}", data_dir.join(naming::FILE).display()))?;
+    }
+    Ok(())
+}
+
 /// The answer `name` recorded in `data_dir`'s [`ANSWERS_FILE`], if any.
 pub fn recorded_answer(data_dir: &Path, name: &str) -> Option<String> {
     let text = std::fs::read_to_string(data_dir.join(ANSWERS_FILE)).ok()?;
@@ -1729,12 +1903,41 @@ fn next_steps(out: &mut impl Write, choices: &Choices, found: &[Found], hints: b
             }
         }
         Some(runtime) => {
-            let name = if runtime == "codex" {
-                "Codex"
-            } else {
-                "Claude Code"
+            let name = match runtime.as_str() {
+                "codex" => "Codex",
+                "opencode" => "OpenCode",
+                "vibe" => "Mistral Vibe",
+                _ => "Claude Code",
             };
             write!(out, "`wats` now runs the node with a {name} agent.")?;
+            if runtime == "vibe" {
+                let inherit = choices
+                    .values
+                    .iter()
+                    .any(|(k, v)| *k == "agent.access" && v.trim() == "inherit");
+                if inherit {
+                    write!(
+                        out,
+                        " With inherit, its runner starts only once agent.review = true or \
+                         agent.allow is set (wats config set agents.vibe.review true, or wats \
+                         config set agents.vibe.allow <ids>)."
+                    )?;
+                } else {
+                    write!(
+                        out,
+                        " Its runs have the wats tools only, with their own Vibe home (not \
+                         ~/.vibe); your API key comes from your OS keyring (`vibe --setup`) \
+                         or MISTRAL_API_KEY."
+                    )?;
+                }
+            }
+            if runtime == "opencode" {
+                write!(
+                    out,
+                    " Its runs read the agent's own OpenCode directory, not ~/.config/opencode \
+                     (`wats setup opencode --agent` creates it and says where)."
+                )?;
+            }
             if hints {
                 write!(
                     out,
@@ -1753,7 +1956,7 @@ fn next_steps(out: &mut impl Write, choices: &Choices, found: &[Found], hints: b
     {
         writeln!(out, "{OPENCLAW_MCP_HINT}")?;
     }
-    if found.iter().any(|f| f.name == "vibe") {
+    if found.iter().any(|f| f.name == "vibe") && choices.runtime.as_deref() != Some("vibe") {
         writeln!(out, "{VIBE_MCP_HINT}")?;
     }
     Ok(())
@@ -1830,6 +2033,50 @@ mod tests {
         setup(data.path(), &mut "".as_bytes(), &mut out, Some(&path)).unwrap();
         let said = String::from_utf8(out).unwrap();
         assert!(!said.contains("openclaw"), "{said}");
+    }
+
+    /// OpenCode on PATH (looked up, never run) is a runtime (ADR 0031):
+    /// choosing it asks its model as provider/model, written to its table.
+    #[cfg(unix)]
+    #[test]
+    fn opencode_is_a_runtime_with_a_model_question() {
+        let bin = tempfile::tempdir().unwrap();
+        let opencode = fake_cli(bin.path(), "opencode");
+        let path = std::env::join_paths([bin.path()]).unwrap();
+        let found = detect_agents(Some(&path));
+        assert_eq!(
+            found,
+            [Found {
+                name: "opencode",
+                path: opencode
+            }]
+        );
+        assert!(found[0].supported());
+        let data = tempfile::tempdir().unwrap();
+        let mut out = Vec::new();
+        let choices = setup(
+            data.path(),
+            &mut "opencode\namazon-bedrock/claude-test\n".as_bytes(),
+            &mut out,
+            Some(&path),
+        )
+        .unwrap();
+        let said = String::from_utf8(out).unwrap();
+        assert_eq!(choices.runtime.as_deref(), Some("opencode"));
+        assert!(said.contains(OPENCODE_MODEL_QUESTION), "{said}");
+        assert!(said.contains("wats setup opencode --mcp"), "{said}");
+        let config = std::fs::read_to_string(data.path().join(FILE_NAME)).unwrap();
+        assert!(config.contains("[agents.opencode]"), "{config}");
+        assert!(
+            config.contains("model = \"amazon-bedrock/claude-test\""),
+            "{config}"
+        );
+        // Enter keeps OpenCode's own default: no model written.
+        let other = tempfile::tempdir().unwrap();
+        let mut out = Vec::new();
+        setup(other.path(), &mut "\n\n".as_bytes(), &mut out, Some(&path)).unwrap();
+        let config = std::fs::read_to_string(other.path().join(FILE_NAME)).unwrap();
+        assert!(!config.contains("\nmodel = "), "{config}");
     }
 
     /// On a desktop session, setup asks notify.desktop (default yes) and
@@ -1947,6 +2194,112 @@ mod tests {
             Some(true)
         );
         assert_eq!(settings.update.security_delay.as_deref(), Some("12h"));
+    }
+
+    /// The node's name (ADR 0023 §8), asked last: a drawn default, kept in
+    /// `node-name` (never config.toml, which 0.4.4 would refuse); an answer
+    /// is checked; with `node.name` already in config.toml, it goes there.
+    #[test]
+    fn setup_asks_the_node_name() {
+        let data = tempfile::tempdir().unwrap();
+        let mut out = Vec::new();
+        setup_with(data.path(), &mut "d\n".as_bytes(), &mut out, None, false).unwrap();
+        let said = String::from_utf8(out).unwrap();
+        let drawn = crate::naming::generated(data.path()).expect("written");
+        assert!(
+            said.contains(&format!("{NODE_NAME_QUESTION} (node.name) [{drawn}]: ")),
+            "{said}"
+        );
+        // Quick keeps it, in one line, not asked (ADR 0027 §5).
+        let mut out = Vec::new();
+        setup_with(data.path(), &mut "".as_bytes(), &mut out, None, false).unwrap();
+        let said = String::from_utf8(out).unwrap();
+        assert!(!said.contains(NODE_NAME_QUESTION), "{said}");
+        assert!(
+            said.contains(&format!(
+                "Node name: {drawn} (`wats setup`, detailed, to change)"
+            )),
+            "{said}"
+        );
+        assert_eq!(crate::naming::generated(data.path()), Some(drawn.clone()));
+        let fresh = tempfile::tempdir().unwrap();
+        let mut out = Vec::new();
+        setup_with(fresh.path(), &mut "".as_bytes(), &mut out, None, false).unwrap();
+        let said = String::from_utf8(out).unwrap();
+        let kept = crate::naming::generated(fresh.path()).expect("drawn and written");
+        assert!(said.contains(&format!("Node name: {kept} (")), "{said}");
+        let config = std::fs::read_to_string(data.path().join(FILE_NAME)).unwrap();
+        assert!(!config.contains(&drawn), "{config}");
+        // Again: the current name is the default. Storage, networks,
+        // security updates, then the name: an invalid one, then another.
+        let mut out = Vec::new();
+        setup_with(
+            data.path(),
+            &mut "d\n\n\n\nNot Valid\nhive_test\n".as_bytes(),
+            &mut out,
+            None,
+            false,
+        )
+        .unwrap();
+        let said = String::from_utf8(out).unwrap();
+        assert!(said.contains(&format!("(node.name) [{drawn}]")), "{said}");
+        assert!(said.contains("node name \"Not Valid\""), "{said}");
+        assert_eq!(
+            crate::naming::generated(data.path()).as_deref(),
+            Some("hive_test")
+        );
+        assert!(Settings::load(data.path()).unwrap().node.name.is_none());
+        // Set in config.toml by hand: the answer goes there.
+        let mut file = ConfigFile::open(data.path()).unwrap();
+        file.set("node.name", "by_hand").unwrap();
+        file.save().unwrap();
+        setup_with(
+            data.path(),
+            &mut "d\n\n\n\nrenamed\n".as_bytes(),
+            &mut Vec::new(),
+            None,
+            false,
+        )
+        .unwrap();
+        let settings = Settings::load(data.path()).unwrap();
+        assert_eq!(settings.node.name.as_deref(), Some("renamed"));
+        assert_eq!(
+            crate::naming::stored(data.path()).as_deref(),
+            Some("renamed")
+        );
+    }
+
+    /// The node name question refuses another node's name, among the
+    /// machine's directories it is given (temporary ones here: a unit test
+    /// never reads the real ~/.wats).
+    #[test]
+    fn the_node_name_question_refuses_another_nodes_name() {
+        let tmp = tempfile::tempdir().unwrap();
+        let registry = tmp.path().join("run");
+        let other = tmp.path().join("other");
+        crate::naming::write(&other, "busy_bee").unwrap();
+        crate::background::register(&registry, &other).unwrap();
+        let machine = crate::naming::Machine {
+            registry: Some(registry),
+            default_dir: Some(tmp.path().join("home/.wats")),
+        };
+        let data = tmp.path().join("data");
+        let mut out = Vec::new();
+        let mut choices = Choices::default();
+        ask_node_name(
+            &mut "busy_bee\ncalm_bee\n".as_bytes(),
+            &mut out,
+            &data,
+            Some(&machine),
+            &mut choices,
+        )
+        .unwrap();
+        let said = String::from_utf8(out).unwrap();
+        assert!(
+            said.contains("another node of this machine is named busy_bee"),
+            "{said}"
+        );
+        assert_eq!(crate::naming::generated(&data).as_deref(), Some("calm_bee"));
     }
 
     /// A No sticks (ADR 0030): it unsets the key (absent is false, and an
@@ -2069,6 +2422,7 @@ mod tests {
         let piped = Asker {
             install: Install::Release,
             terminal: false,
+            machine: Some(crate::naming::Machine::default()),
         };
         for input in ["", "\n\ny\n"] {
             let mut out = Vec::new();
@@ -2078,7 +2432,7 @@ mod tests {
                 &mut out,
                 None,
                 false,
-                piped,
+                piped.clone(),
                 0,
                 Run::Setup,
             )
@@ -2133,6 +2487,7 @@ mod tests {
             let asker = Asker {
                 install,
                 terminal: true,
+                machine: Some(crate::naming::Machine::default()),
             };
             let (choices, _) = ask_and_write(
                 data.path(),
@@ -2164,11 +2519,12 @@ mod tests {
         assert_eq!(new_questions(SETUP_REVISION), 0);
     }
 
-    /// Mistral Vibe on PATH: listed, not offered as the agent, its MCP
-    /// setup suggested.
+    /// Mistral Vibe on PATH (looked up, never run) is a runtime (ADR
+    /// 0033): offered as the agent, with its own access question (no
+    /// workspace, swarm-only by default, inherit with its warning).
     #[cfg(unix)]
     #[test]
-    fn vibe_is_listed_as_mcp_only() {
+    fn vibe_is_a_runtime_without_workspace() {
         let bin = tempfile::tempdir().unwrap();
         let vibe = fake_cli(bin.path(), "vibe");
         let path = std::env::join_paths([bin.path()]).unwrap();
@@ -2180,18 +2536,58 @@ mod tests {
                 path: vibe
             }]
         );
-        assert!(!found[0].supported());
+        assert!(found[0].supported());
+        // Enter everywhere: Vibe, quick, so swarm-only without asking.
         let data = tempfile::tempdir().unwrap();
         let mut out = Vec::new();
         let choices = setup(data.path(), &mut "".as_bytes(), &mut out, Some(&path)).unwrap();
         let said = String::from_utf8(out).unwrap();
-        assert_eq!(choices.runtime, None);
+        assert_eq!(choices.runtime.as_deref(), Some("vibe"));
+        assert!(said.contains("swarm-only access"), "{said}");
+        assert!(!said.contains(VIBE_ACCESS_QUESTION), "{said}");
+        let config = std::fs::read_to_string(data.path().join(FILE_NAME)).unwrap();
+        assert!(!config.contains("\naccess = "), "{config}");
+        assert_eq!(
+            crate::vibe::access(
+                Settings::load(data.path()).unwrap().agents["vibe"]
+                    .access
+                    .as_deref()
+            )
+            .unwrap(),
+            crate::access::Access::SwarmOnly
+        );
+        // Detailed, Enter everywhere: its own access question.
+        let data = tempfile::tempdir().unwrap();
+        let mut out = Vec::new();
+        let choices = setup(data.path(), &mut "\nd\n".as_bytes(), &mut out, Some(&path)).unwrap();
+        let said = String::from_utf8(out).unwrap();
+        assert_eq!(choices.runtime.as_deref(), Some("vibe"));
+        assert!(said.contains("1) vibe"), "{said}");
+        assert!(!said.contains("not supported yet"), "{said}");
         assert!(
-            said.contains("(agent: not supported yet; MCP: wats setup vibe --mcp)"),
+            said.contains(&format!(
+                "{VIBE_ACCESS_QUESTION} (agent.access) [swarm-only]"
+            )),
             "{said}"
         );
-        assert!(said.contains(NO_AGENT_FOUND), "{said}");
-        assert!(said.contains(VIBE_MCP_HINT), "{said}");
+        assert!(!said.contains(crate::vibe::INHERIT_WARNING), "{said}");
+        assert!(said.contains("wats setup vibe --mcp"), "{said}");
+        assert!(!said.contains(VIBE_MCP_HINT), "{said}");
+        let config = std::fs::read_to_string(data.path().join(FILE_NAME)).unwrap();
+        assert!(config.contains("[agents.vibe]"), "{config}");
+        assert!(config.contains("access = \"swarm-only\""), "{config}");
+        // workspace is refused, inherit is taken, with its warning.
+        let data = tempfile::tempdir().unwrap();
+        let mut out = Vec::new();
+        let input = "vibe\nd\n\n\n\n\n\nworkspace\ninherit\n";
+        let choices = setup(data.path(), &mut input.as_bytes(), &mut out, Some(&path)).unwrap();
+        let said = String::from_utf8(out).unwrap();
+        assert_eq!(choices.runtime.as_deref(), Some("vibe"));
+        assert!(said.contains("Vibe cannot keep its tools"), "{said}");
+        assert!(said.contains(crate::vibe::INHERIT_WARNING), "{said}");
+        assert!(said.contains("agent.review = true"), "{said}");
+        let config = std::fs::read_to_string(data.path().join(FILE_NAME)).unwrap();
+        assert!(config.contains("access = \"inherit\""), "{config}");
     }
 
     fn run(found: &[Found], settings: &Settings, input: &str) -> (Choices, String) {

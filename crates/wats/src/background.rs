@@ -11,7 +11,10 @@
 //!   directory (`~/.wats/run`), one small file per data directory, so that
 //!   `wats ps` and `wats stop --all` find nodes outside `~/.wats`. An entry
 //!   says where to look, never whether a node runs: the data directory
-//!   lock does (a stale entry is removed by `wats ps`).
+//!   lock does (a stale entry is removed by `wats ps`). A second index,
+//!   `known/`, keeps every data directory a node ever ran in, stopped ones
+//!   too, so that a node name (`-n NAME`) finds a stopped node; an entry
+//!   goes once its directory is no data directory any more.
 //! - **Signals.** `wats stop` asks the node through its socket first, and
 //!   signals it with `kill(1)` only when it does not answer or stop in
 //!   time (the crate forbids `unsafe`, so no `libc::kill`).
@@ -281,7 +284,10 @@ pub fn registry_dir(hermetic: bool) -> Option<PathBuf> {
     if hermetic {
         return None;
     }
-    std::env::home_dir().map(|home| home.join(".wats").join("run"))
+    let home = std::env::home_dir()?;
+    #[cfg(test)]
+    crate::naming::assert_test_home(&home);
+    Some(home.join(".wats").join("run"))
 }
 
 /// The registry entry of `data_dir`.
@@ -291,13 +297,24 @@ fn entry_path(registry: &Path, data_dir: &Path) -> PathBuf {
     registry.join(format!("{}.json", &hash[..16]))
 }
 
-/// Record that a node runs in `data_dir` (best effort).
+/// Record that a node runs in `data_dir` (best effort), and that the
+/// machine knows it ([`known`]).
 pub fn register(registry: &Path, data_dir: &Path) -> std::io::Result<()> {
     let absolute = std::path::absolute(data_dir)?;
+    let entry = serde_json::json!({ "data_dir": absolute }).to_string();
     let path = entry_path(registry, &absolute);
     create_parent(&path)?;
-    let entry = serde_json::json!({ "data_dir": absolute });
-    std::fs::write(path, entry.to_string())
+    std::fs::write(path, &entry)?;
+    // Best effort: `wats ps` and `stop` need the entry above only.
+    let known = entry_path(&registry.join(KNOWN_DIR), &absolute);
+    if let Err(e) = create_parent(&known).and_then(|()| std::fs::write(&known, &entry)) {
+        tracing::debug!(
+            "could not record {} in {}: {e}",
+            absolute.display(),
+            known.display()
+        );
+    }
+    Ok(())
 }
 
 /// Remove the entry of `data_dir`.
@@ -307,18 +324,76 @@ pub fn unregister(registry: &Path, data_dir: &Path) {
 
 /// The data directories in the registry.
 pub fn registered(registry: &Path) -> Vec<PathBuf> {
+    entries(registry).into_iter().map(|(_, dir)| dir).collect()
+}
+
+/// The registry's sub-directory of the data directories nodes ever ran
+/// in, running or not.
+pub const KNOWN_DIR: &str = "known";
+
+/// How long an entry of [`KNOWN_DIR`] whose data directory is gone stays,
+/// since its node last started: a volume that is not mounted for a while
+/// keeps its nodes known.
+pub const KNOWN_KEEP: std::time::Duration = std::time::Duration::from_secs(30 * 86_400);
+
+/// The data directories nodes ever ran in on this machine (since 0.4.5),
+/// stopped ones too, that are still data directories (a `secret.key`,
+/// `config.toml` or `node-name`). [`register`] adds one; it is only read
+/// here, never removed ([`prune_known`] does, at a node's start or `wats
+/// stop`).
+pub fn known(registry: &Path) -> Vec<PathBuf> {
+    entries(&registry.join(KNOWN_DIR))
+        .into_iter()
+        .map(|(_, dir)| dir)
+        .filter(|dir| {
+            [
+                "secret.key",
+                crate::settings::FILE_NAME,
+                crate::naming::FILE,
+            ]
+            .iter()
+            .any(|f| dir.join(f).exists())
+        })
+        .collect()
+}
+
+/// Remove the entries of [`KNOWN_DIR`] whose data directory is certainly
+/// gone (not found: any other error keeps it) and whose node last started
+/// more than `keep` ago ([`KNOWN_KEEP`]). Run at a node's start and by
+/// `wats stop`, never by a command that only reads.
+pub fn prune_known(registry: &Path, keep: std::time::Duration) {
+    for (path, dir) in entries(&registry.join(KNOWN_DIR)) {
+        let gone = matches!(
+            std::fs::metadata(&dir),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound
+        );
+        let old = std::fs::metadata(&path)
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| t.elapsed().ok())
+            .is_some_and(|age| age >= keep);
+        if gone && old {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}
+
+/// The entries of a registry directory, and the data directory each
+/// names, sorted by data directory.
+fn entries(registry: &Path) -> Vec<(PathBuf, PathBuf)> {
     let Ok(entries) = std::fs::read_dir(registry) else {
         return Vec::new();
     };
-    let mut dirs: Vec<PathBuf> = entries
+    let mut dirs: Vec<(PathBuf, PathBuf)> = entries
         .flatten()
-        .filter(|e| e.path().extension().is_some_and(|x| x == "json"))
-        .filter_map(|e| std::fs::read_to_string(e.path()).ok())
-        .filter_map(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
-        .filter_map(|v| v["data_dir"].as_str().map(PathBuf::from))
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|x| x == "json"))
+        .filter_map(|p| Some((std::fs::read_to_string(&p).ok()?, p)))
+        .filter_map(|(text, p)| Some((serde_json::from_str::<serde_json::Value>(&text).ok()?, p)))
+        .filter_map(|(v, p)| v["data_dir"].as_str().map(|d| (p, PathBuf::from(d))))
         .collect();
-    dirs.sort();
-    dirs.dedup();
+    dirs.sort_by(|a, b| a.1.cmp(&b.1));
+    dirs.dedup_by(|a, b| a.1 == b.1);
     dirs
 }
 
@@ -407,7 +482,7 @@ pub fn spawn_detached(
 ) -> std::io::Result<std::process::Child> {
     use std::os::unix::process::CommandExt;
     let stderr = open_log(log)?;
-    let mut command = std::process::Command::new(std::env::current_exe()?);
+    let mut command = std::process::Command::new(crate::update::spawn_exe()?);
     command
         .args(args)
         .stdin(std::process::Stdio::null())
@@ -442,6 +517,46 @@ pub fn signal(pid: u32, signal: &str) -> std::io::Result<bool> {
         .stderr(std::process::Stdio::null())
         .status()?;
     Ok(status.success())
+}
+
+/// SIGKILL to every process of the process group `pgid` (killpg(2)): an
+/// agent run and what it started (MCP servers, shell commands), ADR 0031
+/// §3. A group already gone is not an error; any other failure is
+/// logged.
+#[cfg(unix)]
+pub fn kill_group(pgid: u32) {
+    use nix::sys::signal::{Signal, killpg};
+    use nix::unistd::Pid;
+    let Ok(raw) = i32::try_from(pgid) else {
+        tracing::warn!("agent run: process group {pgid} out of range, not killed");
+        return;
+    };
+    // pgid 0 or 1 would be ours or init's: never.
+    if raw <= 1 {
+        tracing::warn!("agent run: refusing to kill process group {raw}");
+        return;
+    }
+    match killpg(Pid::from_raw(raw), Signal::SIGKILL) {
+        Ok(()) | Err(nix::errno::Errno::ESRCH) => {}
+        Err(e) => tracing::warn!("agent run: cannot kill its process group {raw}: {e}"),
+    }
+}
+
+/// Ask process `pid` to stop (SIGTERM). A process gone already is fine.
+#[cfg(unix)]
+pub fn terminate(pid: u32) {
+    use nix::sys::signal::{Signal, kill};
+    use nix::unistd::Pid;
+    let Ok(raw) = i32::try_from(pid) else {
+        return;
+    };
+    if raw <= 1 {
+        return;
+    }
+    match kill(Pid::from_raw(raw), Signal::SIGTERM) {
+        Ok(()) | Err(nix::errno::Errno::ESRCH) => {}
+        Err(e) => tracing::warn!("agent run: cannot stop process {raw}: {e}"),
+    }
 }
 
 /// Whether process `pid` exists.
@@ -527,7 +642,39 @@ mod tests {
         register(&registry, &a).unwrap();
         assert_eq!(registered(&registry), [a.clone(), b.clone()]);
         unregister(&registry, &a);
-        assert_eq!(registered(&registry), [b]);
+        assert_eq!(registered(&registry), std::slice::from_ref(&b));
+        // Known: those that are data directories; listing removes nothing.
+        std::fs::create_dir_all(&a).unwrap();
+        std::fs::write(a.join("secret.key"), "x").unwrap();
+        assert_eq!(
+            known(&registry),
+            std::slice::from_ref(&a),
+            "b holds no data"
+        );
+        assert_eq!(entries(&registry.join(KNOWN_DIR)).len(), 2);
+        // Pruned: only a data directory certainly gone, and long enough.
+        prune_known(&registry, KNOWN_KEEP);
+        assert_eq!(
+            entries(&registry.join(KNOWN_DIR)).len(),
+            2,
+            "b started recently"
+        );
+        std::fs::create_dir_all(&b).unwrap();
+        prune_known(&registry, std::time::Duration::ZERO);
+        assert_eq!(entries(&registry.join(KNOWN_DIR)).len(), 2, "b exists");
+        std::fs::remove_dir(&b).unwrap();
+        prune_known(&registry, std::time::Duration::ZERO);
+        let left: Vec<PathBuf> = entries(&registry.join(KNOWN_DIR))
+            .into_iter()
+            .map(|(_, d)| d)
+            .collect();
+        assert_eq!(left, std::slice::from_ref(&a));
+        // `known/` cannot be written: `register` still records the node.
+        let blocked = dir.path().join("blocked");
+        std::fs::create_dir_all(&blocked).unwrap();
+        std::fs::write(blocked.join(KNOWN_DIR), "a file, not a directory").unwrap();
+        register(&blocked, &a).unwrap();
+        assert_eq!(registered(&blocked), [a]);
     }
 
     #[test]

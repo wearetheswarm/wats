@@ -56,6 +56,17 @@ pub fn level(value: Option<&str>) -> Result<Access> {
     value.map_or(Ok(Access::default()), str::parse)
 }
 
+/// An agent's access level for its runtime: Mistral Vibe defaults to
+/// `swarm-only` and has no `workspace` ([`crate::vibe::access`], ADR
+/// 0033); the others as [`level`].
+pub fn level_for(runtime: &str, value: Option<&str>) -> Result<Access> {
+    if runtime == "vibe" {
+        crate::vibe::access(value)
+    } else {
+        level(value)
+    }
+}
+
 impl std::str::FromStr for Access {
     type Err = anyhow::Error;
     fn from_str(s: &str) -> Result<Self> {
@@ -88,8 +99,10 @@ knows and how it should answer; it reads this file at every run.
 - Claude Code: skills go in `.claude/skills/`, MCP servers in `.mcp.json`,
   settings in `.claude/settings.json`.
 - Codex: MCP servers go in `.codex/config.toml` (`[mcp_servers.<name>]`).
+- OpenCode: MCP servers go in `opencode.json` (`\"mcp\"`).
 - Tools are listed in `agent.tools`: Claude Code tools (`wats config set
-  agent.tools Read,Grep`) or Codex features (`image_generation`).
+  agent.tools Read,Grep`), Codex features (`image_generation`) or OpenCode
+  permission keys (`read,grep`).
 
 Whatever the agent can read here may end up posted to the swarm, and
 whatever it can do, a post can ask for.
@@ -282,6 +295,24 @@ pub fn claude_deny_rules(data_dir: &Path, run_dir: &Path) -> Vec<String> {
     for tool in ["Edit", "Write"] {
         rules.extend(paths.iter().map(|p| format!("{tool}({p})")));
     }
+    rules.extend(
+        shell_deny_mentions(data_dir)
+            .iter()
+            .map(|m| format!("Bash(*{m}*)")),
+    );
+    // From a workspace inside the data directory, `..` leads to it.
+    if run_dir.starts_with(data_dir) {
+        rules.push("Bash(*..*)".into());
+    }
+    rules
+}
+
+/// What a shell command of a swarm-only or workspace run may not name:
+/// the data directory (also as `~/…` and `$HOME/…`), config.toml,
+/// safety.json, and `wats config|resume|guardian|setup`. Claude Code's
+/// `Bash(*…*)` deny rules and OpenCode's `bash` patterns (ADR 0031) are
+/// built from it.
+pub fn shell_deny_mentions(data_dir: &Path) -> Vec<String> {
     let mut mentions: Vec<String> = spellings(data_dir)
         .iter()
         .map(|d| d.display().to_string())
@@ -301,12 +332,7 @@ pub fn claude_deny_rules(data_dir: &Path, run_dir: &Path) -> Vec<String> {
         crate::safety::FILE_NAME.to_string(),
     ]);
     mentions.extend(DENIED_WATS_COMMANDS.iter().map(|c| format!("wats {c}")));
-    rules.extend(mentions.iter().map(|m| format!("Bash(*{m}*)")));
-    // From a workspace inside the data directory, `..` leads to it.
-    if run_dir.starts_with(data_dir) {
-        rules.push("Bash(*..*)".into());
-    }
-    rules
+    mentions
 }
 
 /// `claude -p` arguments for one run, before the per-run limits and the
@@ -664,14 +690,22 @@ fn codex_servers() -> usize {
         .unwrap_or(0)
 }
 
+/// Whether an `agent.tools` entry is a shell: Claude Code's `Bash`,
+/// Codex's `shell_tool`, OpenCode's `bash` (or `shell`), with or without
+/// a pattern.
+fn gives_shell(tool: &str) -> bool {
+    let base = tool.split('(').next().unwrap_or(tool).trim();
+    matches!(base, "Bash" | "shell_tool")
+        || base.eq_ignore_ascii_case("bash")
+        || base.eq_ignore_ascii_case("shell")
+}
+
 /// What a run can use, in one sentence for its prompt (`{access}`,
 /// ADR 0018 §1): an agent that knows it cannot build or test offers what
 /// it can do instead of failing or declining silently.
 pub fn prompt_line(runtime: &str, access: Access, workdir: &Path, tools: &[String]) -> String {
     const NOTHING_TO_RUN: &str = "You cannot run, build or test anything in this run.";
-    let shell = tools
-        .iter()
-        .any(|t| t == "Bash" || t.starts_with("Bash(") || t == "shell_tool");
+    let shell = tools.iter().any(|t| gives_shell(t));
     let line = match access {
         Access::SwarmOnly if runtime == "openclaw" => format!(
             "Your OpenClaw agent's tool policy for wats runs, normally the wats tools only. \
@@ -753,16 +787,15 @@ pub fn describe(d: &Describe) -> Summary {
                 workspace_codex_overrides(d.workdir)
                     .map(|(n, _)| n)
                     .unwrap_or_default()
+            } else if d.runtime == "opencode" {
+                crate::opencode::workspace_servers(d.workdir).unwrap_or_default()
             } else {
                 workspace_claude_servers(d.workdir)
                     .keys()
                     .cloned()
                     .collect()
             };
-            let shell = d
-                .tools
-                .iter()
-                .any(|t| t == "Bash" || t.starts_with("Bash(") || t == "shell_tool");
+            let shell = d.tools.iter().any(|t| gives_shell(t));
             (
                 format!(
                     "workspace {}: tools [{}], MCP servers [{}]",
@@ -774,6 +807,22 @@ pub fn describe(d: &Describe) -> Summary {
                 !d.tools.is_empty() || !servers.is_empty(),
             )
         }
+        Access::Inherit if d.runtime == "vibe" => (
+            format!(
+                "inherit: your full Mistral Vibe environment: your ~/.vibe config, MCP servers, \
+                 agents and skills ({})",
+                crate::vibe::INHERIT_WARNING
+            ),
+            true,
+            true,
+        ),
+        Access::Inherit if d.runtime == "opencode" => (
+            "inherit: your full OpenCode environment: your config, MCP servers, plugins and \
+             permissions (OpenCode allows every tool by default)"
+                .to_string(),
+            true,
+            true,
+        ),
         Access::Inherit => {
             let line = if codex {
                 format!(
@@ -818,6 +867,8 @@ struct CapNeed {
     claude: &'static [&'static str],
     /// Codex features.
     codex: &'static [&'static str],
+    /// OpenCode permission keys.
+    opencode: &'static [&'static str],
     /// A part of an MCP tool or server name, if any gives it.
     mcp: Option<&'static str>,
 }
@@ -830,6 +881,7 @@ const CAP_NEEDS: &[CapNeed] = &[
         what: "image",
         claude: &[],
         codex: &[CODEX_IMAGE_GENERATION],
+        opencode: &[],
         mcp: Some("image"),
     },
     CapNeed {
@@ -837,6 +889,7 @@ const CAP_NEEDS: &[CapNeed] = &[
         what: "shell",
         claude: &["Bash"],
         codex: &["shell_tool"],
+        opencode: &["bash", "shell"],
         mcp: None,
     },
     CapNeed {
@@ -844,6 +897,7 @@ const CAP_NEEDS: &[CapNeed] = &[
         what: "web",
         claude: &["WebFetch", "WebSearch"],
         codex: &["web_search", "standalone_web_search"],
+        opencode: &["webfetch", "websearch"],
         mcp: None,
     },
 ];
@@ -865,7 +919,8 @@ pub struct CapCheck<'a> {
 /// whole environment, and OpenClaw its agent's tool policy: neither is
 /// checked.
 pub fn cap_warnings(c: &CapCheck) -> Vec<String> {
-    if c.access == Access::Inherit || !matches!(c.runtime, "claude" | "codex") {
+    if c.access == Access::Inherit || !matches!(c.runtime, "claude" | "codex" | "opencode" | "vibe")
+    {
         return Vec::new();
     }
     // swarm-only ignores `agent.tools` and the workspace's MCP servers.
@@ -875,6 +930,10 @@ pub fn cap_warnings(c: &CapCheck) -> Vec<String> {
             workspace_codex_overrides(c.workdir)
                 .map(|(names, _)| names)
                 .unwrap_or_default(),
+        ),
+        Access::Workspace if c.runtime == "opencode" => (
+            c.tools,
+            crate::opencode::workspace_servers(c.workdir).unwrap_or_default(),
         ),
         Access::Workspace => (
             c.tools,
@@ -886,10 +945,10 @@ pub fn cap_warnings(c: &CapCheck) -> Vec<String> {
         _ => (&[], Vec::new()),
     };
     let runtime_tools = |need: &CapNeed| -> &'static [&'static str] {
-        if c.runtime == "codex" {
-            need.codex
-        } else {
-            need.claude
+        match c.runtime {
+            "codex" => need.codex,
+            "opencode" => need.opencode,
+            _ => need.claude,
         }
     };
     let mut out = Vec::new();
@@ -906,7 +965,12 @@ pub fn cap_warnings(c: &CapCheck) -> Vec<String> {
         seen.push(cap.clone());
         let by_tool = tools.iter().any(|t| {
             let base = t.split('(').next().unwrap_or(t).trim();
-            runtime_tools(need).contains(&base)
+            let base = if c.runtime == "opencode" {
+                base.to_ascii_lowercase()
+            } else {
+                base.to_string()
+            };
+            runtime_tools(need).contains(&base.as_str())
         });
         let by_mcp = need.mcp.is_some_and(|part| {
             tools

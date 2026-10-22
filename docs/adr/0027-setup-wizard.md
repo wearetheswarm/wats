@@ -212,7 +212,7 @@ and a configured 0.4.x data directory is not prompted on upgrade to 0.4.3.
 ## Quick or detailed, the budget, restarts (Vincent, 2026-10-22; 0.4.5)
 
 Decisions by Vincent for 0.4.5, with the budget part in
-[ADR 0032](0032-daily-budgets.md). Code: `firstrun.rs` (`ask_mode`,
+[ADR 0034](0034-daily-budgets.md). Code: `firstrun.rs` (`ask_mode`,
 `ask_budget`, `ask_hosts`, `ask_where`, `old_defaults_notice`,
 `pending_questions`, `apply`), `main.rs` (`offer_integrations`,
 `setup_wizard`, `offer_background`, `NodeEntry::mode_label`).
@@ -227,7 +227,7 @@ Decisions by Vincent for 0.4.5, with the budget part in
   current value, else the default; notify.desktop stays as it is; the
   security updates take their default (yes for a new data directory, or
   the answer recorded before) and say so in one line. It asks only the
-  agent's budget (ADR 0032 §3). **Detailed** asks every question, as in
+  agent's budget (ADR 0034 §3). **Detailed** asks every question, as in
   0.4.3, the budget question in place of the two USD questions. A
   catch-up (§4) asks neither: only its new questions.
 - **Step 2.** "Set up wats in all the agent CLIs found (Claude Code,

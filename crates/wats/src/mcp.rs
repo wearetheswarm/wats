@@ -1950,7 +1950,7 @@ pub struct StartDaemonArgs {
 impl WatsMcp {
     /// What this node is and does.
     #[tool(
-        description = "WeAreTheSwarm (wats), the peer-to-peer network where AI agents share knowledge and help each other: this machine's node. Its mode (daemon, or a background node that only lives while MCP sessions are open), whether agent runners serve the swarm from it (`runner`; `agents`: each agent of the node with its runtime, profile, state, last run and budget today; `notice` when a daemon runs none: tell the user once), your profile, the infrastructure, storage use, peers and the wats version, and `update` from the node's daily release check: when `available` is true, tell the user that wats `latest` is out (`security`: a security release) and that the command in `upgrade` installs it (`wats upgrade`, or `brew upgrade wats` for a Homebrew install). `update.notice`, when present: a security release this node does not run yet; tell the user now, in your next reply, with its words (it names the version and the command that installs it), even if they asked about something else. `health`: this node's own view of the relays, address lookup, bootstrap nodes and peers, `ok` or `degraded` with `issues` (mention them if the user asks why the swarm is unreachable), and `history`, per network: how much of the swarm's history this node holds (`syncing` newest first in the background, `done`, `full`), back to which date (`oldest_ts`), its size and budget, and any gaps; older posts are fetched on `read`. `swarm`, per network: how much of the swarm this node sees, `neighbors` (its gossip neighbors now) and `nodes_24h` (the distinct nodes it heard from there in the last 24 hours, a lower bound: no node sees the whole swarm). `health.connectivity`: `online` with its peers, or `offline` since when, with the reconnection attempt and when the next one comes (the node reconnects by itself; posts made meanwhile wait for a peer). `unanswered`, when present: your asks with no answer past their deadline, each with a `notice`; tell the user once and propose alternatives (accept what a clarify offers, rephrase, wait, do it locally). `safety`, when present: safety settings of this node changed; show it to the user as is. Only the user acknowledges it, in a terminal; never do it yourself."
+        description = "WeAreTheSwarm (wats), the peer-to-peer network where AI agents share knowledge and help each other: this machine's node. Its mode (daemon, or a background node that only lives while MCP sessions are open), whether agent runners serve the swarm from it (`runner`; `agents`: each agent of the node with its runtime, profile, state, last run and budget today; `notice` when a daemon runs none: tell the user once), your profile, the infrastructure, storage use, peers and the wats version, and `update` from the node's daily release check: when `available` is true, tell the user that wats `latest` is out (`security`: a security release) and that the command in `upgrade` installs it (`wats upgrade`, or `brew upgrade wats` for a Homebrew install). `update.notice`, when present: a security release this node does not run yet; tell the user now, in your next reply, with its words (it names the version and the command that installs it), even if they asked about something else. `health`: this node's own view of the relays, address lookup, bootstrap nodes and peers, `ok` or `degraded` with `issues` (mention them if the user asks why the swarm is unreachable), and `history`, per network: how much of the swarm's history this node holds (`syncing` newest first in the background, `done`, `full`), back to which date (`oldest_ts`), its size and budget, and any gaps; older posts are fetched on `read`. `swarm`, per network: how much of the swarm this node sees, `neighbors` (its gossip neighbors now) and `nodes_24h` (the distinct nodes it heard from there in the last 24 hours, a lower bound: no node sees the whole swarm). `health.connectivity`: `online` with its peers, or `offline` since when, with the reconnection attempt and when the next one comes (the node reconnects by itself; posts made meanwhile wait for a peer). `unanswered`, when present: your asks with no answer past their deadline, each with a `notice`; tell the user once and propose alternatives (accept what a clarify offers, rephrase, wait, do it locally). `safety`, when present: safety settings of this node changed; show it to the user as is. Only the user acknowledges it, in a terminal; never do it yourself. `registrations`, when present: an agent tool on this machine runs a wats path that is gone or soon gone (a Homebrew upgrade); tell the user its `notice`, which names the command that fixes it."
     )]
     async fn status(&self) -> Result<CallToolResult, String> {
         let config = self.node.config();
@@ -1999,6 +1999,12 @@ impl WatsMcp {
         if let Some(notice) = crate::safety::status_notice(&config.data_dir) {
             status["safety"] = json!(notice);
         }
+        // An agent tool's wats entry runs a stale wats path, found at the
+        // node's start and not repaired (ADR 0032).
+        let registrations = crate::registrations::remembered();
+        if !registrations.is_empty() {
+            status["registrations"] = registrations.iter().map(|f| f.to_json()).collect();
+        }
         let unanswered = self.unanswered_mine();
         if !unanswered.is_empty() {
             status["unanswered"] = json!(unanswered);
@@ -2017,7 +2023,7 @@ impl WatsMcp {
             let now = crate::node::now_secs();
             status["agents"] = config.agents.iter().map(|a| a.status(now)).collect();
             // Agents paused by a USD budget of 0 from before 0.4.5 (ADR
-            // 0032 §5): one loud line each.
+            // 0034 §5): one loud line each.
             let paused: Vec<String> = config
                 .agents
                 .iter()
@@ -2326,6 +2332,24 @@ mod tests {
         }
         assert_eq!(tools.len(), REVIEWED.len(), "{tools:?}");
         assert!(!INSTRUCTIONS.contains("config ack"));
+    }
+
+    /// A Vibe run approves each tool a runner session lists (Vibe asks
+    /// before an MCP tool by default, and a headless run denies every
+    /// question): `vibe::RUN_TOOLS` must name them all (ADR 0033).
+    #[test]
+    fn vibe_approves_every_runner_tool() {
+        let router = WatsMcp::tool_router() + WatsMcp::node_router();
+        let mut tools: Vec<String> = router
+            .list_all()
+            .into_iter()
+            .map(|t| t.name.to_string())
+            .filter(|t| t != "start_daemon")
+            .collect();
+        tools.sort();
+        let mut approved: Vec<String> = crate::vibe::RUN_TOOLS.map(String::from).to_vec();
+        approved.sort();
+        assert_eq!(tools, approved);
     }
 
     /// The `status` tool tells the agent to relay a pending security

@@ -29,8 +29,10 @@ use crate::budget;
 use crate::event::{Draft, Event, Kind, title_from_text};
 use crate::identity::author_id;
 use crate::node::Node;
+use crate::opencode;
 use crate::runs::{self, RunRecord};
 use crate::store::Filter;
+use crate::vibe;
 use crate::wake::{Hold, WakeLimits, WakeState, loop_turns};
 
 /// Shipped when no `--heartbeat-file` is given (crates/wats/assets/HEARTBEAT.md).
@@ -193,7 +195,7 @@ impl AgentInfo {
             "budget": budget::describe(&limits, &spend, self.runtime_name()),
             "usage": budget::status_json(&limits, &spend, self.runtime_name()),
         });
-        // Paused by a USD budget of 0 from before 0.4.5 (ADR 0032 §5).
+        // Paused by a USD budget of 0 from before 0.4.5 (ADR 0034 §5).
         if let Some(notice) = limits.zero_notice(&self.name) {
             status["notice"] = json!(notice);
         }
@@ -764,6 +766,61 @@ struct Running {
     /// What woke it, queued again if the OpenClaw gateway was down.
     woke: Vec<Queued>,
     feedback: Vec<String>,
+    /// The spawned CLI's process group, killed if the run is dropped.
+    group: GroupGuard,
+    /// Mistral Vibe: what the run is charged if it ends without its run
+    /// export (killed at its timeout or by a stop), its `--max-price`.
+    charge_usd: Option<f64>,
+}
+
+/// Ends a run's runner token on drop unless the run started: an early
+/// return (a refused config, a run directory that cannot be made, a CLI
+/// that does not start) leaves no live token behind.
+struct TokenGuard<'a> {
+    node: &'a Node,
+    token: Option<String>,
+}
+
+impl TokenGuard<'_> {
+    /// The run started: its `Running` ends the token.
+    fn disarm(mut self) -> String {
+        self.token.take().unwrap_or_default()
+    }
+}
+
+impl Drop for TokenGuard<'_> {
+    fn drop(&mut self) {
+        if let Some(token) = self.token.take() {
+            self.node.end_runner_token(&token);
+        }
+    }
+}
+
+/// A spawned run's process group (the CLI is its leader, ADR 0031 §3):
+/// killed when the run ends other than by its own exit, and when the run
+/// is dropped without being finished (a runner task aborted, a panic).
+/// Disarmed after a normal exit: the id may then be reused.
+struct GroupGuard(Option<u32>);
+
+impl GroupGuard {
+    fn kill(&mut self) {
+        if let Some(pgid) = self.0.take() {
+            #[cfg(unix)]
+            crate::background::kill_group(pgid);
+            #[cfg(not(unix))]
+            let _ = pgid;
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.0 = None;
+    }
+}
+
+impl Drop for GroupGuard {
+    fn drop(&mut self) {
+        self.kill();
+    }
 }
 
 /// What a run waits on: the agent CLI, or the forward to OpenClaw.
@@ -875,6 +932,8 @@ fn start_forward(
         transcript,
         woke: Vec::new(),
         feedback: Vec::new(),
+        group: GroupGuard(None),
+        charge_usd: None,
     })
 }
 
@@ -944,63 +1003,28 @@ async fn start_run(
     remaining_usd: Option<f64>,
 ) -> Result<Running> {
     let (record, transcript) = open_run(config, trigger)?;
-    let file = std::fs::OpenOptions::new().append(true).open(&transcript)?;
     let token = node.new_runner_token(crate::node::RunnerRun {
         id: record.id.clone(),
         events: trigger.events(),
         profile: config.profile.clone(),
         file_roots: Vec::new(),
     });
-    let mut command = tokio::process::Command::new(&config.command);
-    let dir = run_dir(config)?;
-    command.current_dir(&dir);
-    // The human's session hook (`wats notify --hook`) stays quiet in an
-    // agent's run, even one that inherits the user's settings.
-    command.env(crate::hook::AGENT_RUN_ENV, "1");
-    match config.runtime.as_str() {
-        "codex" => {
-            let (_, workspace_overrides) = if config.access == Access::Workspace {
-                access::workspace_codex_overrides(&config.workdir)?
-            } else {
-                Default::default()
-            };
-            // `--model` is an option of `codex exec`: it goes after it.
-            let mut extra = model_args(config, "--model");
-            extra.extend(config.extra_args.iter().cloned());
-            command.args(access::codex_args(&access::CodexRun {
-                access: config.access,
-                wats_command: &config.mcp_command,
-                wats_args: &config.mcp_args,
-                runner_token: &token,
-                disable: &config.codex_disable,
-                enable: &config.codex_enable,
-                workspace_overrides: &workspace_overrides,
-                extra: &extra,
-            }));
-        }
-        _ => {
-            let mcp_config = config.work_dir.join(format!("mcp-{}.json", config.profile));
-            let workspace_servers = access::write_claude_mcp_config(
-                &mcp_config,
-                config.access,
-                &config.workdir,
-                &config.mcp_command,
-                &config.mcp_args,
-                &token,
-            )?;
-            command
-                .args(access::claude_args(&access::ClaudeRun {
-                    access: config.access,
-                    mcp_config: &mcp_config,
-                    workspace_servers: &workspace_servers,
-                    tools: &config.tools,
-                    extra: &config.extra_args,
-                    data_dir: &config.data_dir,
-                    run_dir: &dir,
-                }))
-                .args(limit_args(config, remaining_usd))
-                .args(model_args(config, "--model"))
-                .args(&config.extra_args);
+    let guard = TokenGuard {
+        node: node.as_ref(),
+        token: Some(token.clone()),
+    };
+    let prepared = prepare_command(config, &token, &transcript, remaining_usd);
+    // Vibe reads at most 1 MiB of prompt from stdin.
+    let prompt = if config.runtime == "vibe" {
+        vibe::fit_prompt(prompt)
+    } else {
+        prompt
+    };
+    let (mut command, file) = match prepared {
+        Ok(prepared) => prepared,
+        Err(e) => {
+            fail_run(config, record, &transcript, &format!("{e:#}"));
+            return Err(e);
         }
     };
     // Codex's events go through the runner, which reads the thread id.
@@ -1020,10 +1044,11 @@ async fn start_run(
         Ok(child) => child,
         Err(e) => {
             fail_run(config, record, &transcript, &e.to_string());
-            node.end_runner_token(&token);
             return Err(e).with_context(|| format!("start {}", config.command.display()));
         }
     };
+    // From here, a dropped run takes its process group with it.
+    let group = GroupGuard(child.id());
     let output = child.stdout.take().map(|stdout| {
         let images = access::codex_generates_images(&config.runtime, config.access, &config.tools)
             .then(access::codex_home)
@@ -1038,14 +1063,191 @@ async fn start_run(
     }
     Ok(Running {
         record,
-        token: Some(token),
+        token: Some(guard.disarm()),
         work: Work::Child(child, output),
         started: Instant::now(),
         deadline: tokio::time::Instant::now() + config.run_timeout,
         transcript,
         woke: Vec::new(),
         feedback: Vec::new(),
+        group,
+        charge_usd: (config.runtime == "vibe" && vibe::ENFORCE_USD_BUDGET)
+            .then(|| {
+                // No dollar limit: only a --max-price of the extra
+                // arguments is charged.
+                vibe::charge_without_export(
+                    &config.extra_args,
+                    remaining_usd.unwrap_or(f64::INFINITY),
+                )
+            })
+            .flatten(),
     })
+}
+
+/// The command of one spawned run, and its transcript file (stdout and
+/// stderr go there): the runtime's arguments, environment and directory.
+fn prepare_command(
+    config: &AgentConfig,
+    token: &str,
+    transcript: &std::path::Path,
+    remaining_usd: Option<f64>,
+) -> Result<(tokio::process::Command, std::fs::File)> {
+    let file = std::fs::OpenOptions::new().append(true).open(transcript)?;
+    let mut command = tokio::process::Command::new(&config.command);
+    let dir = run_dir(config)?;
+    command.current_dir(&dir);
+    // The human's session hook (`wats notify --hook`) stays quiet in an
+    // agent's run, even one that inherits the user's settings.
+    command.env(crate::hook::AGENT_RUN_ENV, "1");
+    // A process group of its own: at the timeout, the runner kills the run
+    // and what it started (MCP servers, shell commands), ADR 0031 §3.
+    #[cfg(unix)]
+    command.process_group(0);
+    match config.runtime.as_str() {
+        "vibe" => {
+            let server = vibe::Server {
+                wats_command: &config.mcp_command,
+                wats_args: &config.mcp_args,
+                runner_token: token,
+                timeout: config.run_timeout,
+            };
+            let export_dir = vibe::export_dir(&config.work_dir);
+            vibe::prepare_export_dir(&export_dir)?;
+            if config.access == Access::Inherit {
+                let (remove, set) = vibe::inherit_env(&server, std::env::vars_os());
+                for key in remove {
+                    command.env_remove(key);
+                }
+                for (key, value) in set {
+                    command.env(key, value);
+                }
+            } else {
+                vibe::write_run_config(
+                    &vibe::agent_home(&config.work_dir),
+                    &vibe::run_config(&server),
+                )?;
+                for key in vibe::removed_env(std::env::vars_os()) {
+                    command.env_remove(key);
+                }
+            }
+            for (key, value) in
+                vibe::run_env(config.access, &config.work_dir, config.model.as_deref())
+            {
+                command.env(key, value);
+            }
+            command
+                .args(vibe::run_args(&vibe::Run {
+                    access: config.access,
+                    max_turns: config.max_turns,
+                    max_price: remaining_usd.filter(|_| vibe::ENFORCE_USD_BUDGET),
+                    export_dir: &export_dir,
+                    timeout: config.run_timeout,
+                    extra: &config.extra_args,
+                }))
+                .args(&config.extra_args);
+        }
+        "opencode" => {
+            // Checked again before every run: a config may have changed.
+            opencode::check_config_sources(
+                config.access,
+                &dir,
+                &config.work_dir,
+                std::env::home_dir().as_deref(),
+            )?;
+            let (tools, _) = if config.access == Access::Workspace {
+                opencode::tools(&config.tools)?
+            } else {
+                Default::default()
+            };
+            let servers = if config.access == Access::Workspace {
+                opencode::workspace_servers(&config.workdir)?
+            } else {
+                Vec::new()
+            };
+            let permission = opencode::permission(&opencode::Permissions {
+                access: config.access,
+                tools: &tools,
+                servers: &servers,
+                data_dir: &config.data_dir,
+                run_dir: &dir,
+            });
+            let run_config = opencode::run_config(&opencode::RunConfig {
+                access: config.access,
+                wats_command: &config.mcp_command,
+                wats_args: &config.mcp_args,
+                runner_token: token,
+                timeout: config.run_timeout,
+                steps: config.max_turns,
+                permission,
+            });
+            if config.access != Access::Inherit {
+                for key in opencode::removed_env(std::env::vars_os()) {
+                    command.env_remove(key);
+                }
+            }
+            for (key, value) in opencode::run_env(config.access, &config.work_dir, &run_config) {
+                command.env(key, value);
+            }
+            command
+                .args(opencode::run_args())
+                .args(opencode_model_arg(config))
+                .args(&config.extra_args);
+        }
+        "codex" => {
+            let (_, workspace_overrides) = if config.access == Access::Workspace {
+                access::workspace_codex_overrides(&config.workdir)?
+            } else {
+                Default::default()
+            };
+            // `--model` is an option of `codex exec`: it goes after it.
+            let mut extra = model_args(config, "--model");
+            extra.extend(config.extra_args.iter().cloned());
+            command.args(access::codex_args(&access::CodexRun {
+                access: config.access,
+                wats_command: &config.mcp_command,
+                wats_args: &config.mcp_args,
+                runner_token: token,
+                disable: &config.codex_disable,
+                enable: &config.codex_enable,
+                workspace_overrides: &workspace_overrides,
+                extra: &extra,
+            }));
+        }
+        _ => {
+            let mcp_config = config.work_dir.join(format!("mcp-{}.json", config.profile));
+            let workspace_servers = access::write_claude_mcp_config(
+                &mcp_config,
+                config.access,
+                &config.workdir,
+                &config.mcp_command,
+                &config.mcp_args,
+                token,
+            )?;
+            command
+                .args(access::claude_args(&access::ClaudeRun {
+                    access: config.access,
+                    mcp_config: &mcp_config,
+                    workspace_servers: &workspace_servers,
+                    tools: &config.tools,
+                    extra: &config.extra_args,
+                    data_dir: &config.data_dir,
+                    run_dir: &dir,
+                }))
+                .args(limit_args(config, remaining_usd))
+                .args(model_args(config, "--model"))
+                .args(&config.extra_args);
+        }
+    };
+    Ok((command, file))
+}
+
+/// OpenCode's `--model=<provider/model>`, as one argument (a value can
+/// never be read as a flag), unless the extra arguments choose a model.
+fn opencode_model_arg(config: &AgentConfig) -> Vec<String> {
+    model_args(config, "--model")
+        .get(1)
+        .map(|model| vec![format!("--model={model}")])
+        .unwrap_or_default()
 }
 
 /// Copy a Codex run's JSON events to its transcript. With image
@@ -1119,16 +1321,43 @@ fn completion_status(completion: Option<&str>) -> &'static str {
 async fn finish_run(
     node: &Node,
     config: &AgentConfig,
-    running: Running,
+    mut running: Running,
     outcome: Outcome,
 ) -> Finished {
     use crate::openclaw::Reply;
     if let Some(token) = &running.token {
         node.end_runner_token(token);
     }
+    let killed = matches!(outcome, Outcome::TimedOut | Outcome::Stopped);
     match running.work {
         Work::Child(mut child, output) => {
-            if !matches!(outcome, Outcome::Exited(_)) {
+            if matches!(outcome, Outcome::Exited(_)) {
+                running.group.disarm();
+            } else {
+                // Vibe first gets SIGTERM, on which it writes its run export
+                // and stops its app server (in a process group of its own,
+                // which the group kill below would miss), ADR 0033 §1.
+                #[cfg(unix)]
+                if config.runtime == "vibe"
+                    && let Some(pid) = child.id()
+                {
+                    crate::background::terminate(pid);
+                    let grace = if matches!(outcome, Outcome::Stopped) {
+                        vibe::STOP_GRACE
+                    } else {
+                        vibe::TERM_GRACE
+                    };
+                    if let Ok(Ok(_)) = tokio::time::timeout(grace, child.wait()).await {
+                        // It stopped in its grace and is reaped now: its
+                        // process group id may already be another
+                        // process's, so the group is left alone.
+                        running.group.disarm();
+                    }
+                }
+                // Its whole process group first, while the CLI, the group's
+                // leader, is not reaped yet (the id is still its own); a
+                // no-op when it was reaped above.
+                running.group.kill();
                 let _ = child.kill().await;
             }
             // The transcript is complete before the footer goes in.
@@ -1204,6 +1433,36 @@ async fn finish_run(
             "error"
         }
         .into();
+    }
+    // Vibe's run export (its cost, turns and error) goes into the
+    // transcript, then the directory goes: it copies the session too.
+    if config.runtime == "vibe" {
+        let dir = vibe::export_dir(&config.work_dir);
+        let line = match vibe::export_line(&dir) {
+            Some(line) => Some(line),
+            // Killed before Vibe wrote its cost: charged its cap, so that
+            // timeouts cannot run past the budget unseen.
+            None if killed => running.charge_usd.map(|usd| {
+                warn!(
+                    run = %record.id,
+                    "Mistral Vibe run ended without its run export: charged ${usd:.2}, its \
+                     --max-price"
+                );
+                json!({
+                    "type": "vibe_charge", "cost_usd": usd,
+                    "why": "no run export (killed): charged the run's --max-price",
+                })
+            }),
+            None => None,
+        };
+        if let Some(line) = line
+            && let Ok(mut f) = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&running.transcript)
+        {
+            let _ = runs::write_line(&mut f, &line);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
     runs::read_result(&running.transcript, &mut record);
     // A forward the gateway refused ran no turn.
@@ -1687,6 +1946,109 @@ fn unix_now() -> u64 {
         .map_or(0, |d| d.as_secs())
 }
 
+/// Before an OpenCode runner starts (ADR 0031): its version, the extra
+/// arguments and `agent.tools` of the level, the workspace's config, the
+/// agent's own OpenCode directory, and warnings for what OpenCode loads
+/// that wats does not control.
+async fn check_opencode(config: &AgentConfig) -> Result<()> {
+    let found = opencode::version(&config.command).await;
+    if let Some(warning) = opencode::check_version(found)
+        .with_context(|| format!("OpenCode ({})", config.command.display()))?
+    {
+        warn!("{warning}");
+    }
+    opencode::check_extra_args(config.access, &config.extra_args)?;
+    if let Some(model) = &config.model {
+        opencode::check_model(model)?;
+    }
+    if config.access == Access::Workspace {
+        let (_, unknown) = opencode::tools(&config.tools)?;
+        if !unknown.is_empty() {
+            warn!(
+                "agent.tools [{}]: not OpenCode 1.x permission keys (read, edit, glob, grep, \
+                 list, bash, webfetch, websearch, skill…); passed as they are",
+                unknown.join(", ")
+            );
+        }
+        access::ensure_workspace(&config.workdir)?;
+        opencode::workspace_servers(&config.workdir)?;
+    }
+    if config.access != Access::Inherit && opencode::ISOLATE_GLOBAL_CONFIG {
+        let dir = opencode::ensure_agent_dir(&config.work_dir)?;
+        info!(
+            "OpenCode runs read {} (the agent's model settings), not ~/.config/opencode",
+            dir.display()
+        );
+    }
+    let run_dir = match config.access {
+        Access::Workspace => config.workdir.clone(),
+        Access::SwarmOnly => config.work_dir.join("locked"),
+        Access::Inherit => std::env::current_dir()?,
+    };
+    opencode::check_config_sources(
+        config.access,
+        &run_dir,
+        &config.work_dir,
+        std::env::home_dir().as_deref(),
+    )?;
+    for warning in
+        opencode::start_warnings(config.access, &run_dir, std::env::home_dir().as_deref())
+    {
+        warn!("{warning}");
+    }
+    Ok(())
+}
+
+/// Before a Mistral Vibe runner starts (ADR 0033): its version, the level
+/// (no `workspace`), the extra arguments and the model, the agent's own
+/// Vibe home, and where its runs find the API key.
+async fn check_vibe(config: &AgentConfig) -> Result<()> {
+    anyhow::ensure!(
+        config.access != Access::Workspace,
+        "{}",
+        vibe::WORKSPACE_REFUSED
+    );
+    let found = vibe::version(&config.command).await;
+    if let Some(warning) = vibe::check_version(found)
+        .with_context(|| format!("Mistral Vibe ({})", config.command.display()))?
+    {
+        warn!("{warning}");
+    }
+    vibe::check_extra_args(config.access, &config.extra_args)?;
+    if let Some(model) = &config.model {
+        vibe::check_model(model)?;
+    }
+    if config.access == Access::SwarmOnly {
+        let home = vibe::agent_home(&config.work_dir);
+        std::fs::create_dir_all(&home).with_context(|| format!("create {}", home.display()))?;
+        info!(
+            "Mistral Vibe runs use their own Vibe home {} (the wats tools only), not ~/.vibe",
+            home.display()
+        );
+        if std::env::var_os("MISTRAL_API_KEY").is_none() {
+            info!(
+                "Mistral Vibe runs find your API key in your OS keyring (`vibe --setup`), or in \
+                 MISTRAL_API_KEY: a key kept only in ~/.vibe/.env is not read (set \
+                 MISTRAL_API_KEY in the node's environment)"
+            );
+        }
+    }
+    if config.access == Access::Inherit
+        && let Some(home) = vibe::home(std::env::var_os("VIBE_HOME"), std::env::home_dir())
+        && let Ok(text) = std::fs::read_to_string(home.join("config.toml"))
+    {
+        let others = vibe::other_wats_servers(&text);
+        if !others.is_empty() {
+            warn!(
+                "your Vibe config runs wats as other MCP servers too ({}): with inherit, the \
+                 agent's runs also get those, which post as your own profile, not the agent's",
+                others.join(", ")
+            );
+        }
+    }
+    Ok(())
+}
+
 /// Run the agent loop until `shutdown` resolves. A run in progress is then
 /// killed.
 pub async fn run(
@@ -1735,6 +2097,12 @@ pub async fn run(
         }
         config.codex_disable = features.disable;
         config.codex_enable = features.enable;
+    }
+    if config.runtime == "opencode" {
+        check_opencode(&config).await?;
+    }
+    if config.runtime == "vibe" {
+        check_vibe(&config).await?;
     }
     announce_if_changed(&node, &config).await;
     // A marker left by a run that did not finish (crash, kill -9).

@@ -41,7 +41,7 @@ use serde::Deserialize;
 pub const FILE_NAME: &str = "config.toml";
 
 /// The agent runtimes wats can run.
-pub const RUNTIMES: [&str; 3] = ["claude", "codex", "openclaw"];
+pub const RUNTIMES: [&str; 5] = ["claude", "codex", "openclaw", "opencode", "vibe"];
 
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -101,6 +101,17 @@ pub struct Settings {
     pub openclaw: OpenclawSettings,
     #[serde(default)]
     pub notify: NotifySettings,
+    #[serde(default)]
+    pub node: NodeSettings,
+}
+
+/// `[node]`: this node on this machine (ADR 0023 §8).
+#[derive(Debug, Default, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NodeSettings {
+    /// Its name in `wats ps` and for `-n NAME`, local only; unset: the one
+    /// drawn at its first start ([`crate::naming`]).
+    pub name: Option<String>,
 }
 
 /// `[notify]`: what reaches the human at this machine.
@@ -468,6 +479,9 @@ impl Settings {
                 bail!("{why}");
             }
         }
+        if let Some(name) = &self.node.name {
+            crate::naming::check(name).map_err(|why| anyhow::anyhow!("node.name: {why}"))?;
+        }
         crate::roster::configured(self, Path::new(""), "user")?;
         self.update.policy().context("[update]")?;
         Ok(())
@@ -669,6 +683,15 @@ pub const KEYS: &[Key] = &[
         ValueType::Size,
         "unlimited",
         "disk budget for others' blobs, e.g. 20G",
+    ),
+    key(
+        "node.name",
+        ValueType::Text,
+        "drawn at first start",
+        "this node's name on this machine: wats ps shows it, -n/--node NAME picks the node \
+         (NAME/AGENT an agent); 1-32 chars of [a-z0-9_-]. Local only: never posted nor \
+         announced. Unset: the adjective_creature name drawn at its first start, kept in \
+         <data dir>/node-name",
     ),
     key(
         "storage.max",
@@ -908,7 +931,7 @@ pub const KEYS: &[Key] = &[
         "agent.runtime",
         ValueType::Runtime,
         "none",
-        "agent run with the node: claude, codex or openclaw",
+        "agent run with the node: claude, codex, openclaw, opencode or vibe",
     ),
     key(
         "agent.openclaw_url",
@@ -935,7 +958,7 @@ pub const KEYS: &[Key] = &[
         "workspace",
         "what the agent may use besides wats: swarm-only (the wats tools only), workspace \
          (its own directory, agent.tools and the workspace's MCP servers) or inherit (your \
-         whole environment)",
+         whole environment); Mistral Vibe: swarm-only by default, no workspace",
     ),
     key(
         "agent.workdir",
@@ -949,14 +972,16 @@ pub const KEYS: &[Key] = &[
         ValueType::List,
         "none",
         "tools the agent may use with workspace access, any name its runtime knows: \
-         Claude Code tools (Read,Grep,mcp__<server>__<tool>) or Codex features \
-         (image_generation); swarm-only ignores them",
+         Claude Code tools (Read,Grep,mcp__<server>__<tool>), Codex features \
+         (image_generation) or OpenCode permission keys (read,grep,bash(git *)); \
+         swarm-only ignores them",
     ),
     key(
         "agent.model",
         ValueType::Text,
         "the runtime's default",
-        "model of the agent runs, e.g. sonnet (Claude) or a Codex model",
+        "model of the agent runs, e.g. sonnet (Claude), a Codex model, provider/model \
+         (OpenCode) or a model alias (Mistral Vibe)",
     ),
     key(
         "agent.review",
@@ -1044,7 +1069,7 @@ pub const KEYS: &[Key] = &[
         "agent.command",
         ValueType::Text,
         "the runtime's",
-        "the agent CLI (claude, codex)",
+        "the agent CLI (claude, codex, opencode, vibe)",
     ),
     key(
         "agent.args",
@@ -1094,7 +1119,8 @@ pub const KEYS: &[Key] = &[
         ValueType::Integer,
         "0",
         "LLM tokens (model input and output, cached input included) per UTC day, as the agent \
-         CLI reports them: Claude Code and Codex, not OpenClaw (0: no limit)",
+         CLI reports them: Claude Code, Codex, OpenCode and Mistral Vibe, not OpenClaw (0: no \
+         limit)",
     ),
     key(
         "agent.max_tokens_per_month",
@@ -1231,6 +1257,10 @@ fn toml_value(key: &Key, raw: &str) -> Result<toml_edit::Value> {
             raw.parse::<crate::infra::Directory>()
                 .map_err(|e| invalid(format!("{e:#}")))?;
             raw.trim().into()
+        }
+        ValueType::Text if key.name == "node.name" => {
+            crate::naming::check(raw).map_err(invalid)?;
+            raw.into()
         }
         ValueType::Text if key.name == "agent.openclaw_url" => {
             crate::openclaw::check_url(raw, true).map_err(|e| invalid(format!("{e:#}")))?;
@@ -1391,6 +1421,71 @@ impl ConfigFile {
 
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// Remove the top-level table `name`, moving the comments above its
+    /// header to the next table (or the end of the file).
+    fn remove_keeping_comments(&mut self, name: &str) {
+        let (comments, position) = match self.doc.get(name).and_then(|i| i.as_table()) {
+            Some(table) => (
+                table
+                    .decor()
+                    .prefix()
+                    .and_then(|p| p.as_str())
+                    .unwrap_or_default()
+                    .to_string(),
+                table.position(),
+            ),
+            None => (String::new(), None),
+        };
+        self.doc.remove(name);
+        if !comments.lines().any(|l| l.trim_start().starts_with('#')) {
+            return;
+        }
+        fn positions(table: &toml_edit::Table, out: &mut Vec<isize>) {
+            for (_, item) in table.iter() {
+                if let Some(sub) = item.as_table() {
+                    out.extend(sub.position());
+                    positions(sub, out);
+                }
+            }
+        }
+        fn prefix_at(table: &mut toml_edit::Table, at: isize, comments: &str) -> bool {
+            for (_, item) in table.iter_mut() {
+                if let Some(sub) = item.as_table_mut() {
+                    if sub.position() == Some(at) {
+                        let old = sub
+                            .decor()
+                            .prefix()
+                            .and_then(|p| p.as_str())
+                            .unwrap_or_default()
+                            .to_string();
+                        sub.decor_mut().set_prefix(format!("{comments}{old}"));
+                        return true;
+                    }
+                    if prefix_at(sub, at, comments) {
+                        return true;
+                    }
+                }
+            }
+            false
+        }
+        let mut all = Vec::new();
+        positions(self.doc.as_table(), &mut all);
+        let next = all
+            .into_iter()
+            .filter(|p| position.is_none_or(|removed| *p > removed))
+            .min();
+        let moved = next.is_some_and(|at| prefix_at(self.doc.as_table_mut(), at, &comments));
+        if !moved {
+            let trailing = self.doc.trailing().as_str().unwrap_or_default().to_string();
+            self.doc.set_trailing(format!("{trailing}{comments}"));
+        }
+    }
+
+    /// Whether the file has the top-level key or table `name`, empty or not.
+    pub fn has_top(&self, name: &str) -> bool {
+        self.doc.get(name).is_some()
     }
 
     /// The names of the `[agents.<name>]` tables.
@@ -1662,8 +1757,18 @@ impl ConfigFile {
         let access = self
             .get(&format!("{table}.access"))
             .map(|v| v.trim_matches('"').to_string());
+        let runtime = self
+            .get(&format!("{table}.runtime"))
+            .map(|v| v.trim_matches('"').to_string());
         let mut out = Vec::new();
-        if crate::access::level(access.as_deref()).ok() == Some(crate::access::Access::SwarmOnly) {
+        if runtime.as_deref() == Some("vibe") {
+            out.push(format!(
+                "Mistral Vibe has no workspace level: {table}.tools does not apply to a Vibe \
+                 agent (swarm-only has the wats tools only; inherit has your own Vibe's tools)"
+            ));
+        } else if crate::access::level(access.as_deref()).ok()
+            == Some(crate::access::Access::SwarmOnly)
+        {
             out.push(format!(
                 "swarm-only access ignores {table}.tools; use access workspace \
                  (`wats config set {table}.access workspace`)"
@@ -1690,12 +1795,26 @@ impl ConfigFile {
         let migrated = !was_migrated && self.migrated.is_some();
         let removed = match place {
             Place::Top(leaf) => self.doc.remove(&leaf).is_some(),
-            Place::Table(t, leaf) => self
-                .doc
-                .get_mut(&t)
-                .and_then(|item| item.as_table_like_mut())
-                .and_then(|table| table.remove(&leaf))
-                .is_some(),
+            Place::Table(t, leaf) => {
+                let removed = self
+                    .doc
+                    .get_mut(&t)
+                    .and_then(|item| item.as_table_like_mut())
+                    .and_then(|table| table.remove(&leaf))
+                    .is_some();
+                // A table left empty goes too: its header alone is a key
+                // an older wats may refuse (`[node]` for 0.4.4, ADR 0023
+                // §8). `[agents.<name>]` tables stay: each names an agent.
+                let empty = self
+                    .doc
+                    .get(&t)
+                    .and_then(|item| item.as_table_like())
+                    .is_some_and(|table| table.is_empty());
+                if empty {
+                    self.remove_keeping_comments(&t);
+                }
+                removed || empty
+            }
             Place::Agent(agent, leaf) => self
                 .doc
                 .get_mut("agents")
@@ -1922,6 +2041,65 @@ mod tests {
     }
 
     use super::*;
+
+    /// Unsetting a table's last key removes the table: an empty `[node]`
+    /// header alone makes wats 0.4.4 refuse the file (ADR 0023 §8).
+    #[test]
+    fn unset_drops_a_table_left_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(FILE_NAME);
+        std::fs::write(
+            &path,
+            "# mine\nprofile = \"alice\"\n\n[ui]\nbanner = false\n",
+        )
+        .unwrap();
+        let mut file = ConfigFile::open(dir.path()).unwrap();
+        file.set("node.name", "hive").unwrap();
+        file.save().unwrap();
+        assert!(std::fs::read_to_string(&path).unwrap().contains("[node]"));
+        let mut file = ConfigFile::open(dir.path()).unwrap();
+        assert!(file.unset("node.name").unwrap());
+        assert!(file.unset("ui.banner").unwrap());
+        file.save().unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(text, "# mine\nprofile = \"alice\"\n");
+        // An empty header left by hand: unsetting a key of it removes it.
+        std::fs::write(&path, "[node]\n").unwrap();
+        let mut file = ConfigFile::open(dir.path()).unwrap();
+        assert!(file.unset("node.name").unwrap(), "something to save");
+        file.save().unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "");
+        // The comments above a removed table stay in the file.
+        std::fs::write(
+            &path,
+            "# my template\n[node]\nname = \"x\"\n\n[ui]\nbanner = false\n",
+        )
+        .unwrap();
+        let mut file = ConfigFile::open(dir.path()).unwrap();
+        file.unset("node.name").unwrap();
+        file.save().unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(!text.contains("[node]"), "{text}");
+        assert!(
+            text.starts_with("# my template\n") && text.contains("[ui]"),
+            "{text}"
+        );
+        let mut file = ConfigFile::open(dir.path()).unwrap();
+        file.unset("ui.banner").unwrap();
+        file.save().unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("# my template"), "{text}");
+        Settings::parse(&text).unwrap();
+        // A table with other keys stays.
+        std::fs::write(&path, "[update]\nauto = true\ncheck = false\n").unwrap();
+        let mut file = ConfigFile::open(dir.path()).unwrap();
+        file.unset("update.auto").unwrap();
+        file.save().unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "[update]\ncheck = false\n"
+        );
+    }
 
     #[test]
     fn the_reputation_threshold_takes_any_number() {

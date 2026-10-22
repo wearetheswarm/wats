@@ -44,6 +44,9 @@ unused-allowed-license = "allow"
 [bans]
 multiple-versions = "allow"
 wildcards = "deny"
+# The workspace's own path crates (crates/wats-sys), all `publish =
+# false`, carry no version: they are not wildcards.
+allow-wildcard-paths = true
 
 [sources]
 unknown-registry = "deny"

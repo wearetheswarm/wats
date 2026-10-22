@@ -179,6 +179,16 @@ pub fn append_index(work_dir: &Path, record: &RunRecord) -> std::io::Result<()> 
     write_line(&mut file, &serde_json::to_value(record)?)
 }
 
+/// The message of an error event: Codex's `error.message` or `message`,
+/// OpenCode's `error.data.message`, else its `error.name`.
+fn error_message(value: &Value) -> Option<&str> {
+    value["error"]["message"]
+        .as_str()
+        .or(value["message"].as_str())
+        .or(value["error"]["data"]["message"].as_str())
+        .or(value["error"]["name"].as_str())
+}
+
 /// Fill turns, cost and errors from the agent CLI's final `result` line
 /// (Claude Code stream-json).
 pub fn read_result(transcript: &Path, record: &mut RunRecord) {
@@ -197,7 +207,9 @@ pub fn read_result(transcript: &Path, record: &mut RunRecord) {
         {
             record.model = model.to_string();
         }
-        // Codex: turns, LLM tokens and failures, no cost.
+        // Codex: turns, LLM tokens and failures, no cost. OpenCode (`run
+        // --format json`, ADR 0031): a turn, its estimated cost and its LLM
+        // tokens per `step_finish`, and `error` events.
         match value["type"].as_str() {
             Some("turn.completed") => {
                 record.turns = Some(record.turns.unwrap_or(0) + 1);
@@ -206,14 +218,64 @@ pub fn read_result(transcript: &Path, record: &mut RunRecord) {
                 }
                 continue;
             }
+            Some("step_finish") => {
+                record.turns = Some(record.turns.unwrap_or(0) + 1);
+                // A cost of 0 (a model without a price) is no cost: the run
+                // then counts against the runs per day.
+                if crate::opencode::ENFORCE_USD_BUDGET
+                    && let Some(cost) = value["part"]["cost"].as_f64().filter(|c| *c > 0.0)
+                {
+                    record.cost_usd = Some(record.cost_usd.unwrap_or(0.0) + cost);
+                }
+                if let Some(n) = opencode_tokens(&value["part"]["tokens"]) {
+                    record.tokens = Some(record.tokens.unwrap_or(0).saturating_add(n));
+                }
+                continue;
+            }
+            // Mistral Vibe (ADR 0033): its run export, which the runner
+            // adds once the run ended: steps, cost (Vibe's estimate) and
+            // how it ended.
+            Some("vibe_export") => {
+                if let Some(steps) = value["steps"].as_u64() {
+                    record.turns = Some(steps);
+                }
+                if crate::vibe::ENFORCE_USD_BUDGET
+                    && let Some(cost) = value["cost_usd"].as_f64().filter(|c| *c > 0.0)
+                {
+                    record.cost_usd = Some(cost);
+                }
+                if let Some(n) = vibe_tokens(&value["usage"]) {
+                    record.tokens = Some(n);
+                }
+                if record.model.is_empty()
+                    && let Some(model) = value["model"].as_str()
+                {
+                    record.model = model.to_string();
+                }
+                if value["outcome"].as_str().is_some_and(|o| o != "finished") {
+                    if record.status == "ok" {
+                        record.status = "error".into();
+                    }
+                    record.error = error_message(&value)
+                        .or(value["outcome"].as_str())
+                        .map(|m| m.chars().take(200).collect());
+                }
+                continue;
+            }
+            // A Vibe run killed before it wrote its export: charged its cap.
+            Some("vibe_charge") => {
+                if crate::vibe::ENFORCE_USD_BUDGET
+                    && let Some(cost) = value["cost_usd"].as_f64().filter(|c| *c > 0.0)
+                {
+                    record.cost_usd = Some(cost);
+                }
+                continue;
+            }
             Some("turn.failed") | Some("error") => {
                 if record.status == "ok" {
                     record.status = "error".into();
                 }
-                record.error = value["error"]["message"]
-                    .as_str()
-                    .or(value["message"].as_str())
-                    .map(|m| m.chars().take(200).collect());
+                record.error = error_message(&value).map(|m| m.chars().take(200).collect());
                 continue;
             }
             _ => {}
@@ -262,6 +324,32 @@ fn codex_tokens(usage: &Value) -> Option<u64> {
     let output = usage["output_tokens"].as_u64();
     (input.is_some() || output.is_some())
         .then(|| input.unwrap_or(0).saturating_add(output.unwrap_or(0)))
+}
+
+/// The LLM tokens of an OpenCode `step_finish` (`part.tokens`): input,
+/// output, reasoning, cache reads and writes, as OpenCode counts them (it
+/// keeps each apart, and prices reasoning as output).
+fn opencode_tokens(tokens: &Value) -> Option<u64> {
+    let counts: Vec<u64> = [
+        &tokens["input"],
+        &tokens["output"],
+        &tokens["reasoning"],
+        &tokens["cache"]["read"],
+        &tokens["cache"]["write"],
+    ]
+    .into_iter()
+    .filter_map(Value::as_u64)
+    .collect();
+    (!counts.is_empty()).then(|| counts.iter().fold(0u64, |a, b| a.saturating_add(*b)))
+}
+
+/// The LLM tokens of a Mistral Vibe export's `usage`: its
+/// `total_tokens`, else `input_tokens` (cached input a part of it) and
+/// `output_tokens`.
+fn vibe_tokens(usage: &Value) -> Option<u64> {
+    usage["total_tokens"]
+        .as_u64()
+        .or_else(|| codex_tokens(usage))
 }
 
 /// The id of the run in progress, if any.
@@ -629,10 +717,105 @@ pub fn render(line: &str, style: Style) -> Vec<String> {
             "✗ {}",
             value["error"]["message"].as_str().unwrap_or("turn failed")
         ))),
-        "error" => out.push(style.red(&format!(
-            "✗ {}",
-            value["message"].as_str().unwrap_or("error")
+        "error" => out.push(style.red(&format!("✗ {}", error_message(&value).unwrap_or("error")))),
+        // OpenCode (`opencode run --format json`).
+        "text" => {
+            for line in value["part"]["text"].as_str().unwrap_or("").trim().lines() {
+                out.push(format!("  {line}"));
+            }
+        }
+        "tool_use" => {
+            let part = &value["part"];
+            let state = &part["state"];
+            out.push(format!(
+                "{} {}",
+                style.cyan(&format!("→ {}", part["tool"].as_str().unwrap_or("?"))),
+                style.dim(&preview(&state["input"].to_string(), TOOL_PREVIEW)),
+            ));
+            if state["status"] == "error" {
+                out.push(style.red(&format!(
+                    "← ✗ {}",
+                    preview(state["error"].as_str().unwrap_or("error"), TOOL_PREVIEW)
+                )));
+            } else {
+                let mut text = preview(state["output"].as_str().unwrap_or(""), TOOL_PREVIEW);
+                if text.is_empty() {
+                    text = "(no text)".into();
+                }
+                out.push(style.dim(&format!("← {text}")));
+            }
+        }
+        // Mistral Vibe (`vibe -p --output streaming`): one history entry
+        // per line, then the runner's `vibe_export`.
+        "message" if value["role"] == "assistant" => {
+            for part in value["content"].as_array().into_iter().flatten() {
+                for line in part["text"].as_str().unwrap_or("").trim().lines() {
+                    out.push(format!("  {line}"));
+                }
+            }
+        }
+        "effect" => {
+            let state = &value["state"];
+            out.push(style.cyan(&format!(
+                "→ {}",
+                preview(value["title"].as_str().unwrap_or("?"), TOOL_PREVIEW)
+            )));
+            match state["status"].as_str() {
+                Some("failed") => out.push(style.red(&format!(
+                    "← ✗ {}",
+                    preview(
+                        state["error"]["message"].as_str().unwrap_or("failed"),
+                        TOOL_PREVIEW
+                    )
+                ))),
+                Some("completed") => {
+                    let mut text =
+                        preview(state["outputText"].as_str().unwrap_or(""), TOOL_PREVIEW);
+                    if text.is_empty() {
+                        text = "(no text)".into();
+                    }
+                    out.push(style.dim(&format!("← {text}")));
+                }
+                Some(other) => out.push(style.dim(&format!("← {other}"))),
+                None => {}
+            }
+        }
+        "notice" => out.push(style.dim(&format!(
+            "● {}",
+            preview(value["message"].as_str().unwrap_or(""), TOOL_PREVIEW)
         ))),
+        "vibe_export" => {
+            let cost = value["cost_usd"]
+                .as_f64()
+                .map(|c| format!(" · ${c:.4} (Vibe's estimate)"))
+                .unwrap_or_default();
+            let steps = value["steps"]
+                .as_u64()
+                .map(|n| format!(" · {n} steps"))
+                .unwrap_or_default();
+            match value["outcome"].as_str() {
+                Some("finished") => out.push(style.green(&format!("✓ done{steps}{cost}"))),
+                outcome => out.push(style.red(&format!(
+                    "✗ {}{steps}{cost}",
+                    error_message(&value).or(outcome).unwrap_or("ended")
+                ))),
+            }
+        }
+        "vibe_charge" => out.push(style.red(&format!(
+            "✗ no run export: charged ${:.2} (the run's --max-price)",
+            value["cost_usd"].as_f64().unwrap_or(0.0)
+        ))),
+        "step_finish" => {
+            let part = &value["part"];
+            out.push(style.green(&format!(
+                "✓ step done{}",
+                part["cost"]
+                    .as_f64()
+                    .filter(|c| *c > 0.0)
+                    .map(|c| format!(" · ${c:.4} (estimate)"))
+                    .unwrap_or_default()
+            )));
+        }
         "result" => {
             let ok = value["is_error"] != true;
             let label = if ok {
@@ -778,7 +961,7 @@ mod tests {
         assert!(render(&long, style)[0].ends_with('…'));
     }
 
-    /// LLM tokens (ADR 0032): Claude Code's `result.usage` (input, cache
+    /// LLM tokens (ADR 0034): Claude Code's `result.usage` (input, cache
     /// writes and reads, output) for the run; Codex's `turn.completed`
     /// usage summed over the turns (its cached input is part of its
     /// input); none from a transcript without usage (OpenClaw).
@@ -806,6 +989,24 @@ mod tests {
         ]);
         assert_eq!(codex.tokens, Some(3_120));
         assert_eq!(codex.turns, Some(2));
+        // OpenCode: each step_finish, every part of its tokens.
+        let opencode = read(&[
+            r#"{"type":"step_finish","part":{"cost":0.01,"tokens":{"input":100,"output":20,"reasoning":5,"cache":{"read":1000,"write":50}}}}"#,
+            r#"{"type":"step_finish","part":{"cost":0.01,"tokens":{"input":10,"output":2,"reasoning":0,"cache":{"read":0,"write":0}}}}"#,
+        ]);
+        assert_eq!(opencode.tokens, Some(1_187));
+        // Mistral Vibe: its export's usage.
+        let vibe = read(&[
+            r#"{"type":"vibe_export","outcome":"finished","usage":{"input_tokens":10,"output_tokens":2,"cached_input_tokens":4,"total_tokens":12},"cost_usd":0.01,"steps":3}"#,
+        ]);
+        assert_eq!(vibe.tokens, Some(12));
+        let vibe = read(&[
+            r#"{"type":"vibe_export","outcome":"finished","usage":{"input_tokens":10,"output_tokens":5}}"#,
+        ]);
+        assert_eq!(vibe.tokens, Some(15));
+        // A Vibe run killed before its export: charged, no tokens.
+        let killed = read(&[r#"{"type":"vibe_charge","cost_usd":0.5}"#]);
+        assert_eq!(killed.tokens, None);
         let none = read(&[r#"{"type":"openclaw_reply","outcome":"ok"}"#]);
         assert_eq!(none.tokens, None);
         let footer = render(

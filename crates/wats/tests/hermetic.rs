@@ -363,7 +363,8 @@ fn setup_detects_agent_clis_on_path() {
     let said = setup(&dir.path().join("e"), &empty);
     assert!(
         said.contains(
-            "No agent CLI found: install Claude Code (https://claude.com/claude-code) or Codex"
+            "No agent CLI found: install Claude Code (https://claude.com/claude-code), Codex \
+             (https://github.com/openai/codex), OpenCode"
         ),
         "{said}"
     );
@@ -1223,9 +1224,10 @@ fn setup_vibe_edits_its_config() {
     );
     let home = dir.path();
 
-    // No flag: points to --mcp, writes nothing.
+    // No flag: points to --mcp and --agent, writes nothing.
     let said = run(Some(&vibe_home), home, &[]);
     assert!(said.contains("wats setup vibe --mcp"), "{said}");
+    assert!(said.contains("wats setup vibe --agent"), "{said}");
     assert!(!vibe_home.exists());
 
     // A fresh VIBE_HOME: the file is created, no backup.
@@ -1289,7 +1291,8 @@ fn setup_vibe_edits_its_config() {
     );
     assert_eq!(std::fs::read_to_string(&config).unwrap(), original);
 
-    // Detection: a fake `vibe` on PATH (never run).
+    // Detection: a fake `vibe` on PATH (never run), now a runtime too
+    // (ADR 0033).
     let bin = home.join("bin");
     std::fs::create_dir_all(&bin).unwrap();
     fake_cli(&bin, "vibe");
@@ -1305,11 +1308,13 @@ fn setup_vibe_edits_its_config() {
         .unwrap();
     assert!(out.status.success(), "{out:?}");
     let said = String::from_utf8(out.stdout).unwrap();
+    assert!(said.contains("1) vibe"), "{said}");
+    assert!(!said.contains("not supported yet"), "{said}");
     assert!(
-        said.contains("(agent: not supported yet; MCP: wats setup vibe --mcp)"),
+        said.contains("Agent the node runs (agent.runtime) [vibe]"),
         "{said}"
     );
-    assert!(said.contains("Mistral Vibe found"), "{said}");
+    assert!(said.contains("wats setup vibe --mcp"), "{said}");
 }
 
 /// `WATS_MCP_SOCKET` (deploy/openclaw): another container reaches the node

@@ -45,13 +45,75 @@ docs/config.md.
 
 ### Changes
 
+- **Node names, and `-n NAME` for every command about one node** (ADR
+  0023 §8, [docs/agent.md](docs/agent.md#node-names-and-several-nodes)).
+  - Each node of the machine gets a random `adjective_creature` name at
+    its first start (`cheeky_starling`, `sleepy_krill`), never one another
+    node of the machine has. The setup wizard shows it as a default
+    (`Name of this node (node.name) [cheeky_starling]`); `wats config set
+    node.name hive` renames it. A fleet's nodes keep `node-<i>`.
+  - The name is local only: never posted, announced or sent to a peer.
+  - `wats ps` shows a `NAME` column and the start of each node's
+    endpoint id (`ENDPOINT`); `--json` has `name` and `endpoint_id`.
+    `--all` also lists the stopped nodes this machine ran.
+  - `-n/--node NAME` picks the node in `wats attach`, `stop`, `status`,
+    `mcp`, `config` and `agent logs|runs|attach|pending|approve|reject|retracted`;
+    `--dir` still works (both together must name the same node). An agent
+    of another node is `NODE/AGENT` in `wats agent --name`:
+    `wats agent logs --name codex/reviewer`.
+  - Without `-n` or `--dir`, they act on `~/.wats`'s node, as before.
+    With `-n`, `--dir` or several nodes on the machine, they say which
+    first, on stderr: `node cheeky_starling (~/.wats), agent claude`.
+  - `wats config unset` removes a table left empty (its comments kept),
+    and `wats upgrade --rollback` also refuses a table the older wats does
+    not know, even empty.
+  - `wats stop --all` stops every node of the machine.
+  - **`-n` changes meaning**: it was the count of `wats attach` and `wats
+    agent logs|runs`, which is now `--lines` and `--last` only. `wats fleet
+    up -n` is unchanged.
+  - Upgrading: a node of an older wats shows as `default` (`~/.wats`) or
+    its directory's name until it restarts. The drawn name is kept in
+    `<data dir>/node-name`, which older releases ignore, so a rollback to
+    0.4.4 still starts. `node.name` in config.toml (set by `wats config
+    set`) is new in 0.4.5: `wats upgrade --rollback` asks you to unset it
+    first.
+- **Mistral Vibe as an agent runtime** (`wats --agent vibe`, ADR 0033).
+  Each run is Vibe's headless mode, `vibe --prompt=` with the prompt on
+  stdin, `--output streaming` and `--max-turns`; Vibe 3.0.0 or later.
+  - **Locked down by default.** A Vibe agent is `swarm-only` unless set
+    otherwise: the exact wats tools only (`--enabled-tools`), and a per-run
+    `config.toml` in the agent's own Vibe home
+    (`<data dir>/agent/<name>/vibe-home`, never `~/.vibe`) that holds the
+    wats MCP server only, with the wats tools approved, every other tool
+    and every skill disabled. No `VIBE_*` variable of the node's
+    environment reaches the run.
+  - **No `workspace` level**: Vibe cannot keep its tools inside one
+    directory, so wats refuses it. `inherit` (your whole Vibe environment)
+    needs `agent.review = true` or an explicit `agent.allow` (either one;
+    OpenCode needs both).
+  - **Budget.** Vibe's run export (`--output-dir`) gives the cost, Vibe's
+    estimate from the model's prices, and the daily and monthly USD
+    budgets apply; `--max-price` is what is left of them. A run with no
+    cost counts against `agent.max_runs_per_day`. At its timeout, Vibe
+    gets SIGTERM first (it then writes its export and stops its app
+    server); a run killed before it wrote its export is charged its
+    `--max-price`.
+  - **Setup.** `wats setup vibe --agent` enables it; the setup wizard
+    offers Vibe as the node's agent when it finds `vibe` on your PATH, with
+    `swarm-only` or `inherit` (and a warning for `inherit`). Your API key
+    stays where Vibe keeps it (`MISTRAL_API_KEY` or your OS keyring); a
+    key only in `~/.vibe/.env` is not read by swarm-only runs.
+  - Rolling back to 0.4.4 with an agent whose `runtime = "vibe"`: 0.4.4
+    does not know that runtime; remove or disable that agent first.
 - **Daily budgets in dollars, minutes and LLM tokens** ([ADR
-  0032](docs/adr/0032-daily-budgets.md), docs/agent.md "Budget"). Next to
+  0034](docs/adr/0034-daily-budgets.md), docs/agent.md "Budget"). Next to
   `agent.max_usd_per_day`, `agent.max_minutes_per_day` caps the agent's
   total run time per UTC day (new runs stop once it is used; a run in
   progress keeps its timeout), and `agent.max_tokens_per_day` its LLM
   tokens (model input, cached input included, and output) for the
-  runtimes that report them: Claude Code and Codex, not OpenClaw. Each
+  runtimes that report them: Claude Code, Codex, OpenCode (`step_finish`)
+  and Mistral Vibe (its export's `usage`), not OpenClaw. OpenCode and
+  Vibe are held to dollars from their cost estimate, as before. Each
   month is 30 × its day unless `agent.max_*_per_month` is set; 0 is no
   limit. `wats status`, the banner, `wats agent runs` and the MCP
   `status` tool (`agents[].usage`) show the dollars, minutes and LLM
@@ -78,6 +140,83 @@ docs/config.md.
 - **The wizard writes only what changed**: a value equal to its default
   is left out of `config.toml`, and one already set keeps its line and
   comments, so that new defaults apply.
+
+## 0.4.4 (2026-10-22)
+
+Your agent tools keep the swarm across Homebrew upgrades, and a new
+agent runtime, OpenCode, brings your own model or cloud credits (Azure
+OpenAI, AWS Bedrock, Google Vertex AI, …).
+
+### Upgrading from 0.4.3
+
+- `wats upgrade` (or `brew upgrade wats`) installs it. **Homebrew: start
+  the new wats once from a terminal** (`wats --detach`): the node
+  repairs the agent-tool entries 0.4.3 wrote (below), which a tool cannot
+  start once `brew cleanup` removed the old binary. Restart a running
+  node afterwards.
+- No store migration, no format change, no wire change, no new key.
+- Rolling back to 0.4.3 with an agent whose `runtime = "opencode"`: 0.4.3
+  does not know that runtime; remove or disable that agent first.
+- **Homebrew users who ran `wats setup <tool> --mcp` with 0.4.3 or
+  older**: your agent tools run wats from a versioned Cellar path
+  (`/opt/homebrew/Cellar/wats/0.4.3/bin/wats`), which `brew cleanup`
+  removes after an upgrade. A 0.4.4 node repairs those entries at its
+  first start and logs which file it fixed; `wats status` warns about them
+  before. Until then, if `brew cleanup` has already run, run `wats setup
+  <tool> --mcp` again (`claude`, `codex`, `openclaw` or `vibe`).
+
+### To try
+
+- `wats status` after `brew upgrade wats`: a stale entry is named, with
+  the fix; the next node start repairs it.
+- `wats setup opencode --agent`, then `wats --agent opencode`
+  (docs/opencode.md): an agent on your own provider, locked to the wats
+  tools at `swarm-only`.
+
+### Keys in this release
+
+Unchanged from 0.4.3 (`agent.runtime` accepts `opencode`).
+
+### Changes
+
+- **The wats path written into the agent tools survives upgrades.** `wats
+  setup <tool> --mcp` (Claude Code, Codex, OpenClaw, Mistral Vibe), the
+  session hooks (`wats notify --hook`) and each agent run's MCP config now
+  use Homebrew's link (`$(brew --prefix)/bin/wats`) for a Homebrew install,
+  found without running `brew`, else the path you started wats by. Before,
+  they used the versioned Cellar path, and after `brew upgrade` plus `brew
+  cleanup` every agent tool lost the swarm without a word. Installs by
+  install.sh are unchanged. The background node is also respawned through
+  Homebrew's link once the running binary is gone. ADR 0032.
+- **Stale registrations are found and repaired.** At each start, a node
+  checks wats's own entries in each tool's config: the `wats` (and
+  `wats-agent`) MCP servers and the wats session hooks. A path that is
+  gone, or in a versioned Cellar directory, is rewritten to Homebrew's
+  link, and nothing else in the file changes. The write is atomic, after a
+  backup (`<file>.wats-repair.bak-<time>`, at most 3 kept). OpenClaw's
+  entries go through `openclaw mcp set`. `wats status` only checks: it
+  says the node repairs the entry at its next start, or gives the exact
+  `wats setup <tool> --mcp` command when there is no such link; so does
+  the MCP `status` tool (`registrations`). Entries that are not wats's are
+  never touched.
+- **OpenCode, a new agent runtime, for your own model or cloud credits**
+  (Azure OpenAI, AWS Bedrock, Google Vertex AI, …; [ADR 0031](docs/adr/0031-opencode.md),
+  [docs/opencode.md](docs/opencode.md)).
+  - `wats --agent opencode` runs `opencode run --format json` with a
+    per-run config: a dedicated `wats` agent with the permissions of the
+    access level, your global OpenCode config isolated, and nothing in
+    your session history.
+  - `wats setup opencode` registers wats (its stable path, as above)
+    through `opencode mcp add` (OpenCode 1.17.0 or later) and creates the
+    agent's own OpenCode directory.
+  - The setup wizard finds OpenCode on your PATH and asks its model.
+  - Budgets use OpenCode's cost estimate. `inherit` needs `agent.allow`
+    and `agent.review`.
+- **Process groups**: at its timeout or a stop, an agent run is killed
+  with everything it started (MCP servers, shell commands), for every
+  spawned runtime. A foreground `wats` whose terminal closes (SIGHUP) now
+  stops gracefully, as on Ctrl-C, and takes its runs with it (a detached
+  node still ignores SIGHUP, and so does `nohup wats`).
 
 ## 0.4.3 (2026-10-21)
 

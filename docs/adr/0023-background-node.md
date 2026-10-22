@@ -1,13 +1,15 @@
 # 0023. Running the node in the background
 
 Status: Proposed (2026-10-20). Ships in 0.4.0; §6 amended for 0.4.1
-(MCP sessions when their node goes away).
+(MCP sessions when their node goes away); §8 added for 0.4.5 (node names
+and `-n NAME`).
 
 Code: `crates/wats/src/background.rs` (and the stop record),
 `crates/wats/src/main.rs` (`detach_command`, `attach_command`,
 `ps_command`, `stop_command`), `crates/wats/src/attach.rs`
 (`Control::Info`, `Control::Stop`, a session's `Recovery`),
-`crates/wats/src/node.rs` (the lock holder record).
+`crates/wats/src/node.rs` (the lock holder record),
+`crates/wats/src/naming.rs` (node names, §8).
 
 Source: Vincent, relayed: a must-have for 0.4.0.
 
@@ -295,6 +297,98 @@ node to listen again, then ended, whatever the cause.
   lock and the registry (no socket on Windows, so no network or session
   column), and `wats attach` follows a log if there is one.
 
+### 8. Node names, and `-n NAME` (0.4.5)
+
+Decided by Vincent (2026-10-22): nodes get Docker-style names, local only,
+and the commands about one node take `-n/--node NAME`. With several nodes
+on a machine (a fleet, a test node beside `~/.wats`), `wats ps` listed
+them by data directory only, and every command needed the full `--dir`.
+
+- **The name.** A random `adjective_creature`, drawn once, at the node's
+  first start (`Node::start`, for every data directory, `~/.wats`
+  included) or by the setup wizard, which shows it as the default of
+  `Name of this node (node.name) [cheeky_starling]`. 60 playful but kind
+  adjectives × 40 creatures that swarm, flock or school (2,400 names);
+  never a person's name, nor a word that reads as one (no `robin`, `jay`,
+  `sunny`). It is drawn again while another data directory of the machine
+  has it, and after 64 clashes takes a number (`cheeky_bee_2`). A name is
+  1-32 chars of `[a-z0-9_-]`, starting with a letter or a digit, and not
+  only digits (so that `-n 50` is never a name). `wats config set
+  node.name` renames a node, refused when another node of the machine has
+  that name; a running node needs no restart, since every command reads the
+  name from the data directory.
+- **Local only.** The name is in the data directory and in this machine's
+  commands, never in what the node sends: no event, no hello, no announce,
+  no status a peer can read. A name says something about its owner's
+  taste, and other nodes have no use for it (they know a node by its
+  endpoint id). A test checks that a peer's data directory never holds it.
+- **Where it is stored, and rollbacks.** A drawn name goes to
+  `<data dir>/node-name`, not to config.toml. wats 0.4.4 and older refuse
+  a config.toml with a key they do not know: a drawn `node.name` there
+  would make every node unable to start after `wats upgrade --rollback`
+  (or a downgrade by hand), for a name nobody chose. The file is ignored
+  by older releases, and kept for the next upgrade. `node.name` in
+  config.toml, written only by `wats config set node.name` (or by the
+  wizard when config.toml already sets it), wins over the file, and is in
+  `update::KEYS_SINCE` at 0.4.5: `wats upgrade --rollback` to 0.4.4
+  refuses before swapping while it is set, and names `wats config unset
+  node.name`, which brings the drawn name back. The same choice as the
+  security updates answer kept in `setup-answers` (ADR 0030).
+- **Fleets** (ADR 0028). A fleet's nodes keep `node-<i>`, written by
+  `wats fleet up` (and by a fleet node's first start); when another node of
+  the machine has it (a second fleet), `<fleet>-<i>`, after the fleet
+  directory's name. The template's `node.name` is not copied.
+- **Which nodes the machine knows.** The registry (§4) lists the nodes
+  that run. Since 0.4.5 `register` also writes the entry to
+  `~/.wats/run/known/` (best effort, after the running entry), which a
+  stop leaves: every data directory a node ran in, so that a name finds a
+  stopped node and a draw avoids its name. `wats ps --all` lists those that
+  are still data directories (a `secret.key`, `config.toml` or
+  `node-name`). Reading commands (`ps`, `-n`, `status`) never remove an
+  entry; a node's start and `wats stop` remove those whose data directory
+  is certainly gone (not found; any other error keeps it) and whose node
+  last started more than 30 days ago, so that a volume unmounted for a
+  while keeps its nodes.
+- **The machine is given, never guessed, in tests.** The names of the
+  machine come from a registry and a default data directory the caller
+  passes (`naming::Machine`); a node, `wats fleet up` and the wizard pass
+  this user's, which includes `~/.wats` only with a registry (a hermetic
+  process without `WATS_RUN_DIR` reads nothing of the home). Unit tests
+  pass temporary ones, and resolving the real home in a unit test panics.
+- **Empty tables.** `wats config unset` removes a table left empty, keeping
+  the comments above its header: an empty `[node]` alone is refused by
+  0.4.4. `wats upgrade --rollback` also refuses, with the same `unset`
+  command, a table its target knows no key of (`[node]` before 0.4.5), and
+  `wats fleet up` copies a template without its `node.name` nor an empty
+  `[node]`.
+- **`wats ps`** shows a `NAME` column first, and `ENDPOINT`, the first 12
+  hex digits of the endpoint id (as `wats fleet` shows it), after
+  `AGENTS`; `--json` has `name` and the full `endpoint_id`. The `info`
+  request (§5) answers `endpoint_id` too; for a node that does not (an
+  older release) or does not run, it comes from its `secret.key`. A data
+  directory whose node has not started since 0.4.5 (an older node still
+  running) has no name yet: it shows as `default` for `~/.wats`, else its
+  directory's name, until its next start; `-n` accepts that name too.
+- **`-n/--node NAME`** on `wats attach`, `stop`, `status`, `mcp`, `config`
+  and `agent logs|runs|attach|pending|approve|reject|retracted`: the data
+  directory of the node named `NAME`, among `~/.wats` and the registry's,
+  which then acts as `--dir` (child processes, such as the background node
+  of `wats mcp`, get `--dir`). An agent is `NODE/AGENT` wherever `--name`
+  takes one (`wats agent logs --name codex/reviewer`); a plain `--name`
+  works as before. `--dir` (or `WATS_DIR`) with `-n` is an error unless
+  its node has that name; `-n` and `--name NODE/AGENT` naming two nodes
+  too. Two nodes of one name (a copied data directory) are an error that
+  lists both. `-n` was the count of `attach` and `agent logs|runs`; those
+  are now `--lines` and `--last` only, and a number given to `-n` says so.
+  `wats fleet up -n` keeps its meaning (the node count).
+- **Default target**: without `-n` nor `--dir`, `~/.wats`'s node, as
+  before. Each of those commands prints first, on stderr, the node it acts
+  on: `node cheeky_starling (~/.wats), agent claude` (stdout and `--json`
+  stay clean for scripts), when it may not be the one meant: `-n` or
+  `--dir` given, or more than one node on the machine. With one node and
+  neither, it says nothing, so that `2>&1` output is as before. `wats stop
+  --all` prints it for each node it stops.
+
 ## Alternatives
 
 - **A pidfile in the data directory.** Goes stale, and a reused pid
@@ -313,6 +407,16 @@ node to listen again, then ended, whatever the cause.
   renamed file; reopening fd 2 needs `dup2`. Logging only through an
   in-process writer would miss panic messages and the final error, which
   go to fd 2.
+- **A drawn `node.name` in config.toml** (§8). Simpler, one place, but a
+  rollback to 0.4.4 would refuse every node's config.toml, or need
+  `KEYS_SINCE` to be bypassed for it. The file costs a second place to
+  look, read by one function.
+- **Node names in the hello or the status tool**, so that peers could
+  show them. Names are a local convenience; announcing them would turn a
+  joke into an identifier.
+- **Keeping `-n` as the count** of `attach` and `agent logs|runs` and
+  `--node` alone for the node. Vincent chose `-n` for the node, the one
+  option shared by every command about a node.
 - **`wats logs -f`** for attaching. `attach` also replays the banner and
   ends when the node stops; `wats agent logs` remains the agents' run
   transcripts.

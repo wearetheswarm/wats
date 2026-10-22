@@ -291,6 +291,7 @@ fn info(node: &Node, sessions: usize) -> serde_json::Value {
         "role": config.role.to_string(),
         "version": env!("CARGO_PKG_VERSION"),
         "profile": config.profile,
+        "endpoint_id": node.endpoint_id().to_string(),
         "data_dir": config.data_dir,
         "started": node.started_at(),
         "log": config.log_file,

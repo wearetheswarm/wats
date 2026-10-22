@@ -4730,7 +4730,7 @@ dependencies = [
 
 [[package]]
 name = "wats"
-version = "0.4.3"
+version = "0.4.4"
 dependencies = [
  "anyhow",
  "bao-tree",
@@ -4752,6 +4752,7 @@ dependencies = [
  "mimalloc",
  "minisign-verify",
  "n0-future",
+ "nix",
  "redb",
  "reqwest",
  "rmcp",
@@ -4771,6 +4772,14 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "url",
+ "wats-sys",
+]
+
+[[package]]
+name = "wats-sys"
+version = "0.4.4"
+dependencies = [
+ "libc",
 ]
 
 [[package]]

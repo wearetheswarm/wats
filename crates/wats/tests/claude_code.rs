@@ -5,6 +5,9 @@
 
 use std::time::Duration;
 
+mod common;
+use common::ClearToolEnv;
+
 use rmcp::ServiceExt;
 use rmcp::model::CallToolRequestParams;
 use rmcp::transport::TokioChildProcess;
@@ -14,7 +17,8 @@ type Client = rmcp::service::RunningService<rmcp::RoleClient, ()>;
 
 async fn session(dir: &std::path::Path, cwd: &std::path::Path, profile: &str) -> Client {
     let mut cmd = tokio::process::Command::new(env!("CARGO_BIN_EXE_wats"));
-    cmd.args(["--loopback", "--pow-bits=4", "--profile", profile, "--dir"])
+    cmd.clear_tool_env()
+        .args(["--loopback", "--pow-bits=4", "--profile", profile, "--dir"])
         .arg(dir)
         .args(["mcp", "--idle-exit", "1"])
         .current_dir(cwd);
