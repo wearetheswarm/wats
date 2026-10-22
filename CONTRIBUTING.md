@@ -48,6 +48,8 @@ cargo test
 cargo deny check   # dependency licenses, advisories, sources (deny.toml)
 ```
 
+CI runs the tests with [cargo-nextest](https://nexte.st) instead (`cargo nextest run --profile ci`, then `cargo test --doc`): each test gets its own process and is killed after 5 minutes (`.config/nextest.toml`), so a hang fails by name.
+
 Dependencies must use permissive licenses (see the allowlist in `deny.toml`) and are pinned to exact versions in `Cargo.toml`; `Cargo.lock` is committed. The `wats` crate is `#![forbid(unsafe_code)]`; the few OS calls that need `unsafe` live in `crates/wats-sys`, one small function each with its safety argument.
 
 ## Protocol and format changes
