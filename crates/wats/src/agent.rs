@@ -762,6 +762,9 @@ struct Running {
     feedback: Vec<String>,
     /// The spawned CLI's process group, killed if the run is dropped.
     group: GroupGuard,
+    /// Mistral Vibe: what the run is charged if it ends without its run
+    /// export (killed at its timeout or by a stop), its `--max-price`.
+    charge_usd: Option<f64>,
 }
 
 /// Ends a run's runner token on drop unless the run started: an early
@@ -924,6 +927,7 @@ fn start_forward(
         woke: Vec::new(),
         feedback: Vec::new(),
         group: GroupGuard(None),
+        charge_usd: None,
     })
 }
 
@@ -1001,6 +1005,12 @@ async fn start_run(
         token: Some(token.clone()),
     };
     let prepared = prepare_command(config, &token, &transcript, remaining_usd);
+    // Vibe reads at most 1 MiB of prompt from stdin.
+    let prompt = if config.runtime == "vibe" {
+        vibe::fit_prompt(prompt)
+    } else {
+        prompt
+    };
     let (mut command, file) = match prepared {
         Ok(prepared) => prepared,
         Err(e) => {
@@ -1052,6 +1062,9 @@ async fn start_run(
         woke: Vec::new(),
         feedback: Vec::new(),
         group,
+        charge_usd: (config.runtime == "vibe" && vibe::ENFORCE_USD_BUDGET)
+            .then(|| vibe::charge_without_export(&config.extra_args, remaining_usd))
+            .flatten(),
     })
 }
 
@@ -1084,7 +1097,15 @@ fn prepare_command(
             };
             let export_dir = vibe::export_dir(&config.work_dir);
             vibe::prepare_export_dir(&export_dir)?;
-            if config.access != Access::Inherit {
+            if config.access == Access::Inherit {
+                let (remove, set) = vibe::inherit_env(&server, std::env::vars_os());
+                for key in remove {
+                    command.env_remove(key);
+                }
+                for (key, value) in set {
+                    command.env(key, value);
+                }
+            } else {
                 vibe::write_run_config(
                     &vibe::agent_home(&config.work_dir),
                     &vibe::run_config(&server),
@@ -1093,12 +1114,9 @@ fn prepare_command(
                     command.env_remove(key);
                 }
             }
-            for (key, value) in vibe::run_env(
-                config.access,
-                &config.work_dir,
-                &server,
-                config.model.as_deref(),
-            ) {
+            for (key, value) in
+                vibe::run_env(config.access, &config.work_dir, config.model.as_deref())
+            {
                 command.env(key, value);
             }
             command
@@ -1107,6 +1125,7 @@ fn prepare_command(
                     max_turns: config.max_turns,
                     max_price: vibe::ENFORCE_USD_BUDGET.then_some(remaining_usd),
                     export_dir: &export_dir,
+                    timeout: config.run_timeout,
                     extra: &config.extra_args,
                 }))
                 .args(&config.extra_args);
@@ -1293,11 +1312,27 @@ async fn finish_run(
     if let Some(token) = &running.token {
         node.end_runner_token(token);
     }
+    let killed = matches!(outcome, Outcome::TimedOut | Outcome::Stopped);
     match running.work {
         Work::Child(mut child, output) => {
             if matches!(outcome, Outcome::Exited(_)) {
                 running.group.disarm();
             } else {
+                // Vibe first gets SIGTERM, on which it writes its run export
+                // and stops its app server (in a process group of its own,
+                // which the group kill below would miss), ADR 0033 §1.
+                #[cfg(unix)]
+                if config.runtime == "vibe"
+                    && let Some(pid) = child.id()
+                {
+                    crate::background::terminate(pid);
+                    let grace = if matches!(outcome, Outcome::Stopped) {
+                        vibe::STOP_GRACE
+                    } else {
+                        vibe::TERM_GRACE
+                    };
+                    let _ = tokio::time::timeout(grace, child.wait()).await;
+                }
                 // Its whole process group first (the CLI is the group's
                 // leader, not yet reaped: the id is still its own).
                 running.group.kill();
@@ -1381,7 +1416,24 @@ async fn finish_run(
     // transcript, then the directory goes: it copies the session too.
     if config.runtime == "vibe" {
         let dir = vibe::export_dir(&config.work_dir);
-        if let Some(line) = vibe::export_line(&dir)
+        let line = match vibe::export_line(&dir) {
+            Some(line) => Some(line),
+            // Killed before Vibe wrote its cost: charged its cap, so that
+            // timeouts cannot run past the budget unseen.
+            None if killed => running.charge_usd.map(|usd| {
+                warn!(
+                    run = %record.id,
+                    "Mistral Vibe run ended without its run export: charged ${usd:.2}, its \
+                     --max-price"
+                );
+                json!({
+                    "type": "vibe_charge", "cost_usd": usd,
+                    "why": "no run export (killed): charged the run's --max-price",
+                })
+            }),
+            None => None,
+        };
+        if let Some(line) = line
             && let Ok(mut f) = std::fs::OpenOptions::new()
                 .append(true)
                 .open(&running.transcript)
@@ -1948,6 +2000,19 @@ async fn check_vibe(config: &AgentConfig) -> Result<()> {
                 "Mistral Vibe runs find your API key in your OS keyring (`vibe --setup`), or in \
                  MISTRAL_API_KEY: a key kept only in ~/.vibe/.env is not read (set \
                  MISTRAL_API_KEY in the node's environment)"
+            );
+        }
+    }
+    if config.access == Access::Inherit
+        && let Some(home) = vibe::home(std::env::var_os("VIBE_HOME"), std::env::home_dir())
+        && let Ok(text) = std::fs::read_to_string(home.join("config.toml"))
+    {
+        let others = vibe::other_wats_servers(&text);
+        if !others.is_empty() {
+            warn!(
+                "your Vibe config runs wats as other MCP servers too ({}): with inherit, the \
+                 agent's runs also get those, which post as your own profile, not the agent's",
+                others.join(", ")
             );
         }
     }

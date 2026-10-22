@@ -210,10 +210,6 @@ pub const INHERIT_NEEDS_BOTH: bool = false;
 /// only, as for Codex.
 pub const ENFORCE_USD_BUDGET: bool = true;
 
-/// The only tools of a `swarm-only` run: wats's (Vibe names MCP tools
-/// `<server>_<tool>`).
-pub const TOOL_PATTERN: &str = "wats_*";
-
 /// The tools wats serves to a runner session (the review tools and
 /// `start_daemon` are removed there). Each gets `permission = "always"`:
 /// Vibe asks before an MCP tool by default, and a headless run denies
@@ -222,12 +218,42 @@ pub const RUN_TOOLS: [&str; 10] = [
     "post", "reply", "digest", "retract", "read", "search", "browse", "who", "wait", "status",
 ];
 
-/// Vibe's built-in tools (3.0.1), disabled at `swarm-only` on top of the
-/// `wats_*` allow list: a second lock, in case one filter changed.
-/// `search_replace` is `edit`'s old name.
-pub const BUILTIN_TOOLS: [&str; 13] = [
+/// The only tools of a `swarm-only` run, by their exact names (Vibe names
+/// MCP tools `<server>_<tool>`): `wats_post`, `wats_reply`… Never a
+/// pattern, so that no other server's tool (`wats_x_…`) can match.
+pub fn run_tool_names() -> Vec<String> {
+    RUN_TOOLS.iter().map(|t| format!("{SERVER}_{t}")).collect()
+}
+
+/// A Vibe `re:` pattern (case-insensitive, full match) for every tool name
+/// but the exact wats tools: the last lock of `disabled_tools`, whatever
+/// new tool a later Vibe adds.
+pub fn others_pattern() -> String {
+    format!("re:(?!(?:{})$).*", run_tool_names().join("|"))
+}
+
+/// Vibe's built-in and provided tools (3.0.1: `vibe/core/tools/builtins/`,
+/// the app server's `cron`, `start_session` and scratchpad), disabled at
+/// `swarm-only` on top of the allow list of the exact wats tools, and
+/// followed by [`others_pattern`], which disables any other name a later
+/// Vibe adds. `search_replace` is `edit`'s old name.
+pub const BUILTIN_TOOLS: [&str; 30] = [
     "bash",
+    "bash_output",
+    "bash_stdin",
+    "bash_sessions",
+    "bash_log_file",
+    "git_bash",
+    "git_bash_output",
+    "git_bash_stdin",
+    "git_bash_sessions",
+    "git_bash_log_file",
     "powershell",
+    "powershell_output",
+    "powershell_stdin",
+    "powershell_sessions",
+    "powershell_log_file",
+    "shell",
     "read_file",
     "write_file",
     "edit",
@@ -239,7 +265,23 @@ pub const BUILTIN_TOOLS: [&str; 13] = [
     "web_search",
     "web_fetch",
     "ask_user_question",
+    "cron",
+    "start_session",
+    "unified_harness_scratchpad",
 ];
+
+/// Vibe's own cap on a prompt read from stdin (`MAX_STDIN_PROMPT_BYTES`):
+/// a longer prompt is cut to fit, with a note ([`fit_prompt`]).
+pub const MAX_PROMPT_BYTES: usize = 1024 * 1024;
+
+/// At a timeout, the runner sends SIGTERM to Vibe's CLI and waits this
+/// long before it kills the run's process group: on SIGTERM, headless Vibe
+/// writes its run export and stops its app server, which runs in a process
+/// group of its own and would outlive a SIGKILL to the CLI's.
+pub const TERM_GRACE: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// The same, when the node stops.
+pub const STOP_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Shown when `inherit` is chosen for Vibe (setup wizard, `wats setup
 /// vibe --agent`).
@@ -253,7 +295,7 @@ pub const WORKSPACE_REFUSED: &str = "agent.access = workspace is not available w
 
 /// Extra arguments refused at `swarm-only`: they would bring back Vibe's
 /// own tools or approvals, another directory, or an old session.
-pub const REFUSED_ARGS: [&str; 14] = [
+pub const REFUSED_ARGS: [&str; 13] = [
     "--enabled-tools",
     "--agent",
     "--auto-approve",
@@ -267,8 +309,11 @@ pub const REFUSED_ARGS: [&str; 14] = [
     "--resume",
     "--agent-socket",
     "--teleport",
-    "--setup",
 ];
+
+/// Extra arguments refused at every level: they are no headless run
+/// (onboarding, an upgrade check).
+pub const NEVER_ARGS: [&str; 2] = ["--setup", "--check-upgrade"];
 
 /// Extra arguments refused at every level: the runner sets them (the
 /// prompt on stdin, the transcript, the run export).
@@ -322,11 +367,11 @@ pub fn check_access(access: Access, allow: &[String], review: bool) -> Result<()
 /// short option with its value attached (`-pTEXT`).
 fn flag_of(arg: &str) -> &str {
     if arg.starts_with("--") {
-        arg.split('=').next().unwrap_or(arg)
-    } else if arg.starts_with('-') && arg.len() > 2 {
-        &arg[..2]
-    } else {
-        arg
+        return arg.split('=').next().unwrap_or(arg);
+    }
+    match arg.char_indices().nth(2) {
+        Some((end, _)) if arg.starts_with('-') => &arg[..end],
+        _ => arg,
     }
 }
 
@@ -335,6 +380,9 @@ fn flag_of(arg: &str) -> &str {
 pub fn check_extra_args(access: Access, extra: &[String]) -> Result<()> {
     for arg in extra {
         let flag = flag_of(arg);
+        if NEVER_ARGS.contains(&flag) {
+            bail!("agent.args: {flag} is no headless run of Mistral Vibe: remove it");
+        }
         if RUNNER_ARGS.contains(&flag) || flag == "-p" {
             bail!(
                 "agent.args: {flag} is set by the runner for a Mistral Vibe run (the prompt on \
@@ -458,10 +506,11 @@ fn tool_permissions() -> serde_json::Map<String, serde_json::Value> {
 }
 
 /// The per-run `config.toml` of a `swarm-only` run, in the agent's own
-/// Vibe home: the wats tools only (allowed, and every built-in tool
-/// disabled), no connectors, subagents or background processes, no
-/// session log, no update check or telemetry, and the wats MCP server with
-/// the run's runner token.
+/// Vibe home: the exact wats tools only (allowed; every built-in tool and
+/// any other name disabled), no skills (not even through `/<name>` in a
+/// prompt), no connectors, subagents or background processes, no session
+/// log, no update check or telemetry, and the wats MCP server with the
+/// run's runner token.
 pub fn run_config(server: &Server) -> String {
     let strings = |items: &[&str]| -> toml_edit::Array { items.iter().copied().collect() };
     let mut doc = DocumentMut::new();
@@ -469,9 +518,22 @@ pub fn run_config(server: &Server) -> String {
         "# This node's Mistral Vibe agent (wats, ADR 0033): written before every run, \
          do not edit.\n",
     );
-    doc.insert("enabled_tools", value(strings(&[TOOL_PATTERN])));
-    doc.insert("disabled_tools", value(strings(&BUILTIN_TOOLS)));
+    let names = run_tool_names();
+    let names: Vec<&str> = names.iter().map(String::as_str).collect();
+    doc.insert("enabled_tools", value(strings(&names)));
+    let others = others_pattern();
+    let mut disabled: Vec<&str> = BUILTIN_TOOLS.to_vec();
+    disabled.push(&others);
+    doc.insert("disabled_tools", value(strings(&disabled)));
+    // Skills: `enabled_skills` that matches nothing, and every skill
+    // disabled too (Vibe ignores `disabled_skills` when `enabled_skills` is
+    // set; either alone hides them). The app server would otherwise append
+    // a skill's body for a `/<name>` in the prompt, skill tool or not, and
+    // `~/.agents/skills` is found from HOME.
+    doc.insert("enabled_skills", value(strings(&["re:(?!)"])));
+    doc.insert("disabled_skills", value(strings(&["*"])));
     for key in [
+        "experimental_enable_registry_skills",
         "enable_connectors",
         "enable_subagents",
         "enable_background_processes",
@@ -538,14 +600,10 @@ pub fn write_run_config(home: &Path, text: &str) -> Result<PathBuf> {
 /// The environment one run sets. Both levels: no session log (swarm runs
 /// stay out of `vibe --resume`), no update check, the model if set. At
 /// `swarm-only`: the agent's own Vibe home, and the harness's fallback
-/// session store inside it. At `inherit`: the wats server and its tool
-/// approvals as `VIBE_MCP_SERVERS` and `VIBE_TOOLS`, which Vibe merges
-/// with the user's config (servers by name, so the run's `wats` entry
-/// replaces a `wats` the user registered for the human's profile).
+/// session store inside it. At `inherit`, see [`inherit_env`] too.
 pub fn run_env(
     access: Access,
     work_dir: &Path,
-    server: &Server,
     model: Option<&str>,
 ) -> Vec<(&'static str, OsString)> {
     let mut env: Vec<(&'static str, OsString)> = vec![
@@ -556,20 +614,7 @@ pub fn run_env(
     if let Some(model) = model {
         env.push(("VIBE_ACTIVE_MODEL", model.into()));
     }
-    if access == Access::Inherit {
-        env.push((
-            "VIBE_MCP_SERVERS",
-            serde_json::Value::Array(vec![server.json()])
-                .to_string()
-                .into(),
-        ));
-        env.push((
-            "VIBE_TOOLS",
-            serde_json::Value::Object(tool_permissions())
-                .to_string()
-                .into(),
-        ));
-    } else {
+    if access != Access::Inherit {
         let home = agent_home(work_dir);
         env.push((
             "MISTRAL_VIBE_SESSION_ROOT",
@@ -581,15 +626,145 @@ pub fn run_env(
 }
 
 /// The variables of `vars` a `swarm-only` run removes: every `VIBE_*` but
-/// [`KEPT_ENV`], and `MISTRAL_VIBE_SESSION_ROOT`.
+/// [`KEPT_ENV`], and `MISTRAL_VIBE_SESSION_ROOT`, whatever their case:
+/// Vibe reads its settings from the environment case-insensitively
+/// (`vibe_mcp_servers` is `VIBE_MCP_SERVERS`).
 pub fn removed_env(vars: impl Iterator<Item = (OsString, OsString)>) -> Vec<OsString> {
     vars.map(|(k, _)| k)
         .filter(|k| {
-            let k = k.to_string_lossy();
-            (k.starts_with("VIBE_") && !KEPT_ENV.contains(&k.as_ref()))
-                || k == "MISTRAL_VIBE_SESSION_ROOT"
+            let upper = k.to_string_lossy().to_ascii_uppercase();
+            (upper.starts_with("VIBE_") && !KEPT_ENV.contains(&upper.as_str()))
+                || upper == "MISTRAL_VIBE_SESSION_ROOT"
         })
         .collect()
+}
+
+/// The environment an `inherit` run adds to the user's: the wats server as
+/// `VIBE_MCP_SERVERS` and its tool approvals as `VIBE_TOOLS`, which Vibe
+/// merges with the user's config (servers by name, so the run's `wats`
+/// entry replaces a `wats` the user registered for the human's profile).
+/// The user's own values of those two variables (in any case) are merged
+/// in, not overwritten: their servers but `wats`, their per-tool settings
+/// but the wats tools'. Returns the variables to remove (other spellings),
+/// and those to set.
+pub fn inherit_env(
+    server: &Server,
+    vars: impl Iterator<Item = (OsString, OsString)>,
+) -> (Vec<OsString>, Vec<(&'static str, String)>) {
+    let mut servers: Vec<serde_json::Value> = Vec::new();
+    let mut tools = serde_json::Map::new();
+    let mut remove = Vec::new();
+    for (key, value) in vars {
+        let upper = key.to_string_lossy().to_ascii_uppercase();
+        let value = value.to_string_lossy().into_owned();
+        match upper.as_str() {
+            "VIBE_MCP_SERVERS" => {
+                if let Ok(serde_json::Value::Array(list)) = serde_json::from_str(&value) {
+                    servers.extend(list.into_iter().filter(|s| {
+                        !s["name"]
+                            .as_str()
+                            .is_some_and(|n| n.eq_ignore_ascii_case(SERVER))
+                    }));
+                }
+            }
+            "VIBE_TOOLS" => {
+                if let Ok(serde_json::Value::Object(map)) = serde_json::from_str(&value) {
+                    tools.extend(map);
+                }
+            }
+            _ => continue,
+        }
+        remove.push(key);
+    }
+    servers.push(server.json());
+    tools.extend(tool_permissions());
+    (
+        remove,
+        vec![
+            (
+                "VIBE_MCP_SERVERS",
+                serde_json::Value::Array(servers).to_string(),
+            ),
+            ("VIBE_TOOLS", serde_json::Value::Object(tools).to_string()),
+        ],
+    )
+}
+
+/// The `[[mcp_servers]]` of the user's Vibe config (`text`) other than
+/// `wats` that run wats (their command is a `wats` binary): at `inherit`
+/// they keep running as the human's profile, beside the run's own.
+pub fn other_wats_servers(text: &str) -> Vec<String> {
+    let Ok(doc) = text.parse::<DocumentMut>() else {
+        return Vec::new();
+    };
+    let Some(servers) = doc.get("mcp_servers").and_then(Item::as_array_of_tables) else {
+        return Vec::new();
+    };
+    servers
+        .iter()
+        .filter(|t| !is_wats(t))
+        .filter(|t| {
+            let command = match t.get("command") {
+                Some(item) => match item.as_array() {
+                    Some(list) => list.get(0).and_then(|v| v.as_str()).map(str::to_string),
+                    None => item
+                        .as_str()
+                        .and_then(|c| c.split_whitespace().next().map(str::to_string)),
+                },
+                None => None,
+            };
+            command.is_some_and(|c| {
+                Path::new(&c)
+                    .file_name()
+                    .is_some_and(|f| f == "wats" || f == "wats.exe")
+            })
+        })
+        .filter_map(|t| t.get("name").and_then(Item::as_str).map(str::to_string))
+        .collect()
+}
+
+/// `--time-limit` for a run of `timeout`: a little under it (a tenth, at
+/// least 1 s and at most 15 s), so that Vibe stops by itself, with its run
+/// export, before the runner has to.
+pub fn time_limit(timeout: std::time::Duration) -> u64 {
+    let secs = timeout.as_secs();
+    let margin = (secs / 10).clamp(1, 15);
+    secs.saturating_sub(margin).max(1)
+}
+
+/// The prompt as Vibe takes it on stdin: at most [`MAX_PROMPT_BYTES`]. A
+/// longer one is cut at a character boundary, with a note at the end.
+pub fn fit_prompt(prompt: String) -> String {
+    const NOTE: &str = "\n\n[wats: this prompt was cut to fit Mistral Vibe's 1 MiB limit; \
+                        read the events it lists with the wats tools]";
+    if prompt.len() <= MAX_PROMPT_BYTES {
+        return prompt;
+    }
+    let mut end = MAX_PROMPT_BYTES - NOTE.len();
+    while !prompt.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}{NOTE}", &prompt[..end])
+}
+
+/// What a run without a run export is charged (a run killed at its
+/// timeout or by a stop: Vibe had no time to write its cost): the most it
+/// was allowed to spend, its `--max-price` (from the extra arguments, else
+/// what was left of the budget). `None` without a finite cap.
+pub fn charge_without_export(extra: &[String], remaining_usd: f64) -> Option<f64> {
+    let mut given = None;
+    let mut args = extra.iter();
+    while let Some(arg) = args.next() {
+        if let Some(value) = arg.strip_prefix("--max-price=") {
+            given = value.parse::<f64>().ok();
+        } else if arg == "--max-price" {
+            given = args.next().and_then(|v| v.parse::<f64>().ok());
+        }
+    }
+    given
+        .or(Some(remaining_usd))
+        .filter(|usd| usd.is_finite())
+        .map(|usd| usd.max(0.01))
 }
 
 /// Inputs of one run's command line.
@@ -600,13 +775,15 @@ pub struct Run<'a> {
     /// What is left of the USD budget, if it applies: `--max-price`.
     pub max_price: Option<f64>,
     pub export_dir: &'a Path,
+    /// `agent.timeout`: `--time-limit` a little under it.
+    pub timeout: std::time::Duration,
     pub extra: &'a [String],
 }
 
 /// The arguments of one run, before the extra arguments: headless with
 /// the prompt on stdin, NDJSON on stdout, the run export, the limits
-/// (unless the extra arguments set them), and at `swarm-only` the wats
-/// tools only.
+/// (unless the extra arguments set them), and at `swarm-only` the exact
+/// wats tools only.
 pub fn run_args(r: &Run) -> Vec<String> {
     let given = |flag: &str| r.extra.iter().any(|a| flag_of(a) == flag);
     let mut args = vec![
@@ -622,8 +799,15 @@ pub fn run_args(r: &Run) -> Vec<String> {
     {
         args.push(format!("--max-price={:.2}", price.max(0.01)));
     }
+    if !given("--time-limit") {
+        args.push(format!("--time-limit={}", time_limit(r.timeout)));
+    }
     if r.access != Access::Inherit {
-        args.push(format!("--enabled-tools={TOOL_PATTERN}"));
+        args.extend(
+            run_tool_names()
+                .into_iter()
+                .map(|t| format!("--enabled-tools={t}")),
+        );
     }
     args
 }
@@ -891,6 +1075,18 @@ mod tests {
             )
             .is_ok()
         );
+        for arg in ["--setup", "--check-upgrade"] {
+            for level in [Access::SwarmOnly, Access::Inherit] {
+                let e = check_extra_args(level, &s(&[arg])).unwrap_err();
+                assert!(format!("{e:#}").contains("no headless run"), "{arg}: {e:#}");
+            }
+        }
+        // Non-ASCII arguments never panic, and are no flag of the runner's.
+        assert!(check_extra_args(Access::SwarmOnly, &s(&["-é", "é", "-pé", "-"])).is_err());
+        assert!(check_extra_args(Access::SwarmOnly, &s(&["-é", "é", "-"])).is_ok());
+        assert_eq!(flag_of("-pé"), "-p");
+        assert_eq!(flag_of("-é"), "-é");
+        assert_eq!(flag_of("--max-price=é"), "--max-price");
     }
 
     #[test]
@@ -917,30 +1113,48 @@ mod tests {
         }
     }
 
-    /// The per-run config of a `swarm-only` run: valid TOML, the wats tools
-    /// only (enabled, approved), every built-in disabled, the wats server
-    /// with the run's runner token, and Vibe's extras off.
+    /// The per-run config of a `swarm-only` run: valid TOML, the exact wats
+    /// tools only (enabled, approved), every built-in disabled and then any
+    /// other name, no skills, the wats server with the run's runner token,
+    /// and Vibe's extras off.
     #[test]
     fn the_run_config_holds_the_wats_server_only() {
         let args = s(&["--dir", "/d", "mcp", "--profile", "alice-vibe"]);
         let text = run_config(&server(&args));
         let doc: toml::Value = toml::from_str(&text).unwrap();
-        assert_eq!(
-            doc["enabled_tools"],
-            toml::Value::Array(vec!["wats_*".into()])
-        );
+        let names: Vec<toml::Value> = RUN_TOOLS
+            .iter()
+            .map(|t| format!("wats_{t}").into())
+            .collect();
+        assert_eq!(doc["enabled_tools"], toml::Value::Array(names));
+        assert!(!text.contains("wats_*"), "{text}");
         let disabled = doc["disabled_tools"].as_array().unwrap();
+        for tool in BUILTIN_TOOLS {
+            assert!(disabled.contains(&tool.into()), "{tool}: {text}");
+        }
         for tool in [
-            "bash",
-            "read_file",
-            "write_file",
-            "edit",
-            "web_fetch",
-            "task",
+            "bash_output",
+            "git_bash",
+            "powershell_stdin",
+            "cron",
+            "start_session",
         ] {
             assert!(disabled.contains(&tool.into()), "{tool}: {text}");
         }
+        // Last: every name but the exact wats tools.
+        let others = disabled.last().unwrap().as_str().unwrap();
+        assert_eq!(others, others_pattern());
+        assert!(
+            others.starts_with("re:(?!(?:wats_post|wats_reply|") && others.ends_with(")$).*"),
+            "{others}"
+        );
+        assert_eq!(
+            doc["enabled_skills"],
+            toml::Value::Array(vec!["re:(?!)".into()])
+        );
+        assert_eq!(doc["disabled_skills"], toml::Value::Array(vec!["*".into()]));
         for key in [
+            "experimental_enable_registry_skills",
             "enable_connectors",
             "enable_subagents",
             "enable_background_processes",
@@ -999,46 +1213,98 @@ mod tests {
                 max_turns: 7,
                 max_price,
                 export_dir: dir,
+                timeout: std::time::Duration::from_secs(600),
                 extra,
             })
         };
-        assert_eq!(
-            run(Access::SwarmOnly, Some(1.234), &[]),
-            s(&[
-                "--prompt=",
-                "--output=streaming",
-                "--output-dir=/w/vibe-run",
-                "--max-turns=7",
-                "--max-price=1.23",
-                "--enabled-tools=wats_*",
-            ])
+        let mut expected = s(&[
+            "--prompt=",
+            "--output=streaming",
+            "--output-dir=/w/vibe-run",
+            "--max-turns=7",
+            "--max-price=1.23",
+            "--time-limit=585",
+        ]);
+        expected.extend(
+            RUN_TOOLS
+                .iter()
+                .map(|t| format!("--enabled-tools=wats_{t}")),
         );
+        assert_eq!(run(Access::SwarmOnly, Some(1.234), &[]), expected);
         let inherit = run(Access::Inherit, Some(0.0), &[]);
         assert!(
             inherit.contains(&"--max-price=0.01".to_string()),
             "{inherit:?}"
         );
+        assert!(inherit.contains(&"--time-limit=585".to_string()));
         assert!(!inherit.iter().any(|a| a.starts_with("--enabled-tools")));
         // Limits in the extra arguments replace the runner's; no budget, no
         // --max-price.
         let given = run(
             Access::SwarmOnly,
             Some(f64::INFINITY),
-            &s(&["--max-turns=3", "--max-price", "9"]),
+            &s(&["--max-turns=3", "--max-price", "9", "--time-limit=30"]),
         );
-        assert!(
-            !given.iter().any(|a| a.starts_with("--max-turns")),
-            "{given:?}"
-        );
-        assert!(
-            !given.iter().any(|a| a.starts_with("--max-price")),
-            "{given:?}"
-        );
+        for flag in ["--max-turns", "--max-price", "--time-limit"] {
+            assert!(
+                !given.iter().any(|a| a.starts_with(flag)),
+                "{flag}: {given:?}"
+            );
+        }
         assert!(
             !run(Access::SwarmOnly, None, &[])
                 .iter()
                 .any(|a| a.starts_with("--max-price"))
         );
+        // A little under the timeout: a tenth, 1 to 15 s.
+        let secs = std::time::Duration::from_secs;
+        assert_eq!(time_limit(secs(600)), 585);
+        assert_eq!(time_limit(secs(60)), 54);
+        assert_eq!(time_limit(secs(10)), 9);
+        assert_eq!(time_limit(secs(2)), 1);
+        assert_eq!(time_limit(secs(1)), 1);
+    }
+
+    /// What a run killed before its export is charged: its --max-price.
+    #[test]
+    fn a_run_without_export_is_charged_its_cap() {
+        assert_eq!(charge_without_export(&[], 1.5), Some(1.5));
+        assert_eq!(charge_without_export(&[], 0.0), Some(0.01));
+        assert_eq!(charge_without_export(&[], f64::INFINITY), None);
+        assert_eq!(
+            charge_without_export(&s(&["--max-price=0.4"]), 1.5),
+            Some(0.4)
+        );
+        assert_eq!(
+            charge_without_export(&s(&["--max-price", "3"]), 1.5),
+            Some(3.0)
+        );
+    }
+
+    /// A prompt over Vibe's 1 MiB is cut at a character boundary, with a
+    /// note; a shorter one is kept as it is.
+    #[test]
+    fn long_prompts_are_cut_to_fit() {
+        assert_eq!(fit_prompt("hi".into()), "hi");
+        let long = "é".repeat(MAX_PROMPT_BYTES);
+        let cut = fit_prompt(long);
+        assert!(cut.len() <= MAX_PROMPT_BYTES, "{}", cut.len());
+        assert!(cut.ends_with("read the events it lists with the wats tools]"));
+        assert!(cut.starts_with("éé"));
+    }
+
+    /// Other servers of the user's Vibe config that run wats (at
+    /// `inherit`, they keep posting as the human).
+    #[test]
+    fn other_wats_servers_are_found() {
+        let text = "[[mcp_servers]]\nname = \"wats\"\ncommand = \"/usr/bin/wats\"\n\n\
+                    [[mcp_servers]]\nname = \"swarm\"\ncommand = \"/opt/homebrew/bin/wats\"\n\
+                    args = [\"mcp\"]\n\n\
+                    [[mcp_servers]]\nname = \"line\"\ncommand = \"wats mcp --profile x\"\n\n\
+                    [[mcp_servers]]\nname = \"fetch\"\ncommand = \"uvx\"\n";
+        assert_eq!(other_wats_servers(text), s(&["swarm", "line"]));
+        assert!(other_wats_servers("not [toml").is_empty());
+        assert!(other_wats_servers("").is_empty());
     }
 
     #[test]
@@ -1051,7 +1317,7 @@ mod tests {
                 .find(|(k, _)| *k == key)
                 .map(|(_, v)| v.to_string_lossy().into_owned())
         };
-        let locked = run_env(Access::SwarmOnly, work, &server, Some("devstral-2"));
+        let locked = run_env(Access::SwarmOnly, work, Some("devstral-2"));
         assert_eq!(get(&locked, "VIBE_HOME").as_deref(), Some("/w/vibe-home"));
         assert_eq!(
             get(&locked, "MISTRAL_VIBE_SESSION_ROOT").as_deref(),
@@ -1067,28 +1333,67 @@ mod tests {
         );
         assert_eq!(get(&locked, "VIBE_MCP_SERVERS"), None);
 
-        let inherit = run_env(Access::Inherit, work, &server, None);
+        let inherit = run_env(Access::Inherit, work, None);
         assert_eq!(get(&inherit, "VIBE_HOME"), None);
         assert_eq!(get(&inherit, "VIBE_ACTIVE_MODEL"), None);
         assert_eq!(
             get(&inherit, "VIBE_SESSION_LOGGING__ENABLED").as_deref(),
             Some("false")
         );
-        let servers: serde_json::Value =
-            serde_json::from_str(&get(&inherit, "VIBE_MCP_SERVERS").unwrap()).unwrap();
+
+        // inherit: the wats server and approvals, alone…
+        let none = std::iter::empty::<(OsString, OsString)>();
+        let (remove, set) = inherit_env(&server, none);
+        assert!(remove.is_empty());
+        let servers: serde_json::Value = serde_json::from_str(&set[0].1).unwrap();
+        assert_eq!(set[0].0, "VIBE_MCP_SERVERS");
         assert_eq!(servers.as_array().unwrap().len(), 1);
         assert_eq!(servers[0]["name"], "wats");
         assert_eq!(servers[0]["command"], "/opt/wats");
         assert_eq!(servers[0]["env"]["WATS_RUNNER_TOKEN"], "tok-123");
-        let tools: serde_json::Value =
-            serde_json::from_str(&get(&inherit, "VIBE_TOOLS").unwrap()).unwrap();
+        let tools: serde_json::Value = serde_json::from_str(&set[1].1).unwrap();
+        assert_eq!(set[1].0, "VIBE_TOOLS");
         assert_eq!(tools.as_object().unwrap().len(), RUN_TOOLS.len());
         assert_eq!(tools["wats_reply"]["permission"], "always");
+        // …or merged into the user's own, whatever their case.
+        let user = [
+            (
+                "vibe_mcp_servers",
+                r#"[{"name":"fetch","command":"uvx"},{"name":"WATS","command":"/x"}]"#,
+            ),
+            ("VIBE_TOOLS", r#"{"bash":{"permission":"never"}}"#),
+            ("PATH", "/bin"),
+        ]
+        .map(|(k, v)| (OsString::from(k), OsString::from(v)));
+        let (remove, set) = inherit_env(&server, user.into_iter());
+        assert_eq!(
+            remove,
+            [
+                OsString::from("vibe_mcp_servers"),
+                OsString::from("VIBE_TOOLS")
+            ]
+        );
+        let servers: serde_json::Value = serde_json::from_str(&set[0].1).unwrap();
+        let names: Vec<&str> = servers
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|s| s["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(names, ["fetch", "wats"]);
+        assert_eq!(servers[1]["command"], "/opt/wats");
+        let tools: serde_json::Value = serde_json::from_str(&set[1].1).unwrap();
+        assert_eq!(tools["bash"]["permission"], "never");
+        assert_eq!(tools["wats_post"]["permission"], "always");
 
+        // swarm-only removes every VIBE_* but three, in any case.
         let removed = removed_env(
             [
                 "VIBE_ENABLED_TOOLS",
                 "VIBE_MCP_SERVERS",
+                "vibe_mcp_servers",
+                "vibe_tools",
+                "Vibe_Bypass_Tool_Permissions",
                 "VIBE_HOME",
                 "VIBE_CWD",
                 "VIBE_APP_SERVER_BIN",
@@ -1109,6 +1414,9 @@ mod tests {
             s(&[
                 "VIBE_ENABLED_TOOLS",
                 "VIBE_MCP_SERVERS",
+                "vibe_mcp_servers",
+                "vibe_tools",
+                "Vibe_Bypass_Tool_Permissions",
                 "VIBE_HOME",
                 "VIBE_CWD",
                 "MISTRAL_VIBE_SESSION_ROOT",

@@ -3083,6 +3083,24 @@ fn config_command(data_dir: &std::path::Path, action: ConfigAction) -> Result<()
             {
                 wats::access::check_workdir(&data_dir.join(&value), data_dir)?;
             }
+            // A Vibe agent has no workspace level (ADR 0033): refused here
+            // too, whichever of the two keys is set last.
+            if let Some((table, leaf @ ("access" | "runtime"))) = key.rsplit_once('.')
+                && (table == "agent" || table.starts_with("agents."))
+            {
+                let current = |leaf: &str| {
+                    file.get(&format!("{table}.{leaf}"))
+                        .map(|v| v.trim_matches('"').to_string())
+                };
+                let (runtime, access) = if leaf == "access" {
+                    (current("runtime"), Some(value.clone()))
+                } else {
+                    (Some(value.clone()), current("access"))
+                };
+                if runtime.as_deref().map(str::trim) == Some("vibe") {
+                    wats::vibe::access(access.as_deref())?;
+                }
+            }
             let before = safety_before(data_dir, &key);
             file.set(&key, &value)?;
             file.save()?;

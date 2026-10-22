@@ -158,7 +158,8 @@ fn now() -> u64 {
 }
 
 /// A `swarm-only` run: headless with the prompt on stdin, NDJSON output,
-/// the run export, the turn and price limits, `--enabled-tools wats_*`, in
+/// the run export, the turn, price and time limits, the exact wats tools
+/// (`--enabled-tools`, once per tool), in
 /// an empty directory, with the agent's own Vibe home whose per-run config
 /// holds the wats server only (the run's runner token, the wats tools
 /// approved, every built-in tool disabled); its cost and steps come from
@@ -172,15 +173,21 @@ async fn swarm_only_run_is_locked_down() {
     let record = one_run(dir.path(), config, "ok").await;
 
     let args = read(dir.path(), "args");
+    let tools: Vec<String> = wats::vibe::run_tool_names()
+        .iter()
+        .map(|t| format!("--enabled-tools={t}"))
+        .collect();
     assert_eq!(
         args.trim(),
         format!(
             "--prompt= --output=streaming --output-dir={} --max-turns=7 --max-price=2.00 \
-             --enabled-tools=wats_* --max-tokens=50000",
-            work.join("vibe-run").display()
+             --time-limit=9 {} --max-tokens=50000",
+            work.join("vibe-run").display(),
+            tools.join(" ")
         ),
         "{args}"
     );
+    assert!(!args.contains('*'), "{args}");
     assert_eq!(cwd(dir.path()), work.join("locked").canonicalize().unwrap());
     assert!(read(dir.path(), "prompt").contains("WeAreTheSwarm"));
     let env = read(dir.path(), "env");
@@ -201,7 +208,16 @@ async fn swarm_only_run_is_locked_down() {
     let run_config: toml::Value = toml::from_str(&read(dir.path(), "config.toml")).unwrap();
     assert_eq!(
         run_config["enabled_tools"],
-        toml::Value::Array(vec!["wats_*".into()])
+        toml::Value::Array(
+            wats::vibe::run_tool_names()
+                .into_iter()
+                .map(toml::Value::from)
+                .collect()
+        )
+    );
+    assert_eq!(
+        run_config["disabled_skills"],
+        toml::Value::Array(vec!["*".into()])
     );
     assert!(
         run_config["disabled_tools"]
@@ -351,8 +367,10 @@ fn alive(pid: &str) -> bool {
         .is_ok_and(|s| s.success())
 }
 
-/// At the timeout the runner kills the run's whole process group: what
-/// Vibe started (its app server, MCP servers; here a `sleep`) goes too.
+/// At the timeout the runner sends SIGTERM to Vibe, then kills the run's
+/// whole process group: what Vibe started (MCP servers; here a `sleep`)
+/// goes too. A run that wrote no export is charged its --max-price (here
+/// the day's budget left, $2), so that timeouts cannot spend unseen.
 #[tokio::test(flavor = "multi_thread")]
 async fn the_timeout_kills_the_process_group() {
     let dir = tempfile::tempdir().unwrap();
@@ -367,8 +385,39 @@ async fn the_timeout_kills_the_process_group() {
     );
     let mut config = config(dir.path(), fake, Access::SwarmOnly);
     config.run_timeout = Duration::from_secs(2);
+    let work = config.work_dir.clone();
     let record = one_run(dir.path(), config, "timeout").await;
-    assert_eq!(record.cost_usd, None);
+    assert_eq!(record.cost_usd, Some(2.0));
+    assert!((wats::budget::spend(&work, now()).usd_today - 2.0).abs() < 1e-9);
+    let pid = read(dir.path(), "grandchild").trim().to_string();
+    assert!(!pid.is_empty());
+    eventually("the grandchild is gone", || !alive(&pid)).await;
+}
+
+/// Vibe handles SIGTERM: it writes its run export (and stops its app
+/// server) before it exits. The runner then records that cost, not the
+/// cap, and still kills what is left of the group.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_timeout_lets_vibe_write_its_export() {
+    let dir = tempfile::tempdir().unwrap();
+    let out = dir.path().join("out");
+    let fake = fake(
+        dir.path(),
+        "3.0.1",
+        &format!(
+            r#"trap 'echo got-term > {out}/term; echo "{{\"outcome\":\"terminated\",\"cost_usd\":0.03,\"steps\":1,\"exit_code\":3}}" > "$dir/export.json"; exit 3' TERM
+sleep 300 &
+echo $! > {out}/grandchild
+wait $!"#,
+            out = out.display()
+        ),
+    );
+    let mut config = config(dir.path(), fake, Access::SwarmOnly);
+    config.run_timeout = Duration::from_secs(2);
+    let record = one_run(dir.path(), config, "timeout").await;
+    assert_eq!(read(dir.path(), "term").trim(), "got-term");
+    assert_eq!(record.cost_usd, Some(0.03));
+    assert_eq!(record.turns, Some(1));
     let pid = read(dir.path(), "grandchild").trim().to_string();
     assert!(!pid.is_empty());
     eventually("the grandchild is gone", || !alive(&pid)).await;
@@ -400,7 +449,12 @@ async fn old_versions_workspace_and_undoing_arguments_are_refused() {
     .unwrap_err();
     assert!(format!("{e:#}").contains("cannot keep its tools"), "{e:#}");
 
-    for extra in [["--auto-approve"], ["--enabled-tools=bash"], ["-c"]] {
+    for extra in [
+        ["--auto-approve"],
+        ["--enabled-tools=bash"],
+        ["-c"],
+        ["--check-upgrade"],
+    ] {
         let mut config = config(dir.path(), current.clone(), Access::SwarmOnly);
         config.extra_args = extra.map(String::from).to_vec();
         let e = wats::agent::run(Arc::clone(&a), config, async {})
@@ -521,6 +575,31 @@ fn setup_enables_a_swarm_only_agent() {
     for dir in ["home", "xdg-config", "xdg-data", "vibe"] {
         assert!(m.files(dir).is_empty(), "{dir}: {:?}", m.files(dir));
     }
+    // `wats config set` refuses workspace for a Vibe agent too, and says
+    // agent.tools does not apply to it.
+    let set = |key: &str, value: &str| m.wats(&["config", "set", key, value]).output().unwrap();
+    let out = set("agents.vibe.access", "workspace");
+    assert!(!out.status.success(), "{out:?}");
+    assert!(
+        text(&out.stderr).contains("cannot keep its tools"),
+        "{out:?}"
+    );
+    let out = set("agents.vibe.tools", "read_file");
+    assert!(out.status.success(), "{out:?}");
+    assert!(
+        text(&out.stderr).contains("Mistral Vibe has no workspace level"),
+        "{out:?}"
+    );
+    let out = set("agents.other.access", "workspace");
+    assert!(out.status.success(), "{out:?}");
+    let out = set("agents.other.runtime", "vibe");
+    assert!(!out.status.success(), "{out:?}");
+    let config = std::fs::read_to_string(m.path("data/config.toml")).unwrap();
+    assert!(config.contains("access = \"swarm-only\""), "{config}");
+    assert!(
+        !config.contains("access = \"workspace\"\nruntime"),
+        "{config}"
+    );
 
     let out = m.setup(&["--agent", "--access", "inherit"]);
     assert!(out.status.success(), "{out:?}");
@@ -601,7 +680,7 @@ fn the_node_runs_a_vibe_agent() {
         .status();
     let output = node.wait_with_output().unwrap();
     let args = read(&bin, "args");
-    assert!(args.contains("--enabled-tools=wats_*"), "{args}");
+    assert!(args.contains("--enabled-tools=wats_post"), "{args}");
     let run_config = read(&bin, "config.toml");
     assert!(
         run_config.contains("\"--profile\", \"alice-agent\""),

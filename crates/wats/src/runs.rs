@@ -249,6 +249,15 @@ pub fn read_result(transcript: &Path, record: &mut RunRecord) {
                 }
                 continue;
             }
+            // A Vibe run killed before it wrote its export: charged its cap.
+            Some("vibe_charge") => {
+                if crate::vibe::ENFORCE_USD_BUDGET
+                    && let Some(cost) = value["cost_usd"].as_f64().filter(|c| *c > 0.0)
+                {
+                    record.cost_usd = Some(cost);
+                }
+                continue;
+            }
             Some("turn.failed") | Some("error") => {
                 if record.status == "ok" {
                     record.status = "error".into();
@@ -724,6 +733,10 @@ pub fn render(line: &str, style: Style) -> Vec<String> {
                 ))),
             }
         }
+        "vibe_charge" => out.push(style.red(&format!(
+            "✗ no run export: charged ${:.2} (the run's --max-price)",
+            value["cost_usd"].as_f64().unwrap_or(0.0)
+        ))),
         "step_finish" => {
             let part = &value["part"];
             out.push(style.green(&format!(

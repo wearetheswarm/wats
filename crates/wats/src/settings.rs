@@ -1634,8 +1634,18 @@ impl ConfigFile {
         let access = self
             .get(&format!("{table}.access"))
             .map(|v| v.trim_matches('"').to_string());
+        let runtime = self
+            .get(&format!("{table}.runtime"))
+            .map(|v| v.trim_matches('"').to_string());
         let mut out = Vec::new();
-        if crate::access::level(access.as_deref()).ok() == Some(crate::access::Access::SwarmOnly) {
+        if runtime.as_deref() == Some("vibe") {
+            out.push(format!(
+                "Mistral Vibe has no workspace level: {table}.tools does not apply to a Vibe \
+                 agent (swarm-only has the wats tools only; inherit has your own Vibe's tools)"
+            ));
+        } else if crate::access::level(access.as_deref()).ok()
+            == Some(crate::access::Access::SwarmOnly)
+        {
             out.push(format!(
                 "swarm-only access ignores {table}.tools; use access workspace \
                  (`wats config set {table}.access workspace`)"

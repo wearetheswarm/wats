@@ -1,7 +1,8 @@
 # 0033. Mistral Vibe as an agent runtime
 
-Status: Proposed (2026-10-22). Implemented for 0.4.5. The real
-end-to-end run (§6) is still to be done, by Vincent, on a free Mistral
+Status: Proposed (2026-10-22). Implemented for 0.4.5, then revised
+after the review of #196 (see "Review of #196" below). The real
+end-to-end run (§7) is still to be done, by Vincent, on a free Mistral
 account.
 
 Code: `crates/wats/src/vibe.rs` (second half: the levels, refused
@@ -92,11 +93,17 @@ headless mode (`-p`) lives in the Rust CLI. The files read:
 ```
 vibe --prompt= --output=streaming --output-dir=<work dir>/vibe-run \
      --max-turns=<agent.max_turns> [--max-price=<USD left today>] \
-     [--enabled-tools=wats_*] [extra args]   < prompt
+     --time-limit=<a little under agent.timeout> \
+     [--enabled-tools=wats_post --enabled-tools=wats_reply …] [extra args]   < prompt
 ```
 
 - **The prompt on stdin**, as for the other runtimes: never on the
-  command line (`ps`), and never read as a flag.
+  command line (`ps`), and never read as a flag. Vibe reads at most 1 MiB
+  there (`MAX_STDIN_PROMPT_BYTES`): a longer prompt is cut at a character
+  boundary, with a note that says so (`vibe::fit_prompt`).
+- **`--time-limit`** is `agent.timeout` minus a tenth (1 to 15 s), so that
+  Vibe stops by itself (outcome `deadline`, exit 3) and writes its export
+  before the runner has to step in.
 - **`streaming`**, not `json`: one line per history entry, so the
   transcript fills as the run goes and a killed run still has its lines.
 - **The export** is read when the run ends, written into the transcript
@@ -105,20 +112,29 @@ vibe --prompt= --output=streaming --output-dir=<work dir>/vibe-run \
   (it holds a copy of the session too).
 - **The run's status.** `ok` needs exit 0. Otherwise `error`, with the
   export's `error.message`, else its outcome (`turn_limit`…), cut to 200
-  characters. `timeout` when the runner killed it: past `agent.timeout`
-  the runner kills the run's process group (ADR 0031 §3), so the app
-  server and MCP servers go too; a killed run has no export.
+  characters. `timeout` when the runner had to stop it.
+- **Stopping a run.** Vibe's CLI starts its app server in a process group
+  of its own, which a SIGKILL to the CLI's group would miss: the app
+  server and its MCP servers would live on, a turn in progress would keep
+  spending, and no export would be written. So past `agent.timeout` (and
+  on a stop) the runner first sends **SIGTERM to the CLI**, on which
+  headless Vibe writes its export and tears its app server down; it waits
+  up to 10 s (`vibe::TERM_GRACE`; 5 s on a stop), then kills the run's
+  process group (ADR 0031 §3) and the CLI. Only the Vibe runner does this;
+  the other runtimes are killed at once, as before.
 - **The binary**: `vibe` on PATH, or `agent.command`. **Version check at
   start**: `vibe --version` (`vibe 3.0.1`) must be 3.0.0 or later (the
   Rust CLI's run contract); from 4.0 on, a warning.
 - **Refused extra arguments.** At every level, those the runner sets:
-  `-p`/`--prompt`, `--prompt-file`, `--output`, `--output-dir`. At
+  `-p`/`--prompt`, `--prompt-file`, `--output`, `--output-dir`; and those
+  that are no headless run: `--setup`, `--check-upgrade`. At
   `swarm-only`, those that would undo it: `--enabled-tools`, `--agent`,
   `--auto-approve`/`--yolo`, `--smart-approve`, `--trust`, `--add-dir`,
   `--worktree`, `--workdir`, `-c`/`--continue`, `--resume`,
-  `--agent-socket`, `--teleport`, `--setup`. `--max-turns` and
-  `--max-price` in the extra arguments replace the runner's, as for
-  Claude Code.
+  `--agent-socket`, `--teleport`. `--max-turns`, `--max-price` and
+  `--time-limit` in the extra arguments replace the runner's, as for
+  Claude Code. Flags are read by characters, never by bytes, so a
+  non-ASCII argument cannot trip the check.
 - **`agent.model`** is a Vibe model alias (`active_model`), passed as
   `VIBE_ACTIVE_MODEL`. Vibe has no model flag.
 
@@ -134,7 +150,10 @@ vibe --prompt= --output=streaming --output-dir=<work dir>/vibe-run \
   says (`access::level_for`); `wats setup vibe --agent` writes it.
 - **`workspace` is refused** by the runner, `wats --agent vibe --access
   workspace`, `wats setup vibe --agent --access workspace` (before any
-  write) and the wizard, with the same message.
+  write), `wats config set agents.<name>.access workspace` on a Vibe agent
+  (and `runtime vibe` on a table set to workspace), and the wizard, with
+  the same message. `agent.tools` on a Vibe agent gets a warning that it
+  does not apply.
 - **`inherit` needs `agent.review = true` or an explicit `agent.allow`**,
   either one: the product owner's words for Vibe were "`inherit` requires
   `agent.review` or an explicit `agent.allow`". The runner refuses to
@@ -168,10 +187,20 @@ backup).
   before each run, owner-only (it holds the run's runner token):
 
   ```toml
-  enabled_tools = ["wats_*"]
-  disabled_tools = ["bash", "powershell", "read_file", "write_file", "edit",
-                    "search_replace", "grep", "todo", "task", "skill",
-                    "web_search", "web_fetch", "ask_user_question"]
+  enabled_tools = ["wats_post", "wats_reply", "wats_digest", "wats_retract",
+                   "wats_read", "wats_search", "wats_browse", "wats_who",
+                   "wats_wait", "wats_status"]
+  disabled_tools = ["bash", "bash_output", "bash_stdin", "bash_sessions",
+                    "bash_log_file", "git_bash", "git_bash_output", …,
+                    "powershell", "powershell_output", …, "shell",
+                    "read_file", "write_file", "edit", "search_replace",
+                    "grep", "todo", "task", "skill", "web_search", "web_fetch",
+                    "ask_user_question", "cron", "start_session",
+                    "unified_harness_scratchpad",
+                    "re:(?!(?:wats_post|wats_reply|…|wats_status)$).*"]
+  enabled_skills = ["re:(?!)"]
+  disabled_skills = ["*"]
+  experimental_enable_registry_skills = false
   enable_connectors = false
   enable_subagents = false
   enable_background_processes = false
@@ -197,13 +226,30 @@ backup).
 
   `permission = "always"` on the wats tools is what lets a headless run
   call them (§Context); a test keeps `RUN_TOOLS` equal to the tools a
-  runner session lists. `--enabled-tools=wats_*` on the command line
-  (session layer, above the config files) and the `disabled_tools` list
-  are a second and third lock.
+  runner session lists.
+  - **Exact names, never a glob.** `wats_*` would also match the tools of
+    a server named `wats_x`. The names go in `enabled_tools` and once
+    each as `--enabled-tools` on the command line (the session layer,
+    above the config files).
+  - **`disabled_tools`** lists every built-in and provided tool of 3.0.1
+    (`vibe/core/tools/builtins/`, `cron`, `start_session`, the
+    scratchpad), then a `re:` pattern. Vibe matches `re:` patterns
+    case-insensitively and in full (`vibe/core/utils/matching.py`,
+    `fullmatch`), so `re:(?!(?:wats_post|…)$).*` disables every other
+    name, a tool a later Vibe adds included.
+  - **No skills.** The app server appends a skill's body to the prompt
+    for a `/<name>` it contains (`_resolved_invoked_skills`), even with
+    the skill tool filtered out, and `~/.agents/skills` is found from
+    `HOME`, not `VIBE_HOME`. `enabled_skills = ["re:(?!)"]` matches no
+    skill; `disabled_skills = ["*"]` disables them all (Vibe uses the
+    second only when the first is empty). Shared workspace skills from
+    Mistral stay off (`experimental_enable_registry_skills`).
 - **The environment**: every `VIBE_*` variable of the node's own
   environment is removed but `VIBE_APP_SERVER_BIN`, `VIBE_APP_SERVER_CMD`
   (how this install starts Vibe's app server) and `VIBE_THEME`, since Vibe
-  reads `VIBE_<setting>` as config above its files; and
+  reads `VIBE_<setting>` as config above its files. **In any case**:
+  Vibe's environment layer is case-insensitive, so `vibe_mcp_servers` or
+  `Vibe_Bypass_Tool_Permissions` would count too. And
   `MISTRAL_VIBE_SESSION_ROOT` (the harness's fallback session store,
   otherwise `~/.vibe/logs/session`) is set inside the agent's home.
 - **The API key** is found as usual from `MISTRAL_API_KEY` or the OS
@@ -217,8 +263,19 @@ directory `wats` started in. The wats server goes in as
 `VIBE_MCP_SERVERS='[{…}]'` (the same entry as JSON) and its tool
 approvals as `VIBE_TOOLS='{"wats_post":{"permission":"always"},…}'`: Vibe
 merges servers by name, so the run's `wats` replaces a `wats` the user
-registered for the human's profile (the run never posts as the human),
-and keeps the user's other servers.
+registered for the human's profile, and keeps the user's other servers.
+
+- **The user's own `VIBE_MCP_SERVERS` and `VIBE_TOOLS`** (in any case),
+  when the node's environment has them, are merged in, not overwritten:
+  their servers but any `wats`, their per-tool settings but the wats
+  tools'. The other spellings are removed, so one variable of each is
+  left. A value that is not valid JSON is dropped (Vibe would ignore it
+  too).
+- **Another server that runs wats.** A server of the user's
+  `config.toml` under another name whose command is a `wats` binary keeps
+  running with the run, as the human's profile: the runner warns at start
+  (it reads the user's Vibe config for that, as `wats setup vibe --mcp`
+  does; never `.env` or the keyring).
 
 **Both levels:** `VIBE_SESSION_LOGGING__ENABLED=false` (swarm runs never
 show up in `vibe --resume`; the transcript is wats's), no update check or
@@ -234,9 +291,15 @@ auto-update, `VIBE_ACTIVE_MODEL` when `agent.model` is set.
   daily and monthly USD budgets apply. `--max-price` is what is left of
   them, as `--max-budget-usd` is for Claude Code: a per-run cap in
   dollars, which OpenCode does not have.
-- **A cost of 0** (a model without prices, a local model) or **no
-  export** (a killed run) is a run without cost: `agent.max_runs_per_day`
-  applies, as for Codex.
+- **A cost of 0** (a model without prices, a local model) is a run
+  without cost: `agent.max_runs_per_day` applies, as for Codex.
+- **No export after a timeout or a stop** (Vibe ignored SIGTERM, or was
+  killed in the grace): the run is **charged its cap**, its
+  `--max-price` (from the extra arguments, else what was left of the
+  budget), as a `vibe_charge` line of the transcript. Charging nothing
+  would let repeated timeouts spend past the budget unseen; the cap is
+  the most the run was allowed to spend. A run that exits by itself
+  without an export (which 3.0.1 never does) is a run without cost.
 - **The cost is Vibe's estimate** from catalog prices. A free tier or
   credits are not in it: on a free Mistral account the node still counts
   dollars against `agent.max_usd_per_day`. The docs say so.
@@ -260,9 +323,11 @@ auto-update, `VIBE_ACTIVE_MODEL` when `agent.model` is set.
 **Enforced** (from 3.0.1's source and the fake-binary tests, not yet a
 real run):
 
-- At `swarm-only`, the model is offered the wats tools only, and they are
-  the only tools approved; Vibe's own tools, MCP servers and connectors
-  are not loaded or are filtered out three ways.
+- At `swarm-only`, the model is offered the exact wats tools only, and
+  they are the only tools approved; Vibe's own tools, MCP servers and
+  connectors are not loaded or are filtered out three ways (the allow
+  list on the command line and in the config, the deny list, the deny-all
+  pattern). No skill loads, by `/<name>` either.
 - Nothing of `~/.vibe` or of the run directory's project config loads at
   `swarm-only`, and no `VIBE_*` variable of the node's environment
   reaches the run.
@@ -275,12 +340,16 @@ real run):
 1. **No sandbox.** Vibe's filters are checks in its own process, which
    runs as the user. At `inherit` the agent can do what the user's Vibe
    setup lets it do, and review is no boundary there (ADR 0011).
-2. **Admin config** (Vibe's managed settings) is merged last and can
-   change anything, `enable_auto_approve` included.
-3. **`~/.agents/skills`** is found from `HOME`, not `VIBE_HOME`. At
-   `swarm-only` the `skill` tool is filtered and disabled, so they cannot
-   be read; whether their names reach the prompt is to be checked on the
-   real run.
+2. **Admin config** is merged last and can change anything,
+   `enable_auto_approve` and the tool filters included: the machine's
+   managed settings, and an organisation's config that Vibe fetches from
+   Mistral with the API key. They are the organisation's policy, out of
+   wats's reach.
+3. **`~/.agents/skills`** is found from `HOME`, not `VIBE_HOME`, and wats
+   cannot point Vibe's skill search elsewhere without another `HOME`
+   (which would hide the OS keyring). The skills there are still
+   discovered; the filters above keep every one of them out of the run,
+   by the skill tool or by `/<name>`. The real run must confirm it.
 4. **The runner token is in the per-run config file** (owner-only, in the
    data directory) and in the `wats mcp` server's environment.
 5. **Vibe's own writes** in the agent's home: its caches (model catalog,
@@ -288,6 +357,10 @@ real run):
 6. **The mcp SDK's environment** for the `wats mcp` child: it may get only
    a default set of variables plus `env`. `wats mcp` needs none besides
    its arguments; the real run must show the wats tools listed.
+7. **A Vibe that ignores SIGTERM.** After the grace, the runner kills the
+   CLI's process group; an app server in a group of its own then outlives
+   the run until it notices its parent is gone. The run is charged its
+   cap (§4).
 
 ### 7. Tests
 
@@ -310,12 +383,35 @@ prompt, print canned streaming lines, and write an `export.json` into
   throwaway HOME, XDG directories and VIBE_HOME, nothing written there;
 - `wats --agent vibe` end to end: refusals at start, then a heartbeat run
   reaching the fake;
-- the wizard: Vibe offered, `workspace` refused, the inherit warning.
+- the wizard: Vibe offered, `workspace` refused, the inherit warning;
+- after the review: a fake that traps SIGTERM and writes its export at
+  the timeout (its cost recorded, the group still killed), the cap
+  charged when no export comes, `wats config set` refusing `workspace`,
+  and unit tests for the exact tool names, the deny-all pattern, the
+  skills settings, the case-insensitive strip, the `inherit` merge, the
+  other-wats-server warning, `--time-limit`, the prompt cut and
+  non-ASCII flags.
 
 **One real run, by Vincent only**, on his free Mistral account: two
 loopback nodes with `--infra none`, `swarm-only`, one ask answered
 through `wats_reply`; then the levers of §3 and §6 checked on the
 installed Vibe. No agent runs it, and no session copies credentials.
+
+## Review of #196 (2026-10-22)
+
+The review against 3.0.1's source found no blocker. Fixed in the PR:
+
+- skills through `/<name>` (§3: `enabled_skills`, `disabled_skills`);
+- the environment strip made case-insensitive, and the exact wats tool
+  names instead of `wats_*` (§3);
+- the full built-in list plus the deny-all `re:` pattern (§3);
+- SIGTERM before the kill, `--time-limit`, and the cap charged when no
+  export was written (§1, §4);
+- flags read by characters; `--check-upgrade` refused; the organisation's
+  admin config named (§6); at `inherit`, the user's own `VIBE_MCP_SERVERS`
+  and `VIBE_TOOLS` merged and a warning for another server that runs wats
+  (§3); `wats config set` refusing `workspace` for a Vibe agent (§2);
+  prompts over 1 MiB cut with a note (§1).
 
 ## Alternatives
 
