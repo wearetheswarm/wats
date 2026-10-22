@@ -48,6 +48,8 @@ cargo test
 cargo deny check   # dependency licenses, advisories, sources (deny.toml)
 ```
 
+CI runs the tests with [cargo-nextest](https://nexte.st) instead (`cargo nextest run --profile ci`, then `cargo test --doc`): each test gets its own process and is killed after 5 minutes (`.config/nextest.toml`), so a hang fails by name.
+
 If you touch the npm or PyPI wrappers (`packages/`, [ADR 0035](docs/adr/0035-npx-and-uvx-wrappers.md)), also run their offline tests:
 
 ```sh
