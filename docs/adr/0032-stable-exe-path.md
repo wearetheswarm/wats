@@ -97,3 +97,15 @@ Only a node on the real network checks. Hermetic and loopback modes
   `projects.*` in `~/.claude.json`), project-level Vibe configs, and
   OpenClaw configs at a path other than the default or the `OPENCLAW_*`
   variables. Setup fixes those.
+- Follow-up: OpenCode's `mcp.wats` entry in its global config
+  (`$XDG_CONFIG_HOME/opencode/opencode.json(c)`, ADR 0031) is not checked
+  yet. It is new in 0.4.4 and written with `update::stable_exe()` from
+  the start, so no release left a Cellar path there. Adding it is not a
+  small change, for two reasons:
+  - **The file is often JSONC.** Comments and trailing commas defeat the
+    in-place JSON rewrite this check uses.
+  - **ADR 0031 says wats never edits OpenCode's config itself.** A repair
+    would go through `opencode mcp add`, as OpenClaw's goes through
+    `openclaw mcp set`, with its own timeouts and a version check.
+
+  Until then, `wats setup opencode --mcp` fixes it.

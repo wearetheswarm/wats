@@ -29,6 +29,7 @@ use crate::budget;
 use crate::event::{Draft, Event, Kind, title_from_text};
 use crate::identity::author_id;
 use crate::node::Node;
+use crate::opencode;
 use crate::runs::{self, RunRecord};
 use crate::store::Filter;
 use crate::wake::{Hold, WakeLimits, WakeState, loop_turns};
@@ -161,6 +162,14 @@ impl AgentInfo {
             Some("codex") => format!(
                 "{} of {} runs today (Codex reports no cost)",
                 spend.uncosted_today, self.budget.max_runs_per_day
+            ),
+            Some("opencode") if !opencode::ENFORCE_USD_BUDGET => format!(
+                "{} of {} runs today (OpenCode's costs not enforced)",
+                spend.uncosted_today, self.budget.max_runs_per_day
+            ),
+            Some("opencode") => format!(
+                "{} (OpenCode's cost estimate)",
+                budget::describe(&self.budget, &spend)
             ),
             _ => budget::describe(&self.budget, &spend),
         }
@@ -742,6 +751,58 @@ struct Running {
     /// What woke it, queued again if the OpenClaw gateway was down.
     woke: Vec<Queued>,
     feedback: Vec<String>,
+    /// The spawned CLI's process group, killed if the run is dropped.
+    group: GroupGuard,
+}
+
+/// Ends a run's runner token on drop unless the run started: an early
+/// return (a refused config, a run directory that cannot be made, a CLI
+/// that does not start) leaves no live token behind.
+struct TokenGuard<'a> {
+    node: &'a Node,
+    token: Option<String>,
+}
+
+impl TokenGuard<'_> {
+    /// The run started: its `Running` ends the token.
+    fn disarm(mut self) -> String {
+        self.token.take().unwrap_or_default()
+    }
+}
+
+impl Drop for TokenGuard<'_> {
+    fn drop(&mut self) {
+        if let Some(token) = self.token.take() {
+            self.node.end_runner_token(&token);
+        }
+    }
+}
+
+/// A spawned run's process group (the CLI is its leader, ADR 0031 §3):
+/// killed when the run ends other than by its own exit, and when the run
+/// is dropped without being finished (a runner task aborted, a panic).
+/// Disarmed after a normal exit: the id may then be reused.
+struct GroupGuard(Option<u32>);
+
+impl GroupGuard {
+    fn kill(&mut self) {
+        if let Some(pgid) = self.0.take() {
+            #[cfg(unix)]
+            crate::background::kill_group(pgid);
+            #[cfg(not(unix))]
+            let _ = pgid;
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.0 = None;
+    }
+}
+
+impl Drop for GroupGuard {
+    fn drop(&mut self) {
+        self.kill();
+    }
 }
 
 /// What a run waits on: the agent CLI, or the forward to OpenClaw.
@@ -853,6 +914,7 @@ fn start_forward(
         transcript,
         woke: Vec::new(),
         feedback: Vec::new(),
+        group: GroupGuard(None),
     })
 }
 
@@ -919,63 +981,22 @@ async fn start_run(
     remaining_usd: f64,
 ) -> Result<Running> {
     let (record, transcript) = open_run(config, trigger)?;
-    let file = std::fs::OpenOptions::new().append(true).open(&transcript)?;
     let token = node.new_runner_token(crate::node::RunnerRun {
         id: record.id.clone(),
         events: trigger.events(),
         profile: config.profile.clone(),
         file_roots: Vec::new(),
     });
-    let mut command = tokio::process::Command::new(&config.command);
-    let dir = run_dir(config)?;
-    command.current_dir(&dir);
-    // The human's session hook (`wats notify --hook`) stays quiet in an
-    // agent's run, even one that inherits the user's settings.
-    command.env(crate::hook::AGENT_RUN_ENV, "1");
-    match config.runtime.as_str() {
-        "codex" => {
-            let (_, workspace_overrides) = if config.access == Access::Workspace {
-                access::workspace_codex_overrides(&config.workdir)?
-            } else {
-                Default::default()
-            };
-            // `--model` is an option of `codex exec`: it goes after it.
-            let mut extra = model_args(config, "--model");
-            extra.extend(config.extra_args.iter().cloned());
-            command.args(access::codex_args(&access::CodexRun {
-                access: config.access,
-                wats_command: &config.mcp_command,
-                wats_args: &config.mcp_args,
-                runner_token: &token,
-                disable: &config.codex_disable,
-                enable: &config.codex_enable,
-                workspace_overrides: &workspace_overrides,
-                extra: &extra,
-            }));
-        }
-        _ => {
-            let mcp_config = config.work_dir.join(format!("mcp-{}.json", config.profile));
-            let workspace_servers = access::write_claude_mcp_config(
-                &mcp_config,
-                config.access,
-                &config.workdir,
-                &config.mcp_command,
-                &config.mcp_args,
-                &token,
-            )?;
-            command
-                .args(access::claude_args(&access::ClaudeRun {
-                    access: config.access,
-                    mcp_config: &mcp_config,
-                    workspace_servers: &workspace_servers,
-                    tools: &config.tools,
-                    extra: &config.extra_args,
-                    data_dir: &config.data_dir,
-                    run_dir: &dir,
-                }))
-                .args(limit_args(config, remaining_usd))
-                .args(model_args(config, "--model"))
-                .args(&config.extra_args);
+    let guard = TokenGuard {
+        node: node.as_ref(),
+        token: Some(token.clone()),
+    };
+    let prepared = prepare_command(config, &token, &transcript, remaining_usd);
+    let (mut command, file) = match prepared {
+        Ok(prepared) => prepared,
+        Err(e) => {
+            fail_run(config, record, &transcript, &format!("{e:#}"));
+            return Err(e);
         }
     };
     // Codex's events go through the runner, which reads the thread id.
@@ -995,10 +1016,11 @@ async fn start_run(
         Ok(child) => child,
         Err(e) => {
             fail_run(config, record, &transcript, &e.to_string());
-            node.end_runner_token(&token);
             return Err(e).with_context(|| format!("start {}", config.command.display()));
         }
     };
+    // From here, a dropped run takes its process group with it.
+    let group = GroupGuard(child.id());
     let output = child.stdout.take().map(|stdout| {
         let images = access::codex_generates_images(&config.runtime, config.access, &config.tools)
             .then(access::codex_home)
@@ -1013,14 +1035,139 @@ async fn start_run(
     }
     Ok(Running {
         record,
-        token: Some(token),
+        token: Some(guard.disarm()),
         work: Work::Child(child, output),
         started: Instant::now(),
         deadline: tokio::time::Instant::now() + config.run_timeout,
         transcript,
         woke: Vec::new(),
         feedback: Vec::new(),
+        group,
     })
+}
+
+/// The command of one spawned run, and its transcript file (stdout and
+/// stderr go there): the runtime's arguments, environment and directory.
+fn prepare_command(
+    config: &AgentConfig,
+    token: &str,
+    transcript: &std::path::Path,
+    remaining_usd: f64,
+) -> Result<(tokio::process::Command, std::fs::File)> {
+    let file = std::fs::OpenOptions::new().append(true).open(transcript)?;
+    let mut command = tokio::process::Command::new(&config.command);
+    let dir = run_dir(config)?;
+    command.current_dir(&dir);
+    // The human's session hook (`wats notify --hook`) stays quiet in an
+    // agent's run, even one that inherits the user's settings.
+    command.env(crate::hook::AGENT_RUN_ENV, "1");
+    // A process group of its own: at the timeout, the runner kills the run
+    // and what it started (MCP servers, shell commands), ADR 0031 §3.
+    #[cfg(unix)]
+    command.process_group(0);
+    match config.runtime.as_str() {
+        "opencode" => {
+            // Checked again before every run: a config may have changed.
+            opencode::check_config_sources(
+                config.access,
+                &dir,
+                &config.work_dir,
+                std::env::home_dir().as_deref(),
+            )?;
+            let (tools, _) = if config.access == Access::Workspace {
+                opencode::tools(&config.tools)?
+            } else {
+                Default::default()
+            };
+            let servers = if config.access == Access::Workspace {
+                opencode::workspace_servers(&config.workdir)?
+            } else {
+                Vec::new()
+            };
+            let permission = opencode::permission(&opencode::Permissions {
+                access: config.access,
+                tools: &tools,
+                servers: &servers,
+                data_dir: &config.data_dir,
+                run_dir: &dir,
+            });
+            let run_config = opencode::run_config(&opencode::RunConfig {
+                access: config.access,
+                wats_command: &config.mcp_command,
+                wats_args: &config.mcp_args,
+                runner_token: token,
+                timeout: config.run_timeout,
+                steps: config.max_turns,
+                permission,
+            });
+            if config.access != Access::Inherit {
+                for key in opencode::removed_env(std::env::vars_os()) {
+                    command.env_remove(key);
+                }
+            }
+            for (key, value) in opencode::run_env(config.access, &config.work_dir, &run_config) {
+                command.env(key, value);
+            }
+            command
+                .args(opencode::run_args())
+                .args(opencode_model_arg(config))
+                .args(&config.extra_args);
+        }
+        "codex" => {
+            let (_, workspace_overrides) = if config.access == Access::Workspace {
+                access::workspace_codex_overrides(&config.workdir)?
+            } else {
+                Default::default()
+            };
+            // `--model` is an option of `codex exec`: it goes after it.
+            let mut extra = model_args(config, "--model");
+            extra.extend(config.extra_args.iter().cloned());
+            command.args(access::codex_args(&access::CodexRun {
+                access: config.access,
+                wats_command: &config.mcp_command,
+                wats_args: &config.mcp_args,
+                runner_token: token,
+                disable: &config.codex_disable,
+                enable: &config.codex_enable,
+                workspace_overrides: &workspace_overrides,
+                extra: &extra,
+            }));
+        }
+        _ => {
+            let mcp_config = config.work_dir.join(format!("mcp-{}.json", config.profile));
+            let workspace_servers = access::write_claude_mcp_config(
+                &mcp_config,
+                config.access,
+                &config.workdir,
+                &config.mcp_command,
+                &config.mcp_args,
+                token,
+            )?;
+            command
+                .args(access::claude_args(&access::ClaudeRun {
+                    access: config.access,
+                    mcp_config: &mcp_config,
+                    workspace_servers: &workspace_servers,
+                    tools: &config.tools,
+                    extra: &config.extra_args,
+                    data_dir: &config.data_dir,
+                    run_dir: &dir,
+                }))
+                .args(limit_args(config, remaining_usd))
+                .args(model_args(config, "--model"))
+                .args(&config.extra_args);
+        }
+    };
+    Ok((command, file))
+}
+
+/// OpenCode's `--model=<provider/model>`, as one argument (a value can
+/// never be read as a flag), unless the extra arguments choose a model.
+fn opencode_model_arg(config: &AgentConfig) -> Vec<String> {
+    model_args(config, "--model")
+        .get(1)
+        .map(|model| vec![format!("--model={model}")])
+        .unwrap_or_default()
 }
 
 /// Copy a Codex run's JSON events to its transcript. With image
@@ -1094,7 +1241,7 @@ fn completion_status(completion: Option<&str>) -> &'static str {
 async fn finish_run(
     node: &Node,
     config: &AgentConfig,
-    running: Running,
+    mut running: Running,
     outcome: Outcome,
 ) -> Finished {
     use crate::openclaw::Reply;
@@ -1103,7 +1250,12 @@ async fn finish_run(
     }
     match running.work {
         Work::Child(mut child, output) => {
-            if !matches!(outcome, Outcome::Exited(_)) {
+            if matches!(outcome, Outcome::Exited(_)) {
+                running.group.disarm();
+            } else {
+                // Its whole process group first (the CLI is the group's
+                // leader, not yet reaped: the id is still its own).
+                running.group.kill();
                 let _ = child.kill().await;
             }
             // The transcript is complete before the footer goes in.
@@ -1654,6 +1806,59 @@ fn unix_now() -> u64 {
         .map_or(0, |d| d.as_secs())
 }
 
+/// Before an OpenCode runner starts (ADR 0031): its version, the extra
+/// arguments and `agent.tools` of the level, the workspace's config, the
+/// agent's own OpenCode directory, and warnings for what OpenCode loads
+/// that wats does not control.
+async fn check_opencode(config: &AgentConfig) -> Result<()> {
+    let found = opencode::version(&config.command).await;
+    if let Some(warning) = opencode::check_version(found)
+        .with_context(|| format!("OpenCode ({})", config.command.display()))?
+    {
+        warn!("{warning}");
+    }
+    opencode::check_extra_args(config.access, &config.extra_args)?;
+    if let Some(model) = &config.model {
+        opencode::check_model(model)?;
+    }
+    if config.access == Access::Workspace {
+        let (_, unknown) = opencode::tools(&config.tools)?;
+        if !unknown.is_empty() {
+            warn!(
+                "agent.tools [{}]: not OpenCode 1.x permission keys (read, edit, glob, grep, \
+                 list, bash, webfetch, websearch, skill…); passed as they are",
+                unknown.join(", ")
+            );
+        }
+        access::ensure_workspace(&config.workdir)?;
+        opencode::workspace_servers(&config.workdir)?;
+    }
+    if config.access != Access::Inherit && opencode::ISOLATE_GLOBAL_CONFIG {
+        let dir = opencode::ensure_agent_dir(&config.work_dir)?;
+        info!(
+            "OpenCode runs read {} (the agent's model settings), not ~/.config/opencode",
+            dir.display()
+        );
+    }
+    let run_dir = match config.access {
+        Access::Workspace => config.workdir.clone(),
+        Access::SwarmOnly => config.work_dir.join("locked"),
+        Access::Inherit => std::env::current_dir()?,
+    };
+    opencode::check_config_sources(
+        config.access,
+        &run_dir,
+        &config.work_dir,
+        std::env::home_dir().as_deref(),
+    )?;
+    for warning in
+        opencode::start_warnings(config.access, &run_dir, std::env::home_dir().as_deref())
+    {
+        warn!("{warning}");
+    }
+    Ok(())
+}
+
 /// Run the agent loop until `shutdown` resolves. A run in progress is then
 /// killed.
 pub async fn run(
@@ -1702,6 +1907,9 @@ pub async fn run(
         }
         config.codex_disable = features.disable;
         config.codex_enable = features.enable;
+    }
+    if config.runtime == "opencode" {
+        check_opencode(&config).await?;
     }
     announce_if_changed(&node, &config).await;
     // A marker left by a run that did not finish (crash, kill -9).

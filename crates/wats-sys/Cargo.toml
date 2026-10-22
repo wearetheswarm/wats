@@ -1,0 +1,11 @@
+[package]
+name = "wats-sys"
+description = "The few operating-system calls wats makes that need `unsafe`, kept out of the wats crate, which forbids it."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[target.'cfg(unix)'.dependencies]
+libc = "=0.2.190"

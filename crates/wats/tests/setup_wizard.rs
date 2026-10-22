@@ -73,6 +73,9 @@ impl Machine {
             .env("WATS_DIR", self.data())
             .env("WATS_RUN_DIR", self.path("run"))
             .env("HOME", self.path("home"))
+            .env("XDG_CONFIG_HOME", self.path("home/.config"))
+            .env("XDG_DATA_HOME", self.path("home/.local/share"))
+            .env_remove("WATS_OPENCODE")
             .env("VIBE_HOME", self.path("vibe"))
             .env("PATH", self.path("bin"))
             .env("USER", "alice")
@@ -500,4 +503,43 @@ fn wats_setup_with_no_tool_is_the_wizard() {
         "{said}"
     );
     assert!(!machine.path("vibe/config.toml").exists());
+}
+
+/// OpenCode on PATH (ADR 0031): the wizard offers it as the node's agent,
+/// asks its model, and registers wats in the user's own OpenCode sessions
+/// through `opencode mcp add` (a fake: it answers `--version` and records
+/// its arguments).
+#[test]
+fn the_wizard_offers_opencode() {
+    let machine = Machine::new();
+    let fake = machine.path("bin").join("opencode");
+    std::fs::write(
+        &fake,
+        format!(
+            "#!/bin/sh\nif [ \"$1\" = --version ]; then echo 1.19.3; exit 0; fi\nprintf 'opencode %s\\n' \"$*\" >> {}\n",
+            machine.path("calls.log").display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let out = machine
+        .spawn(machine.wats(&["setup"], true), "\nazure/gpt-test\n")
+        .wait_with_output()
+        .unwrap();
+    let said = text(&out.stdout);
+    assert!(out.status.success(), "{out:?}");
+    assert!(said.contains("provider/model"), "{said}");
+    assert!(
+        said.contains("Use the swarm from your own OpenCode sessions"),
+        "{said}"
+    );
+    assert!(
+        said.contains("OpenCode: wats MCP server registered"),
+        "{said}"
+    );
+    let calls = machine.calls();
+    assert!(calls.contains("opencode mcp add wats -- "), "{calls}");
+    let config = std::fs::read_to_string(machine.data().join("config.toml")).unwrap();
+    assert!(config.contains("runtime = \"opencode\""), "{config}");
+    assert!(config.contains("model = \"azure/gpt-test\""), "{config}");
 }

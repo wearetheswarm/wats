@@ -35,6 +35,25 @@
   the MCP `status` tool (`registrations`). Entries that are not wats's are
   never touched.
 
+- **OpenCode, a new agent runtime, for your own model or cloud credits**
+  (Azure OpenAI, AWS Bedrock, Google Vertex AI, …; [ADR 0031](docs/adr/0031-opencode.md),
+  [docs/opencode.md](docs/opencode.md)).
+  - `wats --agent opencode` runs `opencode run --format json` with a
+    per-run config: a dedicated `wats` agent with the permissions of the
+    access level, your global OpenCode config isolated, and nothing in
+    your session history.
+  - `wats setup opencode` registers wats (its stable path, as above)
+    through `opencode mcp add` (OpenCode 1.17.0 or later) and creates the
+    agent's own OpenCode directory.
+  - The setup wizard finds OpenCode on your PATH and asks its model.
+  - Budgets use OpenCode's cost estimate. `inherit` needs `agent.allow`
+    and `agent.review`.
+- **Process groups**: at its timeout or a stop, an agent run is killed
+  with everything it started (MCP servers, shell commands), for every
+  spawned runtime. A foreground `wats` whose terminal closes (SIGHUP) now
+  stops gracefully, as on Ctrl-C, and takes its runs with it (a detached
+  node still ignores SIGHUP, and so does `nohup wats`).
+
 ## 0.4.3 (2026-10-21)
 
 The robustness release. A full node keeps working: at the cap it rotates

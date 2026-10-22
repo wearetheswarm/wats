@@ -444,6 +444,29 @@ pub fn signal(pid: u32, signal: &str) -> std::io::Result<bool> {
     Ok(status.success())
 }
 
+/// SIGKILL to every process of the process group `pgid` (killpg(2)): an
+/// agent run and what it started (MCP servers, shell commands), ADR 0031
+/// §3. A group already gone is not an error; any other failure is
+/// logged.
+#[cfg(unix)]
+pub fn kill_group(pgid: u32) {
+    use nix::sys::signal::{Signal, killpg};
+    use nix::unistd::Pid;
+    let Ok(raw) = i32::try_from(pgid) else {
+        tracing::warn!("agent run: process group {pgid} out of range, not killed");
+        return;
+    };
+    // pgid 0 or 1 would be ours or init's: never.
+    if raw <= 1 {
+        tracing::warn!("agent run: refusing to kill process group {raw}");
+        return;
+    }
+    match killpg(Pid::from_raw(raw), Signal::SIGKILL) {
+        Ok(()) | Err(nix::errno::Errno::ESRCH) => {}
+        Err(e) => tracing::warn!("agent run: cannot kill its process group {raw}: {e}"),
+    }
+}
+
 /// Whether process `pid` exists.
 #[cfg(unix)]
 pub fn alive(pid: u32) -> bool {
