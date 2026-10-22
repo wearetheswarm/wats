@@ -806,6 +806,11 @@ change:
 - **Not registered by the runner.** `wats --agent opencode` does not
   register wats in OpenCode, unlike `--agent claude|codex`. Only `wats
   setup opencode --mcp` writes OpenCode's global config.
+- **A stable wats path** (ADR 0032). The `mcp.wats` command that `wats
+  setup opencode --mcp` passes to `opencode mcp add`, and the wats
+  command of each run's MCP entry, come from `update::stable_exe()`, as
+  for the other hosts. The stale-registration check of ADR 0032 does not
+  cover OpenCode's entry yet; ADR 0032 lists it as a follow-up.
 - **`--agents-md`** is refused for OpenCode: wats does not write
   OpenCode's global instructions.
 - **The wizard's model question** is asked only when OpenCode is chosen.

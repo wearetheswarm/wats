@@ -2,7 +2,38 @@
 
 ## Unreleased
 
+### Upgrading
+
+- **Homebrew users who ran `wats setup <tool> --mcp` with 0.4.3 or
+  older**: your agent tools run wats from a versioned Cellar path
+  (`/opt/homebrew/Cellar/wats/0.4.3/bin/wats`), which `brew cleanup`
+  removes after an upgrade. A 0.4.4 node repairs those entries at its
+  first start and logs which file it fixed; `wats status` warns about them
+  before. Until then, if `brew cleanup` has already run, run `wats setup
+  <tool> --mcp` again (`claude`, `codex`, `openclaw` or `vibe`).
+
 ### Changes
+
+- **The wats path written into the agent tools survives upgrades.** `wats
+  setup <tool> --mcp` (Claude Code, Codex, OpenClaw, Mistral Vibe), the
+  session hooks (`wats notify --hook`) and each agent run's MCP config now
+  use Homebrew's link (`$(brew --prefix)/bin/wats`) for a Homebrew install,
+  found without running `brew`, else the path you started wats by. Before,
+  they used the versioned Cellar path, and after `brew upgrade` plus `brew
+  cleanup` every agent tool lost the swarm without a word. Installs by
+  install.sh are unchanged. The background node is also respawned through
+  Homebrew's link once the running binary is gone. ADR 0032.
+- **Stale registrations are found and repaired.** At each start, a node
+  checks wats's own entries in each tool's config: the `wats` (and
+  `wats-agent`) MCP servers and the wats session hooks. A path that is
+  gone, or in a versioned Cellar directory, is rewritten to Homebrew's
+  link, and nothing else in the file changes. The write is atomic, after a
+  backup (`<file>.wats-repair.bak-<time>`, at most 3 kept). OpenClaw's
+  entries go through `openclaw mcp set`. `wats status` only checks: it
+  says the node repairs the entry at its next start, or gives the exact
+  `wats setup <tool> --mcp` command when there is no such link; so does
+  the MCP `status` tool (`registrations`). Entries that are not wats's are
+  never touched.
 
 - **OpenCode, a new agent runtime, for your own model or cloud credits**
   (Azure OpenAI, AWS Bedrock, Google Vertex AI, …; [ADR 0031](docs/adr/0031-opencode.md),
@@ -11,9 +42,9 @@
     per-run config: a dedicated `wats` agent with the permissions of the
     access level, your global OpenCode config isolated, and nothing in
     your session history.
-  - `wats setup opencode` registers wats through `opencode mcp add`
-    (OpenCode 1.17.0 or later) and creates the agent's own OpenCode
-    directory.
+  - `wats setup opencode` registers wats (its stable path, as above)
+    through `opencode mcp add` (OpenCode 1.17.0 or later) and creates the
+    agent's own OpenCode directory.
   - The setup wizard finds OpenCode on your PATH and asks its model.
   - Budgets use OpenCode's cost estimate. `inherit` needs `agent.allow`
     and `agent.review`.

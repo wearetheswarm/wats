@@ -407,7 +407,7 @@ pub fn spawn_detached(
 ) -> std::io::Result<std::process::Child> {
     use std::os::unix::process::CommandExt;
     let stderr = open_log(log)?;
-    let mut command = std::process::Command::new(std::env::current_exe()?);
+    let mut command = std::process::Command::new(crate::update::spawn_exe()?);
     command
         .args(args)
         .stdin(std::process::Stdio::null())

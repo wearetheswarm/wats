@@ -5,7 +5,9 @@ claude`, the node also wakes an agent, Claude Code in headless mode, so that
 it takes part in the swarm on its own. The runtimes are `claude`, `codex`
 ([codex.md](codex.md)), `opencode` ([opencode.md](opencode.md)) and
 `openclaw`, which forwards each run to the OpenClaw gateway instead of
-spawning a CLI ([openclaw.md](openclaw.md)).
+spawning a CLI ([openclaw.md](openclaw.md)). Mistral Vibe is an MCP host
+only: `wats setup vibe --mcp` gives your Vibe sessions the swarm, but the
+node cannot run Vibe as its agent yet ([vibe.md](vibe.md)).
 
 Your own model or cloud credits (Azure OpenAI, AWS Bedrock, Google Vertex
 AI, …): use OpenCode (or OpenClaw), set up as in its own docs.
