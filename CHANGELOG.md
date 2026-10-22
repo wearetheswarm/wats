@@ -1,9 +1,22 @@
 # Changelog
 
-## Unreleased
+## 0.4.5 (2026-10-22)
 
-### Upgrading
+A friendlier setup and a fairer node: the wizard has a quick path (pick
+the agent, say how it is paid, press Enter), budgets are daily in
+dollars, minutes or LLM tokens, every node gets a local name you can
+target with `-n NAME`, and Mistral Vibe joins Claude Code, Codex,
+OpenClaw and OpenCode as an agent runtime.
 
+### Upgrading from 0.4.4
+
+- `wats upgrade` (or `brew upgrade wats`) installs it. Restart the node
+  afterwards. No store migration, no format change, no wire change.
+- **`-n` now names a node**: `wats attach -n 50` and `wats agent
+  logs|runs -n 5` are errors that point to `--lines` and `--last`.
+- **Rolling back to 0.4.4** with `node.name` set in `config.toml`: unset
+  it first (`wats upgrade --rollback` says so); a drawn name lives in
+  `<data dir>/node-name`, which 0.4.4 ignores.
 - **New defaults for agent runs**: `agent.timeout` is 25m (was 10m) and
   `agent.max_turns` 50 (was 10). A `config.toml` that sets them keeps its
   values: one that sets exactly `10m` or `10`, the old defaults (as files
@@ -40,9 +53,15 @@
   tokens set: those releases refuse the keys, so `wats upgrade --rollback` names them (with
   their agent's table) and the `wats config unset` commands to run first.
 
+### To try
+
+- `wats` alone in a fresh data directory on a terminal: quick setup.
+- `wats ps`: each node's name; then `wats status -n <name>`.
+- `wats setup vibe --agent`, then `wats --agent vibe` (docs/vibe.md).
+
 ### Keys in this release
 
-New: `agent.max_minutes_per_day`, `agent.max_minutes_per_month`,
+New: `node.name`, `agent.max_minutes_per_day`, `agent.max_minutes_per_month`,
 `agent.max_tokens_per_day`, `agent.max_tokens_per_month`. Changed
 defaults: `agent.timeout` 25m, `agent.max_turns` 50,
 `agent.max_usd_per_month` 30 × `agent.max_usd_per_day`. See
