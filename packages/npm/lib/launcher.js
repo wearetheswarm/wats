@@ -13,10 +13,18 @@ const path = require('node:path');
 
 const PACKAGE = require('../package.json');
 const { download } = require('./fetch');
-const { RELEASE_PUBLIC_KEY, VerifyError, verifyReleaseFiles, extractBinary } = require('./verify');
+const {
+  RELEASE_PUBLIC_KEY,
+  VerifyError,
+  verifyReleaseFiles,
+  verifySignature,
+  extractBinary,
+} = require('./verify');
 
 /** Where releases are downloaded from: <base>/v<version>/<file>. */
 const RELEASE_BASE_URL = 'https://github.com/wearetheswarm/wats/releases/download';
+/** The latest release's files (its signed security.json, ADR 0030). */
+const LATEST_URL = 'https://github.com/wearetheswarm/wats/releases/latest/download';
 /** The cache directory's name under the user cache dir, shared with the
  * PyPI wrapper (same layout, same checks). */
 const CACHE_NAME = 'wats-wrapper';
@@ -26,6 +34,14 @@ const CACHE_ENV = 'WATS_WRAPPER_CACHE_DIR';
 const MAX_ARCHIVE_BYTES = 256 * 1024 * 1024;
 const MAX_SMALL_BYTES = 64 * 1024;
 const SIGNALS = ['SIGHUP', 'SIGINT', 'SIGQUIT', 'SIGTERM', 'SIGUSR2'];
+/** Leftover staging and trash directories older than this are removed. */
+const STALE_MS = 60 * 60 * 1000;
+/** The security floor is looked up at most this often, within this time. */
+const SECURITY_CHECK_EVERY_MS = 24 * 60 * 60 * 1000;
+const SECURITY_CHECK_DEADLINE_MS = 5 * 1000;
+
+/** A cache directory or file that must not be trusted. */
+class UnsafeError extends Error {}
 
 /** The release target for this OS and CPU (release.yml's matrix), or null. */
 function releaseTarget(platform = process.platform, arch = process.arch) {
@@ -63,16 +79,96 @@ function cacheRoot(env = process.env, platform = process.platform, home = os.hom
   return path.join(xdg && path.isAbsolute(xdg) ? xdg : path.join(home, '.cache'), CACHE_NAME);
 }
 
-/** Creates the cache root (0700) and checks that it is this user's. */
-function prepareRoot(root) {
-  fs.mkdirSync(root, { recursive: true, mode: 0o700 });
-  const st = fs.statSync(root);
-  if (!st.isDirectory()) throw new Error(`${root} is not a directory`);
-  if (typeof process.getuid === 'function') {
-    if (st.uid !== process.getuid()) {
-      throw new Error(`${root} belongs to another user: refusing to use it as the cache`);
+function currentUid(opts) {
+  if (opts.uid !== undefined) return opts.uid; // tests only
+  return typeof process.getuid === 'function' ? process.getuid() : undefined;
+}
+
+/** A directory of the cache must be a real directory (not a symlink),
+ * this user's, and not writable by group or others. */
+function checkDir(dir, uid) {
+  const st = fs.lstatSync(dir);
+  if (st.isSymbolicLink()) throw new UnsafeError(`${dir} is a symlink`);
+  if (!st.isDirectory()) throw new UnsafeError(`${dir} is not a directory`);
+  if (uid !== undefined && st.uid !== uid) throw new UnsafeError(`${dir} belongs to another user`);
+  if (process.platform !== 'win32' && (st.mode & 0o022) !== 0) {
+    throw new UnsafeError(`${dir} is writable by group or others`);
+  }
+  return st;
+}
+
+function lexists(file) {
+  try {
+    fs.lstatSync(file);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** Moves `dir` out of the way (a rename inside the root, which this user
+ * owns), then deletes it. */
+function removeDir(dir, root) {
+  const trash = path.join(root, `.trash-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+  try {
+    fs.renameSync(dir, trash);
+  } catch {
+    fs.rmSync(dir, { recursive: true, force: true });
+    return;
+  }
+  fs.rmSync(trash, { recursive: true, force: true });
+}
+
+/**
+ * Creates or checks the cache root, and returns its real path. Its parent
+ * is resolved once (symlinks there are the user's own layout); the root
+ * itself must not be a symlink and must be this user's. A root that is
+ * writable by group or others may hold anything: it is emptied and set to
+ * 0700, and every release is downloaded again. Leftover staging and trash
+ * directories older than an hour are removed.
+ */
+function prepareRoot(rootPath, uid, log) {
+  const parent = path.dirname(rootPath);
+  fs.mkdirSync(parent, { recursive: true, mode: 0o700 });
+  const realParent = fs.realpathSync(parent);
+  const pst = fs.statSync(realParent);
+  if (process.platform !== 'win32' && (pst.mode & 0o002) !== 0 && (pst.mode & 0o1000) === 0) {
+    throw new UnsafeError(`${realParent} is writable by everyone without the sticky bit: refusing to keep the cache in it`);
+  }
+  const root = path.join(realParent, path.basename(rootPath));
+  try {
+    fs.mkdirSync(root, { mode: 0o700 });
+  } catch (e) {
+    if (e.code !== 'EEXIST') throw e;
+  }
+  const st = fs.lstatSync(root);
+  if (st.isSymbolicLink()) throw new UnsafeError(`${root} is a symlink: refusing to use it as the cache`);
+  if (!st.isDirectory()) throw new UnsafeError(`${root} is not a directory`);
+  if (uid !== undefined && st.uid !== uid) {
+    throw new UnsafeError(`${root} belongs to another user: refusing to use it as the cache`);
+  }
+  if (process.platform !== 'win32') {
+    if ((st.mode & 0o022) !== 0) {
+      fs.chmodSync(root, 0o700);
+      log(`${root} was writable by group or others: emptying it, every release will be downloaded again`);
+      for (const entry of fs.readdirSync(root)) removeDir(path.join(root, entry), root);
+      if (fs.readdirSync(root).length !== 0) {
+        throw new UnsafeError(`cannot empty ${root}: remove it, then start again`);
+      }
+    } else if ((st.mode & 0o077) !== 0) {
+      fs.chmodSync(root, 0o700);
     }
-    if ((st.mode & 0o077) !== 0) fs.chmodSync(root, 0o700);
+    checkDir(root, uid);
+  }
+  const now = Date.now();
+  for (const entry of fs.readdirSync(root)) {
+    if (!entry.startsWith('.tmp-') && !entry.startsWith('.trash-')) continue;
+    const p = path.join(root, entry);
+    try {
+      if (now - fs.lstatSync(p).mtimeMs > STALE_MS) fs.rmSync(p, { recursive: true, force: true });
+    } catch {
+      // Another start is cleaning it up.
+    }
   }
   return root;
 }
@@ -92,51 +188,63 @@ function readLimited(file, limit) {
   return fs.readFileSync(file);
 }
 
-/** Checks a cache entry as a fresh download: signatures, file names,
- * SHA-256, and that `wats` is byte for byte the archive's binary. */
-function verifyCached(dir, name, publicKey) {
-  const st = fs.lstatSync(dir);
-  if (!st.isDirectory()) throw new VerifyError(`${dir} is not a directory`);
+/**
+ * Checks a cache entry as a fresh download: the directories from the root
+ * down (real, this user's, not writable by others), the signatures, file
+ * names and SHA-256, and that `wats` is byte for byte the archive's binary,
+ * read from the descriptor that is then executed (or compared with the
+ * path just before exec). Returns {path, fd, dev, ino}; the caller closes
+ * fd.
+ */
+function verifyCached(dir, name, publicKey, uid) {
+  checkDir(path.dirname(dir), uid);
+  checkDir(dir, uid);
   const [archive, archiveSig, sha256, sha256Sig] = releaseFileNames(name).map((f, i) =>
     readLimited(path.join(dir, f), i === 0 ? MAX_ARCHIVE_BYTES : MAX_SMALL_BYTES),
   );
-  const files = {
+  verifyReleaseFiles(publicKey, name, {
     archive,
     archiveSig: archiveSig.toString('utf8'),
     sha256: sha256.toString('utf8'),
     sha256Sig: sha256Sig.toString('utf8'),
-  };
-  verifyReleaseFiles(publicKey, name, files);
+  });
   const expected = extractBinary(archive, name);
   const bin = path.join(dir, 'wats');
-  const binStat = fs.lstatSync(bin);
-  if (!binStat.isFile() || (binStat.mode & 0o100) === 0) {
-    throw new VerifyError('the cached wats is not an executable file');
+  const fd = fs.openSync(bin, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0));
+  try {
+    const st = fs.fstatSync(fd);
+    if (!st.isFile() || (st.mode & 0o100) === 0) {
+      throw new VerifyError('the cached wats is not an executable file');
+    }
+    if (uid !== undefined && st.uid !== uid) throw new UnsafeError('the cached wats belongs to another user');
+    if (process.platform !== 'win32' && (st.mode & 0o022) !== 0) {
+      throw new UnsafeError('the cached wats is writable by group or others');
+    }
+    if (st.size !== expected.length) throw new VerifyError('the cached wats differs from the signed archive');
+    const got = Buffer.alloc(expected.length);
+    let off = 0;
+    while (off < got.length) {
+      const n = fs.readSync(fd, got, off, got.length - off, off);
+      if (n === 0) break;
+      off += n;
+    }
+    if (off !== got.length || !got.equals(expected)) {
+      throw new VerifyError('the cached wats differs from the signed archive');
+    }
+    return { path: bin, fd, dev: st.dev, ino: st.ino };
+  } catch (e) {
+    fs.closeSync(fd);
+    throw e;
   }
-  if (binStat.size !== expected.length || !readLimited(bin, expected.length).equals(expected)) {
-    throw new VerifyError('the cached wats differs from the signed archive');
-  }
-  return bin;
 }
 
-function lexists(file) {
-  try {
-    fs.lstatSync(file);
-    return true;
-  } catch {
-    return false;
+/** Just before exec: the path still names the verified file. */
+function checkSame(handle) {
+  const st = fs.lstatSync(handle.path);
+  const fst = fs.fstatSync(handle.fd);
+  if (!st.isFile() || st.dev !== handle.dev || st.ino !== handle.ino || fst.ino !== handle.ino) {
+    throw new UnsafeError(`${handle.path} changed after it was verified: refusing to run it`);
   }
-}
-
-function removeDir(dir, root) {
-  const trash = path.join(root, `.trash-${process.pid}-${Date.now()}`);
-  try {
-    fs.renameSync(dir, trash);
-  } catch {
-    fs.rmSync(dir, { recursive: true, force: true });
-    return;
-  }
-  fs.rmSync(trash, { recursive: true, force: true });
 }
 
 function writeFile(file, data, mode) {
@@ -150,47 +258,68 @@ function writeFile(file, data, mode) {
   fs.chmodSync(file, mode);
 }
 
+function settings(opts) {
+  return {
+    env: opts.env || process.env,
+    version: opts.version || PACKAGE.version,
+    platform: opts.platform || process.platform,
+    arch: opts.arch || process.arch,
+    publicKey: opts.publicKey || RELEASE_PUBLIC_KEY,
+    baseUrl: opts.baseUrl || RELEASE_BASE_URL,
+    latestUrl: opts.latestUrl || LATEST_URL,
+    allowLoopbackHttp: opts.allowLoopbackHttp === true, // tests only
+    uid: currentUid(opts),
+    log: opts.log || ((msg) => process.stderr.write(`${PACKAGE.name}: ${msg}\n`)),
+  };
+}
+
 /**
- * The path of a verified wats binary of `version` for `target`, from the
- * cache or downloaded into it. Throws with a message for the user.
- * Options (all but the tests' leave them unset): version, target,
- * publicKey, baseUrl, cacheRoot, env, platform, arch, log.
+ * A verified wats binary of `version` for `target`, from the cache or
+ * downloaded into it: {path, fd, dev, ino}, fd open on the verified file.
+ * Throws with a message for the user. Options (all but the tests' leave
+ * them unset): version, target, publicKey, baseUrl, cacheRoot, env,
+ * platform, arch, log, and the tests' uid and allowLoopbackHttp.
  */
-async function ensureBinary(opts = {}) {
-  const env = opts.env || process.env;
-  const version = opts.version || PACKAGE.version;
-  const platform = opts.platform || process.platform;
-  const arch = opts.arch || process.arch;
-  const publicKey = opts.publicKey || RELEASE_PUBLIC_KEY;
-  const baseUrl = opts.baseUrl || RELEASE_BASE_URL;
-  const log = opts.log || ((msg) => process.stderr.write(`${PACKAGE.name}: ${msg}\n`));
+async function ensureVerified(opts = {}) {
+  const s = settings(opts);
+  const { version, publicKey, uid, log } = s;
   if (!/^\d+\.\d+\.\d+$/.test(version)) {
     throw new Error(`this package's version ${version} is not a wats release (X.Y.Z)`);
   }
-  const target = opts.target || releaseTarget(platform, arch);
-  if (!target) throw new Error(unsupportedMessage(platform, arch, version));
+  const target = opts.target || releaseTarget(s.platform, s.arch);
+  if (!target) throw new Error(unsupportedMessage(s.platform, s.arch, version));
 
-  const root = prepareRoot(opts.cacheRoot || cacheRoot(env, platform));
+  const root = prepareRoot(opts.cacheRoot || cacheRoot(s.env, s.platform), uid, log);
   const name = archiveName(version, target);
-  const dir = path.join(root, version, target);
+  const versionDir = path.join(root, version);
+  const dir = path.join(versionDir, target);
 
-  if (lexists(dir)) {
+  if (lexists(dir) || lexists(versionDir)) {
     try {
-      return verifyCached(dir, name, publicKey);
+      return verifyCached(dir, name, publicKey, uid);
     } catch (e) {
-      log(`the cached wats ${version} (${dir}) does not verify: ${e.message}; downloading it again`);
-      removeDir(dir, root);
+      let bad = dir;
+      try {
+        checkDir(versionDir, uid);
+      } catch {
+        bad = versionDir;
+      }
+      if (lexists(bad)) {
+        log(`the cached wats ${version} (${bad}) does not verify: ${e.message}; downloading it again`);
+        removeDir(bad, root);
+      }
     }
   }
 
   log(`downloading wats ${version} for ${target}`);
   const fetched = {};
   for (const [i, file] of releaseFileNames(name).entries()) {
-    const url = `${baseUrl}/v${version}/${file}`;
+    const url = `${s.baseUrl}/v${version}/${file}`;
     try {
       fetched[file] = await download(url, {
         limit: i === 0 ? MAX_ARCHIVE_BYTES : MAX_SMALL_BYTES,
-        env,
+        env: s.env,
+        allowLoopbackHttp: s.allowLoopbackHttp,
       });
     } catch (e) {
       throw new Error(
@@ -214,6 +343,7 @@ async function ensureBinary(opts = {}) {
 
   const staging = fs.mkdtempSync(path.join(root, '.tmp-'));
   try {
+    fs.chmodSync(staging, 0o700);
     for (const file of releaseFileNames(name)) writeFile(path.join(staging, file), fetched[file], 0o600);
     const bin = path.join(staging, 'wats');
     writeFile(bin, binary, 0o755);
@@ -231,28 +361,124 @@ async function ensureBinary(opts = {}) {
         `the downloaded binary does not run here, or is not wats ${version} (it says: ${says || 'nothing'}). Nothing was cached.`,
       );
     }
-    fs.mkdirSync(path.join(root, version), { recursive: true, mode: 0o700 });
+    if (lexists(versionDir)) {
+      try {
+        checkDir(versionDir, uid);
+      } catch {
+        removeDir(versionDir, root);
+      }
+    }
+    try {
+      fs.mkdirSync(versionDir, { mode: 0o700 });
+    } catch (e) {
+      if (e.code !== 'EEXIST') throw e;
+    }
     try {
       fs.renameSync(staging, dir);
     } catch (e) {
-      // Another start won the race: use its entry if it verifies.
+      // Another start won the race: its entry is checked below.
       if (!lexists(dir)) throw e;
-      return verifyCached(dir, name, publicKey);
     }
   } finally {
     fs.rmSync(staging, { recursive: true, force: true });
   }
+  // Checked again where it now lives, and opened for exec.
+  const handle = verifyCached(dir, name, publicKey, uid);
   log(`verified wats ${version} (minisign signatures and SHA-256) and cached it in ${dir}`);
-  return path.join(dir, 'wats');
+  return handle;
 }
 
-/** Runs `bin` with `args`: stdio passed through, signals forwarded, its
- * exit status (or signal) becomes this process's. */
-function exec(bin, args, env = process.env) {
-  const child = childProcess.spawn(bin, args, {
-    stdio: 'inherit',
-    env: { ...env, WATS_WRAPPER: 'npm' },
-  });
+/** The path of a verified binary (ensureVerified, descriptor closed). */
+async function ensureBinary(opts = {}) {
+  const handle = await ensureVerified(opts);
+  fs.closeSync(handle.fd);
+  return handle.path;
+}
+
+function parseVersion(v) {
+  const m = /^(\d+)\.(\d+)\.(\d+)$/.exec(String(v));
+  return m ? m.slice(1).map(Number) : null;
+}
+
+function olderThan(a, b) {
+  for (let i = 0; i < 3; i++) if (a[i] !== b[i]) return a[i] < b[i];
+  return false;
+}
+
+/**
+ * The latest release's signed security floor (security.json, ADR 0030),
+ * looked up at most once a day within 5 s, best effort: any failure is
+ * silent. Returns a warning when `version` is below the floor, else null.
+ * Never stops wats from running: the version is pinned on purpose.
+ */
+async function securityWarning(opts = {}) {
+  const s = settings(opts);
+  try {
+    const root = opts.root;
+    const json = path.join(root, 'security.json');
+    const sig = `${json}.minisig`;
+    const stamp = path.join(root, '.security-checked');
+    const now = opts.now || Date.now();
+    let due = true;
+    try {
+      due = now - fs.lstatSync(stamp).mtimeMs > SECURITY_CHECK_EVERY_MS;
+    } catch {
+      // Never checked.
+    }
+    if (due) {
+      fs.writeFileSync(stamp, '', { mode: 0o600 });
+      try {
+        const get = (file) =>
+          download(`${s.latestUrl}/${file}`, {
+            limit: MAX_SMALL_BYTES,
+            env: s.env,
+            allowLoopbackHttp: s.allowLoopbackHttp,
+            deadlineMs: SECURITY_CHECK_DEADLINE_MS,
+          });
+        const [j, m] = await Promise.all([get('security.json'), get('security.json.minisig')]);
+        verifySignature(s.publicKey, j, m.toString('utf8'), 'security.json');
+        for (const [file, data] of [[json, j], [sig, m]]) {
+          const tmp = `${file}.tmp-${process.pid}`;
+          fs.writeFileSync(tmp, data, { mode: 0o600 });
+          fs.renameSync(tmp, file);
+        }
+      } catch {
+        // Best effort: offline, rate-limited, or a release without one.
+      }
+    }
+    const j = readLimited(json, MAX_SMALL_BYTES);
+    verifySignature(s.publicKey, j, readLimited(sig, MAX_SMALL_BYTES).toString('utf8'), 'security.json');
+    const file = JSON.parse(j.toString('utf8'));
+    const floor = parseVersion(file.security_floor);
+    const latest = parseVersion(file.version);
+    const ours = parseVersion(s.version);
+    if (!floor || !latest || !ours || olderThan(latest, floor) || !olderThan(ours, floor)) return null;
+    return (
+      `SECURITY: wats ${s.version} is older than ${file.security_floor}, the security floor of the latest release ` +
+      `(wats ${file.version}): later releases fix security issues. Use ${PACKAGE.name}@${file.version} ` +
+      `(or at least ${file.security_floor}). Running ${s.version} anyway, as asked.`
+    );
+  } catch {
+    return null;
+  }
+}
+
+/** Runs the verified binary with `args`: stdio passed through, signals
+ * forwarded, its exit status (or signal) becomes this process's. On Linux
+ * the verified descriptor itself is executed (/proc/self/fd), elsewhere the
+ * path, once checked to still name the verified file. */
+function exec(handle, args, env = process.env) {
+  checkSame(handle);
+  const childEnv = { ...env, WATS_WRAPPER: 'npm' };
+  const viaFd = process.platform === 'linux' && fs.existsSync('/proc/self/fd');
+  const child = viaFd
+    ? childProcess.spawn('/proc/self/fd/3', args, {
+        stdio: ['inherit', 'inherit', 'inherit', handle.fd],
+        argv0: handle.path,
+        env: childEnv,
+      })
+    : childProcess.spawn(handle.path, args, { stdio: 'inherit', env: childEnv });
+  fs.closeSync(handle.fd);
   const handlers = {};
   for (const sig of SIGNALS) {
     handlers[sig] = () => {
@@ -269,7 +495,7 @@ function exec(bin, args, env = process.env) {
   };
   child.once('error', (e) => {
     unhook();
-    process.stderr.write(`${PACKAGE.name}: cannot run ${bin}: ${e.message}\n`);
+    process.stderr.write(`${PACKAGE.name}: cannot run ${handle.path}: ${e.message}\n`);
     process.exit(1);
   });
   child.once('exit', (code, signal) => {
@@ -285,26 +511,35 @@ function exec(bin, args, env = process.env) {
 
 /** The command: `npx -y <package> mcp …` runs `wats mcp …`. */
 async function main(args = process.argv.slice(2), opts = {}) {
-  let bin;
+  const log = opts.log || ((msg) => process.stderr.write(`${PACKAGE.name}: ${msg}\n`));
+  let handle;
   try {
-    bin = await ensureBinary(opts);
+    handle = await ensureVerified(opts);
+    const warning = await securityWarning({ ...opts, root: path.dirname(path.dirname(path.dirname(handle.path))) });
+    if (warning) log(warning);
+    exec(handle, args, opts.env || process.env);
   } catch (e) {
     process.stderr.write(`${PACKAGE.name}: ${e.message}\n`);
     process.exit(1);
   }
-  exec(bin, args, opts.env || process.env);
 }
 
 module.exports = {
   PACKAGE_NAME: PACKAGE.name,
   VERSION: PACKAGE.version,
   RELEASE_BASE_URL,
+  LATEST_URL,
   CACHE_ENV,
+  UnsafeError,
   releaseTarget,
   unsupportedMessage,
   cacheRoot,
+  prepareRoot,
+  ensureVerified,
   ensureBinary,
   verifyCached,
+  checkSame,
+  securityWarning,
   exec,
   main,
 };

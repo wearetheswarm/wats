@@ -10,6 +10,7 @@ Messages go to stderr only: stdout belongs to the MCP host.
 from __future__ import annotations
 
 import http.client
+import json
 import os
 import platform
 import re
@@ -23,12 +24,21 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from collections import namedtuple
 
 from . import PACKAGE_NAME, __version__
-from .verify import RELEASE_PUBLIC_KEY, VerifyError, extract_binary, verify_release_files
+from .verify import (
+    RELEASE_PUBLIC_KEY,
+    VerifyError,
+    extract_binary,
+    verify_release_files,
+    verify_signature,
+)
 
 #: Where releases are downloaded from: <base>/v<version>/<file>.
 RELEASE_BASE_URL = "https://github.com/wearetheswarm/wats/releases/download"
+#: The latest release's files (its signed security.json, ADR 0030).
+LATEST_URL = "https://github.com/wearetheswarm/wats/releases/latest/download"
 #: The cache directory's name under the user cache dir, shared with the npm
 #: wrapper (same layout, same checks).
 CACHE_NAME = "wats-wrapper"
@@ -38,11 +48,26 @@ CACHE_ENV = "WATS_WRAPPER_CACHE_DIR"
 MAX_ARCHIVE_BYTES = 256 * 1024 * 1024
 MAX_SMALL_BYTES = 64 * 1024
 TIMEOUT_SECS = 60
+DEADLINE_SECS = 10 * 60
 MAX_REDIRECTS = 5
+#: Leftover staging and trash directories older than this are removed.
+STALE_SECS = 3600
+#: The security floor is looked up at most this often, within this time.
+SECURITY_CHECK_EVERY_SECS = 24 * 3600
+SECURITY_CHECK_DEADLINE_SECS = 5
+
+POSIX = os.name == "posix"
+
+#: A verified binary: its path, a descriptor open on it, and its identity.
+Handle = namedtuple("Handle", "path fd dev ino")
 
 
 class WrapperError(Exception):
     """A failure to report to the user; nothing was run."""
+
+
+class UnsafeError(WrapperError):
+    """A cache directory or file that must not be trusted."""
 
 
 def _say(msg: str) -> None:
@@ -96,17 +121,97 @@ def cache_root(env=None, system: str | None = None, home: str | None = None) -> 
     return os.path.join(base, CACHE_NAME)
 
 
-def _prepare_root(root: str) -> str:
-    """Creates the cache root (0700) and checks that it is this user's."""
-    os.makedirs(root, mode=0o700, exist_ok=True)
-    st = os.stat(root)
+def _current_uid(uid):
+    if uid is not None:
+        return uid  # tests only
+    return os.getuid() if hasattr(os, "getuid") else None
+
+
+def _check_dir(path: str, uid) -> os.stat_result:
+    """A directory of the cache must be a real directory (not a symlink),
+    this user's, and not writable by group or others."""
+    st = os.lstat(path)
+    if stat.S_ISLNK(st.st_mode):
+        raise UnsafeError(f"{path} is a symlink")
     if not stat.S_ISDIR(st.st_mode):
-        raise WrapperError(f"{root} is not a directory")
-    if hasattr(os, "getuid"):
-        if st.st_uid != os.getuid():
-            raise WrapperError(f"{root} belongs to another user: refusing to use it as the cache")
-        if st.st_mode & 0o077:
+        raise UnsafeError(f"{path} is not a directory")
+    if uid is not None and st.st_uid != uid:
+        raise UnsafeError(f"{path} belongs to another user")
+    if POSIX and st.st_mode & 0o022:
+        raise UnsafeError(f"{path} is writable by group or others")
+    return st
+
+
+def _remove(path: str, root: str) -> None:
+    """Moves `path` out of the way (a rename inside the root, which this
+    user owns), then deletes it."""
+    trash = os.path.join(root, f".trash-{os.getpid()}-{time.time_ns()}")
+    try:
+        os.rename(path, trash)
+    except OSError:
+        if os.path.isdir(path) and not os.path.islink(path):
+            shutil.rmtree(path, ignore_errors=True)
+        else:
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+        return
+    if os.path.isdir(trash) and not os.path.islink(trash):
+        shutil.rmtree(trash, ignore_errors=True)
+    else:
+        os.unlink(trash)
+
+
+def _prepare_root(root_path: str, uid, log) -> str:
+    """Creates or checks the cache root, and returns its real path. Its
+    parent is resolved once (symlinks there are the user's own layout); the
+    root itself must not be a symlink and must be this user's. A root that
+    is writable by group or others may hold anything: it is emptied and set
+    to 0700, and every release is downloaded again. Leftover staging and
+    trash directories older than an hour are removed."""
+    parent = os.path.dirname(root_path)
+    os.makedirs(parent, mode=0o700, exist_ok=True)
+    real_parent = os.path.realpath(parent)
+    pst = os.stat(real_parent)
+    if POSIX and pst.st_mode & 0o002 and not pst.st_mode & stat.S_ISVTX:
+        raise UnsafeError(
+            f"{real_parent} is writable by everyone without the sticky bit:"
+            " refusing to keep the cache in it"
+        )
+    root = os.path.join(real_parent, os.path.basename(root_path))
+    try:
+        os.mkdir(root, 0o700)
+    except FileExistsError:
+        pass
+    st = os.lstat(root)
+    if stat.S_ISLNK(st.st_mode):
+        raise UnsafeError(f"{root} is a symlink: refusing to use it as the cache")
+    if not stat.S_ISDIR(st.st_mode):
+        raise UnsafeError(f"{root} is not a directory")
+    if uid is not None and st.st_uid != uid:
+        raise UnsafeError(f"{root} belongs to another user: refusing to use it as the cache")
+    if POSIX:
+        if st.st_mode & 0o022:
             os.chmod(root, 0o700)
+            log(f"{root} was writable by group or others: emptying it, every release will be downloaded again")
+            for entry in os.listdir(root):
+                _remove(os.path.join(root, entry), root)
+            if os.listdir(root):
+                raise UnsafeError(f"cannot empty {root}: remove it, then start again")
+        elif st.st_mode & 0o077:
+            os.chmod(root, 0o700)
+        _check_dir(root, uid)
+    now = time.time()
+    for entry in os.listdir(root):
+        if not (entry.startswith(".tmp-") or entry.startswith(".trash-")):
+            continue
+        p = os.path.join(root, entry)
+        try:
+            if now - os.lstat(p).st_mtime > STALE_SECS:
+                shutil.rmtree(p, ignore_errors=True)
+        except OSError:
+            pass  # another start is cleaning it up
     return root
 
 
@@ -158,50 +263,82 @@ def proxy_for(url: str, env) -> str | None:
     return proxy
 
 
-def _allowed(url: str) -> bool:
+def _allowed(url: str, allow_loopback_http: bool) -> bool:
     parts = urllib.parse.urlsplit(url)
-    return parts.scheme == "https" or (parts.scheme == "http" and _is_loopback(parts.hostname or ""))
+    if parts.scheme == "https":
+        return True
+    return allow_loopback_http and parts.scheme == "http" and _is_loopback(parts.hostname or "")
 
 
-class _Redirects(urllib.request.HTTPRedirectHandler):
-    max_redirections = MAX_REDIRECTS
+class _NoRedirects(urllib.request.HTTPRedirectHandler):
+    """Redirects are followed by download() itself, one hop at a time, so
+    that each hop gets its own scheme and proxy decision."""
 
     def redirect_request(self, req, fp, code, msg, headers, newurl):
-        if not _allowed(newurl):
-            raise urllib.error.URLError(f"refusing a redirect to {newurl}: HTTPS only")
-        return super().redirect_request(req, fp, code, msg, headers, newurl)
+        return None
 
 
-def download(url: str, limit: int, env=None, cafile: str | None = None) -> bytes:
-    """GET `url`, at most `limit` bytes, following redirects (HTTPS only,
-    except to a loopback host). HTTPS_PROXY and NO_PROXY are honoured.
-    `cafile` (tests only) replaces the trusted certificates."""
+def download(
+    url: str,
+    limit: int,
+    env=None,
+    cafile: str | None = None,
+    allow_loopback_http: bool = False,
+    deadline: float = DEADLINE_SECS,
+) -> bytes:
+    """GET `url`, at most `limit` bytes, following up to 5 redirects, within
+    `deadline` seconds in all (each read also times out after 60 s).
+    HTTPS only. HTTPS_PROXY and NO_PROXY are honoured, decided again at
+    each hop. Test-only: `cafile` replaces the trusted certificates, and
+    `allow_loopback_http` accepts plain http:// to 127.0.0.1."""
     env = os.environ if env is None else env
-    if not _allowed(url):
-        raise WrapperError(f"refusing to download {url}: HTTPS only")
-    proxy = proxy_for(url, env)
-    opener = urllib.request.build_opener(
-        urllib.request.ProxyHandler({"https": proxy} if proxy else {}),
-        urllib.request.HTTPSHandler(context=ssl.create_default_context(cafile=cafile)),
-        _Redirects(),
-    )
-    req = urllib.request.Request(
-        url, headers={"User-Agent": "wats-pypi-wrapper", "Accept": "application/octet-stream"}
-    )
-    with opener.open(req, timeout=TIMEOUT_SECS) as resp:
-        declared = resp.headers.get("Content-Length")
-        if declared and declared.isdigit() and int(declared) > limit:
-            raise WrapperError(f"{url} is larger than {limit} bytes")
-        chunks, size = [], 0
-        while True:
-            chunk = resp.read(1024 * 1024)
-            if not chunk:
-                break
-            size += len(chunk)
-            if size > limit:
-                raise WrapperError(f"{url} is larger than {limit} bytes")
-            chunks.append(chunk)
-    return b"".join(chunks)
+    end = time.monotonic() + deadline
+    context = ssl.create_default_context(cafile=cafile)
+
+    def remaining() -> float:
+        left = end - time.monotonic()
+        if left <= 0:
+            raise WrapperError(f"the download of {url} took longer than {int(deadline)} s")
+        return left
+
+    current = url
+    for hop in range(MAX_REDIRECTS + 1):
+        if not _allowed(current, allow_loopback_http):
+            raise WrapperError(f"refusing to download {current}: HTTPS only")
+        proxy = proxy_for(current, env)
+        opener = urllib.request.build_opener(
+            urllib.request.ProxyHandler({"https": proxy} if proxy else {}),
+            urllib.request.HTTPSHandler(context=context),
+            _NoRedirects(),
+        )
+        req = urllib.request.Request(
+            current, headers={"User-Agent": "wats-pypi-wrapper", "Accept": "application/octet-stream"}
+        )
+        try:
+            resp = opener.open(req, timeout=min(TIMEOUT_SECS, remaining()))
+        except urllib.error.HTTPError as e:
+            location = e.headers.get("Location") if e.headers else None
+            e.close()
+            if e.code in (301, 302, 303, 307, 308) and location:
+                current = urllib.parse.urljoin(current, location)
+                continue
+            raise
+        with resp:
+            declared = resp.headers.get("Content-Length")
+            if declared and declared.isdigit() and int(declared) > limit:
+                raise WrapperError(f"{current} is larger than {limit} bytes")
+            chunks, size = [], 0
+            while True:
+                remaining()
+                chunk = resp.read1(1024 * 1024)
+                if not chunk:
+                    break
+                size += len(chunk)
+                if size > limit:
+                    raise WrapperError(f"{current} is larger than {limit} bytes")
+                chunks.append(chunk)
+        return b"".join(chunks)
+    raise WrapperError(f"too many redirects for {url}")
 
 
 # --- The cache ---------------------------------------------------------------
@@ -217,11 +354,14 @@ def _read_limited(path: str, limit: int) -> bytes:
         return f.read()
 
 
-def verify_cached(directory: str, name: str, public_key: str) -> str:
-    """Checks a cache entry as a fresh download: signatures, file names,
-    SHA-256, and that `wats` is byte for byte the archive's binary."""
-    if not stat.S_ISDIR(os.lstat(directory).st_mode):
-        raise VerifyError(f"{directory} is not a directory")
+def verify_cached(directory: str, name: str, public_key: str, uid=None) -> Handle:
+    """Checks a cache entry as a fresh download: the directories from the
+    root down (real, this user's, not writable by others), the signatures,
+    file names and SHA-256, and that `wats` is byte for byte the archive's
+    binary, read from the descriptor that is then executed (or compared
+    with the path just before exec). The caller closes the handle's fd."""
+    _check_dir(os.path.dirname(directory), uid)
+    _check_dir(directory, uid)
     files = _release_files(name)
     archive = _read_limited(os.path.join(directory, files[0]), MAX_ARCHIVE_BYTES)
     texts = [
@@ -231,22 +371,38 @@ def verify_cached(directory: str, name: str, public_key: str) -> str:
     verify_release_files(public_key, name, archive, texts[0], texts[1], texts[2])
     expected = extract_binary(archive, name)
     binary = os.path.join(directory, "wats")
-    st = os.lstat(binary)
-    if not stat.S_ISREG(st.st_mode) or not st.st_mode & stat.S_IXUSR:
-        raise VerifyError("the cached wats is not an executable file")
-    if st.st_size != len(expected) or _read_limited(binary, len(expected)) != expected:
-        raise VerifyError("the cached wats differs from the signed archive")
-    return binary
-
-
-def _remove(directory: str, root: str) -> None:
-    trash = os.path.join(root, f".trash-{os.getpid()}-{time.time_ns()}")
+    fd = os.open(binary, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
     try:
-        os.rename(directory, trash)
-    except OSError:
-        shutil.rmtree(directory, ignore_errors=True)
-        return
-    shutil.rmtree(trash, ignore_errors=True)
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode) or not st.st_mode & stat.S_IXUSR:
+            raise VerifyError("the cached wats is not an executable file")
+        if uid is not None and st.st_uid != uid:
+            raise UnsafeError("the cached wats belongs to another user")
+        if POSIX and st.st_mode & 0o022:
+            raise UnsafeError("the cached wats is writable by group or others")
+        if st.st_size != len(expected):
+            raise VerifyError("the cached wats differs from the signed archive")
+        got = bytearray()
+        os.lseek(fd, 0, os.SEEK_SET)
+        while len(got) < len(expected):
+            chunk = os.read(fd, len(expected) - len(got))
+            if not chunk:
+                break
+            got += chunk
+        if bytes(got) != expected:
+            raise VerifyError("the cached wats differs from the signed archive")
+        return Handle(binary, fd, st.st_dev, st.st_ino)
+    except BaseException:
+        os.close(fd)
+        raise
+
+
+def check_same(handle: Handle) -> None:
+    """Just before exec: the path still names the verified file."""
+    st = os.lstat(handle.path)
+    fst = os.fstat(handle.fd)
+    if not stat.S_ISREG(st.st_mode) or (st.st_dev, st.st_ino) != (handle.dev, handle.ino) or fst.st_ino != handle.ino:
+        raise UnsafeError(f"{handle.path} changed after it was verified: refusing to run it")
 
 
 def _write(path: str, data: bytes, mode: int) -> None:
@@ -260,7 +416,7 @@ def _write(path: str, data: bytes, mode: int) -> None:
         os.chmod(path, mode)
 
 
-def ensure_binary(
+def ensure_verified(
     version: str = __version__,
     target: str | None = None,
     public_key: str = RELEASE_PUBLIC_KEY,
@@ -270,11 +426,16 @@ def ensure_binary(
     system: str | None = None,
     machine: str | None = None,
     log=_say,
-) -> str:
-    """The path of a verified wats binary of `version` for `target`, from
-    the cache or downloaded into it. Raises WrapperError with a message for
-    the user. All arguments but the tests' keep their defaults."""
+    uid=None,
+    allow_loopback_http: bool = False,
+    **_ignored,
+) -> Handle:
+    """A verified wats binary of `version` for `target`, from the cache or
+    downloaded into it, with a descriptor open on it. Raises WrapperError
+    with a message for the user. All arguments but the tests' keep their
+    defaults (`uid` and `allow_loopback_http` are for tests only)."""
     env = os.environ if env is None else env
+    uid = _current_uid(uid)
     if not re.fullmatch(r"\d+\.\d+\.\d+", version):
         raise WrapperError(f"this package's version {version} is not a wats release (X.Y.Z)")
     if target is None:
@@ -284,23 +445,35 @@ def ensure_binary(
         if target is None:
             raise WrapperError(unsupported_message(system, machine, version))
 
-    root = _prepare_root(root or cache_root(env))
+    root = _prepare_root(root or cache_root(env), uid, log)
     name = archive_name(version, target)
-    directory = os.path.join(root, version, target)
+    version_dir = os.path.join(root, version)
+    directory = os.path.join(version_dir, target)
 
-    if os.path.lexists(directory):
+    if os.path.lexists(directory) or os.path.lexists(version_dir):
         try:
-            return verify_cached(directory, name, public_key)
-        except (VerifyError, OSError) as e:
-            log(f"the cached wats {version} ({directory}) does not verify: {e}; downloading it again")
-            _remove(directory, root)
+            return verify_cached(directory, name, public_key, uid)
+        except (VerifyError, OSError, WrapperError) as e:
+            bad = directory
+            try:
+                _check_dir(version_dir, uid)
+            except (OSError, WrapperError):
+                bad = version_dir
+            if os.path.lexists(bad):
+                log(f"the cached wats {version} ({bad}) does not verify: {e}; downloading it again")
+                _remove(bad, root)
 
     log(f"downloading wats {version} for {target}")
     fetched = {}
     for i, f in enumerate(_release_files(name)):
         url = f"{base_url}/v{version}/{f}"
         try:
-            fetched[f] = download(url, MAX_ARCHIVE_BYTES if i == 0 else MAX_SMALL_BYTES, env)
+            fetched[f] = download(
+                url,
+                MAX_ARCHIVE_BYTES if i == 0 else MAX_SMALL_BYTES,
+                env,
+                allow_loopback_http=allow_loopback_http,
+            )
         except (OSError, http.client.HTTPException, WrapperError, ValueError) as e:
             if isinstance(e, urllib.error.HTTPError):
                 reason = f"HTTP {e.code}"
@@ -341,46 +514,142 @@ def ensure_binary(
                 f"the downloaded binary does not run here, or is not wats {version}"
                 f" (it says: {says or 'nothing'}). Nothing was cached."
             )
-        os.makedirs(os.path.join(root, version), mode=0o700, exist_ok=True)
+        if os.path.lexists(version_dir):
+            try:
+                _check_dir(version_dir, uid)
+            except (OSError, WrapperError):
+                _remove(version_dir, root)
+        try:
+            os.mkdir(version_dir, 0o700)
+        except FileExistsError:
+            pass
         try:
             os.rename(staging, directory)
         except OSError:
-            # Another start won the race: use its entry if it verifies.
+            # Another start won the race: its entry is checked below.
             if not os.path.lexists(directory):
                 raise
-            try:
-                return verify_cached(directory, name, public_key)
-            except VerifyError as e:
-                raise WrapperError(f"the cached wats does not verify: {e}") from None
     finally:
         shutil.rmtree(staging, ignore_errors=True)
+    # Checked again where it now lives, and opened for exec.
+    try:
+        handle = verify_cached(directory, name, public_key, uid)
+    except VerifyError as e:
+        raise WrapperError(f"the cached wats does not verify: {e}") from None
     log(f"verified wats {version} (minisign signatures and SHA-256) and cached it in {directory}")
-    return os.path.join(directory, "wats")
+    return handle
 
 
-def exec_wats(binary: str, args: list, env=None):
+def ensure_binary(**kwargs) -> str:
+    """The path of a verified binary (ensure_verified, descriptor closed)."""
+    handle = ensure_verified(**kwargs)
+    os.close(handle.fd)
+    return handle.path
+
+
+def _parse_version(v):
+    m = re.fullmatch(r"(\d+)\.(\d+)\.(\d+)", str(v))
+    return tuple(int(x) for x in m.groups()) if m else None
+
+
+def security_warning(
+    root: str,
+    version: str = __version__,
+    public_key: str = RELEASE_PUBLIC_KEY,
+    latest_url: str = LATEST_URL,
+    env=None,
+    allow_loopback_http: bool = False,
+    now: float | None = None,
+    **_ignored,
+) -> str | None:
+    """The latest release's signed security floor (security.json, ADR
+    0030), looked up at most once a day within 5 s, best effort: any
+    failure is silent. Returns a warning when `version` is below the floor,
+    else None. Never stops wats from running: the version is pinned on
+    purpose."""
+    env = os.environ if env is None else env
+    try:
+        path = os.path.join(root, "security.json")
+        sig = path + ".minisig"
+        stamp = os.path.join(root, ".security-checked")
+        now = time.time() if now is None else now
+        try:
+            due = now - os.lstat(stamp).st_mtime > SECURITY_CHECK_EVERY_SECS
+        except OSError:
+            due = True
+        if due:
+            with open(stamp, "w", encoding="utf-8"):
+                pass
+            try:
+                def get(f):
+                    return download(
+                        f"{latest_url}/{f}",
+                        MAX_SMALL_BYTES,
+                        env,
+                        allow_loopback_http=allow_loopback_http,
+                        deadline=SECURITY_CHECK_DEADLINE_SECS,
+                    )
+
+                data, signature = get("security.json"), get("security.json.minisig")
+                verify_signature(public_key, data, signature.decode("utf-8", "replace"), "security.json")
+                for target, content in ((path, data), (sig, signature)):
+                    tmp = f"{target}.tmp-{os.getpid()}"
+                    _write(tmp, content, 0o600)
+                    os.replace(tmp, target)
+            except Exception:  # noqa: BLE001 (best effort: offline, rate-limited, none)
+                pass
+        data = _read_limited(path, MAX_SMALL_BYTES)
+        signature = _read_limited(sig, MAX_SMALL_BYTES).decode("utf-8", "replace")
+        verify_signature(public_key, data, signature, "security.json")
+        info = json.loads(data.decode("utf-8"))
+        floor = _parse_version(info.get("security_floor"))
+        latest = _parse_version(info.get("version"))
+        ours = _parse_version(version)
+        if not floor or not latest or not ours or latest < floor or ours >= floor:
+            return None
+        return (
+            f"SECURITY: wats {version} is older than {info['security_floor']}, the security floor"
+            f" of the latest release (wats {info['version']}): later releases fix security issues."
+            f" Use {PACKAGE_NAME}@{info['version']} (or at least {info['security_floor']})."
+            f" Running {version} anyway, as asked."
+        )
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def exec_wats(handle: Handle, args: list, env=None):
     """Replaces this process with wats (POSIX exec): stdio, signals and the
-    exit status are wats's own. Elsewhere, runs it and exits with its
+    exit status are wats's own. On Linux the verified descriptor itself is
+    executed (fexecve); elsewhere the path, once checked to still name the
+    verified file. Without exec (Windows), runs it and exits with its
     status."""
     env = dict(os.environ if env is None else env)
     env["WATS_WRAPPER"] = "pypi"
+    check_same(handle)
     sys.stdout.flush()
     sys.stderr.flush()
-    if os.name == "posix":
-        os.execve(binary, [binary, *args], env)
-    sys.exit(subprocess.call([binary, *args], env=env))
+    argv = [handle.path, *args]
+    if POSIX:
+        if sys.platform.startswith("linux") and os.execve in os.supports_fd:
+            # Inheritable, so that an interpreter (#!) can still read it.
+            os.set_inheritable(handle.fd, True)
+            os.execve(handle.fd, argv, env)
+        os.execve(handle.path, argv, env)
+    os.close(handle.fd)
+    sys.exit(subprocess.call(argv, env=env))
 
 
 def main(args=None, **overrides) -> None:
     """The command: `uvx <package> mcp …` runs `wats mcp …`."""
     args = sys.argv[1:] if args is None else list(args)
+    log = overrides.get("log", _say)
     try:
-        binary = ensure_binary(**overrides)
+        handle = ensure_verified(**overrides)
+        root = os.path.dirname(os.path.dirname(os.path.dirname(handle.path)))
+        warning = security_warning(root, **{k: v for k, v in overrides.items() if k != "root"})
+        if warning:
+            log(warning)
+        exec_wats(handle, args, overrides.get("env"))
     except (WrapperError, OSError) as e:
         _say(str(e))
-        sys.exit(1)
-    try:
-        exec_wats(binary, args, overrides.get("env"))
-    except OSError as e:
-        _say(f"cannot run {binary}: {e}")
         sys.exit(1)

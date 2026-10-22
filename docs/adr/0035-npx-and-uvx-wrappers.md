@@ -42,7 +42,7 @@ link of that chain.
 | Where the name lives | `name` in `package.json` (the code reads it from there) | `name` in `pyproject.toml`, `PACKAGE_NAME` in `__init__.py` (a test keeps them and the script name equal) |
 | Command | `wats` (the only `bin`, which `npx` runs) | `wearetheswarm-wats` (what `uvx <name>` runs) and `wats` |
 | Runtime dependencies | none (Node ≥ 18) | none (Python ≥ 3.9) |
-| Build | none (`npm pack`) | `flit_core` (build time only) |
+| Build | none (`npm pack`) | `flit_core==3.12.0` (build time only) |
 
 The product owner reserves the real names; renaming is the one `name`
 (plus `PACKAGE_NAME` and the first script on PyPI) and the docs' snippets.
@@ -160,11 +160,12 @@ Each wrapper has the release key as a constant
 (`RWRq1jSm2cLFXa7MknbYgKFMYbgbyNEF5fkIpkEGGZzkQZ3i5rIYabci`). Tests in
 both suites read `RELEASE_PUBLIC_KEY` out of `update.rs` (and
 `install.sh`'s `PUBKEY`) and fail when they differ, so a key rotation
-(docs/release-signing.md) cannot forget the wrappers. The key and the
-download URL can be overridden only through the library functions the
-tests call (`ensureBinary(opts)`, `ensure_binary(**opts)`); the commands
-`npx`/`uvx` run read neither from the environment, so an MCP host's `env`
-cannot swap the key.
+(docs/release-signing.md) cannot forget the wrappers. The key, the
+download URLs, plain HTTP to loopback and the user id the cache checks
+use can be overridden only through options of the library functions the
+tests call (`ensureVerified(opts)`, `ensure_verified(**opts)`); the
+commands `npx`/`uvx` run read none of them from the environment, so an
+MCP host's `env` cannot swap the key.
 
 ### 5. Platforms
 
@@ -181,17 +182,24 @@ release target is one line in each `releaseTarget`/`release_target`.
 
 - From `https://github.com/wearetheswarm/wats/releases/download/vX.Y.Z/<file>`,
   following up to 5 redirects (GitHub serves assets from its CDN). HTTPS
-  only; plain HTTP is accepted only to a loopback host, for the tests.
-  TLS uses the runtime's certificate store.
+  only, at every hop. Plain HTTP to a loopback host is accepted only
+  through an option of the library functions that the tests pass
+  (`allowLoopbackHttp`, `allow_loopback_http`); the commands never set
+  it. TLS uses the runtime's certificate store.
 - No token is ever sent: release downloads need none, and GitHub's API
   (and its rate limits) is not used.
-- `HTTPS_PROXY` (or `https_proxy`) and `NO_PROXY` are honoured. Python's
-  urllib tunnels through the proxy itself; Node's `https` does not, so
-  `fetch.js` opens an HTTP `CONNECT` tunnel (with `user:password@` as
-  Basic proxy auth) and runs TLS to GitHub inside it. Only `http://`
-  proxies.
+- `HTTPS_PROXY` (or `https_proxy`) and `NO_PROXY` are honoured, decided
+  again for each redirect hop (both wrappers follow redirects themselves,
+  one hop at a time). Python's urllib tunnels through the proxy itself;
+  Node's `https` does not, so `fetch.js` opens an HTTP `CONNECT` tunnel
+  (with `user:password@` as Basic proxy auth) and runs TLS to GitHub
+  inside it. Only `http://` proxies.
 - Limits as in `update.rs`: 256 MiB for the archive, 64 KiB for the
-  small files; 60 s without data aborts.
+  small files. 60 s without data aborts a hop, and a whole download
+  (redirects included) has 10 minutes. Node enforces the deadline with a
+  timer that destroys the request; Python checks it between reads, which
+  return what has arrived, so it can overrun by at most one 60 s read
+  timeout.
 - Any failure says what failed, suggests the connection or the proxy, and
   says that nothing was run.
 
@@ -202,41 +210,83 @@ release target is one line in each `releaseTarget`/`release_target`.
   (default `~/.cache/wats-wrapper`) elsewhere. Both wrappers use the same
   root and layout, and each checks what the other wrote.
 - **Layout:** `<root>/<version>/<target>/` holds the four release files
-  and the extracted `wats` (0755; the others 0600).
-- **Permissions:** the root is created 0700, refused when another user
-  owns it, and set back to 0700 when it is group- or world-accessible.
+  and the extracted `wats` (0755; the others 0600), plus, in the root, the
+  latest `security.json` (§8a) and a `.security-checked` stamp.
+- **The root.** Its parent is resolved once (`realpath`): symlinks above
+  the root are the user's own layout, and from then on only the resolved
+  path is used. A parent writable by everyone without the sticky bit is
+  refused. The root itself is `lstat`ed: a symlink, a non-directory, or a
+  directory of another user is refused (the start fails closed). With
+  `WATS_WRAPPER_CACHE_DIR=/tmp/x`, another user who created `/tmp/x` (or
+  a symlink there) first is therefore refused, not followed.
+- **A root that is writable by group or others** may hold anything
+  another user put there. It is set to 0700 first (nobody else can add an
+  entry from then on), then emptied, and every release is downloaded
+  again; it is never just `chmod`ed and trusted. A root that is only
+  group- or world-readable is set to 0700 and kept.
+- **Every directory down to the binary** (`<version>`, `<target>`) must
+  be a real directory (not a symlink), this user's, and not writable by
+  group or others, and the binary a regular file of this user, not
+  writable by others. An entry that fails is moved aside (a rename inside
+  the root, which this user owns, so it works even for a directory of
+  another user) and downloaded again. When `<version>` is the culprit, all
+  of it goes.
 - **Atomic:** files are written (and fsynced) into
-  `<root>/.tmp-XXXXXX/`, checked, then the directory is renamed to
+  `<root>/.tmp-XXXXXX/` (0700), checked, then the directory is renamed to
   `<version>/<target>`. A start never sees a half-written entry. When two
   starts race, the second rename fails, and the second uses the first's
-  entry once it verifies.
+  entry once it verifies. A fresh entry is verified again where it ends
+  up, like a cache hit, which also opens it for exec (§8).
 - **Checked at every start:** a cache hit is verified as a download is:
   both signatures, their file names, the SHA-256, then the binary
   extracted again from the archive and compared byte for byte with the
-  cached `wats`. No network is needed, so a cached version works offline.
-  The cache is not a trust anchor: anyone who can write it can also write
-  the wrapper itself, but this catches corruption, a partial copy, and a
+  cached `wats`, read through the descriptor that is then executed. No
+  network is needed, so a cached version works offline. The cache is not
+  a trust anchor: anyone who can write it as this user can also write the
+  wrapper itself, but this catches corruption, a partial copy, and a
   `wats` replaced in place (for instance by `wats upgrade`, below).
 - **A cache entry that fails** is moved aside and removed, then downloaded
   again; offline, the start fails closed and says why.
+- **Leftovers:** `.tmp-*` and `.trash-*` entries older than an hour (a
+  start killed mid-download) are removed at each start; younger ones may
+  belong to a start in progress.
 - **Old versions are kept.** A running background node may still use an
   older entry's binary, and a host config may name it (§8). Clearing the
   cache is `rm -rf` of the root; a pruning policy can come later.
 
 ### 8. Running wats
 
-- **npm:** `child_process.spawn(wats, args, {stdio: 'inherit'})`. SIGHUP,
-  SIGINT, SIGQUIT, SIGTERM and SIGUSR2 are forwarded to wats (not
-  SIGUSR1, Node's debugger signal). The wrapper exits with wats's status;
-  when wats dies of a signal, the wrapper kills itself with the same
-  signal. A terminal's Ctrl-C reaches wats twice (from the terminal and
-  forwarded); `wats mcp` is not run from a terminal in practice.
+- **Between verification and exec.** The binary is verified through an
+  open descriptor (`O_NOFOLLOW`), and that same file is what runs:
+  - **Linux:** the descriptor itself is executed. The PyPI wrapper calls
+    `os.execve(fd, …)` (fexecve); the npm wrapper passes the descriptor
+    as the child's fd 3 and spawns `/proc/self/fd/3`, with `argv[0]` set
+    to the cache path. Whatever happens to the path afterwards, the
+    verified inode runs. wats inherits that read-only descriptor (fd 3
+    under npm; under PyPI it is made inheritable, as an interpreter
+    needs it for `#!` scripts), which it does not use.
+  - **macOS** has no fexecve. Just before exec, the path is `lstat`ed and
+    must still be the verified inode (same device and inode as the open
+    descriptor), then the path is executed. The window left is the few
+    instructions between that check and `execve`, inside directories
+    that only this user can write (§7), so only a process of the same
+    user, which could rewrite the wrapper anyway, could use it.
+  - A private copy in a fresh temp directory was not taken: it would
+    copy 30+ MB at each start, and the background node that `wats mcp`
+    starts would run from a path that goes away.
+- **npm:** `child_process.spawn` with stdio inherited. SIGHUP, SIGINT,
+  SIGQUIT, SIGTERM and SIGUSR2 are forwarded to wats (not SIGUSR1, Node's
+  debugger signal). The wrapper exits with wats's status; when wats dies
+  of a signal, the wrapper kills itself with the same signal. A
+  terminal's Ctrl-C reaches wats twice (from the terminal and forwarded);
+  `wats mcp` is not run from a terminal in practice.
 - **PyPI:** `os.execve`: the Python process becomes wats, so stdio,
   signals and the exit status are wats's own. (Windows would run it as a
   child and exit with its status, but has no release yet.)
 - **stdout is the MCP channel:** the wrappers write only to stderr
-  (`<package>: downloading…`, `verified …`, errors), and only on a
-  download, a failure, or a bad cache. A cache hit prints nothing.
+  (`<package>: downloading…`, `verified …`, the security warning,
+  errors), and only on a download, a failure, a bad cache, or a version
+  below the security floor. A cache hit prints nothing otherwise.
 - **`WATS_WRAPPER=npm|pypi`** is set in wats's environment. wats ignores
   it today; it is there for the follow-ups below.
 - **Arguments pass through verbatim.** The wrappers have no options of
@@ -245,6 +295,27 @@ release target is one line in each `releaseTarget`/`release_target`.
 - **The wrappers never write an MCP host's configuration.** Registering
   is the host's own config (the snippet in its docs), or `wats setup …`,
   which writes the path of the binary it runs as (ADR 0032).
+
+### 8a. A pinned version below the security floor
+
+A wrapper version is pinned on purpose, so it keeps running a release
+that a later security release fixed. To say so, at most once a day each
+start fetches the latest release's `security.json` and its `.minisig`
+(`releases/latest/download/…`, ADR 0030), within 5 s, best effort: any
+failure (offline, rate limit, a release without one) is silent and never
+delays a start more than that. The signature must verify with the
+release key and name `file:security.json`, as in `update.rs`; the
+verified file is kept in the root and verified again at each start. When
+this wrapper's version is below the floor, the start prints a loud
+`SECURITY: wats X.Y.Z is older than F, the security floor of the latest
+release (wats L) …` line on stderr naming the release to move to, and
+still runs the pinned version.
+
+Unlike `update.rs`, the wrapper cannot check that the file is the latest
+release's own (it does not ask the API which release is the latest), so
+a replayed older `security.json` can lower the floor and hide the
+warning. It can never stop wats from running or make it run anything
+else; it is advice only.
 
 ### 9. Tests
 
@@ -258,23 +329,39 @@ whose secret is deleted at the end of the script, as for
 status, or waits for SIGTERM. Caches are throwaway directories; no test
 touches `~/.wats`, the real cache, or any agent config.
 
-Both suites (`node --test`, Python's `unittest`) cover: a good release
-downloaded, verified, cached with its modes and run; a cache hit with the
-server gone; a corrupt cache downloaded again, and refused offline; a
-signature by another key; a tampered archive or trusted comment; a
-trusted comment naming another file; a legacy signature; a signed
-`.sha256` that does not match; a binary of another version; a version
-that is not X.Y.Z and a missing release; an unsupported platform; a cache
-root of the wrong mode; the Rust fixtures; the key against `update.rs`
-and `install.sh`; the version against Cargo.toml; the targets against
-`release.yml`; proxy selection, and a download through a local `CONNECT`
-proxy (with proxy auth) to a local HTTPS server whose throwaway
-certificate is made by the openssl CLI at test time (skipped without it),
-the certificate still checked inside the tunnel; and, through the
-command, arguments,
-stdin and stdout passed through, the exit status, a failure that prints
-to stderr only and runs nothing, and SIGTERM reaching wats. CI runs them
-on the Linux leg.
+Both suites (`node --test`, Python's `unittest`) cover:
+
+- a good release downloaded, verified, cached with its modes and run; a
+  cache hit with the server gone; a corrupt cache downloaded again, and
+  refused offline;
+- refusals: a signature by another key; a tampered archive or trusted
+  comment; a trusted comment naming another file; a legacy signature; a
+  signed `.sha256` that does not match; a binary of another version; a
+  version that is not X.Y.Z; a missing release; an unsupported platform;
+- the cache's safety: a symlinked root and a root of another user
+  refused; a root writable by others emptied and everything downloaded
+  again; a group-readable root set to 0700 and kept; a loose or
+  symlinked entry directory downloaded again; an entry of another user
+  that does not verify; a binary swapped after verification not run;
+  stale `.tmp-*`/`.trash-*` removed (another user is simulated by the
+  tests' `uid` option, since tests cannot `chown`);
+- the security floor: a version below it warned about, above it or badly
+  signed not, no file at all not, and at most one lookup a day;
+- downloads: plain http refused without the tests' option, the overall
+  deadline, a proxy decision per redirect hop (Python), proxy selection,
+  and a download through a local `CONNECT` proxy (with proxy auth) to a
+  local HTTPS server whose throwaway certificate is made by the openssl
+  CLI at test time (skipped without it), the certificate still checked
+  inside the tunnel;
+- the Rust fixtures; the key against `update.rs` and `install.sh`; the
+  version against Cargo.toml; the targets against `release.yml`;
+- through the command: arguments, stdin and stdout passed through, the
+  exit status, a failure that prints to stderr only and runs nothing,
+  and SIGTERM reaching wats. On Linux (CI) this runs the descriptor-exec
+  path, on macOS the inode check.
+
+CI runs them on the Linux leg. The PyPI build backend is pinned
+(`flit_core==3.12.0`).
 
 ## Homebrew, Windows, and wats's own update paths
 

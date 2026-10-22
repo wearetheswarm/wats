@@ -45,14 +45,16 @@ def good_files(name: str = NAME, directory: str = "good") -> dict:
 
 def tmpdir(test) -> str:
     """A temporary directory removed after `test`."""
-    d = tempfile.mkdtemp(prefix="wats-pypi-test-")
+    d = os.path.realpath(tempfile.mkdtemp(prefix="wats-pypi-test-"))
     test.addCleanup(shutil.rmtree, d, True)
     return d
 
 
-def mirror(test, overrides=None) -> str:
+def mirror(test, overrides=None, security=None) -> str:
     """A mirror holding the good release files of both targets, with the
-    files of `overrides` ({file: fixture dir}) put over the Linux ones."""
+    files of `overrides` ({file: fixture dir}) put over the Linux ones, and
+    the security.json of fixture dir `security` as the latest release's
+    (<mirror>/latest/)."""
     d = tmpdir(test)
     v = os.path.join(d, f"v{VERSION}")
     os.mkdir(v)
@@ -60,6 +62,10 @@ def mirror(test, overrides=None) -> str:
         shutil.copy(os.path.join(FIX, "good", f), os.path.join(v, f))
     for f, src in (overrides or {}).items():
         shutil.copy(os.path.join(FIX, src, f), os.path.join(v, f))
+    if security:
+        os.mkdir(os.path.join(d, "latest"))
+        for f in ("security.json", "security.json.minisig"):
+            shutil.copy(os.path.join(FIX, security, f), os.path.join(d, "latest", f))
     return d
 
 
@@ -133,6 +139,8 @@ def options(base_url: str, root: str, **extra) -> dict:
         "target": LINUX,
         "public_key": TEST_KEY,
         "base_url": base_url,
+        "latest_url": base_url.rsplit("/redirect", 1)[0] + "/latest",
+        "allow_loopback_http": True,
         "root": root,
         "env": {"PATH": os.environ.get("PATH", ""), "HOME": os.path.dirname(root)},
         "log": lambda msg: None,

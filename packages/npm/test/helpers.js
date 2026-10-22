@@ -33,7 +33,7 @@ function goodFiles(name = NAME, dir = 'good') {
 let base = null;
 function tmpdir(prefix = 'wats-npm-test-') {
   if (base === null) {
-    base = fs.mkdtempSync(path.join(os.tmpdir(), 'wats-npm-tests-'));
+    base = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'wats-npm-tests-')));
     process.on('exit', () => fs.rmSync(base, { recursive: true, force: true }));
   }
   return fs.mkdtempSync(path.join(base, prefix));
@@ -41,8 +41,9 @@ function tmpdir(prefix = 'wats-npm-test-') {
 
 /** A mirror directory holding the good release files of both targets,
  * with the files of `overrides` ({file: [fixtureDir, file]}) put over
- * the Linux ones. */
-function mirror(overrides = {}) {
+ * the Linux ones, and the security.json of fixture dir `security` as the
+ * latest release's (<mirror>/latest/). */
+function mirror(overrides = {}, security = null) {
   const dir = tmpdir('wats-npm-mirror-');
   const v = path.join(dir, `v${VERSION}`);
   fs.mkdirSync(v);
@@ -51,6 +52,12 @@ function mirror(overrides = {}) {
   }
   for (const [file, [fdir, ffile]] of Object.entries(overrides)) {
     fs.copyFileSync(path.join(FIX, fdir, ffile || file), path.join(v, file));
+  }
+  if (security) {
+    fs.mkdirSync(path.join(dir, 'latest'));
+    for (const f of ['security.json', 'security.json.minisig']) {
+      fs.copyFileSync(path.join(FIX, security, f), path.join(dir, 'latest', f));
+    }
   }
   return dir;
 }
@@ -93,6 +100,8 @@ function options(baseUrl, cacheRoot, extra = {}) {
     target: LINUX,
     publicKey: TEST_KEY,
     baseUrl,
+    latestUrl: `${baseUrl.replace(/\/redirect$/, '')}/latest`,
+    allowLoopbackHttp: true,
     cacheRoot,
     env: { PATH: process.env.PATH, HOME: cacheRoot },
     log: () => {},

@@ -156,14 +156,165 @@ test('a version that is not a release, or a missing release, is refused', async 
   );
 });
 
-test('a cache root of the wrong mode is fixed', { skip: !posix }, async (t) => {
+test('a group-readable cache root is set to 0700 and kept', { skip: !posix }, async (t) => {
   const srv = await serve(mirror());
   t.after(srv.close);
   const cache = path.join(tmpdir(), 'cache');
-  fs.mkdirSync(cache, { mode: 0o755 });
-  fs.chmodSync(cache, 0o755);
+  await launcher.ensureBinary(options(srv.url, cache));
+  fs.chmodSync(cache, 0o750);
   await launcher.ensureBinary(options(srv.url, cache));
   assert.equal(fs.statSync(cache).mode & 0o777, 0o700);
+  assert.equal(srv.requests.length, 4, 'the entry was kept');
+});
+
+test('a cache root writable by others is emptied and everything downloaded again', { skip: !posix }, async (t) => {
+  const srv = await serve(mirror());
+  t.after(srv.close);
+  const cache = path.join(tmpdir(), 'cache');
+  await launcher.ensureBinary(options(srv.url, cache));
+  fs.chmodSync(cache, 0o777);
+  fs.writeFileSync(path.join(cache, 'planted'), 'x');
+  const logs = [];
+  const bin = await launcher.ensureBinary(options(srv.url, cache, { log: (m) => logs.push(m) }));
+  assert.equal(fs.statSync(cache).mode & 0o777, 0o700);
+  assert.ok(!fs.existsSync(path.join(cache, 'planted')), 'the planted file is gone');
+  assert.equal(srv.requests.length, 8, 'downloaded again');
+  assert.ok(logs.some((m) => /writable by group or others: emptying it/.test(m)), logs.join('\n'));
+  assert.ok(fs.existsSync(bin));
+});
+
+test('a symlinked cache root is refused', { skip: !posix }, async (t) => {
+  const srv = await serve(mirror());
+  t.after(srv.close);
+  const dir = tmpdir();
+  fs.mkdirSync(path.join(dir, 'elsewhere'), { mode: 0o700 });
+  fs.symlinkSync(path.join(dir, 'elsewhere'), path.join(dir, 'cache'));
+  await assert.rejects(launcher.ensureBinary(options(srv.url, path.join(dir, 'cache'))), /is a symlink/);
+  assert.equal(srv.requests.length, 0);
+});
+
+test('a cache root of another user is refused', { skip: !posix }, async (t) => {
+  const srv = await serve(mirror());
+  t.after(srv.close);
+  const cache = path.join(tmpdir(), 'cache');
+  await assert.rejects(
+    launcher.ensureBinary(options(srv.url, cache, { uid: process.getuid() + 1 })),
+    /belongs to another user/,
+  );
+  assert.equal(srv.requests.length, 0);
+});
+
+test('a loose or symlinked entry directory is downloaded again', { skip: !posix }, async (t) => {
+  const srv = await serve(mirror());
+  t.after(srv.close);
+  const cache = path.join(tmpdir(), 'cache');
+  const bin = await launcher.ensureBinary(options(srv.url, cache));
+  fs.chmodSync(path.join(cache, VERSION), 0o777);
+  await launcher.ensureBinary(options(srv.url, cache));
+  assert.equal(fs.statSync(path.join(cache, VERSION)).mode & 0o777, 0o700);
+  assert.equal(srv.requests.length, 8);
+
+  // The target directory swapped for a symlink to a good copy.
+  const copy = path.join(tmpdir(), 'copy');
+  fs.cpSync(path.dirname(bin), copy, { recursive: true });
+  fs.rmSync(path.dirname(bin), { recursive: true });
+  fs.symlinkSync(copy, path.dirname(bin));
+  await launcher.ensureBinary(options(srv.url, cache));
+  assert.ok(!fs.lstatSync(path.dirname(bin)).isSymbolicLink());
+  assert.equal(srv.requests.length, 12);
+});
+
+test('an entry of another user does not verify', { skip: !posix }, async (t) => {
+  const srv = await serve(mirror());
+  t.after(srv.close);
+  const cache = path.join(tmpdir(), 'cache');
+  const bin = await launcher.ensureBinary(options(srv.url, cache));
+  assert.throws(
+    () => launcher.verifyCached(path.dirname(bin), NAME, TEST_KEY, process.getuid() + 1),
+    /belongs to another user/,
+  );
+  const handle = launcher.verifyCached(path.dirname(bin), NAME, TEST_KEY, process.getuid());
+  fs.closeSync(handle.fd);
+});
+
+test('a binary swapped after verification is not run', { skip: !posix }, async (t) => {
+  const srv = await serve(mirror());
+  t.after(srv.close);
+  const cache = path.join(tmpdir(), 'cache');
+  const bin = await launcher.ensureBinary(options(srv.url, cache));
+  const handle = launcher.verifyCached(path.dirname(bin), NAME, TEST_KEY, process.getuid());
+  t.after(() => fs.closeSync(handle.fd));
+  launcher.checkSame(handle);
+  const other = `${bin}.other`;
+  fs.copyFileSync(bin, other);
+  fs.renameSync(other, bin);
+  assert.throws(() => launcher.checkSame(handle), /changed after it was verified/);
+});
+
+test('stale staging and trash directories are cleaned up', async (t) => {
+  const srv = await serve(mirror());
+  t.after(srv.close);
+  const cache = path.join(tmpdir(), 'cache');
+  fs.mkdirSync(cache, { mode: 0o700 });
+  const old = new Date(Date.now() - 2 * 3600 * 1000);
+  for (const d of ['.tmp-old', '.trash-old', '.tmp-new']) fs.mkdirSync(path.join(cache, d));
+  fs.utimesSync(path.join(cache, '.tmp-old'), old, old);
+  fs.utimesSync(path.join(cache, '.trash-old'), old, old);
+  await launcher.ensureBinary(options(srv.url, cache));
+  assert.deepEqual(fs.readdirSync(cache).filter((f) => f.startsWith('.')).sort(), ['.tmp-new']);
+});
+
+test("plain http is refused without the tests' option, even to loopback", async () => {
+  await assert.rejects(download('http://127.0.0.1:9/x', { limit: 10 }), /HTTPS only/);
+});
+
+test('a download has an overall deadline', async (t) => {
+  const http = require('node:http');
+  const server = http.createServer((req, res) => {
+    res.writeHead(200);
+    const timer = setInterval(() => res.write('x'), 20);
+    res.on('close', () => clearInterval(timer));
+  });
+  await new Promise((r) => server.listen(0, '127.0.0.1', r));
+  t.after(() => {
+    server.closeAllConnections?.();
+    server.close();
+  });
+  const url = `http://127.0.0.1:${server.address().port}/slow`;
+  await assert.rejects(
+    download(url, { limit: 1e6, allowLoopbackHttp: true, deadlineMs: 300 }),
+    /took longer than/,
+  );
+});
+
+for (const [fixture, expect] of [
+  ['security-high', /SECURITY: wats 9\.9\.9 is older than 9\.9\.10.*Running 9\.9\.9 anyway/],
+  ['security-low', null],
+  ['security-other-key', null],
+]) {
+  test(`the security floor (${fixture})`, async (t) => {
+    const srv = await serve(mirror({}, fixture));
+    t.after(srv.close);
+    const cache = path.join(tmpdir(), 'cache');
+    const opts = options(srv.url, cache);
+    await launcher.ensureBinary(opts);
+    const warning = await launcher.securityWarning({ ...opts, root: cache });
+    if (expect) assert.match(warning, expect);
+    else assert.equal(warning, null);
+    // At most once a day: the next start reads the cached file, verified again.
+    const before = srv.requests.length;
+    assert.equal(await launcher.securityWarning({ ...opts, root: cache }), warning);
+    assert.equal(srv.requests.length, before);
+  });
+}
+
+test('without a security.json, nothing is said', async (t) => {
+  const srv = await serve(mirror());
+  t.after(srv.close);
+  const cache = path.join(tmpdir(), 'cache');
+  const opts = options(srv.url, cache);
+  await launcher.ensureBinary(opts);
+  assert.equal(await launcher.securityWarning({ ...opts, root: cache }), null);
 });
 
 // --- The command: stdio, exit status, signals ------------------------------
@@ -172,7 +323,15 @@ async function harness(t, args, spawnOpts = {}) {
   const srv = await serve(mirror());
   t.after(srv.close);
   const cache = path.join(tmpdir(), 'cache');
-  const opts = { version: VERSION, target: LINUX, publicKey: TEST_KEY, baseUrl: srv.url, cacheRoot: cache };
+  const opts = {
+    version: VERSION,
+    target: LINUX,
+    publicKey: TEST_KEY,
+    baseUrl: srv.url,
+    latestUrl: `${srv.url}/latest`,
+    allowLoopbackHttp: true,
+    cacheRoot: cache,
+  };
   const env = { PATH: process.env.PATH, HOME: path.dirname(cache), WATS_NPM_TEST_OPTS: JSON.stringify(opts) };
   return childProcess.spawn(process.execPath, [HARNESS, ...args], { env, ...spawnOpts });
 }
@@ -212,7 +371,15 @@ test('a failure exits 1 with a message and runs nothing', async (t) => {
   const srv = await serve(mirror({ [`${NAME}.minisig`]: ['other-key'] }));
   t.after(srv.close);
   const cache = path.join(tmpdir(), 'cache');
-  const opts = { version: VERSION, target: LINUX, publicKey: TEST_KEY, baseUrl: srv.url, cacheRoot: cache };
+  const opts = {
+    version: VERSION,
+    target: LINUX,
+    publicKey: TEST_KEY,
+    baseUrl: srv.url,
+    latestUrl: `${srv.url}/latest`,
+    allowLoopbackHttp: true,
+    cacheRoot: cache,
+  };
   const child = childProcess.spawn(process.execPath, [HARNESS, 'echo-args', 'ran'], {
     env: { PATH: process.env.PATH, HOME: path.dirname(cache), WATS_NPM_TEST_OPTS: JSON.stringify(opts) },
   });

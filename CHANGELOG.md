@@ -11,9 +11,12 @@
   arm64, Linux x86_64; elsewhere it says how to install otherwise),
   verifies both minisign signatures with the pinned release key, their
   trusted file names and the SHA-256, as `wats upgrade` does, caches the
-  binary (0700, atomic, checked again at every start, so it works
-  offline), then runs it with the same arguments. Nothing runs when a
-  check fails. No runtime dependency in either: Node's crypto, and a
+  binary (a 0700 root that is never a symlink nor another user's, an
+  emptied and refetched cache when it was writable by others, atomic
+  entries checked again at every start, so it works offline), then runs
+  the very file it verified with the same arguments, and warns on stderr
+  when the pinned version is below the latest release's signed security
+  floor. Nothing runs when a check fails. No runtime dependency in either: Node's crypto, and a
   pure-Python Ed25519 copied from `tools/verify-py`. The package names
   are placeholders until they are reserved; nothing is on npm or PyPI.
 - `scripts/wrapper-versions.sh` keeps the wrappers' versions equal to

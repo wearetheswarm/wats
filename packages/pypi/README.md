@@ -25,7 +25,9 @@ At each start, the wrapper:
    offline;
 4. execs `wats` with the arguments given.
 
-Nothing is run when a check fails. No runtime dependency: Ed25519 is
+Nothing is run when a check fails. Once a day it also looks up the latest
+release's signed security floor, and warns on stderr when this version is
+below it. No runtime dependency: Ed25519 is
 verified in pure Python. The cache is `~/Library/Caches/wats-wrapper`
 (macOS) or `$XDG_CACHE_HOME/wats-wrapper` (default `~/.cache`), or
 `$WATS_WRAPPER_CACHE_DIR`. `HTTPS_PROXY` and `NO_PROXY` are honoured.

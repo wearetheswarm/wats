@@ -26,7 +26,9 @@ At each start, the wrapper:
 4. runs `wats` with the arguments given: stdio passed through, signals
    forwarded, its exit status returned.
 
-Nothing is run when a check fails. No dependency: Node's own crypto
+Nothing is run when a check fails. Once a day it also looks up the latest
+release's signed security floor, and warns on stderr when this version is
+below it. No dependency: Node's own crypto
 (Ed25519, BLAKE2b-512), Node 18 or later. The cache is
 `~/Library/Caches/wats-wrapper` (macOS) or `$XDG_CACHE_HOME/wats-wrapper`
 (default `~/.cache`), or `$WATS_WRAPPER_CACHE_DIR`. `HTTPS_PROXY` and

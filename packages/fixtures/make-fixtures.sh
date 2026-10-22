@@ -23,6 +23,10 @@
 #                             .minisig, which wats refuses too
 #   wrong-version/            a correctly signed 9.9.9 archive whose binary
 #                             says `wats 9.9.8`
+#   security-high/            security.json and its .minisig (ADR 0030) of a
+#                             latest release 9.9.10 whose floor is 9.9.10
+#   security-low/             the same with a floor of 9.9.0
+#   security-other-key/       security-high's file, signed by another key
 #
 # The "binary" is a shell script (fake-wats.sh) standing in for wats.
 # Needs minisign (0.12, as the release workflow), tar, and shasum or
@@ -110,6 +114,17 @@ mv "$T/$replay.minisig" "$out/wrong-file/$N.minisig"
 sign "$T/test.key" "$T" "$N" -l
 mv "$T/$N.minisig" "$out/legacy/$N.minisig"
 
+# security DIR FLOOR [KEY]: DIR/security.json for a latest 9.9.10, signed.
+security() {
+    mkdir -p "$1" "$T/sec"
+    printf '{"version":"9.9.10","security_floor":"%s"}\n' "$2" > "$T/sec/security.json"
+    sign "${3:-$T/test.key}" "$T/sec" security.json
+    mv "$T/sec/security.json" "$T/sec/security.json.minisig" "$1/"
+}
+security "$out/security-high" 9.9.10
+security "$out/security-low" 9.9.0
+security "$out/security-other-key" 9.9.10 "$T/other.key"
+
 printf '%064d  %s\n' 0 "$N" > "$T/$N.sha256"
 sign "$T/test.key" "$T" "$N.sha256"
 mv "$T/$N.sha256" "$T/$N.sha256.minisig" "$out/bad-sha256/"
@@ -121,7 +136,7 @@ for f in "$out/good/"*.tar.gz "$out/good/"*.sha256 "$out/wrong-version/"*.tar.gz
 done
 
 rm -f "$T/test.key" "$T/other.key"
-for d in good other-key wrong-file bad-sha256 legacy wrong-version; do
+for d in good other-key wrong-file bad-sha256 legacy wrong-version security-high security-low security-other-key; do
     rm -rf "${HERE:?}/$d"
     cp -R "$out/$d" "$HERE/$d"
 done

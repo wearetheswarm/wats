@@ -1,9 +1,11 @@
 import json
 import os
 import re
+import shutil
 import signal
 import subprocess
 import sys
+import time
 import unittest
 
 from helpers import (
@@ -81,6 +83,48 @@ class Metadata(unittest.TestCase):
     def test_downloads_refuse_plain_http_off_loopback(self):
         with self.assertRaisesRegex(WrapperError, "HTTPS only"):
             launcher.download("http://example.invalid/x", 10, {})
+
+    def test_plain_http_is_refused_without_the_tests_option_even_to_loopback(self):
+        with self.assertRaisesRegex(WrapperError, "HTTPS only"):
+            launcher.download("http://127.0.0.1:9/x", 10, {})
+
+    def test_a_download_has_an_overall_deadline(self):
+        import http.server
+        import threading
+
+        from helpers import LocalHTTPServer
+
+        class Slow(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):  # noqa: N802
+                self.send_response(200)
+                self.end_headers()
+                try:
+                    for _ in range(200):
+                        self.wfile.write(b"x" * 1024)
+                        self.wfile.flush()
+                        time.sleep(0.02)
+                except OSError:
+                    pass
+
+            def log_message(self, *args):
+                pass
+
+        srv = LocalHTTPServer(("127.0.0.1", 0), Slow)
+        threading.Thread(target=srv.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True).start()
+        self.addCleanup(srv.server_close)
+        self.addCleanup(srv.shutdown)
+        url = f"http://127.0.0.1:{srv.server_address[1]}/slow"
+        with self.assertRaisesRegex(WrapperError, "took longer than"):
+            launcher.download(url, 10**7, {}, allow_loopback_http=True, deadline=0.3)
+
+    def test_each_redirect_hop_gets_its_own_proxy_decision(self):
+        srv = serve(self, mirror(self))
+        # A proxy that does not exist, bypassed for the loopback hop: the
+        # first hop (and the redirect) are direct, so this works.
+        env = {"HTTPS_PROXY": "http://127.0.0.1:9", "NO_PROXY": "127.0.0.1"}
+        body = launcher.download(f"{srv.url}/redirect/v{VERSION}/{NAME}.sha256", 1000, env, allow_loopback_http=True)
+        self.assertIn(NAME.encode(), body)
+        self.assertEqual(srv.requests, [f"/redirect/v{VERSION}/{NAME}.sha256", f"/v{VERSION}/{NAME}.sha256"])
 
 
 class Cache(unittest.TestCase):
@@ -167,13 +211,120 @@ class Cache(unittest.TestCase):
             ensure_binary(**options(srv.url, cache, version="9.9.8"))
 
     @unittest.skipUnless(POSIX, "POSIX modes")
-    def test_a_cache_root_of_the_wrong_mode_is_fixed(self):
+    def test_a_group_readable_cache_root_is_set_to_0700_and_kept(self):
         srv = serve(self, mirror(self))
         cache = self.cache()
-        os.mkdir(cache)
-        os.chmod(cache, 0o755)
+        ensure_binary(**options(srv.url, cache))
+        os.chmod(cache, 0o750)
         ensure_binary(**options(srv.url, cache))
         self.assertEqual(os.stat(cache).st_mode & 0o777, 0o700)
+        self.assertEqual(len(srv.requests), 4, "the entry was kept")
+
+    @unittest.skipUnless(POSIX, "POSIX modes")
+    def test_a_cache_root_writable_by_others_is_emptied_and_downloaded_again(self):
+        srv = serve(self, mirror(self))
+        cache = self.cache()
+        ensure_binary(**options(srv.url, cache))
+        os.chmod(cache, 0o777)
+        with open(os.path.join(cache, "planted"), "w", encoding="utf-8") as f:
+            f.write("x")
+        logs = []
+        binary = ensure_binary(**options(srv.url, cache, log=logs.append))
+        self.assertEqual(os.stat(cache).st_mode & 0o777, 0o700)
+        self.assertFalse(os.path.exists(os.path.join(cache, "planted")))
+        self.assertEqual(len(srv.requests), 8, "downloaded again")
+        self.assertTrue(any("writable by group or others: emptying it" in m for m in logs), logs)
+        self.assertTrue(os.path.exists(binary))
+
+    @unittest.skipUnless(POSIX, "symlinks")
+    def test_a_symlinked_cache_root_is_refused(self):
+        srv = serve(self, mirror(self))
+        d = tmpdir(self)
+        os.mkdir(os.path.join(d, "elsewhere"), 0o700)
+        os.symlink(os.path.join(d, "elsewhere"), os.path.join(d, "cache"))
+        with self.assertRaisesRegex(WrapperError, "is a symlink"):
+            ensure_binary(**options(srv.url, os.path.join(d, "cache")))
+        self.assertEqual(srv.requests, [])
+
+    @unittest.skipUnless(POSIX, "owners")
+    def test_a_cache_root_of_another_user_is_refused(self):
+        srv = serve(self, mirror(self))
+        with self.assertRaisesRegex(WrapperError, "belongs to another user"):
+            ensure_binary(**options(srv.url, self.cache(), uid=os.getuid() + 1))
+        self.assertEqual(srv.requests, [])
+
+    @unittest.skipUnless(POSIX, "POSIX modes and symlinks")
+    def test_a_loose_or_symlinked_entry_directory_is_downloaded_again(self):
+        srv = serve(self, mirror(self))
+        cache = self.cache()
+        binary = ensure_binary(**options(srv.url, cache))
+        os.chmod(os.path.join(cache, VERSION), 0o777)
+        ensure_binary(**options(srv.url, cache))
+        self.assertEqual(os.stat(os.path.join(cache, VERSION)).st_mode & 0o777, 0o700)
+        self.assertEqual(len(srv.requests), 8)
+
+        copy = os.path.join(tmpdir(self), "copy")
+        shutil.copytree(os.path.dirname(binary), copy)
+        shutil.rmtree(os.path.dirname(binary))
+        os.symlink(copy, os.path.dirname(binary))
+        ensure_binary(**options(srv.url, cache))
+        self.assertFalse(os.path.islink(os.path.dirname(binary)))
+        self.assertEqual(len(srv.requests), 12)
+
+    @unittest.skipUnless(POSIX, "owners")
+    def test_an_entry_of_another_user_does_not_verify(self):
+        srv = serve(self, mirror(self))
+        binary = ensure_binary(**options(srv.url, self.cache()))
+        with self.assertRaisesRegex(WrapperError, "belongs to another user"):
+            launcher.verify_cached(os.path.dirname(binary), NAME, TEST_KEY, os.getuid() + 1)
+        os.close(launcher.verify_cached(os.path.dirname(binary), NAME, TEST_KEY, os.getuid()).fd)
+
+    @unittest.skipUnless(POSIX, "inodes")
+    def test_a_binary_swapped_after_verification_is_not_run(self):
+        srv = serve(self, mirror(self))
+        binary = ensure_binary(**options(srv.url, self.cache()))
+        handle = launcher.verify_cached(os.path.dirname(binary), NAME, TEST_KEY, os.getuid())
+        self.addCleanup(os.close, handle.fd)
+        launcher.check_same(handle)
+        shutil.copy(binary, binary + ".other")
+        os.rename(binary + ".other", binary)
+        with self.assertRaisesRegex(WrapperError, "changed after it was verified"):
+            launcher.check_same(handle)
+
+    def test_stale_staging_and_trash_directories_are_cleaned_up(self):
+        srv = serve(self, mirror(self))
+        cache = self.cache()
+        os.mkdir(cache, 0o700)
+        old = time.time() - 2 * 3600
+        for d in (".tmp-old", ".trash-old", ".tmp-new"):
+            os.mkdir(os.path.join(cache, d))
+        os.utime(os.path.join(cache, ".tmp-old"), (old, old))
+        os.utime(os.path.join(cache, ".trash-old"), (old, old))
+        ensure_binary(**options(srv.url, cache))
+        self.assertEqual(sorted(f for f in os.listdir(cache) if f.startswith(".")), [".tmp-new"])
+
+    def security(self, fixture):
+        srv = serve(self, mirror(self, security=fixture))
+        cache = self.cache()
+        opts = options(srv.url, cache)
+        ensure_binary(**opts)
+        opts.pop("root")
+        warning = launcher.security_warning(cache, **opts)
+        before = len(srv.requests)
+        self.assertEqual(launcher.security_warning(cache, **opts), warning, "cached, verified again")
+        self.assertEqual(len(srv.requests), before, "at most once a day")
+        return warning
+
+    def test_a_version_below_the_security_floor_gets_a_warning(self):
+        self.assertRegex(
+            self.security("security-high"),
+            r"SECURITY: wats 9\.9\.9 is older than 9\.9\.10.*Running 9\.9\.9 anyway",
+        )
+
+    def test_a_version_above_the_floor_or_a_bad_signature_gets_none(self):
+        self.assertIsNone(self.security("security-low"))
+        self.assertIsNone(self.security("security-other-key"))
+        self.assertIsNone(self.security(None))
 
 
 @unittest.skipUnless(POSIX, "exec and the shell-script stand-in need POSIX")
@@ -181,7 +332,15 @@ class Command(unittest.TestCase):
     def run_harness(self, args, input_text="", overrides=None, **kwargs):
         srv = serve(self, mirror(self, overrides))
         cache = os.path.join(tmpdir(self), "cache")
-        opts = {"version": VERSION, "target": LINUX, "public_key": TEST_KEY, "base_url": srv.url, "root": cache}
+        opts = {
+            "version": VERSION,
+            "target": LINUX,
+            "public_key": TEST_KEY,
+            "base_url": srv.url,
+            "latest_url": f"{srv.url}/latest",
+            "allow_loopback_http": True,
+            "root": cache,
+        }
         env = {
             "PATH": os.environ.get("PATH", ""),
             "HOME": os.path.dirname(cache),
