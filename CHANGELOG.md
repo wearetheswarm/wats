@@ -142,6 +142,11 @@ docs/config.md.
 - **An older node is named**: a node of wats 0.3.2 or older showed as
   `unknown` in `wats ps` and in setup's messages (it records no role); it
   now shows as `older wats, v0.3.2`.
+- **An agent runner no longer wakes on an event stored just before it
+  started**: the store sends an event to its listeners right after
+  committing it, so one committed before the runner listened could still
+  reach it as new (a flaky test on a loaded CI runner showed it). The
+  catch-up, when on, still has such events.
 - **The wizard writes only what changed**: a value equal to its default
   is left out of `config.toml`, and one already set keeps its line and
   comments, so that new defaults apply.

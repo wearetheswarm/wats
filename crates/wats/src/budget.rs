@@ -374,9 +374,23 @@ fn rewrite(work_dir: &Path, lines: &[Line]) -> std::io::Result<()> {
         }
         text.push('\n');
     }
+    // On disk before the rename, and the rename itself made durable where
+    // that is cheap (unix): a power loss leaves the old ledger or the new
+    // one, never an empty one.
     let tmp = path.with_extension("jsonl.tmp");
-    std::fs::write(&tmp, text)?;
-    std::fs::rename(&tmp, &path)
+    {
+        let mut file = std::fs::File::create(&tmp)?;
+        file.write_all(text.as_bytes())?;
+        file.sync_all()?;
+    }
+    std::fs::rename(&tmp, &path)?;
+    #[cfg(unix)]
+    if let Some(dir) = path.parent()
+        && let Ok(dir) = std::fs::File::open(dir)
+    {
+        let _ = dir.sync_all();
+    }
+    Ok(())
 }
 
 /// Append one entry, as one write with its newline; after a newline first

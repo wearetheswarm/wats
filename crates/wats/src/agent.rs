@@ -2170,6 +2170,10 @@ pub async fn run(
         }
     }
     write_cursor(&config.work_dir, since);
+    // The store sends an event to its subscribers just after it commits
+    // it: one committed before the runner listened can still reach it, and
+    // must not wake it as new (the catch-up above, when on, has it).
+    let listening_from = since;
     // Clarifies past their deadline already queued (ADR 0018 §3).
     let mut deadline_checked: Option<Instant> = None;
     let mut next_deadline: Option<u64> = None;
@@ -2255,6 +2259,9 @@ pub async fn run(
                 }
             }
             event = events.recv() => match event {
+                Ok(stored) if stored.seq <= listening_from => {
+                    debug!(event = short(&stored.event.id), "not for the agent: stored before the runner listened");
+                }
                 Ok(stored) => {
                     let event = &stored.event;
                     // A claim or an accept may settle the agent's own claim
@@ -2475,7 +2482,10 @@ pub async fn run(
                         let cap = budget::Usage {
                             usd: match config.runtime.as_str() {
                                 "vibe" => run.charge_usd,
-                                "claude" => remaining_usd,
+                                // OpenCode's dollars are held to its
+                                // estimate, with no per-run cap: what is
+                                // left, as for Claude Code's.
+                                "claude" | "opencode" => remaining_usd,
                                 _ => None,
                             },
                             secs: Some(timeout.as_secs_f64()),

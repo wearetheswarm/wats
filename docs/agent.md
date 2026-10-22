@@ -1174,9 +1174,12 @@ measures, each per UTC day and per UTC month (ADR 0034):
   have no such flag, so one run may go past what is left. Cached input
   counts toward them.
 - **A run that never ends is charged**: if the node crashes or is killed
-  during a run, its next start charges that run its timeout and its dollar
-  cap (Claude Code's `--max-budget-usd`, Vibe's `--max-price`), marked
-  unfinished in the ledger.
+  during a run (also `wats stop`, or setup's restart offer, when the node
+  does not stop within its 10 s and is killed), its next start charges that
+  run its timeout and its dollar cap, marked unfinished in the ledger. The
+  cap is Vibe's `--max-price`, and for Claude Code and OpenCode everything
+  left of the day's dollars when the run started: that can pause the agent
+  until the next UTC day.
 - **Per author and per thread**, the [wake limits](#wake-limits) hold
   events before they reach the budget.
 - **When a budget is reached**, the agent pauses until the window resets

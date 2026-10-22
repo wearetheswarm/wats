@@ -196,18 +196,26 @@ was spent, and no run starts. The confirmation is **per agent** (review,
   `--max-price <dollars left>`.
 - **A run that never ends is charged.** When a run starts, the ledger gets
   a provisional entry with its id and its caps: its timeout, and the
-  dollars it may spend (Claude Code's `--max-budget-usd`, Vibe's
-  `--max-price`; none for the others). The run's own entry replaces it
-  when it ends; a run that ran no turn (refused by OpenClaw's gateway,
-  deferred) removes it. A provisional entry still there when a runner
-  starts is from a run whose node crashed or was killed (SIGKILL): it is
-  charged its caps and marked `unfinished`, and the runner logs it once.
-  Provisional entries are not counted while their run runs.
+  dollars it may spend (Claude Code's `--max-budget-usd` and, for
+  OpenCode, which has no per-run cap, the same dollars left; Vibe's
+  `--max-price`; none for Codex and OpenClaw). The run's own entry
+  replaces it when it ends, also when the node stops it gracefully; a run
+  that ran no turn (refused by OpenClaw's gateway, deferred) removes it. A
+  provisional entry still there when a runner starts is from a run whose
+  node crashed or was killed (SIGKILL, also the 10 s-then-kill of `wats
+  stop` and of setup's restart offer when the node does not stop in
+  time): it is charged its caps and marked `unfinished`, and the runner
+  logs it once. **For Claude Code and OpenCode that is everything left of
+  the day's (or month's) dollars when the run started, which can pause the
+  agent until the next UTC day.** Provisional entries are not counted while
+  their run runs.
 - **The ledger keeps what it cannot read.** A line that is not an entry
   (a torn write, a newer format) is kept as it is, also when old entries
   are pruned; each entry is written in one append with its newline, after
   a newline first when the file does not end with one; a rewrite goes
-  through a temporary file renamed.
+  through a temporary file, synced to disk before it is renamed, and the
+  directory synced after the rename (unix): a power loss leaves the old
+  ledger or the new one, never an empty one.
 
 ## Alternatives
 
@@ -227,6 +235,19 @@ was spent, and no run starts. The confirmation is **per agent** (review,
   minute.
 
 ## Consequences
+
+- **Rolling back to 0.4.4 with a run in progress, or an unsettled one:**
+  0.4.4 reads a provisional line as a run without a reported cost, and its
+  prune of old entries rewrites the line without the `provisional` flag.
+  After a rollback and a new upgrade, that run can count twice (once as
+  0.4.4 kept it, once settled), in the runs per day. Accepted: it needs a
+  rollback during or right after a crash, and errs on the side of the
+  budget.
+- **Hand edits can bypass the per-agent confirmation (§5)**: renaming an
+  agent's table onto the name of a confirmed agent, or setting
+  `legacy_dir = true` onto `<data dir>/agent` when that directory is
+  confirmed, carries the confirmation over. Accepted: the marker guards
+  upgrades, not deliberate edits of config.toml.
 
 - **0 now means no limit for `agent.max_usd_per_day` and
   `agent.max_usd_per_month`.** Before 0.4.5 a 0 paused the agent; such a
