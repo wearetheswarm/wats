@@ -1,9 +1,10 @@
 # 0031. OpenCode as an agent runtime
 
 Status: Proposed (2026-10-21). Implemented for 0.4.4 (2026-10-22), in one
-PR rather than the three planned: see "Implementation" below. Three
-product defaults there are pending Vincent's confirmation, and the real
-end-to-end run (§6) is still to be done.
+PR rather than the three planned: see "Implementation" below. The
+product owner confirmed its product defaults on 2026-10-22, with
+`inherit` aligned on Vibe's rule for 0.4.6; the real end-to-end run (§6)
+is still to be done.
 
 Code: `crates/wats/src/opencode.rs` (the per-run config, environment,
 permission sets, version check, refused arguments, workspace config),
@@ -428,9 +429,12 @@ per-run config (`OPENCODE_CONFIG_CONTENT`, §5), and selects it with
   - **OpenCode allows everything by default**, so `inherit` usually means
     a full shell, edits and web access. `ask` rules are rejected (`run`).
     The banner says so.
-  - `inherit` without `agent.allow` and `agent.review = true` is
-    **refused** at start, as for OpenClaw (open question 10, default
-    pending confirmation); `wats setup opencode --agent` warns.
+  - `inherit` without `agent.review = true` or an explicit `agent.allow`
+    is **refused** at start, as for Vibe (ADR 0033 §2): either guardrail
+    is enough. `wats setup opencode --agent` shows one line, "OpenCode
+    allows every tool by default: with inherit, a post can make it read,
+    edit or run anything you can", and warns when neither is set. Until
+    0.4.6 both were needed (open question 10, below).
 
 **What this enforces.** This comes from the v1.19.3 source, not yet from
 a real run:
@@ -656,18 +660,22 @@ README and at the top of `docs/agent.md`, with `docs/opencode.md`.
 
 ## Implementation (2026-10-22)
 
-**Product defaults, pending Vincent's confirmation.** Each is one
-constant in `crates/wats/src/opencode.rs`, so flipping it is a one-line
-change:
+**Product defaults, confirmed by the product owner (2026-10-22).** Each
+is one constant in `crates/wats/src/opencode.rs`:
 
 - **Q1, `ISOLATE_GLOBAL_CONFIG = true`.** The agent's provider settings
   live in its own OpenCode directory, which the user fills. The user's
   global config never loads at `swarm-only` and `workspace`. With
   `false`, `XDG_CONFIG_HOME` is left alone.
-- **Q10, `INHERIT_NEEDS_GUARDRAILS = true`.** `inherit` without
-  `agent.allow` and `agent.review = true` is refused at start, as for
-  OpenClaw. `wats setup opencode --agent` warns. With `false`, it only
+- **Q10, `INHERIT_NEEDS_GUARDRAILS = true`.** Superseded in 0.4.6 by the
+  product owner's rule for both runtimes: `inherit` needs `agent.review =
+  true` or an explicit `agent.allow`, as for Vibe (ADR 0033 §2), with the
+  warning above. 0.4.4 and 0.4.5 needed both. With `false`, it only
   warns, as for Claude Code and Codex.
+  - **The trade-off** is ADR 0033 §2's: with `agent.allow` alone, an
+    allowed author's post drives the user's whole OpenCode environment
+    and the agent's posts go out unreviewed. The product owner chose one
+    rule for both runtimes over the stricter one.
 - **Q11, `ENFORCE_USD_BUDGET = true`.** The USD budgets are enforced from
   the sum of `step_finish` costs, documented everywhere as OpenCode's
   estimate. With `false`, runs are counted, as for Codex.
@@ -880,8 +888,9 @@ change:
    covered by setting both.
 10. **`inherit` without `agent.allow` and `agent.review`.** Warn, as for
     Claude Code and Codex, or refuse, as setup does for OpenClaw? With
-    OpenCode's allow-all defaults, refusing is the safer default. Needs a
-    product decision.
+    OpenCode's allow-all defaults, refusing is the safer default. Decided:
+    refused without at least one of them, as for Vibe (Implementation,
+    Q10).
 11. **Budget from OpenCode's estimate.** Enforce the USD budgets from it
     (recommended, with the warning of §3), or count runs only, as for
     Codex, and leave spend caps to the provider, as for OpenClaw?

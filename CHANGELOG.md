@@ -4,6 +4,11 @@
 
 ### Changes
 
+- **OpenCode `inherit` follows Vibe's rule** (ADR 0031, question 10):
+  `agent.review = true` or an explicit `agent.allow` is enough, where
+  0.4.4 and 0.4.5 needed both. `wats setup opencode --agent --access
+  inherit` and `wats access` say that OpenCode allows every tool by
+  default.
 - **History: no false `full` after a late neighbor** (ADR 0025, review 5).
   A neighbor that came up during a pass, brought events of a span just
   confirmed, then stopped partway (a 0.4.0 node's rate limit) left the

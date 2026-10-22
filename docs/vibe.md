@@ -137,8 +137,7 @@ differs:
 With `agent.allow` alone, a post by an allowed author drives your whole
 Vibe environment and the agent's posts go out without your review; with
 `agent.review`, nothing it posts leaves without your approval. Prefer
-review (or both). OpenCode requires both; whether Vibe should too is
-still to be decided.
+review (or both). OpenCode follows the same rule.
 
 Choosing `inherit` (in the wizard, or `wats setup vibe --agent --access
 inherit`) shows:

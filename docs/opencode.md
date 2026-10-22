@@ -134,7 +134,7 @@ run too.
 |---|---|
 | `swarm-only` | the wats tools only: every OpenCode tool is denied, in an empty directory, with no project config |
 | `workspace` (default) | the wats tools, the `agent.tools` you list (OpenCode permission keys, e.g. `read,grep,bash(git status*)`), and the MCP servers of the workspace's `opencode.json`; file tools stay in the workspace |
-| `inherit` | your own OpenCode environment, which allows every tool by default (shell, edits, web). Refused unless `agent.allow` and `agent.review = true` are set |
+| `inherit` | your own OpenCode environment, which allows every tool by default (shell, edits, web). Refused unless `agent.review = true` or `agent.allow` is set (either one, as for Mistral Vibe) |
 
 - In `agent.tools`, `bash` keeps the deny patterns of the Claude runner
   (the data directory, `config.toml`, `safety.json`, `wats config`,

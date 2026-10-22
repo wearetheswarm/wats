@@ -162,8 +162,8 @@ vibe --prompt= --output=streaming --output-dir=<work dir>/vibe-run \
   either one: the product owner's words for Vibe were "`inherit` requires
   `agent.review` or an explicit `agent.allow`". The runner refuses to
   start with neither, and `wats setup vibe --agent --access inherit`
-  warns. Two constants: `vibe::INHERIT_NEEDS_GUARDRAILS` (refuse, or only
-  warn) and `vibe::INHERIT_NEEDS_BOTH` (`false`: either one is enough).
+  warns. One constant: `vibe::INHERIT_NEEDS_GUARDRAILS` (refuse, or only
+  warn).
   - **The trade-off.** With `agent.allow` alone (no review), a post by
     an allowed author drives the user's whole Vibe environment (what it
     approves runs unasked), and the agent's posts go out unreviewed: an
@@ -173,12 +173,11 @@ vibe --prompt= --output=streaming --output-dir=<work dir>/vibe-run \
     but nothing it posts leaves without the user's approval (review is
     still no boundary against a shell, §6.1). Requiring both, as OpenCode
     does, closes the first case.
-  - **This differs from OpenCode**, which needs both (ADR 0031 open
-    question 10, `opencode::INHERIT_NEEDS_GUARDRAILS`), as OpenClaw's
-    setup does. OpenCode is left as it is. Whether to align the two
-    runtimes, and which way, is **pending the product owner's call**;
-    either side is a one-constant change (`INHERIT_NEEDS_BOTH = true` for
-    Vibe).
+  - **OpenCode follows the same rule since 0.4.6** (ADR 0031, question
+    10): the product owner aligned the two runtimes on this one, either
+    guardrail. 0.4.5 still needed both for OpenCode, as OpenClaw's setup
+    does. The `vibe::INHERIT_NEEDS_BOTH` constant that kept the other
+    way open is gone.
   The wizard and `wats setup vibe --agent --access inherit` show one line:
   "Vibe approves its own tools: with inherit, a post can make it read or
   run anything you can".
@@ -436,9 +435,9 @@ The review against 3.0.1's source found no blocker. Fixed in the PR:
 
 ## Alternatives
 
-- **Both guardrails for `inherit`, as for OpenCode.** Stricter, but not
-  the product owner's rule for Vibe; kept as `INHERIT_NEEDS_BOTH = true`,
-  one constant away (§2).
+- **Both guardrails for `inherit`**, as OpenCode needed until 0.4.5.
+  Stricter, but not the product owner's rule, now the same for both
+  runtimes (§2).
 - **`--auto-approve` at `swarm-only`** instead of `permission = "always"`
   on the wats tools. Simpler and robust to new wats tools, but it
   approves whatever the filter lets through: one filter bug and the shell
