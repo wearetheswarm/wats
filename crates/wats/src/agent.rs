@@ -32,6 +32,7 @@ use crate::node::Node;
 use crate::opencode;
 use crate::runs::{self, RunRecord};
 use crate::store::Filter;
+use crate::vibe;
 use crate::wake::{Hold, WakeLimits, WakeState, loop_turns};
 
 /// Shipped when no `--heartbeat-file` is given (crates/wats/assets/HEARTBEAT.md).
@@ -169,6 +170,14 @@ impl AgentInfo {
             ),
             Some("opencode") => format!(
                 "{} (OpenCode's cost estimate)",
+                budget::describe(&self.budget, &spend)
+            ),
+            Some("vibe") if !vibe::ENFORCE_USD_BUDGET => format!(
+                "{} of {} runs today (Vibe's costs not enforced)",
+                spend.uncosted_today, self.budget.max_runs_per_day
+            ),
+            Some("vibe") => format!(
+                "{} (Vibe's cost estimate)",
                 budget::describe(&self.budget, &spend)
             ),
             _ => budget::describe(&self.budget, &spend),
@@ -1066,6 +1075,42 @@ fn prepare_command(
     #[cfg(unix)]
     command.process_group(0);
     match config.runtime.as_str() {
+        "vibe" => {
+            let server = vibe::Server {
+                wats_command: &config.mcp_command,
+                wats_args: &config.mcp_args,
+                runner_token: token,
+                timeout: config.run_timeout,
+            };
+            let export_dir = vibe::export_dir(&config.work_dir);
+            vibe::prepare_export_dir(&export_dir)?;
+            if config.access != Access::Inherit {
+                vibe::write_run_config(
+                    &vibe::agent_home(&config.work_dir),
+                    &vibe::run_config(&server),
+                )?;
+                for key in vibe::removed_env(std::env::vars_os()) {
+                    command.env_remove(key);
+                }
+            }
+            for (key, value) in vibe::run_env(
+                config.access,
+                &config.work_dir,
+                &server,
+                config.model.as_deref(),
+            ) {
+                command.env(key, value);
+            }
+            command
+                .args(vibe::run_args(&vibe::Run {
+                    access: config.access,
+                    max_turns: config.max_turns,
+                    max_price: vibe::ENFORCE_USD_BUDGET.then_some(remaining_usd),
+                    export_dir: &export_dir,
+                    extra: &config.extra_args,
+                }))
+                .args(&config.extra_args);
+        }
         "opencode" => {
             // Checked again before every run: a config may have changed.
             opencode::check_config_sources(
@@ -1331,6 +1376,19 @@ async fn finish_run(
             "error"
         }
         .into();
+    }
+    // Vibe's run export (its cost, turns and error) goes into the
+    // transcript, then the directory goes: it copies the session too.
+    if config.runtime == "vibe" {
+        let dir = vibe::export_dir(&config.work_dir);
+        if let Some(line) = vibe::export_line(&dir)
+            && let Ok(mut f) = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&running.transcript)
+        {
+            let _ = runs::write_line(&mut f, &line);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
     runs::read_result(&running.transcript, &mut record);
     // A forward the gateway refused ran no turn.
@@ -1859,6 +1917,43 @@ async fn check_opencode(config: &AgentConfig) -> Result<()> {
     Ok(())
 }
 
+/// Before a Mistral Vibe runner starts (ADR 0033): its version, the level
+/// (no `workspace`), the extra arguments and the model, the agent's own
+/// Vibe home, and where its runs find the API key.
+async fn check_vibe(config: &AgentConfig) -> Result<()> {
+    anyhow::ensure!(
+        config.access != Access::Workspace,
+        "{}",
+        vibe::WORKSPACE_REFUSED
+    );
+    let found = vibe::version(&config.command).await;
+    if let Some(warning) = vibe::check_version(found)
+        .with_context(|| format!("Mistral Vibe ({})", config.command.display()))?
+    {
+        warn!("{warning}");
+    }
+    vibe::check_extra_args(config.access, &config.extra_args)?;
+    if let Some(model) = &config.model {
+        vibe::check_model(model)?;
+    }
+    if config.access == Access::SwarmOnly {
+        let home = vibe::agent_home(&config.work_dir);
+        std::fs::create_dir_all(&home).with_context(|| format!("create {}", home.display()))?;
+        info!(
+            "Mistral Vibe runs use their own Vibe home {} (the wats tools only), not ~/.vibe",
+            home.display()
+        );
+        if std::env::var_os("MISTRAL_API_KEY").is_none() {
+            info!(
+                "Mistral Vibe runs find your API key in your OS keyring (`vibe --setup`), or in \
+                 MISTRAL_API_KEY: a key kept only in ~/.vibe/.env is not read (set \
+                 MISTRAL_API_KEY in the node's environment)"
+            );
+        }
+    }
+    Ok(())
+}
+
 /// Run the agent loop until `shutdown` resolves. A run in progress is then
 /// killed.
 pub async fn run(
@@ -1910,6 +2005,9 @@ pub async fn run(
     }
     if config.runtime == "opencode" {
         check_opencode(&config).await?;
+    }
+    if config.runtime == "vibe" {
+        check_vibe(&config).await?;
     }
     announce_if_changed(&node, &config).await;
     // A marker left by a run that did not finish (crash, kill -9).

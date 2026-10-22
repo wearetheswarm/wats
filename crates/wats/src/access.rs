@@ -56,6 +56,17 @@ pub fn level(value: Option<&str>) -> Result<Access> {
     value.map_or(Ok(Access::default()), str::parse)
 }
 
+/// An agent's access level for its runtime: Mistral Vibe defaults to
+/// `swarm-only` and has no `workspace` ([`crate::vibe::access`], ADR
+/// 0033); the others as [`level`].
+pub fn level_for(runtime: &str, value: Option<&str>) -> Result<Access> {
+    if runtime == "vibe" {
+        crate::vibe::access(value)
+    } else {
+        level(value)
+    }
+}
+
 impl std::str::FromStr for Access {
     type Err = anyhow::Error;
     fn from_str(s: &str) -> Result<Self> {
@@ -796,6 +807,15 @@ pub fn describe(d: &Describe) -> Summary {
                 !d.tools.is_empty() || !servers.is_empty(),
             )
         }
+        Access::Inherit if d.runtime == "vibe" => (
+            format!(
+                "inherit: your full Mistral Vibe environment: your ~/.vibe config, MCP servers, \
+                 agents and skills ({})",
+                crate::vibe::INHERIT_WARNING
+            ),
+            true,
+            true,
+        ),
         Access::Inherit if d.runtime == "opencode" => (
             "inherit: your full OpenCode environment: your config, MCP servers, plugins and \
              permissions (OpenCode allows every tool by default)"
@@ -899,7 +919,8 @@ pub struct CapCheck<'a> {
 /// whole environment, and OpenClaw its agent's tool policy: neither is
 /// checked.
 pub fn cap_warnings(c: &CapCheck) -> Vec<String> {
-    if c.access == Access::Inherit || !matches!(c.runtime, "claude" | "codex" | "opencode") {
+    if c.access == Access::Inherit || !matches!(c.runtime, "claude" | "codex" | "opencode" | "vibe")
+    {
         return Vec::new();
     }
     // swarm-only ignores `agent.tools` and the workspace's MCP servers.

@@ -41,7 +41,7 @@ use serde::Deserialize;
 pub const FILE_NAME: &str = "config.toml";
 
 /// The agent runtimes wats can run.
-pub const RUNTIMES: [&str; 4] = ["claude", "codex", "openclaw", "opencode"];
+pub const RUNTIMES: [&str; 5] = ["claude", "codex", "openclaw", "opencode", "vibe"];
 
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -904,7 +904,7 @@ pub const KEYS: &[Key] = &[
         "agent.runtime",
         ValueType::Runtime,
         "none",
-        "agent run with the node: claude, codex, openclaw or opencode",
+        "agent run with the node: claude, codex, openclaw, opencode or vibe",
     ),
     key(
         "agent.openclaw_url",
@@ -931,7 +931,7 @@ pub const KEYS: &[Key] = &[
         "workspace",
         "what the agent may use besides wats: swarm-only (the wats tools only), workspace \
          (its own directory, agent.tools and the workspace's MCP servers) or inherit (your \
-         whole environment)",
+         whole environment); Mistral Vibe: swarm-only by default, no workspace",
     ),
     key(
         "agent.workdir",
@@ -953,8 +953,8 @@ pub const KEYS: &[Key] = &[
         "agent.model",
         ValueType::Text,
         "the runtime's default",
-        "model of the agent runs, e.g. sonnet (Claude), a Codex model, or provider/model \
-         (OpenCode)",
+        "model of the agent runs, e.g. sonnet (Claude), a Codex model, provider/model \
+         (OpenCode) or a model alias (Mistral Vibe)",
     ),
     key(
         "agent.review",
@@ -1042,7 +1042,7 @@ pub const KEYS: &[Key] = &[
         "agent.command",
         ValueType::Text,
         "the runtime's",
-        "the agent CLI (claude, codex, opencode)",
+        "the agent CLI (claude, codex, opencode, vibe)",
     ),
     key(
         "agent.args",
