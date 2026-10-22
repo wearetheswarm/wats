@@ -122,13 +122,13 @@ fn spend_budget(info: &AgentInfo) -> budget::Budget {
     info.budget.for_runtime(info.runtime_name())
 }
 
-/// Default of `agent.timeout` (25 minutes since 0.4.4).
+/// Default of `agent.timeout` (25 minutes since 0.4.5).
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(25 * 60);
 
-/// Default of `agent.max_turns` (50 since 0.4.4).
+/// Default of `agent.max_turns` (50 since 0.4.5).
 pub const DEFAULT_MAX_TURNS: u32 = 50;
 
-/// The defaults of `agent.timeout` and `agent.max_turns` in wats 0.4.3
+/// The defaults of `agent.timeout` and `agent.max_turns` in wats 0.4.4
 /// and older: a config.toml that sets them to these values is told of the
 /// new defaults ([`crate::firstrun::old_defaults_notice`]).
 pub const OLD_DEFAULT_TIMEOUT: Duration = Duration::from_secs(10 * 60);
@@ -184,7 +184,7 @@ impl AgentInfo {
     pub fn status(&self, now: u64) -> serde_json::Value {
         let spend = budget::spend(&self.work_dir, now);
         let limits = spend_budget(self);
-        json!({
+        let mut status = json!({
             "name": self.name,
             "runtime": self.runtime,
             "profile": self.profile,
@@ -192,7 +192,12 @@ impl AgentInfo {
             "last_run": runs::list(&self.work_dir).last().map(|r| runs::format_time(r.started)),
             "budget": budget::describe(&limits, &spend, self.runtime_name()),
             "usage": budget::status_json(&limits, &spend, self.runtime_name()),
-        })
+        });
+        // Paused by a USD budget of 0 from before 0.4.5 (ADR 0032 §5).
+        if let Some(notice) = limits.zero_notice(&self.name) {
+            status["notice"] = json!(notice);
+        }
+        status
     }
 }
 

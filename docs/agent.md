@@ -87,7 +87,7 @@ with a default that Enter accepts:
    its default is left commented (or unset in an existing file), so that a
    later release's new default applies. When `config.toml` sets
    `agent.timeout = "10m"` or `agent.max_turns = 10`, the defaults of
-   0.4.3 and older, it offers to drop them (default yes), in both modes.
+   0.4.4 and older, it offers to drop them (default yes), in both modes.
 
 2. Your own agent sessions: "Set up wats in all the agent CLIs found
    (Claude Code, Codex, …): MCP server + session hook? [Y = all / d = one
@@ -129,7 +129,7 @@ bumps the revision (not tied to the version number); then a bare `wats` on
 a terminal asks only the new questions, and starts the node. Any other
 start logs one line saying that `wats setup` has new questions. A data
 directory set up by 0.4.2 or older (no `setup-revision`) is at revision 1,
-that of 0.4.3. Revision 2 (0.4.4) adds the budget question: a node with an
+that of 0.4.3. Revision 2 (0.4.5) adds the budget question: a node with an
 agent is asked it once, at its next bare `wats` on a terminal; one with no
 agent is asked nothing and recorded at revision 2.
 
@@ -1084,7 +1084,12 @@ measures, each per UTC day and per UTC month (ADR 0032):
 
 - **0 is no limit**, for a day and for a month, as with
   `sync.initial_max`. An agent you want off is `agents.<name>.enabled =
-  false`, not a budget of 0.
+  false`, not a budget of 0. Before 0.4.5 a USD budget of 0 paused the
+  agent: such a 0, in a data directory not set up again since (setup
+  revision below 2), still pauses it, with a line in `wats status`, at the
+  node's start and in the MCP `status` (`budget_paused`), until the budget
+  question of `wats setup` (or of the next bare `wats` on a terminal)
+  settles it.
 - **Each month is 30 × its day** unless you set it: `max_usd_per_day =
   5` allows $150 a month. A month you set applies as it is (the old
   `agent.max_usd_per_month` keeps working); `0` there means no monthly

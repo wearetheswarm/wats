@@ -192,7 +192,7 @@ fn text(bytes: &[u8]) -> String {
 }
 
 const BACKGROUND: &str = "Run the node in the background (`wats --detach`";
-/// Step 3's question, Enter for the background (ADR 0027, 0.4.4).
+/// Step 3's question, Enter for the background (ADR 0027, 0.4.5).
 const WHERE: &str = "[Y = background, recommended / d = choose]: ";
 /// Step 1's quick or detailed question.
 const MODE: &str = "Recommended settings, or choose each one? [quick/detailed, Enter: quick]: ";
@@ -321,7 +321,7 @@ fn first_bare_wats_runs_the_wizard_then_the_node_in_the_background() {
 
 /// Enter for every question: no agent CLI it can run (Vibe only: an MCP
 /// host), quick, Vibe registered with the others (all), and the node in
-/// the background, recommended (ADR 0027, 0.4.4). Not a UTF-8 locale, and
+/// the background, recommended (ADR 0027, 0.4.5). Not a UTF-8 locale, and
 /// NO_COLOR: the screens in plain ASCII.
 #[test]
 fn wizard_defaults_run_the_node_in_the_background() {
@@ -364,7 +364,7 @@ fn wizard_defaults_run_the_node_in_the_background() {
 }
 
 /// Step 3, detailed: the node here, in this terminal, as a bare `wats`
-/// ran before 0.4.4; or not at all for now.
+/// ran before 0.4.5; or not at all for now.
 #[test]
 fn step_three_detailed_runs_the_node_here_or_not_now() {
     let machine = Machine::new();
@@ -517,7 +517,7 @@ fn old_defaults_are_noticed() {
                max_turns = 10\n";
     std::fs::write(machine.data().join("config.toml"), old).unwrap();
     let notice = "config.toml sets agent.timeout = 10m and agent.max_turns = 10: the defaults of \
-                  wats 0.4.3 and older; the defaults are now 25m and 50. To use them: wats setup, \
+                  wats 0.4.4 and older; the defaults are now 25m and 50. To use them: wats setup, \
                   or wats config unset agent.timeout agent.max_turns";
     let out = machine
         .wats(
@@ -838,4 +838,78 @@ fn wats_setup_with_no_tool_is_the_wizard() {
         "{said}"
     );
     assert!(!machine.path("vibe/config.toml").exists());
+}
+
+/// A config.toml of 0.4.4 or older with `max_usd_per_day = 0`, which
+/// paused the agent then and means no limit since: after the upgrade the
+/// agent stays paused (no run), with one loud line in `wats status`, the
+/// node's start and the MCP status, until the budget question of `wats`
+/// (the catch-up) settles it and records revision 2 (ADR 0032 §5).
+#[test]
+fn a_usd_budget_of_zero_from_before_stays_paused() {
+    let machine = Machine::new();
+    machine.fake_cli("claude");
+    std::fs::create_dir_all(machine.data()).unwrap();
+    std::fs::write(
+        machine.data().join("config.toml"),
+        "[agents.claude]\nruntime = \"claude\"\nmax_usd_per_day = 0\nheartbeat = \"1s\"\n\
+         every = \"1s\"\n",
+    )
+    .unwrap();
+    let notice = "agent claude: max_usd_per_day = 0 meant paused before 0.4.5 and now means no \
+                  limit; it stays paused until you run `wats setup` (or set \
+                  agents.claude.enabled = false to keep it off)";
+    let status = |machine: &Machine| {
+        let out = machine
+            .wats(
+                &["--infra", "none", "--no-default-bootstrap", "status"],
+                false,
+            )
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{out:?}");
+        text(&out.stdout)
+    };
+    assert!(status(&machine).contains(&format!("budget_paused: {notice}")));
+    // The node: the notice at its start, no agent run, and the MCP status
+    // says it too.
+    let mut child = machine.spawn(
+        machine.wats(&["--infra", "none", "--no-default-bootstrap"], false),
+        "",
+    );
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while !(machine.running().is_some() && machine.data().join("mcp.sock").exists()) {
+        assert!(child.try_wait().unwrap().is_none(), "exited");
+        assert!(Instant::now() < deadline, "not up");
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    // A heartbeat every second: a run would have started by now.
+    std::thread::sleep(Duration::from_secs(4));
+    let said = status(&machine);
+    assert!(said.contains("node: running"), "{said}");
+    assert!(said.contains(&format!("budget_paused: {notice}")), "{said}");
+    assert!(said.contains("paused until `wats setup`"), "{said}");
+    machine.stop();
+    let out = child.wait_with_output().unwrap();
+    assert!(text(&out.stderr).contains(notice), "{out:?}");
+    assert!(
+        !machine.calls().contains("--max-turns"),
+        "no run: {}",
+        machine.calls()
+    );
+    assert!(machine.revision().is_none());
+
+    // The catch-up of a bare `wats` on a terminal: the budget question
+    // (API key, $3 a day), then revision 2; the pause is lifted.
+    let child = machine.spawn(machine.wats(&[], true), "2\nusd=3\n");
+    let (out, _) = machine.foreground(child);
+    let said = text(&out.stdout);
+    assert!(
+        said.contains("Note: agent.max_usd_per_day = 0 paused the agent before 0.4.5"),
+        "{said}"
+    );
+    assert_eq!(machine.revision().as_deref(), Some("2\n"));
+    let config = std::fs::read_to_string(machine.data().join("config.toml")).unwrap();
+    assert!(config.contains("max_usd_per_day = 3.0"), "{config}");
+    assert!(!status(&machine).contains("budget_paused"));
 }

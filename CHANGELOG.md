@@ -18,13 +18,21 @@
   set agent.max_usd_per_month 20` keeps the old one.
 - **0 is no limit** for every budget key, `agent.max_usd_per_day` and
   `agent.max_usd_per_month` included, as for `sync.initial_max`. Before,
-  a 0 paused the agent: turn an agent off with `agents.<name>.enabled =
-  false` instead.
+  a 0 paused the agent. **An upgrade never turns that pause into no
+  limit by itself**: an agent whose table sets `max_usd_per_day = 0` or
+  `max_usd_per_month = 0`, in a data directory not set up again since
+  (setup revision below 2), stays paused (no run) and says so in one line
+  in `wats status`, at the node's start and in the MCP `status`
+  (`budget_paused`): "agent X: max_usd_per_day = 0 meant paused before
+  0.4.5 and now means no limit; it stays paused until you run `wats
+  setup` (or set agents.X.enabled = false to keep it off)". The budget
+  question of `wats setup`, or of the next bare `wats` on a terminal,
+  settles it. To keep an agent off, use `agents.<name>.enabled = false`.
 - **One new setup question** (revision 2): a node with an agent is asked
   its budget once, at its next bare `wats` on a terminal. A node without
   an agent is asked nothing.
-- **Rolling back to 0.4.3** with a budget in minutes or LLM tokens set:
-  0.4.3 refuses those keys, so `wats upgrade --rollback` names them (with
+- **Rolling back to 0.4.4 or older** with a budget in minutes or LLM
+  tokens set: those releases refuse the keys, so `wats upgrade --rollback` names them (with
   their agent's table) and the `wats config unset` commands to run first.
 
 ### Keys in this release

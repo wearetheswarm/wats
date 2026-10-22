@@ -15,7 +15,7 @@
 //!
 //! The ledger, `<data dir>/agent/spend.jsonl`, has one line per run:
 //! `{"ts": <start, unix seconds>, "usd": <cost or null>, "secs": <wall
-//! time>, "tokens": <LLM tokens>}` (`secs` and `tokens` since 0.4.4: an
+//! time>, "tokens": <LLM tokens>}` (`secs` and `tokens` since 0.4.5: an
 //! older line counts as 0 of each). It is kept for two months,
 //! independently of transcript retention.
 
@@ -49,7 +49,17 @@ pub struct Budget {
     pub max_tokens_per_month: Option<u64>,
     /// For runs whose cost is not reported.
     pub max_runs_per_day: usize,
+    /// config.toml sets `max_usd_per_day = 0` (`.0`) or
+    /// `max_usd_per_month = 0` (`.1`), which paused the agent before
+    /// 0.4.5, and the data directory's setup has not been confirmed since
+    /// (its revision is below [`ZERO_CONFIRMED_REVISION`]): the agent stays
+    /// paused ([`Budget::legacy_zero`], ADR 0032 §5).
+    pub legacy_zero: (bool, bool),
 }
+
+/// The setup revision from which a USD budget of 0 means no limit: the
+/// one whose budget question settles it (ADR 0032 §5).
+pub const ZERO_CONFIRMED_REVISION: u32 = 2;
 
 impl Default for Budget {
     /// The defaults of config.toml: $2 a day ($60 a month), no time nor
@@ -89,15 +99,66 @@ impl Budget {
                     .unwrap_or(tokens.saturating_mul(MONTH_DAYS)),
             ),
             max_runs_per_day: file.max_runs_per_day.unwrap_or(DEFAULT_RUNS_PER_DAY),
+            legacy_zero: (false, false),
         }
+    }
+
+    /// [`Budget::of`], and the pause of a USD budget of 0 written before
+    /// 0.4.5 (when it meant paused): `revision` is the data directory's
+    /// setup revision ([`crate::firstrun::stored_revision`]).
+    pub fn of_dir(file: &AgentSettings, revision: Option<u32>) -> Budget {
+        Budget {
+            legacy_zero: legacy_zero(file, revision),
+            ..Budget::of(file)
+        }
+    }
+
+    /// Whether a USD budget of 0 written before 0.4.5 keeps the agent
+    /// paused.
+    pub fn paused_by_zero(&self) -> bool {
+        self.legacy_zero.0 || self.legacy_zero.1
+    }
+
+    /// The keys that keep it paused: `max_usd_per_day = 0`, …
+    fn zero_keys(&self) -> String {
+        let mut keys = Vec::new();
+        if self.legacy_zero.0 {
+            keys.push("max_usd_per_day = 0");
+        }
+        if self.legacy_zero.1 {
+            keys.push("max_usd_per_month = 0");
+        }
+        keys.join(" and ")
+    }
+
+    /// The one-line notice of an agent paused by a USD budget of 0 from
+    /// before 0.4.5 (ADR 0032 §5), for `wats status`, the node's start
+    /// and the MCP `status` tool.
+    pub fn zero_notice(&self, agent: &str) -> Option<String> {
+        self.paused_by_zero().then(|| {
+            let keys = self.zero_keys();
+            let one = !(self.legacy_zero.0 && self.legacy_zero.1);
+            format!(
+                "agent {agent}: {keys} meant paused before 0.4.5 and now {} no limit; it stays \
+                 paused until you run `wats setup` (or set agents.{agent}.enabled = false to \
+                 keep it off)",
+                if one { "means" } else { "mean" }
+            )
+        })
     }
 
     /// Without the limits `runtime` cannot be held to: dollars for one
     /// that reports no cost, LLM tokens for one that reports none.
+    /// A USD budget of 0 from before 0.4.5 still pauses Codex, which it
+    /// paused then (no cost reported, so nothing ever reached 0); not
+    /// OpenClaw, whose USD budgets never applied.
     pub fn for_runtime(mut self, runtime: &str) -> Budget {
         if !reports_cost(runtime) {
             self.max_usd_per_day = None;
             self.max_usd_per_month = None;
+        }
+        if runtime == "openclaw" {
+            self.legacy_zero = (false, false);
         }
         if !reports_tokens(runtime) {
             self.max_tokens_per_day = None;
@@ -105,6 +166,16 @@ impl Budget {
         }
         self
     }
+}
+
+/// Whether `file` sets a USD budget of 0 (day, month) that, with the data
+/// directory at setup `revision`, still means paused: written before 0.4.5
+/// and not confirmed by the budget question since. No config.toml
+/// (`None`) sets nothing.
+pub fn legacy_zero(file: &AgentSettings, revision: Option<u32>) -> (bool, bool) {
+    let old = revision.is_some_and(|r| r < ZERO_CONFIRMED_REVISION);
+    let zero = |v: Option<f64>| old && v.is_some_and(|x| x <= 0.0);
+    (zero(file.max_usd_per_day), zero(file.max_usd_per_month))
 }
 
 /// Whether the agent CLI of `runtime` reports a run's cost: Claude Code
@@ -264,7 +335,20 @@ pub fn spend(work_dir: &Path, now: u64) -> Spend {
     spend
 }
 
+/// `until` of a pause that lasts until the user runs `wats setup` (a USD
+/// budget of 0 from before 0.4.5).
+pub const UNTIL_SETUP: u64 = 0;
+
 pub fn check(budget: &Budget, spend: &Spend, now: u64) -> Verdict {
+    if budget.paused_by_zero() {
+        return Verdict::Paused {
+            why: format!(
+                "{} meant paused before 0.4.5 (now: no limit)",
+                budget.zero_keys()
+            ),
+            until: UNTIL_SETUP,
+        };
+    }
     let tomorrow = day_start(now) + 86_400;
     let month_end = next_month(now);
     let paused = |why: String, until: u64| Verdict::Paused { why, until };
@@ -393,6 +477,12 @@ fn metric(
 /// instead of dollars, and those without tokens no tokens.
 pub fn describe(budget: &Budget, spend: &Spend, runtime: &str) -> String {
     let mut parts = Vec::new();
+    if budget.paused_by_zero() {
+        parts.push(format!(
+            "paused until `wats setup` ({} meant paused before 0.4.5)",
+            budget.zero_keys()
+        ));
+    }
     match runtime {
         "openclaw" => parts.push(format!(
             "{} ({} of {} runs today)",
@@ -462,6 +552,7 @@ pub fn status_json(budget: &Budget, spend: &Spend, runtime: &str) -> Value {
             "tokens_per_month": budget.max_tokens_per_month,
             "runs_without_cost_per_day": budget.max_runs_per_day,
         },
+        "paused_until_setup": budget.paused_by_zero(),
     })
 }
 
@@ -474,8 +565,11 @@ fn runtime_name(runtime: &str) -> &str {
     }
 }
 
-/// `until 2026-10-17 00:00:00Z`.
+/// `until 2026-10-17 00:00:00Z`; `until you run `wats setup``.
 pub fn until(ts: u64) -> String {
+    if ts == UNTIL_SETUP {
+        return "until you run `wats setup`".to_string();
+    }
     format!("until {}", format_time(ts))
 }
 
@@ -768,7 +862,7 @@ mod tests {
         assert_eq!(json["limits"]["tokens_per_month"], 300_000);
     }
 
-    /// A ledger line of 0.4.3 or older (no `secs`, no `tokens`) counts as
+    /// A ledger line of 0.4.4 or older (no `secs`, no `tokens`) counts as
     /// none of them; a line of today reads back in an older wats (it
     /// ignores the new fields).
     #[test]
@@ -813,5 +907,77 @@ mod tests {
         assert_eq!(tokens(12_345), "12.3k");
         assert_eq!(tokens(1_500_000), "1.5M");
         assert_eq!(tokens(2_000_000), "2M");
+    }
+
+    /// A USD budget of 0 paused the agent before 0.4.5 and means no limit
+    /// since: written before (setup revision below 2), it keeps the agent
+    /// paused, with its notice, until the budget question confirms it
+    /// (revision 2). Codex too (a 0 paused it then); not OpenClaw.
+    #[test]
+    fn a_zero_from_before_stays_paused() {
+        let day = AgentSettings {
+            max_usd_per_day: Some(0.0),
+            ..AgentSettings::default()
+        };
+        let month = AgentSettings {
+            max_usd_per_month: Some(0.0),
+            ..AgentSettings::default()
+        };
+        let both = AgentSettings {
+            max_usd_per_day: Some(0.0),
+            max_usd_per_month: Some(0.0),
+            ..AgentSettings::default()
+        };
+        assert_eq!(legacy_zero(&day, Some(1)), (true, false));
+        assert_eq!(legacy_zero(&month, Some(1)), (false, true));
+        assert_eq!(legacy_zero(&day, Some(2)), (false, false));
+        assert_eq!(legacy_zero(&day, None), (false, false));
+        assert_eq!(
+            legacy_zero(&AgentSettings::default(), Some(1)),
+            (false, false)
+        );
+        let paused = Budget::of_dir(&day, Some(1));
+        match check(&paused, &Spend::default(), NOW) {
+            Verdict::Paused { why, until } => {
+                assert_eq!(
+                    why,
+                    "max_usd_per_day = 0 meant paused before 0.4.5 (now: no limit)"
+                );
+                assert_eq!(until, UNTIL_SETUP);
+            }
+            go => panic!("{go:?}"),
+        }
+        assert_eq!(super::until(UNTIL_SETUP), "until you run `wats setup`");
+        assert_eq!(
+            paused.zero_notice("claude").unwrap(),
+            "agent claude: max_usd_per_day = 0 meant paused before 0.4.5 and now means no \
+             limit; it stays paused until you run `wats setup` (or set agents.claude.enabled = \
+             false to keep it off)"
+        );
+        assert!(describe(&paused, &Spend::default(), "claude").starts_with(
+            "paused until `wats setup` (max_usd_per_day = 0 meant paused before 0.4.5) · "
+        ));
+        assert_eq!(
+            status_json(&paused, &Spend::default(), "claude")["paused_until_setup"],
+            true
+        );
+        assert!(
+            Budget::of_dir(&both, Some(1))
+                .zero_notice("a")
+                .unwrap()
+                .starts_with("agent a: max_usd_per_day = 0 and max_usd_per_month = 0 meant paused before 0.4.5 and now mean no limit")
+        );
+        // Codex: still paused; OpenClaw: never was.
+        assert!(paused.for_runtime("codex").paused_by_zero());
+        assert!(!paused.for_runtime("openclaw").paused_by_zero());
+        // Confirmed (revision 2): no limit.
+        let confirmed = Budget::of_dir(&day, Some(2));
+        assert_eq!(confirmed.zero_notice("claude"), None);
+        assert_eq!(
+            check(&confirmed, &Spend::default(), NOW),
+            Verdict::Go {
+                remaining_usd: None
+            }
+        );
     }
 }

@@ -609,10 +609,10 @@ pub const KEYS_SINCE: &[(&str, Version)] = &[
     ("storage.events_share", Version(0, 4, 1)),
     ("sync.initial_max", Version(0, 4, 1)),
     ("update.security_auto", Version(0, 4, 3)),
-    ("agent.max_minutes_per_day", Version(0, 4, 4)),
-    ("agent.max_minutes_per_month", Version(0, 4, 4)),
-    ("agent.max_tokens_per_day", Version(0, 4, 4)),
-    ("agent.max_tokens_per_month", Version(0, 4, 4)),
+    ("agent.max_minutes_per_day", Version(0, 4, 5)),
+    ("agent.max_minutes_per_month", Version(0, 4, 5)),
+    ("agent.max_tokens_per_day", Version(0, 4, 5)),
+    ("agent.max_tokens_per_month", Version(0, 4, 5)),
 ];
 
 /// The keys set in `data_dir`'s config.toml that wats `version` does not
@@ -2420,7 +2420,7 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("config unset sync.initial_max"), "{err}");
-        // The budget keys of 0.4.4 (ADR 0032), in an agent's table: named
+        // The budget keys of 0.4.5 (ADR 0032), in an agent's table: named
         // with the table.
         std::fs::write(
             &config,
@@ -2435,8 +2435,8 @@ mod tests {
                 "agents.codex.max_tokens_per_day"
             ]
         );
-        fake("0.4.3");
-        let err = check_rollback(&old, &data, Version(0, 4, 4))
+        fake("0.4.4");
+        let err = check_rollback(&old, &data, Version(0, 4, 5))
             .unwrap_err()
             .to_string();
         assert!(

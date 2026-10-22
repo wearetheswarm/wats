@@ -1,10 +1,10 @@
 # 0032. Daily agent budgets: dollars, minutes, LLM tokens
 
-Status: Proposed (2026-10-22). Ships in 0.4.4.
+Status: Proposed (2026-10-22). Ships in 0.4.5.
 
 Amends ADR 0011 ("Budget", 2026-10-16): the dollar budget stays, two
 measures join it, each monthly limit is derived from its daily one, and 0
-means no limit. Asked by the setup wizard of ADR 0027 (its 0.4.4 section).
+means no limit. Asked by the setup wizard of ADR 0027 (its 0.4.5 section).
 
 Code: `crates/wats/src/budget.rs` (`Budget::of`, `Budget::for_runtime`,
 `check`, `describe`, `status_json`, `reports_cost`, `reports_tokens`),
@@ -22,7 +22,7 @@ makes a node fair to the swarm without hurting its owner.
 
 ## Context
 
-Until 0.4.3 the node held an agent to dollars only: `agent.max_usd_per_day`
+Until 0.4.4 the node held an agent to dollars only: `agent.max_usd_per_day`
 (2) and `agent.max_usd_per_month` (20), from the cost the agent CLI
 reports, and a number of runs per day for the runs that report none. On a
 subscription (Claude Pro/Max, ChatGPT) the reported cost is an estimate of
@@ -85,7 +85,7 @@ only for Codex on an API key, is sized with it.
 
 ### 3. Asked by the wizard, by how the agent is paid
 
-In step 1, in quick and detailed mode alike (ADR 0027, 0.4.4): "How is
+In step 1, in quick and detailed mode alike (ADR 0027, 0.4.5): "How is
 this agent paid? 1) subscription (Claude Pro/Max, ChatGPT…) 2) API key,
 pay per use 3) self-hosted or free model". The answer picks the measure
 and its daily defaults:
@@ -112,7 +112,7 @@ named on the line. When config.toml already sets a budget, the answer it
 suggests is the default, and its own values are shown.
 
 The values are written only where they differ from the defaults (ADR
-0027, 0.4.4), so a subscription writes `max_usd_per_day = 0.0` and
+0027, 0.4.5), so a subscription writes `max_usd_per_day = 0.0` and
 `max_minutes_per_day = 120`.
 
 ### 4. Where it shows
@@ -125,6 +125,35 @@ cost, and no tokens for one that reports none. `wats status --json` and
 the MCP `status` tool add each agent's `usage`: `today` and `month`
 (`usd`, `minutes`, `tokens`, `runs`; `null` for what the runtime does not
 report) and `limits` (`null`: no limit).
+
+### 5. A USD budget of 0 from before 0.4.5 stays a pause
+
+(Vincent, 2026-10-22, on the review.) Until 0.4.5, `max_usd_per_day = 0`
+or `max_usd_per_month = 0` paused the agent; since, it means no limit. An
+upgrade must not turn a pause into free spending by itself. So when an
+agent's table (`[agent]` or `[agents.<name>]`) sets one of them to 0 and
+the data directory's setup revision is below 2 (`ZERO_CONFIRMED_REVISION`:
+the revision whose budget question settles it), the agent **stays
+paused**: `check` returns a pause "until you run `wats setup`", whatever
+was spent, and no run starts.
+
+- One loud line says it, in `wats status` and the MCP `status`
+  (`budget_paused`, and the agent's `notice`), and at the node's start:
+  "agent X: max_usd_per_day = 0 meant paused before 0.4.5 and now means
+  no limit; it stays paused until you run `wats setup` (or set
+  agents.X.enabled = false to keep it off)". The agent's budget line
+  starts with "paused until `wats setup`".
+- The budget question settles it, in `wats setup` and in the catch-up of
+  a bare `wats` on a terminal: it says what the 0 meant, offers the
+  preset of the answer (never the 0 as it is), writes the budget and
+  records revision 2. The other agents' zeros, which that revision then
+  turns into no limit, are each named in a warning with the commands to
+  set a budget or turn the agent off.
+- A catch-up with nothing to ask (no enabled agent) does not record
+  revision 2 while a table has such a 0, so a disabled agent's pause
+  holds until `wats setup`.
+- Codex is held to it too (a 0 paused it then, though it reports no
+  cost); OpenClaw is not (its USD budgets never applied).
 
 ## Alternatives
 
@@ -145,13 +174,13 @@ report) and `limits` (`null`: no limit).
 ## Consequences
 
 - **0 now means no limit for `agent.max_usd_per_day` and
-  `agent.max_usd_per_month`.** Before 0.4.4 a 0 paused the agent. Nobody
-  is expected to rely on it (an agent you want off is `enabled = false`),
-  but the CHANGELOG says so.
+  `agent.max_usd_per_month`.** Before 0.4.5 a 0 paused the agent; such a
+  0 stays a pause until `wats setup` confirms the budget (§5), and the
+  CHANGELOG says so.
 - **A config.toml that sets `max_usd_per_day` and not the month gets 30 ×
   the day**: the default month goes from $20 to $60. `wats config set
   agent.max_usd_per_month 20` keeps the old one.
-- The new keys are refused by wats 0.4.3 and older: `wats upgrade
+- The new keys are refused by wats 0.4.4 and older: `wats upgrade
   --rollback` names them, with their agent's table, before it swaps
   anything (`KEYS_SINCE`).
 - They are safety keys (ADR 0011, addendum): a change shows until `wats

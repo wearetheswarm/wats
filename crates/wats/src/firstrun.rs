@@ -17,7 +17,7 @@
 //! then dollars, minutes and LLM tokens per day: ADR 0032), its access
 //! level, and `nets`. Right after the agent, "quick" keeps the
 //! recommended (or current) settings and asks only the budget; "detailed"
-//! asks each one (ADR 0027, 0.4.4).
+//! asks each one (ADR 0027, 0.4.5).
 //!
 //! Each question carries the setup revision that added it
 //! ([`SETUP_REVISION`], ADR 0027): `<data dir>/setup-revision` records the
@@ -99,7 +99,7 @@ const DESKTOP_SINCE: u32 = 1;
 const SECURITY_AUTO_SINCE: u32 = 1;
 
 /// The revision that added the budget question (how the agent is paid,
-/// then its daily budget: ADR 0032), in 0.4.4. It replaces the two USD
+/// then its daily budget: ADR 0032), in 0.4.5. It replaces the two USD
 /// questions of revision 1.
 const BUDGET_SINCE: u32 = 2;
 
@@ -110,7 +110,7 @@ the swarm from your subscription, machine or API spend.";
 /// The budget question (ADR 0032).
 pub const PAID_QUESTION: &str = "How is this agent paid?";
 
-/// The mode question, right after the agent (ADR 0027, 0.4.4).
+/// The mode question, right after the agent (ADR 0027, 0.4.5).
 pub const MODE_QUESTION: &str = "Recommended settings, or choose each one?";
 
 /// Shown before the security updates question (ADR 0030).
@@ -475,7 +475,7 @@ pub fn ask_yes_no(
     }
 }
 
-/// Step 2 of the wizard (ADR 0027, 0.4.4): set up wats in all the agent
+/// Step 2 of the wizard (ADR 0027, 0.4.5): set up wats in all the agent
 /// CLIs found at once, one by one, or none.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Hosts {
@@ -512,7 +512,7 @@ pub fn ask_hosts(
     }
 }
 
-/// Step 3 of the wizard (ADR 0027, 0.4.4): where the node runs.
+/// Step 3 of the wizard (ADR 0027, 0.4.5): where the node runs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Where {
     /// In the background (`wats --detach`), the recommended choice.
@@ -587,16 +587,19 @@ pub fn prompt(
     found: &[Found],
     settings: &Settings,
 ) -> Result<Choices> {
-    writeln!(
-        out,
-        "wats setup: the node's main choices. Enter accepts the [default]."
-    )?;
-    prompt_after(input, out, found, settings, &QUESTIONS, 0, true)
+    writeln!(out, "{SETUP_HEADER}")?;
+    prompt_after(input, out, found, settings, &QUESTIONS, 0, true, None)
 }
+
+/// The first line of `wats setup` without its screens.
+const SETUP_HEADER: &str = "wats setup: the node's main choices. Enter accepts the [default].";
 
 /// Ask those of `questions` newer than `revision` (0: all of them), after
 /// the agent runtime when it is newer too. `full`: the whole setup, which
 /// asks quick or detailed first; a catch-up asks its few questions.
+/// `stored`: the data directory's setup revision, which tells whether a
+/// USD budget of 0 is one from before 0.4.5 (ADR 0032 §5).
+#[allow(clippy::too_many_arguments)]
 fn prompt_after(
     input: &mut impl BufRead,
     out: &mut impl Write,
@@ -605,6 +608,7 @@ fn prompt_after(
     questions: &[Question],
     revision: u32,
     full: bool,
+    stored: Option<u32>,
 ) -> Result<Choices> {
     let primary = settings
         .primary_agent()
@@ -623,7 +627,7 @@ fn prompt_after(
     // its few new questions).
     let quick = full && ask_mode(input, out, settings, runtime.as_deref())?;
     let mut values = Vec::new();
-    // Values of 0.4.3's defaults would pin them (ADR 0027, 0.4.4): offered
+    // Values of the old defaults would pin them (ADR 0027, 0.4.5): offered
     // to drop, in both modes, for the agent asked about.
     let mut dropped = Vec::new();
     let same_agent = settings
@@ -633,7 +637,7 @@ fn prompt_after(
         let old = old_defaults_of(primary_table(settings));
         if !old.is_empty() {
             let question = format!(
-                "config.toml sets {}: the defaults of wats 0.4.3 and older, now {}. Drop {}, \
+                "config.toml sets {}: the defaults of wats 0.4.4 and older, now {}. Drop {}, \
                  to use the new defaults?",
                 old.iter()
                     .map(|o| format!("{} = {}", o.key, o.value))
@@ -660,7 +664,7 @@ fn prompt_after(
         }
         if q.budget {
             let runtime = runtime.as_deref().unwrap_or("claude");
-            values.extend(ask_budget(input, out, settings, runtime)?);
+            values.extend(ask_budget(input, out, settings, runtime, stored)?);
             continue;
         }
         if quick {
@@ -692,7 +696,7 @@ fn primary_table(settings: &Settings) -> &settings::AgentSettings {
         .map_or(&settings.agent, |(_, table)| table)
 }
 
-/// The quick or detailed question (ADR 0027, 0.4.4): Enter is quick.
+/// The quick or detailed question (ADR 0027, 0.4.5): Enter is quick.
 /// Returns whether quick.
 fn ask_mode(
     input: &mut impl BufRead,
@@ -942,10 +946,19 @@ fn ask_budget(
     out: &mut impl Write,
     settings: &Settings,
     runtime: &str,
+    stored: Option<u32>,
 ) -> Result<Vec<(&'static str, String)>> {
     let table = primary_table(settings);
-    let (now, was) = current_daily(table);
+    let (now, mut was) = current_daily(table);
     writeln!(out, "{BUDGET_GUIDE}")?;
+    // A USD budget of 0 from before 0.4.5 paused the agent: said, and not
+    // offered as is (it now means no limit). The answer here confirms the
+    // budget (ADR 0032 §5).
+    let zero = crate::budget::legacy_zero(table, stored);
+    if runtime != "openclaw" && (zero.0 || zero.1) {
+        writeln!(out, "{}", zero_line(zero, "agent"))?;
+        was = None;
+    }
     let paid = if runtime == "openclaw" {
         None
     } else {
@@ -1040,8 +1053,64 @@ fn ask_budget(
     Ok(values)
 }
 
-/// A key of an agent's table set to the default of wats 0.4.3 and older,
-/// which would pin it (ADR 0027, 0.4.4).
+/// What the budget question says of a USD budget of 0 from before 0.4.5
+/// in the table whose keys start with `prefix` (`agent`, `agents.<name>`).
+fn zero_line(zero: (bool, bool), prefix: &str) -> String {
+    let mut parts = Vec::new();
+    if zero.0 {
+        parts.push(format!(
+            "{prefix}.max_usd_per_day = 0 paused the agent before 0.4.5 and now means no \
+             limit: the daily budget below replaces it"
+        ));
+    }
+    if zero.1 {
+        parts.push(format!(
+            "{prefix}.max_usd_per_month = 0 paused it before 0.4.5 and now means no monthly \
+             limit (`wats config unset {prefix}.max_usd_per_month` for 30 × the day)"
+        ));
+    }
+    format!("Note: {}.", parts.join("; "))
+}
+
+/// The agents' tables, other than the one setup asked about (`asked`),
+/// whose USD budget of 0 from before 0.4.5 will mean no limit once setup
+/// records its revision: one warning line each (ADR 0032 §5).
+fn other_zero_warnings(
+    settings: &Settings,
+    stored: Option<u32>,
+    asked: Option<&str>,
+) -> Vec<String> {
+    let mut lines = Vec::new();
+    for (name, table) in &settings.agents {
+        if Some(name.as_str()) == asked || table.runtime.as_deref() == Some("openclaw") {
+            continue;
+        }
+        let zero = crate::budget::legacy_zero(table, stored);
+        if zero.0 || zero.1 {
+            lines.push(format!(
+                "warning: agents.{name}: a USD budget of 0 paused it before 0.4.5 and now means \
+                 no limit. Set one (wats config set agents.{name}.max_usd_per_day <n>, or \
+                 max_minutes_per_day), or keep it off: wats config set agents.{name}.enabled \
+                 false"
+            ));
+        }
+    }
+    lines
+}
+
+/// Whether a table of `settings` has a USD budget of 0 from before 0.4.5.
+fn any_legacy_zero(settings: &Settings, stored: Option<u32>) -> bool {
+    std::iter::once(&settings.agent)
+        .chain(settings.agents.values())
+        .filter(|t| t.runtime.as_deref() != Some("openclaw"))
+        .any(|t| {
+            let zero = crate::budget::legacy_zero(t, stored);
+            zero.0 || zero.1
+        })
+}
+
+/// A key of an agent's table set to the default of wats 0.4.4 and older,
+/// which would pin it (ADR 0027, 0.4.5).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OldDefault {
     /// The key, as `wats config unset` takes it.
@@ -1076,7 +1145,7 @@ fn old_defaults_of(table: &settings::AgentSettings) -> Vec<OldDefault> {
 
 /// The one-line notice of `wats status` and the node's start when an
 /// agent's table sets `agent.timeout` or `agent.max_turns` to the default
-/// of wats 0.4.3 and older (10m, 10), which would pin it: the new
+/// of wats 0.4.4 and older (10m, 10), which would pin it: the new
 /// defaults, and how to use them. config.toml is never rewritten for it.
 pub fn old_defaults_notice(settings: &Settings) -> Option<String> {
     let several =
@@ -1113,7 +1182,7 @@ pub fn old_defaults_notice(settings: &Settings) -> Option<String> {
     }
     let one = set.len() == 1;
     Some(format!(
-        "config.toml sets {}: {} of wats 0.4.3 and older; {} now {}. To use {}: wats setup, or \
+        "config.toml sets {}: {} of wats 0.4.4 and older; {} now {}. To use {}: wats setup, or \
          wats config unset {}",
         set.join(" and "),
         if one { "the default" } else { "the defaults" },
@@ -1287,7 +1356,7 @@ pub fn apply(data_dir: &Path, choices: &Choices) -> Result<PathBuf> {
             None => key.to_string(),
         };
         // Only what changes: a value the file already has keeps its line
-        // and comments, a default unsets its key (ADR 0027, 0.4.4).
+        // and comments, a default unsets its key (ADR 0027, 0.4.5).
         let set = file.get(&key);
         if is_default(&key, value) {
             if set.is_some() {
@@ -1432,9 +1501,14 @@ pub fn catch_up_with(
     revision: u32,
     desktop: bool,
 ) -> Result<Choices> {
-    // Only questions for an agent, and it runs none: nothing to ask.
-    if pending_questions(&Settings::load(data_dir)?, revision) == 0 {
-        record_revision(data_dir)?;
+    // Only questions for an agent, and it runs none: nothing to ask. Not
+    // with a USD budget of 0 from before 0.4.5 in a table: that pause
+    // waits for `wats setup` (ADR 0032 §5).
+    let settings = Settings::load(data_dir)?;
+    if pending_questions(&settings, revision) == 0 {
+        if !any_legacy_zero(&settings, stored_revision(data_dir)) {
+            record_revision(data_dir)?;
+        }
         return Ok(Choices {
             keep_runtime: true,
             ..Choices::default()
@@ -1503,19 +1577,20 @@ fn ask_and_write(
 ) -> Result<(Choices, Vec<Found>)> {
     let settings = Settings::load(data_dir)?;
     let found = detect_agents(path);
-    let mut choices = if revision == 0 && run == Run::Setup {
-        prompt(input, out, &found, &settings)?
-    } else {
-        prompt_after(
-            input,
-            out,
-            &found,
-            &settings,
-            &QUESTIONS,
-            revision,
-            run != Run::CatchUp,
-        )?
-    };
+    let stored = stored_revision(data_dir);
+    if revision == 0 && run == Run::Setup {
+        writeln!(out, "{SETUP_HEADER}")?;
+    }
+    let mut choices = prompt_after(
+        input,
+        out,
+        &found,
+        &settings,
+        &QUESTIONS,
+        revision,
+        run != Run::CatchUp,
+        stored,
+    )?;
     // Quick: notify.desktop stays as it is (unset: on with a desktop
     // session), the security updates as recommended.
     if desktop && DESKTOP_SINCE > revision && !choices.quick {
@@ -1533,6 +1608,15 @@ fn ask_and_write(
     } else {
         None
     };
+    // The other agents' USD budgets of 0 from before 0.4.5 mean no limit
+    // once the revision is recorded: said.
+    let asked = choices
+        .runtime
+        .as_ref()
+        .and_then(|_| settings.primary_agent().map(|(name, _)| name));
+    for line in other_zero_warnings(&settings, stored, asked.as_deref()) {
+        writeln!(out, "{line}")?;
+    }
     let file = apply(data_dir, &choices)?;
     if let Some(on) = security {
         record_answer(data_dir, "security_auto", if on { "yes" } else { "no" })?;
@@ -2075,7 +2159,7 @@ mod tests {
                 None
             );
         }
-        // Revision 2 (0.4.4) adds the budget question only.
+        // Revision 2 (0.4.5) adds the budget question only.
         assert_eq!(new_questions(BASELINE_REVISION), 1);
         assert_eq!(new_questions(SETUP_REVISION), 0);
     }
@@ -2355,7 +2439,7 @@ mod tests {
         assert_eq!(
             notice,
             "config.toml sets agent.timeout = 10m and agent.max_turns = 10: the defaults of \
-             wats 0.4.3 and older; the defaults are now 25m and 50. To use them: wats setup, or \
+             wats 0.4.4 and older; the defaults are now 25m and 50. To use them: wats setup, or \
              wats config unset agent.timeout agent.max_turns"
         );
         // Quick, yes to drop them (Enter), the budget as it was (API key,
@@ -2364,7 +2448,7 @@ mod tests {
         assert!(
             said.contains(
                 "config.toml sets agent.timeout = 10m and agent.max_turns = 10: the defaults of \
-                 wats 0.4.3 and older, now 25m and 50. Drop them, to use the new defaults? [Y/n]"
+                 wats 0.4.4 and older, now 25m and 50. Drop them, to use the new defaults? [Y/n]"
             ),
             "{said}"
         );
@@ -2395,7 +2479,7 @@ mod tests {
         assert_eq!(after.agents["claude"].timeout.as_deref(), Some("10m"));
         assert_eq!(
             old_defaults_notice(&after).unwrap(),
-            "config.toml sets agent.timeout = 10m: the default of wats 0.4.3 and older; the \
+            "config.toml sets agent.timeout = 10m: the default of wats 0.4.4 and older; the \
              default is now 25m. To use it: wats setup, or wats config unset agent.timeout"
         );
         // Several agents: named by their table.
@@ -2673,7 +2757,7 @@ mod tests {
         assert_eq!(stored_revision(dir.path()), Some(BASELINE_REVISION));
         // Revision 1 (0.4.3): the questions of 0.4.2, plus agent.access,
         // whose default every 0.4.x node already runs with. Revision 2
-        // (0.4.4): the budget question, asked of nodes with an agent.
+        // (0.4.5): the budget question, asked of nodes with an agent.
         assert_eq!(
             new_questions(BASELINE_REVISION),
             1,
@@ -2730,6 +2814,7 @@ mod tests {
             &questions,
             1,
             false,
+            None,
         )
         .unwrap();
         let said = String::from_utf8(out).unwrap();
@@ -2764,6 +2849,7 @@ mod tests {
             &questions,
             2,
             false,
+            None,
         )
         .unwrap();
         assert!(none.values.is_empty() && out.is_empty());
@@ -2841,5 +2927,70 @@ mod tests {
         catch_up_with(none.path(), &mut "".as_bytes(), &mut out, None, 1, false).unwrap();
         assert!(out.is_empty(), "{}", String::from_utf8_lossy(&out));
         assert_eq!(stored_revision(none.path()), Some(2));
+    }
+
+    /// A USD budget of 0 from before 0.4.5 (revision 1), when it paused
+    /// the agent: the catch-up's budget question says so, offers the
+    /// preset (not the zero as it is), and confirms it: revision 2, the
+    /// pause lifted. Another agent's zero is warned about. A disabled
+    /// agent's zero keeps the revision as it is (no silent confirmation).
+    #[test]
+    fn a_zero_from_before_is_settled_by_the_budget_question() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(FILE_NAME),
+            "[agents.claude]\nruntime = \"claude\"\nmax_usd_per_day = 0.0\nmax_usd_per_month = 0.0\n\n\
+             [agents.other]\nruntime = \"codex\"\nenabled = false\nmax_usd_per_day = 0.0\n",
+        )
+        .unwrap();
+        let before = Settings::load(dir.path()).unwrap();
+        let stored = stored_revision(dir.path());
+        assert_eq!(stored, Some(1));
+        assert!(crate::budget::Budget::of_dir(&before.agents["claude"], stored).paused_by_zero());
+        let mut out = Vec::new();
+        let choices =
+            catch_up_with(dir.path(), &mut "\n\n".as_bytes(), &mut out, None, 1, false).unwrap();
+        let said = String::from_utf8(out).unwrap();
+        assert!(
+            said.contains(
+                "Note: agent.max_usd_per_day = 0 paused the agent before 0.4.5 and now means no \
+                 limit: the daily budget below replaces it; agent.max_usd_per_month = 0 paused \
+                 it before 0.4.5 and now means no monthly limit"
+            ),
+            "{said}"
+        );
+        // Not the zeros as they are: the subscription preset, by default.
+        assert!(said.contains(&format!("{PAID_QUESTION} [1]: ")), "{said}");
+        assert!(
+            said.contains("Daily budget: 120 min, no USD limit"),
+            "{said}"
+        );
+        assert!(
+            said.contains("warning: agents.other: a USD budget of 0 paused it before 0.4.5"),
+            "{said}"
+        );
+        assert!(
+            choices
+                .values
+                .contains(&("agent.max_minutes_per_day", "120".into()))
+        );
+        assert_eq!(stored_revision(dir.path()), Some(2));
+        let after = Settings::load(dir.path()).unwrap();
+        let claude = &after.agents["claude"];
+        assert_eq!(claude.max_minutes_per_day, Some(120));
+        assert!(!crate::budget::Budget::of_dir(claude, Some(2)).paused_by_zero());
+
+        // Only a disabled agent's zero: nothing asked, and the revision
+        // not recorded silently.
+        let off = tempfile::tempdir().unwrap();
+        std::fs::write(
+            off.path().join(FILE_NAME),
+            "[agents.claude]\nruntime = \"claude\"\nenabled = false\nmax_usd_per_day = 0.0\n",
+        )
+        .unwrap();
+        let mut out = Vec::new();
+        catch_up_with(off.path(), &mut "".as_bytes(), &mut out, None, 1, false).unwrap();
+        assert!(out.is_empty(), "{}", String::from_utf8_lossy(&out));
+        assert_eq!(stored_revision(off.path()), Some(1));
     }
 }

@@ -1,6 +1,6 @@
 # 0027. The setup wizard of a bare `wats`, and setup revisions
 
-Status: Proposed (2026-10-21). Ships in 0.4.3; §5 to §8 (2026-10-22) in 0.4.4.
+Status: Proposed (2026-10-21). Ships in 0.4.3; §5 to §8 (2026-10-22) in 0.4.5.
 
 Amends ADR 0023 §1 ("a bare `wats` runs in the foreground"): it still
 does, after the wizard the first time, or in the background if the
@@ -209,9 +209,9 @@ and a configured 0.4.x data directory is not prompted on upgrade to 0.4.3.
 - If a revision adds an MCP-host or background question, decide then
   whether the catch-up asks it.
 
-## Quick or detailed, the budget, restarts (Vincent, 2026-10-22; 0.4.4)
+## Quick or detailed, the budget, restarts (Vincent, 2026-10-22; 0.4.5)
 
-Decisions by Vincent for 0.4.4, with the budget part in
+Decisions by Vincent for 0.4.5, with the budget part in
 [ADR 0032](0032-daily-budgets.md). Code: `firstrun.rs` (`ask_mode`,
 `ask_budget`, `ask_hosts`, `ask_where`, `old_defaults_notice`,
 `pending_questions`, `apply`), `main.rs` (`offer_integrations`,
@@ -270,18 +270,18 @@ the default unsets its key, and one equal to the value already set leaves
 its line and comments untouched. Otherwise a value written once would pin
 an old default forever.
 
-0.4.4 raises the defaults of `agent.timeout` (10m to 25m) and
+0.4.5 raises the defaults of `agent.timeout` (10m to 25m) and
 `agent.max_turns` (10 to 50). A config.toml that sets them to 10m and 10,
 as many 0.4.3 files do, is never rewritten by itself. Instead:
 
 - `wats status`, and the node at its start (a warning in its log), say in
-  one line that these are the defaults of 0.4.3 and older, name the new
+  one line that these are the defaults of 0.4.4 and older, name the new
   ones, and suggest `wats setup` or `wats config unset agent.timeout
   agent.max_turns` (`wats config unset` takes several keys; with several
   agents, `agents.<name>.<key>`);
 - the wizard (quick and detailed) and a catch-up offer to drop them:
   "config.toml sets agent.timeout = 10m and agent.max_turns = 10: the
-  defaults of wats 0.4.3 and older, now 25m and 50. Drop them, to use the
+  defaults of wats 0.4.4 and older, now 25m and 50. Drop them, to use the
   new defaults? [Y/n]".
 
 ### 8. Revision 2

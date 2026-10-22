@@ -2495,7 +2495,7 @@ async fn offer_background(
             ""
         };
         println!("{what}{whose}: it reads config.toml when it starts.");
-        // Restart it now (ADR 0027, 0.4.4): asked of a person only.
+        // Restart it now (ADR 0027, 0.4.5): asked of a person only.
         let restart = !yes
             && interactive(args)
             && wats::firstrun::ask_yes_no(
@@ -2583,7 +2583,7 @@ fn offer_integrations(
         };
         Some((openclaw_agent, label, command))
     };
-    // All at once (Enter), one by one, or none (ADR 0027, 0.4.4).
+    // All at once (Enter), one by one, or none (ADR 0027, 0.4.5).
     let labels: Vec<String> = found
         .iter()
         .filter_map(&host)
@@ -2713,7 +2713,7 @@ async fn setup_wizard(node: &NodeArgs, data_dir: &std::path::Path) -> Result<boo
     let mcp = offer_integrations(node, data_dir, &choices, &found)?;
     print!("{}", welcome::step(3, style));
     // The background, recommended (Enter), or `d` to choose: here, or not
-    // now (ADR 0027, 0.4.4). Native Windows has no `--detach`: here.
+    // now (ADR 0027, 0.4.5). Native Windows has no `--detach`: here.
     use wats::firstrun::Where;
     let place = if cfg!(unix) {
         wats::firstrun::ask_where(&mut std::io::stdin().lock(), &mut std::io::stdout(), true)?
@@ -3518,20 +3518,34 @@ async fn status_command(config: &NodeConfig, json: bool) -> Result<()> {
                     let now = unix_now();
                     status["agents"] = members
                         .iter()
-                        .map(|m| agent_info(m, false).status(now))
+                        .map(|m| agent_info(m, false, &config.data_dir).status(now))
                         .collect();
                 }
             }
             status
         }
     };
-    // agent.timeout and agent.max_turns set to the defaults of 0.4.3 and
+    // agent.timeout and agent.max_turns set to the defaults of 0.4.4 and
     // older: one line naming the new ones (config.toml is never rewritten
     // for it).
     if let Ok(settings) = Settings::load(&config.data_dir)
         && let Some(notice) = wats::firstrun::old_defaults_notice(&settings)
     {
         status["old_defaults"] = notice.into();
+    }
+    // Agents paused by a USD budget of 0 from before 0.4.5 (ADR 0032 §5):
+    // the MCP status says it of the running node's; without one, from
+    // config.toml.
+    if status.get("budget_paused").is_none() {
+        let paused: Vec<serde_json::Value> = status["agents"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|a| a["notice"].as_str().map(serde_json::Value::from))
+            .collect();
+        if !paused.is_empty() {
+            status["budget_paused"] = paused.into();
+        }
     }
     if json {
         println!("{}", serde_json::to_string_pretty(&status)?);
@@ -5307,8 +5321,13 @@ fn agent_members(
 }
 
 /// One agent as `status` shows it.
-fn agent_info(member: &wats::roster::Member, running: bool) -> wats::agent::AgentInfo {
-    let budget = wats::budget::Budget::of(&member.settings)
+fn agent_info(
+    member: &wats::roster::Member,
+    running: bool,
+    data_dir: &std::path::Path,
+) -> wats::agent::AgentInfo {
+    let revision = wats::firstrun::stored_revision(data_dir);
+    let budget = wats::budget::Budget::of_dir(&member.settings, revision)
         .for_runtime(member.runtime.as_deref().unwrap_or("claude"));
     wats::agent::AgentInfo {
         name: member.name.clone(),
@@ -5390,7 +5409,10 @@ fn agent_config(
     // Without the limits the runtime cannot be held to: OpenClaw reports
     // no cost nor LLM tokens (its spend caps are its own; the runs per day
     // and the minutes still count), Codex no cost.
-    let budget = wats::budget::Budget::of(file).for_runtime(&runtime);
+    // A USD budget of 0 from before 0.4.5 keeps it paused until `wats
+    // setup` confirms it (ADR 0032 §5).
+    let revision = wats::firstrun::stored_revision(data_dir);
+    let budget = wats::budget::Budget::of_dir(file, revision).for_runtime(&runtime);
     let mut openclaw = wats::openclaw::Target::default();
     if runtime == "openclaw" {
         wats::openclaw::check_access(access, &allow, file.review == Some(true))?;
@@ -5826,7 +5848,9 @@ async fn agent_watch(
                     .as_ref()
                     .map_or(settings.agent.runtime.as_deref(), |m| m.runtime.as_deref())
                     .unwrap_or("claude");
-                let budget = wats::budget::Budget::of(own).for_runtime(runtime);
+                let budget =
+                    wats::budget::Budget::of_dir(own, wats::firstrun::stored_revision(data_dir))
+                        .for_runtime(runtime);
                 let now = unix_now();
                 let spend = wats::budget::spend(&work_dir, now);
                 let paused = match wats::budget::check(&budget, &spend, now) {
@@ -6464,6 +6488,12 @@ async fn async_main(cli: Cli) -> Result<()> {
     if let Some(notice) = wats::firstrun::old_defaults_notice(&settings) {
         tracing::warn!("{notice}");
     }
+    // A USD budget of 0 from before 0.4.5: still paused (ADR 0032 §5).
+    for (name, agent) in &agents {
+        if let Some(notice) = agent.budget.zero_notice(name) {
+            tracing::warn!("{notice}");
+        }
+    }
     for (member, (_, agent)) in members.iter().zip(&agents) {
         if member.settings.review == Some(true) && !config.review_profiles.contains(&agent.profile)
         {
@@ -6522,8 +6552,8 @@ async fn async_main(cli: Cli) -> Result<()> {
     config.agents = configured
         .iter()
         .filter(|c| !members.iter().any(|m| m.name == c.name))
-        .map(|c| agent_info(c, false))
-        .chain(members.iter().map(|m| agent_info(m, true)))
+        .map(|c| agent_info(c, false, &data_dir))
+        .chain(members.iter().map(|m| agent_info(m, true, &data_dir)))
         .collect();
     config.agents.sort_by(|a, b| a.name.cmp(&b.name));
     config.relaunch_args = cli.node.to_args(&data_dir);
