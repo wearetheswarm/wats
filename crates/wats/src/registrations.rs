@@ -31,8 +31,11 @@ use crate::update::{homebrew_managed, homebrew_relink};
 /// HOME). Otherwise only a node on the real network checks.
 pub const CHECK_ENV: &str = "WATS_CHECK_REGISTRATIONS";
 
-/// How long one `openclaw` command may take before it is killed.
+/// How long `openclaw mcp show` may take before it is killed.
 const OPENCLAW_TIMEOUT: Duration = Duration::from_secs(3);
+/// How long `openclaw mcp set` may take: longer, so that a cold Node.js
+/// start is not killed while it writes openclaw.json.
+const OPENCLAW_SET_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// Backups kept per file by repairs.
 const MAX_BACKUPS: usize = 3;
@@ -1046,7 +1049,8 @@ fn redacted(value: &Value) -> bool {
 
 /// Run `cli args`, stdin closed, stderr dropped; killed after `limit`
 /// (None then, or when it cannot start), so that a hung OpenClaw never
-/// holds up the node or `wats status`.
+/// holds up the node or `wats status`. Its stdout is awaited within the
+/// same deadline: a descendant left holding it does not hang us either.
 fn run_for(cli: &Path, args: &[&str], limit: Duration) -> Option<std::process::Output> {
     use std::io::Read;
     let mut child = std::process::Command::new(cli)
@@ -1057,10 +1061,11 @@ fn run_for(cli: &Path, args: &[&str], limit: Duration) -> Option<std::process::O
         .spawn()
         .ok()?;
     let mut stdout = child.stdout.take()?;
-    let reader = std::thread::spawn(move || {
+    let (sent, read) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
         let mut buf = Vec::new();
         let _ = stdout.read_to_end(&mut buf);
-        buf
+        let _ = sent.send(buf);
     });
     let deadline = Instant::now() + limit;
     let status = loop {
@@ -1076,7 +1081,8 @@ fn run_for(cli: &Path, args: &[&str], limit: Duration) -> Option<std::process::O
             }
         }
     };
-    let stdout = reader.join().ok()?;
+    let left = deadline.saturating_duration_since(Instant::now());
+    let stdout = read.recv_timeout(left).ok()?;
     Some(std::process::Output {
         status,
         stdout,
@@ -1087,7 +1093,8 @@ fn run_for(cli: &Path, args: &[&str], limit: Duration) -> Option<std::process::O
 /// OpenClaw's `wats` and `wats-agent` entries, when openclaw.json has a
 /// stale wats path at all. Only checked (`repair` false): from the file
 /// alone, no CLI is run. Repaired: through `openclaw mcp show` and `mcp
-/// set` ([`OPENCLAW_TIMEOUT`] each), when the entry shows no redacted value.
+/// set` ([`OPENCLAW_TIMEOUT`], [`OPENCLAW_SET_TIMEOUT`]), when the entry
+/// shows no redacted value.
 fn openclaw(
     file: &Path,
     cli: Option<&Path>,
@@ -1128,6 +1135,7 @@ fn openclaw(
         }
     };
     let run = |args: &[&str]| run_for(cli, args, OPENCLAW_TIMEOUT);
+    let run_set = |args: &[&str]| run_for(cli, args, OPENCLAW_SET_TIMEOUT);
     let mut out = Vec::new();
     let mut copied: Option<Option<PathBuf>> = None;
     for (name, flag) in [("wats", "--mcp"), (oc::AGENT_SERVER, "--agent")] {
@@ -1210,7 +1218,7 @@ fn openclaw(
             .get_or_insert_with(|| backup(&target, &text, now).ok().flatten())
             .clone();
         entry.insert("command".into(), json!(link.to_string_lossy()));
-        let set = run(&["mcp", "set", name, &Value::Object(entry).to_string()]);
+        let set = run_set(&["mcp", "set", name, &Value::Object(entry).to_string()]);
         let outcome = match set {
             Some(o) if o.status.success() => Outcome::Repaired { to: link, backup },
             Some(o) => Outcome::Left {
@@ -1223,7 +1231,7 @@ fn openclaw(
                 error: Some(format!(
                     "{} did not answer within {}s",
                     cli.display(),
-                    OPENCLAW_TIMEOUT.as_secs()
+                    OPENCLAW_SET_TIMEOUT.as_secs()
                 )),
                 auto: false,
             },
@@ -1589,6 +1597,15 @@ mod tests {
         assert!(started.elapsed() < Duration::from_secs(5));
         let out = run_for(Path::new("/bin/echo"), &["hi"], Duration::from_secs(5)).unwrap();
         assert_eq!(out.stdout, b"hi\n");
+        // A descendant left holding stdout does not hang us past the deadline.
+        let started = Instant::now();
+        let out = run_for(
+            Path::new("/bin/sh"),
+            &["-c", "sleep 10 & echo started"],
+            Duration::from_millis(300),
+        );
+        assert!(out.is_none());
+        assert!(started.elapsed() < Duration::from_secs(5));
     }
 
     #[test]
