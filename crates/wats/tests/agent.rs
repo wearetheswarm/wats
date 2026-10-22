@@ -8,6 +8,9 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
+mod common;
+use common::ClearToolEnv;
+
 use wats::agent::{AgentConfig, DEFAULT_HEARTBEAT};
 use wats::event::{Draft, Kind};
 use wats::node::{NetworkMode, Node, NodeConfig, PUBLIC_NET};
@@ -373,6 +376,7 @@ async fn interactive_session_attaches_while_agent_runs() -> anyhow::Result<()> {
     let home = dir.path().join("home");
     std::fs::create_dir_all(&home)?;
     let mut agent = tokio::process::Command::new(wats)
+        .clear_tool_env()
         .env("HOME", &home)
         .env_remove("CLAUDE_CONFIG_DIR")
         .args(["--loopback", "--pow-bits=0", "--min-pow-bits=0", "--dir"])
@@ -640,7 +644,8 @@ async fn agent_claude_registers_once_then_runs_the_agent() {
     let wats = env!("CARGO_BIN_EXE_wats");
     let run = || {
         let mut cmd = tokio::process::Command::new(wats);
-        cmd.env("HOME", &home)
+        cmd.clear_tool_env()
+            .env("HOME", &home)
             .env("USER", "tester")
             .env_remove("CLAUDE_CONFIG_DIR")
             .env_remove("WATS_PROFILE")
@@ -687,7 +692,10 @@ async fn bare_wats_runs_agents_from_config_toml() {
     let wats = env!("CARGO_BIN_EXE_wats");
     let base = |extra: &[&str]| {
         let mut cmd = tokio::process::Command::new(wats);
-        cmd.args(["--loopback", "--dir"]).arg(&data).args(extra);
+        cmd.clear_tool_env()
+            .args(["--loopback", "--dir"])
+            .arg(&data)
+            .args(extra);
         cmd
     };
     let banner = banner_of(&mut base(&[])).await;
@@ -757,7 +765,8 @@ async fn access_defaults_to_workspace_and_caps_without_tools_warn() {
     let wats = env!("CARGO_BIN_EXE_wats");
     let base = |extra: &[&str]| {
         let mut cmd = tokio::process::Command::new(wats);
-        cmd.env("HOME", &home)
+        cmd.clear_tool_env()
+            .env("HOME", &home)
             .env("USER", "tester")
             .env_remove("CLAUDE_CONFIG_DIR")
             .env_remove("WATS_PROFILE")
@@ -873,6 +882,7 @@ async fn two_agents_from_config_both_run() {
     )
     .unwrap();
     let mut node = tokio::process::Command::new(env!("CARGO_BIN_EXE_wats"))
+        .clear_tool_env()
         .env("USER", "tester")
         .env_remove("WATS_PROFILE")
         .args(["--loopback", "--pow-bits=0", "--min-pow-bits=0", "--dir"])
@@ -960,7 +970,8 @@ async fn agent_flag_takes_a_name() {
     .unwrap();
     let base = |extra: &[&str]| {
         let mut cmd = tokio::process::Command::new(env!("CARGO_BIN_EXE_wats"));
-        cmd.env("USER", "tester")
+        cmd.clear_tool_env()
+            .env("USER", "tester")
             .env_remove("WATS_PROFILE")
             .args(["--loopback", "--dir"])
             .arg(&data)
@@ -1028,6 +1039,7 @@ async fn background_node_runs_agents_only_with_mcp() {
     std::fs::write(data.join("config.toml"), config).unwrap();
     let start = || {
         tokio::process::Command::new(env!("CARGO_BIN_EXE_wats"))
+            .clear_tool_env()
             .env("USER", "tester")
             .env_remove("WATS_PROFILE")
             .args(["--loopback", "--pow-bits=0", "--min-pow-bits=0", "--dir"])
@@ -1421,6 +1433,7 @@ echo '{{"type":"turn.completed","usage":{{"input_tokens":10,"output_tokens":2}}}
         ),
     )?;
     let mut node = tokio::process::Command::new(wats)
+        .clear_tool_env()
         .env("HOME", &home)
         .env("CODEX_HOME", &codex_home)
         .env("USER", "tester")
@@ -1854,7 +1867,8 @@ async fn runner_token_marks_the_session_over_the_socket() -> anyhow::Result<()> 
     std::fs::write(&persistent_file, format!("{persistent}\n"))?;
     let session = |token: Option<&str>| {
         let mut cmd = tokio::process::Command::new(env!("CARGO_BIN_EXE_wats"));
-        cmd.args(["--loopback", "--profile", "human", "--dir"])
+        cmd.clear_tool_env()
+            .args(["--loopback", "--profile", "human", "--dir"])
             .arg(&data)
             .args(["mcp", "--idle-exit", "1"]);
         match token {

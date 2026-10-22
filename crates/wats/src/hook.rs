@@ -453,7 +453,7 @@ pub fn command_line(
 
 /// `s` as one POSIX shell word: as it is when it is plain, else in single
 /// quotes.
-fn shell_quote(s: &str) -> String {
+pub fn shell_quote(s: &str) -> String {
     let plain = !s.is_empty()
         && s.chars()
             .all(|c| c.is_ascii_alphanumeric() || "/._-+=:@,".contains(c));

@@ -6,6 +6,9 @@ use std::process::{Child, Command, Stdio};
 use std::sync::mpsc;
 use std::time::Duration;
 
+mod common;
+use common::ClearToolEnv;
+
 use serde_json::Value;
 
 struct Proc {
@@ -16,6 +19,7 @@ struct Proc {
 impl Proc {
     fn spawn(args: &[&str]) -> Proc {
         let mut child = Command::new(env!("CARGO_BIN_EXE_wats"))
+            .clear_tool_env()
             .args(args)
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
