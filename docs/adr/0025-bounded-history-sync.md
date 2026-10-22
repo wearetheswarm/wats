@@ -705,6 +705,13 @@ A walk over a range ends in one of four ways.
     (union check, or an older peer's windows) fails after serving some of
     it, the range is not confirmed until that neighbor reads it to the end
     on a later try, under the backoff. What it holds further is unknown.
+    This holds for the check of neighbors that came up, too (review 5,
+    0.4.6). That check reads from the watermark the pass started with. If
+    such a neighbor brings events a range just confirmed lacked, then
+    fails partway, the span it read becomes `unconfirmed` again, with that
+    neighbor blocking. Otherwise a 0.4.0 holder that came up after two
+    quiet claims, and hit its rate limit after one page, left the node
+    `full` with the rest missing.
   - **No events, no claim.** A peer that served no events of the range
     confirms nothing, unless it is trusted or holds an event below the
     range's floor (one page asked): a peer with history can say a quiet

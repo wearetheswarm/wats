@@ -1,5 +1,15 @@
 # Changelog
 
+## Unreleased
+
+### Changes
+
+- **History: no false `full` after a late neighbor** (ADR 0025, review 5).
+  A neighbor that came up during a pass, brought events of a span just
+  confirmed, then stopped partway (a 0.4.0 node's rate limit) left the
+  node `full` with the rest of the span missing. That span is now
+  `unconfirmed` again until the neighbor reads it to the end.
+
 ## 0.4.5 (2026-10-22)
 
 A friendlier setup and a fairer node: the wizard has a quick path (pick

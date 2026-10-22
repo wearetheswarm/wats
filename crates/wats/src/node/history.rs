@@ -267,6 +267,8 @@ struct Pass {
     incomplete: HashSet<EndpointId>,
     /// Neighbors whose union read got to the end of the range.
     completed: HashSet<EndpointId>,
+    /// Neighbors whose union read brought events this node did not hold.
+    brought: HashSet<EndpointId>,
 }
 
 impl Pass {
@@ -858,8 +860,43 @@ impl Node {
             ..Walk::default()
         };
         let top = started.saturating_add(MAX_CLOCK_SKEW_SECS);
+        pass.incomplete.clear();
+        pass.brought.clear();
         self.union_check(net, top, &check, &walk, &mut pass, false)
             .await?;
+        // The check reads from the watermark the pass started with, so it
+        // can cover a range the pass just confirmed. A neighbor that
+        // brought what that range lacked, then stopped partway (an older
+        // peer's rate limit): what it holds further is unknown, so the
+        // span is unconfirmed again until it reads it to its end (ADR
+        // 0025, review 5).
+        let blockers: HashSet<EndpointId> = pass
+            .incomplete
+            .intersection(&pass.brought)
+            .copied()
+            .collect();
+        if !blockers.is_empty() {
+            let lo = walk.floor.max(self.store.cut_ts(net)?.unwrap_or(0));
+            info!(
+                %net,
+                "history: {} – {} unconfirmed: a neighbor that came up holds more",
+                date(lo),
+                date(top)
+            );
+            let id = self.store.add_sync_range(&SyncRange {
+                id: 0,
+                net: net.to_string(),
+                lo_ts: lo,
+                hi_ts: top,
+                cursor_ts: lo,
+                cursor_id: String::new(),
+                state: RangeState::Unconfirmed,
+                phase: String::new(),
+                opened: started,
+                base_bytes: self.store.store_bytes(),
+            })?;
+            self.set_progress(net, |p| p.blockers.entry(id).or_default().extend(blockers));
+        }
         if !self.history_pending(net) {
             self.store.set_sync_watermark(net, started)?;
         }
@@ -1166,6 +1203,7 @@ impl Node {
                 if new > 0 {
                     // The walk missed these: its "nothing more" was wrong.
                     pass.claimers.clear();
+                    pass.brought.insert(peer);
                 }
                 served = served.saturating_add(events.len());
                 received = events.iter().fold(received, |n, v| {
