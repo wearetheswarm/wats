@@ -19,7 +19,7 @@
 //! older line counts as 0 of each). It is kept for two months,
 //! independently of transcript retention.
 
-use std::io::{BufRead, Write};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -105,10 +105,12 @@ impl Budget {
 
     /// [`Budget::of`], and the pause of a USD budget of 0 written before
     /// 0.4.5 (when it meant paused): `revision` is the data directory's
-    /// setup revision ([`crate::firstrun::stored_revision`]).
-    pub fn of_dir(file: &AgentSettings, revision: Option<u32>) -> Budget {
+    /// setup revision ([`crate::firstrun::stored_revision`]), `work_dir`
+    /// the agent's directory, whose [`CONFIRMED_FILE`] says the budget
+    /// question confirmed this agent's budget.
+    pub fn of_dir(file: &AgentSettings, revision: Option<u32>, work_dir: &Path) -> Budget {
         Budget {
-            legacy_zero: legacy_zero(file, revision),
+            legacy_zero: legacy_zero(file, revision, work_dir),
             ..Budget::of(file)
         }
     }
@@ -170,12 +172,30 @@ impl Budget {
 
 /// Whether `file` sets a USD budget of 0 (day, month) that, with the data
 /// directory at setup `revision`, still means paused: written before 0.4.5
-/// and not confirmed by the budget question since. No config.toml
-/// (`None`) sets nothing.
-pub fn legacy_zero(file: &AgentSettings, revision: Option<u32>) -> (bool, bool) {
-    let old = revision.is_some_and(|r| r < ZERO_CONFIRMED_REVISION);
+/// and not confirmed since, neither for this agent (its `work_dir` has no
+/// [`CONFIRMED_FILE`]) nor for the whole directory (revision 2, recorded
+/// once every agent's is). No config.toml (`None`) sets nothing.
+pub fn legacy_zero(file: &AgentSettings, revision: Option<u32>, work_dir: &Path) -> (bool, bool) {
+    let old = revision.is_some_and(|r| r < ZERO_CONFIRMED_REVISION) && !confirmed(work_dir);
     let zero = |v: Option<f64>| old && v.is_some_and(|x| x <= 0.0);
     (zero(file.max_usd_per_day), zero(file.max_usd_per_month))
+}
+
+/// The marker, in an agent's directory, that the budget question confirmed
+/// its budget (ADR 0034 §5): a USD budget of 0 then means no limit.
+pub const CONFIRMED_FILE: &str = "budget-confirmed";
+
+/// Whether the budget question confirmed the budget of the agent of
+/// `work_dir`.
+pub fn confirmed(work_dir: &Path) -> bool {
+    work_dir.join(CONFIRMED_FILE).exists()
+}
+
+/// Record that the budget question confirmed the budget of the agent of
+/// `work_dir`.
+pub fn confirm(work_dir: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(work_dir)?;
+    std::fs::write(work_dir.join(CONFIRMED_FILE), "confirmed by wats setup\n")
 }
 
 /// Whether the node holds `runtime` to a dollar budget, from the cost
@@ -247,13 +267,20 @@ impl Spend {
 #[derive(Debug, Clone, PartialEq)]
 pub enum Verdict {
     /// Yes, with this much left for the run (the smaller of what is left
-    /// today and this month), `None` without a dollar limit.
-    Go { remaining_usd: Option<f64> },
+    /// today and this month): dollars (`None` without a dollar limit), and
+    /// run time in seconds (`None` without a time limit; at least a
+    /// minute), which caps the run's timeout; LLM tokens (`None` without
+    /// a token limit), which only Vibe can be capped by (`--max-tokens`).
+    Go {
+        remaining_usd: Option<f64>,
+        remaining_secs: Option<f64>,
+        remaining_tokens: Option<u64>,
+    },
     /// No: why, and when the window resets (unix seconds).
     Paused { why: String, until: u64 },
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct Entry {
     ts: u64,
     usd: Option<f64>,
@@ -261,6 +288,31 @@ struct Entry {
     secs: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     tokens: Option<u64>,
+    /// The run's id, on its provisional entry and the one replacing it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    run: Option<String>,
+    /// Written when the run starts ([`begin`]), replaced when it ends
+    /// ([`finish`]); one left at a node's start is from a run that never
+    /// ended (a crash, SIGKILL), and [`settle`] charges it its caps. Not
+    /// counted while provisional.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    provisional: bool,
+    /// The caps a provisional entry is charged if its run never ends: the
+    /// dollars it was allowed, its timeout.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    cap_usd: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    cap_secs: Option<f64>,
+    /// Settled by [`settle`]: charged its caps, its run never ended.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    unfinished: bool,
+}
+
+/// A line of the ledger: an entry, or a line this wats cannot read, kept
+/// as it is.
+enum Line {
+    Entry(Entry),
+    Raw(String),
 }
 
 /// Two months of history.
@@ -285,51 +337,160 @@ fn next_month(now: u64) -> u64 {
     days_from_civil(y, m, 1) * 86_400
 }
 
-fn entries(work_dir: &Path) -> Vec<Entry> {
-    let Ok(file) = std::fs::File::open(ledger_path(work_dir)) else {
+/// Every line of the ledger, in order; an unreadable one (a torn write,
+/// a newer format) is kept as it is, never dropped.
+fn lines(work_dir: &Path) -> Vec<Line> {
+    let Ok(bytes) = std::fs::read(ledger_path(work_dir)) else {
         return Vec::new();
     };
-    std::io::BufReader::new(file)
+    String::from_utf8_lossy(&bytes)
         .lines()
-        .map_while(Result::ok)
-        .filter_map(|line| serde_json::from_str(&line).ok())
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| match serde_json::from_str::<Entry>(l) {
+            Ok(entry) => Line::Entry(entry),
+            Err(_) => Line::Raw(l.to_string()),
+        })
         .collect()
 }
 
-/// Add a run to the ledger, dropping entries older than two months.
-pub fn record(work_dir: &Path, ts: u64, usage: Usage) -> std::io::Result<()> {
+fn entries(work_dir: &Path) -> Vec<Entry> {
+    lines(work_dir)
+        .into_iter()
+        .filter_map(|l| match l {
+            Line::Entry(e) => Some(e),
+            Line::Raw(_) => None,
+        })
+        .collect()
+}
+
+/// Write the whole ledger again, atomically (a temporary file renamed).
+fn rewrite(work_dir: &Path, lines: &[Line]) -> std::io::Result<()> {
     let path = ledger_path(work_dir);
-    let mut all = entries(work_dir);
-    let cutoff = ts.saturating_sub(KEEP_SECS);
-    if all.first().is_some_and(|e| e.ts < cutoff) {
-        all.retain(|e| e.ts >= cutoff);
-        let text: String = all
-            .iter()
-            .filter_map(|e| serde_json::to_string(e).ok())
-            .map(|l| l + "\n")
-            .collect();
-        let tmp = path.with_extension("jsonl.tmp");
-        std::fs::write(&tmp, text)?;
-        std::fs::rename(&tmp, &path)?;
+    let mut text = String::new();
+    for line in lines {
+        match line {
+            Line::Entry(e) => text.push_str(&serde_json::to_string(e)?),
+            Line::Raw(raw) => text.push_str(raw),
+        }
+        text.push('\n');
+    }
+    let tmp = path.with_extension("jsonl.tmp");
+    std::fs::write(&tmp, text)?;
+    std::fs::rename(&tmp, &path)
+}
+
+/// Append one entry, as one write with its newline; after a newline first
+/// when the file does not end with one (a torn line stays a line apart).
+fn append(work_dir: &Path, entry: &Entry) -> std::io::Result<()> {
+    std::fs::create_dir_all(work_dir)?;
+    let path = ledger_path(work_dir);
+    let mut line = serde_json::to_string(entry)?;
+    line.push('\n');
+    let ends_cleanly = match std::fs::read(&path) {
+        Ok(bytes) => bytes.last().is_none_or(|b| *b == b'\n'),
+        Err(_) => true,
+    };
+    if !ends_cleanly {
+        line.insert(0, '\n');
     }
     let mut file = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open(&path)?;
-    let line = serde_json::to_string(&Entry {
+    file.write_all(line.as_bytes())
+}
+
+/// Add a run to the ledger, dropping entries older than two months (lines
+/// it cannot read are kept).
+pub fn record(work_dir: &Path, ts: u64, usage: Usage) -> std::io::Result<()> {
+    finish(work_dir, ts, None, usage)
+}
+
+/// A run starts: its provisional entry, charged `cap` (the dollars it is
+/// allowed, its timeout) if it never ends ([`settle`]). Not counted
+/// meanwhile.
+pub fn begin(work_dir: &Path, ts: u64, run: &str, cap: Usage) -> std::io::Result<()> {
+    append(
+        work_dir,
+        &Entry {
+            ts,
+            run: Some(run.to_string()),
+            provisional: true,
+            cap_usd: cap.usd.filter(|x| x.is_finite() && *x > 0.0),
+            cap_secs: cap.secs.filter(|s| s.is_finite() && *s >= 0.0),
+            ..Entry::default()
+        },
+    )
+}
+
+/// A run ended: its entry replaces its provisional one (`run`), and
+/// entries older than two months are dropped.
+pub fn finish(work_dir: &Path, ts: u64, run: Option<&str>, usage: Usage) -> std::io::Result<()> {
+    let all = lines(work_dir);
+    let cutoff = ts.saturating_sub(KEEP_SECS);
+    let drop = |l: &Line| match l {
+        Line::Entry(e) => {
+            e.ts < cutoff || (e.provisional && run.is_some() && e.run.as_deref() == run)
+        }
+        Line::Raw(_) => false,
+    };
+    let entry = Entry {
         ts,
         usd: usage.usd,
         secs: usage.secs.filter(|s| s.is_finite() && *s >= 0.0),
         tokens: usage.tokens,
-    })?;
-    writeln!(file, "{line}")
+        run: run.map(str::to_string),
+        ..Entry::default()
+    };
+    if all.iter().any(drop) {
+        let mut kept: Vec<Line> = all.into_iter().filter(|l| !drop(l)).collect();
+        kept.push(Line::Entry(entry));
+        return rewrite(work_dir, &kept);
+    }
+    append(work_dir, &entry)
+}
+
+/// A run that ran no turn (refused by the OpenClaw gateway, deferred):
+/// its provisional entry goes, nothing is charged.
+pub fn cancel(work_dir: &Path, run: &str) -> std::io::Result<()> {
+    let all = lines(work_dir);
+    let ours =
+        |l: &Line| matches!(l, Line::Entry(e) if e.provisional && e.run.as_deref() == Some(run));
+    if !all.iter().any(ours) {
+        return Ok(());
+    }
+    let kept: Vec<Line> = all.into_iter().filter(|l| !ours(l)).collect();
+    rewrite(work_dir, &kept)
+}
+
+/// At a runner's start: the provisional entries left by runs that never
+/// ended (the node crashed or was killed) are charged their caps (the
+/// dollars allowed, the timeout) and marked unfinished. Returns how many.
+pub fn settle(work_dir: &Path) -> std::io::Result<usize> {
+    let mut all = lines(work_dir);
+    let mut settled = 0;
+    for line in &mut all {
+        if let Line::Entry(e) = line
+            && e.provisional
+        {
+            e.provisional = false;
+            e.unfinished = true;
+            e.usd = e.cap_usd;
+            e.secs = e.cap_secs;
+            settled += 1;
+        }
+    }
+    if settled > 0 {
+        rewrite(work_dir, &all)?;
+    }
+    Ok(settled)
 }
 
 /// What was spent today and this month (UTC), as of `now`.
 pub fn spend(work_dir: &Path, now: u64) -> Spend {
     let (today, month) = (day_start(now), month_start(now));
     let mut spend = Spend::default();
-    for entry in entries(work_dir) {
+    for entry in entries(work_dir).into_iter().filter(|e| !e.provisional) {
         let usd = entry.usd.unwrap_or(0.0);
         let secs = entry.secs.unwrap_or(0.0);
         let tokens = entry.tokens.unwrap_or(0);
@@ -384,8 +545,9 @@ pub fn check(budget: &Budget, spend: &Spend, now: u64) -> Verdict {
             tomorrow,
         );
     }
+    // Less than a minute left is none: a run gets at least a minute.
     if let Some(max) = budget.max_minutes_per_month
-        && spend.minutes_month() >= max as f64
+        && spend.secs_month + 60.0 > max as f64 * 60.0
     {
         return paused(
             format!(
@@ -396,7 +558,7 @@ pub fn check(budget: &Budget, spend: &Spend, now: u64) -> Verdict {
         );
     }
     if let Some(max) = budget.max_minutes_per_day
-        && spend.minutes_today() >= max as f64
+        && spend.secs_today + 60.0 > max as f64 * 60.0
     {
         return paused(
             format!(
@@ -443,8 +605,26 @@ pub fn check(budget: &Budget, spend: &Spend, now: u64) -> Verdict {
         budget.max_usd_per_day.map(|max| max - spend.usd_today),
         budget.max_usd_per_month.map(|max| max - spend.usd_month),
     ];
+    let secs = [
+        budget
+            .max_minutes_per_day
+            .map(|max| max as f64 * 60.0 - spend.secs_today),
+        budget
+            .max_minutes_per_month
+            .map(|max| max as f64 * 60.0 - spend.secs_month),
+    ];
+    let tokens = [
+        budget
+            .max_tokens_per_day
+            .map(|max| max.saturating_sub(spend.tokens_today)),
+        budget
+            .max_tokens_per_month
+            .map(|max| max.saturating_sub(spend.tokens_month)),
+    ];
     Verdict::Go {
         remaining_usd: left.into_iter().flatten().reduce(f64::min),
+        remaining_secs: secs.into_iter().flatten().reduce(f64::min),
+        remaining_tokens: tokens.into_iter().flatten().min(),
     }
 }
 
@@ -648,6 +828,8 @@ mod tests {
         match check(&budget, &s, NOW) {
             Verdict::Go {
                 remaining_usd: Some(remaining),
+                remaining_secs: None,
+                remaining_tokens: None,
             } => assert!((remaining - 0.6).abs() < 1e-9),
             paused => panic!("{paused:?}"),
         }
@@ -775,7 +957,9 @@ mod tests {
         assert_eq!(
             check(&budget, &spend(dir.path(), NOW), NOW),
             Verdict::Go {
-                remaining_usd: None
+                remaining_usd: None,
+                remaining_secs: None,
+                remaining_tokens: None,
             }
         );
         let said = describe(&budget, &spend(dir.path(), NOW), "claude");
@@ -805,10 +989,14 @@ mod tests {
         record(dir.path(), NOW - 3600, run(20.0 * 60.0)).unwrap();
         let s = spend(dir.path(), NOW);
         assert!((s.minutes_today() - 20.0).abs() < 1e-9);
+        // 10 of the day's minutes left (30 of the month's): the next run's
+        // timeout is capped to them.
         assert_eq!(
             check(&budget, &s, NOW),
             Verdict::Go {
-                remaining_usd: None
+                remaining_usd: None,
+                remaining_secs: Some(600.0),
+                remaining_tokens: None,
             }
         );
         assert_eq!(
@@ -961,15 +1149,17 @@ mod tests {
             max_usd_per_month: Some(0.0),
             ..AgentSettings::default()
         };
-        assert_eq!(legacy_zero(&day, Some(1)), (true, false));
-        assert_eq!(legacy_zero(&month, Some(1)), (false, true));
-        assert_eq!(legacy_zero(&day, Some(2)), (false, false));
-        assert_eq!(legacy_zero(&day, None), (false, false));
+        let dir = tempfile::tempdir().unwrap();
+        let w = dir.path();
+        assert_eq!(legacy_zero(&day, Some(1), w), (true, false));
+        assert_eq!(legacy_zero(&month, Some(1), w), (false, true));
+        assert_eq!(legacy_zero(&day, Some(2), w), (false, false));
+        assert_eq!(legacy_zero(&day, None, w), (false, false));
         assert_eq!(
-            legacy_zero(&AgentSettings::default(), Some(1)),
+            legacy_zero(&AgentSettings::default(), Some(1), w),
             (false, false)
         );
-        let paused = Budget::of_dir(&day, Some(1));
+        let paused = Budget::of_dir(&day, Some(1), w);
         match check(&paused, &Spend::default(), NOW) {
             Verdict::Paused { why, until } => {
                 assert_eq!(
@@ -995,7 +1185,7 @@ mod tests {
             true
         );
         assert!(
-            Budget::of_dir(&both, Some(1))
+            Budget::of_dir(&both, Some(1), w)
                 .zero_notice("a")
                 .unwrap()
                 .starts_with("agent a: max_usd_per_day = 0 and max_usd_per_month = 0 meant paused before 0.4.5 and now mean no limit")
@@ -1003,15 +1193,27 @@ mod tests {
         // Codex: still paused; OpenClaw: never was.
         assert!(paused.for_runtime("codex").paused_by_zero());
         assert!(!paused.for_runtime("openclaw").paused_by_zero());
-        // Confirmed (revision 2): no limit.
-        let confirmed = Budget::of_dir(&day, Some(2));
+        // Confirmed for the whole directory (revision 2): no limit.
+        let confirmed = Budget::of_dir(&day, Some(2), w);
         assert_eq!(confirmed.zero_notice("claude"), None);
         assert_eq!(
             check(&confirmed, &Spend::default(), NOW),
             Verdict::Go {
-                remaining_usd: None
+                remaining_usd: None,
+                remaining_secs: None,
+                remaining_tokens: None,
             }
         );
+        // Or for this agent only (its marker), at revision 1; another
+        // agent's directory stays paused.
+        let other = tempfile::tempdir().unwrap();
+        confirm(w).unwrap();
+        assert!(confirmed_dir_unpaused(&day, w));
+        assert!(Budget::of_dir(&day, Some(1), other.path()).paused_by_zero());
+    }
+
+    fn confirmed_dir_unpaused(file: &AgentSettings, w: &Path) -> bool {
+        !Budget::of_dir(file, Some(1), w).paused_by_zero()
     }
 
     /// OpenCode and Mistral Vibe: held to dollars from their own cost
@@ -1059,6 +1261,144 @@ mod tests {
                 said.ends_with("1.5k of 1M LLM tokens today, 1.5k of 30M this month"),
                 "{said}"
             );
+        }
+    }
+
+    /// A run's provisional entry (ADR 0034 §6): not counted while it runs,
+    /// replaced by the run's when it ends, gone for a run that ran no turn,
+    /// and, left by a node that stopped during the run, charged its caps
+    /// at the next start, marked unfinished.
+    #[test]
+    fn provisional_entries_are_settled() {
+        let dir = tempfile::tempdir().unwrap();
+        let w = dir.path();
+        let cap = Usage {
+            usd: Some(1.5),
+            secs: Some(1500.0),
+            tokens: None,
+        };
+        begin(w, NOW - 100, "r1", cap).unwrap();
+        assert_eq!(spend(w, NOW).runs_today, 0, "not counted while it runs");
+        finish(
+            w,
+            NOW - 100,
+            Some("r1"),
+            Usage {
+                usd: Some(0.2),
+                secs: Some(30.0),
+                tokens: Some(100),
+            },
+        )
+        .unwrap();
+        let s = spend(w, NOW);
+        assert_eq!((s.runs_today, s.tokens_today), (1, 100));
+        assert!((s.usd_today - 0.2).abs() < 1e-9);
+        // Refused by the gateway: nothing charged.
+        begin(w, NOW - 50, "r2", cap).unwrap();
+        cancel(w, "r2").unwrap();
+        assert_eq!(spend(w, NOW).runs_today, 1);
+        // A run the node never finished (crash, SIGKILL): charged its caps.
+        begin(w, NOW - 10, "r3", cap).unwrap();
+        assert_eq!(settle(w).unwrap(), 1);
+        assert_eq!(settle(w).unwrap(), 0, "settled once");
+        let s = spend(w, NOW);
+        assert_eq!(s.runs_today, 2);
+        assert!((s.usd_today - 1.7).abs() < 1e-9, "{s:?}");
+        assert!((s.secs_today - 1530.0).abs() < 1e-9, "{s:?}");
+        let text = std::fs::read_to_string(ledger_path(w)).unwrap();
+        assert!(text.contains("\"unfinished\":true"), "{text}");
+        assert!(!text.contains("provisional"), "{text}");
+        // Without a dollar cap: an uncosted run, with its timeout.
+        begin(
+            w,
+            NOW - 5,
+            "r4",
+            Usage {
+                usd: None,
+                secs: Some(60.0),
+                tokens: None,
+            },
+        )
+        .unwrap();
+        settle(w).unwrap();
+        assert_eq!(spend(w, NOW).uncosted_today, 1);
+    }
+
+    /// The ledger keeps lines it cannot read, even when it prunes, and an
+    /// entry after a torn line (no trailing newline) starts on a line of
+    /// its own.
+    #[test]
+    fn unreadable_ledger_lines_are_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        let w = dir.path();
+        let old = NOW - 90 * 86_400;
+        std::fs::write(
+            ledger_path(w),
+            format!(
+                "{{\"ts\":{old},\"usd\":1.0}}\nnot json\n{{\"ts\":{},\"usd\":0.5",
+                NOW - 60
+            ),
+        )
+        .unwrap();
+        record(w, NOW, usd(0.1)).unwrap();
+        let text = std::fs::read_to_string(ledger_path(w)).unwrap();
+        assert!(text.contains("not json\n"), "{text}");
+        assert!(text.ends_with('\n'), "{text}");
+        assert!(!text.contains(&format!("\"ts\":{old}")), "pruned: {text}");
+        // The torn line is a line of its own, kept; the new entry counts.
+        let s = spend(w, NOW);
+        assert!((s.usd_today - 0.1).abs() < 1e-9, "{s:?}");
+        // Appending after a torn line: a newline first.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(ledger_path(dir.path()), "{\"ts\":1,\"usd\":0.5").unwrap();
+        record(dir.path(), NOW, usd(0.1)).unwrap();
+        let text = std::fs::read_to_string(ledger_path(dir.path())).unwrap();
+        assert!(text.starts_with("{\"ts\":1,\"usd\":0.5\n{"), "{text}");
+        assert!((spend(dir.path(), NOW).usd_today - 0.1).abs() < 1e-9);
+    }
+
+    /// The run time left caps the next run's timeout, never under a minute:
+    /// with less than a minute left, no run starts.
+    #[test]
+    fn minutes_left_cap_the_run() {
+        let budget = Budget::of(&AgentSettings {
+            max_usd_per_day: Some(0.0),
+            max_minutes_per_day: Some(10),
+            ..AgentSettings::default()
+        });
+        let spent = |secs: f64| Spend {
+            secs_today: secs,
+            secs_month: secs,
+            ..Spend::default()
+        };
+        match check(&budget, &spent(9.0 * 60.0 - 30.0), NOW) {
+            Verdict::Go { remaining_secs, .. } => assert_eq!(remaining_secs, Some(90.0)),
+            p => panic!("{p:?}"),
+        }
+        assert!(matches!(
+            check(&budget, &spent(9.0 * 60.0 + 30.0), NOW),
+            Verdict::Paused { .. }
+        ));
+        let t = std::time::Duration::from_secs(25 * 60);
+        assert_eq!(crate::agent::run_timeout(t, Some(90.0)).as_secs(), 90);
+        assert_eq!(crate::agent::run_timeout(t, Some(10.0)).as_secs(), 60);
+        assert_eq!(crate::agent::run_timeout(t, None), t);
+        assert_eq!(crate::agent::run_timeout(t, Some(1e9)), t);
+        // LLM tokens left, for Vibe's --max-tokens.
+        let tokens = Budget::of(&AgentSettings {
+            max_tokens_per_day: Some(1000),
+            ..AgentSettings::default()
+        });
+        let s = Spend {
+            tokens_today: 400,
+            tokens_month: 400,
+            ..Spend::default()
+        };
+        match check(&tokens, &s, NOW) {
+            Verdict::Go {
+                remaining_tokens, ..
+            } => assert_eq!(remaining_tokens, Some(600)),
+            p => panic!("{p:?}"),
         }
     }
 }

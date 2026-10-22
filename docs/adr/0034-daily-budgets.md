@@ -53,8 +53,7 @@ model costs the machine's time.
   the dollar budget (ADR 0011). The ledger lines gain `secs` and `tokens`;
   an older line counts as 0 of each, and an older wats ignores the new
   fields.
-- **Minutes stop new runs.** A run in progress keeps its own timeout: the
-  budget is checked before a run, never during one. Claude Code still gets
+- **Minutes cap each run and stop new ones** (§6). Claude Code still gets
   the dollars left as `--max-budget-usd`, and no such flag without a
   dollar limit.
 - `agent.max_runs_per_day` (48) still counts the runs without a reported
@@ -97,10 +96,24 @@ and its daily defaults:
 | API key | 5 | 0 | 0 |
 | self-hosted | 0 | 240 (the machine's time) | 0 |
 
-Adjusted for the runtimes: **Codex on an API key gets 5M LLM tokens a
-day** instead of $5, since it reports no cost; LLM tokens are the only
-per-use measure it reports. OpenClaw is not asked how it is paid (its
-spend caps are its own): its line has minutes only, 0 by default.
+Adjusted for the runtimes, by what each reports rather than by name: an
+API key is $5 where the runtime reports a cost, else **5M LLM tokens** where
+it reports them (Codex), else 120 minutes. Cached input counts toward the
+tokens (§2), so 5M is a few dozen Codex runs with most of their input
+cached; it is a starting point, kept rather than lowered. OpenClaw is not
+asked how it is paid (its spend caps are its own): its line has minutes
+only, 0 by default.
+
+**How it is paid has no Enter default** (review, 2026-10-22): the person
+types 1, 2 or 3, unless config.toml already says a budget (its answer is
+the default) or the runtime's API key is in the environment
+(`ANTHROPIC_API_KEY` for Claude Code, `OPENAI_API_KEY` for Codex,
+`MISTRAL_API_KEY` for Vibe; not for OpenCode, which reaches many
+providers): then 2, said in one line. The end of the input with no
+default is no answer: nothing changes. **Without a terminal it is not
+asked at all**: the budget keys and the old-default keys (ADR 0027 §7)
+stay as they are, and the setup revision stays (§5), as for
+`update.security_auto` (ADR 0030).
 
 Then one line shows the result, for the measures the runtime is held to:
 "Daily budget: 120 min, no USD limit, no LLM token limit (monthly: 30×).
@@ -114,7 +127,11 @@ suggests is the default, and its own values are shown.
 
 The values are written only where they differ from the defaults (ADR
 0027, 0.4.5), so a subscription writes `max_usd_per_day = 0.0` and
-`max_minutes_per_day = 120`.
+`max_minutes_per_day = 120`. That also unsets a value the user had pinned
+when it equals today's default (`max_usd_per_day = 2` set by hand): the
+key then follows the default if a release changes it. When setup switches
+the node to another runtime, the new agent's own table (or the defaults)
+is the baseline, not the previous agent's values.
 
 ### 4. Where it shows
 
@@ -134,9 +151,11 @@ or `max_usd_per_month = 0` paused the agent; since, it means no limit. An
 upgrade must not turn a pause into free spending by itself. So when an
 agent's table (`[agent]` or `[agents.<name>]`) sets one of them to 0 and
 the data directory's setup revision is below 2 (`ZERO_CONFIRMED_REVISION`:
-the revision whose budget question settles it), the agent **stays
+the revision whose budget question settles it) and the agent's budget is
+not confirmed (no `<agent dir>/budget-confirmed`), the agent **stays
 paused**: `check` returns a pause "until you run `wats setup`", whatever
-was spent, and no run starts.
+was spent, and no run starts. The confirmation is **per agent** (review,
+2026-10-22): one agent's answer never lifts another's pause.
 
 - One loud line says it, in `wats status` and the MCP `status`
   (`budget_paused`, and the agent's `notice`), and at the node's start:
@@ -144,17 +163,51 @@ was spent, and no run starts.
   no limit; it stays paused until you run `wats setup` (or set
   agents.X.enabled = false to keep it off)". The agent's budget line
   starts with "paused until `wats setup`".
-- The budget question settles it, in `wats setup` and in the catch-up of
-  a bare `wats` on a terminal: it says what the 0 meant, offers the
-  preset of the answer (never the 0 as it is), writes the budget and
-  records revision 2. The other agents' zeros, which that revision then
-  turns into no limit, are each named in a warning with the commands to
-  set a budget or turn the agent off.
-- A catch-up with nothing to ask (no enabled agent) does not record
-  revision 2 while a table has such a 0, so a disabled agent's pause
-  holds until `wats setup`.
+- The budget question settles it for its agent, in `wats setup` and in
+  the catch-up of a bare `wats` on a terminal: it says what the 0 meant,
+  offers the preset of the answer (never the 0 as it is), writes the
+  budget and writes the agent's `budget-confirmed`. Every other agent
+  with such a 0, the old `[agent]` table included (which `wats --agent
+  <runtime>` runs from `<data dir>/agent`), then gets its own budget
+  question, written to its own table and confirmed; one left unanswered
+  (the end of the input) stays paused, with a warning.
+- **Revision 2 is recorded only when a person answered the budget
+  question (with an agent) and no agent is left with an unconfirmed 0.**
+  Otherwise the revision stays, so that the next bare `wats` on a
+  terminal asks again (a catch-up does not ask an agent already
+  confirmed). Without a terminal nothing is asked, nothing is confirmed
+  and the revision stays.
 - Codex is held to it too (a 0 paused it then, though it reports no
   cost); OpenClaw is not (its USD budgets never applied).
+
+### 6. Each run within the budget, and runs that never end
+
+(Review, 2026-10-22.)
+
+- **The minutes left cap the run's timeout.** A run gets `agent.timeout`,
+  or less: the minutes left today and this month, never under one
+  minute. With less than a minute left, no run starts: the budget is
+  paused until the window resets. The run time a run actually used is
+  what the ledger counts.
+- **LLM tokens cannot be capped per run** for most runtimes: Claude Code,
+  Codex and OpenCode have no flag for it, so a run may go past the tokens
+  left, and the next one does not start. Mistral Vibe has one: it gets
+  `--max-tokens <left>` (unless its extra arguments set it), as it gets
+  `--max-price <dollars left>`.
+- **A run that never ends is charged.** When a run starts, the ledger gets
+  a provisional entry with its id and its caps: its timeout, and the
+  dollars it may spend (Claude Code's `--max-budget-usd`, Vibe's
+  `--max-price`; none for the others). The run's own entry replaces it
+  when it ends; a run that ran no turn (refused by OpenClaw's gateway,
+  deferred) removes it. A provisional entry still there when a runner
+  starts is from a run whose node crashed or was killed (SIGKILL): it is
+  charged its caps and marked `unfinished`, and the runner logs it once.
+  Provisional entries are not counted while their run runs.
+- **The ledger keeps what it cannot read.** A line that is not an entry
+  (a torn write, a newer format) is kept as it is, also when old entries
+  are pruned; each entry is written in one append with its newline, after
+  a newline first when the file does not end with one; a rewrite goes
+  through a temporary file renamed.
 
 ## Alternatives
 
@@ -168,9 +221,10 @@ was spent, and no run starts.
   depend on the provider's caching.
 - **A token budget for every runtime, 0 where unknown.** Rejected: a limit
   that is never reached would read as enforced.
-- **Cut a run when the minutes run out.** Rejected: a run cut in the
-  middle may leave a claim or a half-written answer; the timeout bounds a
-  run.
+- **Cut a run when the minutes run out, whatever its timeout.** Rejected
+  as such: the run's timeout is set to the minutes left instead (§6), so
+  the cut is the timeout's, known at the start, and never under a
+  minute.
 
 ## Consequences
 
@@ -189,7 +243,7 @@ was spent, and no run starts.
 
 ## Later
 
-- Pass the LLM tokens left today as Vibe's `--max-tokens` per run, as
-  the dollars left go to `--max-price`.
+- A per-run LLM token cap for the runtimes that get one (Claude Code,
+  Codex and OpenCode have none today).
 - A per-node budget across agents, if several agents share one
   subscription.

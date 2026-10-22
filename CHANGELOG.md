@@ -25,9 +25,14 @@
   in `wats status`, at the node's start and in the MCP `status`
   (`budget_paused`): "agent X: max_usd_per_day = 0 meant paused before
   0.4.5 and now means no limit; it stays paused until you run `wats
-  setup` (or set agents.X.enabled = false to keep it off)". The budget
-  question of `wats setup`, or of the next bare `wats` on a terminal,
-  settles it. To keep an agent off, use `agents.<name>.enabled = false`.
+  setup` (or set agents.X.enabled = false to keep it off)". Each such
+  agent's own budget question, in `wats setup` or the next bare `wats` on
+  a terminal, settles it for that agent; `wats setup` without a terminal
+  changes no budget. To keep an agent off, use `agents.<name>.enabled =
+  false`.
+- **The budget question has no Enter default**: type 1, 2 or 3 (with
+  `ANTHROPIC_API_KEY`, `OPENAI_API_KEY` or `MISTRAL_API_KEY` set for the
+  agent's runtime, 2 is the default).
 - **One new setup question** (revision 2): a node with an agent is asked
   its budget once, at its next bare `wats` on a terminal. A node without
   an agent is asked nothing.

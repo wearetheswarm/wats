@@ -1488,6 +1488,15 @@ impl ConfigFile {
         self.doc.get(name).is_some()
     }
 
+    /// Whether the old `[agent]` table itself sets `leaf`, whatever
+    /// `[agents.<name>]` tables the file has too.
+    pub fn agent_table_has(&self, leaf: &str) -> bool {
+        self.doc
+            .get("agent")
+            .and_then(|t| t.as_table_like())
+            .is_some_and(|t| t.get(leaf).is_some())
+    }
+
     /// The names of the `[agents.<name>]` tables.
     pub fn agent_names(&self) -> Vec<String> {
         self.doc

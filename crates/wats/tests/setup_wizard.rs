@@ -94,6 +94,11 @@ impl Machine {
             .env("XDG_CONFIG_HOME", self.path("home/.config"))
             .env("XDG_DATA_HOME", self.path("home/.local/share"))
             .env_remove("WATS_OPENCODE")
+            // No API key from the environment: the budget question has no
+            // default (a test sets one when it wants it).
+            .env_remove("ANTHROPIC_API_KEY")
+            .env_remove("OPENAI_API_KEY")
+            .env_remove("MISTRAL_API_KEY")
             .env("VIBE_HOME", self.path("vibe"))
             .env("XDG_STATE_HOME", self.path("xdg/state"))
             .env("XDG_CACHE_HOME", self.path("xdg/cache"))
@@ -354,8 +359,9 @@ n
 }
 
 /// Enter for every question: Vibe only on PATH, so a Vibe agent (ADR
-/// 0033), quick (swarm-only, the budget of a subscription, the drawn
-/// name), Vibe registered for your own sessions (all), and the node in the
+/// 0033), quick (swarm-only, the budget of an API key, whose key is in the
+/// environment, the drawn name), Vibe registered for your own sessions
+/// (all), and the node in the
 /// background, recommended (ADR 0027, 0.4.5). Not a UTF-8 locale, and
 /// NO_COLOR: the screens in plain ASCII.
 #[test]
@@ -363,7 +369,12 @@ fn wizard_defaults_run_the_node_in_the_background() {
     let machine = Machine::new();
     machine.fake_vibe();
     let mut command = machine.wats(&[], true);
-    command.env("LANG", "C").env("NO_COLOR", "1");
+    // A key in the environment (a fake: the fake Vibe never reads it):
+    // the budget question's default is then an API key.
+    command
+        .env("LANG", "C")
+        .env("NO_COLOR", "1")
+        .env("MISTRAL_API_KEY", "not-a-real-key");
     let out = machine.spawn(command, "").wait_with_output().unwrap();
     let said = text(&out.stdout);
     assert!(out.status.success(), "{out:?}");
@@ -387,7 +398,14 @@ fn wizard_defaults_run_the_node_in_the_background() {
     assert!(!said.contains("(agent.access)"), "{said}");
     assert!(!said.contains("(node.name)"), "{said}");
     assert!(said.contains("Node name: "), "{said}");
-    assert!(said.contains("How is this agent paid? [1]: "), "{said}");
+    assert!(
+        said.contains(
+            "MISTRAL_API_KEY is set: Mistral Vibe bills that API key per use, so 2 is the \
+             default."
+        ),
+        "{said}"
+    );
+    assert!(said.contains("How is this agent paid? [2]: "), "{said}");
     assert!(
         said.contains("Set up wats in all the agent CLIs found (Mistral Vibe)"),
         "{said}"
@@ -399,12 +417,12 @@ fn wizard_defaults_run_the_node_in_the_background() {
     assert!(said.contains(WHERE), "{said}");
     let node = machine.running().expect("ps lists it");
     assert_eq!(node["mode"], "detached", "{node}");
-    assert_eq!(machine.revision().as_deref(), Some("2\n"));
+    assert_eq!(machine.revision().as_deref(), Some("2\n"), "{said}");
     // Quick wrote the agent, its budget and the recommended security
     // updates, nothing else.
     let config = std::fs::read_to_string(machine.data().join("config.toml")).unwrap();
     assert!(config.contains("\nruntime = \"vibe\"\n"), "{config}");
-    assert!(config.contains("\nmax_minutes_per_day = 120\n"), "{config}");
+    assert!(config.contains("\nmax_usd_per_day = 5.0\n"), "{config}");
     assert!(!config.contains("\naccess = "), "{config}");
     assert!(config.contains("\nsecurity_auto = true\n"), "{config}");
     assert!(config.contains("# max = \"10G\""), "{config}");
@@ -456,16 +474,17 @@ fn quick_and_detailed_with_an_agent() {
     for name in ["claude", "codex"] {
         machine.fake_cli(name);
     }
-    // Claude (Enter), quick (Enter), a subscription (Enter), the line
+    // Claude (Enter), quick (Enter), a subscription (1), the line
     // edited; all (Enter); not now (d, 3).
     let out = machine
-        .spawn(machine.wats(&[], true), "\n\n\nmin=90 usd=1\n\nd\n3\n")
+        .spawn(machine.wats(&[], true), "\n\n1\nmin=90 usd=1\n\nd\n3\n")
         .wait_with_output()
         .unwrap();
     let said = text(&out.stdout);
     assert!(out.status.success(), "{out:?}");
     assert!(said.contains(MODE), "{said}");
-    assert!(said.contains("How is this agent paid? [1]: "), "{said}");
+    // No default: typed.
+    assert!(said.contains("How is this agent paid? [1/2/3]: "), "{said}");
     assert!(
         said.contains(
             "Daily budget: 120 min, no USD limit, no LLM token limit (monthly: 30×). Enter to \
@@ -987,7 +1006,7 @@ fn the_wizard_offers_opencode() {
             machine.wats(&["setup"], true),
             // OpenCode, its model, quick, a subscription, the budget as
             // offered, all, not now.
-            "\nazure/gpt-test\n\n\n\n\nn\n",
+            "\nazure/gpt-test\n\n1\n\n\nn\n",
         )
         .wait_with_output()
         .unwrap();
@@ -1029,7 +1048,7 @@ fn the_wizard_offers_vibe_without_workspace() {
     // Vibe, detailed: storage, timeout, turns, the budget (paid, line),
     // then its access (workspace refused, inherit), networks, security
     // updates, name; one by one: Vibe yes; not now.
-    let input = "\nd\n\n\n\n\n\nworkspace\ninherit\n\n\n\nd\n\nn\n";
+    let input = "\nd\n\n\n\n1\n\nworkspace\ninherit\n\n\n\nd\n\nn\n";
     let out = machine
         .spawn(machine.wats(&["setup"], true), input)
         .wait_with_output()
@@ -1060,4 +1079,48 @@ fn the_wizard_offers_vibe_without_workspace() {
     assert!(vibe.contains("name = \"wats\""), "{vibe}");
     // Detection never ran it.
     assert!(!machine.calls().contains("vibe "), "{}", machine.calls());
+}
+
+/// `wats setup` without a terminal (`</dev/null`) on a config.toml of 0.4.4
+/// with a USD budget of 0 and the old defaults 10m and 10: nothing of them
+/// changes, the 0 stays a pause, and the revision stays (ADR 0034 §5).
+#[test]
+fn setup_without_a_terminal_changes_no_budget() {
+    let machine = Machine::new();
+    machine.fake_cli("claude");
+    std::fs::create_dir_all(machine.data()).unwrap();
+    let old = "[agents.claude]\nruntime = \"claude\"\ntimeout = \"10m\"\nmax_turns = 10\n\
+               max_usd_per_day = 0\n";
+    std::fs::write(machine.data().join("config.toml"), old).unwrap();
+    let out = machine
+        .wats(
+            &["--infra", "none", "--no-default-bootstrap", "setup"],
+            false,
+        )
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    let said = text(&out.stdout);
+    assert!(out.status.success(), "{out:?}");
+    assert!(
+        said.contains("Budget: not asked without a terminal"),
+        "{said}"
+    );
+    assert!(!said.contains("Drop them"), "{said}");
+    assert_eq!(
+        std::fs::read_to_string(machine.data().join("config.toml")).unwrap(),
+        old
+    );
+    assert!(machine.revision().is_none());
+    let out = machine
+        .wats(
+            &["--infra", "none", "--no-default-bootstrap", "status"],
+            false,
+        )
+        .output()
+        .unwrap();
+    assert!(
+        text(&out.stdout).contains("budget_paused: agent claude"),
+        "{out:?}"
+    );
 }

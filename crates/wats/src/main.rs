@@ -2782,8 +2782,25 @@ async fn offer_background(
             println!("To apply this setup, restart it: {how}");
             return Ok(());
         }
+        // Acted on only if it is still the node that was asked about: the
+        // same process, started at the same time.
+        let now = NodeEntry::look(dir.clone()).await;
+        if !now.running || now.pid() != entry.pid() || now.started() != entry.started() {
+            println!(
+                "The node changed while you answered ({}): nothing done. To apply this setup: {how}",
+                if now.running {
+                    format!(
+                        "pid {} now",
+                        now.pid().map_or_else(|| "?".into(), |p| p.to_string())
+                    )
+                } else {
+                    "it stopped".to_string()
+                }
+            );
+            return Ok(());
+        }
         if !takeover {
-            stop_node(&entry, Duration::from_secs(10), "`wats setup`").await?;
+            stop_node(&now, Duration::from_secs(10), "`wats setup`").await?;
         }
         return start_detached(args, &dir).await;
     }
@@ -5920,7 +5937,7 @@ fn agent_info(
     data_dir: &std::path::Path,
 ) -> wats::agent::AgentInfo {
     let revision = wats::firstrun::stored_revision(data_dir);
-    let budget = wats::budget::Budget::of_dir(&member.settings, revision)
+    let budget = wats::budget::Budget::of_dir(&member.settings, revision, &member.work_dir)
         .for_runtime(member.runtime.as_deref().unwrap_or("claude"));
     wats::agent::AgentInfo {
         name: member.name.clone(),
@@ -6005,7 +6022,8 @@ fn agent_config(
     // A USD budget of 0 from before 0.4.5 keeps it paused until `wats
     // setup` confirms it (ADR 0034 §5).
     let revision = wats::firstrun::stored_revision(data_dir);
-    let budget = wats::budget::Budget::of_dir(file, revision).for_runtime(&runtime);
+    let budget =
+        wats::budget::Budget::of_dir(file, revision, &member.work_dir).for_runtime(&runtime);
     let mut openclaw = wats::openclaw::Target::default();
     if runtime == "openclaw" {
         wats::openclaw::check_access(access, &allow, file.review == Some(true))?;
@@ -6471,9 +6489,12 @@ async fn agent_watch(
                     .as_ref()
                     .map_or(settings.agent.runtime.as_deref(), |m| m.runtime.as_deref())
                     .unwrap_or("claude");
-                let budget =
-                    wats::budget::Budget::of_dir(own, wats::firstrun::stored_revision(data_dir))
-                        .for_runtime(runtime);
+                let budget = wats::budget::Budget::of_dir(
+                    own,
+                    wats::firstrun::stored_revision(data_dir),
+                    &work_dir,
+                )
+                .for_runtime(runtime);
                 let now = unix_now();
                 let spend = wats::budget::spend(&work_dir, now);
                 let paused = match wats::budget::check(&budget, &spend, now) {

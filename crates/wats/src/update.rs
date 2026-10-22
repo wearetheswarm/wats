@@ -729,6 +729,10 @@ pub fn keys_unknown_to(data_dir: &Path, version: Version) -> Vec<String> {
         }
         match key.strip_prefix("agent.") {
             Some(leaf) if crate::settings::is_agent_leaf(leaf) && !agents.is_empty() => {
+                // The old [agent] table too, next to [agents.<name>] ones.
+                if file.agent_table_has(leaf) {
+                    keys.push(key.to_string());
+                }
                 for name in &agents {
                     let named = format!("agents.{name}.{leaf}");
                     if file.get(&named).is_some() {
@@ -2562,6 +2566,26 @@ mod tests {
                 "agents.codex.max_tokens_per_day"
             ]
         );
+        // The old [agent] table, next to [agents.<name>] ones: named too.
+        std::fs::write(
+            &config,
+            "[agent]\nmax_minutes_per_day = 60\n\n[agents.claude]\nruntime = \"claude\"\n\
+             max_tokens_per_day = 1000\n",
+        )
+        .unwrap();
+        assert_eq!(
+            keys_unknown_to(&data, Version(0, 4, 4)),
+            [
+                "agent.max_minutes_per_day",
+                "agents.claude.max_tokens_per_day"
+            ]
+        );
+        std::fs::write(
+            &config,
+            "[agents.claude]\nruntime = \"claude\"\nmax_minutes_per_day = 120\n\n\
+             [agents.codex]\nruntime = \"codex\"\nmax_tokens_per_day = 5000000\n",
+        )
+        .unwrap();
         fake("0.4.4");
         let err = check_rollback(&old, &data, Version(0, 4, 5))
             .unwrap_err()

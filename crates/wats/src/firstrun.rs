@@ -336,13 +336,13 @@ pub struct Choices {
     pub values: Vec<(&'static str, String)>,
     pub keep_runtime: bool,
     pub quick: bool,
+    /// The budget question was answered (by a person), for this agent.
+    pub budget_for: Option<String>,
 }
 
-/// The value of `key` in `settings`, as `wats config set` takes it.
-fn current(settings: &Settings, key: &str) -> Option<String> {
-    let agent = settings
-        .primary_agent()
-        .map_or(&settings.agent, |(_, table)| table);
+/// The value of `key` in `settings`, as `wats config set` takes it; an
+/// agent's key from `agent`, the table setup asks about.
+fn current(settings: &Settings, agent: &settings::AgentSettings, key: &str) -> Option<String> {
     match key {
         "storage.max" => settings.storage.max.clone(),
         "agent.timeout" => agent.timeout.clone(),
@@ -473,9 +473,10 @@ fn ask_vibe_access(
     input: &mut impl BufRead,
     out: &mut impl Write,
     settings: &Settings,
+    table: &settings::AgentSettings,
 ) -> Result<String> {
     let key = "agent.access";
-    let default = current(settings, key)
+    let default = current(settings, table, key)
         .filter(|v| crate::vibe::access(Some(v)).is_ok())
         .unwrap_or_else(|| "swarm-only".to_string());
     let answer = loop {
@@ -635,18 +636,60 @@ pub fn prompt(
     settings: &Settings,
 ) -> Result<Choices> {
     writeln!(out, "{SETUP_HEADER}")?;
-    prompt_after(input, out, found, settings, &QUESTIONS, 0, true, None)
+    prompt_after(input, out, found, settings, &QUESTIONS, 0, &Ctx::person())
+}
+
+/// How setup asks (ADR 0027, ADR 0034).
+#[derive(Debug, Clone)]
+struct Ctx {
+    /// The whole setup, which asks quick or detailed first; a catch-up
+    /// asks its few questions.
+    full: bool,
+    /// A person answers (stdin a terminal): only then are the budget and
+    /// the old defaults asked; without one they stay as they are.
+    person: bool,
+    /// The agents whose USD budget of 0 from before 0.4.5 is not
+    /// confirmed, by name (day, month).
+    zeros: Vec<(String, (bool, bool))>,
+    /// The agents whose budget the budget question already confirmed (ADR
+    /// 0034 §5): a catch-up does not ask it again.
+    confirmed: Vec<String>,
+    /// The API key variable set for a runtime, if any: the budget
+    /// question's default then is "API key".
+    api_key: fn(&str) -> Option<&'static str>,
+}
+
+impl Ctx {
+    /// A person, the whole setup, no API key looked up.
+    fn person() -> Ctx {
+        Ctx {
+            full: true,
+            person: true,
+            zeros: Vec::new(),
+            confirmed: Vec::new(),
+            api_key: |_| None,
+        }
+    }
+}
+
+/// The API key variable of `runtime` set in this environment: Claude
+/// Code's `ANTHROPIC_API_KEY`, Codex's `OPENAI_API_KEY`, Mistral Vibe's
+/// `MISTRAL_API_KEY` (OpenCode reaches many providers: none).
+fn env_api_key(runtime: &str) -> Option<&'static str> {
+    let var = match runtime {
+        "claude" => "ANTHROPIC_API_KEY",
+        "codex" => "OPENAI_API_KEY",
+        "vibe" => "MISTRAL_API_KEY",
+        _ => return None,
+    };
+    std::env::var_os(var).filter(|v| !v.is_empty()).map(|_| var)
 }
 
 /// The first line of `wats setup` without its screens.
 const SETUP_HEADER: &str = "wats setup: the node's main choices. Enter accepts the [default].";
 
 /// Ask those of `questions` newer than `revision` (0: all of them), after
-/// the agent runtime when it is newer too. `full`: the whole setup, which
-/// asks quick or detailed first; a catch-up asks its few questions.
-/// `stored`: the data directory's setup revision, which tells whether a
-/// USD budget of 0 is one from before 0.4.5 (ADR 0034 §5).
-#[allow(clippy::too_many_arguments)]
+/// the agent runtime when it is newer too, as `ctx` says.
 fn prompt_after(
     input: &mut impl BufRead,
     out: &mut impl Write,
@@ -654,8 +697,7 @@ fn prompt_after(
     settings: &Settings,
     questions: &[Question],
     revision: u32,
-    full: bool,
-    stored: Option<u32>,
+    ctx: &Ctx,
 ) -> Result<Choices> {
     let primary = settings
         .primary_agent()
@@ -670,6 +712,24 @@ fn prompt_after(
     if openclaw && !keep_runtime {
         writeln!(out, "{}", crate::openclaw::SPEND_CAPS)?;
     }
+    // The agent asked about, and its table: the primary agent's when it
+    // keeps its runtime; another runtime is the agent named after it, from
+    // its own table if there is one, else the defaults.
+    let fresh = settings::AgentSettings::default();
+    let (target, table) = match settings.primary_agent() {
+        Some((name, t)) if t.runtime == runtime => (Some(name), t),
+        Some(_) => (
+            runtime.clone(),
+            runtime
+                .as_ref()
+                .and_then(|r| settings.agents.get(r))
+                .unwrap_or(&fresh),
+        ),
+        None => (runtime.clone(), &settings.agent),
+    };
+    let same_agent = settings
+        .primary_agent()
+        .is_some_and(|(_, t)| t.runtime == runtime);
     let mut values = Vec::new();
     // OpenCode reaches many providers: its model is asked when it is
     // chosen (ADR 0031 §2), in quick mode too (it goes with the agent's
@@ -677,7 +737,7 @@ fn prompt_after(
     // setups.
     if runtime.as_deref() == Some("opencode") && !keep_runtime {
         writeln!(out, "{OPENCODE_MODEL_ABOUT}")?;
-        let default = current(settings, "agent.model").unwrap_or_default();
+        let default = current(settings, table, "agent.model").unwrap_or_default();
         let model = loop {
             write!(out, "{OPENCODE_MODEL_QUESTION} (agent.model) [{default}]: ")?;
             let model = match read_answer(input, out)? {
@@ -695,15 +755,13 @@ fn prompt_after(
     }
     // Quick or detailed: asked with the whole setup only (a catch-up asks
     // its few new questions).
-    let quick = full && ask_mode(input, out, settings, runtime.as_deref())?;
+    let quick = ctx.full && ask_mode(input, out, settings, table, runtime.as_deref())?;
     // Values of the old defaults would pin them (ADR 0027, 0.4.5): offered
-    // to drop, in both modes, for the agent asked about.
+    // to drop, in both modes, for the agent asked about; asked of a person
+    // only, never dropped without an answer.
     let mut dropped = Vec::new();
-    let same_agent = settings
-        .primary_agent()
-        .is_some_and(|(_, t)| t.runtime == runtime);
-    if runtime.is_some() && same_agent {
-        let old = old_defaults_of(primary_table(settings));
+    if runtime.is_some() && same_agent && ctx.person {
+        let old = old_defaults_of(table);
         if !old.is_empty() {
             let question = format!(
                 "config.toml sets {}: the defaults of wats 0.4.4 and older, now {}. Drop {}, \
@@ -725,11 +783,12 @@ fn prompt_after(
         }
     }
     let vibe = runtime.as_deref() == Some("vibe");
+    let mut budget_for = None;
     for q in questions {
         if vibe && q.key == "agent.access" && q.since > revision {
             // Quick: unset is swarm-only for Vibe (it refuses workspace).
             if !quick {
-                values.push((q.key, ask_vibe_access(input, out, settings)?));
+                values.push((q.key, ask_vibe_access(input, out, settings, table)?));
             }
             continue;
         }
@@ -741,13 +800,30 @@ fn prompt_after(
         }
         if q.budget {
             let runtime = runtime.as_deref().unwrap_or("claude");
-            values.extend(ask_budget(input, out, settings, runtime, stored)?);
+            if !ctx.full && target.as_ref().is_some_and(|t| ctx.confirmed.contains(t)) {
+                // Already confirmed: a catch-up does not ask it again.
+                budget_for = target.clone();
+                continue;
+            }
+            if !ctx.person {
+                writeln!(out, "{BUDGET_NOT_ASKED}")?;
+                continue;
+            }
+            let zero = target
+                .as_ref()
+                .and_then(|name| ctx.zeros.iter().find(|(n, _)| n == name))
+                .map_or((false, false), |(_, z)| *z);
+            let api_key = (ctx.api_key)(runtime);
+            if let Some(budget) = ask_budget(input, out, table, runtime, zero, "agent", api_key)? {
+                values.extend(budget);
+                budget_for = target.clone();
+            }
             continue;
         }
         if quick {
             continue;
         }
-        let default = current(settings, q.key)
+        let default = current(settings, table, q.key)
             .filter(|_| !dropped.contains(&q.key))
             .unwrap_or_else(|| {
                 settings::find_key(q.key)
@@ -763,15 +839,15 @@ fn prompt_after(
         values,
         keep_runtime,
         quick,
+        budget_for,
     })
 }
 
-/// The table of the agent setup asks about (as [`current`] reads it).
-fn primary_table(settings: &Settings) -> &settings::AgentSettings {
-    settings
-        .primary_agent()
-        .map_or(&settings.agent, |(_, table)| table)
-}
+/// Said instead of the budget question without a terminal: the budget, and
+/// the pause of a USD budget of 0 from before 0.4.5, need a person.
+pub const BUDGET_NOT_ASKED: &str = "Budget: not asked without a terminal, so the agent's \
+budget stays as it is (and a USD budget of 0 from before 0.4.5 stays a pause). Run `wats \
+setup` on a terminal to set it.";
 
 /// The quick or detailed question (ADR 0027, 0.4.5): Enter is quick.
 /// Returns whether quick.
@@ -779,10 +855,11 @@ fn ask_mode(
     input: &mut impl BufRead,
     out: &mut impl Write,
     settings: &Settings,
+    table: &settings::AgentSettings,
     runtime: Option<&str>,
 ) -> Result<bool> {
     let value = |key: &str| {
-        current(settings, key).unwrap_or_else(|| {
+        current(settings, table, key).unwrap_or_else(|| {
             settings::find_key(key)
                 .map_or("", |k| k.default)
                 .to_string()
@@ -804,7 +881,7 @@ fn ask_mode(
         ));
         if runtime == Some("vibe") {
             // Vibe refuses workspace: unset is swarm-only.
-            let access = current(settings, "agent.access")
+            let access = current(settings, table, "agent.access")
                 .filter(|v| crate::vibe::access(Some(v)).is_ok())
                 .unwrap_or_else(|| "swarm-only".to_string());
             kept.push(format!("{access} access"));
@@ -868,21 +945,26 @@ pub struct Daily {
 }
 
 /// The daily budget offered for `paid` and `runtime` (ADR 0034): a
-/// subscription, 120 minutes; an API key, $5 (Codex, which reports no
-/// cost: 5M LLM tokens); self-hosted, 240 minutes of the machine.
-/// OpenClaw: no limit (its spend caps are its own).
+/// subscription, 120 minutes; an API key, $5 where the runtime reports a
+/// cost, else 5M LLM tokens where it reports them (Codex; cached input
+/// counts); self-hosted, 240 minutes of the machine. OpenClaw: no limit
+/// (its spend caps are its own).
 pub fn preset(paid: Paid, runtime: &str) -> Daily {
     let daily = |usd, minutes, tokens| Daily {
         usd,
         minutes,
         tokens,
     };
-    match (paid, runtime) {
-        (_, "openclaw") => daily(0.0, 0, 0),
-        (Paid::Subscription, _) => daily(0.0, 120, 0),
-        (Paid::ApiKey, "codex") => daily(0.0, 0, 5_000_000),
-        (Paid::ApiKey, _) => daily(5.0, 0, 0),
-        (Paid::SelfHosted, _) => daily(0.0, 240, 0),
+    use crate::budget::{reports_cost, reports_tokens};
+    match paid {
+        _ if runtime == "openclaw" => daily(0.0, 0, 0),
+        Paid::Subscription => daily(0.0, 120, 0),
+        // Pay per use: dollars where the runtime reports a cost, else LLM
+        // tokens where it reports them (Codex), else its time.
+        Paid::ApiKey if reports_cost(runtime) => daily(5.0, 0, 0),
+        Paid::ApiKey if reports_tokens(runtime) => daily(0.0, 0, 5_000_000),
+        Paid::ApiKey => daily(0.0, 120, 0),
+        Paid::SelfHosted => daily(0.0, 240, 0),
     }
 }
 
@@ -1019,33 +1101,47 @@ fn current_daily(table: &settings::AgentSettings) -> (Daily, Option<Paid>) {
     (daily, set.then_some(paid))
 }
 
-/// The budget question (ADR 0034), asked in both modes: how the agent is
-/// paid, which picks the metric and its defaults, then the daily budget
-/// on one line that Enter accepts or the user edits ([`parse_daily`]).
-/// Each month is 30 × its day unless config.toml sets it. Returns the
-/// keys to write (those `runtime` is held to).
+/// The budget question (ADR 0034), asked in both modes of a person: how
+/// the agent is paid, which picks the metric and its defaults, then the
+/// daily budget on one line that Enter accepts or the user edits
+/// ([`parse_daily`]). How it is paid has no default but the answer
+/// config.toml already says, or "API key" when the runtime's key is in the
+/// environment (`api_key`). Each month is 30 × its day unless config.toml
+/// sets it. `zero`: the table's USD budget of 0 from before 0.4.5, said and
+/// not offered as it is. `prefix`: the table's keys (`agent`,
+/// `agents.<name>`). Returns the keys to write (those `runtime` is held to),
+/// or `None` at the end of the input: not answered.
 fn ask_budget(
     input: &mut impl BufRead,
     out: &mut impl Write,
-    settings: &Settings,
+    table: &settings::AgentSettings,
     runtime: &str,
-    stored: Option<u32>,
-) -> Result<Vec<(&'static str, String)>> {
-    let table = primary_table(settings);
+    zero: (bool, bool),
+    prefix: &str,
+    api_key: Option<&'static str>,
+) -> Result<Option<Vec<(&'static str, String)>>> {
     let (now, mut was) = current_daily(table);
     writeln!(out, "{BUDGET_GUIDE}")?;
     // A USD budget of 0 from before 0.4.5 paused the agent: said, and not
     // offered as is (it now means no limit). The answer here confirms the
     // budget (ADR 0034 §5).
-    let zero = crate::budget::legacy_zero(table, stored);
     if runtime != "openclaw" && (zero.0 || zero.1) {
-        writeln!(out, "{}", zero_line(zero, "agent"))?;
+        writeln!(out, "{}", zero_line(zero, prefix))?;
         was = None;
     }
     let paid = if runtime == "openclaw" {
         None
     } else {
-        let default = was.unwrap_or(Paid::Subscription);
+        let default = was.or_else(|| api_key.map(|_| Paid::ApiKey));
+        if was.is_none()
+            && let Some(var) = api_key
+        {
+            writeln!(
+                out,
+                "{var} is set: {} bills that API key per use, so 2 is the default.",
+                runtime_label(runtime)
+            )?;
+        }
         let number = |p: Paid| match p {
             Paid::Subscription => 1,
             Paid::ApiKey => 2,
@@ -1056,14 +1152,19 @@ fn ask_budget(
             "  1) subscription (Claude Pro/Max, ChatGPT…)\n  2) API key, pay per use\n  3) \
              self-hosted or free model"
         )?;
+        let shown = default.map_or("1/2/3".to_string(), |d| number(d).to_string());
         loop {
-            write!(out, "{PAID_QUESTION} [{}]: ", number(default))?;
-            let answer = match read_answer(input, out)? {
-                Some(answer) => answer.to_lowercase(),
-                None => break Some(default),
+            write!(out, "{PAID_QUESTION} [{shown}]: ")?;
+            let Some(answer) = read_answer(input, out)? else {
+                // The end of the input: the default, if there is one; else
+                // no answer, and nothing changes.
+                match default {
+                    Some(_) => break default,
+                    None => return Ok(None),
+                }
             };
-            match answer.as_str() {
-                "" => break Some(default),
+            match answer.to_lowercase().as_str() {
+                "" if default.is_some() => break default,
                 "1" | "subscription" | "sub" => break Some(Paid::Subscription),
                 "2" | "api" | "api key" | "key" => break Some(Paid::ApiKey),
                 "3" | "self-hosted" | "self" | "free" | "local" => break Some(Paid::SelfHosted),
@@ -1094,7 +1195,7 @@ fn ask_budget(
         ),
     ]
     .into_iter()
-    .filter_map(|(k, v)| v.map(|v| format!("agent.{k} = {v}")))
+    .filter_map(|(k, v)| v.map(|v| format!("{prefix}.{k} = {v}")))
     .collect();
     let month = if months.is_empty() {
         "monthly: 30×".to_string()
@@ -1133,7 +1234,19 @@ fn ask_budget(
     if crate::budget::reports_tokens(runtime) {
         values.push(("agent.max_tokens_per_day", daily.tokens.to_string()));
     }
-    Ok(values)
+    Ok(Some(values))
+}
+
+/// A runtime as people know it.
+fn runtime_label(runtime: &str) -> &str {
+    match runtime {
+        "claude" => "Claude Code",
+        "codex" => "Codex",
+        "vibe" => "Mistral Vibe",
+        "opencode" => "OpenCode",
+        "openclaw" => "OpenClaw",
+        other => other,
+    }
 }
 
 /// What the budget question says of a USD budget of 0 from before 0.4.5
@@ -1155,41 +1268,130 @@ fn zero_line(zero: (bool, bool), prefix: &str) -> String {
     format!("Note: {}.", parts.join("; "))
 }
 
-/// The agents' tables, other than the one setup asked about (`asked`),
-/// whose USD budget of 0 from before 0.4.5 will mean no limit once setup
-/// records its revision: one warning line each (ADR 0034 §5).
-fn other_zero_warnings(
-    settings: &Settings,
+/// For each agent's table left with an unconfirmed USD budget of 0 from
+/// before 0.4.5 (ADR 0034 §5): its own budget question, asked of a person,
+/// written to its table and confirmed; without a person, or at the end of
+/// the input, a warning that it stays paused. Returns how many are left.
+fn confirm_zeros(
+    data_dir: &Path,
+    input: &mut impl BufRead,
+    out: &mut impl Write,
     stored: Option<u32>,
-    asked: Option<&str>,
-) -> Vec<String> {
-    let mut lines = Vec::new();
-    for (name, table) in &settings.agents {
-        if Some(name.as_str()) == asked || table.runtime.as_deref() == Some("openclaw") {
+    person: bool,
+    api_key: fn(&str) -> Option<&'static str>,
+) -> Result<usize> {
+    let mut left = 0;
+    let settings = Settings::load(data_dir)?;
+    for z in zero_tables(&settings, data_dir, stored) {
+        let answered = if person {
+            writeln!(
+                out,
+                "\nThe agent {} ({}, [{}]) also has a USD budget of 0 from before 0.4.5, which \
+                 paused it: its own budget now.",
+                z.name,
+                runtime_label(&z.runtime),
+                z.prefix
+            )?;
+            ask_budget(
+                input,
+                out,
+                &z.table,
+                &z.runtime,
+                z.zero,
+                &z.prefix,
+                api_key(&z.runtime),
+            )?
+        } else {
+            None
+        };
+        let Some(values) = answered else {
+            writeln!(
+                out,
+                "warning: {}: a USD budget of 0 from before 0.4.5 keeps the agent {} paused, \
+                 until `wats setup` on a terminal sets its budget (or {}.enabled = false keeps \
+                 it off)",
+                z.prefix, z.name, z.prefix
+            )?;
+            left += 1;
             continue;
+        };
+        let mut file = ConfigFile::open(data_dir)?;
+        for (key, value) in &values {
+            let leaf = key.trim_start_matches("agent.");
+            let key = format!("{}.{leaf}", z.prefix);
+            if is_default(&key, value) {
+                if file.get(&key).is_some() {
+                    file.unset(&key)?;
+                }
+            } else {
+                file.set(&key, value)?;
+            }
         }
-        let zero = crate::budget::legacy_zero(table, stored);
-        if zero.0 || zero.1 {
-            lines.push(format!(
-                "warning: agents.{name}: a USD budget of 0 paused it before 0.4.5 and now means \
-                 no limit. Set one (wats config set agents.{name}.max_usd_per_day <n>, or \
-                 max_minutes_per_day), or keep it off: wats config set agents.{name}.enabled \
-                 false"
-            ));
-        }
+        file.save()?;
+        crate::budget::confirm(&z.work_dir)
+            .with_context(|| format!("write {}", z.work_dir.display()))?;
     }
-    lines
+    Ok(left)
 }
 
-/// Whether a table of `settings` has a USD budget of 0 from before 0.4.5.
-fn any_legacy_zero(settings: &Settings, stored: Option<u32>) -> bool {
-    std::iter::once(&settings.agent)
-        .chain(settings.agents.values())
-        .filter(|t| t.runtime.as_deref() != Some("openclaw"))
-        .any(|t| {
-            let zero = crate::budget::legacy_zero(t, stored);
-            zero.0 || zero.1
-        })
+/// An agent's table with a USD budget of 0 from before 0.4.5 that the
+/// budget question has not confirmed (ADR 0034 §5): its agent stays paused.
+#[derive(Debug, Clone)]
+struct ZeroTable {
+    /// The agent's name (`agent` for an old `[agent]` table with no
+    /// runtime, which `wats --agent <runtime>` runs).
+    name: String,
+    /// Its keys: `agent` (the old table) or `agents.<name>`.
+    prefix: String,
+    runtime: String,
+    work_dir: PathBuf,
+    table: settings::AgentSettings,
+    zero: (bool, bool),
+}
+
+/// The agents' tables of `settings`, the old `[agent]` one included, whose
+/// USD budget of 0 from before 0.4.5 is not confirmed (`stored`: the data
+/// directory's setup revision). Not OpenClaw's, whose USD budgets never
+/// applied.
+fn zero_tables(settings: &Settings, data_dir: &Path, stored: Option<u32>) -> Vec<ZeroTable> {
+    let mut tables = Vec::new();
+    let members = crate::roster::configured(settings, data_dir, "user").unwrap_or_default();
+    for m in members {
+        let runtime = m.runtime.clone().unwrap_or_else(|| "claude".to_string());
+        let zero = crate::budget::legacy_zero(&m.settings, stored, &m.work_dir);
+        if runtime == "openclaw" || !(zero.0 || zero.1) {
+            continue;
+        }
+        tables.push(ZeroTable {
+            prefix: if m.legacy {
+                "agent".to_string()
+            } else {
+                format!("agents.{}", m.name)
+            },
+            name: m.name,
+            runtime,
+            work_dir: m.work_dir,
+            table: m.settings,
+            zero,
+        });
+    }
+    // The old [agent] table with no runtime: `wats --agent <runtime>` runs
+    // it, in <data dir>/agent.
+    if settings.legacy_agent && settings.agent.runtime.is_none() {
+        let work_dir = data_dir.join("agent");
+        let zero = crate::budget::legacy_zero(&settings.agent, stored, &work_dir);
+        if zero.0 || zero.1 {
+            tables.push(ZeroTable {
+                name: "agent".to_string(),
+                prefix: "agent".to_string(),
+                runtime: "claude".to_string(),
+                work_dir,
+                table: settings.agent.clone(),
+                zero,
+            });
+        }
+    }
+    tables
 }
 
 /// A key of an agent's table set to the default of wats 0.4.4 and older,
@@ -1507,13 +1709,15 @@ pub fn setup(
             install: Install::detect(),
             terminal: std::io::stdin().is_terminal(),
             machine: None,
+            api_key: env_api_key,
         },
     )
 }
 
 /// [`setup`], `desktop` telling whether this machine has a desktop session
 /// ([`crate::desktop::desktop_session`]): only then is `notify.desktop`
-/// asked (default yes). As if a person answered on a terminal.
+/// asked (default yes). As if a person answered on a terminal, with no API
+/// key in the environment.
 pub fn setup_with(
     data_dir: &Path,
     input: &mut impl BufRead,
@@ -1523,6 +1727,7 @@ pub fn setup_with(
 ) -> Result<Choices> {
     let asker = Asker {
         machine: Some(crate::naming::Machine::default()),
+        api_key: |_| None,
         ..Asker::person()
     };
     setup_asking(data_dir, input, out, path, desktop, asker)
@@ -1559,7 +1764,10 @@ pub fn setup_for_wizard(
         out,
         path,
         crate::desktop::this_desktop_session(),
-        Asker::person(),
+        Asker {
+            api_key: env_api_key,
+            ..Asker::person()
+        },
         0,
         Run::Wizard,
     )?;
@@ -1577,17 +1785,22 @@ pub fn catch_up(
     path: Option<&OsStr>,
     revision: u32,
 ) -> Result<Choices> {
-    catch_up_with(
+    catch_up_asking(
         data_dir,
         input,
         out,
         path,
         revision,
         crate::desktop::this_desktop_session(),
+        Asker {
+            api_key: env_api_key,
+            ..Asker::person()
+        },
     )
 }
 
-/// [`catch_up`], `desktop` as in [`setup_with`].
+/// [`catch_up`], `desktop` as in [`setup_with`], with no API key in the
+/// environment.
 pub fn catch_up_with(
     data_dir: &Path,
     input: &mut impl BufRead,
@@ -1596,14 +1809,34 @@ pub fn catch_up_with(
     revision: u32,
     desktop: bool,
 ) -> Result<Choices> {
+    catch_up_asking(
+        data_dir,
+        input,
+        out,
+        path,
+        revision,
+        desktop,
+        Asker::person(),
+    )
+}
+
+fn catch_up_asking(
+    data_dir: &Path,
+    input: &mut impl BufRead,
+    out: &mut impl Write,
+    path: Option<&OsStr>,
+    revision: u32,
+    desktop: bool,
+    asker: Asker,
+) -> Result<Choices> {
     // Only questions for an agent, and it runs none: nothing to ask. Not
     // with a USD budget of 0 from before 0.4.5 in a table: that pause
     // waits for `wats setup` (ADR 0034 §5).
     let settings = Settings::load(data_dir)?;
-    if pending_questions(&settings, revision) == 0 {
-        if !any_legacy_zero(&settings, stored_revision(data_dir)) {
-            record_revision(data_dir)?;
-        }
+    if pending_questions(&settings, revision) == 0
+        && zero_tables(&settings, data_dir, stored_revision(data_dir)).is_empty()
+    {
+        record_revision(data_dir)?;
         return Ok(Choices {
             keep_runtime: true,
             ..Choices::default()
@@ -1620,7 +1853,7 @@ pub fn catch_up_with(
         out,
         path,
         desktop,
-        Asker::person(),
+        asker,
         revision,
         Run::CatchUp,
     )?;
@@ -1647,15 +1880,20 @@ struct Asker {
     /// The nodes whose names the node name question refuses (ADR 0023
     /// §8); None: this user's, looked up when asked.
     machine: Option<crate::naming::Machine>,
+    /// The API key variable set for a runtime ([`env_api_key`]), for the
+    /// budget question's default.
+    api_key: fn(&str) -> Option<&'static str>,
 }
 
 impl Asker {
-    /// A person on a terminal, with this binary's install.
+    /// A person on a terminal, with this binary's install, no API key
+    /// looked up.
     fn person() -> Asker {
         Asker {
             install: Install::detect(),
             terminal: true,
             machine: None,
+            api_key: |_| None,
         }
     }
 }
@@ -1680,16 +1918,23 @@ fn ask_and_write(
     if revision == 0 && run == Run::Setup {
         writeln!(out, "{SETUP_HEADER}")?;
     }
-    let mut choices = prompt_after(
-        input,
-        out,
-        &found,
-        &settings,
-        &QUESTIONS,
-        revision,
-        run != Run::CatchUp,
-        stored,
-    )?;
+    let person = asker.terminal;
+    let ctx = Ctx {
+        full: run != Run::CatchUp,
+        person,
+        zeros: zero_tables(&settings, data_dir, stored)
+            .into_iter()
+            .map(|z| (z.name, z.zero))
+            .collect(),
+        confirmed: crate::roster::configured(&settings, data_dir, "user")
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|m| crate::budget::confirmed(&m.work_dir))
+            .map(|m| m.name)
+            .collect(),
+        api_key: asker.api_key,
+    };
+    let mut choices = prompt_after(input, out, &found, &settings, &QUESTIONS, revision, &ctx)?;
     // Quick: notify.desktop stays as it is (unset: on with a desktop
     // session), the security updates as recommended.
     if desktop && DESKTOP_SINCE > revision && !choices.quick {
@@ -1711,20 +1956,41 @@ fn ask_and_write(
     if revision == 0 {
         ask_node_name(input, out, data_dir, asker.machine.as_ref(), &mut choices)?;
     }
-    // The other agents' USD budgets of 0 from before 0.4.5 mean no limit
-    // once the revision is recorded: said.
-    let asked = choices
-        .runtime
-        .as_ref()
-        .and_then(|_| settings.primary_agent().map(|(name, _)| name));
-    for line in other_zero_warnings(&settings, stored, asked.as_deref()) {
-        writeln!(out, "{line}")?;
-    }
     let file = apply(data_dir, &choices)?;
     if let Some(on) = security {
         record_answer(data_dir, "security_auto", if on { "yes" } else { "no" })?;
     }
-    record_revision(data_dir)?;
+    // The budget question answered: that agent's budget is confirmed, and a
+    // USD budget of 0 from before 0.4.5 no longer pauses it (ADR 0034 §5).
+    if let Some(name) = &choices.budget_for {
+        let after = Settings::load(data_dir)?;
+        let work_dir = crate::roster::configured(&after, data_dir, "user")
+            .unwrap_or_default()
+            .into_iter()
+            .find(|m| &m.name == name)
+            .map_or_else(|| data_dir.join("agent").join(name), |m| m.work_dir);
+        crate::budget::confirm(&work_dir)
+            .with_context(|| format!("write {}", work_dir.display()))?;
+    }
+    // The other agents with such a 0: each one's budget asked (a person),
+    // else it stays paused.
+    let left = confirm_zeros(data_dir, input, out, stored, person, asker.api_key)?;
+    // Revision 2 once a person answered the budget question (with an agent)
+    // and no agent is left with an unconfirmed 0; else as it was, so that
+    // a terminal asks it next.
+    let budget_due = choices.runtime.is_some() && revision < BUDGET_SINCE;
+    if person && left == 0 && (!budget_due || choices.budget_for.is_some()) {
+        record_revision(data_dir)?;
+    } else if stored.is_some_and(|r| r >= SETUP_REVISION) {
+        // Already there: nothing to lower.
+    } else if left > 0 || budget_due {
+        writeln!(
+            out,
+            "Setup revision kept at {}: run `wats setup` on a terminal to answer the budget \
+             question.",
+            stored.unwrap_or(BASELINE_REVISION)
+        )?;
+    }
     writeln!(out, "Wrote {}", file.display())?;
     Ok((choices, found))
 }
@@ -2423,6 +2689,7 @@ mod tests {
             install: Install::Release,
             terminal: false,
             machine: Some(crate::naming::Machine::default()),
+            api_key: |_| None,
         };
         for input in ["", "\n\ny\n"] {
             let mut out = Vec::new();
@@ -2488,6 +2755,7 @@ mod tests {
                 install,
                 terminal: true,
                 machine: Some(crate::naming::Machine::default()),
+                api_key: |_| None,
             };
             let (choices, _) = ask_and_write(
                 data.path(),
@@ -2579,8 +2847,15 @@ mod tests {
         // workspace is refused, inherit is taken, with its warning.
         let data = tempfile::tempdir().unwrap();
         let mut out = Vec::new();
-        let input = "vibe\nd\n\n\n\n\n\nworkspace\ninherit\n";
-        let choices = setup(data.path(), &mut input.as_bytes(), &mut out, Some(&path)).unwrap();
+        let input = "vibe\nd\n\n\n\n1\n\nworkspace\ninherit\n";
+        let choices = setup_with(
+            data.path(),
+            &mut input.as_bytes(),
+            &mut out,
+            Some(&path),
+            false,
+        )
+        .unwrap();
         let said = String::from_utf8(out).unwrap();
         assert_eq!(choices.runtime.as_deref(), Some("vibe"));
         assert!(said.contains("Vibe cannot keep its tools"), "{said}");
@@ -2611,7 +2886,11 @@ mod tests {
     /// from the defaults written.
     #[test]
     fn enter_accepts_every_default() {
-        let (choices, said) = run(&found(&["claude", "codex"]), &Settings::default(), "");
+        let (choices, said) = run(
+            &found(&["claude", "codex"]),
+            &Settings::default(),
+            "\n\n1\n",
+        );
         assert_eq!(choices.runtime.as_deref(), Some("claude"));
         assert!(choices.quick);
         assert_eq!(
@@ -2635,7 +2914,10 @@ mod tests {
             "{said}"
         );
         assert!(said.contains(BUDGET_GUIDE), "{said}");
-        assert!(said.contains(&format!("{PAID_QUESTION} [1]: ")), "{said}");
+        assert!(
+            said.contains(&format!("{PAID_QUESTION} [1/2/3]: ")),
+            "{said}"
+        );
         assert!(
             said.contains(
                 "Daily budget: 120 min, no USD limit, no LLM token limit (monthly: 30×). Enter \
@@ -2654,8 +2936,9 @@ mod tests {
         assert!(text.contains("\nmax_usd_per_day = 0.0\n"), "{text}");
         assert!(text.contains("\nmax_minutes_per_day = 120\n"), "{text}");
         assert!(text.contains("# max_tokens_per_day = 0"), "{text}");
-        // Detailed, Enter for each: every question, the same budget.
-        let (choices, said) = run(&found(&["claude"]), &Settings::default(), "\nd\n");
+        // Detailed, Enter for each (a subscription): every question, the
+        // same budget.
+        let (choices, said) = run(&found(&["claude"]), &Settings::default(), "\nd\n\n\n\n1\n");
         assert!(!choices.quick);
         let keys: Vec<_> = choices.values.iter().map(|(k, _)| *k).collect();
         assert_eq!(
@@ -2914,7 +3197,7 @@ mod tests {
         let (choices, _) = run(
             &found(&["claude"]),
             &Settings::default(),
-            "\nd\n\n30m\n\n\n\n\n\n",
+            "\nd\n\n30m\n\n1\n\n\n\n",
         );
         apply(dir.path(), &choices).unwrap();
         let text = std::fs::read_to_string(dir.path().join(FILE_NAME)).unwrap();
@@ -3209,8 +3492,10 @@ mod tests {
             &settings,
             &questions,
             1,
-            false,
-            None,
+            &Ctx {
+                full: false,
+                ..Ctx::person()
+            },
         )
         .unwrap();
         let said = String::from_utf8(out).unwrap();
@@ -3244,8 +3529,10 @@ mod tests {
             &after,
             &questions,
             2,
-            false,
-            None,
+            &Ctx {
+                full: false,
+                ..Ctx::person()
+            },
         )
         .unwrap();
         assert!(none.values.is_empty() && out.is_empty());
@@ -3325,27 +3612,35 @@ mod tests {
         assert_eq!(stored_revision(none.path()), Some(2));
     }
 
-    /// A USD budget of 0 from before 0.4.5 (revision 1), when it paused
-    /// the agent: the catch-up's budget question says so, offers the
-    /// preset (not the zero as it is), and confirms it: revision 2, the
-    /// pause lifted. Another agent's zero is warned about. A disabled
-    /// agent's zero keeps the revision as it is (no silent confirmation).
+    /// USD budgets of 0 from before 0.4.5 (revision 1), when they paused
+    /// their agents, in two agents' tables and the old [agent] one (which
+    /// `wats --agent claude` runs): each agent's budget question confirms
+    /// that agent only (its marker), and revision 2 is recorded once none
+    /// is left. A question left unanswered keeps that agent paused and the
+    /// revision as it was.
     #[test]
-    fn a_zero_from_before_is_settled_by_the_budget_question() {
+    fn each_zero_from_before_is_confirmed_on_its_own() {
         let dir = tempfile::tempdir().unwrap();
+        let d = dir.path();
         std::fs::write(
-            dir.path().join(FILE_NAME),
-            "[agents.claude]\nruntime = \"claude\"\nmax_usd_per_day = 0.0\nmax_usd_per_month = 0.0\n\n\
-             [agents.other]\nruntime = \"codex\"\nenabled = false\nmax_usd_per_day = 0.0\n",
+            d.join(FILE_NAME),
+            "[agent]\nmax_usd_per_day = 0.0\n\n\
+             [agents.claude]\nruntime = \"claude\"\nmax_usd_per_day = 0.0\nmax_usd_per_month = 0.0\n\n\
+             [agents.other]\nruntime = \"codex\"\nmax_usd_per_day = 0.0\n",
         )
         .unwrap();
-        let before = Settings::load(dir.path()).unwrap();
-        let stored = stored_revision(dir.path());
+        let settings = Settings::load(d).unwrap();
+        let stored = stored_revision(d);
         assert_eq!(stored, Some(1));
-        assert!(crate::budget::Budget::of_dir(&before.agents["claude"], stored).paused_by_zero());
+        let zeros = zero_tables(&settings, d, stored);
+        let names: Vec<&str> = zeros.iter().map(|z| z.name.as_str()).collect();
+        assert_eq!(names, ["claude", "other", "agent"], "{zeros:?}");
+        // The catch-up: the first agent (claude), a subscription, then the
+        // others in turn; `other` answered, the old [agent] one not (the
+        // end of the input).
         let mut out = Vec::new();
         let choices =
-            catch_up_with(dir.path(), &mut "\n\n".as_bytes(), &mut out, None, 1, false).unwrap();
+            catch_up_with(d, &mut "1\n\n3\n\n".as_bytes(), &mut out, None, 1, false).unwrap();
         let said = String::from_utf8(out).unwrap();
         assert!(
             said.contains(
@@ -3355,29 +3650,67 @@ mod tests {
             ),
             "{said}"
         );
-        // Not the zeros as they are: the subscription preset, by default.
-        assert!(said.contains(&format!("{PAID_QUESTION} [1]: ")), "{said}");
+        // No default for how it is paid: the answer is typed.
+        assert!(
+            said.contains(&format!("{PAID_QUESTION} [1/2/3]: ")),
+            "{said}"
+        );
         assert!(
             said.contains("Daily budget: 120 min, no USD limit"),
             "{said}"
         );
         assert!(
-            said.contains("warning: agents.other: a USD budget of 0 paused it before 0.4.5"),
+            said.contains("The agent other (Codex, [agents.other]) also has a USD budget of 0"),
             "{said}"
         );
         assert!(
-            choices
-                .values
-                .contains(&("agent.max_minutes_per_day", "120".into()))
+            said.contains("Note: agents.other.max_usd_per_day = 0 paused the agent"),
+            "{said}"
         );
-        assert_eq!(stored_revision(dir.path()), Some(2));
-        let after = Settings::load(dir.path()).unwrap();
-        let claude = &after.agents["claude"];
-        assert_eq!(claude.max_minutes_per_day, Some(120));
-        assert!(!crate::budget::Budget::of_dir(claude, Some(2)).paused_by_zero());
+        assert!(
+            said.contains(
+                "warning: agent: a USD budget of 0 from before 0.4.5 keeps the agent agent paused"
+            ),
+            "{said}"
+        );
+        assert_eq!(choices.budget_for.as_deref(), Some("claude"));
+        // claude and other confirmed, the old table not: revision 1 kept.
+        let after = Settings::load(d).unwrap();
+        assert_eq!(after.agents["claude"].max_minutes_per_day, Some(120));
+        assert_eq!(after.agents["other"].max_minutes_per_day, Some(240));
+        assert!(crate::budget::confirmed(&d.join("agent/claude")));
+        assert!(crate::budget::confirmed(&d.join("agent/other")));
+        assert!(!crate::budget::confirmed(&d.join("agent")));
+        assert_eq!(stored_revision(d), Some(1));
+        let left = zero_tables(&after, d, stored_revision(d));
+        assert_eq!(left.len(), 1);
+        assert_eq!(left[0].prefix, "agent");
+        assert!(
+            crate::budget::Budget::of_dir(
+                &after.agents["claude"],
+                Some(1),
+                &d.join("agent/claude")
+            )
+            .zero_notice("claude")
+            .is_none()
+        );
+        assert!(
+            crate::budget::Budget::of_dir(&after.agent, Some(1), &d.join("agent")).paused_by_zero()
+        );
+        // Again: only the old table is asked; answered, revision 2.
+        let mut out = Vec::new();
+        catch_up_with(d, &mut "2\n\n".as_bytes(), &mut out, None, 1, false).unwrap();
+        let said = String::from_utf8(out).unwrap();
+        assert!(!said.contains("agents.other.max_usd_per_day = 0"), "{said}");
+        assert!(
+            said.contains("The agent agent (Claude Code, [agent])"),
+            "{said}"
+        );
+        assert_eq!(stored_revision(d), Some(2));
+        assert_eq!(Settings::load(d).unwrap().agent.max_usd_per_day, Some(5.0));
 
-        // Only a disabled agent's zero: nothing asked, and the revision
-        // not recorded silently.
+        // Only a disabled agent's zero: asked, and at the end of the input
+        // the revision is not recorded.
         let off = tempfile::tempdir().unwrap();
         std::fs::write(
             off.path().join(FILE_NAME),
@@ -3386,7 +3719,90 @@ mod tests {
         .unwrap();
         let mut out = Vec::new();
         catch_up_with(off.path(), &mut "".as_bytes(), &mut out, None, 1, false).unwrap();
-        assert!(out.is_empty(), "{}", String::from_utf8_lossy(&out));
+        let said = String::from_utf8(out).unwrap();
+        assert!(said.contains("keeps the agent claude paused"), "{said}");
         assert_eq!(stored_revision(off.path()), Some(1));
+    }
+
+    /// Without a terminal (`wats setup </dev/null`): the budget and the old
+    /// defaults are not asked, nothing of them changes, a USD budget of 0
+    /// from before 0.4.5 stays a pause, and the revision stays.
+    #[test]
+    fn without_a_terminal_the_budget_stays_as_it_is() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path();
+        let text = "[agents.claude]\nruntime = \"claude\"\ntimeout = \"10m\"\nmax_turns = 10\n\
+                    max_usd_per_day = 0.0\n";
+        std::fs::write(d.join(FILE_NAME), text).unwrap();
+        let piped = Asker {
+            install: Install::Release,
+            terminal: false,
+            machine: Some(crate::naming::Machine::default()),
+            api_key: |_| None,
+        };
+        for input in ["", "\n\n\n\n\n", "y\n2\nusd=9\n"] {
+            let mut out = Vec::new();
+            let (choices, _) = ask_and_write(
+                d,
+                &mut input.as_bytes(),
+                &mut out,
+                None,
+                false,
+                piped.clone(),
+                0,
+                Run::Setup,
+            )
+            .unwrap();
+            let said = String::from_utf8(out).unwrap();
+            assert!(said.contains(BUDGET_NOT_ASKED), "{said}");
+            assert!(!said.contains(PAID_QUESTION), "{said}");
+            assert!(!said.contains("Drop them"), "{said}");
+            assert_eq!(choices.budget_for, None);
+            assert_eq!(std::fs::read_to_string(d.join(FILE_NAME)).unwrap(), text);
+            assert_eq!(stored_revision(d), Some(1));
+            assert!(!crate::budget::confirmed(&d.join("agent/claude")));
+        }
+    }
+
+    /// How the agent is paid has no default, but the answer config.toml
+    /// already says, or "API key" when the runtime's key is in the
+    /// environment (said in one line); not for OpenCode.
+    #[test]
+    fn the_budget_question_defaults_to_an_api_key_in_the_environment() {
+        let ask = |runtime: &str, api_key: Option<&'static str>, input: &str| {
+            let mut out = Vec::new();
+            let values = ask_budget(
+                &mut input.as_bytes(),
+                &mut out,
+                &settings::AgentSettings::default(),
+                runtime,
+                (false, false),
+                "agent",
+                api_key,
+            )
+            .unwrap();
+            (values, String::from_utf8(out).unwrap())
+        };
+        let (values, said) = ask("claude", Some("ANTHROPIC_API_KEY"), "\n\n");
+        assert!(
+            said.contains(
+                "ANTHROPIC_API_KEY is set: Claude Code bills that API key per use, so 2 is the \
+                 default."
+            ),
+            "{said}"
+        );
+        assert!(said.contains(&format!("{PAID_QUESTION} [2]: ")), "{said}");
+        assert!(
+            values
+                .unwrap()
+                .contains(&("agent.max_usd_per_day", "5".into()))
+        );
+        // No key: Enter is no answer, asked again; the end of the input is
+        // none at all.
+        let (values, said) = ask("claude", None, "\n");
+        assert!(said.contains("answer 1, 2 or 3"), "{said}");
+        assert_eq!(values, None);
+        assert_eq!(env_api_key("opencode"), None);
+        assert_eq!(env_api_key("openclaw"), None);
     }
 }

@@ -1157,17 +1157,26 @@ measures, each per UTC day and per UTC month (ADR 0034):
   `sync.initial_max`. An agent you want off is `agents.<name>.enabled =
   false`, not a budget of 0. Before 0.4.5 a USD budget of 0 paused the
   agent: such a 0, in a data directory not set up again since (setup
-  revision below 2), still pauses it, with a line in `wats status`, at the
-  node's start and in the MCP `status` (`budget_paused`), until the budget
-  question of `wats setup` (or of the next bare `wats` on a terminal)
-  settles it.
+  revision below 2), still pauses that agent, with a line in `wats status`,
+  at the node's start and in the MCP `status` (`budget_paused`), until its
+  own budget question (in `wats setup`, or the next bare `wats` on a
+  terminal) confirms it. Each agent with such a 0 is asked in turn; never
+  without a terminal.
 - **Each month is 30 × its day** unless you set it: `max_usd_per_day =
   5` allows $150 a month. A month you set applies as it is (the old
   `agent.max_usd_per_month` keeps working); `0` there means no monthly
   limit.
-- **Minutes count the wall time of each run** and stop new runs once the
-  day's (or the month's) are used. A run in progress keeps its own
-  timeout: it is never cut short by the budget.
+- **Minutes count the wall time of each run.** A run's timeout is
+  `agent.timeout` or the minutes left today and this month, whichever is
+  less (at least a minute); with less than a minute left, no run starts.
+- **LLM tokens stop the next run**: only Mistral Vibe can be capped within
+  a run (`--max-tokens`, the tokens left); Claude Code, Codex and OpenCode
+  have no such flag, so one run may go past what is left. Cached input
+  counts toward them.
+- **A run that never ends is charged**: if the node crashes or is killed
+  during a run, its next start charges that run its timeout and its dollar
+  cap (Claude Code's `--max-budget-usd`, Vibe's `--max-price`), marked
+  unfinished in the ledger.
 - **Per author and per thread**, the [wake limits](#wake-limits) hold
   events before they reach the budget.
 - **When a budget is reached**, the agent pauses until the window resets
@@ -1198,7 +1207,11 @@ What each runtime reports, so what each budget holds it to:
 
 **How the wizard sets it.** It asks "How is this agent paid?", which
 picks the measure and its defaults, then shows the result on one line
-that Enter accepts:
+that Enter accepts. The answer is typed (1, 2 or 3): its only defaults
+are what `config.toml` already says, or "API key" when the runtime's key
+is in the environment (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`,
+`MISTRAL_API_KEY`). Without a terminal, `wats setup` does not ask it and
+changes no budget.
 
 | Answer | Dollars per day | Minutes per day | LLM tokens per day |
 |---|---|---|---|

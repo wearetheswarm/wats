@@ -136,6 +136,15 @@ pub const DEFAULT_MAX_TURNS: u32 = 50;
 pub const OLD_DEFAULT_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 pub const OLD_DEFAULT_MAX_TURNS: u32 = 10;
 
+/// A run's timeout: `agent.timeout`, within the run time left in its
+/// budget (`remaining_secs`), never under a minute (ADR 0034 §6).
+pub fn run_timeout(timeout: Duration, remaining_secs: Option<f64>) -> Duration {
+    match remaining_secs {
+        Some(left) if left.is_finite() => timeout.min(Duration::from_secs_f64(left.max(60.0))),
+        _ => timeout,
+    }
+}
+
 /// Default of `agent.catchup`.
 pub const DEFAULT_CATCHUP: Duration = Duration::from_secs(24 * 3600);
 
@@ -1001,6 +1010,7 @@ async fn start_run(
     trigger: &Trigger,
     prompt: String,
     remaining_usd: Option<f64>,
+    remaining_tokens: Option<u64>,
 ) -> Result<Running> {
     let (record, transcript) = open_run(config, trigger)?;
     let token = node.new_runner_token(crate::node::RunnerRun {
@@ -1013,7 +1023,7 @@ async fn start_run(
         node: node.as_ref(),
         token: Some(token.clone()),
     };
-    let prepared = prepare_command(config, &token, &transcript, remaining_usd);
+    let prepared = prepare_command(config, &token, &transcript, remaining_usd, remaining_tokens);
     // Vibe reads at most 1 MiB of prompt from stdin.
     let prompt = if config.runtime == "vibe" {
         vibe::fit_prompt(prompt)
@@ -1091,6 +1101,7 @@ fn prepare_command(
     token: &str,
     transcript: &std::path::Path,
     remaining_usd: Option<f64>,
+    remaining_tokens: Option<u64>,
 ) -> Result<(tokio::process::Command, std::fs::File)> {
     let file = std::fs::OpenOptions::new().append(true).open(transcript)?;
     let mut command = tokio::process::Command::new(&config.command);
@@ -1140,6 +1151,8 @@ fn prepare_command(
                     access: config.access,
                     max_turns: config.max_turns,
                     max_price: remaining_usd.filter(|_| vibe::ENFORCE_USD_BUDGET),
+                    // The only runtime with a per-run token cap (ADR 0034).
+                    max_tokens: remaining_tokens,
                     export_dir: &export_dir,
                     timeout: config.run_timeout,
                     extra: &config.extra_args,
@@ -1422,6 +1435,9 @@ async fn finish_run(
         Outcome::Stopped => record.status = "stopped".into(),
     }
     if matches!(finished, Finished::Deferred(_)) {
+        if let Err(e) = crate::budget::cancel(&config.work_dir, &record.id) {
+            warn!("agent spend ledger: {e}");
+        }
         let _ = std::fs::remove_file(&running.transcript);
         let _ = std::fs::remove_file(runs::current_path(&config.work_dir));
         return finished;
@@ -1465,18 +1481,23 @@ async fn finish_run(
         let _ = std::fs::remove_dir_all(&dir);
     }
     runs::read_result(&running.transcript, &mut record);
-    // A forward the gateway refused ran no turn.
-    if record.status != "failed"
-        && let Err(e) = crate::budget::record(
+    // A forward the gateway refused ran no turn: its provisional entry
+    // goes. Otherwise the run's entry replaces it.
+    let ledger = if record.status == "failed" {
+        crate::budget::cancel(&config.work_dir, &record.id)
+    } else {
+        crate::budget::finish(
             &config.work_dir,
             record.started,
+            Some(&record.id),
             crate::budget::Usage {
                 usd: record.cost_usd,
                 secs: record.seconds,
                 tokens: record.tokens,
             },
         )
-    {
+    };
+    if let Err(e) = ledger {
         warn!("agent spend ledger: {e}");
     }
     let footer = record.footer();
@@ -2058,6 +2079,16 @@ pub async fn run(
 ) -> Result<()> {
     let me = author_id(&node.author_key(&config.profile)?);
     std::fs::create_dir_all(&config.work_dir)?;
+    // Runs that never ended (the node crashed or was killed): charged their
+    // caps, the dollars they were allowed and their timeout (ADR 0034 §6).
+    match budget::settle(&config.work_dir) {
+        Ok(0) => {}
+        Ok(n) => warn!(
+            "agent: {n} run(s) never ended (the node stopped during them): charged their \
+             timeout and their dollar cap, marked unfinished in the budget ledger"
+        ),
+        Err(e) => warn!("agent spend ledger: {e}"),
+    }
     let mut config = config;
     if config.access == Access::SwarmOnly
         && !config.tools.is_empty()
@@ -2343,7 +2374,8 @@ pub async fn run(
                 }
                 capped = false;
                 let spend = budget::spend(&config.work_dir, unix_now);
-                let remaining_usd = match budget::check(&config.budget, &spend, unix_now) {
+                let (remaining_usd, remaining_secs, remaining_tokens) =
+                    match budget::check(&config.budget, &spend, unix_now) {
                     budget::Verdict::Paused { why, until } => {
                         if paused_until != Some(until) {
                             warn!("agent paused, budget reached: {why}; {}", budget::until(until));
@@ -2352,15 +2384,37 @@ pub async fn run(
                         last_heartbeat = now;
                         continue;
                     }
-                    budget::Verdict::Go { remaining_usd } => {
+                    budget::Verdict::Go {
+                        remaining_usd,
+                        remaining_secs,
+                        remaining_tokens,
+                    } => {
                         if paused_until.take().is_some() {
                             info!(
                                 "agent budget available again: {}",
                                 budget::describe(&config.budget, &spend, &config.runtime)
                             );
                         }
-                        remaining_usd
+                        (remaining_usd, remaining_secs, remaining_tokens)
                     }
+                };
+                // The run's timeout, within the minutes left today and this
+                // month (at least one: `check` starts no run with less).
+                let timeout = run_timeout(config.run_timeout, remaining_secs);
+                let clamped;
+                let run_config = if timeout < config.run_timeout {
+                    info!(
+                        "agent run timeout {}s, the run time left in its budget (agent.timeout {}s)",
+                        timeout.as_secs(),
+                        config.run_timeout.as_secs()
+                    );
+                    clamped = AgentConfig {
+                        run_timeout: timeout,
+                        ..config.clone()
+                    };
+                    &clamped
+                } else {
+                    &config
                 };
                 let mut text = prompt(&node, &config, since, &trigger);
                 if let Trigger::Events(ids) = &trigger {
@@ -2410,12 +2464,28 @@ pub async fn run(
                 last_heartbeat = now;
                 info!(trigger = %trigger.label(), "waking the agent");
                 let started = if openclaw {
-                    start_forward(&config, &trigger, &text, thread.as_deref(), &isolated)
+                    start_forward(run_config, &trigger, &text, thread.as_deref(), &isolated)
                 } else {
-                    start_run(&node, &config, &trigger, text, remaining_usd).await
+                    start_run(&node, run_config, &trigger, text, remaining_usd, remaining_tokens)
+                        .await
                 };
                 match started {
                     Ok(mut run) => {
+                        // Charged its caps if it never ends (ADR 0034 §6).
+                        let cap = budget::Usage {
+                            usd: match config.runtime.as_str() {
+                                "vibe" => run.charge_usd,
+                                "claude" => remaining_usd,
+                                _ => None,
+                            },
+                            secs: Some(timeout.as_secs_f64()),
+                            tokens: None,
+                        };
+                        if let Err(e) =
+                            budget::begin(&config.work_dir, run.record.started, &run.record.id, cap)
+                        {
+                            warn!("agent spend ledger: {e}");
+                        }
                         run.woke = woke;
                         run.feedback = taken;
                         running = Some(run);

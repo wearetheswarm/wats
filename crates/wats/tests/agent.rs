@@ -3444,27 +3444,31 @@ fn unix_now() -> u64 {
 }
 
 /// The minutes budget (ADR 0034): the wall time of the runs. The day has
-/// one minute, 58.5 s of it used already: a run goes, keeps its own
-/// timeout past the budget (it is not cut), and no new run starts once
-/// the minute is used. No dollar limit: no `--max-budget-usd` either.
+/// two minutes, 58.5 s of them used already: a run goes (more than a minute
+/// is left), and no new run starts once less than a minute is left. A run
+/// left by a node that stopped during it (a provisional entry) is charged
+/// its timeout at the runner's start, marked unfinished. No dollar limit:
+/// no `--max-budget-usd` either.
 #[tokio::test(flavor = "multi_thread")]
 async fn the_minutes_budget_stops_new_runs() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     let a = node(&dir.path().join("a"), &[]).await?;
     let work = dir.path().join("work");
     std::fs::create_dir_all(&work)?;
-    wats::budget::record(
+    // A run the node never finished: charged its 58.5 s timeout.
+    wats::budget::begin(
         &work,
         unix_now(),
+        "20261022T000000Z-heartbeat",
         wats::budget::Usage {
-            usd: Some(0.0),
+            usd: None,
             secs: Some(58.5),
             tokens: None,
         },
     )?;
     let budget = wats::budget::Budget::of(&wats::settings::AgentSettings {
         max_usd_per_day: Some(0.0),
-        max_minutes_per_day: Some(1),
+        max_minutes_per_day: Some(2),
         ..Default::default()
     });
     assert_eq!(budget.max_usd_per_day, None);
@@ -3485,13 +3489,16 @@ async fn the_minutes_budget_stops_new_runs() -> anyhow::Result<()> {
         .into_iter()
         .find(|r| r.status == "ok")
         .unwrap();
-    // Past the budget's 1.5 s left: its own timeout applies, not cut.
     assert!(record.seconds.unwrap_or(0.0) >= 2.9, "{record:?}");
+    let ledger = std::fs::read_to_string(wats::budget::ledger_path(&work))?;
+    assert!(ledger.contains("\"unfinished\":true"), "{ledger}");
+    assert!(!ledger.contains("\"provisional\""), "{ledger}");
     let spend = wats::budget::spend(&work, unix_now());
-    assert!(spend.minutes_today() >= 1.0, "{spend:?}");
+    assert!(spend.secs_today >= 61.4, "{spend:?}");
+    assert_eq!(spend.runs_today, 2, "{spend:?}");
     match wats::budget::check(&budget, &spend, unix_now()) {
         wats::budget::Verdict::Paused { why, .. } => {
-            assert_eq!(why, "1 min of agent runs today, budget 1 min")
+            assert_eq!(why, "1 min of agent runs today, budget 2 min")
         }
         go => panic!("{go:?}"),
     }
