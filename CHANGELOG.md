@@ -1,9 +1,21 @@
 # Changelog
 
-## Unreleased
+## 0.4.4 (2026-10-22)
 
-### Upgrading
+Your agent tools keep the swarm across Homebrew upgrades, and a new
+agent runtime, OpenCode, brings your own model or cloud credits (Azure
+OpenAI, AWS Bedrock, Google Vertex AI, …).
 
+### Upgrading from 0.4.3
+
+- `wats upgrade` (or `brew upgrade wats`) installs it. **Homebrew: start
+  the new wats once from a terminal** (`wats --detach`): the node
+  repairs the agent-tool entries 0.4.3 wrote (below), which a tool cannot
+  start once `brew cleanup` removed the old binary. Restart a running
+  node afterwards.
+- No store migration, no format change, no wire change, no new key.
+- Rolling back to 0.4.3 with an agent whose `runtime = "opencode"`: 0.4.3
+  does not know that runtime; remove or disable that agent first.
 - **Homebrew users who ran `wats setup <tool> --mcp` with 0.4.3 or
   older**: your agent tools run wats from a versioned Cellar path
   (`/opt/homebrew/Cellar/wats/0.4.3/bin/wats`), which `brew cleanup`
@@ -11,6 +23,18 @@
   first start and logs which file it fixed; `wats status` warns about them
   before. Until then, if `brew cleanup` has already run, run `wats setup
   <tool> --mcp` again (`claude`, `codex`, `openclaw` or `vibe`).
+
+### To try
+
+- `wats status` after `brew upgrade wats`: a stale entry is named, with
+  the fix; the next node start repairs it.
+- `wats setup opencode --agent`, then `wats --agent opencode`
+  (docs/opencode.md): an agent on your own provider, locked to the wats
+  tools at `swarm-only`.
+
+### Keys in this release
+
+Unchanged from 0.4.3 (`agent.runtime` accepts `opencode`).
 
 ### Changes
 
@@ -34,7 +58,6 @@
   `wats setup <tool> --mcp` command when there is no such link; so does
   the MCP `status` tool (`registrations`). Entries that are not wats's are
   never touched.
-
 - **OpenCode, a new agent runtime, for your own model or cloud credits**
   (Azure OpenAI, AWS Bedrock, Google Vertex AI, …; [ADR 0031](docs/adr/0031-opencode.md),
   [docs/opencode.md](docs/opencode.md)).
