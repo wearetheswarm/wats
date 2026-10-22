@@ -101,6 +101,17 @@ pub struct Settings {
     pub openclaw: OpenclawSettings,
     #[serde(default)]
     pub notify: NotifySettings,
+    #[serde(default)]
+    pub node: NodeSettings,
+}
+
+/// `[node]`: this node on this machine (ADR 0023 §8).
+#[derive(Debug, Default, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NodeSettings {
+    /// Its name in `wats ps` and for `-n NAME`, local only; unset: the one
+    /// drawn at its first start ([`crate::naming`]).
+    pub name: Option<String>,
 }
 
 /// `[notify]`: what reaches the human at this machine.
@@ -464,6 +475,9 @@ impl Settings {
                 bail!("{why}");
             }
         }
+        if let Some(name) = &self.node.name {
+            crate::naming::check(name).map_err(|why| anyhow::anyhow!("node.name: {why}"))?;
+        }
         crate::roster::configured(self, Path::new(""), "user")?;
         self.update.policy().context("[update]")?;
         Ok(())
@@ -665,6 +679,15 @@ pub const KEYS: &[Key] = &[
         ValueType::Size,
         "unlimited",
         "disk budget for others' blobs, e.g. 20G",
+    ),
+    key(
+        "node.name",
+        ValueType::Text,
+        "drawn at first start",
+        "this node's name on this machine: wats ps shows it, -n/--node NAME picks the node \
+         (NAME/AGENT an agent); 1-32 chars of [a-z0-9_-]. Local only: never posted nor \
+         announced. Unset: the adjective_creature name drawn at its first start, kept in \
+         <data dir>/node-name",
     ),
     key(
         "storage.max",
@@ -1203,6 +1226,10 @@ fn toml_value(key: &Key, raw: &str) -> Result<toml_edit::Value> {
             raw.parse::<crate::infra::Directory>()
                 .map_err(|e| invalid(format!("{e:#}")))?;
             raw.trim().into()
+        }
+        ValueType::Text if key.name == "node.name" => {
+            crate::naming::check(raw).map_err(invalid)?;
+            raw.into()
         }
         ValueType::Text if key.name == "agent.openclaw_url" => {
             crate::openclaw::check_url(raw, true).map_err(|e| invalid(format!("{e:#}")))?;

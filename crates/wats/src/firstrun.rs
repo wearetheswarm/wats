@@ -902,6 +902,10 @@ fn ask_and_write(
     } else {
         None
     };
+    // Last, so that the answers before it keep their order (ADR 0023 §8).
+    if revision == 0 {
+        ask_node_name(input, out, data_dir, &mut choices)?;
+    }
     let file = apply(data_dir, &choices)?;
     if let Some(on) = security {
         record_answer(data_dir, "security_auto", if on { "yes" } else { "no" })?;
@@ -966,6 +970,51 @@ fn ask_security_auto(
             .push(("update.security_auto", "false".to_string()));
     }
     Ok(Some(on))
+}
+
+/// The node name question (ADR 0023 §8).
+pub const NODE_NAME_QUESTION: &str = "Name of this node";
+
+/// Ask the node's name (ADR 0023 §8), its current one by default, else one
+/// drawn now; another node of this machine's name is refused. Written to
+/// `<data dir>/node-name`, which older releases ignore (so a rollback still
+/// starts), unless config.toml sets `node.name`: then there.
+fn ask_node_name(
+    input: &mut impl BufRead,
+    out: &mut impl Write,
+    data_dir: &Path,
+    choices: &mut Choices,
+) -> Result<()> {
+    use crate::naming;
+    let registry = crate::background::registry_dir(crate::update::hermetic_env());
+    let home = registry.as_ref().and(naming::default_dir());
+    let dirs = naming::machine_dirs(registry.as_deref(), home.as_deref());
+    let taken = naming::taken(&dirs, data_dir, home.as_deref());
+    let current = naming::stored(data_dir);
+    let default = current
+        .clone()
+        .unwrap_or_else(|| naming::draw_random(&taken));
+    let name = loop {
+        write!(out, "{NODE_NAME_QUESTION} (node.name) [{default}]: ")?;
+        let answer = match read_answer(input, out)? {
+            Some(answer) if !answer.is_empty() => answer,
+            _ => break default.clone(),
+        };
+        if let Err(why) = naming::check(&answer) {
+            writeln!(out, "  {why}")?;
+        } else if taken.contains(&answer) {
+            writeln!(out, "  another node of this machine is named {answer}")?;
+        } else {
+            break answer;
+        }
+    };
+    if naming::configured(data_dir).is_some() {
+        choices.values.push(("node.name", name));
+    } else if current.as_deref() != Some(name.as_str()) {
+        naming::write(data_dir, &name)
+            .with_context(|| format!("write {}", data_dir.join(naming::FILE).display()))?;
+    }
+    Ok(())
 }
 
 /// The answer `name` recorded in `data_dir`'s [`ANSWERS_FILE`], if any.
@@ -1240,6 +1289,61 @@ mod tests {
         let settings = Settings::load(other.path()).unwrap();
         assert_eq!(settings.update.security_auto, Some(true));
         assert_eq!(settings.update.security_delay.as_deref(), Some("12h"));
+    }
+
+    /// The node's name (ADR 0023 §8), asked last: a drawn default, kept in
+    /// `node-name` (never config.toml, which 0.4.4 would refuse); an answer
+    /// is checked; with `node.name` already in config.toml, it goes there.
+    #[test]
+    fn setup_asks_the_node_name() {
+        let data = tempfile::tempdir().unwrap();
+        let mut out = Vec::new();
+        setup_with(data.path(), &mut "".as_bytes(), &mut out, None, false).unwrap();
+        let said = String::from_utf8(out).unwrap();
+        let drawn = crate::naming::generated(data.path()).expect("written");
+        assert!(
+            said.contains(&format!("{NODE_NAME_QUESTION} (node.name) [{drawn}]: ")),
+            "{said}"
+        );
+        let config = std::fs::read_to_string(data.path().join(FILE_NAME)).unwrap();
+        assert!(!config.contains(&drawn), "{config}");
+        // Again: the current name is the default. Storage, networks,
+        // security updates, then the name: an invalid one, then another.
+        let mut out = Vec::new();
+        setup_with(
+            data.path(),
+            &mut "\n\n\nNot Valid\nhive_test\n".as_bytes(),
+            &mut out,
+            None,
+            false,
+        )
+        .unwrap();
+        let said = String::from_utf8(out).unwrap();
+        assert!(said.contains(&format!("(node.name) [{drawn}]")), "{said}");
+        assert!(said.contains("node name \"Not Valid\""), "{said}");
+        assert_eq!(
+            crate::naming::generated(data.path()).as_deref(),
+            Some("hive_test")
+        );
+        assert!(Settings::load(data.path()).unwrap().node.name.is_none());
+        // Set in config.toml by hand: the answer goes there.
+        let mut file = ConfigFile::open(data.path()).unwrap();
+        file.set("node.name", "by_hand").unwrap();
+        file.save().unwrap();
+        setup_with(
+            data.path(),
+            &mut "\n\n\nrenamed\n".as_bytes(),
+            &mut Vec::new(),
+            None,
+            false,
+        )
+        .unwrap();
+        let settings = Settings::load(data.path()).unwrap();
+        assert_eq!(settings.node.name.as_deref(), Some("renamed"));
+        assert_eq!(
+            crate::naming::stored(data.path()).as_deref(),
+            Some("renamed")
+        );
     }
 
     /// A No sticks (ADR 0030): it unsets the key (absent is false, and an

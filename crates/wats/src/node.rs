@@ -1570,6 +1570,11 @@ impl Node {
         {
             debug!("could not record this node in {}: {e}", registry.display());
         }
+        // Its name on this machine, drawn at its first start (ADR 0023
+        // §8): local only, in nothing it sends.
+        if let Err(e) = crate::naming::ensure(&config.data_dir, config.registry.as_deref()) {
+            debug!("could not name this node: {e}");
+        }
         let root = match &config.secret_file {
             Some(path) => RootSecret::load(path)?,
             None => RootSecret::load_or_create(&config.data_dir.join("secret.key"))?,

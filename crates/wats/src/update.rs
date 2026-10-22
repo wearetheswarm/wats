@@ -702,6 +702,9 @@ pub const KEYS_SINCE: &[(&str, Version)] = &[
     ("storage.events_share", Version(0, 4, 1)),
     ("sync.initial_max", Version(0, 4, 1)),
     ("update.security_auto", Version(0, 4, 3)),
+    // Set only by `wats config set node.name`: a drawn name goes to
+    // <data dir>/node-name, which older releases ignore (ADR 0023 §8).
+    ("node.name", Version(0, 4, 5)),
 ];
 
 /// The keys set in `data_dir`'s config.toml that wats `version` does not
@@ -1266,7 +1269,7 @@ pub fn may_check(policy: &UpdatePolicy, loopback: bool) -> bool {
     policy.check && !loopback && !hermetic_env()
 }
 
-fn hermetic_env() -> bool {
+pub(crate) fn hermetic_env() -> bool {
     std::env::var("WATS_HERMETIC").is_ok_and(|v| {
         matches!(
             v.trim().to_ascii_lowercase().as_str(),
@@ -2503,6 +2506,50 @@ mod tests {
         check_rollback(&old, &data, current).unwrap();
         assert_eq!(shell_word("/home/me/.wats"), "/home/me/.wats");
         assert_eq!(shell_word("it's"), r"'it'\''s'");
+    }
+
+    /// Node names (ADR 0023 §8): a drawn name lives in `node-name`, which
+    /// 0.4.4 ignores, so a rollback goes ahead and 0.4.4 still loads
+    /// config.toml; `node.name` set in config.toml makes it refuse first.
+    #[cfg(unix)]
+    #[test]
+    fn a_drawn_node_name_never_blocks_a_rollback() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let old = dir.path().join("wats.old");
+        std::fs::write(&old, "#!/bin/sh\necho 'wats 0.4.4'\n").unwrap();
+        std::fs::set_permissions(&old, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let data = dir.path().join("data");
+        std::fs::create_dir_all(&data).unwrap();
+        std::fs::write(
+            data.join(crate::settings::FILE_NAME),
+            "profile = \"alice\"\n",
+        )
+        .unwrap();
+        let drawn = crate::naming::ensure(&data, None).unwrap();
+        let current = Version(0, 4, 5);
+        // The drawn name: config.toml is as 0.4.4 knows it.
+        let text = std::fs::read_to_string(data.join(crate::settings::FILE_NAME)).unwrap();
+        assert_eq!(text, "profile = \"alice\"\n");
+        assert!(keys_unknown_to(&data, Version(0, 4, 4)).is_empty());
+        check_rollback(&old, &data, current).unwrap();
+        // Renamed in config.toml: refused, with the command to run first.
+        let mut file = crate::settings::ConfigFile::open(&data).unwrap();
+        file.set("node.name", "hive").unwrap();
+        file.save().unwrap();
+        assert_eq!(crate::naming::stored(&data).as_deref(), Some("hive"));
+        assert_eq!(keys_unknown_to(&data, Version(0, 4, 4)), ["node.name"]);
+        assert!(keys_unknown_to(&data, Version(0, 4, 5)).is_empty());
+        let err = check_rollback(&old, &data, current)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("config unset node.name"), "{err}");
+        // Unset: the drawn name is back, and the rollback goes ahead.
+        let mut file = crate::settings::ConfigFile::open(&data).unwrap();
+        file.unset("node.name").unwrap();
+        file.save().unwrap();
+        assert_eq!(crate::naming::stored(&data), Some(drawn));
+        check_rollback(&old, &data, current).unwrap();
     }
 
     #[test]

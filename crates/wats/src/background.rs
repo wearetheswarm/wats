@@ -11,7 +11,10 @@
 //!   directory (`~/.wats/run`), one small file per data directory, so that
 //!   `wats ps` and `wats stop --all` find nodes outside `~/.wats`. An entry
 //!   says where to look, never whether a node runs: the data directory
-//!   lock does (a stale entry is removed by `wats ps`).
+//!   lock does (a stale entry is removed by `wats ps`). A second index,
+//!   `known/`, keeps every data directory a node ever ran in, stopped ones
+//!   too, so that a node name (`-n NAME`) finds a stopped node; an entry
+//!   goes once its directory is no data directory any more.
 //! - **Signals.** `wats stop` asks the node through its socket first, and
 //!   signals it with `kill(1)` only when it does not answer or stop in
 //!   time (the crate forbids `unsafe`, so no `libc::kill`).
@@ -291,13 +294,17 @@ fn entry_path(registry: &Path, data_dir: &Path) -> PathBuf {
     registry.join(format!("{}.json", &hash[..16]))
 }
 
-/// Record that a node runs in `data_dir` (best effort).
+/// Record that a node runs in `data_dir` (best effort), and that the
+/// machine knows it ([`known`]).
 pub fn register(registry: &Path, data_dir: &Path) -> std::io::Result<()> {
     let absolute = std::path::absolute(data_dir)?;
+    let entry = serde_json::json!({ "data_dir": absolute }).to_string();
+    let known = entry_path(&registry.join(KNOWN_DIR), &absolute);
+    create_parent(&known)?;
+    std::fs::write(known, &entry)?;
     let path = entry_path(registry, &absolute);
     create_parent(&path)?;
-    let entry = serde_json::json!({ "data_dir": absolute });
-    std::fs::write(path, entry.to_string())
+    std::fs::write(path, entry)
 }
 
 /// Remove the entry of `data_dir`.
@@ -307,18 +314,52 @@ pub fn unregister(registry: &Path, data_dir: &Path) {
 
 /// The data directories in the registry.
 pub fn registered(registry: &Path) -> Vec<PathBuf> {
+    entries(registry).into_iter().map(|(_, dir)| dir).collect()
+}
+
+/// The registry's sub-directory of the data directories nodes ever ran
+/// in, running or not.
+pub const KNOWN_DIR: &str = "known";
+
+/// The data directories nodes ever ran in on this machine (since 0.4.5),
+/// stopped ones too: [`register`] adds one, and it stays until its
+/// directory is no data directory any more (no `secret.key`,
+/// `config.toml` nor `node-name`), when this removes it.
+pub fn known(registry: &Path) -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    for (path, dir) in entries(&registry.join(KNOWN_DIR)) {
+        let data = [
+            "secret.key",
+            crate::settings::FILE_NAME,
+            crate::naming::FILE,
+        ]
+        .iter()
+        .any(|f| dir.join(f).exists());
+        if data {
+            dirs.push(dir);
+        } else {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+    dirs
+}
+
+/// The entries of a registry directory, and the data directory each
+/// names, sorted by data directory.
+fn entries(registry: &Path) -> Vec<(PathBuf, PathBuf)> {
     let Ok(entries) = std::fs::read_dir(registry) else {
         return Vec::new();
     };
-    let mut dirs: Vec<PathBuf> = entries
+    let mut dirs: Vec<(PathBuf, PathBuf)> = entries
         .flatten()
-        .filter(|e| e.path().extension().is_some_and(|x| x == "json"))
-        .filter_map(|e| std::fs::read_to_string(e.path()).ok())
-        .filter_map(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
-        .filter_map(|v| v["data_dir"].as_str().map(PathBuf::from))
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|x| x == "json"))
+        .filter_map(|p| Some((std::fs::read_to_string(&p).ok()?, p)))
+        .filter_map(|(text, p)| Some((serde_json::from_str::<serde_json::Value>(&text).ok()?, p)))
+        .filter_map(|(v, p)| v["data_dir"].as_str().map(|d| (p, PathBuf::from(d))))
         .collect();
-    dirs.sort();
-    dirs.dedup();
+    dirs.sort_by(|a, b| a.1.cmp(&b.1));
+    dirs.dedup_by(|a, b| a.1 == b.1);
     dirs
 }
 
@@ -550,7 +591,16 @@ mod tests {
         register(&registry, &a).unwrap();
         assert_eq!(registered(&registry), [a.clone(), b.clone()]);
         unregister(&registry, &a);
-        assert_eq!(registered(&registry), [b]);
+        assert_eq!(registered(&registry), std::slice::from_ref(&b));
+        // Known: both, while they are data directories.
+        std::fs::create_dir_all(&a).unwrap();
+        std::fs::write(a.join("secret.key"), "x").unwrap();
+        assert_eq!(
+            known(&registry),
+            std::slice::from_ref(&a),
+            "b has no data: forgotten"
+        );
+        assert_eq!(known(&registry), [a]);
     }
 
     #[test]
