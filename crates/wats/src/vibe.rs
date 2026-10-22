@@ -774,6 +774,9 @@ pub struct Run<'a> {
     pub max_turns: u32,
     /// What is left of the USD budget, if it applies: `--max-price`.
     pub max_price: Option<f64>,
+    /// What is left of the LLM token budget, if any: `--max-tokens` (ADR
+    /// 0034).
+    pub max_tokens: Option<u64>,
     pub export_dir: &'a Path,
     /// `agent.timeout`: `--time-limit` a little under it.
     pub timeout: std::time::Duration,
@@ -798,6 +801,11 @@ pub fn run_args(r: &Run) -> Vec<String> {
         && !given("--max-price")
     {
         args.push(format!("--max-price={:.2}", price.max(0.01)));
+    }
+    if let Some(tokens) = r.max_tokens
+        && !given("--max-tokens")
+    {
+        args.push(format!("--max-tokens={}", tokens.max(1)));
     }
     if !given("--time-limit") {
         args.push(format!("--time-limit={}", time_limit(r.timeout)));
@@ -1204,6 +1212,32 @@ mod tests {
         }
     }
 
+    /// The LLM tokens left in the budget (ADR 0034) cap the run, unless the
+    /// extra arguments set `--max-tokens`.
+    #[test]
+    fn llm_tokens_left_cap_the_run() {
+        let dir = Path::new("/w/vibe-run");
+        let run = |max_tokens, extra: &[String]| {
+            run_args(&Run {
+                access: Access::SwarmOnly,
+                max_turns: 7,
+                max_price: None,
+                max_tokens,
+                export_dir: dir,
+                timeout: std::time::Duration::from_secs(600),
+                extra,
+            })
+        };
+        assert!(run(Some(1200), &[]).contains(&"--max-tokens=1200".to_string()));
+        assert!(!run(None, &[]).iter().any(|a| a.starts_with("--max-tokens")));
+        let mine = s(&["--max-tokens=50"]);
+        assert!(
+            !run(Some(1200), &mine)
+                .iter()
+                .any(|a| a.starts_with("--max-tokens"))
+        );
+    }
+
     #[test]
     fn run_arguments_per_level() {
         let dir = Path::new("/w/vibe-run");
@@ -1212,6 +1246,7 @@ mod tests {
                 access,
                 max_turns: 7,
                 max_price,
+                max_tokens: None,
                 export_dir: dir,
                 timeout: std::time::Duration::from_secs(600),
                 extra,

@@ -342,6 +342,10 @@ pub struct AgentSettings {
     pub max_turns: Option<u32>,
     pub max_usd_per_day: Option<f64>,
     pub max_usd_per_month: Option<f64>,
+    pub max_minutes_per_day: Option<u64>,
+    pub max_minutes_per_month: Option<u64>,
+    pub max_tokens_per_day: Option<u64>,
+    pub max_tokens_per_month: Option<u64>,
     pub max_runs_per_day: Option<usize>,
     pub keep_runs: Option<usize>,
     pub keep_days: Option<u64>,
@@ -1076,26 +1080,53 @@ pub const KEYS: &[Key] = &[
     key(
         "agent.timeout",
         ValueType::Duration,
-        "10m",
+        "25m",
         "a run is killed after this",
     ),
     key(
         "agent.max_turns",
         ValueType::Integer,
-        "10",
+        "50",
         "turns per run (passed to the agent CLI)",
     ),
     key(
         "agent.max_usd_per_day",
         ValueType::Float,
         "2",
-        "spend budget per UTC day, from the cost the agent CLI reports",
+        "spend budget per UTC day, in USD, from the cost the agent CLI reports (0: no limit)",
     ),
     key(
         "agent.max_usd_per_month",
         ValueType::Float,
-        "20",
-        "spend budget per UTC month",
+        "30 × max_usd_per_day",
+        "spend budget per UTC month, in USD (0: no limit)",
+    ),
+    key(
+        "agent.max_minutes_per_day",
+        ValueType::Integer,
+        "0",
+        "total run time of the agent per UTC day, in minutes; it stops new runs, a run keeps \
+         its timeout (0: no limit)",
+    ),
+    key(
+        "agent.max_minutes_per_month",
+        ValueType::Integer,
+        "30 × max_minutes_per_day",
+        "total run time of the agent per UTC month, in minutes (0: no limit)",
+    ),
+    key(
+        "agent.max_tokens_per_day",
+        ValueType::Integer,
+        "0",
+        "LLM tokens (model input and output, cached input included) per UTC day, as the agent \
+         CLI reports them: Claude Code, Codex, OpenCode and Mistral Vibe, not OpenClaw (0: no \
+         limit)",
+    ),
+    key(
+        "agent.max_tokens_per_month",
+        ValueType::Integer,
+        "30 × max_tokens_per_day",
+        "LLM tokens per UTC month (0: no limit)",
     ),
     key(
         "agent.max_runs_per_day",
@@ -1455,6 +1486,15 @@ impl ConfigFile {
     /// Whether the file has the top-level key or table `name`, empty or not.
     pub fn has_top(&self, name: &str) -> bool {
         self.doc.get(name).is_some()
+    }
+
+    /// Whether the old `[agent]` table itself sets `leaf`, whatever
+    /// `[agents.<name>]` tables the file has too.
+    pub fn agent_table_has(&self, leaf: &str) -> bool {
+        self.doc
+            .get("agent")
+            .and_then(|t| t.as_table_like())
+            .is_some_and(|t| t.get(leaf).is_some())
     }
 
     /// The names of the `[agents.<name>]` tables.

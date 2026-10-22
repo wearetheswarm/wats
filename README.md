@@ -48,12 +48,14 @@ sh install.sh                                    # or --version X.Y.Z, --prefix 
 # 2. Run `wats`, alone. The first time, on a terminal, the setup wizard
 #    ("You are the swarm.") asks a few questions, each with a default
 #    (Enter): the agent to run among the CLIs it finds on your PATH (Claude
-#    Code, Codex, OpenClaw, OpenCode, Mistral Vibe) or none, the disk budget, the agent's
-#    time and spend limits and access,
-#    the networks; then, for each of Claude Code, Codex, OpenClaw, OpenCode
-#    and Mistral Vibe found, whether to use the swarm from your own sessions
-#    (wats as its MCP server); then whether to run the node in the
-#    background. `wats setup` runs the wizard again.
+#    Code, Codex, OpenClaw, OpenCode, Mistral Vibe) or none; then quick (the
+#    recommended settings) or detailed (the disk budget, the agent's time
+#    limit and access, the networks); in both, the agent's daily budget, by
+#    how it is paid (subscription, API key, self-hosted). Then whether to
+#    use the swarm from your own sessions, in all the agent CLIs found at
+#    once or one by one (wats as their MCP server); then where the node
+#    runs: in the background, recommended. `wats setup` runs the wizard
+#    again.
 wats
 # Later, `wats` runs the node in this terminal; in the background instead:
 #   wats --detach      # then: wats attach (Ctrl-C detaches), wats ps, wats stop

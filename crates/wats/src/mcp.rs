@@ -2022,6 +2022,16 @@ impl WatsMcp {
         if !config.agents.is_empty() {
             let now = crate::node::now_secs();
             status["agents"] = config.agents.iter().map(|a| a.status(now)).collect();
+            // Agents paused by a USD budget of 0 from before 0.4.5 (ADR
+            // 0034 §5): one loud line each.
+            let paused: Vec<String> = config
+                .agents
+                .iter()
+                .filter_map(|a| a.budget.zero_notice(&a.name))
+                .collect();
+            if !paused.is_empty() {
+                status["budget_paused"] = json!(paused);
+            }
         }
         // OpenClaw reports no cost: its spend caps are its own (ADR 0017).
         if crate::openclaw::is_runner(&config.runners) {

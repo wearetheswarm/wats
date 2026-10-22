@@ -176,7 +176,7 @@ struct AgentArgs {
     /// Agent CLI to run [default: claude].
     #[arg(long, env = "WATS_AGENT_COMMAND")]
     agent_command: Option<PathBuf>,
-    /// Longest run before it is killed [default: 10m].
+    /// Longest run before it is killed [default: 25m].
     #[arg(long, value_parser = parse_duration)]
     run_timeout: Option<Duration>,
     /// Extra arguments for the agent CLI, split on spaces (e.g.
@@ -357,7 +357,8 @@ enum Command {
         tool: Option<SetupTool>,
         /// Then start the node in the background, as `wats --detach` does,
         /// unless one already runs. Without it, `wats setup` asks on a
-        /// terminal (default no), and never starts one otherwise.
+        /// terminal (with no tool, the background by default; with a tool,
+        /// default no), and never starts one otherwise.
         #[arg(short = 'd', long, global = true)]
         detach: bool,
     },
@@ -1085,8 +1086,12 @@ enum ConfigAction {
         #[arg(allow_negative_numbers = true)]
         value: String,
     },
-    /// Remove a key: its default applies again.
-    Unset { key: String },
+    /// Remove keys: their defaults apply again (e.g. `wats config unset
+    /// agent.timeout agent.max_turns`).
+    Unset {
+        #[arg(required = true, num_args = 1..)]
+        keys: Vec<String>,
+    },
     /// List every key, its value and what it does.
     List {
         /// Also the operator and test settings (e.g. halt.serve).
@@ -2020,10 +2025,10 @@ fn hook_command(
     ))
 }
 
-/// Whether to add the session hook: asked on a terminal (default yes),
-/// yes otherwise.
-fn want_hook(args: &NodeArgs, name: &str) -> Result<bool> {
-    if !interactive(args) {
+/// Whether to add the session hook: asked on a terminal (default yes)
+/// when `ask`, yes otherwise (the wizard's "all" of step 2 says yes).
+fn want_hook(args: &NodeArgs, name: &str, ask: bool) -> Result<bool> {
+    if !ask || !interactive(args) {
         return Ok(true);
     }
     wats::firstrun::ask_yes_no(
@@ -2073,9 +2078,9 @@ fn codex_config() -> Result<PathBuf> {
 }
 
 /// Add (or update) the session hooks in Claude Code's settings.json.
-fn install_claude_hooks(args: &NodeArgs, profile: &str, scope: &str) -> Result<()> {
+fn install_claude_hooks(args: &NodeArgs, profile: &str, scope: &str, ask: bool) -> Result<()> {
     use wats::hook::{CLAUDE_EVENTS, Host};
-    if !want_hook(args, "Claude Code")? {
+    if !want_hook(args, "Claude Code", ask)? {
         println!("Claude Code: no session hook (add it later: wats setup claude --mcp)");
         return Ok(());
     }
@@ -2103,7 +2108,12 @@ fn install_claude_hooks(args: &NodeArgs, profile: &str, scope: &str) -> Result<(
 
 /// Add (or update) the session hooks in Codex's config.toml, when this
 /// Codex has hooks: SessionStart, and UserPromptSubmit since 0.116.0.
-fn install_codex_hooks(args: &NodeArgs, profile: &str, codex: &std::path::Path) -> Result<()> {
+fn install_codex_hooks(
+    args: &NodeArgs,
+    profile: &str,
+    codex: &std::path::Path,
+    ask: bool,
+) -> Result<()> {
     use wats::hook::Host;
     let Some(feature) = wats::hook::codex_hook_feature(&wats::hook::codex_features(codex)) else {
         println!(
@@ -2113,7 +2123,7 @@ fn install_codex_hooks(args: &NodeArgs, profile: &str, codex: &std::path::Path) 
         );
         return Ok(());
     };
-    if !want_hook(args, "Codex")? {
+    if !want_hook(args, "Codex", ask)? {
         println!("Codex: no session hook (add it later: wats setup codex --mcp)");
         return Ok(());
     }
@@ -2532,7 +2542,7 @@ async fn setup_command(
         let mcp = offer_integrations(node, data_dir, &choices, &found)?;
         print!("{}", welcome::step(3, style));
         let changed = std::fs::read(&config).ok() != before;
-        offer_background(node, data_dir, detach, false, changed).await?;
+        offer_background(node, data_dir, detach, false, changed, true).await?;
         let running = wats::node::node_running(&std::path::absolute(data_dir)?);
         print!(
             "{}",
@@ -2548,7 +2558,7 @@ async fn setup_command(
         return Ok(());
     }
     let changed = std::fs::read(&config).ok() != before;
-    offer_background(node, data_dir, detach, yes, changed).await
+    offer_background(node, data_dir, detach, yes, changed, false).await
 }
 
 /// `wats setup [tool]` itself.
@@ -2586,7 +2596,7 @@ fn setup_tool_command(
             }
             let scope = scope.as_str();
             let hooks: HookStep = (!no_hooks).then(|| {
-                Box::new(move |profile: &str| install_claude_hooks(node, profile, scope)) as _
+                Box::new(move |profile: &str| install_claude_hooks(node, profile, scope, true)) as _
             });
             setup_tool(
                 node,
@@ -2616,7 +2626,7 @@ fn setup_tool_command(
             }
             let codex = codex.as_path();
             let hooks: HookStep = (!no_hooks).then(|| {
-                Box::new(move |profile: &str| install_codex_hooks(node, profile, codex)) as _
+                Box::new(move |profile: &str| install_codex_hooks(node, profile, codex, true)) as _
             });
             setup_tool(
                 node,
@@ -2730,6 +2740,7 @@ async fn offer_background(
     detach: bool,
     yes: bool,
     changed: bool,
+    wizard: bool,
 ) -> Result<()> {
     let dir = std::path::absolute(data_dir)?;
     let entry = NodeEntry::look(dir.clone()).await;
@@ -2741,32 +2752,77 @@ async fn offer_background(
         let flag = entry.dir_flag();
         let what = format!(
             "a wats node already runs here (pid {pid}, {})",
-            entry.mode()
+            entry.mode_label()
         );
         if !changed {
             println!("{what}: nothing to restart, new sessions use it");
-        } else if takeover {
-            println!(
-                "{what}, for your MCP sessions: it reads config.toml when it starts. To run it \
-                 with this setup: wats --detach{flag} (it takes over)"
-            );
-        } else {
-            println!(
-                "{what}: it reads config.toml when it starts. To apply this setup, restart it: \
-                 wats stop{flag}; wats --detach{flag}"
-            );
+            return Ok(());
         }
-        return Ok(());
-    }
-    let start = detach
-        || (!yes
+        let how = if takeover {
+            format!("wats --detach{flag} (it takes over)")
+        } else {
+            format!("wats stop{flag}; wats --detach{flag}")
+        };
+        let whose = if takeover {
+            ", for your MCP sessions"
+        } else {
+            ""
+        };
+        println!("{what}{whose}: it reads config.toml when it starts.");
+        // Restart it now (ADR 0027, 0.4.5): asked of a person only.
+        let restart = !yes
             && interactive(args)
             && wats::firstrun::ask_yes_no(
                 &mut std::io::stdin().lock(),
                 &mut std::io::stdout(),
-                "Start the node in the background now (`wats --detach`)?",
-                false,
-            )?);
+                &format!("Restart it now with this setup, in the background ({how})?"),
+                true,
+            )?;
+        if !restart {
+            println!("To apply this setup, restart it: {how}");
+            return Ok(());
+        }
+        // Acted on only if it is still the node that was asked about: the
+        // same process, started at the same time.
+        let now = NodeEntry::look(dir.clone()).await;
+        if !now.running || now.pid() != entry.pid() || now.started() != entry.started() {
+            println!(
+                "The node changed while you answered ({}): nothing done. To apply this setup: {how}",
+                if now.running {
+                    format!(
+                        "pid {} now",
+                        now.pid().map_or_else(|| "?".into(), |p| p.to_string())
+                    )
+                } else {
+                    "it stopped".to_string()
+                }
+            );
+            return Ok(());
+        }
+        if !takeover {
+            stop_node(&now, Duration::from_secs(10), "`wats setup`").await?;
+        }
+        return start_detached(args, &dir).await;
+    }
+    let start = detach
+        || (!yes
+            && interactive(args)
+            && if wizard {
+                // Step 3 of the wizard: the background, recommended, or
+                // not now.
+                wats::firstrun::ask_where(
+                    &mut std::io::stdin().lock(),
+                    &mut std::io::stdout(),
+                    false,
+                )? == wats::firstrun::Where::Background
+            } else {
+                wats::firstrun::ask_yes_no(
+                    &mut std::io::stdin().lock(),
+                    &mut std::io::stdout(),
+                    "Start the node in the background now (`wats --detach`)?",
+                    false,
+                )?
+            });
     if !start {
         return Ok(());
     }
@@ -2806,7 +2862,7 @@ fn offer_integrations(
              `wats setup <tool> --mcp` connects it."
         );
     }
-    for f in found {
+    let host = |f: &wats::firstrun::Found| {
         let openclaw_agent = f.name == "openclaw" && choices.runtime.as_deref() == Some("openclaw");
         let (label, command) = match f.name {
             "claude" => ("Claude Code", "wats setup claude --mcp"),
@@ -2815,8 +2871,41 @@ fn offer_integrations(
             "openclaw" => ("OpenClaw", "wats setup openclaw --mcp"),
             "opencode" => ("OpenCode", "wats setup opencode --mcp"),
             "vibe" => ("Mistral Vibe", "wats setup vibe --mcp"),
-            _ => continue,
+            _ => return None,
         };
+        Some((openclaw_agent, label, command))
+    };
+    // All at once (Enter), one by one, or none (ADR 0027, 0.4.5).
+    let labels: Vec<String> = found
+        .iter()
+        .filter_map(&host)
+        .map(|(openclaw_agent, label, _)| {
+            if openclaw_agent {
+                format!("{label}, its agent setup")
+            } else {
+                label.to_string()
+            }
+        })
+        .collect();
+    let mode = if labels.is_empty() {
+        wats::firstrun::Hosts::None
+    } else {
+        wats::firstrun::ask_hosts(
+            &mut std::io::stdin().lock(),
+            &mut std::io::stdout(),
+            &labels,
+        )?
+    };
+    for f in found {
+        let Some((openclaw_agent, label, command)) = host(f) else {
+            continue;
+        };
+        if mode == wats::firstrun::Hosts::None {
+            println!("{label}: skipped (later: {command})");
+            continue;
+        }
+        // One by one: each host, and each one's session hook, is asked.
+        let ask = mode == wats::firstrun::Hosts::OneByOne;
         let question = if openclaw_agent {
             format!(
                 "Finish OpenClaw's agent setup now: the hook token, the `wats` OpenClaw agent \
@@ -2828,12 +2917,14 @@ fn offer_integrations(
                  (`{command}`)?"
             )
         };
-        if !wats::firstrun::ask_yes_no(
-            &mut std::io::stdin().lock(),
-            &mut std::io::stdout(),
-            &question,
-            true,
-        )? {
+        if ask
+            && !wats::firstrun::ask_yes_no(
+                &mut std::io::stdin().lock(),
+                &mut std::io::stdout(),
+                &question,
+                true,
+            )?
+        {
             println!("{label}: skipped (later: {command})");
             continue;
         }
@@ -2847,7 +2938,7 @@ fn offer_integrations(
                 &SetupKeys::default(),
                 |profile| register_in_claude(node, profile, "user", path),
                 Some(Box::new(move |profile: &str| {
-                    install_claude_hooks(node, profile, "user")
+                    install_claude_hooks(node, profile, "user", ask)
                 })),
             ),
             "codex" => setup_tool(
@@ -2858,7 +2949,7 @@ fn offer_integrations(
                 &SetupKeys::default(),
                 |profile| register_in_codex(node, profile, path),
                 Some(Box::new(move |profile: &str| {
-                    install_codex_hooks(node, profile, path)
+                    install_codex_hooks(node, profile, path, ask)
                 })),
             ),
             "openclaw" => setup_openclaw(
@@ -2897,9 +2988,10 @@ fn offer_integrations(
 
 /// The setup wizard of a bare `wats` on a terminal, for a data directory
 /// never set up (ADR 0027): the main choices (those of `wats setup`), the
-/// MCP hosts found on PATH, then where the node runs: in the background
-/// (`wats --detach`) or in this terminal (the default, as a bare `wats`
-/// always did). Returns whether it started the node in the background.
+/// MCP hosts found on PATH (all at once, or one by one), then where the
+/// node runs: in the background (`wats --detach`, the recommended
+/// default), in this terminal, or not now. Returns whether nothing is left
+/// to run here (the node runs in the background, or not now).
 async fn setup_wizard(node: &NodeArgs, data_dir: &std::path::Path) -> Result<bool> {
     use wats::welcome;
     let style = welcome::Style::detect();
@@ -2921,24 +3013,25 @@ async fn setup_wizard(node: &NodeArgs, data_dir: &std::path::Path) -> Result<boo
     print!("{}", welcome::step(2, style));
     let mcp = offer_integrations(node, data_dir, &choices, &found)?;
     print!("{}", welcome::step(3, style));
-    let background = cfg!(unix)
-        && wats::firstrun::ask_yes_no(
-            &mut std::io::stdin().lock(),
-            &mut std::io::stdout(),
-            "Run the node in the background (`wats --detach`: it keeps running when this \
-             terminal closes; `wats attach` follows it, `wats stop` stops it)? Otherwise it runs \
-             here until Ctrl-C",
-            false,
-        )?;
-    let summary = wizard_summary(data_dir, &choices, mcp, background, !background)?;
+    // The background, recommended (Enter), or `d` to choose: here, or not
+    // now (ADR 0027, 0.4.5). Native Windows has no `--detach`: here.
+    use wats::firstrun::Where;
+    let place = if cfg!(unix) {
+        wats::firstrun::ask_where(&mut std::io::stdin().lock(), &mut std::io::stdout(), true)?
+    } else {
+        Where::Here
+    };
+    let background = place == Where::Background;
+    let here = place == Where::Here;
+    let summary = wizard_summary(data_dir, &choices, mcp, background, here)?;
     if background {
         start_detached(node, data_dir).await?;
     }
     print!("{}", welcome::closing(&summary, style));
-    if !background {
+    if here {
         println!();
     }
-    Ok(background)
+    Ok(!here)
 }
 
 /// What the wizard set up, for its closing screen: `running`, the node
@@ -2969,6 +3062,7 @@ fn wizard_summary(
 async fn offer_background(
     _: &NodeArgs,
     _: &std::path::Path,
+    _: bool,
     _: bool,
     _: bool,
     _: bool,
@@ -3006,7 +3100,12 @@ async fn first_run(cli: &Cli, data_dir: &std::path::Path, bare: bool) -> Result<
         None if wizard => return setup_wizard(&cli.node, data_dir).await,
         None => {}
         Some(revision) if revision < wats::firstrun::SETUP_REVISION => {
+            // Only the questions it would ask (an agent's, with an agent).
+            let pending = Settings::load(data_dir)
+                .map(|s| wats::firstrun::pending_questions(&s, revision))
+                .unwrap_or_else(|_| wats::firstrun::new_questions(revision));
             if wizard {
+                // With none, it records the revision without a word.
                 wats::firstrun::catch_up(
                     data_dir,
                     &mut std::io::stdin().lock(),
@@ -3014,12 +3113,13 @@ async fn first_run(cli: &Cli, data_dir: &std::path::Path, bare: bool) -> Result<
                     std::env::var_os("PATH").as_deref(),
                     revision,
                 )?;
-                println!();
-            } else {
+                if pending > 0 {
+                    println!();
+                }
+            } else if pending > 0 {
                 tracing::info!(
-                    "`wats setup` has {} new question(s) since this data directory was set up: \
-                     run `wats` alone, or `wats setup`, on a terminal",
-                    wats::firstrun::new_questions(revision)
+                    "`wats setup` has {pending} new question(s) since this data directory was \
+                     set up: run `wats` alone, or `wats setup`, on a terminal"
                 );
             }
             return Ok(false);
@@ -3167,13 +3267,15 @@ fn config_command(node: &NodeArgs, data_dir: &std::path::Path, action: ConfigAct
             infra_note(&file, &key);
             safety_after(data_dir, before);
         }
-        ConfigAction::Unset { key } => {
-            let before = safety_before(data_dir, &key);
-            if file.unset(&key)? {
-                file.save()?;
+        ConfigAction::Unset { keys } => {
+            for key in &keys {
+                let before = safety_before(data_dir, key);
+                if file.unset(key)? {
+                    file.save()?;
+                }
+                infra_note(&file, key);
+                safety_after(data_dir, before);
             }
-            infra_note(&file, &key);
-            safety_after(data_dir, before);
         }
         ConfigAction::List { all } => {
             println!("# {}", file.path().display());
@@ -3792,13 +3894,35 @@ async fn status_command(config: &NodeConfig, json: bool, local: bool) -> Result<
                     let now = unix_now();
                     status["agents"] = members
                         .iter()
-                        .map(|m| agent_info(m, false).status(now))
+                        .map(|m| agent_info(m, false, &config.data_dir).status(now))
                         .collect();
                 }
             }
             status
         }
     };
+    // agent.timeout and agent.max_turns set to the defaults of 0.4.4 and
+    // older: one line naming the new ones (config.toml is never rewritten
+    // for it).
+    if let Ok(settings) = Settings::load(&config.data_dir)
+        && let Some(notice) = wats::firstrun::old_defaults_notice(&settings)
+    {
+        status["old_defaults"] = notice.into();
+    }
+    // Agents paused by a USD budget of 0 from before 0.4.5 (ADR 0034 §5):
+    // the MCP status says it of the running node's; without one, from
+    // config.toml.
+    if status.get("budget_paused").is_none() {
+        let paused: Vec<serde_json::Value> = status["agents"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|a| a["notice"].as_str().map(serde_json::Value::from))
+            .collect();
+        if !paused.is_empty() {
+            status["budget_paused"] = paused.into();
+        }
+    }
     // wats's entries in the agent tools, only checked here (the node
     // repairs them at its start): fresher than the running node's view.
     let registrations = check_registrations(&config.data_dir, local, false);
@@ -4055,7 +4179,20 @@ impl NodeEntry {
             "background" => "mcp-background",
             "in-process" => "mcp-in-process",
             "cli" => "cli",
+            // A wats older than 0.3.3: its lock file names no role, and it
+            // answers no `Info` on its socket.
+            "" => "older",
             _ => "unknown",
+        }
+    }
+
+    /// [`NodeEntry::mode`] for a person: `older wats, v0.3.2` for a node
+    /// too old to say how it runs.
+    fn mode_label(&self) -> String {
+        match (self.mode(), self.version()) {
+            ("older", Some(version)) => format!("older wats, v{version}"),
+            ("older", None) => "older wats".to_string(),
+            (mode, _) => mode.to_string(),
         }
     }
 
@@ -4277,7 +4414,7 @@ async fn ps_command(node: &NodeArgs, all: bool, json: bool) -> Result<()> {
             [
                 e.name(),
                 e.pid().map_or_else(dash, |p| p.to_string()),
-                e.mode().to_string(),
+                e.mode_label(),
                 e.version().unwrap_or_else(dash),
                 e.started().map_or_else(dash, |s| {
                     wats::background::format_uptime(now.saturating_sub(s))
@@ -4363,7 +4500,7 @@ async fn detach_command(
              stop it: wats stop{flag}",
             tilde(&dir),
             before.pid().map_or_else(|| "?".into(), |p| p.to_string()),
-            before.mode(),
+            before.mode_label(),
             before
                 .holder
                 .as_ref()
@@ -4503,9 +4640,10 @@ async fn attach_command(node: &NodeArgs, lines: usize, mut shutdown: Shutdown) -
                  or service that started it. `wats --detach` runs one you can attach to",
                 tilde(&entry.dir)
             ),
-            mode => anyhow::bail!(
-                "the node in {} (pid {pid}, {mode}) keeps no log to attach to",
-                tilde(&entry.dir)
+            _ => anyhow::bail!(
+                "the node in {} (pid {pid}, {}) keeps no log to attach to",
+                tilde(&entry.dir),
+                entry.mode_label()
             ),
         }
     };
@@ -4693,7 +4831,7 @@ async fn stop_gracefully_or_kill(
     started: std::time::Instant,
 ) -> Result<()> {
     let dir = &entry.dir;
-    let mode = entry.mode();
+    let mode = entry.mode_label();
     // Graceful: through the socket, else SIGTERM to the lock holder.
     let asked = attach::control_within(dir, attach::Control::Stop, Duration::from_secs(5))
         .await
@@ -5793,12 +5931,14 @@ fn agent_members(
 }
 
 /// One agent as `status` shows it.
-fn agent_info(member: &wats::roster::Member, running: bool) -> wats::agent::AgentInfo {
-    let mut budget = budget_of(&member.settings);
-    if member.runtime.as_deref() == Some("openclaw") {
-        budget.max_usd_per_day = f64::INFINITY;
-        budget.max_usd_per_month = f64::INFINITY;
-    }
+fn agent_info(
+    member: &wats::roster::Member,
+    running: bool,
+    data_dir: &std::path::Path,
+) -> wats::agent::AgentInfo {
+    let revision = wats::firstrun::stored_revision(data_dir);
+    let budget = wats::budget::Budget::of_dir(&member.settings, revision, &member.work_dir)
+        .for_runtime(member.runtime.as_deref().unwrap_or("claude"));
     wats::agent::AgentInfo {
         name: member.name.clone(),
         runtime: member.runtime.clone(),
@@ -5876,7 +6016,14 @@ fn agent_config(
     {
         wats::access::check_workdir(workdir, data_dir)?;
     }
-    let mut budget = budget_of(file);
+    // Without the limits the runtime cannot be held to: OpenClaw reports
+    // no cost nor LLM tokens (its spend caps are its own; the runs per day
+    // and the minutes still count), Codex no cost.
+    // A USD budget of 0 from before 0.4.5 keeps it paused until `wats
+    // setup` confirms it (ADR 0034 §5).
+    let revision = wats::firstrun::stored_revision(data_dir);
+    let budget =
+        wats::budget::Budget::of_dir(file, revision, &member.work_dir).for_runtime(&runtime);
     let mut openclaw = wats::openclaw::Target::default();
     if runtime == "openclaw" {
         wats::openclaw::check_access(access, &allow, file.review == Some(true))?;
@@ -5898,10 +6045,6 @@ fn agent_config(
             openclaw.agent = agent.trim().to_string();
         }
         openclaw.token_file = wats::openclaw::hooks_token_path(data_dir);
-        // OpenClaw reports no cost: spend caps are OpenClaw's; the runs per
-        // day still count.
-        budget.max_usd_per_day = f64::INFINITY;
-        budget.max_usd_per_month = f64::INFINITY;
     }
     if runtime == "opencode" {
         wats::opencode::check_access(access, &allow, file.review == Some(true))?;
@@ -5911,11 +6054,6 @@ fn agent_config(
         {
             wats::opencode::check_model(model.trim())?;
         }
-        if !wats::opencode::ENFORCE_USD_BUDGET {
-            // ADR 0031 open question 11, flipped: runs only, as for Codex.
-            budget.max_usd_per_day = f64::INFINITY;
-            budget.max_usd_per_month = f64::INFINITY;
-        }
     }
     if runtime == "vibe" {
         wats::vibe::check_access(access, &allow, file.review == Some(true))?;
@@ -5924,11 +6062,6 @@ fn agent_config(
             && !model.trim().is_empty()
         {
             wats::vibe::check_model(model.trim())?;
-        }
-        if !wats::vibe::ENFORCE_USD_BUDGET {
-            // Runs only, as for Codex.
-            budget.max_usd_per_day = f64::INFINITY;
-            budget.max_usd_per_month = f64::INFINITY;
         }
     }
     let catchup = match &file.catchup {
@@ -5978,10 +6111,10 @@ fn agent_config(
         run_timeout: args
             .run_timeout
             .or(file_duration(&file.timeout, "timeout")?)
-            .unwrap_or(Duration::from_secs(10 * 60)),
+            .unwrap_or(wats::agent::DEFAULT_TIMEOUT),
         work_dir: member.work_dir.clone(),
         data_dir: data_dir.to_path_buf(),
-        max_turns: file.max_turns.unwrap_or(10),
+        max_turns: file.max_turns.unwrap_or(wats::agent::DEFAULT_MAX_TURNS),
         budget,
         wakes: {
             let default = wats::wake::WakeLimits::default();
@@ -6013,16 +6146,6 @@ fn short_duration(d: Duration) -> String {
 /// The CLI of an agent runtime: `claude` or `codex`.
 fn runtime_default_command(runtime: &str) -> PathBuf {
     runtime.into()
-}
-
-/// The spend budget from config.toml, or the defaults.
-fn budget_of(file: &wats::settings::AgentSettings) -> wats::budget::Budget {
-    let default = wats::budget::Budget::default();
-    wats::budget::Budget {
-        max_usd_per_day: file.max_usd_per_day.unwrap_or(default.max_usd_per_day),
-        max_usd_per_month: file.max_usd_per_month.unwrap_or(default.max_usd_per_month),
-        max_runs_per_day: file.max_runs_per_day.unwrap_or(default.max_runs_per_day),
-    }
 }
 
 fn unix_now() -> u64 {
@@ -6177,54 +6300,25 @@ fn banner_lines(config: &NodeConfig, agents: &[(String, wats::agent::AgentConfig
             ));
         }
         let spend = wats::budget::spend(&agent.work_dir, unix_now());
+        let budget = wats::budget::describe(&agent.budget, &spend, &agent.runtime);
         if agent.runtime == "openclaw" {
             lines.push(format!(
-                "{who} forwards to OpenClaw {} (agent {}) · budget: {}: spend caps belong on the \
-                 OpenClaw side · {} of {} runs today · {} per run",
+                "{who} forwards to OpenClaw {} (agent {}) · budget: {budget}: spend caps belong \
+                 on the OpenClaw side · {} per run",
                 wats::openclaw::redacted_url(&agent.openclaw.url),
                 agent.openclaw.agent,
-                wats::openclaw::BUDGET,
-                spend.uncosted_today,
-                agent.budget.max_runs_per_day,
                 short_duration(agent.run_timeout)
             ));
         } else if agent.runtime == "codex" {
-            // Codex reports tokens, not dollars: runs are what is counted.
+            // Codex reports LLM tokens, not dollars: runs and tokens are
+            // what is counted. No turn limit flag for `codex exec`.
             lines.push(format!(
-                "{who} budget: {} of {} runs today (Codex reports no cost) · {} per run",
-                spend.uncosted_today,
-                agent.budget.max_runs_per_day,
-                short_duration(agent.run_timeout)
-            ));
-        } else if agent.runtime == "vibe" {
-            let budget = if wats::vibe::ENFORCE_USD_BUDGET {
-                format!(
-                    "{} (Vibe's cost estimate from the model's prices, not your bill)",
-                    wats::budget::describe(&agent.budget, &spend)
-                )
-            } else {
-                format!(
-                    "{} of {} runs today",
-                    spend.uncosted_today, agent.budget.max_runs_per_day
-                )
-            };
-            lines.push(format!(
-                "{who} budget: {budget} · {} turns and {} per run",
-                agent.max_turns,
+                "{who} budget: {budget} · {} per run",
                 short_duration(agent.run_timeout)
             ));
         } else if agent.runtime == "opencode" {
-            let budget = if wats::opencode::ENFORCE_USD_BUDGET {
-                format!(
-                    "{} (OpenCode's cost estimate, not your provider's bill)",
-                    wats::budget::describe(&agent.budget, &spend)
-                )
-            } else {
-                format!(
-                    "{} of {} runs today",
-                    spend.uncosted_today, agent.budget.max_runs_per_day
-                )
-            };
+            // OpenCode counts steps; its cost is its estimate (said by
+            // `describe`).
             lines.push(format!(
                 "{who} budget: {budget} · {} steps and {} per run",
                 agent.max_turns,
@@ -6232,8 +6326,7 @@ fn banner_lines(config: &NodeConfig, agents: &[(String, wats::agent::AgentConfig
             ));
         } else {
             lines.push(format!(
-                "{who} budget: {} · {} turns and {} per run",
-                wats::budget::describe(&agent.budget, &spend),
+                "{who} budget: {budget} · {} turns and {} per run",
                 agent.max_turns,
                 short_duration(agent.run_timeout)
             ));
@@ -6392,15 +6485,16 @@ async fn agent_watch(
                     .filter_map(|r| r.cost_usd)
                     .fold(0.0, |a, b| a + b);
                 let own = member.as_ref().map_or(&settings.agent, |m| &m.settings);
-                let mut budget = budget_of(own);
-                let openclaw = member
+                let runtime = member
                     .as_ref()
                     .map_or(settings.agent.runtime.as_deref(), |m| m.runtime.as_deref())
-                    == Some("openclaw");
-                if openclaw {
-                    budget.max_usd_per_day = f64::INFINITY;
-                    budget.max_usd_per_month = f64::INFINITY;
-                }
+                    .unwrap_or("claude");
+                let budget = wats::budget::Budget::of_dir(
+                    own,
+                    wats::firstrun::stored_revision(data_dir),
+                    &work_dir,
+                )
+                .for_runtime(runtime);
                 let now = unix_now();
                 let spend = wats::budget::spend(&work_dir, now);
                 let paused = match wats::budget::check(&budget, &spend, now) {
@@ -6414,16 +6508,7 @@ async fn agent_watch(
                         out,
                         "{} runs shown, ${cost:.4} reported\nbudget: {}{paused}",
                         shown.len(),
-                        if openclaw {
-                            format!(
-                                "{} ({} of {} runs today)",
-                                wats::openclaw::BUDGET,
-                                spend.uncosted_today,
-                                budget.max_runs_per_day
-                            )
-                        } else {
-                            wats::budget::describe(&budget, &spend)
-                        }
+                        wats::budget::describe(&budget, &spend, runtime)
                     )
                 })
             }
@@ -7059,6 +7144,15 @@ async fn async_main(mut cli: Cli) -> Result<()> {
     if let Some(notice) = wats::update::start_notice(&data_dir, &config.update) {
         tracing::warn!("{notice}");
     }
+    if let Some(notice) = wats::firstrun::old_defaults_notice(&settings) {
+        tracing::warn!("{notice}");
+    }
+    // A USD budget of 0 from before 0.4.5: still paused (ADR 0034 §5).
+    for (name, agent) in &agents {
+        if let Some(notice) = agent.budget.zero_notice(name) {
+            tracing::warn!("{notice}");
+        }
+    }
     for (member, (_, agent)) in members.iter().zip(&agents) {
         if member.settings.review == Some(true) && !config.review_profiles.contains(&agent.profile)
         {
@@ -7122,8 +7216,8 @@ async fn async_main(mut cli: Cli) -> Result<()> {
     config.agents = configured
         .iter()
         .filter(|c| !members.iter().any(|m| m.name == c.name))
-        .map(|c| agent_info(c, false))
-        .chain(members.iter().map(|m| agent_info(m, true)))
+        .map(|c| agent_info(c, false, &data_dir))
+        .chain(members.iter().map(|m| agent_info(m, true, &data_dir)))
         .collect();
     config.agents.sort_by(|a, b| a.name.cmp(&b.name));
     config.relaunch_args = cli.node.to_args(&data_dir);

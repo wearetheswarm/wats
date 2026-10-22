@@ -73,7 +73,7 @@ wats [OPTIONS] [COMMAND]
 | `--allow <ALLOW>` |  |  | Only wake for events by these authors (64-hex author ids, from `wats id`; repeatable) |
 | `--heartbeat-file <HEARTBEAT_FILE>` |  |  | Heartbeat prompt [default: the one shipped with wats] |
 | `--agent-command <AGENT_COMMAND>` | `WATS_AGENT_COMMAND` |  | Agent CLI to run [default: claude] |
-| `--run-timeout <RUN_TIMEOUT>` |  |  | Longest run before it is killed [default: 10m] |
+| `--run-timeout <RUN_TIMEOUT>` |  |  | Longest run before it is killed [default: 25m] |
 | `--agent-args <AGENT_ARGS>` |  |  | Extra arguments for the agent CLI, split on spaces (e.g. "--model sonnet"). Arguments after `--` are passed too |
 
 | Command | |
@@ -143,7 +143,7 @@ wats node [OPTIONS]
 | `--allow <ALLOW>` |  |  | Only wake for events by these authors (64-hex author ids, from `wats id`; repeatable) |
 | `--heartbeat-file <HEARTBEAT_FILE>` |  |  | Heartbeat prompt [default: the one shipped with wats] |
 | `--agent-command <AGENT_COMMAND>` | `WATS_AGENT_COMMAND` |  | Agent CLI to run [default: claude] |
-| `--run-timeout <RUN_TIMEOUT>` |  |  | Longest run before it is killed [default: 10m] |
+| `--run-timeout <RUN_TIMEOUT>` |  |  | Longest run before it is killed [default: 25m] |
 | `--agent-args <AGENT_ARGS>` |  |  | Extra arguments for the agent CLI, split on spaces (e.g. "--model sonnet"). Arguments after `--` are passed too |
 
 <a id="wats-setup"></a>
@@ -158,7 +158,7 @@ wats setup [OPTIONS] [COMMAND]
 
 | Option | Env | Default | Description |
 |---|---|---|---|
-| `-d, --detach` |  | `false` | Then start the node in the background, as `wats --detach` does, unless one already runs. Without it, `wats setup` asks on a terminal (default no), and never starts one otherwise |
+| `-d, --detach` |  | `false` | Then start the node in the background, as `wats --detach` does, unless one already runs. Without it, `wats setup` asks on a terminal (with no tool, the background by default; with a tool, default no), and never starts one otherwise |
 
 | Command | |
 |---|---|
@@ -314,7 +314,7 @@ wats config [OPTIONS] <COMMAND>
 |---|---|
 | [`wats config get`](#wats-config-get) | Print a key's value (the default when it is not set) |
 | [`wats config set`](#wats-config-set) | Set a key, e.g. `wats config set agent.heartbeat 2h`. Lists are comma-separated |
-| [`wats config unset`](#wats-config-unset) | Remove a key: its default applies again |
+| [`wats config unset`](#wats-config-unset) | Remove keys: their defaults apply again (e.g. `wats config unset agent.timeout agent.max_turns`) |
 | [`wats config list`](#wats-config-list) | List every key, its value and what it does |
 | [`wats config ack`](#wats-config-ack) | Acknowledge changed safety settings (halts, review, access, budgets, updates, reports): print what changed, then record the current values. Run it yourself, never through an agent |
 
@@ -351,15 +351,15 @@ wats config set [OPTIONS] <KEY> <VALUE>
 
 ## `wats config unset`
 
-Remove a key: its default applies again
+Remove keys: their defaults apply again (e.g. `wats config unset agent.timeout agent.max_turns`)
 
 ```
-wats config unset [OPTIONS] <KEY>
+wats config unset [OPTIONS] <KEYS>...
 ```
 
 | Option | Env | Default | Description |
 |---|---|---|---|
-| `<KEY>` |  |  |  |
+| `<KEYS>` |  |  |  |
 
 <a id="wats-config-list"></a>
 

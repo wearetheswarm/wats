@@ -2,6 +2,52 @@
 
 ## Unreleased
 
+### Upgrading
+
+- **New defaults for agent runs**: `agent.timeout` is 25m (was 10m) and
+  `agent.max_turns` 50 (was 10). A `config.toml` that sets them keeps its
+  values: one that sets exactly `10m` or `10`, the old defaults (as files
+  written by 0.4.3 often do), is not rewritten, but `wats status` and the
+  node's start say so in one line, with the new defaults and the command
+  to use them: `wats setup`, or `wats config unset agent.timeout
+  agent.max_turns` (`config unset` now takes several keys). `wats setup`
+  offers to drop them.
+- **Monthly budgets are 30 × the daily ones** unless set: with
+  `agent.max_usd_per_day` at its default of $2 and no
+  `agent.max_usd_per_month`, the month goes from $20 to $60. `wats config
+  set agent.max_usd_per_month 20` keeps the old one.
+- **0 is no limit** for every budget key, `agent.max_usd_per_day` and
+  `agent.max_usd_per_month` included, as for `sync.initial_max`. Before,
+  a 0 paused the agent. **An upgrade never turns that pause into no
+  limit by itself**: an agent whose table sets `max_usd_per_day = 0` or
+  `max_usd_per_month = 0`, in a data directory not set up again since
+  (setup revision below 2), stays paused (no run) and says so in one line
+  in `wats status`, at the node's start and in the MCP `status`
+  (`budget_paused`): "agent X: max_usd_per_day = 0 meant paused before
+  0.4.5 and now means no limit; it stays paused until you run `wats
+  setup` (or set agents.X.enabled = false to keep it off)". Each such
+  agent's own budget question, in `wats setup` or the next bare `wats` on
+  a terminal, settles it for that agent; `wats setup` without a terminal
+  changes no budget. To keep an agent off, use `agents.<name>.enabled =
+  false`.
+- **The budget question has no Enter default**: type 1, 2 or 3 (with
+  `ANTHROPIC_API_KEY`, `OPENAI_API_KEY` or `MISTRAL_API_KEY` set for the
+  agent's runtime, 2 is the default).
+- **One new setup question** (revision 2): a node with an agent is asked
+  its budget once, at its next bare `wats` on a terminal. A node without
+  an agent is asked nothing.
+- **Rolling back to 0.4.4 or older** with a budget in minutes or LLM
+  tokens set: those releases refuse the keys, so `wats upgrade --rollback` names them (with
+  their agent's table) and the `wats config unset` commands to run first.
+
+### Keys in this release
+
+New: `agent.max_minutes_per_day`, `agent.max_minutes_per_month`,
+`agent.max_tokens_per_day`, `agent.max_tokens_per_month`. Changed
+defaults: `agent.timeout` 25m, `agent.max_turns` 50,
+`agent.max_usd_per_month` 30 × `agent.max_usd_per_day`. See
+docs/config.md.
+
 ### Changes
 
 - **Node names, and `-n NAME` for every command about one node** (ADR
@@ -64,6 +110,46 @@
     key only in `~/.vibe/.env` is not read by swarm-only runs.
   - Rolling back to 0.4.4 with an agent whose `runtime = "vibe"`: 0.4.4
     does not know that runtime; remove or disable that agent first.
+- **Daily budgets in dollars, minutes and LLM tokens** ([ADR
+  0034](docs/adr/0034-daily-budgets.md), docs/agent.md "Budget"). Next to
+  `agent.max_usd_per_day`, `agent.max_minutes_per_day` caps the agent's
+  total run time per UTC day (new runs stop once it is used; a run in
+  progress keeps its timeout), and `agent.max_tokens_per_day` its LLM
+  tokens (model input, cached input included, and output) for the
+  runtimes that report them: Claude Code, Codex, OpenCode (`step_finish`)
+  and Mistral Vibe (its export's `usage`), not OpenClaw. OpenCode and
+  Vibe are held to dollars from their cost estimate, as before. Each
+  month is 30 × its day unless `agent.max_*_per_month` is set; 0 is no
+  limit. `wats status`, the banner, `wats agent runs` and the MCP
+  `status` tool (`agents[].usage`) show the dollars, minutes and LLM
+  tokens used today and this month; transcripts and `wats agent logs`
+  show each run's LLM tokens.
+- **The setup wizard asks the budget by how the agent is paid**:
+  subscription (120 minutes a day, no dollar limit), API key ($5 a day;
+  5M LLM tokens for Codex, which reports no cost) or self-hosted (240
+  minutes), then shows it on one line that Enter accepts or that you
+  edit (`min=90 usd=3 tokens=2M`). "Set it to what you're willing to give
+  the swarm from your subscription, machine or API spend."
+- **Quick or detailed, at each step of the wizard** ([ADR
+  0027](docs/adr/0027-setup-wizard.md) §5 to §8). Step 1: "Recommended
+  settings, or choose each one?"; quick asks only the budget. Step 2:
+  "Set up wats in all the agent CLIs found (MCP + session hook)? [Y = all
+  / d = one by one / n = none]". Step 3: the background is now the
+  recommended answer (Enter); `d` offers this terminal or not now.
+- **`wats setup` restarts a running node** with the new setup when you
+  say yes ("Restart it now with this setup?"), instead of only printing
+  `wats stop; wats --detach`.
+- **An older node is named**: a node of wats 0.3.2 or older showed as
+  `unknown` in `wats ps` and in setup's messages (it records no role); it
+  now shows as `older wats, v0.3.2`.
+- **An agent runner no longer wakes on an event stored just before it
+  started**: the store sends an event to its listeners right after
+  committing it, so one committed before the runner listened could still
+  reach it as new (a flaky test on a loaded CI runner showed it). The
+  catch-up, when on, still has such events.
+- **The wizard writes only what changed**: a value equal to its default
+  is left out of `config.toml`, and one already set keeps its line and
+  comments, so that new defaults apply.
 
 ## 0.4.4 (2026-10-22)
 

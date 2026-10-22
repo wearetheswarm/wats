@@ -1,6 +1,6 @@
 # 0027. The setup wizard of a bare `wats`, and setup revisions
 
-Status: Proposed (2026-10-21). Ships in 0.4.3.
+Status: Proposed (2026-10-21). Ships in 0.4.3; §5 to §8 (2026-10-22) in 0.4.5.
 
 Amends ADR 0023 §1 ("a bare `wats` runs in the foreground"): it still
 does, after the wizard the first time, or in the background if the
@@ -208,3 +208,87 @@ and a configured 0.4.x data directory is not prompted on upgrade to 0.4.3.
   asked of a data directory.
 - If a revision adds an MCP-host or background question, decide then
   whether the catch-up asks it.
+
+## Quick or detailed, the budget, restarts (Vincent, 2026-10-22; 0.4.5)
+
+Decisions by Vincent for 0.4.5, with the budget part in
+[ADR 0034](0034-daily-budgets.md). Code: `firstrun.rs` (`ask_mode`,
+`ask_budget`, `ask_hosts`, `ask_where`, `old_defaults_notice`,
+`pending_questions`, `apply`), `main.rs` (`offer_integrations`,
+`setup_wizard`, `offer_background`, `NodeEntry::mode_label`).
+
+### 5. One keystroke for the recommended, at each step
+
+- **Step 1.** Right after the agent: "Recommended settings, or choose
+  each one? [quick/detailed, Enter: quick]", after a line naming what
+  quick keeps (the disk budget, the networks, the run limits, the access
+  level; "your current settings" when config.toml has some). **Quick**
+  answers every question with its default, without asking it: the
+  current value, else the default; notify.desktop stays as it is; the
+  security updates take their default (yes for a new data directory, or
+  the answer recorded before) and say so in one line. It asks only the
+  agent's budget (ADR 0034 §3). **Detailed** asks every question, as in
+  0.4.3, the budget question in place of the two USD questions. A
+  catch-up (§4) asks neither: only its new questions.
+- **Step 2.** "Set up wats in all the agent CLIs found (Claude Code,
+  Codex, …): MCP server + session hook? [Y = all / d = one by one / n =
+  none]". All runs, for each, what a yes did in 0.4.3, the session hook
+  included and not asked; one by one asks as 0.4.3 did; none skips them
+  all, each with its later command.
+- **Step 3.** "Run the node in the background (`wats --detach`…)? [Y =
+  background, recommended / d = choose]". `d` lists: in the background,
+  here in this terminal until Ctrl-C (a bare `wats` only), not now. **The
+  default changes from this terminal (§2.3) to the background**: Enter is
+  the recommended choice here as in steps 1 and 2, and a node that keeps
+  running when the terminal closes is what serves the swarm. `n` keeps
+  the 0.4.3 answer (this terminal; for `wats setup`, not now). `wats
+  setup <tool>` keeps its own question, "Start the node in the background
+  now?" (default no).
+
+### 6. A node already running: restart it
+
+When `wats setup` changed config.toml and a node already runs in the
+data directory, it asks, on a terminal: "Restart it now with this setup,
+in the background (wats stop; wats --detach)? [Y/n]". Yes stops it as
+`wats stop` does (graceful, killed after 10 s) and starts it as `wats
+--detach` does; a background node of `wats mcp` is taken over instead,
+as `wats --detach` does. No, `--yes`, or no terminal: the commands, as in
+0.4.3.
+
+That line used to say "(pid 68406, unknown)" for a node of wats 0.3.2:
+a wats older than 0.3.3 writes no `role` in its lock file and answers no
+`Info` on its socket, so its mode was unknown. Such a node is now "older
+wats, v0.3.2" (its version is in its lock file), in `wats ps` and in
+these messages; its mode in `wats ps --json` is `older`. It still stops:
+`wats stop` signals the pid its lock file names.
+
+### 7. Only what changed is written
+
+config.toml keeps a key only when its value differs from the default: a
+new file comments the others, and on an existing file an answer equal to
+the default unsets its key, and one equal to the value already set leaves
+its line and comments untouched. Otherwise a value written once would pin
+an old default forever.
+
+0.4.5 raises the defaults of `agent.timeout` (10m to 25m) and
+`agent.max_turns` (10 to 50). A config.toml that sets them to 10m and 10,
+as many 0.4.3 files do, is never rewritten by itself. Instead:
+
+- `wats status`, and the node at its start (a warning in its log), say in
+  one line that these are the defaults of 0.4.4 and older, name the new
+  ones, and suggest `wats setup` or `wats config unset agent.timeout
+  agent.max_turns` (`wats config unset` takes several keys; with several
+  agents, `agents.<name>.<key>`);
+- the wizard (quick and detailed) and a catch-up offer to drop them:
+  "config.toml sets agent.timeout = 10m and agent.max_turns = 10: the
+  defaults of wats 0.4.4 and older, now 25m and 50. Drop them, to use the
+  new defaults? [Y/n]".
+
+### 8. Revision 2
+
+The budget question is a new question: `SETUP_REVISION` is 2. A data
+directory at revision 1 (0.4.3, or set up before revisions) with an
+agent is asked it once, at its next bare `wats` on a terminal; other
+starts log the one line of §4. One with no agent has nothing to ask: a
+bare `wats` on a terminal records revision 2 without a word, and other
+starts log nothing.

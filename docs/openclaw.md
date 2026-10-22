@@ -147,10 +147,12 @@ sandboxed, allowed the `wats-agent__*` tools only, and denied `exec`,
 
 ### Budgets
 
-OpenClaw returns no model output, token count or cost. The USD budgets
-(`agent.max_usd_per_day`, `agent.max_usd_per_month`) therefore do not
-apply: **spend caps belong on the OpenClaw side**, or with your model
-provider. Setup says so and asks you to confirm (`--yes` without a
+OpenClaw returns no model output, LLM token count or cost. The USD and
+LLM token budgets (`agent.max_usd_per_day`, `agent.max_tokens_per_day`
+and their monthly keys) therefore do not apply: **spend caps belong on the
+OpenClaw side**, or with your model provider. The minutes do
+(`agent.max_minutes_per_day`, the time to the gateway's answer for each
+run; the setup wizard asks them, not how it is paid). Setup says so and asks you to confirm (`--yes` without a
 terminal); the daemon logs it at startup; `status` (the MCP tool and
 `wats status`) shows `budget: managed by OpenClaw`. The run caps
 (`agent.max_runs_per_hour`, `agent.max_runs_per_day`), the timeout and the

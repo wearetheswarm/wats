@@ -705,21 +705,45 @@ pub const KEYS_SINCE: &[(&str, Version)] = &[
     // Set only by `wats config set node.name`: a drawn name goes to
     // <data dir>/node-name, which older releases ignore (ADR 0023 §8).
     ("node.name", Version(0, 4, 5)),
+    ("agent.max_minutes_per_day", Version(0, 4, 5)),
+    ("agent.max_minutes_per_month", Version(0, 4, 5)),
+    ("agent.max_tokens_per_day", Version(0, 4, 5)),
+    ("agent.max_tokens_per_month", Version(0, 4, 5)),
 ];
 
 /// The keys set in `data_dir`'s config.toml that wats `version` does not
 /// know ([`KEYS_SINCE`]), and for a table it does not know at all, even
 /// empty (`[node]` before 0.4.5), one of its keys: unsetting it removes
-/// the table. None when config.toml is absent or unreadable.
-pub fn keys_unknown_to(data_dir: &Path, version: Version) -> Vec<&'static str> {
+/// the table. A key of one agent (`agent.<leaf>`) is looked for in each
+/// `[agents.<name>]` table, and named so. None when config.toml is absent
+/// or unreadable.
+pub fn keys_unknown_to(data_dir: &Path, version: Version) -> Vec<String> {
     let Ok(file) = crate::settings::ConfigFile::open(data_dir) else {
         return Vec::new();
     };
-    let mut keys: Vec<&'static str> = KEYS_SINCE
-        .iter()
-        .filter(|(key, since)| version < *since && file.get(key).is_some())
-        .map(|(key, _)| *key)
-        .collect();
+    let agents = file.agent_names();
+    let mut keys: Vec<String> = Vec::new();
+    for (key, since) in KEYS_SINCE {
+        if version >= *since {
+            continue;
+        }
+        match key.strip_prefix("agent.") {
+            Some(leaf) if crate::settings::is_agent_leaf(leaf) && !agents.is_empty() => {
+                // The old [agent] table too, next to [agents.<name>] ones.
+                if file.agent_table_has(leaf) {
+                    keys.push(key.to_string());
+                }
+                for name in &agents {
+                    let named = format!("agents.{name}.{leaf}");
+                    if file.get(&named).is_some() {
+                        keys.push(named);
+                    }
+                }
+            }
+            _ if file.get(key).is_some() => keys.push(key.to_string()),
+            _ => {}
+        }
+    }
     for (key, since) in KEYS_SINCE {
         let Some((table, _)) = key.split_once('.') else {
             continue;
@@ -730,7 +754,7 @@ pub fn keys_unknown_to(data_dir: &Path, version: Version) -> Vec<&'static str> {
             && table_unknown_to(table, version)
             && !keys.iter().any(|k| k.starts_with(&prefix))
         {
-            keys.push(key);
+            keys.push(key.to_string());
         }
     }
     keys
@@ -2527,6 +2551,50 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("config unset sync.initial_max"), "{err}");
+        // The budget keys of 0.4.5 (ADR 0034), in an agent's table: named
+        // with the table.
+        std::fs::write(
+            &config,
+            "[agents.claude]\nruntime = \"claude\"\nmax_minutes_per_day = 120\n\n\
+             [agents.codex]\nruntime = \"codex\"\nmax_tokens_per_day = 5000000\n",
+        )
+        .unwrap();
+        assert_eq!(
+            keys_unknown_to(&data, Version(0, 4, 3)),
+            [
+                "agents.claude.max_minutes_per_day",
+                "agents.codex.max_tokens_per_day"
+            ]
+        );
+        // The old [agent] table, next to [agents.<name>] ones: named too.
+        std::fs::write(
+            &config,
+            "[agent]\nmax_minutes_per_day = 60\n\n[agents.claude]\nruntime = \"claude\"\n\
+             max_tokens_per_day = 1000\n",
+        )
+        .unwrap();
+        assert_eq!(
+            keys_unknown_to(&data, Version(0, 4, 4)),
+            [
+                "agent.max_minutes_per_day",
+                "agents.claude.max_tokens_per_day"
+            ]
+        );
+        std::fs::write(
+            &config,
+            "[agents.claude]\nruntime = \"claude\"\nmax_minutes_per_day = 120\n\n\
+             [agents.codex]\nruntime = \"codex\"\nmax_tokens_per_day = 5000000\n",
+        )
+        .unwrap();
+        fake("0.4.4");
+        let err = check_rollback(&old, &data, Version(0, 4, 5))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("config unset agents.claude.max_minutes_per_day"),
+            "{err}"
+        );
+        fake("0.4.0");
         // No such key set, no config.toml, or an old binary that does not
         // say its version: go ahead.
         std::fs::write(&config, "[update]\nauto = true\n").unwrap();
