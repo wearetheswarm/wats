@@ -20,5 +20,10 @@ secret.key
 # Cross-NAT test logs (scripts/nat-test.sh).
 wats-nat-*.log
 
-# Python bytecode (tools/verify-py).
+# Python bytecode (tools/verify-py, packages/pypi).
 __pycache__/
+
+# npm and PyPI wrappers (packages/): installs, packs and builds.
+node_modules/
+packages/npm/*.tgz
+packages/pypi/dist/

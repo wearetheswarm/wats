@@ -12,6 +12,8 @@ paths = [
   '''docs/test-vectors/.*\.json''',
   # Signed fixtures of the upgrade and install tests (a throwaway key).
   '''crates/wats/tests/fixtures/.*''',
+  # Signed fixtures of the npm and PyPI wrapper tests (a throwaway key).
+  '''packages/fixtures/.*''',
 ]
 regexes = [
   # minisign public keys (the release key is pinned in several places).

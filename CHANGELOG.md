@@ -1,5 +1,25 @@
 # Changelog
 
+## Unreleased
+
+### Changes
+
+- **npm and PyPI wrappers, not published yet** ([ADR 0035](docs/adr/0035-npx-and-uvx-wrappers.md),
+  `packages/npm`, `packages/pypi`): so that MCP hosts can start wats with
+  `npx -y <package> mcp` or `uvx <package> mcp`. A wrapper of version
+  X.Y.Z downloads the wats X.Y.Z release archive for the machine (macOS
+  arm64, Linux x86_64; elsewhere it says how to install otherwise),
+  verifies both minisign signatures with the pinned release key, their
+  trusted file names and the SHA-256, as `wats upgrade` does, caches the
+  binary (0700, atomic, checked again at every start, so it works
+  offline), then runs it with the same arguments. Nothing runs when a
+  check fails. No runtime dependency in either: Node's crypto, and a
+  pure-Python Ed25519 copied from `tools/verify-py`. The package names
+  are placeholders until they are reserved; nothing is on npm or PyPI.
+- `scripts/wrapper-versions.sh` keeps the wrappers' versions equal to
+  Cargo.toml's (CI checks it), and CONTRIBUTING.md lists the version
+  bumps of a release.
+
 ## 0.4.5 (2026-10-22)
 
 A friendlier setup and a fairer node: the wizard has a quick path (pick

@@ -103,6 +103,19 @@ jobs:
         run: |
           shellcheck scripts/security-floor.sh scripts/test-security-floor.sh
           sh scripts/test-security-floor.sh
+      # The npm and PyPI wrappers (ADR 0035): their versions equal
+      # Cargo.toml's, and their verification against signed fixtures (a
+      # throwaway key, a local server: never github.com). Node and Python
+      # as the runner has them, no install.
+      - name: npm and PyPI wrappers
+        if: runner.os == 'Linux'
+        run: |
+          shellcheck scripts/wrapper-versions.sh packages/fixtures/make-fixtures.sh packages/fixtures/fake-wats.sh
+          sh scripts/wrapper-versions.sh check
+          node --version
+          node --test packages/npm/test/*.test.js
+          python3 --version
+          python3 -m unittest discover -s packages/pypi/tests -v
       # The rendered formula passes Homebrew's own style checks.
       - name: Homebrew formula style
         if: runner.os == 'macOS'
