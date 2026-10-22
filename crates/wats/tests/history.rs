@@ -1478,6 +1478,66 @@ async fn review5_quiet_claims_and_an_older_holder_that_fails() -> anyhow::Result
     Ok(())
 }
 
+/// REVIEW5, the ordering the test above hits now and then: the quiet
+/// claims confirm the catch-up range before the 0.4.0 holder is a
+/// neighbor; it comes up before the pass ends, so the check of the
+/// neighbors that came up reads it from the watermark the pass started
+/// with, below the range just confirmed. It serves a page that range
+/// lacked, then stops (rate limit): the span is unconfirmed again, never
+/// `full` with it missing. Forced here: the holder starts once the range
+/// is confirmed, the watermark just ahead (no catch-up range opens) and
+/// the span within the skew below it, where the check reads.
+#[tokio::test(flavor = "multi_thread")]
+async fn review5_an_older_holder_that_comes_up_after_the_quiet_claims() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let now = now_secs();
+    let below = note(900, now - 3 * DAY);
+    let c1 = reference(&dir.path().join("c1")).await?;
+    let c2 = reference(&dir.path().join("c2")).await?;
+    hold(&c1, std::slice::from_ref(&below));
+    hold(&c2, std::slice::from_ref(&below));
+    let a_dir = dir.path().join("a");
+    std::fs::create_dir_all(&a_dir)?;
+    Store::open(&a_dir.join("events.sqlite"))?.set_sync_watermark(PUBLIC_NET, now - 2 * DAY)?;
+    let a = Node::start(config(&a_dir, &[])).await?;
+    for p in [&c1, &c2] {
+        a.add_peer(p.endpoint().addr()).await?;
+    }
+    eventually("the quiet claims confirm the range", 30, || {
+        (a.store().sync_ranges(PUBLIC_NET).unwrap().is_empty() && state(&a) == "full").then_some(())
+    })
+    .await;
+    a.store().set_sync_watermark(PUBLIC_NET, now_secs() + 60)?;
+    let mut h_config = config(&dir.path().join("h"), &[]);
+    h_config.history.legacy = true;
+    h_config.limits.challenge = false;
+    h_config.limits.sync_per_min = 1;
+    let h = Node::start(h_config).await?;
+    let span: Vec<Event> = (0..40u32)
+        .map(|i| note(i, now - 400 + u64::from(i) * 5))
+        .collect();
+    hold(&h, &span);
+    a.add_peer(h.endpoint().addr()).await?;
+    eventually("the holder serves a page", 30, || {
+        span.iter().any(|e| seq(&a, &e.id).is_some()).then_some(())
+    })
+    .await;
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    let held = span.iter().filter(|e| seq(&a, &e.id).is_some()).count();
+    let ranges = a.store().sync_ranges(PUBLIC_NET)?;
+    assert!(held < span.len(), "one page only: {held}/40");
+    assert_ne!(state(&a), "full", "{held}/40, ranges {ranges:?}");
+    assert!(!a.history_full());
+    assert!(
+        ranges.iter().any(|r| r.state == RangeState::Unconfirmed),
+        "{held}/40, ranges {ranges:?}"
+    );
+    for node in [a, c1, c2, h] {
+        node.shutdown().await?;
+    }
+    Ok(())
+}
+
 /// Key age from the peers (ADR 0025, "Key age"): a new node holds an old
 /// key's events since a minute, but three peers, one with full history,
 /// saw it 40 days ago. The fill reads one peer; the announces asked of
