@@ -54,7 +54,9 @@ case "${1:-}" in
         [ -n "$(pypi_version)" ] || die "no __version__ line in $PYPI"
         rewrite "$NPM" "s/^  \"version\": \"[^\"]*\",\$/  \"version\": \"$cargo\",/"
         rewrite "$PYPI" "s/^__version__ = \"[^\"]*\"\$/__version__ = \"$cargo\"/"
-        [ "$(npm_version)" = "$cargo" ] && [ "$(pypi_version)" = "$cargo" ] || die "could not set the versions"
+        if [ "$(npm_version)" != "$cargo" ] || [ "$(pypi_version)" != "$cargo" ]; then
+            die "could not set the versions"
+        fi
         echo "npm and PyPI wrappers set to $cargo"
         ;;
     *)
