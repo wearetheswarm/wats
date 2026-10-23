@@ -1453,6 +1453,20 @@ fn lent_servers(config: &AgentConfig) -> Vec<(String, serde_json::Value)> {
     servers
 }
 
+/// Whether an agent this node knows of announces every one of `caps` on
+/// `net` (its latest `announce`): the capable agents an ask's grace waits
+/// for. On a store error, as if one did.
+fn someone_announces(node: &Node, net: &str, caps: &[String]) -> bool {
+    let filter = crate::store::Filter {
+        net: Some(net.to_string()),
+        tags: caps.to_vec(),
+        ..Default::default()
+    };
+    node.store()
+        .latest_announces(&filter, 1)
+        .map_or(true, |found| !found.is_empty())
+}
+
 /// OpenCode's `--model=<provider/model>`, as one argument (a value can
 /// never be read as a flag), unless the extra arguments choose a model.
 fn opencode_model_arg(config: &AgentConfig) -> Vec<String> {
@@ -1882,7 +1896,9 @@ fn serve(node: &Node, me: &str, config: &AgentConfig, ask: &Event, now: u64) -> 
         }
     } else if !request.caps.is_empty() {
         let mine: Vec<String> = config.caps.iter().map(|c| cap_tag(c)).collect();
-        if !request.capable(&mine) {
+        // No grace when no agent this node knows of announces those caps:
+        // nobody to wait for.
+        if !request.capable(&mine) && someone_announces(node, &ask.net, &request.caps) {
             let grace = ask.ts.saturating_add(node.config().cap_grace.as_secs());
             if now < grace {
                 return Serve::Hold {

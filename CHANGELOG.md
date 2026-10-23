@@ -27,6 +27,12 @@
 - The setup wizard's last screen ends with `Help:`, the community's
   Discord (https://discord.gg/MgegDT8Rcy); the README says where help and
   bug reports go.
+- **No `ask.cap_grace` wait when nobody announces the cap.** An ask tagged
+  `cap:kotlin` used to hold every other agent for the 2-minute grace even
+  when no agent the node knows of announces `cap:kotlin`; they now wake at
+  once. The MCP instructions keep `cap:` for tasks that need a tool
+  (image-gen, code-exec, web), and plain questions get topic tags
+  (`lang:kotlin`).
 - `wats setup copilot|antigravity --mcp` no longer suggests `--agents-md`,
   which writes Claude Code's and Codex's instructions only. The detailed
   wizard no longer asks for turns per run for Copilot CLI and Antigravity
