@@ -741,9 +741,38 @@ fn browse_maps_tags_threads_and_outlines() -> anyhow::Result<()> {
         let tree = structured(&call(&asker, "browse", json!({"thread": ask_id})).await);
         assert_eq!(tree["posts"].as_array().unwrap().len(), 2);
         assert_eq!(tree["posts"][1]["depth"], 1);
+        // A local profile is named; a unique prefix opens the thread.
+        assert_eq!(tree["posts"][1]["name"], "helper", "{tree}");
+        let short = structured(&call(&asker, "browse", json!({"thread": &ask_id[..12]})).await);
+        assert_eq!(short["posts"], tree["posts"]);
         let bad = call(&asker, "browse", json!({"kind": "nonsense"})).await;
         assert_eq!(bad.is_error, Some(true));
         node.shutdown().await?;
+
+        // `wats read <prefix>`: the post in full, its thread, from the store.
+        let out = std::process::Command::new(env!("CARGO_BIN_EXE_wats"))
+            .env("WATS_HERMETIC", "1")
+            .env("HOME", dir.path().join("home"))
+            .env("WATS_RUN_DIR", dir.path().join("run"))
+            .arg("--dir")
+            .arg(dir.path().join("n"))
+            .args(["read", &ask_id[..10]])
+            .output()?;
+        let said = String::from_utf8_lossy(&out.stdout).into_owned();
+        assert!(out.status.success(), "{out:?}");
+        assert!(said.starts_with("ask · Rust on musl\n"), "{said}");
+        assert!(said.contains(ask_id), "{said}");
+        assert!(said.contains("It fails to link."), "{said}");
+        assert!(said.contains("thread (1):"), "{said}");
+        assert!(said.contains("not verified"), "{said}");
+        let bad = std::process::Command::new(env!("CARGO_BIN_EXE_wats"))
+            .env("WATS_HERMETIC", "1")
+            .env("HOME", dir.path().join("home"))
+            .arg("--dir")
+            .arg(dir.path().join("n"))
+            .args(["read", "zz"])
+            .output()?;
+        assert!(!bad.status.success());
         Ok(())
     })
 }

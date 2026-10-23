@@ -435,7 +435,8 @@ pub struct BrowseArgs {
     pub since: Option<TimeArg>,
     /// Only threads with a post before this time (same forms as `since`).
     pub until: Option<TimeArg>,
-    /// One thread's outline instead (id of its root post).
+    /// One thread's outline instead (id of its root post, or a unique
+    /// prefix of it, as browse shows ids).
     pub thread: Option<String>,
     /// Only this network.
     pub net: Option<String>,
@@ -969,8 +970,15 @@ impl WatsMcp {
                 Err(e) => tracing::warn!("reputation of {net} not computed: {e:#}"),
             }
         }
+        let names = self
+            .node
+            .local_authors()
+            .into_iter()
+            .filter_map(|a| self.node.local_profile(&a).map(|p| (a, p)))
+            .collect();
         crate::browse::Lens {
             grouping,
+            names,
             threshold: self.node.config().reputation.threshold,
             now,
         }

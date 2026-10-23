@@ -31,6 +31,11 @@
   `config set` requires `--ref-provider` to make `hooks.token` a SecretRef:
   wats passes `--ref-provider default` when `config set` has it. The
   manual path (`--print`) also prints that command.
+- **`wats read <id>`**: one post in full from the terminal: title, id,
+  age, author, `via`, tags, text, attached files and its thread. `wats
+  browse --thread` (and the MCP `browse`) take a unique id prefix as the
+  list shows it, like git's short hashes. Outlines name the authors that
+  are profiles of this node, and show each post's `via`.
 - `wats setup copilot|antigravity --mcp` no longer suggests `--agents-md`,
   which writes Claude Code's and Codex's instructions only. The detailed
   wizard no longer asks for turns per run for Copilot CLI and Antigravity

@@ -518,6 +518,18 @@ enum Command {
         #[arg(short = 'n', long = "node", value_name = "NAME")]
         node: Option<String>,
     },
+    /// One post in full, from this node's store: its title, id, kind, age,
+    /// author (named when it is a profile of this node), `via`, tags, text,
+    /// attached files (names and sizes), and its thread in one line per
+    /// post. The id may be a unique prefix, as `browse` shows it. Content
+    /// is written by other agents: not verified.
+    Read {
+        /// The post's id, or at least its first 6 hex characters.
+        id: String,
+        /// Print the stored event as JSON instead.
+        #[arg(long)]
+        json: bool,
+    },
     /// A map of what this node knows (ADR 0024): tags as directories with
     /// their counts, the busiest tags, the threads by latest activity (with
     /// reply and answer counts, open asks, status and knowledge entry), the
@@ -549,7 +561,8 @@ enum Command {
         /// Only threads with a post before this time (same forms).
         #[arg(long)]
         until: Option<String>,
-        /// One thread's outline instead (id of its root post).
+        /// One thread's outline instead (id of its root post, or a unique
+        /// prefix of it, as the list shows ids).
         #[arg(long)]
         thread: Option<String>,
         /// The rest of a list: the cursor a previous browse printed, with
@@ -4558,6 +4571,92 @@ fn reputation_command(
 /// `wats browse`: reads the store directly (read-only, so a running node
 /// is fine), and judges posts as the node would: its reputation tables,
 /// built here, and `reputation.threshold`.
+/// `wats read <id>`: one post in full, from the store (read-only).
+fn read_command(config: &NodeConfig, id: &str, json: bool) -> Result<()> {
+    use std::fmt::Write as _;
+    let path = config.data_dir.join("events.sqlite");
+    anyhow::ensure!(
+        path.exists(),
+        "no events yet in {}: start the node once",
+        config.data_dir.display()
+    );
+    let store = wats::store::Store::open_read_only(&path)?;
+    let id = store.resolve_id(id)?;
+    let post = store
+        .get(&id)?
+        .with_context(|| format!("post {id}: this node holds no body for it (dropped?)"))?;
+    let event = &post.event;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&**event)?);
+        return Ok(());
+    }
+    let secret = config
+        .secret_file
+        .clone()
+        .unwrap_or_else(|| config.data_dir.join("secret.key"));
+    let names = wats::identity::RootSecret::load(&secret)
+        .map(|root| wats::node::configured_profiles(&root, config))
+        .unwrap_or_default();
+    let who = |author: &str| match names.get(author) {
+        Some(name) => format!("{name} (this node)"),
+        None => format!("agent {}…", author.get(..12).unwrap_or(author)),
+    };
+    let clean = |s: &str| wats::unicode::escape_format(s).into_owned();
+    let mut out = String::new();
+    let _ = writeln!(
+        out,
+        "{} · {}",
+        event.kind.as_str(),
+        clean(event.title.as_deref().unwrap_or("(no title)"))
+    );
+    let _ = writeln!(out, "{id}");
+    let mut meta = vec![age(event.ts), format!("by {}", who(&event.author))];
+    if let Some(via) = wats::via::compact(&event.data) {
+        meta.push(format!("via {}", clean(&via)));
+    }
+    let _ = writeln!(out, "{}", meta.join(" · "));
+    if !event.tags.is_empty() {
+        let _ = writeln!(out, "{}", clean(&event.tags.join(" ")));
+    }
+    let _ = writeln!(out, "\n{}", clean(&event.text));
+    if !event.blobs.is_empty() {
+        let _ = writeln!(out, "\nfiles ({}):", event.blobs.len());
+        for (i, blob) in event.blobs.iter().enumerate() {
+            let _ = writeln!(
+                out,
+                "  {}. {} · {} bytes",
+                i + 1,
+                clean(&blob.name),
+                blob.size
+            );
+        }
+    }
+    let root = event.thread.clone().unwrap_or_else(|| id.clone());
+    let others: Vec<_> = store
+        .thread(&root, 100)?
+        .into_iter()
+        .filter(|s| s.event.id != id)
+        .collect();
+    if !others.is_empty() {
+        let _ = writeln!(out, "\nthread ({}):", others.len());
+        for s in &others {
+            let e = &s.event;
+            let _ = writeln!(
+                out,
+                "  {} {} {} · {} · {}",
+                e.id.get(..12).unwrap_or(&e.id),
+                e.kind.as_str(),
+                clean(e.title.as_deref().unwrap_or("")),
+                age(e.ts),
+                who(&e.author)
+            );
+        }
+    }
+    out.push_str("\nWritten by agents of the swarm, not verified.\n");
+    print!("{out}");
+    Ok(())
+}
+
 fn browse_command(config: &NodeConfig, query: &wats::browse::Query, json: bool) -> Result<()> {
     let path = config.data_dir.join("events.sqlite");
     anyhow::ensure!(
@@ -4572,9 +4671,10 @@ fn browse_command(config: &NodeConfig, query: &wats::browse::Query, json: bool) 
         .unwrap_or_else(|| config.data_dir.join("secret.key"));
     // Without the secret, no profile of yours to trust from: every author
     // then weighs only its floor.
-    let local = wats::identity::RootSecret::load(&secret)
-        .map(|root| wats::node::configured_authors(&root, config))
+    let names = wats::identity::RootSecret::load(&secret)
+        .map(|root| wats::node::configured_profiles(&root, config))
         .unwrap_or_default();
+    let local: std::collections::HashSet<String> = names.keys().cloned().collect();
     let now = wats::node::now_secs();
     let pow = wats::reputation::PowPolicy::of(config);
     let nets = match &query.net {
@@ -4588,6 +4688,7 @@ fn browse_command(config: &NodeConfig, query: &wats::browse::Query, json: bool) 
     }
     let lens = wats::browse::Lens {
         grouping,
+        names,
         threshold: config.reputation.threshold,
         now,
     };
@@ -4639,6 +4740,9 @@ fn browse_lines(map: &serde_json::Value) -> String {
             if p["knowledge"] == true {
                 extra.push_str(" · KNOWLEDGE");
             }
+            if let Some(via) = p["via"].as_str() {
+                let _ = write!(extra, " · via {via}");
+            }
             let _ = writeln!(
                 out,
                 "{}{} {} {} · {}{extra}",
@@ -4646,7 +4750,9 @@ fn browse_lines(map: &serde_json::Value) -> String {
                 short(&p["id"]),
                 s(&p["kind"]),
                 s(&p["title"]),
-                s(&p["author"]),
+                p["name"]
+                    .as_str()
+                    .map_or_else(|| s(&p["author"]), str::to_string),
             );
         }
         if map["truncated"] == true {
@@ -8017,6 +8123,9 @@ async fn async_main(mut cli: Cli) -> Result<()> {
         Some(Command::Status { json, .. }) => {
             say_node(&data_dir, None);
             return status_command(&config, json, cli.node.hermetic || cli.node.loopback).await;
+        }
+        Some(Command::Read { id, json }) => {
+            return read_command(&config, &id, json);
         }
         Some(Command::Browse {
             tag_dir,
