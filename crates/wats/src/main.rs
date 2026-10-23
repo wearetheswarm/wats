@@ -2595,13 +2595,13 @@ fn setup_tool(
         }
         // Said in the file, not only by default: Vibe's level is never
         // `workspace`, whatever a shared `[agent]` table says.
-        // Copilot's default level is swarm-only too (ADR 0038): said in
-        // the file as well.
-        if matches!(runtime, "vibe" | "copilot" | "antigravity")
-            && agent
-            && file.get(&key("access")).is_none()
-        {
+        if runtime == "vibe" && agent && file.get(&key("access")).is_none() {
             file.set(&key("access"), "swarm-only")?;
+        }
+        // What `wats share` would check: the runtime's own tools, the web
+        // included, no shell (0.4.11).
+        if agent {
+            apply_share_defaults(&mut file, &key, runtime)?;
         }
         file.save()?;
         if let Some(note) = keys.access.as_deref().and_then(wats::access::deprecation) {
@@ -2836,6 +2836,7 @@ async fn setup_command(
             std::env::var_os("PATH").as_deref(),
         )?;
         print!("{}", welcome::step(2, style));
+        wizard_share_defaults(data_dir, &choices)?;
         let mcp = offer_integrations(node, data_dir, &choices, &found)?;
         if choices.runtime.is_some() {
             offer_more_agents(node, data_dir)?;
@@ -3383,6 +3384,7 @@ async fn setup_wizard(node: &NodeArgs, data_dir: &std::path::Path) -> Result<boo
         std::env::var_os("PATH").as_deref(),
     )?;
     print!("{}", welcome::step(2, style));
+    wizard_share_defaults(data_dir, &choices)?;
     let mcp = offer_integrations(node, data_dir, &choices, &found)?;
     if choices.runtime.is_some() {
         offer_more_agents(node, data_dir)?;
@@ -4132,6 +4134,68 @@ fn antigravity_login(args: &NodeArgs, work_dir: &std::path::Path) -> Result<()> 
             antigravity::COMMAND
         ),
     }
+    Ok(())
+}
+
+/// After the wizard: the agent it set up gets the share defaults
+/// ([`apply_share_defaults`]), in its `[agents.<runtime>]` table.
+fn wizard_share_defaults(
+    data_dir: &std::path::Path,
+    choices: &wats::firstrun::Choices,
+) -> Result<()> {
+    let Some(runtime) = choices.runtime.clone() else {
+        return Ok(());
+    };
+    let settings = Settings::load(data_dir)?;
+    let Some(member) = wats::roster::configured(&settings, data_dir, &os_user_profile())?
+        .into_iter()
+        .find(|m| m.runtime.as_deref() == Some(runtime.as_str()) && m.enabled)
+    else {
+        return Ok(());
+    };
+    let mut file = ConfigFile::open(data_dir)?;
+    let key = |leaf: &str| member_key(&member, leaf);
+    apply_share_defaults(&mut file, &key, &runtime)?;
+    file.save()
+}
+
+/// Before any `wats share`: an agent of a runtime that lends gets the
+/// default checklist (its native tools, not running commands, and their
+/// caps), when its table sets no `tools` yet. Said once.
+fn apply_share_defaults(
+    file: &mut ConfigFile,
+    key: &dyn Fn(&str) -> String,
+    runtime: &str,
+) -> Result<()> {
+    if !wats::share::supports(runtime) || file.get(&key("tools")).is_some() {
+        return Ok(());
+    }
+    let lending = wats::share::default_lending(runtime);
+    if lending.tools.is_empty() {
+        return Ok(());
+    }
+    file.set(&key("tools"), &lending.tools.join(","))?;
+    let mut caps: Vec<String> = file
+        .get(&key("caps"))
+        .map(|v| {
+            v.trim_matches(|c| c == '[' || c == ']')
+                .split(',')
+                .map(|c| c.trim().trim_matches('"').to_string())
+                .filter(|c| !c.is_empty())
+                .collect()
+        })
+        .unwrap_or_default();
+    for cap in lending.caps {
+        if !caps.contains(&cap) {
+            caps.push(cap);
+        }
+    }
+    file.set(&key("caps"), &caps.join(","))?;
+    println!(
+        "{}: [{}] (`wats share` changes them; running commands stays off)",
+        key("tools"),
+        lending.tools.join(", ")
+    );
     Ok(())
 }
 

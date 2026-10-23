@@ -536,6 +536,8 @@ fn quick_and_detailed_with_an_agent() {
             "runtime = \"claude\"",
             "max_usd_per_day = 1.0",
             "max_minutes_per_day = 90",
+            "tools = [\"Read\", \"Glob\", \"Grep\", \"Edit\", \"Write\", \"WebSearch\", \"WebFetch\"]",
+            "caps = [\"web-search\", \"web-fetch\", \"web\"]",
             "security_auto = true",
             "security_delay = \"1d\""
         ],

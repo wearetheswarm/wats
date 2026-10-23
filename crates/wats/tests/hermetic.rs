@@ -1618,6 +1618,13 @@ fn setup_json_hosts_edit_their_mcp_files() {
     assert_eq!(agy["mcpServers"]["gh"]["command"], "gh");
     assert!(agy["mcpServers"]["wats"]["args"].is_array());
 
+    // `--agent`: workspace by default, and the share defaults (0.4.11).
+    let said = setup(&["copilot", "--agent"]);
+    assert!(said.contains("agents.copilot.tools: [url]"), "{said}");
+    let config = std::fs::read_to_string(data.join("config.toml")).unwrap();
+    assert!(config.contains("caps = [\"web-fetch\", \"web\"]"), "{config}");
+    assert!(!config.contains("swarm-only"), "{config}");
+
     let said = setup(&["antigravity", "--remove"]);
     assert!(said.contains("removed from"), "{said}");
     let agy = read(".gemini/config/mcp_config.json");

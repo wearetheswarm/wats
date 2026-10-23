@@ -681,6 +681,14 @@ pub struct Lending {
     pub caps: Vec<String>,
 }
 
+/// What an agent of `runtime` gets before anyone runs `wats share`: the
+/// natives checked by default (running commands is not), their caps.
+pub fn default_lending(runtime: &str) -> Lending {
+    let natives = natives(runtime);
+    let chosen: Vec<usize> = (0..natives.len()).filter(|i| natives[*i].default).collect();
+    choose(&Lending::default(), runtime, &chosen, &[], &[])
+}
+
 /// Whether a native is on in `tools`: all its tools listed.
 pub fn native_on(native: &Native, tools: &[String]) -> bool {
     // Antigravity's `web` (0.4.9 and 0.4.10) lends both search and fetch.

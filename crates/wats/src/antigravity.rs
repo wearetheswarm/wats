@@ -20,8 +20,8 @@
 //!   antigravity`, that hard-denies every tool but the wats ones (the
 //!   rules do not cover the browser, subagents, messages or images).
 //!
-//! Only `swarm-only` in this version: `workspace` waits for check (d),
-//! `inherit` for a per-run MCP config.
+//! `workspace` by default since 0.4.11, `swarm-only` on request; no
+//! `inherit` until Antigravity has a per-run MCP config.
 
 use std::path::{Path, PathBuf};
 
@@ -54,10 +54,11 @@ pub const TOOL_ARGS: &str = "\n\nThe wats tools go through call_mcp_tool with Se
      ask|offer|announce|note, title, text; tags, refs, data}; digest {title, text, refs; \
      reply_to, supersedes, tags}; wait {thread, kinds, timeout}; who {tags}; status {}.";
 
-/// Antigravity's access level (ADR 0038 §2.2): swarm-only by default,
-/// workspace (check (d): Ask fails closed headless), never inherit.
+/// Antigravity's access level (ADR 0038 §2.2): workspace by default since
+/// 0.4.11 (check (d): Ask fails closed headless), swarm-only on request,
+/// never inherit.
 pub fn access(value: Option<&str>) -> Result<Access> {
-    let level = value.map_or(Ok(Access::SwarmOnly), str::parse)?;
+    let level = value.map_or(Ok(Access::Workspace), str::parse)?;
     if level == Access::Inherit {
         bail!(
             "agent.access = inherit is not available with Antigravity CLI: it has no per-run \
@@ -510,7 +511,7 @@ mod tests {
 
     #[test]
     fn levels_and_arguments() {
-        assert_eq!(access(None).unwrap(), Access::SwarmOnly);
+        assert_eq!(access(None).unwrap(), Access::Workspace);
         assert_eq!(access(Some("workspace")).unwrap(), Access::Workspace);
         assert!(access(Some("inherit")).is_err());
         assert!(check_extra_args(&s(&["--effort=high"])).is_ok());

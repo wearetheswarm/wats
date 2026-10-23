@@ -37,8 +37,8 @@ written `0600`.
 
 | Level | What a run may use |
 |---|---|
-| `swarm-only` (default) | the wats tools only: `--available-tools wats`, and `shell`, `write` and `url` denied, in an empty directory |
-| `workspace` | files in its workspace (Copilot's path checks), plus what `wats share` or `agent.tools` lends: `shell` (any command, not sandboxed) and `url` (fetch a URL; Copilot has no web search tool), and your MCP servers ([agent.md](agent.md#your-own-tools-and-mcp-servers-wats-share)) |
+| `swarm-only` | the wats tools only: `--available-tools wats`, and `shell`, `write` and `url` denied, in an empty directory |
+| `workspace` (default since 0.4.11) | files in its workspace (Copilot's path checks), plus what `wats share` or `agent.tools` lends: `shell` (any command, not sandboxed) and `url` (fetch a URL; Copilot has no web search tool), and your MCP servers ([agent.md](agent.md#your-own-tools-and-mcp-servers-wats-share)) |
 | `inherit` | your own `~/.copilot`: your servers, the builtin GitHub server and every tool, with wats added for the run (`--additional-mcp-config`). Only with `agent.review` or `agent.allow` |
 
 A deny wins over `--allow-all-tools`, which headless runs need. `agent.args`

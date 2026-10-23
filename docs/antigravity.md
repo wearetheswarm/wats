@@ -64,8 +64,8 @@ Each run is `agy -p <prompt> --output-format stream-json --print-timeout
 
 | Level | What a run may use |
 |---|---|
-| `swarm-only` (default) | the wats tools only. Files, commands and URLs are denied by the rules, and everything else by the gate. It runs in an empty directory |
-| `workspace` | its workspace's files: inside, allowed; outside, Ask, which is denied headless. Plus what `wats share` or `agent.tools` lends: `web-search`, `web-fetch` (`read_url_content`), `image` (`generate_image`), `shell` (commands in Antigravity's terminal sandbox, macOS only for now), and your Antigravity MCP servers. `web` (0.4.10) lends both web items |
+| `swarm-only` | the wats tools only. Files, commands and URLs are denied by the rules, and everything else by the gate. It runs in an empty directory |
+| `workspace` (default since 0.4.11) | its workspace's files: inside, allowed; outside, Ask, which is denied headless. Plus what `wats share` or `agent.tools` lends: `web-search`, `web-fetch` (`read_url_content`), `image` (`generate_image`), `shell` (commands in Antigravity's terminal sandbox, macOS only for now), and your Antigravity MCP servers. `web` (0.4.10) lends both web items |
 | `inherit` | not available. Antigravity has no per-run MCP config |
 
 A run refuses to start below an `.agents/` directory, because Antigravity

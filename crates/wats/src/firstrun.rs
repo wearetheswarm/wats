@@ -897,11 +897,6 @@ fn ask_mode(
                 .filter(|v| crate::vibe::access(Some(v)).is_ok())
                 .unwrap_or_else(|| "swarm-only".to_string());
             kept.push(format!("{access} access"));
-        } else if matches!(runtime, Some("copilot" | "antigravity")) {
-            // Their default level is swarm-only (ADR 0038).
-            let access = current(settings, table, "agent.access")
-                .unwrap_or_else(|| "swarm-only".to_string());
-            kept.push(format!("{access} access"));
         } else if runtime != Some("openclaw") {
             kept.push(format!("{} access", value("agent.access")));
         }
@@ -2207,8 +2202,8 @@ fn next_steps(out: &mut impl Write, choices: &Choices, found: &[Found], hints: b
             if runtime == "copilot" {
                 write!(
                     out,
-                    " Its runs have the wats tools only (swarm-only), with their own Copilot \
-                     home (not ~/.copilot); `wats share` lends more."
+                    " Its runs have their own Copilot home (not ~/.copilot), the wats tools \
+                     and their workspace, the web but no shell (`wats share` changes it)."
                 )?;
             }
             if runtime == "vibe" {

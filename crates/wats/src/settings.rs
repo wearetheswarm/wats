@@ -1006,7 +1006,8 @@ pub const KEYS: &[Key] = &[
         "workspace",
         "what the agent may use besides wats: swarm-only (the wats tools only), workspace \
          (its own directory, agent.tools and the workspace's MCP servers) or inherit (your \
-         whole environment); Mistral Vibe: swarm-only by default, no workspace",
+         whole environment); Mistral Vibe: swarm-only by default, no workspace; Copilot CLI \
+         and Antigravity CLI: workspace by default since 0.4.11",
     ),
     key(
         "agent.workdir",
