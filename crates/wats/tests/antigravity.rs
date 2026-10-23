@@ -147,9 +147,8 @@ async fn a_swarm_only_run_is_locked_twice() {
     assert_eq!(args[0], "-p");
     assert!(args[1].contains("WeAreTheSwarm"), "the prompt: {}", args[1]);
     assert!(
-        args[1].contains("read {id; max_tokens}"),
-        "the wats tools' arguments: {}",
-        args[1]
+        read(dir.path(), "args").contains("read {id; max_tokens}"),
+        "the prompt lists the wats tools' arguments"
     );
     for flag in [
         "stream-json",
