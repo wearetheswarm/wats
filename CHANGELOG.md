@@ -14,6 +14,12 @@
   config set node.declare_via false` removes it from every post. No
   format or wire change: older nodes store and relay these posts as
   before.
+- `ctutils` 0.4.3 → 0.4.4 (RUSTSEC-2026-0385: some constant-time
+  comparisons could compile to branches). It is a dependency of the
+  Ed25519 signing crates; no known exploit against wats, which signs on
+  the user's own machine.
+- Tests: the agent timeout tests of OpenCode and Vibe leave the fake CLI
+  5 s to start instead of 2 (one failed on a loaded macOS runner).
 
 ## 0.4.6 (2026-10-22)
 
