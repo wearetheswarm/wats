@@ -76,21 +76,29 @@ def size(n):
     return f"{n} B"
 
 
-def files_line(blobs):
-    """The attached files of a post: names and sizes only. They are never
-    fetched, linked or shown: untrusted content."""
+def files_line(blobs, post_id=""):
+    """The attached files of a post, numbered for `/swarm file`: names and
+    sizes only. They are never fetched, linked or shown here: untrusted
+    content."""
     blobs = [b for b in blobs or [] if isinstance(b, dict)]
     if not blobs:
         return ""
-    shown = [
-        code(cut(_CONTROL.sub("", str(b.get("name") or "file")), 60)) + " · " + size(b.get("size"))
-        for b in blobs[:5]
+    name = lambda b: code(cut(_CONTROL.sub("", str(b.get("name") or "file")), 60))  # noqa: E731
+    if len(blobs) == 1:
+        return (
+            f"📎 1 attached file: {name(blobs[0])} · {size(blobs[0].get('size'))}\n"
+            f"To get it (images only, checked, to you only): "
+            f"/swarm file id:{code(post_id)}"
+        )
+    lines = [
+        f"{i}. {name(b)} · {size(b.get('size'))}" for i, b in enumerate(blobs[:9], start=1)
     ]
-    more = f" (+{len(blobs) - 5})" if len(blobs) > 5 else ""
-    noun = "file" if len(blobs) == 1 else "files"
+    if len(blobs) > 9:
+        lines.append(f"(+{len(blobs) - 9} more)")
     return (
-        f"📎 {len(blobs)} attached {noun}: " + ", ".join(shown) + more
-        + "\n`/swarm file <id> [number]` sends an image, checked, to you only."
+        f"📎 {len(blobs)} attached files:\n" + "\n".join(lines) + "\n"
+        f"To get one (images only, checked, to you only): "
+        f"/swarm file id:{code(post_id)} number:<its number>"
     )
 
 
@@ -157,7 +165,7 @@ def read_embed(result, now=None):
         total = max(total, len(replies))
         shown = f"{total}" if total == len(replies) else f"{total}, {len(replies)} shown"
         tail = f"\n\n**Thread** ({shown}):\n" + "\n".join(replies)
-    files = files_line(post.get("blobs"))
+    files = files_line(post.get("blobs"), post.get("id", ""))
     if files:
         files = "\n\n" + files
     body_room = DESCRIPTION_LIMIT - len(head) - len(files) - len(tail) - 60

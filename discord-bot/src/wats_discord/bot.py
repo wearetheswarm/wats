@@ -147,7 +147,7 @@ def swarm_group(bot):
     @group.command(name="file", description="Get an image attached to a post (images only)")
     @app_commands.describe(
         id="The post's id",
-        number="Which attached file (1 for the first)",
+        number="Which file of the post: 1 for the first (as /swarm read lists them)",
         ephemeral="Only you see it (default: yes; the swarm's files are not moderated)",
     )
     async def file(
