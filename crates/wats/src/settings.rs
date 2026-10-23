@@ -41,7 +41,7 @@ use serde::Deserialize;
 pub const FILE_NAME: &str = "config.toml";
 
 /// The agent runtimes wats can run.
-pub const RUNTIMES: [&str; 7] = [
+pub const RUNTIMES: [&str; 8] = [
     "claude",
     "codex",
     "openclaw",
@@ -49,6 +49,7 @@ pub const RUNTIMES: [&str; 7] = [
     "vibe",
     "copilot",
     "antigravity",
+    "custom",
 ];
 
 /// The command of a runtime: its name, but Antigravity CLI's `agy`.
@@ -342,6 +343,14 @@ pub struct AgentSettings {
     /// use (names only, ADR 0037).
     #[serde(default)]
     pub servers: Vec<String>,
+    /// The `custom` runtime's MCP config format (ADR 0039).
+    pub mcp_format: Option<String>,
+    /// Where the `custom` runtime writes its MCP config, inside the run
+    /// directory (`.cursor/mcp.json`).
+    pub mcp_file: Option<String>,
+    /// Environment of the agent CLI (`KEY=VALUE`; the `custom` runtime).
+    #[serde(default)]
+    pub env: Vec<String>,
     pub model: Option<String>,
     pub review: Option<bool>,
     pub ignore_local: Option<bool>,
@@ -969,7 +978,7 @@ pub const KEYS: &[Key] = &[
         "agent.runtime",
         ValueType::Runtime,
         "none",
-        "agent run with the node: claude, codex, openclaw, opencode, vibe, copilot or antigravity",
+        "agent run with the node: claude, codex, openclaw, opencode, vibe, copilot, antigravity or custom (any other CLI)",
     ),
     key(
         "agent.openclaw_url",
@@ -1115,13 +1124,34 @@ pub const KEYS: &[Key] = &[
         "agent.command",
         ValueType::Text,
         "the runtime's",
-        "the agent CLI (claude, codex, opencode, vibe, copilot, agy)",
+        "the agent CLI (claude, codex, opencode, vibe, copilot, agy; required with custom)",
     ),
     key(
         "agent.args",
         ValueType::List,
         "none",
-        "extra arguments for the agent CLI",
+        "extra arguments for the agent CLI; with custom, its whole argument template, with \
+         {prompt}, {prompt_file}, {mcp_config}, {cwd}, {model} and {wats_mcp} (ADR 0039)",
+    ),
+    key(
+        "agent.mcp_format",
+        ValueType::Text,
+        "claude-json",
+        "custom runtime: the per-run MCP config wats writes, claude-json, codex-toml, or none \
+         (the CLI's own config runs wats mcp)",
+    ),
+    key(
+        "agent.mcp_file",
+        ValueType::Text,
+        "none ({mcp_config})",
+        "custom runtime: where in its run directory the MCP config goes, for CLIs that read \
+         a project config and take no file flag (.cursor/mcp.json, .kiro/settings/mcp.json)",
+    ),
+    key(
+        "agent.env",
+        ValueType::List,
+        "none",
+        "custom runtime: environment of the CLI, KEY=VALUE entries",
     ),
     key(
         "agent.timeout",

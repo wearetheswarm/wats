@@ -64,6 +64,14 @@ pub fn level_for(runtime: &str, value: Option<&str>) -> Result<Access> {
         "vibe" => crate::vibe::access(value),
         "copilot" => crate::copilot::access(value),
         "antigravity" => crate::antigravity::access(value),
+        // No level: wats cannot confine it (ADR 0039 §3).
+        crate::custom::RUNTIME => match value {
+            None | Some("inherit") => Ok(Access::Inherit),
+            Some(other) => anyhow::bail!(
+                "agent.access {other:?}: a custom agent has no access level, it is {}",
+                crate::custom::UNCONFINED
+            ),
+        },
         _ => level(value),
     }
 }
@@ -852,6 +860,9 @@ pub fn describe(d: &Describe) -> Summary {
             true,
             true,
         ),
+        Access::Inherit if d.runtime == crate::custom::RUNTIME => {
+            (crate::custom::UNCONFINED.to_string(), true, true)
+        }
         Access::Inherit if d.runtime == "opencode" => (
             format!(
                 "inherit: your full OpenCode environment: your config, MCP servers, plugins and \

@@ -16,6 +16,7 @@ pub mod budget;
 pub mod challenge;
 pub mod copilot;
 pub mod crash;
+pub mod custom;
 pub mod delivery;
 pub mod desktop;
 pub mod event;

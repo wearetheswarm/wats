@@ -100,6 +100,11 @@ pub struct AgentConfig {
     /// `workspace` access (`agent.servers`, ADR 0037): names, their
     /// definitions read at each run.
     pub servers: Vec<String>,
+    /// The `custom` runtime (ADR 0039): its MCP config format and the
+    /// environment of its CLI.
+    pub mcp_format: crate::custom::Format,
+    pub mcp_file: Option<String>,
+    pub env: Vec<(String, String)>,
     /// The model, when set (`agent.model`); otherwise the runtime's own
     /// default.
     pub model: Option<String>,
@@ -1000,6 +1005,12 @@ fn limit_args(config: &AgentConfig, remaining_usd: Option<f64>) -> Vec<String> {
 /// Where a run starts: an empty directory (swarm-only), the workspace, or
 /// the directory `wats` was started in (inherit).
 fn run_dir(config: &AgentConfig) -> Result<PathBuf> {
+    // A custom CLI runs in its own empty directory (ADR 0039).
+    if config.runtime == crate::custom::RUNTIME {
+        let dir = crate::custom::run_dir(&config.work_dir);
+        std::fs::create_dir_all(&dir)?;
+        return Ok(dir);
+    }
     Ok(match config.access {
         // The directory keeps the level's name before 0.4.0.
         Access::SwarmOnly => {
@@ -1029,7 +1040,7 @@ async fn start_run(
         events: trigger.events(),
         profile: config.profile.clone(),
         file_roots: Vec::new(),
-        via: crate::via::Via::of_run(&config.runtime, config.model.as_deref()),
+        via: crate::via::Via::of_run(&via_runtime(config), config.model.as_deref()),
     });
     let guard = TokenGuard {
         node: node.as_ref(),
@@ -1089,7 +1100,7 @@ async fn start_run(
     // values and would swallow a positional prompt.
     // Copilot has it in `-p`: its stdin closes empty.
     if let Some(mut stdin) = child.stdin.take()
-        && !prompt_in_args(&config.runtime)
+        && !prompt_in_args(config)
     {
         stdin.write_all(prompt.as_bytes()).await?;
     }
@@ -1116,9 +1127,29 @@ async fn start_run(
     })
 }
 
-/// Whether a runtime gets its prompt as an argument, not on stdin.
-fn prompt_in_args(runtime: &str) -> bool {
-    matches!(runtime, "copilot" | "antigravity")
+/// Whether a run gets its prompt as an argument (or a file), not on
+/// stdin.
+fn prompt_in_args(config: &AgentConfig) -> bool {
+    match config.runtime.as_str() {
+        "copilot" | "antigravity" => true,
+        crate::custom::RUNTIME => !crate::custom::prompt_on_stdin(&config.extra_args),
+        _ => false,
+    }
+}
+
+/// The runtime a run's posts declare (`data.via`): `custom:<name>` for a
+/// custom agent, its directory's name.
+fn via_runtime(config: &AgentConfig) -> String {
+    if config.runtime == crate::custom::RUNTIME {
+        let name = config
+            .work_dir
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        crate::custom::via_runtime(&name)
+    } else {
+        config.runtime.clone()
+    }
 }
 
 /// The command of one spawned run, and its transcript file (stdout and
@@ -1240,6 +1271,55 @@ fn prepare_command(
                 .args(opencode::run_args())
                 .args(opencode_model_arg(config))
                 .args(&config.extra_args);
+        }
+        crate::custom::RUNTIME => {
+            // Any other CLI (ADR 0039): its template, the wats server only
+            // in a per-run MCP file, its environment; nothing parsed.
+            let mcp = crate::custom::mcp_path(
+                config.mcp_format,
+                &config.work_dir,
+                &dir,
+                config.mcp_file.as_deref(),
+            );
+            if let Some(path) = &mcp {
+                crate::custom::write_mcp(
+                    config.mcp_format,
+                    path,
+                    &config.mcp_command,
+                    &config.mcp_args,
+                    token,
+                )?;
+            }
+            let prompt_file = crate::custom::prompt_path(&config.work_dir);
+            if crate::custom::uses(&config.extra_args, "prompt_file") {
+                crate::access::write_private(&prompt_file, prompt.as_bytes())?;
+            }
+            let mut wats_mcp = vec![config.mcp_command.display().to_string()];
+            wats_mcp.extend(config.mcp_args.iter().cloned());
+            let wats_mcp = wats_mcp
+                .iter()
+                .map(|w| crate::antigravity::shell_word(w))
+                .collect::<Vec<_>>()
+                .join(" ");
+            // The CLI's own `wats mcp` (or `{wats_mcp}`) finds the run's
+            // token here, if it hands its environment to its servers.
+            if mcp.is_none() || crate::custom::uses(&config.extra_args, "wats_mcp") {
+                command.env("WATS_RUNNER_TOKEN", token);
+            }
+            for (key, value) in &config.env {
+                command.env(key, value);
+            }
+            command.args(crate::custom::render(
+                &config.extra_args,
+                &crate::custom::Values {
+                    prompt,
+                    prompt_file: &prompt_file,
+                    mcp_config: mcp.as_deref(),
+                    cwd: &dir,
+                    model: config.model.as_deref(),
+                    wats_mcp: &wats_mcp,
+                },
+            ));
         }
         "antigravity" => {
             // Its own home: its login, the wats server only, the locks
@@ -1568,6 +1648,19 @@ async fn finish_run(
             "error"
         }
         .into();
+    }
+    // A custom run's MCP and prompt files go: they hold its token and
+    // its prompt.
+    if config.runtime == crate::custom::RUNTIME {
+        if let Some(path) = crate::custom::mcp_path(
+            config.mcp_format,
+            &config.work_dir,
+            &crate::custom::run_dir(&config.work_dir),
+            config.mcp_file.as_deref(),
+        ) {
+            let _ = std::fs::remove_file(path);
+        }
+        let _ = std::fs::remove_file(crate::custom::prompt_path(&config.work_dir));
     }
     // Copilot's usage file (its AI credits and premium requests) goes
     // into the transcript.

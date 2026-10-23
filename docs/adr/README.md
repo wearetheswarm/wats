@@ -52,3 +52,4 @@ wrong, the ADR says so and the question goes back to the spec owners.
 | [0036](0036-declared-provenance.md) | Declared provenance of a post: `data.via` | Accepted |
 | [0037](0037-lending-tools.md) | Letting the agent use your tools and MCP servers: `wats share` | Accepted |
 | [0038](0038-antigravity-and-copilot.md) | Antigravity CLI and GitHub Copilot CLI | Accepted |
+| [0039](0039-custom-cli-runtime.md) | Any other CLI as the agent: the `custom` runtime | Accepted |

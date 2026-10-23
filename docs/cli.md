@@ -170,6 +170,7 @@ wats setup [OPTIONS] [COMMAND]
 | [`wats setup vibe`](#wats-setup-vibe) | Mistral Vibe (ADR 0033): an MCP host, and an agent runtime. Vibe has no CLI for MCP servers: --mcp edits its config.toml, after a backup copy, and touches nothing but its own entry. With neither --mcp nor --agent, says what each does and changes nothing |
 | [`wats setup copilot`](#wats-setup-copilot) | GitHub Copilot CLI (`copilot`): add wats as its MCP server in $COPILOT_HOME/mcp-config.json (default ~/.copilot), after a backup, and/or enable a Copilot agent (ADR 0038). With neither flag, both |
 | [`wats setup antigravity`](#wats-setup-antigravity) | Antigravity CLI (`agy`): add wats as its MCP server in ~/.gemini/config/mcp_config.json, after a backup, and/or enable an Antigravity agent (ADR 0038). With neither flag, both |
+| [`wats setup custom`](#wats-setup-custom) | Any other agent CLI as the node's agent (ADR 0039): a command and an argument template in `[agents.<name>]`. wats can't confine it, so it needs agent.review (turned on here) or agent.allow. Asked on a terminal for what the flags do not give |
 
 <a id="wats-setup-codex"></a>
 
@@ -346,6 +347,25 @@ wats setup antigravity [OPTIONS]
 | `--agents-md` |  | `false` | Also add a short marked block about WeAreTheSwarm to your global instructions (~/.claude/CLAUDE.md, ~/.codex/AGENTS.md), so that "the swarm" means these tools. Replaced in place if present |
 | `--remove-agents-md` |  | `false` | Remove that block |
 | `--remove` |  | `false` | Remove that entry (with a backup copy too) |
+
+<a id="wats-setup-custom"></a>
+
+## `wats setup custom`
+
+Any other agent CLI as the node's agent (ADR 0039): a command and an argument template in `[agents.<name>]`. wats can't confine it, so it needs agent.review (turned on here) or agent.allow. Asked on a terminal for what the flags do not give
+
+```
+wats setup custom [OPTIONS]
+```
+
+| Option | Env | Default | Description |
+|---|---|---|---|
+| `--agent` |  | `false` | Enable the agent (the only thing this setup does) |
+| `--name <NAME>` |  |  | The agent's name, e.g. cursor |
+| `--command <COMMAND>` |  |  | The CLI to run, e.g. agent (Cursor CLI) |
+| `--args <ARGS>` |  |  | Its argument template, words separated by spaces, with {prompt}, {prompt_file}, {mcp_config}, {cwd}, {model} and {wats_mcp} |
+| `--mcp-format <MCP_FORMAT>` |  |  | claude-json (default), codex-toml or none |
+| `--mcp-file <MCP_FILE>` |  |  | Where in the run directory the MCP config goes, for a CLI that takes no file flag (.cursor/mcp.json) |
 
 <a id="wats-config"></a>
 

@@ -438,7 +438,11 @@ fn ask_runtime(
             Ok(0) => Some("none"),
             Ok(i) => supported.get(i - 1).map(|f| f.runtime()),
             Err(_) if answer == "none" => Some("none"),
-            Err(_) => RUNTIMES.iter().copied().find(|r| *r == answer),
+            // A custom CLI needs its command line: `wats setup custom`.
+            Err(_) => RUNTIMES
+                .iter()
+                .copied()
+                .find(|r| *r == answer && *r != crate::custom::RUNTIME),
         };
         match pick {
             Some("none") => return Ok(None),
@@ -802,6 +806,7 @@ fn prompt_after(
         if q.since <= revision
             || (q.agent_only && runtime.is_none())
             || (openclaw && NOT_FOR_OPENCLAW.contains(&q.key))
+            || (q.key == "agent.max_turns" && !has_turn_limit(runtime.as_deref()))
         {
             continue;
         }
@@ -880,10 +885,10 @@ fn ask_mode(
         kept.push(format!(
             "agent runs of at most {}{}",
             value("agent.timeout"),
-            if runtime == Some("openclaw") {
-                String::new()
-            } else {
+            if has_turn_limit(runtime) {
                 format!(" and {} turns", value("agent.max_turns"))
+            } else {
+                String::new()
             }
         ));
         if runtime == Some("vibe") {
@@ -1247,6 +1252,13 @@ fn ask_budget(
         values.push(("agent.max_tokens_per_day", daily.tokens.to_string()));
     }
     Ok(Some(values))
+}
+
+/// Whether `agent.max_turns` means something for `runtime`: Copilot CLI
+/// and Antigravity CLI have no turn limit to pass (ADR 0038), OpenClaw
+/// keeps its own.
+fn has_turn_limit(runtime: Option<&str>) -> bool {
+    !matches!(runtime, Some("copilot" | "antigravity" | "openclaw"))
 }
 
 /// A runtime as people know it.

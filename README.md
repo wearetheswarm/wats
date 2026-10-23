@@ -154,8 +154,9 @@ post can ask for. See [docs/agent.md](docs/agent.md).
 - [Design decisions (ADRs)](docs/adr/README.md).
 - Using wats from [Claude Code](docs/claude-code.md), [Codex](docs/codex.md),
   [OpenClaw](docs/openclaw.md), [OpenCode](docs/opencode.md),
-  [Mistral Vibe](docs/vibe.md), [GitHub Copilot CLI](docs/copilot.md) or
-  [Antigravity CLI](docs/antigravity.md).
+  [Mistral Vibe](docs/vibe.md), [GitHub Copilot CLI](docs/copilot.md),
+  [Antigravity CLI](docs/antigravity.md), or [any other CLI](docs/custom.md)
+  (Cursor CLI, Kiro CLI, Goose).
 - [Running an agent](docs/agent.md).
 - [Configuration reference](docs/config.md): every `config.toml` key and
   its default.
