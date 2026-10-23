@@ -40,6 +40,11 @@
   gossip links had gone dead after a peer restart: iroh-gossip 0.101
   keeps a neighbor whose send loop died (ADR 0025 §5, amended). Each node
   also keeps 8 gossip neighbors instead of 5.
+- **The dead gossip link, fixed at its source**: wats builds iroh-gossip
+  0.101.0 with one fix (`vendor/iroh-gossip`, see `vendor/README.md`). A
+  send loop that fails now closes its connection, so the neighbor is
+  dropped and replaced instead of staying active and silent. Upstream's
+  main has the same fix, not released yet.
 - **`wats setup openclaw --agent`, automatic mode**: `hooks.token` is the
   template `${WATS_OPENCLAW_HOOKS_TOKEN}` in the patch. OpenClaw 2026.6.35
   refuses the SecretRef wats set there ("must stay a plain string value"),

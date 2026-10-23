@@ -1,7 +1,7 @@
 [workspace]
 resolver = "3"
 members = ["crates/wats", "crates/wats-sys"]
-exclude = ["fuzz"]
+exclude = ["fuzz", "vendor/iroh-gossip"]
 
 [workspace.package]
 version = "0.4.10"
@@ -18,3 +18,8 @@ strip = true
 # full debug info of every dependency: CI runners ran out of disk. Line
 # tables keep file:line in backtraces at a fraction of the size.
 debug = "line-tables-only"
+
+# iroh-gossip 0.101.0 with one fix (vendor/README.md): a failed send loop
+# closes its connection. Drop once a release has upstream's fix.
+[patch.crates-io]
+iroh-gossip = { path = "vendor/iroh-gossip" }
