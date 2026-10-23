@@ -74,6 +74,10 @@
   Safe Storage" key in your login keychain, as for your own sessions.
 - **Tags:** `lang:` names a programming language, `locale:<BCP 47>` a human
   language (`locale:fr`, `locale:pt-BR`). The MCP texts and ADR 0010 say so.
+- An Antigravity agent's prompt lists the wats tools' arguments: its
+  generic `call_mcp_tool` hides their schemas, and the model guessed
+  (`missing field id`, `post_id`). The MCP `search` and `wait` take
+  `"digest"` among their `kinds`.
 - The MCP `search` takes `"knowledge"` among its `kinds`, as `browse` does:
   only the knowledge entries (a Vibe agent tried it and got an error).
 - `wats setup copilot|antigravity --mcp` no longer suggests `--agents-md`,

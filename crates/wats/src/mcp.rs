@@ -205,6 +205,10 @@ const MAX_RESULTS: usize = 100;
 const SEARCH_CANDIDATES: usize = 300;
 
 fn parse_kind(kind: &str) -> Result<Kind, String> {
+    // A digest is the note of that extension kind.
+    if kind.trim() == "digest" {
+        return Ok(Kind::Ext(crate::knowledge::DIGEST_KIND.into()));
+    }
     kind.parse().map_err(|_| {
         format!(
             "unknown kind {kind:?}; use one of: {}, or a namespaced extension x.<domain>.<name>",

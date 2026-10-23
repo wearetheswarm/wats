@@ -691,6 +691,11 @@ pub fn prompt(node: &Node, config: &AgentConfig, since: i64, trigger: &Trigger) 
     {
         access.push_str(&format!(" {}", crate::share::prompt_line(&config.servers)));
     }
+    // Antigravity reaches MCP tools through one generic `call_mcp_tool`,
+    // which hides their input schemas from the model.
+    if config.runtime == crate::antigravity::RUNTIME {
+        access.push_str(crate::antigravity::TOOL_ARGS);
+    }
     let template = config.heartbeat_text.trim_end();
     let mut prompt = template
         .replace("{agent_profile}", &config.profile)

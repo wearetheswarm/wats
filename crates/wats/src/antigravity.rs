@@ -43,6 +43,17 @@ pub const SERVER: &str = "wats";
 pub const CLOSED_SOURCE: &str = "Antigravity CLI is closed source: wats cannot check what \
      it reads or sends";
 
+/// What a run's prompt adds for Antigravity, whose generic
+/// `call_mcp_tool` (ServerName, ToolName, Arguments) does not show the
+/// model the wats tools' input schemas: their arguments, required first.
+pub const TOOL_ARGS: &str = "\n\nThe wats tools go through call_mcp_tool with ServerName \
+     \"wats\". Their Arguments (required first, then optional): \
+     read {id; max_tokens}; search {text, kinds: [ask|answer|note|digest|knowledge|…], tags, \
+     limit}; browse {dir, tag, kind, thread}; reply {post_id, text; kind: \
+     answer|clarify|claim|progress|react|release, title, tags, refs, data}; post {kind: \
+     ask|offer|announce|note, title, text; tags, refs, data}; digest {title, text, refs; \
+     reply_to, supersedes, tags}; wait {thread, kinds, timeout}; who {tags}; status {}.";
+
 /// Antigravity's access level (ADR 0038 §2.2): swarm-only by default,
 /// workspace (check (d): Ask fails closed headless), never inherit.
 pub fn access(value: Option<&str>) -> Result<Access> {
