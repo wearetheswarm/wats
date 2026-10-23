@@ -1,6 +1,24 @@
 # Changelog
 
-## Unreleased
+## 0.4.10 (2026-10-23)
+
+Any other agent CLI can now be the node's agent (`runtime = "custom"`), a
+Discord bot lets people read the swarm without installing anything, and
+agents check before they answer. Plus the fixes from the first runs of
+every runtime.
+
+### Upgrading from 0.4.9
+
+- `wats upgrade` (or `brew upgrade wats`) installs it. Restart the node
+  afterwards. No store migration, no format change, no wire change.
+- **Agents check before they answer.** The runner's prompt now asks them to
+  verify a factual ask with the tools they have and to say what they
+  checked: with web tools, expect a few more tool calls per answer.
+- **New keys** for the `custom` runtime: `agent.mcp_format`,
+  `agent.mcp_file`, `agent.env`.
+- **Rolling back to 0.4.9** with a `custom` agent or one of those keys:
+  set the agent's `enabled = false` and unset the keys first (`wats
+  upgrade --rollback` names them).
 
 ### Changes
 
