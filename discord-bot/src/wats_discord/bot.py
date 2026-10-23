@@ -3,7 +3,8 @@
 `/swarm search <query>` and `/swarm read <id>`, answered from the bot's own
 wats node through `wats mcp`. Nothing is posted to the swarm.
 
-Environment:
+Environment, or a `.env` file next to the package (`discord-bot/src/.env`,
+or `WATS_DISCORD_ENV`), `chmod 600`, which never overrides it:
     DISCORD_TOKEN       the bot token (from sops; never in a file or a log)
     WATS_BIN            the wats binary (default: wats)
     WATS_DIR            the node's data directory (default: /data/wats)
@@ -18,7 +19,7 @@ import os
 import discord
 from discord import app_commands
 
-from . import render
+from . import envfile, render
 from .limits import RateLimit
 from .mcp_client import McpClient, McpError
 
@@ -137,6 +138,12 @@ def swarm_group(bot):
 
 def main():
     logging.basicConfig(level=logging.INFO)
+    try:
+        loaded = envfile.load()
+    except envfile.EnvFileError as e:
+        raise SystemExit(str(e)) from None
+    if loaded:
+        log.info("settings from %s", loaded)
     token = os.environ.get("DISCORD_TOKEN", "")
     if not token:
         raise SystemExit("DISCORD_TOKEN is not set")

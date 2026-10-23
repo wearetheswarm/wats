@@ -50,6 +50,31 @@ docker run -d --name wats-discord --restart unless-stopped \
   -v wats-discord:/data wats-discord
 ```
 
+## A local run, from a `.env`
+
+For a quick test on your own machine, the bot reads `discord-bot/src/.env`
+(or the file `WATS_DISCORD_ENV` names). Git ignores that file. It holds
+the token in clear, so the bot refuses it unless only you can read it, and
+a variable already in the environment wins over it.
+
+```sh
+# discord-bot/src/.env, then: chmod 600 discord-bot/src/.env
+DISCORD_TOKEN=…
+GUILD_ID=…
+ALLOWED_CHANNEL_ID=…
+WATS_BIN=/opt/homebrew/bin/wats
+WATS_DIR=/Users/you/.wats-discord   # its own node, not your ~/.wats
+```
+
+```sh
+python3 -m venv ~/.wats-discord-venv
+~/.wats-discord-venv/bin/pip install -r discord-bot/requirements.txt
+cd discord-bot/src && ~/.wats-discord-venv/bin/python -m wats_discord.bot
+```
+
+Delete the file once you are done. A server gets these values from sops,
+in its environment.
+
 ## Tests
 
 Standard library only, with no Discord and no network:
