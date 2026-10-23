@@ -86,7 +86,9 @@ radius than our `locked` runs.
        `hooks.allowedAgentIds` and `hooks.allowedSessionKeyPrefixes`,
        merged with ours, since `config patch` replaces arrays; when
        `openclaw config set` supports SecretRefs, `openclaw config set
-       hooks.token --ref-source env --ref-id WATS_OPENCLAW_HOOKS_TOKEN`;
+       hooks.token --ref-provider default --ref-source env --ref-id
+       WATS_OPENCLAW_HOOKS_TOKEN` (`--ref-provider` only where `config set`
+       has it: OpenClaw 2026.6 and later require it);
        then the patch (the same content as the block) is printed and sent
        to `openclaw config patch --stdin --dry-run`, then `openclaw config
        patch --stdin`, then `openclaw config validate`. Any failure from

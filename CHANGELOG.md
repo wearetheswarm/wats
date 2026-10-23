@@ -27,6 +27,10 @@
 - The setup wizard's last screen ends with `Help:`, the community's
   Discord (https://discord.gg/MgegDT8Rcy); the README says where help and
   bug reports go.
+- `wats setup openclaw --agent` works with OpenClaw 2026.6 and later, whose
+  `config set` requires `--ref-provider` to make `hooks.token` a SecretRef:
+  wats passes `--ref-provider default` when `config set` has it. The
+  manual path (`--print`) also prints that command.
 - `wats setup copilot|antigravity --mcp` no longer suggests `--agents-md`,
   which writes Claude Code's and Codex's instructions only. The detailed
   wizard no longer asks for turns per run for Copilot CLI and Antigravity

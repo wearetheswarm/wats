@@ -34,6 +34,22 @@ pub const DEFAULT_AGENT: &str = "wats";
 pub const AGENT_SERVER: &str = "wats-agent";
 /// The environment variable the gateway reads the hook token from.
 pub const HOOKS_TOKEN_ENV: &str = "WATS_OPENCLAW_HOOKS_TOKEN";
+
+/// The SecretRef provider of `hooks.token`: OpenClaw's default one, which
+/// its `config set` ref builder requires since 2026.6 (`--ref-provider`).
+pub const SECRET_REF_PROVIDER: &str = "default";
+
+/// `openclaw config set` arguments that make `hooks.token` a SecretRef to
+/// [`HOOKS_TOKEN_ENV`]; with `provider`, the `--ref-provider` OpenClaw
+/// 2026.6 and later require.
+pub fn secret_ref_args(provider: bool) -> Vec<&'static str> {
+    let mut args = vec!["config", "set", "hooks.token"];
+    if provider {
+        args.extend(["--ref-provider", SECRET_REF_PROVIDER]);
+    }
+    args.extend(["--ref-source", "env", "--ref-id", HOOKS_TOKEN_ENV]);
+    args
+}
 /// What `status` says of the budget.
 pub const BUDGET: &str = "managed by OpenClaw";
 /// Said at startup and by setup.
@@ -751,6 +767,19 @@ pub fn backup_path(file: &Path, now: u64) -> PathBuf {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn the_secret_ref_names_its_provider_where_openclaw_wants_one() {
+        assert_eq!(
+            secret_ref_args(true).join(" "),
+            "config set hooks.token --ref-provider default --ref-source env --ref-id \
+             WATS_OPENCLAW_HOOKS_TOKEN"
+        );
+        assert_eq!(
+            secret_ref_args(false).join(" "),
+            "config set hooks.token --ref-source env --ref-id WATS_OPENCLAW_HOOKS_TOKEN"
+        );
+    }
 
     #[test]
     fn credentials_never_reach_the_logs() {

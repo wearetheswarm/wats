@@ -748,7 +748,7 @@ case "$1 $2" in
 'mcp show') cat {d}/entry-$3.json;;
 'config file') echo '~/oc/openclaw.json';;
 'config get') if [ -f "{d}/get-$3" ]; then cat "{d}/get-$3"; else echo "Config path not found: $3" >&2; exit 1; fi;;
-'config set') if [ "$3" = --help ]; then [ -f {d}/norefs ] || echo '  --ref-source <source>  SecretRef source'; else echo "// set $3" >> {d}/oc/openclaw.json; fi;;
+'config set') if [ "$3" = --help ]; then [ -f {d}/norefs ] || echo '  --ref-source <source>  SecretRef source'; [ -f {d}/norefs ] || [ -f {d}/noprovider ] || echo '  --ref-provider <alias>  SecretRef provider'; else echo "// set $3" >> {d}/oc/openclaw.json; fi;;
 'config patch') if [ "$4" = --dry-run ]; then cat > {d}/dry.json; else cat > {d}/real.json; echo '// patched' >> {d}/oc/openclaw.json; fi;;
 'config validate') if [ -f {d}/invalid ]; then echo 'Invalid config: hooks.token' >&2; exit 1; fi; [ -n "$WATS_OPENCLAW_HOOKS_TOKEN" ] || exit 2;;
 esac
@@ -813,6 +813,8 @@ esac
                 "config",
                 "set",
                 "hooks.token",
+                "--ref-provider",
+                "default",
                 "--ref-source",
                 "env",
                 "--ref-id",

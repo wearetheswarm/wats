@@ -197,8 +197,9 @@ writes `openclaw.json` itself):
       wats adds `"wats"` and `"wats:"` to what is there (your `"main"`
       stays).
    3. The hook token: when `openclaw config set` supports SecretRefs,
-      `openclaw config set hooks.token --ref-source env --ref-id
-      WATS_OPENCLAW_HOOKS_TOKEN`, so the token is never in
+      `openclaw config set hooks.token --ref-provider default --ref-source env
+      --ref-id WATS_OPENCLAW_HOOKS_TOKEN` (no `--ref-provider` before OpenClaw
+      2026.6, which did not have it), so the token is never in
       `openclaw.json`, only a reference to the gateway's environment.
       Otherwise the patch sets `token: "${WATS_OPENCLAW_HOOKS_TOKEN}"`, the
       environment reference of the manual block.
