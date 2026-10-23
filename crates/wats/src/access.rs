@@ -1072,6 +1072,11 @@ pub fn cap_warnings(c: &CapCheck) -> Vec<String> {
             _ => need.claude,
         }
     };
+    // A lent shell can back any cap through a command (a script the
+    // workspace's AGENTS.md names, e.g. an image generator): no warning.
+    if c.access == Access::Workspace && tools.iter().any(|t| gives_shell(t)) {
+        return Vec::new();
+    }
     let mut out = Vec::new();
     let mut seen = Vec::new();
     for cap in c.caps {
@@ -1146,6 +1151,10 @@ mod tests {
                 caps: &caps.iter().map(|t| t.to_string()).collect::<Vec<_>>(),
             })
         };
+        assert!(
+            w("opencode", Access::Workspace, &["bash"], &["image-gen"]).is_empty(),
+            "a shell backs it through a command"
+        );
         let none = w("codex", Access::Workspace, &[], &["image-gen", "Image-Gen"]);
         assert_eq!(
             none,
