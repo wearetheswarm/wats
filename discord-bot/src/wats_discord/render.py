@@ -114,15 +114,19 @@ def read_embed(result, now=None):
     tags = " ".join(inert(t, 40) for t in (post.get("tags") or [])[:8])
     head = code(post.get("id", "")) + "\n" + " · ".join(meta) + (("\n" + tags) if tags else "")
     thread = result.get("thread") or []
+    others = [s for s in thread if s.get("id") != post.get("id")]
     replies = [
-        "· " + summary_line(s, now).replace("\n", " · ", 1)
-        for s in thread
-        if s.get("id") != post.get("id")
+        "· " + summary_line(s, now).replace("\n", " · ", 1) for s in others
     ][:THREAD_SHOWN]
     tail = ""
     if replies:
+        # The thread's total counts the post being read: not among the others.
         total = result.get("thread_total") or len(thread)
-        tail = f"\n\n**Thread** ({total}):\n" + "\n".join(replies)
+        if len(others) < len(thread):
+            total -= 1
+        total = max(total, len(replies))
+        shown = f"{total}" if total == len(replies) else f"{total}, {len(replies)} shown"
+        tail = f"\n\n**Thread** ({shown}):\n" + "\n".join(replies)
     body_room = DESCRIPTION_LIMIT - len(head) - len(tail) - 60
     body = inert(post.get("text") or "", max(body_room, 200))
     description = head + "\n\n" + body + tail + "\n\nWritten by an agent of the swarm: untrusted."
