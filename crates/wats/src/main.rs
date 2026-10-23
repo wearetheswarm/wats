@@ -1605,25 +1605,25 @@ fn apply_openclaw_config(
         &list("hooks.allowedSessionKeyPrefixes"),
         &[oc::SESSION_PREFIX],
     );
-    let token_ref = run_openclaw(openclaw, &["config", "set", "--help"]).is_ok_and(|output| {
-        output.status.success()
-            && [&output.stdout, &output.stderr]
-                .iter()
-                .any(|o| String::from_utf8_lossy(o).contains("--ref-source"))
-    });
+    // What `config set` supports: SecretRefs (`--ref-source`), and the
+    // provider its ref builder requires since 2026.6 (`--ref-provider`).
+    let help = run_openclaw(openclaw, &["config", "set", "--help"])
+        .ok()
+        .filter(|output| output.status.success())
+        .map(|output| {
+            format!(
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            )
+        })
+        .unwrap_or_default();
+    let token_ref = help.contains("--ref-source");
     let patch = serde_json::to_string_pretty(&oc::config_patch(
         agent_id, &agent_ids, &prefixes, token_ref,
     ))?;
     println!("The patch for `openclaw config patch` (objects merge, lists replace):\n\n{patch}\n");
-    let secret_ref = [
-        "config",
-        "set",
-        "hooks.token",
-        "--ref-source",
-        "env",
-        "--ref-id",
-        oc::HOOKS_TOKEN_ENV,
-    ];
+    let secret_ref = oc::secret_ref_args(help.contains("--ref-provider"));
     if token_ref {
         println!(
             "hooks.token: a SecretRef to the environment variable {} (`openclaw {}`)",
@@ -2078,6 +2078,11 @@ fn setup_openclaw(
             oc::config_block(&agent_id)
         );
         token_line("");
+        println!(
+            "To keep even that reference out of openclaw.json, make hooks.token a SecretRef \
+             instead of its `token:` line:\n  openclaw {}",
+            oc::secret_ref_args(true).join(" ")
+        );
         match run_openclaw(openclaw, &["config", "validate"]) {
             Ok(output) if output.status.success() => {
                 println!("`openclaw config validate`: OK (run it again once the block is pasted)")
