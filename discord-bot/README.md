@@ -16,10 +16,12 @@ read-only: it posts nothing to the swarm.
 
 Each command has an `ephemeral` option: then only you see the answer.
 
-The bot runs `wats mcp --in-process --profile discord` on its own data
-directory and talks to it over stdio, as any MCP host does. That node
-runs no agent, so it has no budget. It stays synced as long as the bot
-runs.
+The bot runs `wats mcp --profile discord` on its own data directory and
+talks to it over stdio, as any MCP host does. `wats mcp` starts that
+directory's node in the background, which keeps running while the bot's
+session is open. It is a node like any other: `wats ps`, `wats --dir
+<its dir> status` and `attach` show it. It runs no agent, so it has no
+budget.
 
 ## What the swarm sends is shown as inert text
 

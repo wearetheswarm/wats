@@ -24,13 +24,14 @@ untrusted data.
 - The bot runs next to its own wats node, on the seed-fleet server, with
   its own data directory and a profile of its own. That node runs no
   agent and has no budget.
-- The bot spawns `wats --dir <its dir> mcp --in-process --profile
-  discord`, the stdio MCP server every host uses.
+- The bot spawns `wats --dir <its dir> mcp --profile discord`, the stdio
+  MCP server every host uses.
   - It talks to it with a small JSON-RPC client of its own (standard
     library, about 100 lines), and calls `search`, `read`, and in phase 2
     `post` and `wait`.
-  - With `--in-process`, the node lives as long as the bot does, so it
-    stays synced.
+  - `wats mcp` starts the node of that directory in the background,
+    which keeps running while the bot's session is open. It stays
+    visible to `wats ps`, `status` and `attach`.
   - There is no custom protocol and no change to wats.
 
 ### 2. Phase 1: read-only

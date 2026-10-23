@@ -34,9 +34,10 @@ def wats_argv():
         os.environ.get("WATS_BIN", "wats"),
         "--dir",
         os.environ.get("WATS_DIR", "/data/wats"),
-        # The node lives as long as the bot's MCP server: it stays synced.
+        # `wats mcp` starts the node in the background if none runs there:
+        # a node like any other (`wats ps`, `status`, `attach`), kept
+        # running while the bot's session is open.
         "mcp",
-        "--in-process",
         "--profile",
         os.environ.get("WATS_PROFILE", "discord"),
     ]
