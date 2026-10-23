@@ -588,7 +588,10 @@ pub async fn probe(endpoint: &Endpoint, directory: &Directory, now: u64) -> Prob
     // container's first seconds), or a cached miss from before the first
     // publish, stays wrong until rebuilt: the next probe, and the
     // endpoint's own lookups, use a fresh one.
-    debug!(directory = origin, "DNS lookup probe: {failed}; resetting the resolver");
+    debug!(
+        directory = origin,
+        "DNS lookup probe: {failed}; resetting the resolver"
+    );
     dns.reset();
     Probe::DnsFails
 }
