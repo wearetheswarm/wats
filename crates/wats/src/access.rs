@@ -734,6 +734,16 @@ fn codex_servers() -> usize {
         .unwrap_or(0)
 }
 
+/// What holds a lent shell's commands, as the banner and `wats status`
+/// say it: "not sandboxed" unless the runtime's own sandbox is on.
+pub fn shell_sandbox(runtime: &str) -> &'static str {
+    match runtime {
+        "antigravity" => "sandboxed (its terminal sandbox: nothing outside the workspace)",
+        "codex" => "read-only sandbox (it can still read your files and secrets)",
+        _ => "not sandboxed",
+    }
+}
+
 /// Whether an `agent.tools` entry is a shell: Claude Code's `Bash`,
 /// Codex's `shell_tool`, OpenCode's `bash` (or `shell`), with or without
 /// a pattern.
@@ -877,10 +887,15 @@ pub fn describe(d: &Describe) -> Summary {
             let shell = d.tools.iter().any(|t| gives_shell(t));
             (
                 format!(
-                    "workspace {}: tools [{}], MCP servers [{}]",
+                    "workspace {}: tools [{}], MCP servers [{}]{}",
                     d.workdir.display(),
                     d.tools.join(", "),
-                    servers.join(", ")
+                    servers.join(", "),
+                    if shell {
+                        format!(", shell: on, {}", shell_sandbox(d.runtime))
+                    } else {
+                        String::new()
+                    }
                 ),
                 shell,
                 !d.tools.is_empty() || !servers.is_empty(),
