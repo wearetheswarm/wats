@@ -1574,19 +1574,17 @@ fn openclaw_mcp_set(
 ///    `<file>.bak-<UTC timestamp>`.
 /// 2. `openclaw config get` of the two hooks lists, merged with ours
 ///    (`patch` replaces arrays).
-/// 3. `hooks.token`: a SecretRef to the environment variable when `openclaw
-///    config set` supports `--ref-source`, else the `${VAR}` reference in
-///    the patch.
+/// 3. `hooks.token`: the `${VAR}` template in the patch (OpenClaw refuses a
+///    SecretRef there).
 /// 4. The patch is printed, then `openclaw config patch --stdin --dry-run`,
 ///    `openclaw config patch --stdin` and `openclaw config validate`.
 ///
 /// Any failure from the first write on restores the backup and fails.
-/// Returns whether `hooks.token` is a SecretRef.
 fn apply_openclaw_config(
     openclaw: &std::path::Path,
     agent_id: &str,
     hooks_token: &str,
-) -> Result<bool> {
+) -> Result<()> {
     use wats::openclaw as oc;
     let output = run_openclaw(openclaw, &["config", "file"])?;
     openclaw_ok(&output, "config file")?;
@@ -1627,38 +1625,10 @@ fn apply_openclaw_config(
         &list("hooks.allowedSessionKeyPrefixes"),
         &[oc::SESSION_PREFIX],
     );
-    // What `config set` supports: SecretRefs (`--ref-source`), and the
-    // provider its ref builder requires since 2026.6 (`--ref-provider`).
-    let help = run_openclaw(openclaw, &["config", "set", "--help"])
-        .ok()
-        .filter(|output| output.status.success())
-        .map(|output| {
-            format!(
-                "{}{}",
-                String::from_utf8_lossy(&output.stdout),
-                String::from_utf8_lossy(&output.stderr)
-            )
-        })
-        .unwrap_or_default();
-    let token_ref = help.contains("--ref-source");
-    let patch = serde_json::to_string_pretty(&oc::config_patch(
-        agent_id, &agent_ids, &prefixes, token_ref,
-    ))?;
+    let patch = serde_json::to_string_pretty(&oc::config_patch(agent_id, &agent_ids, &prefixes))?;
     println!("The patch for `openclaw config patch` (objects merge, lists replace):\n\n{patch}\n");
-    let secret_ref = oc::secret_ref_args(help.contains("--ref-provider"));
-    if token_ref {
-        println!(
-            "hooks.token: a SecretRef to the environment variable {} (`openclaw {}`)",
-            oc::HOOKS_TOKEN_ENV,
-            secret_ref.join(" ")
-        );
-    }
 
     let applied = (|| -> Result<()> {
-        if token_ref {
-            let output = run_openclaw(openclaw, &secret_ref)?;
-            openclaw_ok(&output, "config set hooks.token --ref-source env")?;
-        }
         for args in [
             &["config", "patch", "--stdin", "--dry-run"][..],
             &["config", "patch", "--stdin"][..],
@@ -1678,7 +1648,7 @@ fn apply_openclaw_config(
     })();
     let Err(error) = applied else {
         println!("OpenClaw's config: applied, and `openclaw config validate` passes");
-        return Ok(token_ref);
+        return Ok(());
     };
     let error = anyhow::anyhow!("{}", format!("{error:#}").replace(hooks_token, "<token>"));
     let restored = match &backup {
@@ -2086,12 +2056,8 @@ fn setup_openclaw(
         )
     };
     if automatic {
-        let token_ref = apply_openclaw_config(openclaw, &agent_id, &hooks_token)?;
-        token_line(if token_ref {
-            " (hooks.token is a SecretRef to that variable)"
-        } else {
-            ""
-        });
+        apply_openclaw_config(openclaw, &agent_id, &hooks_token)?;
+        token_line(" (hooks.token is the template ${WATS_OPENCLAW_HOOKS_TOKEN})");
         println!("Then restart the gateway (e.g. `openclaw gateway restart`).");
     } else {
         println!(
@@ -2101,9 +2067,8 @@ fn setup_openclaw(
         );
         token_line("");
         println!(
-            "To keep even that reference out of openclaw.json, make hooks.token a SecretRef \
-             instead of its `token:` line:\n  openclaw {}",
-            oc::secret_ref_args(true).join(" ")
+            "If your config already has a hooks block, its token alone:\n  {}",
+            oc::hooks_token_command()
         );
         match run_openclaw(openclaw, &["config", "validate"]) {
             Ok(output) if output.status.success() => {

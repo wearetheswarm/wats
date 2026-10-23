@@ -196,13 +196,11 @@ writes `openclaw.json` itself):
       hooks.allowedSessionKeyPrefixes`: `config patch` replaces arrays, so
       wats adds `"wats"` and `"wats:"` to what is there (your `"main"`
       stays).
-   3. The hook token: when `openclaw config set` supports SecretRefs,
-      `openclaw config set hooks.token --ref-provider default --ref-source env
-      --ref-id WATS_OPENCLAW_HOOKS_TOKEN` (no `--ref-provider` before OpenClaw
-      2026.6, which did not have it), so the token is never in
-      `openclaw.json`, only a reference to the gateway's environment.
-      Otherwise the patch sets `token: "${WATS_OPENCLAW_HOOKS_TOKEN}"`, the
-      environment reference of the manual block.
+   3. The hook token: the patch sets `token: "${WATS_OPENCLAW_HOOKS_TOKEN}"`,
+      the environment template of the manual block, so the token is never
+      in `openclaw.json`. OpenClaw refuses a SecretRef there (2026.6.35:
+      "runtime-managed and must stay a plain string value"). To set it
+      alone: `openclaw config set hooks.token '${WATS_OPENCLAW_HOOKS_TOKEN}'`.
    4. Prints the patch (the content of the block below, as JSON, with the
       merged lists), then runs `openclaw config patch --stdin --dry-run`,
       `openclaw config patch --stdin`, and `openclaw config validate`.

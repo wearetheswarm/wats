@@ -35,20 +35,21 @@ pub const AGENT_SERVER: &str = "wats-agent";
 /// The environment variable the gateway reads the hook token from.
 pub const HOOKS_TOKEN_ENV: &str = "WATS_OPENCLAW_HOOKS_TOKEN";
 
-/// The SecretRef provider of `hooks.token`: OpenClaw's default one, which
-/// its `config set` ref builder requires since 2026.6 (`--ref-provider`).
-pub const SECRET_REF_PROVIDER: &str = "default";
+/// `hooks.token` in OpenClaw's config: the environment template of
+/// [`HOOKS_TOKEN_ENV`], never the token. OpenClaw refuses a SecretRef
+/// there ("runtime-managed and must stay a plain string value"; 2026.6.35)
+/// and allows a `${VAR}` template.
+pub fn hooks_token_template() -> String {
+    format!("${{{HOOKS_TOKEN_ENV}}}")
+}
 
-/// `openclaw config set` arguments that make `hooks.token` a SecretRef to
-/// [`HOOKS_TOKEN_ENV`]; with `provider`, the `--ref-provider` OpenClaw
-/// 2026.6 and later require.
-pub fn secret_ref_args(provider: bool) -> Vec<&'static str> {
-    let mut args = vec!["config", "set", "hooks.token"];
-    if provider {
-        args.extend(["--ref-provider", SECRET_REF_PROVIDER]);
-    }
-    args.extend(["--ref-source", "env", "--ref-id", HOOKS_TOKEN_ENV]);
-    args
+/// The command that sets `hooks.token` alone, for the manual mode, quoted
+/// for a POSIX shell.
+pub fn hooks_token_command() -> String {
+    format!(
+        "openclaw config set hooks.token '{}'",
+        hooks_token_template()
+    )
 }
 /// What `status` says of the budget.
 pub const BUDGET: &str = "managed by OpenClaw";
@@ -660,24 +661,16 @@ pub const SESSION_PREFIX: &str = "wats:";
 /// The patch `wats setup openclaw --apply` sends to `openclaw config patch`:
 /// the content of [`config_block`] as JSON. `patch` replaces arrays, so
 /// `agent_ids` and `prefixes` are the merged lists (see [`merge_list`]).
-/// With `token_ref`, `hooks.token` is left out: it is set apart as a
-/// SecretRef to [`HOOKS_TOKEN_ENV`].
-pub fn config_patch(
-    agent: &str,
-    agent_ids: &[String],
-    prefixes: &[String],
-    token_ref: bool,
-) -> Value {
-    let mut hooks = json!({
+/// `hooks.token` is [`hooks_token_template`].
+pub fn config_patch(agent: &str, agent_ids: &[String], prefixes: &[String]) -> Value {
+    let hooks = json!({
         "enabled": true,
+        "token": hooks_token_template(),
         "path": "/hooks",
         "allowedAgentIds": agent_ids,
         "allowRequestSessionKey": true,
         "allowedSessionKeyPrefixes": prefixes,
     });
-    if !token_ref {
-        hooks["token"] = format!("${{{HOOKS_TOKEN_ENV}}}").into();
-    }
     let mut patch = json!({ "hooks": hooks });
     if agent == DEFAULT_AGENT {
         patch["agents"] = json!({ "entries": { DEFAULT_AGENT: {
@@ -769,16 +762,12 @@ pub fn backup_path(file: &Path, now: u64) -> PathBuf {
 mod tests {
 
     #[test]
-    fn the_secret_ref_names_its_provider_where_openclaw_wants_one() {
+    fn the_hook_token_is_an_environment_template() {
         assert_eq!(
-            secret_ref_args(true).join(" "),
-            "config set hooks.token --ref-provider default --ref-source env --ref-id \
-             WATS_OPENCLAW_HOOKS_TOKEN"
+            hooks_token_command(),
+            "openclaw config set hooks.token '${WATS_OPENCLAW_HOOKS_TOKEN}'"
         );
-        assert_eq!(
-            secret_ref_args(false).join(" "),
-            "config set hooks.token --ref-source env --ref-id WATS_OPENCLAW_HOOKS_TOKEN"
-        );
+        assert!(config_block(DEFAULT_AGENT).contains(&hooks_token_template()));
     }
 
     #[test]
@@ -953,13 +942,13 @@ mod tests {
     }
 
     /// The patch is the printed block, as JSON, with the merged lists; the
-    /// token is an environment reference unless a SecretRef sets it.
+    /// token is an environment reference.
     #[test]
     fn patch_matches_the_block() {
         let ids = merge_list(&["main".into(), "wats".into()], &["wats"]);
         assert_eq!(ids, ["main", "wats"]);
         let prefixes = merge_list(&[], &[SESSION_PREFIX]);
-        let patch = config_patch(DEFAULT_AGENT, &ids, &prefixes, false);
+        let patch = config_patch(DEFAULT_AGENT, &ids, &prefixes);
         assert_eq!(patch["hooks"]["token"], "${WATS_OPENCLAW_HOOKS_TOKEN}");
         assert_eq!(patch["hooks"]["allowedAgentIds"], json!(["main", "wats"]));
         assert_eq!(
@@ -974,10 +963,8 @@ mod tests {
         for value in ["/hooks", "wats (swarm)", "~/.openclaw/workspace-wats"] {
             assert!(block.contains(value) && patch.to_string().contains(value));
         }
-        let with_ref = config_patch(DEFAULT_AGENT, &ids, &prefixes, true);
-        assert!(with_ref["hooks"].get("token").is_none());
         assert!(
-            config_patch("main", &ids, &prefixes, true)
+            config_patch("main", &ids, &prefixes)
                 .get("agents")
                 .is_none()
         );

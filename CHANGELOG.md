@@ -31,6 +31,11 @@
   CLI `--effort`, OpenCode `--variant`). Unset, the runtime's default
   applies; one set in `agent.extra_args` wins. Vibe, OpenClaw and custom
   agents take none, and the start says so. `data.via` reports it.
+- **`wats setup openclaw --agent`, automatic mode**: `hooks.token` is the
+  template `${WATS_OPENCLAW_HOOKS_TOKEN}` in the patch. OpenClaw 2026.6.35
+  refuses the SecretRef wats set there ("must stay a plain string value"),
+  so the automatic mode failed and restored the backup. The manual mode
+  prints `openclaw config set hooks.token '${WATS_OPENCLAW_HOOKS_TOKEN}'`.
 - **Docs**: the runtimes checked on a real run (wats 0.4.9) say so.
 - **The manifesto** in the README.
 

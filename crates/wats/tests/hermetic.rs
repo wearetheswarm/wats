@@ -724,11 +724,12 @@ fn setup_openclaw_agent_tokens_entries_and_block() {
 
 /// `wats setup openclaw --agent --apply`, against a fake `openclaw` that
 /// keeps a fake openclaw.json: a backup of that file, the existing hooks
-/// lists merged with ours, the SecretRef `config set` for the hook token,
-/// the same patch on stdin to the dry run then the real `config patch`,
-/// then `config validate` (with the token in its environment). A failing
-/// validate restores the file byte for byte and fails. Without SecretRefs,
-/// the patch carries the `${VAR}` reference. `--print` patches nothing.
+/// lists merged with ours, the same patch on stdin to the dry run then the
+/// real `config patch`, with the hook token as the `${VAR}` template, then
+/// `config validate` (with the token in its environment). The fake refuses
+/// a SecretRef at hooks.token, as OpenClaw 2026.6.35 does. A failing
+/// validate restores the file byte for byte and fails. `--print` patches
+/// nothing.
 #[test]
 fn setup_openclaw_agent_applies_through_config_patch() {
     use std::os::unix::fs::PermissionsExt;
@@ -748,8 +749,8 @@ case "$1 $2" in
 'mcp show') cat {d}/entry-$3.json;;
 'config file') echo '~/oc/openclaw.json';;
 'config get') if [ -f "{d}/get-$3" ]; then cat "{d}/get-$3"; else echo "Config path not found: $3" >&2; exit 1; fi;;
-'config set') if [ "$3" = --help ]; then [ -f {d}/norefs ] || echo '  --ref-source <source>  SecretRef source'; [ -f {d}/norefs ] || [ -f {d}/noprovider ] || echo '  --ref-provider <alias>  SecretRef provider'; else echo "// set $3" >> {d}/oc/openclaw.json; fi;;
-'config patch') if [ "$4" = --dry-run ]; then cat > {d}/dry.json; else cat > {d}/real.json; echo '// patched' >> {d}/oc/openclaw.json; fi;;
+'config set') case "$*" in *--ref-*) echo 'Config policy validation failed: unsupported SecretRef usage was detected. hooks.token: SecretRef objects are not supported at hooks.token.' >&2; exit 1;; esac; echo "// set $3" >> {d}/oc/openclaw.json;;
+'config patch') p=$(cat); case "$p" in *'"token": {'*) echo 'Config policy validation failed: SecretRef objects are not supported at hooks.token.' >&2; exit 1;; esac; if [ "$4" = --dry-run ]; then printf '%s' "$p" > {d}/dry.json; else printf '%s' "$p" > {d}/real.json; echo '// patched' >> {d}/oc/openclaw.json; fi;;
 'config validate') if [ -f {d}/invalid ]; then echo 'Invalid config: hooks.token' >&2; exit 1; fi; [ -n "$WATS_OPENCLAW_HOOKS_TOKEN" ] || exit 2;;
 esac
 "#;
@@ -808,18 +809,6 @@ esac
             &["config", "file"][..],
             &["config", "get", "hooks.allowedAgentIds"],
             &["config", "get", "hooks.allowedSessionKeyPrefixes"],
-            &["config", "set", "--help"],
-            &[
-                "config",
-                "set",
-                "hooks.token",
-                "--ref-provider",
-                "default",
-                "--ref-source",
-                "env",
-                "--ref-id",
-                "WATS_OPENCLAW_HOOKS_TOKEN"
-            ],
             &["config", "patch", "--stdin", "--dry-run"],
             &["config", "patch", "--stdin"],
             &["config", "validate"],
@@ -843,7 +832,10 @@ esac
         serde_json::json!(["wats:"])
     );
     assert_eq!(patch["hooks"]["enabled"], true);
-    assert!(patch["hooks"].get("token").is_none(), "{patch}");
+    assert_eq!(
+        patch["hooks"]["token"], "${WATS_OPENCLAW_HOOKS_TOKEN}",
+        "{patch}"
+    );
     assert_eq!(
         patch["agents"]["entries"]["wats"]["tools"]["allow"],
         serde_json::json!(["wats-agent__*"])
@@ -878,23 +870,6 @@ esac
     assert_eq!(backups().len(), 2);
     std::fs::remove_file(d.join("invalid")).unwrap();
 
-    // No SecretRefs: the token is the `${VAR}` reference in the patch.
-    std::fs::write(d.join("norefs"), "").unwrap();
-    let start = calls().len();
-    let out = run(&["--apply"]);
-    assert!(out.status.success(), "{out:?}");
-    assert!(
-        !calls()[start..]
-            .iter()
-            .any(|c| c.contains(&"hooks.token".into())),
-        "{:?}",
-        calls()
-    );
-    assert_eq!(
-        json("real.json")["hooks"]["token"],
-        "${WATS_OPENCLAW_HOOKS_TOKEN}"
-    );
-
     // --print: the block, and no `config patch`.
     let start = calls().len();
     let out = run(&["--print"]);
@@ -905,6 +880,11 @@ esac
         "{said}"
     );
     assert!(!said.contains("`--apply` applies"), "{said}");
+    assert!(
+        said.contains("openclaw config set hooks.token '${WATS_OPENCLAW_HOOKS_TOKEN}'"),
+        "{said}"
+    );
+    assert!(!said.contains("--ref-"), "{said}");
     let later = calls();
     assert!(
         !later[start..]
