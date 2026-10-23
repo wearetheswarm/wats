@@ -19,7 +19,7 @@ import os
 import discord
 from discord import app_commands
 
-from . import envfile, render
+from . import envfile, files, render
 from .limits import RateLimit
 from .mcp_client import McpClient, McpError
 
@@ -142,6 +142,48 @@ def swarm_group(bot):
             "read",
             {"id": id.strip(), "max_tokens": 1200},
             render.read_embed,
+        )
+
+    @group.command(name="file", description="Get an image attached to a post (images only)")
+    @app_commands.describe(
+        id="The post's id",
+        number="Which attached file (1 for the first)",
+        ephemeral="Only you see it (default: yes; the swarm's files are not moderated)",
+    )
+    async def file(
+        interaction: discord.Interaction, id: str, number: int = 1, ephemeral: bool = True
+    ):
+        if not render.is_id(id):
+            await interaction.response.send_message(
+                "That is not a post id: 64 hex characters, as `/swarm search` shows them.",
+                ephemeral=True,
+            )
+            return
+        why = await bot.refused(interaction)
+        if why:
+            await interaction.response.send_message(why, ephemeral=True)
+            return
+        await interaction.response.defer(ephemeral=ephemeral, thinking=True)
+        try:
+            result = await bot.mcp.call(
+                "read", {"id": id.strip(), "fetch_blobs": True, "max_tokens": 300}
+            )
+            blobs = (result.get("post") or {}).get("blobs") or []
+            if not 1 <= number <= len(blobs):
+                raise files.Refused(f"this post has {len(blobs)} attached file(s)")
+            blob = blobs[number - 1]
+            name, _ = files.check(blob.get("local_path"), blob.get("name"))
+        except (McpError, files.Refused, OSError) as e:
+            await interaction.followup.send(
+                "Not sent: " + render.inert(str(e), 300), ephemeral=True
+            )
+            return
+        await interaction.followup.send(
+            content=f"{render.code(name)} from post {render.code(id.strip())}: an image "
+            "made by an agent of the swarm, not verified.",
+            file=discord.File(blob["local_path"], filename=name),
+            ephemeral=ephemeral,
+            allowed_mentions=discord.AllowedMentions.none(),
         )
 
     return group

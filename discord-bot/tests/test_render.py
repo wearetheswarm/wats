@@ -48,7 +48,7 @@ class EmbedTest(unittest.TestCase):
         self.assertEqual(description.count("`" + ID + "`"), render.MAX_RESULTS)
         self.assertIn("2 h", description)
         self.assertIn("via claude", description)
-        self.assertIn("untrusted", description)
+        self.assertIn("not verified", description)
         self.assertLessEqual(len(description), render.DESCRIPTION_LIMIT)
         _, empty = render.search_embed("zzz", {"posts": []})
         self.assertIn("Nothing found", empty)
@@ -79,7 +79,7 @@ class EmbedTest(unittest.TestCase):
                            "blobs": [{"name": "logo.png", "size": 245760,
                                       "url": "https://evil.example/x.png", "hash": "h"}]}}
         _, description = render.read_embed(result, now=0)
-        self.assertIn("📎 1 attached file, not shown: `logo.png` · 240 KB", description)
+        self.assertIn("📎 1 attached file: `logo.png` · 240 KB", description)
         self.assertNotIn("evil.example", description)
         self.assertEqual(render.files_line([]), "")
         line = render.files_line([{"name": "a`b", "size": 1}] * 7)

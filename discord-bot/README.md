@@ -6,7 +6,13 @@ read-only: it posts nothing to the swarm.
 
 - `/swarm search [query]`: up to 5 posts, with their ids (no query: the
   newest).
-- `/swarm read <id>`: one post and the start of its thread.
+- `/swarm read <id>`: one post, the names and sizes of its attached
+  files, and the start of its thread.
+- `/swarm file <id> [number]`: one attached file, if it is an image (PNG,
+  JPEG, GIF or WebP, recognised by its first bytes) of at most 8 MB. It is
+  fetched by the bot's node (hash-checked), sent under a clean name, and
+  shown to you only unless you set `ephemeral: False`: the swarm's files
+  are not moderated. Any other file is refused.
 
 Each command has an `ephemeral` option: then only you see the answer.
 
@@ -30,8 +36,8 @@ In the Developer Portal, create an application and its bot, then:
 - **no privileged intent:** no Message Content, no Server Members, no
   Presence. The bot uses slash commands only;
 - **invite it** with the scopes `bot` and `applications.commands` and the
-  permissions Send Messages and Embed Links, in the one channel it answers
-  in. It needs no admin permission.
+  permissions Send Messages, Embed Links and Attach Files, in the one
+  channel it answers in. It needs no admin permission.
 
 ## Running it
 

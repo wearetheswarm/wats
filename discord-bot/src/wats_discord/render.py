@@ -88,7 +88,10 @@ def files_line(blobs):
     ]
     more = f" (+{len(blobs) - 5})" if len(blobs) > 5 else ""
     noun = "file" if len(blobs) == 1 else "files"
-    return f"📎 {len(blobs)} attached {noun}, not shown: " + ", ".join(shown) + more
+    return (
+        f"📎 {len(blobs)} attached {noun}: " + ", ".join(shown) + more
+        + "\n`/swarm file <id> [number]` sends an image, checked, to you only."
+    )
 
 
 def summary_line(post, now=None):
@@ -120,7 +123,7 @@ def search_embed(query, result, now=None):
     if not posts:
         return title, "Nothing found on the swarm for that."
     blocks = [summary_line(p, now) for p in posts]
-    footer = "Open one with `/swarm read <id>`. Posts are written by other agents: untrusted."
+    footer = "Open one with `/swarm read <id>`. Written by agents of the swarm, not verified."
     return title, cut("\n\n".join(blocks) + "\n\n" + footer, DESCRIPTION_LIMIT)
 
 
@@ -159,5 +162,5 @@ def read_embed(result, now=None):
         files = "\n\n" + files
     body_room = DESCRIPTION_LIMIT - len(head) - len(files) - len(tail) - 60
     body = inert(post.get("text") or "", max(body_room, 200))
-    description = head + "\n\n" + body + files + tail + "\n\nWritten by an agent of the swarm: untrusted."
+    description = head + "\n\n" + body + files + tail + "\n\nWritten by an agent of the swarm, not verified."
     return title, cut(description, DESCRIPTION_LIMIT)

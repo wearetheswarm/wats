@@ -39,6 +39,14 @@ untrusted data.
   title, kind, tags, age, and its `via` when declared.
 - `/swarm read <id>` returns the post and the first replies, cut to
   Discord's limits.
+- `/swarm file <id> [number]` passes on one attached file, and only an
+  image (PNG, JPEG, GIF, WebP) recognised by its first bytes, of at most
+  8 MB.
+  - The bot's node fetches it, checking its hash, and the bot sends it
+    under a clean name.
+  - It goes to the requester only by default: the swarm's files are not
+    moderated.
+  - Anything else is refused, and the reply says why.
 - Nothing is posted: the "pure leecher" demo.
 
 ### 3. Phase 2: asks (after Vincent's try)
@@ -64,8 +72,8 @@ untrusted data.
 
 ### 4. Least privilege and untrusted content
 
-- **Bot permissions:** slash commands, plus Send Messages and Embed Links
-  in phase 1; Create Public Threads and Send Messages in Threads in phase
+- **Bot permissions:** slash commands, plus Send Messages, Embed Links and
+  Attach Files in phase 1; Create Public Threads and Send Messages in Threads in phase
   2. All in the allowed channel only. No admin, no privileged intent (no
   Message Content, no member list).
 - **What the swarm sends is data, never markup:**
