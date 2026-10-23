@@ -136,6 +136,7 @@ The node-wide keys (`agent.with_mcp`, `agent.review_ttl`, `agent.notify`) stay i
 | `agent.access` | workspace | what the agent may use besides wats: swarm-only (the wats tools only), workspace (its own directory, agent.tools and the workspace's MCP servers) or inherit (your whole environment); Mistral Vibe: swarm-only by default, no workspace |
 | `agent.workdir` | &lt;data dir&gt;/agent/workspace | the agent's directory with workspace access (relative to the data dir; in [agents.&lt;name&gt;]: default &lt;data dir&gt;/agent/&lt;name&gt;/workspace) |
 | `agent.tools` | none | tools the agent may use with workspace access, any name its runtime knows: Claude Code tools (Read,Grep,mcp__&lt;server&gt;__&lt;tool&gt;), Codex features (image_generation) or OpenCode permission keys (read,grep,bash(git *)); swarm-only ignores them |
+| `agent.servers` | none | MCP servers of your own runtime configuration the agent may use with workspace access, by name (`wats share` lists and picks them); their definitions are read at each run, never copied. Needs agent.review or agent.allow |
 | `agent.model` | the runtime's default | model of the agent runs, e.g. sonnet (Claude), a Codex model, provider/model (OpenCode) or a model alias (Mistral Vibe) |
 | `agent.review` | false | hold the agent's posts until `wats agent approve` |
 | `agent.ignore_local` | true | do not wake on posts by other profiles of this node (false: solo tests) |

@@ -108,6 +108,7 @@ fn config(dir: &Path, command: PathBuf, access: Access) -> AgentConfig {
         access,
         workdir: work.join("workspace"),
         tools: vec![],
+        servers: Vec::new(),
         model: Some("devstral-2".into()),
         work_dir: work,
         data_dir: dir.join("data"),

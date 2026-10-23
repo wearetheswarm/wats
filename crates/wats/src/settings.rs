@@ -314,6 +314,10 @@ pub struct AgentSettings {
     pub workdir: Option<PathBuf>,
     #[serde(default)]
     pub tools: Vec<String>,
+    /// MCP servers of the user's own runtime configuration the agent may
+    /// use (names only, ADR 0037).
+    #[serde(default)]
+    pub servers: Vec<String>,
     pub model: Option<String>,
     pub review: Option<bool>,
     pub ignore_local: Option<bool>,
@@ -985,6 +989,14 @@ pub const KEYS: &[Key] = &[
          Claude Code tools (Read,Grep,mcp__<server>__<tool>), Codex features \
          (image_generation) or OpenCode permission keys (read,grep,bash(git *)); \
          swarm-only ignores them",
+    ),
+    key(
+        "agent.servers",
+        ValueType::List,
+        "none",
+        "MCP servers of your own runtime configuration the agent may use with workspace \
+         access, by name (`wats share` lists and picks them); their definitions are read at \
+         each run, never copied. Needs agent.review or agent.allow",
     ),
     key(
         "agent.model",

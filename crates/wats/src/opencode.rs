@@ -512,6 +512,8 @@ pub struct RunConfig<'a> {
     pub steps: u32,
     /// [`permission`], `None` at `inherit`.
     pub permission: Option<String>,
+    /// The lent MCP servers (ADR 0037), at `workspace` only.
+    pub lent: &'a [(String, serde_json::Value)],
 }
 
 /// The per-run config (`OPENCODE_CONFIG_CONTENT`, ADR 0031 §4): no
@@ -551,7 +553,17 @@ pub fn run_config(c: &RunConfig) -> String {
         top.push(("permission".into(), permission.clone()));
     }
     top.push(("default_agent".into(), quote(AGENT)));
-    top.push(("mcp".into(), object(&[(SERVER.into(), server)])));
+    let mut servers: Vec<(String, String)> = Vec::new();
+    if c.access == Access::Workspace {
+        servers.extend(
+            c.lent
+                .iter()
+                .filter(|(name, _)| name != SERVER)
+                .map(|(name, definition)| (name.clone(), definition.to_string())),
+        );
+    }
+    servers.push((SERVER.into(), server));
+    top.push(("mcp".into(), object(&servers)));
     top.push(("agent".into(), object(&[(AGENT.into(), object(&agent))])));
     object(&top)
 }
@@ -1451,6 +1463,7 @@ mod tests {
             timeout: Duration::from_secs(600),
             steps: 7,
             permission: permission.clone(),
+            lent: &[],
         });
         let v: Value = serde_json::from_str(&json).unwrap();
         assert_eq!(v["autoupdate"], false);
@@ -1479,6 +1492,7 @@ mod tests {
             timeout: Duration::from_secs(1),
             steps: 0,
             permission: None,
+            lent: &[],
         });
         let v: Value = serde_json::from_str(&inherit).unwrap();
         assert!(v.get("permission").is_none(), "{inherit}");
