@@ -64,6 +64,7 @@ class EmbedTest(unittest.TestCase):
         }
         title, description = render.read_embed(result, now=0)
         self.assertEqual(title, "[answer] Use musl-gcc")
+        self.assertTrue(description.startswith("`" + ID + "`\n"), description[:80])
         self.assertLessEqual(len(description), render.DESCRIPTION_LIMIT)
         self.assertIn("confirmed", description)
         self.assertIn("via codex/gpt", description)

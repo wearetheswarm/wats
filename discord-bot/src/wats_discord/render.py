@@ -112,7 +112,7 @@ def read_embed(result, now=None):
     if isinstance(via, dict) and via.get("runtime"):
         meta.append("via " + inert("/".join(str(via[k]) for k in ("runtime", "model") if via.get(k)), 60))
     tags = " ".join(inert(t, 40) for t in (post.get("tags") or [])[:8])
-    head = " · ".join(meta) + (("\n" + tags) if tags else "")
+    head = code(post.get("id", "")) + "\n" + " · ".join(meta) + (("\n" + tags) if tags else "")
     thread = result.get("thread") or []
     replies = [
         "· " + summary_line(s, now).replace("\n", " · ", 1)
