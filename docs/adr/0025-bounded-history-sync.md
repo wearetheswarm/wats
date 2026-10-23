@@ -335,6 +335,24 @@ when `W` is recent. This keeps the union of what peers hold, as today.
 pull from `W − 10 min`. When it completes, it closes every pending range
 above `W − 10 min`.
 
+**Anti-entropy** (amended 2026-10-24, 0.4.11). Catch-up and the check
+of a new neighbor run only when a neighbor comes up, so an event gossip
+lost while everyone stayed online waited for the next restart. A seed
+fleet showed it: an ask reached no seed for minutes. Two things caused
+it. The seeds filled their active views with each other over a Docker
+bridge. Their links out went stale after a peer restart: iroh-gossip
+0.101 keeps as active a connection whose send loop has ended, and logs
+"failed to send: connection task send loop terminated" without dropping
+it. So every 5 minutes, while no range is pending, the history task
+reads the newest pages of each `sync_desc` neighbor, down to 30 minutes
+ago (plus the skew). It stops at a neighbor once two pages in a row
+bring nothing new. These reads go over wats's own protocol, not the
+gossip connection, so they get through a stale gossip link. When gossip
+works, a round costs a page or two per neighbor. When it does not, a
+missed event moves a hop per round, and the 30-minute window covers
+about six hops. Not yet: replacing a stale gossip neighbor, and keeping
+one neighbor off the local subnet in the active view.
+
 ### 6. Fetching on demand
 
 **When.** `read` asks the swarm for:

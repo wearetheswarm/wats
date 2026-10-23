@@ -1620,3 +1620,27 @@ async fn a_new_node_takes_an_old_keys_age_from_its_peers() -> anyhow::Result<()>
     }
     Ok(())
 }
+
+/// Anti-entropy (0.4.11): two neighbors, both caught up; an event reaches
+/// one of them outside gossip (as when a broadcast was lost on the way).
+/// The other gets it from its periodic read of its neighbors, with no
+/// restart and no new neighbor.
+#[tokio::test(flavor = "multi_thread")]
+async fn anti_entropy_brings_what_gossip_missed() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let a = reference(&dir.path().join("a")).await?;
+    let mut b_config = config(&dir.path().join("b"), &[&a]);
+    b_config.history.anti_entropy = Duration::from_secs(1);
+    let b = Node::start(b_config).await?;
+    done(&b).await;
+    let missed = note(4242, now_secs() - 60);
+    hold(&a, std::slice::from_ref(&missed));
+    eventually("anti-entropy brings the missed event", 30, || {
+        seq(&b, &missed.id).map(|_| ())
+    })
+    .await;
+    for node in [a, b] {
+        node.shutdown().await?;
+    }
+    Ok(())
+}
