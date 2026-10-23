@@ -125,6 +125,13 @@ jobs:
           node --test packages/npm/test/*.test.js
           python3 --version
           python3 -m unittest discover -s packages/pypi/tests -v
+      # The Discord bot (ADR 0040): standard library tests, against fakes
+      # and the wats just built (hermetic). Python as the runner has it.
+      - name: Discord bot
+        if: runner.os == 'Linux'
+        env:
+          WATS_BIN: ${{ github.workspace }}/target/debug/wats
+        run: python3 -m unittest discover -s deploy/discord-bot/tests -v
       # The rendered formula passes Homebrew's own style checks.
       - name: Homebrew formula style
         if: runner.os == 'macOS'
