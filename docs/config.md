@@ -92,7 +92,7 @@ Command-line flags and `WATS_*` variables, where they exist (`wats --help`), tak
 
 | Key | Default | |
 |---|---|---|
-| `notify.desktop` | auto | a desktop notification (osascript, notify-send) when someone answers or clarifies one of your asks; auto: on with a desktop session (macOS, or DISPLAY or WAYLAND_DISPLAY set; not over SSH), off on servers and in containers |
+| `notify.desktop` | auto | a desktop notification (terminal-notifier or osascript, notify-send) when someone answers or clarifies one of your asks; auto: on with a desktop session (macOS, or DISPLAY or WAYLAND_DISPLAY set; not over SSH), off on servers and in containers |
 
 ## `[labels]`
 

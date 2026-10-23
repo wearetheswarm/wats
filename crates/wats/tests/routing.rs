@@ -97,7 +97,13 @@ fn agent(root: &Path, data: &Path, caps: &[&str], every: Duration) -> AgentConfi
         runtime: "claude".into(),
         profile: "agent".into(),
         user: "alice".into(),
-        about: String::new(),
+        // An agent with caps announces them (an announce needs an about):
+        // the others' cap grace waits for it.
+        about: if caps.is_empty() {
+            String::new()
+        } else {
+            format!("I handle {}.", caps.join(", "))
+        },
         caps: caps.iter().map(|c| c.to_string()).collect(),
         every,
         heartbeat: Duration::from_secs(3600),
@@ -785,4 +791,37 @@ async fn cap_wakes_capable_agents_first_once() -> anyhow::Result<Result<(), Stri
         n.shutdown().await?;
     }
     Ok(outcome)
+}
+
+/// No agent the node knows of announces the ask's cap: no grace to wait
+/// for, the agent wakes at once (a plain question tagged cap:kotlin).
+#[tokio::test(flavor = "multi_thread")]
+async fn no_grace_when_nobody_announces_the_cap() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let hub = node(&dir.path().join("hub"), &[], |_| {}).await?;
+    let grace = |c: &mut NodeConfig| c.cap_grace = Duration::from_secs(60);
+    let b = node(&dir.path().join("b"), &[&hub], grace).await?;
+    b.wait_for_neighbor(PUBLIC_NET, Duration::from_secs(10))
+        .await?;
+    let rb = dir.path().join("rb");
+    let runner = start(
+        &b,
+        agent(&rb, &dir.path().join("b"), &[], Duration::from_millis(200)),
+    );
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let ask = hub
+        .publish(
+            ask_with("Advantages of Kotlin?", json!({}), &["cap:kotlin".into()]),
+            &[],
+        )
+        .await?;
+    eventually("b woke without waiting for the grace", 15, || {
+        !runs_for(&rb, &ask).is_empty()
+    })
+    .await;
+    runner.stop().await?;
+    for n in [b, hub] {
+        n.shutdown().await?;
+    }
+    Ok(())
 }

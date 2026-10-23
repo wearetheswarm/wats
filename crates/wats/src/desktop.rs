@@ -4,8 +4,10 @@
 //! have no channel the node can push to; the desktop is the one that
 //! reaches the person, whatever host they asked from.
 //!
-//! - macOS: `osascript`, the strings passed as arguments of an `on run
-//!   argv` script, never spliced into it.
+//! - macOS: `terminal-notifier` when it is on `PATH` (a click on the
+//!   notification then opens nothing), else `osascript`, the strings
+//!   passed as arguments of an `on run argv` script, never spliced into it
+//!   (its notifications belong to Script Editor, which a click opens).
 //! - Linux: `notify-send`, when it is on `PATH`.
 //!
 //! Never through a shell. Off when `notify.desktop` is unset on a machine
@@ -40,6 +42,8 @@ const TIMEOUT: Duration = Duration::from_secs(10);
 pub enum Notifier {
     /// macOS: `osascript`.
     Osascript,
+    /// macOS: `terminal-notifier`, found on `PATH`.
+    TerminalNotifier(PathBuf),
     /// Linux and others: `notify-send`, found on `PATH`.
     NotifySend(PathBuf),
     /// Tests: this program, with the title and the text as arguments.
@@ -52,7 +56,10 @@ impl Notifier {
     /// there is none.
     pub fn detect(path: Option<&OsStr>) -> Option<Self> {
         if cfg!(target_os = "macos") {
-            return Some(Self::Osascript);
+            return Some(
+                find_on_path(path, "terminal-notifier")
+                    .map_or(Self::Osascript, Self::TerminalNotifier),
+            );
         }
         find_on_path(path, "notify-send").map(Self::NotifySend)
     }
@@ -74,6 +81,18 @@ impl Notifier {
                     "end run".into(),
                     title,
                     text,
+                ],
+            ),
+            // Each value follows its option: a leading `-` cannot make it one.
+            Self::TerminalNotifier(program) => (
+                program.clone(),
+                vec![
+                    "-title".into(),
+                    title,
+                    "-message".into(),
+                    text,
+                    "-group".into(),
+                    "wats".into(),
                 ],
             ),
             Self::NotifySend(program) => (program.clone(), vec!["--".into(), title, text]),
@@ -139,14 +158,19 @@ pub fn configured(
     Notifier::detect(std::env::var_os("PATH").as_deref())
 }
 
-/// "Answer from agent 3f16ab12…: <the ask's title>".
-pub fn reply_text(ask_title: &str, reply: &Event) -> String {
+/// "Answer from vincent-agent (this node): <the ask's title>" when the
+/// replier is a profile of this node (`local`), else "Answer from agent
+/// 3f16ab12…: …".
+pub fn reply_text(ask_title: &str, reply: &Event, local: Option<&str>) -> String {
     let kind = match reply.kind {
         Kind::Clarify => "Clarify",
         _ => "Answer",
     };
-    let short = reply.author.get(..8).unwrap_or(&reply.author);
-    format!("{kind} from agent {short}…: {}", clean(ask_title, 120))
+    let from = match local {
+        Some(profile) => format!("{} (this node)", clean(profile, 40)),
+        None => format!("agent {}…", reply.author.get(..8).unwrap_or(&reply.author)),
+    };
+    format!("{kind} from {from}: {}", clean(ask_title, 120))
 }
 
 /// One line of at most `max` characters, without control characters, and
@@ -260,6 +284,48 @@ mod tests {
     }
 
     /// The post's strings are arguments, never part of the script.
+    #[test]
+    fn terminal_notifier_takes_each_string_after_its_option() {
+        let notifier = Notifier::TerminalNotifier(PathBuf::from("/opt/tn"));
+        let (program, args) = notifier.argv("WeAreTheSwarm", "-a \"x\"");
+        assert_eq!(program, PathBuf::from("/opt/tn"));
+        assert_eq!(
+            args,
+            [
+                "-title",
+                "WeAreTheSwarm",
+                "-message",
+                "-a \"x\"",
+                "-group",
+                "wats"
+            ]
+        );
+    }
+
+    #[test]
+    fn replies_name_a_local_profile() {
+        let key = ed25519_dalek::SigningKey::from_bytes(&[7; 32]);
+        let mut reply = crate::event::Draft {
+            net: "public".into(),
+            kind: Some(Kind::Answer),
+            title: Some("Kotlin".into()),
+            text: "Use it for Android.".into(),
+            ..Default::default()
+        }
+        .sign(&key, 1_700_000_000, 0)
+        .unwrap();
+        let short = reply.author[..8].to_string();
+        assert_eq!(
+            reply_text("Kotlin?", &reply, None),
+            format!("Answer from agent {short}…: Kotlin?")
+        );
+        reply.kind = Kind::Clarify;
+        assert_eq!(
+            reply_text("Kotlin?", &reply, Some("vincent-agent")),
+            "Clarify from vincent-agent (this node): Kotlin?"
+        );
+    }
+
     #[test]
     fn osascript_gets_the_strings_as_argv() {
         let (program, args) = Notifier::Osascript.argv(TITLE, "say \"hi\" \\ end run\n-e x");

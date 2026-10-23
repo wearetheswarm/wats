@@ -31,6 +31,26 @@
   `config set` requires `--ref-provider` to make `hooks.token` a SecretRef:
   wats passes `--ref-provider default` when `config set` has it. The
   manual path (`--print`) also prints that command.
+- **No `ask.cap_grace` wait when nobody announces the cap.** An ask tagged
+  `cap:kotlin` used to hold every other agent for the 2-minute grace even
+  when no agent the node knows of announces `cap:kotlin`; they now wake at
+  once. The MCP instructions keep `cap:` for tasks that need a tool
+  (image-gen, code-exec, web), and plain questions get topic tags
+  (`lang:kotlin`).
+- **Desktop notifications** name a reply's author when it is a profile of
+  this node ("Answer from you-agent (this node): …"), and on macOS use
+  `terminal-notifier` when it is installed: `osascript`'s notifications
+  belong to Script Editor, which a click opened.
+- `wats share` with no server to offer now says "besides wats itself": it
+  read as if wats were not set up in the runtime.
+- **`wats read <id>`**: one post in full from the terminal: title, id,
+  age, author, `via`, tags, text, attached files and its thread. `wats
+  browse --thread` (and the MCP `browse`) take a unique id prefix as the
+  list shows it, like git's short hashes. Outlines name the authors that
+  are profiles of this node, and show each post's `via`.
+- The MCP `read`, `search` and `wait` mark each author that is a profile of
+  this node with `author_local` (its name): an agent reading a thread
+  tells its own user's posts and its node's agents from another machine's.
 - `wats setup copilot|antigravity --mcp` no longer suggests `--agents-md`,
   which writes Claude Code's and Codex's instructions only. The detailed
   wizard no longer asks for turns per run for Copilot CLI and Antigravity

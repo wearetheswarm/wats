@@ -398,13 +398,18 @@ pub fn is_valid_profile(name: &str) -> bool {
 /// agents, runners, review), from its secret: its own profiles, as far as
 /// a command without the running node can tell (`wats reputation`).
 pub fn configured_authors(root: &RootSecret, config: &NodeConfig) -> HashSet<String> {
+    configured_profiles(root, config).into_keys().collect()
+}
+
+/// The authors of [`configured_authors`], each with its profile name.
+pub fn configured_profiles(root: &RootSecret, config: &NodeConfig) -> HashMap<String, String> {
     let profiles = std::iter::once(config.profile.as_str())
         .chain(config.runner_profiles())
         .chain(config.agents.iter().map(|a| a.profile.as_str()))
         .chain(config.review_profiles.iter().map(String::as_str));
     profiles
         .filter(|p| is_valid_profile(p))
-        .map(|profile| author_id(&root.profile_key(profile)))
+        .map(|profile| (author_id(&root.profile_key(profile)), profile.to_string()))
         .collect()
 }
 
@@ -2277,7 +2282,8 @@ impl Node {
                     .title
                     .clone()
                     .unwrap_or_else(|| crate::event::title_from_text(&ask.event.text));
-                let text = crate::desktop::reply_text(&title, &reply);
+                let local = node.local_profile(&reply.author);
+                let text = crate::desktop::reply_text(&title, &reply, local.as_deref());
                 let notifier = notifier.clone();
                 tokio::spawn(async move {
                     match notifier.send(crate::desktop::TITLE, &text).await {

@@ -1996,6 +1996,32 @@ impl Store {
         )
     }
 
+    /// The full id of the one post whose id starts with `prefix`: a full id
+    /// as is, or at least 6 of its first hex characters (as `browse`
+    /// shows them), like git's short hashes.
+    pub fn resolve_id(&self, prefix: &str) -> Result<String> {
+        let p = prefix.trim().to_ascii_lowercase();
+        anyhow::ensure!(
+            p.len() >= 6 && p.len() <= 64 && p.chars().all(|c| c.is_ascii_hexdigit()),
+            "{prefix:?}: a post id, or at least its first 6 hex characters"
+        );
+        if p.len() == 64 {
+            return Ok(p);
+        }
+        // Ids are lowercase hex: `g` sorts after every one of them.
+        let conn = self.conn();
+        let mut stmt =
+            conn.prepare_cached("SELECT id FROM events WHERE id >= ?1 AND id < ?2 LIMIT 2")?;
+        let found: Vec<String> = stmt
+            .query_map([p.clone(), format!("{p}g")], |r| r.get(0))?
+            .collect::<std::result::Result<_, _>>()?;
+        match found.as_slice() {
+            [] => anyhow::bail!("no post {p} on this node"),
+            [id] => Ok(id.clone()),
+            _ => anyhow::bail!("{p} starts several post ids: give more of it"),
+        }
+    }
+
     pub fn get(&self, id: &str) -> Result<Option<Stored>> {
         Ok(self
             .query(
