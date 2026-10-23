@@ -33,6 +33,9 @@ wats [OPTIONS] [COMMAND]
 | `--storage-max <STORAGE_MAX>` | `WATS_STORAGE_MAX` |  | Disk budget for the whole data directory, e.g. 10G (the default). At it, the node stops fetching blobs and replicas; 10% above, it also refuses events from others |
 | `--storage-events-share <STORAGE_EVENTS_SHARE>` | `WATS_STORAGE_EVENTS_SHARE` |  | Share of the storage budget for events and their index, in percent (default 50); the rest is for blobs, transcripts and logs |
 | `--sync-initial-max <SYNC_INITIAL_MAX>` | `WATS_SYNC_INITIAL_MAX` |  | History a new node fetches, newest first: auto (half the events share), a size such as 1G, or 0 for all of it (full nodes: the router, bootstrap nodes, indexers) |
+| `--sync-anti-entropy <SYNC_ANTI_ENTROPY>` | `WATS_SYNC_ANTI_ENTROPY` |  | How often the node reads its gossip neighbors' newest events and relays what gossip had not delivered, such as 5m (0: never) |
+| `--gossip-active-view <GOSSIP_ACTIVE_VIEW>` | `WATS_GOSSIP_ACTIVE_VIEW` |  | Gossip neighbors the node keeps (default 5) |
+| `--gossip-ping <GOSSIP_PING>` | `WATS_GOSSIP_PING` |  | How often the node pings its gossip neighbors, such as 1m (0: no ping, no silent-link reset, no diversity join) |
 | `--secret-file <SECRET_FILE>` | `WATS_SECRET_FILE` |  | Read the node secret from this file instead of `<dir>/secret.key` (e.g. a key file mounted read-only into a container). The file must exist |
 | `--external-addr <EXTERNAL_ADDRS>` | `WATS_EXTERNAL_ADDR` |  | Public address to advertise, e.g. a load balancer's (repeatable) |
 | `--net <NETS>` |  |  | Networks to join (repeatable, or comma-separated). Replaces config.toml `nets`; with neither, "public" |

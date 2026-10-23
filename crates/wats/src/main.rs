@@ -302,6 +302,17 @@ struct NodeArgs {
     /// router, bootstrap nodes, indexers).
     #[arg(long, global = true, env = "WATS_SYNC_INITIAL_MAX", value_parser = wats::settings::parse_initial_max)]
     sync_initial_max: Option<wats::settings::InitialMax>,
+    /// How often the node reads its gossip neighbors' newest events and
+    /// relays what gossip had not delivered, such as 5m (0: never).
+    #[arg(long, global = true, env = "WATS_SYNC_ANTI_ENTROPY")]
+    sync_anti_entropy: Option<String>,
+    /// Gossip neighbors the node keeps (default 5).
+    #[arg(long, global = true, env = "WATS_GOSSIP_ACTIVE_VIEW", value_parser = clap::value_parser!(u64).range(1..=64))]
+    gossip_active_view: Option<u64>,
+    /// How often the node pings its gossip neighbors, such as 1m (0: no
+    /// ping, no silent-link reset, no diversity join).
+    #[arg(long, global = true, env = "WATS_GOSSIP_PING")]
+    gossip_ping: Option<String>,
     /// For tests, with --hermetic only: collect blobs every this many
     /// milliseconds instead of hourly.
     #[arg(long, global = true, hide = true, env = "WATS_TEST_BLOB_GC_MS")]
@@ -6387,10 +6398,18 @@ impl NodeArgs {
                 .map_err(|e| anyhow::anyhow!("config.toml sync.initial_max: {e}"))?
                 .unwrap_or_default(),
         };
-        if let Some(every) = &file.sync.anti_entropy {
-            config.history.anti_entropy = wats::settings::parse_retention(every)
-                .map_err(|e| anyhow::anyhow!("config.toml sync.anti_entropy: {e}"))?
-                .unwrap_or_default();
+        match (&self.sync_anti_entropy, &file.sync.anti_entropy) {
+            (Some(every), _) => {
+                config.history.anti_entropy = wats::settings::parse_retention(every)
+                    .map_err(|e| anyhow::anyhow!("--sync-anti-entropy: {e}"))?
+                    .unwrap_or_default();
+            }
+            (None, Some(every)) => {
+                config.history.anti_entropy = wats::settings::parse_retention(every)
+                    .map_err(|e| anyhow::anyhow!("config.toml sync.anti_entropy: {e}"))?
+                    .unwrap_or_default();
+            }
+            (None, None) => {}
         }
         for addr in &self.external_addrs {
             config.external_addrs.push(
@@ -6490,7 +6509,7 @@ impl NodeArgs {
             );
             config.reputation.threshold = threshold;
         }
-        if let Some(view) = file.gossip.active_view {
+        if let Some(view) = self.gossip_active_view.or(file.gossip.active_view) {
             anyhow::ensure!(
                 (1..=64).contains(&view),
                 "config.toml gossip.active_view: {view} is not 1-64"
@@ -6498,9 +6517,9 @@ impl NodeArgs {
             config.gossip_active_view =
                 usize::try_from(view).unwrap_or(wats::node::GOSSIP_ACTIVE_VIEW);
         }
-        if let Some(every) = &file.gossip.ping {
+        if let Some(every) = self.gossip_ping.as_ref().or(file.gossip.ping.as_ref()) {
             config.gossip_ping = wats::settings::parse_retention(every)
-                .map_err(|e| anyhow::anyhow!("config.toml gossip.ping: {e}"))?
+                .map_err(|e| anyhow::anyhow!("gossip.ping: {e}"))?
                 .unwrap_or_default();
         }
         if let Some(after) = &file.health.no_peers_after {
@@ -6646,6 +6665,15 @@ impl NodeArgs {
                 args.push(format!("--sync-initial-max={n}").into());
             }
             None => {}
+        }
+        if let Some(every) = &self.sync_anti_entropy {
+            args.push(format!("--sync-anti-entropy={every}").into());
+        }
+        if let Some(view) = self.gossip_active_view {
+            args.push(format!("--gossip-active-view={view}").into());
+        }
+        if let Some(every) = &self.gossip_ping {
+            args.push(format!("--gossip-ping={every}").into());
         }
         if let Some(file) = &self.secret_file {
             let mut arg = std::ffi::OsString::from("--secret-file=");

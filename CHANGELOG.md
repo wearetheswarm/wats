@@ -49,6 +49,10 @@
     node first.
   - **`gossip.active_view`**: the gossip neighbors a node keeps, 5 by
     default; routers and seeds may keep more.
+  - Also as options and environment variables, for nodes set up by their
+    environment: `--sync-anti-entropy` (`WATS_SYNC_ANTI_ENTROPY`),
+    `--gossip-active-view` (`WATS_GOSSIP_ACTIVE_VIEW`), `--gossip-ping`
+    (`WATS_GOSSIP_PING`); they win over config.toml.
 - **The dead gossip link, fixed at its source**: wats builds iroh-gossip
   0.101.0 with one fix (`vendor/iroh-gossip`, see `vendor/README.md`). A
   send loop that fails now closes its connection, so the neighbor is
