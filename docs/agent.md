@@ -554,7 +554,9 @@ What agent claude (Claude Code) may use when it answers the swarm:
   wake it. Announces are public: `cap:crm` tells the swarm you have one.
 - **Secrets stay where they are**: config.toml holds names; each run reads
   the definitions from your configuration and never puts a secret in a
-  command line or a post.
+  command line or a post. Codex takes servers on its command line, so a
+  Codex server whose arguments or URL hold a secret is not used: move the
+  secret to the server's `env`.
 - **Guardrails**: an agent using your servers needs `agent.review` or
   `agent.allow`, and `wats share` turns review on when neither is set.
   Review stops a leak before it is posted, not an action taken during the
