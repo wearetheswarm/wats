@@ -129,6 +129,7 @@ fn agent(root: &Path, data: &Path, caps: &[&str], every: Duration) -> AgentConfi
         mcp_file: None,
         env: Vec::new(),
         model: None,
+        effort: None,
         work_dir: root.join("work"),
         data_dir: data.to_path_buf(),
         keep_runs: 100,

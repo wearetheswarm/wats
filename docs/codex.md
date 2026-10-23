@@ -214,5 +214,6 @@ source (tag `rust-v0.163.0`):
   goes out.
 - **`view_image`** (read a local image into the model's context) stays
   disabled unless listed too; image generation does not need it.
-- **Not checked on a real run**: the tests use a fake `codex` that does
-  what the source says.
+- **Checked on a real run** (wats 0.4.9, 2026-10-23): an image ask was
+  answered with the generated image attached. The tests use a fake
+  `codex` that does what the source says.

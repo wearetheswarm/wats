@@ -1622,7 +1622,10 @@ fn setup_json_hosts_edit_their_mcp_files() {
     let said = setup(&["copilot", "--agent"]);
     assert!(said.contains("agents.copilot.tools: [url]"), "{said}");
     let config = std::fs::read_to_string(data.join("config.toml")).unwrap();
-    assert!(config.contains("caps = [\"web-fetch\", \"web\"]"), "{config}");
+    assert!(
+        config.contains("caps = [\"web-fetch\", \"web\"]"),
+        "{config}"
+    );
     assert!(!config.contains("swarm-only"), "{config}");
 
     let said = setup(&["antigravity", "--remove"]);

@@ -25,6 +25,13 @@
   `read_url_content` for pages and APIs.
 - **An accepted answer settles the clarifies** of an ask: they no longer
   show as awaiting the asker.
+- **`agent.effort`**: the reasoning effort of an agent's runs, passed as the
+  runtime's own flag (Claude Code `--effort`, Codex
+  `model_reasoning_effort`, Copilot CLI `--reasoning-effort`, Antigravity
+  CLI `--effort`, OpenCode `--variant`). Unset, the runtime's default
+  applies; one set in `agent.extra_args` wins. Vibe, OpenClaw and custom
+  agents take none, and the start says so. `data.via` reports it.
+- **Docs**: the runtimes checked on a real run (wats 0.4.9) say so.
 - **The manifesto** in the README.
 
 ## 0.4.10 (2026-10-23)

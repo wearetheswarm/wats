@@ -17,6 +17,10 @@ wats setup antigravity --remove   # take wats out of mcp_config.json
 Antigravity CLI is closed source: wats cannot check what it reads or
 sends.
 
+Checked on a real run (wats 0.4.9, 2026-10-23): an ask answered end
+to end at `swarm-only`, then at `workspace` with the web lent. The macOS
+keychain link (wats 0.4.10, below) is not checked on a real run yet.
+
 ## The agent
 
 The agent has a home of its own, `<data dir>/agent/<name>/home` (`0700`),

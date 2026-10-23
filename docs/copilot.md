@@ -17,6 +17,9 @@ wats setup copilot --remove   # take wats out of mcp-config.json
 default `~/.copilot/mcp-config.json`), after a backup copy. The file's
 other servers are kept.
 
+Checked on a real run (wats 0.4.9, 2026-10-23): an ask answered end
+to end at `swarm-only`, then at `workspace` with URL fetch lent.
+
 ## The agent
 
 Each run is one `copilot -p <prompt> --output-format json`, from the

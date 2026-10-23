@@ -527,6 +527,7 @@ fn agent_config(data_dir: &Path) -> wats::agent::AgentConfig {
         mcp_file: None,
         env: Vec::new(),
         model: None,
+        effort: None,
         work_dir: data_dir.join("agent/helper"),
         data_dir: data_dir.to_path_buf(),
         keep_runs: 2,

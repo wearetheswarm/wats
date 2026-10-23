@@ -97,6 +97,7 @@ fn config(dir: &Path, command: PathBuf) -> AgentConfig {
         mcp_file: None,
         env: Vec::new(),
         model: None,
+        effort: None,
         work_dir: work,
         data_dir: dir.join("data"),
         keep_runs: 100,

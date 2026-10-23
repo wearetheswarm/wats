@@ -39,6 +39,8 @@ pub struct Run<'a> {
     pub runtime: &'a str,
     pub access: Access,
     pub model: Option<&'a str>,
+    /// `agent.effort`.
+    pub effort: Option<&'a str>,
     pub extra_args: &'a [String],
     /// The agent's directory (its own OpenCode config lives there).
     pub work_dir: &'a Path,
@@ -121,11 +123,16 @@ pub fn resolve(r: &Run) -> Resolved {
     let mut out = Resolved {
         model: non_empty(arg_value(r.extra_args, "--model", Some("-m")))
             .or_else(|| non_empty(r.model.map(str::to_string))),
-        effort: None,
+        // Only where `agent.effort` reaches the run.
+        effort: non_empty(r.effort.map(str::to_string))
+            .filter(|_| crate::agent::takes_effort(r.runtime)),
     };
     match r.runtime {
         "codex" => {
-            out.effort = non_empty(codex_override(r.extra_args, "model_reasoning_effort"));
+            // An extra `-c` wins over `agent.effort` (which then passes
+            // nothing), and both over the user's config.toml.
+            out.effort =
+                non_empty(codex_override(r.extra_args, "model_reasoning_effort")).or(out.effort);
             if out.model.is_none() {
                 out.model = non_empty(codex_override(r.extra_args, "model"));
             }
@@ -200,6 +207,7 @@ mod tests {
             runtime,
             access,
             model: None,
+            effort: None,
             extra_args: extra,
             work_dir: dir,
             workdir: dir,
@@ -273,6 +281,17 @@ mod tests {
         let mut configured = run("codex", Access::SwarmOnly, dir.path(), &none);
         configured.model = Some("o5");
         assert_eq!(resolve(&configured).model.as_deref(), Some("o5"));
+        // agent.effort: over config.toml, under an extra -c.
+        let mut inherit = run("codex", Access::Inherit, dir.path(), &none);
+        inherit.effort = Some("low");
+        assert_eq!(resolve(&inherit).effort.as_deref(), Some("low"));
+        let mut both = run("codex", Access::Workspace, dir.path(), &extra);
+        both.effort = Some("low");
+        assert_eq!(resolve(&both).effort.as_deref(), Some("high"));
+        // A runtime that takes no effort does not claim one.
+        let mut vibe = run("vibe", Access::SwarmOnly, dir.path(), &none);
+        vibe.effort = Some("low");
+        assert_eq!(resolve(&vibe).effort, None);
     }
 
     #[test]

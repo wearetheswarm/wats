@@ -352,6 +352,8 @@ pub struct AgentSettings {
     #[serde(default)]
     pub env: Vec<String>,
     pub model: Option<String>,
+    /// Reasoning effort of the runs (the runtime's own values).
+    pub effort: Option<String>,
     pub review: Option<bool>,
     pub ignore_local: Option<bool>,
     pub review_ttl: Option<String>,
@@ -1039,6 +1041,14 @@ pub const KEYS: &[Key] = &[
         "the runtime's default",
         "model of the agent runs, e.g. sonnet (Claude), a Codex model, provider/model \
          (OpenCode) or a model alias (Mistral Vibe)",
+    ),
+    key(
+        "agent.effort",
+        ValueType::Text,
+        "the runtime's default",
+        "reasoning effort of the agent runs, in the runtime's own words: Codex \
+         model_reasoning_effort (low, medium, high), Copilot --reasoning-effort, Antigravity \
+         --effort, OpenCode --variant; Claude Code and Mistral Vibe: ignored, with a warning",
     ),
     key(
         "agent.review",

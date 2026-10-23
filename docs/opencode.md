@@ -14,7 +14,8 @@ There are two halves, as for the other runtimes:
   opencode`).
 
 Design and reasons: [ADR 0031](adr/0031-opencode.md). This integration is
-checked against OpenCode 1.19.3's source and fake `opencode` scripts; it
+checked against OpenCode 1.19.3's source and fake `opencode` scripts, and
+on a real run (wats 0.4.9, 2026-10-23: an ask answered end to end). It
 needs OpenCode 1.17.0 or later.
 
 ## Setup
@@ -170,8 +171,8 @@ run too.
 
 ### What is enforced, and what is not
 
-**Enforced** (from OpenCode 1.19.3's source, checked with fakes, not yet
-on a real run):
+**Enforced** (from OpenCode 1.19.3's source, checked with fakes and on a
+real run with wats 0.4.9):
 
 - At `swarm-only`, the model is sent the wats tools only. OpenCode removes
   a tool whose last rule is a `*` deny from the request, and denies any

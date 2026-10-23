@@ -7239,6 +7239,11 @@ fn agent_config(
             wats::vibe::check_model(model.trim())?;
         }
     }
+    if file.effort.as_deref().is_some_and(|e| !e.trim().is_empty())
+        && !wats::agent::takes_effort(&runtime)
+    {
+        tracing::warn!("agent.effort is ignored: {runtime} runs take no effort setting");
+    }
     // Lent servers (ADR 0037): refused without review or allow.
     wats::share::check_lend(
         &runtime,
@@ -7271,6 +7276,7 @@ fn agent_config(
             .clone()
             .or(file.model.clone())
             .filter(|m| !m.trim().is_empty()),
+        effort: file.effort.clone().filter(|e| !e.trim().is_empty()),
         codex_disable: Vec::new(),
         codex_enable: Vec::new(),
         access,
