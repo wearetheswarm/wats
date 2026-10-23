@@ -1,0 +1,91 @@
+name: discord-bot
+
+# The Discord bot's image (ADR 0040), for the router VM:
+#   ghcr.io/wearetheswarm/wats-discord:main         moving: what deployments pull
+#   ghcr.io/wearetheswarm/wats-discord:sha-<short>  this commit: to roll back to
+# Built when the bot changes on main, after each wats release (it holds the
+# latest released wats binary), or by hand. linux/amd64 only (the OVH VM).
+# Its tests run first; they need no Discord and no network.
+on:
+  push:
+    branches: [main]
+    paths:
+      - "discord-bot/**"
+      - ".github/workflows/discord-bot.yml"
+  workflow_run:
+    workflows: [release]
+    types: [completed]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: discord-bot-image
+  cancel-in-progress: false
+
+env:
+  IMAGE: ghcr.io/wearetheswarm/wats-discord
+
+jobs:
+  image:
+    if: github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Tests
+        run: python3 -m unittest discover -s discord-bot/tests -v
+
+      - name: The latest wats release
+        id: version
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag=$(gh release view --repo "$GITHUB_REPOSITORY" --json tagName -q .tagName)
+          echo "wats=${tag#v}" >> "$GITHUB_OUTPUT"
+          echo "short=${GITHUB_SHA::12}" >> "$GITHUB_OUTPUT"
+          echo "created=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push the image
+        id: image
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: discord-bot
+          platforms: linux/amd64
+          push: true
+          build-args: |
+            WATS_IMAGE=ghcr.io/wearetheswarm/wats:${{ steps.version.outputs.wats }}
+          tags: |
+            ${{ env.IMAGE }}:main
+            ${{ env.IMAGE }}:sha-${{ steps.version.outputs.short }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/wearetheswarm/wats
+            org.opencontainers.image.title=wats-discord
+            org.opencontainers.image.description=The WeAreTheSwarm Discord bot: a visitor of the swarm through its own wats node
+            org.opencontainers.image.version=wats-${{ steps.version.outputs.wats }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.created=${{ steps.version.outputs.created }}
+            org.opencontainers.image.licenses=Apache-2.0
+
+      - name: Summary
+        env:
+          WATS: ${{ steps.version.outputs.wats }}
+          SHORT: ${{ steps.version.outputs.short }}
+          DIGEST: ${{ steps.image.outputs.digest }}
+        run: |
+          {
+            echo "### ${IMAGE}:main (sha-${SHORT}), wats ${WATS}"
+            echo "digest: \`${DIGEST}\`"
+          } >> "$GITHUB_STEP_SUMMARY"

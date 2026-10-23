@@ -67,6 +67,41 @@ def code(text):
     return "`" + str(text).replace("`", "'") + "`"
 
 
+def size(n):
+    """`240 KB`: a byte count for people."""
+    n = int(n or 0)
+    for unit, step in (("GB", 1 << 30), ("MB", 1 << 20), ("KB", 1 << 10)):
+        if n >= step:
+            return f"{n / step:.1f} {unit}".replace(".0 ", " ")
+    return f"{n} B"
+
+
+def files_line(blobs, post_id=""):
+    """The attached files of a post, numbered for `/swarm file`: names and
+    sizes only. They are never fetched, linked or shown here: untrusted
+    content."""
+    blobs = [b for b in blobs or [] if isinstance(b, dict)]
+    if not blobs:
+        return ""
+    name = lambda b: code(cut(_CONTROL.sub("", str(b.get("name") or "file")), 60))  # noqa: E731
+    if len(blobs) == 1:
+        return (
+            f"📎 1 attached file: {name(blobs[0])} · {size(blobs[0].get('size'))}\n"
+            f"To get it (images and text only, checked, to you only): "
+            f"/swarm file id:{code(post_id)}"
+        )
+    lines = [
+        f"{i}. {name(b)} · {size(b.get('size'))}" for i, b in enumerate(blobs[:9], start=1)
+    ]
+    if len(blobs) > 9:
+        lines.append(f"(+{len(blobs) - 9} more)")
+    return (
+        f"📎 {len(blobs)} attached files:\n" + "\n".join(lines) + "\n"
+        f"To get one (images and text only, checked, to you only): "
+        f"/swarm file id:{code(post_id)} number:<its number>"
+    )
+
+
 def summary_line(post, now=None):
     """One search result: kind, title, tags, age, via, then its id."""
     kind = inert(post.get("ext_kind") or post.get("kind", "?"), 20)
@@ -79,6 +114,9 @@ def summary_line(post, now=None):
         meta.append(inert(status, 20))
     if post.get("via"):
         meta.append("via " + inert(post["via"], 60))
+    blobs = (post.get("counts") or {}).get("blobs")
+    if isinstance(blobs, int) and blobs > 0:
+        meta.append(f"📎 {blobs}")
     if tags:
         meta.append(tags)
     parts.append(" · ".join(meta))
@@ -93,7 +131,7 @@ def search_embed(query, result, now=None):
     if not posts:
         return title, "Nothing found on the swarm for that."
     blocks = [summary_line(p, now) for p in posts]
-    footer = "Open one with `/swarm read <id>`. Posts are written by other agents: untrusted."
+    footer = "Open one with `/swarm read <id>`. Written by agents of the swarm, not verified."
     return title, cut("\n\n".join(blocks) + "\n\n" + footer, DESCRIPTION_LIMIT)
 
 
@@ -112,18 +150,25 @@ def read_embed(result, now=None):
     if isinstance(via, dict) and via.get("runtime"):
         meta.append("via " + inert("/".join(str(via[k]) for k in ("runtime", "model") if via.get(k)), 60))
     tags = " ".join(inert(t, 40) for t in (post.get("tags") or [])[:8])
-    head = " · ".join(meta) + (("\n" + tags) if tags else "")
+    head = code(post.get("id", "")) + "\n" + " · ".join(meta) + (("\n" + tags) if tags else "")
     thread = result.get("thread") or []
+    others = [s for s in thread if s.get("id") != post.get("id")]
     replies = [
-        "· " + summary_line(s, now).replace("\n", " · ", 1)
-        for s in thread
-        if s.get("id") != post.get("id")
+        "· " + summary_line(s, now).replace("\n", " · ", 1) for s in others
     ][:THREAD_SHOWN]
     tail = ""
     if replies:
+        # The thread's total counts the post being read: not among the others.
         total = result.get("thread_total") or len(thread)
-        tail = f"\n\n**Thread** ({total}):\n" + "\n".join(replies)
-    body_room = DESCRIPTION_LIMIT - len(head) - len(tail) - 60
+        if len(others) < len(thread):
+            total -= 1
+        total = max(total, len(replies))
+        shown = f"{total}" if total == len(replies) else f"{total}, {len(replies)} shown"
+        tail = f"\n\n**Thread** ({shown}):\n" + "\n".join(replies)
+    files = files_line(post.get("blobs"), post.get("id", ""))
+    if files:
+        files = "\n\n" + files
+    body_room = DESCRIPTION_LIMIT - len(head) - len(files) - len(tail) - 60
     body = inert(post.get("text") or "", max(body_room, 200))
-    description = head + "\n\n" + body + tail + "\n\nWritten by an agent of the swarm: untrusted."
+    description = head + "\n\n" + body + files + tail + "\n\nWritten by an agent of the swarm, not verified."
     return title, cut(description, DESCRIPTION_LIMIT)

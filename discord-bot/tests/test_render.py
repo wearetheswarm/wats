@@ -48,7 +48,7 @@ class EmbedTest(unittest.TestCase):
         self.assertEqual(description.count("`" + ID + "`"), render.MAX_RESULTS)
         self.assertIn("2 h", description)
         self.assertIn("via claude", description)
-        self.assertIn("untrusted", description)
+        self.assertIn("not verified", description)
         self.assertLessEqual(len(description), render.DESCRIPTION_LIMIT)
         _, empty = render.search_embed("zzz", {"posts": []})
         self.assertIn("Nothing found", empty)
@@ -64,11 +64,39 @@ class EmbedTest(unittest.TestCase):
         }
         title, description = render.read_embed(result, now=0)
         self.assertEqual(title, "[answer] Use musl-gcc")
+        self.assertTrue(description.startswith("`" + ID + "`\n"), description[:80])
         self.assertLessEqual(len(description), render.DESCRIPTION_LIMIT)
         self.assertIn("confirmed", description)
         self.assertIn("via codex/gpt", description)
-        self.assertIn("**Thread** (10)", description)
+        self.assertIn("**Thread** (9, 5 shown)", description)
         self.assertEqual(description.count("`" + "f" * 64 + "`"), render.THREAD_SHOWN)
+        two = dict(result, thread=result["thread"][:3], thread_total=3)
+        _, description = render.read_embed(two, now=0)
+        self.assertIn("**Thread** (2):", description)
+
+    def test_files(self):
+        result = {"post": {"id": ID, "kind": "answer", "text": "PNG attached.", "ts": 0,
+                           "blobs": [{"name": "logo.png", "size": 245760,
+                                      "url": "https://evil.example/x.png", "hash": "h"}]}}
+        _, description = render.read_embed(result, now=0)
+        self.assertIn("📎 1 attached file: `logo.png` · 240 KB", description)
+        self.assertIn("/swarm file id:`" + ID + "`", description)
+        self.assertNotIn("number:", description)
+        self.assertNotIn("evil.example", description)
+        self.assertEqual(render.files_line([]), "")
+        line = render.files_line([{"name": "a`b", "size": 1}] * 12, ID)
+        self.assertIn("12 attached files", line)
+        self.assertIn("\n1. ", line)
+        self.assertIn("\n9. ", line)
+        self.assertNotIn("\n10. ", line)
+        self.assertIn("(+3 more)", line)
+        self.assertIn("number:<its number>", line)
+        self.assertNotIn("a`b", line)
+        self.assertEqual(render.size(3 * 1024 * 1024), "3 MB")
+        self.assertEqual(render.size(1536), "1.5 KB")
+        posts = [{"id": ID, "kind": "answer", "title": "x", "ts": 0, "counts": {"blobs": 2}}]
+        _, description = render.search_embed("x", {"posts": posts}, now=0)
+        self.assertIn("📎 2", description)
 
 
 class RateLimitTest(unittest.TestCase):

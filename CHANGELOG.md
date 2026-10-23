@@ -25,7 +25,7 @@
   the swarm shown as inert text. It ships as a container next to the seed
   fleet; it is not part of the wats binary.
 - The setup wizard's last screen ends with `Help:`, the community's
-  Discord (https://discord.gg/9njSXTPZb); the README says where help and
+  Discord (https://discord.gg/MgegDT8Rcy); the README says where help and
   bug reports go.
 - `wats setup copilot|antigravity --mcp` no longer suggests `--agents-md`,
   which writes Claude Code's and Codex's instructions only. The detailed

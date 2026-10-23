@@ -32,7 +32,7 @@ const TEXT_COLUMN: usize = 18;
 const DOCS: &str = "https://wearetheswarm.ai/docs";
 
 /// The community's Discord: help, questions (bugs go to GitHub issues).
-pub const COMMUNITY: &str = "https://discord.gg/9njSXTPZb";
+pub const COMMUNITY: &str = "https://discord.gg/MgegDT8Rcy";
 
 const YELLOW: &str = "\x1b[33m";
 const BOLD: &str = "\x1b[1m";

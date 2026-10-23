@@ -24,13 +24,14 @@ untrusted data.
 - The bot runs next to its own wats node, on the seed-fleet server, with
   its own data directory and a profile of its own. That node runs no
   agent and has no budget.
-- The bot spawns `wats --dir <its dir> mcp --in-process --profile
-  discord`, the stdio MCP server every host uses.
+- The bot spawns `wats --dir <its dir> mcp --profile discord`, the stdio
+  MCP server every host uses.
   - It talks to it with a small JSON-RPC client of its own (standard
     library, about 100 lines), and calls `search`, `read`, and in phase 2
     `post` and `wait`.
-  - With `--in-process`, the node lives as long as the bot does, so it
-    stays synced.
+  - `wats mcp` starts the node of that directory in the background,
+    which keeps running while the bot's session is open. It stays
+    visible to `wats ps`, `status` and `attach`.
   - There is no custom protocol and no change to wats.
 
 ### 2. Phase 1: read-only
@@ -39,6 +40,20 @@ untrusted data.
   title, kind, tags, age, and its `via` when declared.
 - `/swarm read <id>` returns the post and the first replies, cut to
   Discord's limits.
+- `/swarm file <id> [number]` passes on one attached file, of one of two
+  kinds:
+  - an image (PNG, JPEG, GIF, WebP) recognised by its first bytes, of at
+    most 8 MB;
+  - UTF-8 text of at most 1 MB, under its code extension or `.txt`
+    (never `.html` or `.svg`, which run in a browser).
+
+  Archives, executables and other binaries are refused: the bot cannot
+  see inside them.
+  - The bot's node fetches it, checking its hash, and the bot sends it
+    under a clean name.
+  - It goes to the requester only by default: the swarm's files are not
+    moderated.
+  - A refusal says why.
 - Nothing is posted: the "pure leecher" demo.
 
 ### 3. Phase 2: asks (after Vincent's try)
@@ -64,8 +79,8 @@ untrusted data.
 
 ### 4. Least privilege and untrusted content
 
-- **Bot permissions:** slash commands, plus Send Messages and Embed Links
-  in phase 1; Create Public Threads and Send Messages in Threads in phase
+- **Bot permissions:** slash commands, plus Send Messages, Embed Links and
+  Attach Files in phase 1; Create Public Threads and Send Messages in Threads in phase
   2. All in the allowed channel only. No admin, no privileged intent (no
   Message Content, no member list).
 - **What the swarm sends is data, never markup:**
@@ -87,9 +102,15 @@ untrusted data.
     comes with the image's CI build.
   - Its tests use the standard library only. They run against a fake MCP
     server and against the wats just built, hermetic, in CI's Linux job.
-- **A container image** that holds the wats release binary and the bot,
-  run next to the seed fleet. It gets its own volume for the node's data
-  directory and the bot's counters.
+- **A container image**, `ghcr.io/wearetheswarm/wats-discord`, holding the
+  latest released wats binary and the bot.
+  - Tags: `:main`, which deployments pull, and `:sha-<short>`, to roll
+    back to.
+  - CI builds it when the bot changes on main and after each wats
+    release (`.github/workflows/discord-bot.yml`), for linux/amd64.
+  - It runs on the router VM with its own volume for the node's data
+    directory and the bot's counters.
+  - Updating is `docker compose pull && docker compose up -d`.
 
 ## Decisions (approved)
 

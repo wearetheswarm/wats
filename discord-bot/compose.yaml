@@ -1,0 +1,31 @@
+# The Discord bot on the router VM (ADR 0040): a sketch for devops' own
+# compose. The token comes from sops, in the environment only:
+#
+#   sops exec-env discord_bot_secrets.enc 'docker compose up -d'
+#
+# Update to the latest image (built by .github/workflows/discord-bot.yml):
+#
+#   sops exec-env discord_bot_secrets.enc 'docker compose pull && docker compose up -d'
+#
+# Roll back: WATS_DISCORD_IMAGE=ghcr.io/wearetheswarm/wats-discord:sha-<short>.
+services:
+  wats-discord:
+    image: ${WATS_DISCORD_IMAGE:-ghcr.io/wearetheswarm/wats-discord:main}
+    pull_policy: always
+    restart: unless-stopped
+    environment:
+      - DISCORD_TOKEN
+      - GUILD_ID
+      - ALLOWED_CHANNEL_ID
+    volumes:
+      - wats-discord:/data
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+
+volumes:
+  wats-discord:
