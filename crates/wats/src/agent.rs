@@ -108,6 +108,8 @@ pub struct AgentConfig {
     /// The model, when set (`agent.model`); otherwise the runtime's own
     /// default.
     pub model: Option<String>,
+    /// `agent.effort`: the reasoning effort of the runs, when set.
+    pub effort: Option<String>,
     /// Where transcripts, the runs index, the budget ledger and the
     /// generated MCP config go: `<data dir>/agent/<name>`, or
     /// `<data dir>/agent` for the single agent of before ADR 0021.
@@ -173,6 +175,9 @@ pub struct AgentInfo {
     /// Its budget, without the limits its runtime cannot be held to
     /// ([`budget::Budget::for_runtime`]).
     pub budget: budget::Budget,
+    /// A lent shell, and what holds its commands
+    /// ([`access::shell_sandbox`]): `None` without one.
+    pub shell: Option<&'static str>,
 }
 
 impl AgentInfo {
@@ -214,6 +219,9 @@ impl AgentInfo {
             "budget": budget::describe(&limits, &spend, self.runtime_name()),
             "usage": budget::status_json(&limits, &spend, self.runtime_name()),
         });
+        if let Some(sandbox) = self.shell {
+            status["shell"] = json!(format!("on, {sandbox}"));
+        }
         // Paused by a USD budget of 0 from before 0.4.5 (ADR 0034 §5).
         if let Some(notice) = limits.zero_notice(&self.name) {
             status["notice"] = json!(notice);
@@ -263,13 +271,23 @@ fn unanswered(node: &Node, me: &str, event: &Event) -> bool {
     let Ok(thread) = node.store().thread(event.thread_root(), 1000) else {
         return true;
     };
-    !thread.iter().any(|stored| {
-        let post = &stored.event;
-        post.id != event.id
-            && ((post.author == me && post.ts >= event.ts)
-                || (event.kind == Kind::Ask
-                    && post.kind == Kind::Answer
-                    && post.author != event.author))
+    // A follow-up ask in a thread is answered only by what descends from
+    // it: the answers to the root came before it (a revision asked of
+    // their author, say).
+    // The agent's own post it replies to (its answer, for a revision) is
+    // not an answer to it, even within the same second.
+    let scope: Vec<&Event> = if event.kind == Kind::Ask {
+        crate::delivery::replies_to(event, thread.iter().map(|s| &*s.event))
+    } else {
+        thread
+            .iter()
+            .map(|s| &*s.event)
+            .filter(|e| e.id != event.id)
+            .collect()
+    };
+    !scope.iter().any(|post| {
+        (post.author == me && post.ts >= event.ts)
+            || (event.kind == Kind::Ask && post.kind == Kind::Answer && post.author != event.author)
     })
 }
 
@@ -1143,6 +1161,7 @@ fn run_model(config: &AgentConfig) -> crate::run_model::Resolved {
         runtime: &config.runtime,
         access: config.access,
         model: config.model.as_deref(),
+        effort: config.effort.as_deref(),
         extra_args: &config.extra_args,
         work_dir: &config.work_dir,
         workdir: &config.workdir,
@@ -1300,6 +1319,7 @@ fn prepare_command(
             command
                 .args(opencode::run_args())
                 .args(opencode_model_arg(config))
+                .args(effort_args(config))
                 .args(&config.extra_args);
         }
         crate::custom::RUNTIME => {
@@ -1377,6 +1397,7 @@ fn prepare_command(
                     timeout: config.run_timeout,
                     model: config.model.as_deref(),
                 }))
+                .args(effort_args(config))
                 .args(&config.extra_args);
         }
         "copilot" => {
@@ -1410,6 +1431,7 @@ fn prepare_command(
                     model: config.model.as_deref(),
                     usage_file: &usage,
                 }))
+                .args(effort_args(config))
                 .args(&config.extra_args);
         }
         "codex" => {
@@ -1429,6 +1451,7 @@ fn prepare_command(
             }
             // `--model` is an option of `codex exec`: it goes after it.
             let mut extra = model_args(config, "--model");
+            extra.extend(effort_args(config));
             extra.extend(config.extra_args.iter().cloned());
             command.args(access::codex_args(&access::CodexRun {
                 access: config.access,
@@ -1464,6 +1487,7 @@ fn prepare_command(
                 }))
                 .args(limit_args(config, remaining_usd))
                 .args(model_args(config, "--model"))
+                .args(effort_args(config))
                 .args(&config.extra_args);
         }
     };
@@ -1495,6 +1519,54 @@ fn someone_announces(node: &Node, net: &str, caps: &[String]) -> bool {
     node.store()
         .latest_announces(&filter, 1)
         .map_or(true, |found| !found.is_empty())
+}
+
+/// `agent.effort` as the runtime's own flag, unless the extra arguments
+/// already set one: Claude Code `--effort`, Codex `-c
+/// model_reasoning_effort`, Copilot `--reasoning-effort`, Antigravity
+/// `--effort`, OpenCode `--variant`. Other runtimes take none (the start
+/// says so).
+fn effort_args(config: &AgentConfig) -> Vec<String> {
+    let Some(effort) = config
+        .effort
+        .as_deref()
+        .map(str::trim)
+        .filter(|e| !e.is_empty())
+    else {
+        return Vec::new();
+    };
+    let set = |flag: &str| {
+        config
+            .extra_args
+            .iter()
+            .any(|a| a == flag || a.starts_with(&format!("{flag}=")))
+    };
+    match config.runtime.as_str() {
+        "claude" if !set("--effort") => vec!["--effort".into(), effort.into()],
+        "codex"
+            if !config
+                .extra_args
+                .iter()
+                .any(|a| a.contains("model_reasoning_effort")) =>
+        {
+            vec![
+                "-c".into(),
+                format!("model_reasoning_effort={}", serde_json::json!(effort)),
+            ]
+        }
+        "copilot" if !set("--reasoning-effort") => vec![format!("--reasoning-effort={effort}")],
+        "antigravity" if !set("--effort") => vec![format!("--effort={effort}")],
+        "opencode" if !set("--variant") => vec![format!("--variant={effort}")],
+        _ => Vec::new(),
+    }
+}
+
+/// Whether `agent.effort` reaches this runtime ([`effort_args`]).
+pub fn takes_effort(runtime: &str) -> bool {
+    matches!(
+        runtime,
+        "claude" | "codex" | "copilot" | "antigravity" | "opencode"
+    )
 }
 
 /// OpenCode's `--model=<provider/model>`, as one argument (a value can
@@ -2365,6 +2437,13 @@ pub async fn run(
         warn!(
             "swarm-only access ignores agent.tools [{}]; use access workspace",
             config.tools.join(", ")
+        );
+    }
+    if config.runtime != "openclaw" && budget::unlimited(&config.budget, &config.runtime) {
+        warn!(
+            "agent {}: {} (agent.max_minutes_per_day); only the run caps and the timeout bound it",
+            config.profile,
+            budget::UNLIMITED
         );
     }
     for warning in access::cap_warnings(&access::CapCheck {

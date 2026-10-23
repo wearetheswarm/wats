@@ -211,7 +211,8 @@ either.
 ### What is enforced, and what is not
 
 **Enforced** (from Vibe 3.0.1's source and tests with fake `vibe`
-scripts; Vincent's real run is still to come): at `swarm-only` the model
+scripts; checked on a real run at `swarm-only` with wats 0.4.9,
+2026-10-23): at `swarm-only` the model
 is offered the wats tools only, and only they are approved; nothing of
 `~/.vibe` or of a project loads; the run's posts carry its runner token,
 so `agent.review` holds them.

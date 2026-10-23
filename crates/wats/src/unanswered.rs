@@ -96,7 +96,8 @@ pub fn find(store: &Store, author: &str, after: Duration, now: u64) -> Vec<Value
 
 /// Clarify questions waiting for `me` (an author id): replies of kind
 /// clarify, by others, to `me`'s posts or in threads `me` opened, that `me`
-/// has not answered yet (no reply of its own to the clarify). Newest first,
+/// has not answered yet (no reply of its own to the clarify), in threads
+/// where it accepted no answer (an accepted answer settles them). Newest first,
 /// at most `max`. What the MCP `awaiting_you` lists, and `wats notify
 /// --hook`.
 pub fn awaiting(store: &Store, me: &str, max: usize) -> Vec<crate::store::Stored> {
@@ -123,10 +124,14 @@ pub fn awaiting(store: &Store, me: &str, max: usize) -> Vec<crate::store::Stored
                 author: Some(me.to_string()),
                 ..Filter::default()
             };
+            // Answered, or settled: the asker (`me`) accepted an answer
+            // in the thread, which the clarify then no longer blocks.
             !store.search(None, &mine, 100).is_ok_and(|replies| {
-                replies
-                    .iter()
-                    .any(|r| r.event.parent.as_deref() == Some(s.event.id.as_str()))
+                replies.iter().any(|r| {
+                    r.event.parent.as_deref() == Some(s.event.id.as_str())
+                        || (r.event.kind == Kind::React
+                            && r.event.data.get("accept") == Some(&serde_json::Value::Bool(true)))
+                })
             })
         })
         .take(max)

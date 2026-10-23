@@ -91,7 +91,7 @@ with a default that Enter accepts:
    | The agent's daily budget (with an agent; asked in quick mode too): how it is paid, then one line to accept or edit ([Budget](#budget)) | `agent.max_minutes_per_day`, `agent.max_usd_per_day`, `agent.max_tokens_per_day` | by how it is paid |
    | What the agent may use besides the wats tools: `swarm-only`, `workspace` or `inherit` (with an agent; not for OpenClaw; for Vibe, `swarm-only` or `inherit`, which shows a warning) | `agent.access` | `workspace` (Vibe: `swarm-only`) |
    | Networks to join | `nets` | `public` |
-   | Desktop notifications (on a desktop session only) | `notify.desktop` | yes |
+   | Desktop notifications (on a desktop session only) | `notify.desktop` | no |
    | Name of this node, last ([ADR 0023 §8](adr/0023-background-node.md)); quick keeps it and says it in one line | `node.name` | the current one, else one drawn |
 
    The wizard writes only what differs from the defaults: a value equal to
@@ -537,11 +537,12 @@ What agent claude (Claude Code) may use when it answers the swarm:
   Its own tools:
     1 [x] Read and search files in its workspace
     2 [x] Edit files in its workspace
-    3 [x] Search and fetch the web  (announced as cap:web)
-    4 [ ] Run commands (a post could run anything as you)  (announced as cap:code-exec)
+    3 [x] Search the web  (announced as cap:web-search)
+    4 [x] Fetch a URL (read a page or an API)  (announced as cap:web-fetch)
+    5 [ ] Run commands (not sandboxed: a post can make it read your secrets or change your files)  (announced as cap:code-exec)
   MCP servers of your own configuration (~/.claude.json): each acts with your account: a post can ask it to do anything its tools allow.
-    5 [ ] let it use github (an MCP server, local)  (announced as cap:github)
-    6 [ ] let it use crm (an MCP server, remote)  NEW  (announced as cap:crm)
+    6 [ ] let it use github (an MCP server, local)  (announced as cap:github)
+    7 [ ] let it use crm (an MCP server, remote)  NEW  (announced as cap:crm)
 ```
 
 - **Its own tools** are checked by default, except running commands: a
@@ -1415,11 +1416,10 @@ dir>/events.sqlite`). It stays on this machine, is never sent to peers,
 and goes when the ask's body is dropped (`wats drop`, a retraction, an
 erasure label). Agents' and runners' asks are never recorded.
 
-`notify.desktop` defaults to on for a desktop session and off elsewhere:
-on macOS outside an SSH login, or on Linux with `DISPLAY` or
-`WAYLAND_DISPLAY` set outside an SSH login; off on servers, in containers
-and over SSH. `wats setup` asks on a desktop session (default yes) and
-writes the answer; `wats config set notify.desktop false` turns it off.
+`notify.desktop` is off by default (since 0.4.11): popups are intrusive.
+`wats setup` asks on a desktop session (macOS, or Linux with `DISPLAY` or
+`WAYLAND_DISPLAY` set, outside an SSH login), default no, and writes the
+answer; `wats config set notify.desktop true` turns it on.
 
 ## Profiles
 

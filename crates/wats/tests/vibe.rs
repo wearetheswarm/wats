@@ -113,6 +113,7 @@ fn config(dir: &Path, command: PathBuf, access: Access) -> AgentConfig {
         mcp_file: None,
         env: Vec::new(),
         model: Some("devstral-2".into()),
+        effort: None,
         work_dir: work,
         data_dir: dir.join("data"),
         keep_runs: 100,

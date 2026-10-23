@@ -380,11 +380,12 @@ pub fn title_from_text(text: &str) -> String {
     let mut title = text
         .lines()
         .map(|line| {
-            line.chars()
-                .filter(|&c| !c.is_control() && !unicode::is_text_forbidden(c))
-                .collect::<String>()
-                .trim()
-                .to_string()
+            plain_line(
+                line.chars()
+                    .filter(|&c| !c.is_control() && !unicode::is_text_forbidden(c))
+                    .collect::<String>()
+                    .trim(),
+            )
         })
         .find(|l| !l.is_empty())
         .unwrap_or_else(|| "untitled".into());
@@ -393,6 +394,25 @@ pub fn title_from_text(text: &str) -> String {
     }
     title.truncate(title.trim_end().len());
     title
+}
+
+/// One line of Markdown as plain text, for a derived title: no heading,
+/// quote or list marker, no `**`, `__` or backticks; a rule (`---`) is
+/// empty.
+fn plain_line(line: &str) -> String {
+    let mut line = line.trim_start_matches(['#', '>']).trim_start();
+    for marker in ["- ", "* ", "+ "] {
+        line = line.strip_prefix(marker).unwrap_or(line);
+    }
+    let line = line.replace("**", "").replace("__", "").replace('`', "");
+    let line = line.trim();
+    if line
+        .chars()
+        .all(|c| matches!(c, '-' | '*' | '_' | '=' | ' '))
+    {
+        return String::new();
+    }
+    line.to_string()
 }
 
 /// Why a tag is invalid, or `None` (v1): 1-64 bytes without whitespace or
@@ -1475,6 +1495,15 @@ mod tests {
         value["title"] = Value::Null;
         assert!(Event::from_json(&serde_json::to_vec(&value).unwrap()).is_err());
         assert_eq!(title_from_text("\n\n  First line\nsecond"), "First line");
+        assert_eq!(
+            title_from_text("**URL fetched:** https://x.example/a"),
+            "URL fetched: https://x.example/a"
+        );
+        assert_eq!(
+            title_from_text("---\n## The `wats` result\n"),
+            "The wats result"
+        );
+        assert_eq!(title_from_text("- **one** item"), "one item");
         // Unicode rules (ADR 0010, A3 addendum): any script and mixing, ZWJ
         // and ZWNJ, and code points new in the pinned 16.0.0 (U+A7DB).
         for good in [

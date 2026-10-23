@@ -127,6 +127,7 @@ async fn agent_wakes_on_asks_and_heartbeats() -> anyhow::Result<()> {
         mcp_file: None,
         env: Vec::new(),
         model: None,
+        effort: None,
         work_dir: dir.path().join("work"),
         data_dir: dir.path().to_path_buf(),
         keep_runs: 2,
@@ -334,6 +335,7 @@ async fn history_older_than_a_day_wakes_no_runner() -> anyhow::Result<()> {
         mcp_file: None,
         env: Vec::new(),
         model: None,
+        effort: None,
         work_dir: dir.path().join("work"),
         data_dir: dir.path().to_path_buf(),
         keep_runs: 10,
@@ -1120,6 +1122,7 @@ async fn budget_pauses_the_agent() -> anyhow::Result<()> {
         mcp_file: None,
         env: Vec::new(),
         model: Some("haiku".into()),
+        effort: Some("low".into()),
         work_dir: dir.path().join("work"),
         data_dir: dir.path().to_path_buf(),
         keep_runs: 100,
@@ -1136,6 +1139,7 @@ async fn budget_pauses_the_agent() -> anyhow::Result<()> {
     let all = runs(dir.path());
     assert_eq!(all.len(), 2, "paused after the budget is spent");
     assert!(all[0].1.contains("--model haiku"), "{}", all[0].1);
+    assert!(all[0].1.contains("--effort low"), "{}", all[0].1);
     assert!(
         all[0].1.contains("--max-turns 4 --max-budget-usd 0.02"),
         "{}",
@@ -1292,6 +1296,7 @@ echo '{{"type":"turn.completed","usage":{{"input_tokens":10,"output_tokens":2}}}
         mcp_file: None,
         env: Vec::new(),
         model: Some("gpt-test".into()),
+        effort: Some("high".into()),
         work_dir: work.clone(),
         data_dir: work.parent().unwrap().to_path_buf(),
         keep_runs: 100,
@@ -1317,7 +1322,7 @@ echo '{{"type":"turn.completed","usage":{{"input_tokens":10,"output_tokens":2}}}
         "-c mcp_servers.wats.command=\"/opt/wats\"",
         "-c mcp_servers.wats.args=[\"--dir\",\"/d\",\"mcp\",\"--profile\",\"agent\"]",
         "--disable shell_tool --disable apps",
-        "--model gpt-test",
+        "--model gpt-test -c model_reasoning_effort=\"high\"",
         "--sandbox-note -",
     ] {
         assert!(args.contains(expected), "missing {expected:?} in {args}");
@@ -1649,6 +1654,7 @@ async fn swarm_only_agent_with_tools_warns_and_starts() -> anyhow::Result<()> {
         mcp_file: None,
         env: Vec::new(),
         model: None,
+        effort: None,
         work_dir: work.clone(),
         data_dir: work.parent().unwrap().to_path_buf(),
         keep_runs: 100,
@@ -1718,6 +1724,7 @@ async fn workspace_access_opens_the_workspace() -> anyhow::Result<()> {
         mcp_file: None,
         env: Vec::new(),
         model: None,
+        effort: None,
         work_dir: work.clone(),
         data_dir: work.parent().unwrap().to_path_buf(),
         keep_runs: 100,
@@ -2231,6 +2238,7 @@ async fn wakes_only_on_what_is_addressed_to_it() -> anyhow::Result<()> {
         mcp_file: None,
         env: Vec::new(),
         model: None,
+        effort: None,
         work_dir: dir.path().join("work"),
         data_dir: dir.path().to_path_buf(),
         keep_runs: 100,
@@ -2342,6 +2350,7 @@ async fn wake_limits_defer_and_survive_a_restart() -> anyhow::Result<()> {
         mcp_file: None,
         env: Vec::new(),
         model: None,
+        effort: None,
         work_dir: dir.path().join("work"),
         data_dir: dir.path().to_path_buf(),
         keep_runs: 100,
@@ -2458,6 +2467,7 @@ async fn loop_detector_pauses_a_thread_until_a_third_party_posts() -> anyhow::Re
         mcp_file: None,
         env: Vec::new(),
         model: None,
+        effort: None,
         work_dir: dir.path().join("work"),
         data_dir: dir.path().to_path_buf(),
         keep_runs: 100,
@@ -2754,6 +2764,7 @@ async fn openclaw_forwards_wakes_to_the_gateway() -> anyhow::Result<()> {
         mcp_file: None,
         env: Vec::new(),
         model: Some("cheap-model".into()),
+        effort: None,
         work_dir: work.clone(),
         data_dir: work.parent().unwrap().to_path_buf(),
         keep_runs: 50,
@@ -2955,6 +2966,7 @@ async fn asks_stored_before_the_runner_started_still_wake_it() -> anyhow::Result
         mcp_file: None,
         env: Vec::new(),
         model: None,
+        effort: None,
         work_dir: dir.path().join("work"),
         data_dir: dir.path().to_path_buf(),
         keep_runs: 100,
@@ -3066,6 +3078,7 @@ async fn heartbeats_offer_older_unanswered_asks() -> anyhow::Result<()> {
         mcp_file: None,
         env: Vec::new(),
         model: None,
+        effort: None,
         work_dir: dir.path().join("work"),
         data_dir: dir.path().to_path_buf(),
         keep_runs: 100,
@@ -3186,6 +3199,7 @@ async fn a_clarify_past_its_deadline_wakes_the_agent_for_its_default() -> anyhow
         mcp_file: None,
         env: Vec::new(),
         model: None,
+        effort: None,
         work_dir: dir.path().join("work"),
         data_dir: dir.path().to_path_buf(),
         keep_runs: 100,
@@ -3381,6 +3395,7 @@ async fn local_agents_wake_each_other_but_not_on_the_humans_posts() -> anyhow::R
             mcp_file: None,
             env: Vec::new(),
             model: None,
+            effort: None,
             work_dir: data.join("agent").join(name),
             data_dir: data.clone(),
             keep_runs: 20,
@@ -3487,6 +3502,7 @@ fn budget_config(
         mcp_file: None,
         env: Vec::new(),
         model: None,
+        effort: None,
         work_dir: dir.join("work"),
         data_dir: dir.to_path_buf(),
         keep_runs: 100,
@@ -3609,8 +3625,10 @@ async fn the_llm_token_budget_stops_new_runs() -> anyhow::Result<()> {
         running: true,
         work_dir: work.clone(),
         budget,
+        shell: Some(wats::access::shell_sandbox("claude")),
     };
     let status = info.status(unix_now());
+    assert_eq!(status["shell"], "on, not sandboxed", "{status}");
     assert_eq!(status["usage"]["today"]["tokens"], 2200, "{status}");
     assert_eq!(
         status["usage"]["limits"]["tokens_per_day"], 2000,
@@ -3740,5 +3758,133 @@ async fn posts_declare_what_produced_them() -> anyhow::Result<()> {
         human.cancel().await?;
         a.shutdown().await?;
     }
+    Ok(())
+}
+
+/// A revision (0.4.11): the agent answered an ask; the asker replies to
+/// that answer with a follow-up ask. It is a request of its own: the
+/// root's answer (the agent's) does not settle it, so the catch-up wakes
+/// the agent for it, and `read` shows its own delivery.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_follow_up_ask_to_an_answer_wakes_its_author() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let a = node(&dir.path().join("a"), &[]).await?;
+    let b = node(&dir.path().join("b"), &[&a]).await?;
+    a.wait_for_neighbor(PUBLIC_NET, Duration::from_secs(10))
+        .await?;
+    let drawn = b.publish(ask("Draw a cat"), &[]).await?;
+    eventually("the ask reaches a", {
+        let a = Arc::clone(&a);
+        let id = drawn.id.clone();
+        move || a.store().get(&id).unwrap().is_some()
+    })
+    .await;
+    let drawing = a
+        .publish_as(
+            &a.author_key("agent")?,
+            Draft {
+                net: PUBLIC_NET.into(),
+                thread: Some(drawn.id.clone()),
+                parent: Some(drawn.id.clone()),
+                kind: Some(Kind::Answer),
+                text: "A cat.".into(),
+                ..Draft::default()
+            },
+            &[],
+        )
+        .await?;
+    eventually("the answer reaches b", {
+        let b = Arc::clone(&b);
+        let id = drawing.id.clone();
+        move || b.store().get(&id).unwrap().is_some()
+    })
+    .await;
+    let revision = b
+        .publish(
+            Draft {
+                net: PUBLIC_NET.into(),
+                thread: Some(drawn.id.clone()),
+                parent: Some(drawing.id.clone()),
+                kind: Some(Kind::Ask),
+                title: Some("Redo it in blue".into()),
+                text: "Redo it in blue".into(),
+                data: serde_json::json!({"mode": "one"})
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+                ..Draft::default()
+            },
+            &[],
+        )
+        .await?;
+    eventually("the follow-up reaches a", {
+        let a = Arc::clone(&a);
+        let id = revision.id.clone();
+        move || a.store().get(&id).unwrap().is_some()
+    })
+    .await;
+
+    // Its own state: mode one, nobody on it yet.
+    let state = wats::delivery::state_on(
+        &a,
+        &a.store().get(&revision.id)?.unwrap().event,
+        wats::node::now_secs(),
+    )
+    .expect("a follow-up ask has a state");
+    assert_eq!(state.request.mode.as_str(), "one");
+    assert!(state.answered.is_empty(), "the root's answer is not its");
+
+    let config = AgentConfig {
+        runtime: "claude".into(),
+        profile: "agent".into(),
+        user: "alice".into(),
+        about: String::new(),
+        caps: vec![],
+        every: Duration::from_secs(1),
+        heartbeat: Duration::from_secs(3600),
+        max_runs_per_hour: 100,
+        allow: vec![],
+        ignore_local: true,
+        heartbeat_text: DEFAULT_HEARTBEAT.into(),
+        command: fake_agent(dir.path()),
+        mcp_command: "/usr/bin/true".into(),
+        mcp_args: vec![],
+        extra_args: vec![],
+        run_timeout: Duration::from_secs(10),
+        max_turns: 10,
+        budget: wats::budget::Budget::default(),
+        wakes: wats::wake::WakeLimits::unlimited(),
+        codex_disable: vec![],
+        codex_enable: vec![],
+        access: wats::access::Access::SwarmOnly,
+        workdir: std::path::PathBuf::from("/nonexistent"),
+        tools: vec![],
+        servers: Vec::new(),
+        mcp_format: Default::default(),
+        mcp_file: None,
+        env: Vec::new(),
+        model: None,
+        effort: None,
+        work_dir: dir.path().join("work"),
+        data_dir: dir.path().to_path_buf(),
+        keep_runs: 100,
+        keep_days: 30,
+        openclaw: Default::default(),
+        catchup: Some(wats::agent::DEFAULT_CATCHUP),
+    };
+    let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+    let runner = tokio::spawn(wats::agent::run(Arc::clone(&a), config, async {
+        let _ = stopped.await;
+    }));
+    eventually("a run for the follow-up", || {
+        runs(dir.path())
+            .iter()
+            .any(|(prompt, _)| prompt.contains(&revision.id))
+    })
+    .await;
+    let _ = stop.send(());
+    runner.await??;
+    a.shutdown().await?;
+    b.shutdown().await?;
     Ok(())
 }

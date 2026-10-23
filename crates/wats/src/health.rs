@@ -578,17 +578,22 @@ pub async fn probe(endpoint: &Endpoint, directory: &Directory, now: u64) -> Prob
         return Probe::Ok;
     };
     let lookup = dns.lookup_endpoint_by_id(&me, origin);
-    match tokio::time::timeout(LOOKUP_PROBE_TIMEOUT, lookup).await {
-        Ok(Ok(_)) => Probe::Ok,
-        Ok(Err(e)) => {
-            debug!(directory = origin, "DNS lookup probe: {e:#}");
-            Probe::DnsFails
-        }
-        Err(_) => {
-            debug!(directory = origin, "DNS lookup probe: timeout");
-            Probe::DnsFails
-        }
-    }
+    let failed = match tokio::time::timeout(LOOKUP_PROBE_TIMEOUT, lookup).await {
+        Ok(Ok(_)) => return Probe::Ok,
+        Ok(Err(e)) => format!("{e:#}"),
+        Err(_) => "timeout".to_string(),
+    };
+    // The record is there (the directory served it above): the resolver
+    // is what fails. One built before the host's DNS was ready (a
+    // container's first seconds), or a cached miss from before the first
+    // publish, stays wrong until rebuilt: the next probe, and the
+    // endpoint's own lookups, use a fresh one.
+    debug!(
+        directory = origin,
+        "DNS lookup probe: {failed}; resetting the resolver"
+    );
+    dns.reset();
+    Probe::DnsFails
 }
 
 #[cfg(test)]

@@ -897,11 +897,6 @@ fn ask_mode(
                 .filter(|v| crate::vibe::access(Some(v)).is_ok())
                 .unwrap_or_else(|| "swarm-only".to_string());
             kept.push(format!("{access} access"));
-        } else if matches!(runtime, Some("copilot" | "antigravity")) {
-            // Their default level is swarm-only (ADR 0038).
-            let access = current(settings, table, "agent.access")
-                .unwrap_or_else(|| "swarm-only".to_string());
-            kept.push(format!("{access} access"));
         } else if runtime != Some("openclaw") {
             kept.push(format!("{} access", value("agent.access")));
         }
@@ -974,7 +969,8 @@ pub fn preset(paid: Paid, runtime: &str) -> Daily {
     };
     use crate::budget::{reports_cost, reports_tokens};
     match paid {
-        _ if runtime == "openclaw" => daily(0.0, 0, 0),
+        // Its time only: OpenClaw reports no cost nor tokens.
+        _ if runtime == "openclaw" => daily(0.0, crate::budget::DEFAULT_MINUTES_PER_DAY, 0),
         Paid::Subscription => daily(0.0, 120, 0),
         // Pay per use: dollars where the runtime reports a cost, else LLM
         // tokens where it reports them (Codex), else its time.
@@ -1102,7 +1098,9 @@ fn current_daily(table: &settings::AgentSettings) -> (Daily, Option<Paid>) {
         usd: table
             .max_usd_per_day
             .unwrap_or(crate::budget::DEFAULT_USD_PER_DAY),
-        minutes: table.max_minutes_per_day.unwrap_or(0),
+        minutes: table
+            .max_minutes_per_day
+            .unwrap_or(crate::budget::DEFAULT_MINUTES_PER_DAY),
         tokens: table.max_tokens_per_day.unwrap_or(0),
     };
     let set = table.max_usd_per_day.is_some()
@@ -1358,6 +1356,64 @@ fn confirm_zeros(
             .with_context(|| format!("write {}", z.work_dir.display()))?;
     }
     Ok(left)
+}
+
+/// Whether an agent's table sets any budget key of its own.
+pub fn has_budget(table: &settings::AgentSettings) -> bool {
+    table.max_usd_per_day.is_some()
+        || table.max_usd_per_month.is_some()
+        || table.max_minutes_per_day.is_some()
+        || table.max_minutes_per_month.is_some()
+        || table.max_tokens_per_day.is_some()
+        || table.max_tokens_per_month.is_some()
+}
+
+/// `wats setup <runtime> --agent` on a terminal (0.4.11): the budget
+/// question of the wizard (ADR 0034) for the agent `name`, whose table
+/// sets no budget yet. The answer goes to `agents.<name>` and confirms the
+/// budget. Returns the line to show, or `None` at the end of the input.
+pub fn ask_agent_budget(
+    data_dir: &Path,
+    input: &mut impl BufRead,
+    out: &mut impl Write,
+    name: &str,
+    runtime: &str,
+    table: &settings::AgentSettings,
+    work_dir: &Path,
+) -> Result<Option<String>> {
+    let prefix = format!("agents.{name}");
+    writeln!(out)?;
+    let Some(values) = ask_budget(
+        input,
+        out,
+        table,
+        runtime,
+        (false, false),
+        &prefix,
+        env_api_key(runtime),
+    )?
+    else {
+        return Ok(None);
+    };
+    let mut file = ConfigFile::open(data_dir)?;
+    let mut set = Vec::new();
+    // Defaults are left out of the table, as the wizard does; the
+    // confirmation keeps the question from coming back.
+    for (key, value) in &values {
+        let leaf = key.trim_start_matches("agent.");
+        let key = format!("{prefix}.{leaf}");
+        if is_default(&key, value) {
+            if file.get(&key).is_some() {
+                file.unset(&key)?;
+            }
+        } else {
+            file.set(&key, value)?;
+        }
+        set.push(format!("{leaf} = {value}"));
+    }
+    file.save()?;
+    crate::budget::confirm(work_dir).with_context(|| format!("write {}", work_dir.display()))?;
+    Ok(Some(format!("{prefix}: {}", set.join(", "))))
 }
 
 /// An agent's table with a USD budget of 0 from before 0.4.5 that the
@@ -1961,15 +2017,15 @@ fn ask_and_write(
         api_key: asker.api_key,
     };
     let mut choices = prompt_after(input, out, &found, &settings, &QUESTIONS, revision, &ctx)?;
-    // Quick: notify.desktop stays as it is (unset: on with a desktop
-    // session), the security updates as recommended.
+    // Quick: notify.desktop stays as it is (unset: off since 0.4.11), the
+    // security updates as recommended.
     if desktop && DESKTOP_SINCE > revision && !choices.quick {
         let on = ask_yes_no(
             input,
             out,
             "Desktop notification when someone answers or clarifies one of your asks \
              (notify.desktop)",
-            settings.notify.desktop.unwrap_or(true),
+            settings.notify.desktop.unwrap_or(false),
         )?;
         choices.values.push(("notify.desktop", on.to_string()));
     }
@@ -2207,8 +2263,8 @@ fn next_steps(out: &mut impl Write, choices: &Choices, found: &[Found], hints: b
             if runtime == "copilot" {
                 write!(
                     out,
-                    " Its runs have the wats tools only (swarm-only), with their own Copilot \
-                     home (not ~/.copilot); `wats share` lends more."
+                    " Its runs have their own Copilot home (not ~/.copilot), the wats tools \
+                     and their workspace, the web but no shell (`wats share` changes it)."
                 )?;
             }
             if runtime == "vibe" {
@@ -2380,9 +2436,9 @@ mod tests {
         assert!(!config.contains("\nmodel = "), "{config}");
     }
 
-    /// On a desktop session, setup asks notify.desktop (default yes) and
-    /// writes the answer; elsewhere it does not ask. Quick keeps it as it
-    /// is (unset: on with a desktop session).
+    /// On a desktop session, setup asks notify.desktop (default no since
+    /// 0.4.11) and writes the answer; elsewhere it does not ask. Quick keeps
+    /// it as it is (unset: off).
     #[test]
     fn setup_asks_desktop_notifications_on_a_desktop() {
         let data = tempfile::tempdir().unwrap();
@@ -2395,16 +2451,14 @@ mod tests {
         let mut out = Vec::new();
         let choices = setup_with(data.path(), &mut "d\n".as_bytes(), &mut out, None, true).unwrap();
         let said = String::from_utf8(out).unwrap();
-        assert!(said.contains("(notify.desktop) [Y/n]"), "{said}");
-        assert!(choices.values.contains(&("notify.desktop", "true".into())));
-        let settings = Settings::load(data.path()).unwrap();
-        assert_eq!(settings.notify.desktop, Some(true));
-        // Asked again (no agent CLI: storage and networks first): "n"
-        // turns it off.
+        assert!(said.contains("(notify.desktop) [y/N]"), "{said}");
+        assert!(choices.values.contains(&("notify.desktop", "false".into())));
+        // Asked again (no agent CLI: storage and networks first): "y"
+        // turns it on.
         let mut out = Vec::new();
         setup_with(
             data.path(),
-            &mut "d\n\n\nn\n".as_bytes(),
+            &mut "d\n\n\ny\n".as_bytes(),
             &mut out,
             None,
             true,
@@ -2412,7 +2466,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             Settings::load(data.path()).unwrap().notify.desktop,
-            Some(false)
+            Some(true)
         );
         // Headless: not asked, not written.
         let other = tempfile::tempdir().unwrap();
@@ -2969,7 +3023,8 @@ mod tests {
         assert!(text.contains("# timeout = \"25m\""), "{text}");
         assert!(text.contains("# max_turns = 50"), "{text}");
         assert!(text.contains("\nmax_usd_per_day = 0.0\n"), "{text}");
-        assert!(text.contains("\nmax_minutes_per_day = 120\n"), "{text}");
+        // 120 minutes, the subscription's, is the default since 0.4.11.
+        assert!(text.contains("# max_minutes_per_day = 120"), "{text}");
         assert!(text.contains("# max_tokens_per_day = 0"), "{text}");
         // Detailed, Enter for each (a subscription): every question, the
         // same budget.
@@ -3042,12 +3097,13 @@ mod tests {
             ),
             "{said}"
         );
-        // OpenClaw: not asked how it is paid; minutes only.
+        // OpenClaw: not asked how it is paid; minutes only, 120 by default
+        // since 0.4.11.
         let (usd, min, tok, said) = budget("openclaw", "");
-        assert_eq!((usd, min, tok), (None, some("0"), None));
+        assert_eq!((usd, min, tok), (None, some("120"), None));
         assert!(!said.contains(PAID_QUESTION), "{said}");
         assert!(
-            said.contains("Daily budget: no time limit (monthly: 30×; OpenClaw keeps its own"),
+            said.contains("Daily budget: 120 min (monthly: 30×; OpenClaw keeps its own"),
             "{said}"
         );
         // A wrong answer is asked again.
@@ -3167,7 +3223,8 @@ mod tests {
             "{said}"
         );
         assert!(said.contains(&format!("{PAID_QUESTION} [2]: ")), "{said}");
-        assert!(said.contains("Daily budget: no time limit, $2,"), "{said}");
+        // 120 minutes: the default since 0.4.11.
+        assert!(said.contains("Daily budget: 120 min, $2,"), "{said}");
         apply(dir.path(), &choices).unwrap();
         let after = Settings::load(dir.path()).unwrap();
         let claude = &after.agents["claude"];
@@ -3246,7 +3303,6 @@ mod tests {
                 "runtime = \"claude\"",
                 "timeout = \"30m\"",
                 "max_usd_per_day = 0.0",
-                "max_minutes_per_day = 120"
             ],
             "{text}"
         );
@@ -3711,7 +3767,11 @@ mod tests {
         assert_eq!(choices.budget_for.as_deref(), Some("claude"));
         // claude and other confirmed, the old table not: revision 1 kept.
         let after = Settings::load(d).unwrap();
-        assert_eq!(after.agents["claude"].max_minutes_per_day, Some(120));
+        // 120: the default since 0.4.11, so not written.
+        assert_eq!(
+            crate::budget::Budget::of(&after.agents["claude"]).max_minutes_per_day,
+            Some(120)
+        );
         assert_eq!(after.agents["other"].max_minutes_per_day, Some(240));
         assert!(crate::budget::confirmed(&d.join("agent/claude")));
         assert!(crate::budget::confirmed(&d.join("agent/other")));
@@ -3797,6 +3857,53 @@ mod tests {
             assert_eq!(stored_revision(d), Some(1));
             assert!(!crate::budget::confirmed(&d.join("agent/claude")));
         }
+    }
+
+    /// `wats setup <runtime> --agent` (0.4.11): the wizard's budget
+    /// question for one agent nobody budgeted, written to its table and
+    /// confirmed; the end of the input writes nothing.
+    #[test]
+    fn setup_agent_asks_its_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path();
+        std::fs::write(d.join(FILE_NAME), "[agents.codex]\nruntime = \"codex\"\n").unwrap();
+        let work = d.join("agent/codex");
+        let table = settings::AgentSettings::default();
+        assert!(!has_budget(&table));
+        let mut out = Vec::new();
+        let line = ask_agent_budget(
+            d,
+            &mut "3\n\n".as_bytes(),
+            &mut out,
+            "codex",
+            "codex",
+            &table,
+            &work,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            line,
+            "agents.codex: max_minutes_per_day = 240, max_tokens_per_day = 0"
+        );
+        let after = Settings::load(d).unwrap();
+        assert_eq!(after.agents["codex"].max_minutes_per_day, Some(240));
+        assert!(has_budget(&after.agents["codex"]));
+        assert!(crate::budget::confirmed(&work));
+        let said = String::from_utf8(out).unwrap();
+        assert!(said.contains(PAID_QUESTION), "{said}");
+        // No answer: nothing written.
+        let none = ask_agent_budget(
+            d,
+            &mut "".as_bytes(),
+            &mut Vec::new(),
+            "x",
+            "codex",
+            &table,
+            &d.join("agent/x"),
+        )
+        .unwrap();
+        assert_eq!(none, None);
     }
 
     /// How the agent is paid has no default, but the answer config.toml

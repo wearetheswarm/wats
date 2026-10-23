@@ -93,6 +93,7 @@ fn config(dir: &Path, command: PathBuf, access: Access) -> AgentConfig {
         mcp_file: None,
         env: Vec::new(),
         model: Some("gemini-3.8-flash".into()),
+        effort: None,
         work_dir: work,
         data_dir: dir.join("data"),
         keep_runs: 100,
@@ -197,7 +198,10 @@ async fn a_workspace_run_has_its_files_and_what_is_lent() {
         .as_str()
         .unwrap()
         .to_string();
-    assert_eq!(gate, "/opt/wats gate antigravity --workspace --web");
+    assert_eq!(
+        gate,
+        "/opt/wats gate antigravity --workspace --web-search --web-fetch"
+    );
     let cwd = PathBuf::from(read(dir.path(), "cwd").trim_end());
     assert!(cwd.ends_with("workspace"), "{}", cwd.display());
 }

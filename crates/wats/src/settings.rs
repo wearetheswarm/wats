@@ -115,6 +115,8 @@ pub struct Settings {
     #[serde(default)]
     pub health: HealthSettings,
     #[serde(default)]
+    pub gossip: GossipSettings,
+    #[serde(default)]
     pub ask: AskSettings,
     #[serde(default)]
     pub reputation: ReputationSettings,
@@ -191,6 +193,14 @@ pub struct AskSettings {
 #[serde(deny_unknown_fields)]
 pub struct ReputationSettings {
     pub threshold: Option<f64>,
+}
+
+/// `[gossip]`: the gossip mesh (`crate::node::links`).
+#[derive(Debug, Default, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GossipSettings {
+    pub active_view: Option<u64>,
+    pub ping: Option<String>,
 }
 
 /// `[health]`: infra health alerts (`crate::health`).
@@ -323,6 +333,8 @@ pub struct StorageSettings {
 pub struct SyncSettings {
     /// Budget of the initial fill: `auto`, a size, or 0 for no limit.
     pub initial_max: Option<String>,
+    /// How often the node reads its neighbors' newest events (0: never).
+    pub anti_entropy: Option<String>,
 }
 
 /// Default share of `storage.max` for the event store, in percent.
@@ -352,6 +364,8 @@ pub struct AgentSettings {
     #[serde(default)]
     pub env: Vec<String>,
     pub model: Option<String>,
+    /// Reasoning effort of the runs (the runtime's own values).
+    pub effort: Option<String>,
     pub review: Option<bool>,
     pub ignore_local: Option<bool>,
     pub review_ttl: Option<String>,
@@ -765,6 +779,12 @@ pub const KEYS: &[Key] = &[
         "history a new node fetches, newest first: auto (half the events share), a size, or 0 for all of it (full nodes)",
     ),
     key(
+        "sync.anti_entropy",
+        ValueType::Retention,
+        "5m",
+        "how often the node reads its gossip neighbors' newest events (the last 30 minutes) and relays what gossip had not delivered; a neighbor that held old ones gets a fresh gossip link (0: never)",
+    ),
+    key(
         "limits.hello_per_min",
         ValueType::Integer,
         "60",
@@ -885,6 +905,18 @@ pub const KEYS: &[Key] = &[
         "on a guardian halt, keep serving halt events instead of stopping (our router only)",
     ),
     key(
+        "gossip.active_view",
+        ValueType::Integer,
+        "5",
+        "gossip neighbors the node keeps (HyParView's active view); infrastructure nodes such as routers and seeds may keep more",
+    ),
+    key(
+        "gossip.ping",
+        ValueType::Retention,
+        "1m",
+        "how often the node pings its gossip neighbors; one that pings too and goes silent for three rounds gets a fresh gossip link, and a node whose neighbors are all on its own networks joins one outside them (0: none of this)",
+    ),
+    key(
         "health.no_peers_after",
         ValueType::Retention,
         "5m",
@@ -907,11 +939,9 @@ pub const KEYS: &[Key] = &[
     key(
         "notify.desktop",
         ValueType::Bool,
-        "auto",
+        "false",
         "a desktop notification (terminal-notifier or osascript, notify-send) when someone \
-         answers or clarifies \
-         one of your asks; auto: on with a desktop session (macOS, or DISPLAY or \
-         WAYLAND_DISPLAY set; not over SSH), off on servers and in containers",
+         answers or clarifies one of your asks (off by default since 0.4.11)",
     ),
     key(
         "labels.subscribe",
@@ -1006,7 +1036,8 @@ pub const KEYS: &[Key] = &[
         "workspace",
         "what the agent may use besides wats: swarm-only (the wats tools only), workspace \
          (its own directory, agent.tools and the workspace's MCP servers) or inherit (your \
-         whole environment); Mistral Vibe: swarm-only by default, no workspace",
+         whole environment); Mistral Vibe: swarm-only by default, no workspace; Copilot CLI \
+         and Antigravity CLI: workspace by default since 0.4.11",
     ),
     key(
         "agent.workdir",
@@ -1038,6 +1069,14 @@ pub const KEYS: &[Key] = &[
         "the runtime's default",
         "model of the agent runs, e.g. sonnet (Claude), a Codex model, provider/model \
          (OpenCode) or a model alias (Mistral Vibe)",
+    ),
+    key(
+        "agent.effort",
+        ValueType::Text,
+        "the runtime's default",
+        "reasoning effort of the agent runs, in the runtime's own words: Codex \
+         model_reasoning_effort (low, medium, high), Copilot --reasoning-effort, Antigravity \
+         --effort, OpenCode --variant; Claude Code and Mistral Vibe: ignored, with a warning",
     ),
     key(
         "agent.review",
@@ -1181,7 +1220,7 @@ pub const KEYS: &[Key] = &[
     key(
         "agent.max_minutes_per_day",
         ValueType::Integer,
-        "0",
+        "120",
         "total run time of the agent per UTC day, in minutes; it stops new runs, a run keeps \
          its timeout (0: no limit)",
     ),

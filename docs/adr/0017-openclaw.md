@@ -84,12 +84,12 @@ radius than our `locked` runs.
      - **Automatic**: `openclaw config file`, a copy of that file to
        `<file>.bak-<UTC timestamp>` (printed); `openclaw config get` of
        `hooks.allowedAgentIds` and `hooks.allowedSessionKeyPrefixes`,
-       merged with ours, since `config patch` replaces arrays; when
-       `openclaw config set` supports SecretRefs, `openclaw config set
-       hooks.token --ref-provider default --ref-source env --ref-id
-       WATS_OPENCLAW_HOOKS_TOKEN` (`--ref-provider` only where `config set`
-       has it: OpenClaw 2026.6 and later require it);
-       then the patch (the same content as the block) is printed and sent
+       merged with ours, since `config patch` replaces arrays; then the
+       patch, with `hooks.token` as the template
+       `"${WATS_OPENCLAW_HOOKS_TOKEN}"` (amended 2026-10-24: OpenClaw
+       2026.6.35 refuses a SecretRef at `hooks.token`, a runtime-managed
+       credential that must stay a plain string; a `${VAR}` template is
+       allowed; the same content as the block), is printed and sent
        to `openclaw config patch --stdin --dry-run`, then `openclaw config
        patch --stdin`, then `openclaw config validate`. Any failure from
        the first write on copies the backup back and fails.
@@ -154,14 +154,17 @@ radius than our `locked` runs.
   for swarm work. It is our `locked` level:
 
   ```json5
-  agents: { entries: { wats: {
+  // agents.list since OpenClaw 2026.6 (amended 2026-10-24: `entries`
+  // is refused by its schema)
+  agents: { list: [ {
+    id: "wats",
     name: "wats (swarm)",
     workspace: "~/.openclaw/workspace-wats",
     sandbox: { mode: "all", scope: "agent" },
     tools: { allow: ["wats-agent__*"],
              deny: ["exec", "process", "write", "edit", "apply_patch",
                     "browser", "message"] },
-  } } }
+  } ] }
   ```
 
   - **Two MCP entries.** `wats` is registered with the user's profile, for
@@ -237,8 +240,8 @@ radius than our `locked` runs.
    (`[A]`, or `--apply`), it applies the config through OpenClaw's own
    CLI (`openclaw config patch`, dry run first), after a backup of the
    file, and validates; any failure restores the backup. The hook token
-   is a SecretRef to the environment when OpenClaw supports it, so it
-   never sits in `openclaw.json`. The printed block stays as the manual
+   is the `${WATS_OPENCLAW_HOOKS_TOKEN}` template, so it never sits in
+   `openclaw.json` (a SecretRef, tried first, is refused there). The printed block stays as the manual
    mode, and the default without a terminal.
 3. **No USD budget for v1.** Setup warns once that spend caps belong on
    the OpenClaw side, and the user confirms. `status` shows

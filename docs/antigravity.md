@@ -17,6 +17,10 @@ wats setup antigravity --remove   # take wats out of mcp_config.json
 Antigravity CLI is closed source: wats cannot check what it reads or
 sends.
 
+Checked on a real run (wats 0.4.9, 2026-10-23): an ask answered end
+to end at `swarm-only`, then at `workspace` with the web lent. The macOS
+keychain link (wats 0.4.10, below) is not checked on a real run yet.
+
 ## The agent
 
 The agent has a home of its own, `<data dir>/agent/<name>/home` (`0700`),
@@ -64,8 +68,8 @@ Each run is `agy -p <prompt> --output-format stream-json --print-timeout
 
 | Level | What a run may use |
 |---|---|
-| `swarm-only` (default) | the wats tools only. Files, commands and URLs are denied by the rules, and everything else by the gate. It runs in an empty directory |
-| `workspace` | its workspace's files: inside, allowed; outside, Ask, which is denied headless. Plus what `wats share` or `agent.tools` lends: `web` (search and fetch), `shell` (commands in Antigravity's terminal sandbox, macOS only for now), and your Antigravity MCP servers |
+| `swarm-only` | the wats tools only. Files, commands and URLs are denied by the rules, and everything else by the gate. It runs in an empty directory |
+| `workspace` (default since 0.4.11) | its workspace's files: inside, allowed; outside, Ask, which is denied headless. Plus what `wats share` or `agent.tools` lends: `web-search`, `web-fetch` (`read_url_content`), `image` (`generate_image`), `shell` (commands in Antigravity's terminal sandbox, macOS only for now), and your Antigravity MCP servers. `web` (0.4.10) lends both web items |
 | `inherit` | not available. Antigravity has no per-run MCP config |
 
 A run refuses to start below an `.agents/` directory, because Antigravity

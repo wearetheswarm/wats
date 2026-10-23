@@ -734,10 +734,20 @@ fn codex_servers() -> usize {
         .unwrap_or(0)
 }
 
+/// What holds a lent shell's commands, as the banner and `wats status`
+/// say it: "not sandboxed" unless the runtime's own sandbox is on.
+pub fn shell_sandbox(runtime: &str) -> &'static str {
+    match runtime {
+        "antigravity" => "sandboxed (its terminal sandbox: nothing outside the workspace)",
+        "codex" => "read-only sandbox (it can still read your files and secrets)",
+        _ => "not sandboxed",
+    }
+}
+
 /// Whether an `agent.tools` entry is a shell: Claude Code's `Bash`,
 /// Codex's `shell_tool`, OpenCode's `bash` (or `shell`), with or without
 /// a pattern.
-fn gives_shell(tool: &str) -> bool {
+pub fn gives_shell(tool: &str) -> bool {
     let base = tool.split('(').next().unwrap_or(tool).trim();
     matches!(base, "Bash" | "shell_tool")
         || base.eq_ignore_ascii_case("bash")
@@ -777,10 +787,45 @@ pub fn prompt_line(runtime: &str, access: Access, workdir: &Path, tools: &[Strin
         ),
         Access::Inherit => "The tools of your runtime's own configuration.".to_string(),
     };
+    let mut line = line;
+    if access == Access::Workspace && runtime != "openclaw" {
+        let (search, fetch) = web_abilities(runtime, tools);
+        let yes = |b: bool| if b { "yes" } else { "no" };
+        line.push_str(&format!(
+            " You can search the web: {}. You can fetch a URL (read a page or an API): {}.",
+            yes(search),
+            yes(fetch)
+        ));
+        if runtime == "antigravity" && fetch {
+            line.push_str(
+                " To read a page or an API URL, use read_url_content; search_web returns \
+                 snippets only.",
+            );
+        }
+    }
     if codex_generates_images(runtime, access, tools) {
         format!("{line} {IMAGES_LINE}")
     } else {
         line
+    }
+}
+
+/// Whether a `workspace` run can search the web, and fetch a URL, with
+/// `agent.tools`: each runtime's own tools for it.
+pub fn web_abilities(runtime: &str, tools: &[String]) -> (bool, bool) {
+    let has = |names: &[&str]| {
+        tools.iter().any(|t| {
+            let base = t.split('(').next().unwrap_or(t).trim();
+            names.iter().any(|n| base.eq_ignore_ascii_case(n))
+        })
+    };
+    match runtime {
+        "claude" => (has(&["WebSearch"]), has(&["WebFetch"])),
+        "codex" => (has(&["web_search", "standalone_web_search"]), false),
+        "opencode" => (has(&["websearch"]), has(&["webfetch"])),
+        "copilot" => (false, has(&["url"])),
+        "antigravity" => (has(&["web", "web-search"]), has(&["web", "web-fetch"])),
+        _ => (false, false),
     }
 }
 
@@ -842,10 +887,15 @@ pub fn describe(d: &Describe) -> Summary {
             let shell = d.tools.iter().any(|t| gives_shell(t));
             (
                 format!(
-                    "workspace {}: tools [{}], MCP servers [{}]",
+                    "workspace {}: tools [{}], MCP servers [{}]{}",
                     d.workdir.display(),
                     d.tools.join(", "),
-                    servers.join(", ")
+                    servers.join(", "),
+                    if shell {
+                        format!(", shell: on, {}", shell_sandbox(d.runtime))
+                    } else {
+                        String::new()
+                    }
                 ),
                 shell,
                 !d.tools.is_empty() || !servers.is_empty(),
@@ -942,11 +992,27 @@ const CAP_NEEDS: &[CapNeed] = &[
         mcp: None,
     },
     CapNeed {
-        caps: &["web", "web-search"],
+        caps: &["web"],
         what: "web",
         claude: &["WebFetch", "WebSearch"],
         codex: &["web_search", "standalone_web_search"],
         opencode: &["webfetch", "websearch"],
+        mcp: None,
+    },
+    CapNeed {
+        caps: &["web-search"],
+        what: "web search",
+        claude: &["WebSearch"],
+        codex: &["web_search", "standalone_web_search"],
+        opencode: &["websearch"],
+        mcp: None,
+    },
+    CapNeed {
+        caps: &["web-fetch"],
+        what: "URL fetch",
+        claude: &["WebFetch"],
+        codex: &[],
+        opencode: &["webfetch"],
         mcp: None,
     },
 ];
@@ -1006,6 +1072,11 @@ pub fn cap_warnings(c: &CapCheck) -> Vec<String> {
             _ => need.claude,
         }
     };
+    // A lent shell can back any cap through a command (a script the
+    // workspace's AGENTS.md names, e.g. an image generator): no warning.
+    if c.access == Access::Workspace && tools.iter().any(|t| gives_shell(t)) {
+        return Vec::new();
+    }
     let mut out = Vec::new();
     let mut seen = Vec::new();
     for cap in c.caps {
@@ -1080,6 +1151,10 @@ mod tests {
                 caps: &caps.iter().map(|t| t.to_string()).collect::<Vec<_>>(),
             })
         };
+        assert!(
+            w("opencode", Access::Workspace, &["bash"], &["image-gen"]).is_empty(),
+            "a shell backs it through a command"
+        );
         let none = w("codex", Access::Workspace, &[], &["image-gen", "Image-Gen"]);
         assert_eq!(
             none,
@@ -1177,10 +1252,22 @@ mod tests {
         assert!(swarm_only.ends_with(cannot), "{swarm_only}");
         assert!(prompt_line("openclaw", Access::SwarmOnly, dir, &[]).ends_with(cannot));
         let read_only = prompt_line("claude", Access::Workspace, dir, &["Read".into()]);
+        let no_web = "You can search the web: no. You can fetch a URL (read a page or an API): no.";
         assert_eq!(
             read_only,
-            format!("The wats tools plus Read in /w, nothing outside it. No shell: {cannot}")
+            format!(
+                "The wats tools plus Read in /w, nothing outside it. No shell: {cannot} {no_web}"
+            )
         );
+        let web = prompt_line("claude", Access::Workspace, dir, &["WebSearch".into()]);
+        assert!(
+            web.ends_with(
+                "You can search the web: yes. You can fetch a URL (read a page or an API): no."
+            ),
+            "{web}"
+        );
+        let agy = prompt_line("antigravity", Access::Workspace, dir, &["web-fetch".into()]);
+        assert!(agy.contains("use read_url_content"), "{agy}");
         let shell = prompt_line(
             "claude",
             Access::Workspace,
@@ -1189,9 +1276,9 @@ mod tests {
         );
         assert_eq!(
             shell,
-            "The wats tools plus Read, Bash(cargo:*) in /w, nothing outside it."
+            format!("The wats tools plus Read, Bash(cargo:*) in /w, nothing outside it. {no_web}")
         );
-        assert!(prompt_line("claude", Access::Workspace, dir, &[]).ends_with(cannot));
+        assert!(prompt_line("claude", Access::Workspace, dir, &[]).contains(cannot));
         assert_eq!(
             prompt_line("claude", Access::Inherit, dir, &[]),
             "The tools of your runtime's own configuration."

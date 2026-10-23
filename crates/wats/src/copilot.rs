@@ -7,11 +7,12 @@
 //!         --no-auto-update --allow-all-tools [level flags] [extra args]
 //! ```
 //!
-//! - **swarm-only** (the default): `COPILOT_HOME` is the agent's own, its
+//! - **swarm-only**: `COPILOT_HOME` is the agent's own, its
 //!   `mcp-config.json` holds the wats server only; `--disable-builtin-mcps`,
 //!   `--available-tools wats`, and `shell`, `write` and `url` denied
 //!   (a deny wins over `--allow-all-tools`).
-//! - **workspace**: the same home, with the lent servers (ADR 0037); the
+//! - **workspace** (the default since 0.4.11): the same home, with the
+//!   lent servers (ADR 0037); the
 //!   run starts in the workspace, Copilot's path checks keep file tools
 //!   inside it; `shell` and `url` stay denied unless `agent.tools` lists
 //!   them.
@@ -33,9 +34,10 @@ pub const SERVER: &str = "wats";
 pub const INHERIT_WARNING: &str = "Copilot CLI with inherit uses your own ~/.copilot: your MCP \
      servers, the builtin GitHub server and every tool, with your GitHub account";
 
-/// Copilot's default access level: swarm-only (ADR 0038 §1).
+/// Copilot's default access level: workspace since 0.4.11 (its path
+/// checks hold it to the workspace; swarm-only before).
 pub fn access(value: Option<&str>) -> Result<Access> {
-    value.map_or(Ok(Access::SwarmOnly), str::parse)
+    value.map_or(Ok(Access::Workspace), str::parse)
 }
 
 /// `inherit` is refused without `agent.review` or `agent.allow`.
@@ -296,7 +298,7 @@ mod tests {
 
     #[test]
     fn swarm_only_is_the_wats_tools_only() {
-        assert_eq!(access(None).unwrap(), Access::SwarmOnly);
+        assert_eq!(access(None).unwrap(), Access::Workspace);
         let a = args(Access::SwarmOnly, &s(&["shell"]));
         assert_eq!(&a[..2], ["-p", "hello"]);
         for flag in [

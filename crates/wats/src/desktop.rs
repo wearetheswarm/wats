@@ -152,7 +152,9 @@ pub fn configured(
     if hermetic && let Some(command) = test_command.filter(|c| !c.is_empty()) {
         return Some(Notifier::Command(PathBuf::from(command)));
     }
-    if loopback || hermetic || !setting.unwrap_or_else(this_desktop_session) {
+    // Off unless set (0.4.11): popups are intrusive, and no agent CLI
+    // shows any.
+    if loopback || hermetic || !setting.unwrap_or(false) {
         return None;
     }
     Notifier::detect(std::env::var_os("PATH").as_deref())
@@ -270,10 +272,8 @@ mod tests {
         let fake = Some(OsString::from("/tmp/fake"));
         assert_eq!(configured(Some(true), true, false, None), None);
         assert_eq!(configured(Some(true), true, true, None), None);
-        assert_eq!(configured(None, false, false, fake.clone()).is_some(), {
-            this_desktop_session()
-                && Notifier::detect(std::env::var_os("PATH").as_deref()).is_some()
-        });
+        // Unset: off since 0.4.11, desktop session or not.
+        assert_eq!(configured(None, false, false, fake.clone()), None);
         assert_eq!(
             configured(None, true, true, fake.clone()),
             Some(Notifier::Command(PathBuf::from("/tmp/fake")))

@@ -54,3 +54,4 @@ wrong, the ADR says so and the question goes back to the spec owners.
 | [0038](0038-antigravity-and-copilot.md) | Antigravity CLI and GitHub Copilot CLI | Accepted |
 | [0039](0039-custom-cli-runtime.md) | Any other CLI as the agent: the `custom` runtime | Accepted |
 | [0040](0040-discord-visitor-bot.md) | A Discord bot as a visitor node | Accepted |
+| [0041](0041-lent-shell-and-credentials.md) | What a lent shell can read: credentials and the node's key | Proposed (deferred) |

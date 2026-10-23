@@ -301,10 +301,7 @@ impl State {
         let net = ask.net.as_str();
         let asker = ask.author.as_str();
         let request = Request::of(ask);
-        let mut events: Vec<&Event> = thread
-            .into_iter()
-            .filter(|e| e.id != ask.id && e.thread.as_deref() == Some(ask.id.as_str()))
-            .collect();
+        let mut events: Vec<&Event> = replies_to(ask, thread);
         events.sort_by(|a, b| (a.ts, &a.id).cmp(&(b.ts, &b.id)));
         let by_asker = |e: &&Event| grouping.same_key(net, asker, &e.author);
 
@@ -684,13 +681,45 @@ pub fn grouping(node: &crate::node::Node, net: &str) -> Grouping {
     }
 }
 
+/// What answers `ask` among `thread`: for an ask that opens a thread, the
+/// whole thread; for a follow-up ask inside one (a revision asked of an
+/// answerer, say), only what descends from it. It is a request of its
+/// own: the root's answers, claims and accept are not its.
+pub fn replies_to<'e>(ask: &Event, thread: impl IntoIterator<Item = &'e Event>) -> Vec<&'e Event> {
+    let all: Vec<&Event> = thread.into_iter().filter(|e| e.id != ask.id).collect();
+    if ask.thread.is_none() {
+        return all
+            .into_iter()
+            .filter(|e| e.thread.as_deref() == Some(ask.id.as_str()))
+            .collect();
+    }
+    let mut below: HashSet<&str> = HashSet::from([ask.id.as_str()]);
+    // Parents come before their replies by `ts` but not always in the
+    // store's order: grow the set until it is stable.
+    loop {
+        let before = below.len();
+        for e in &all {
+            if e.parent.as_deref().is_some_and(|p| below.contains(p)) {
+                below.insert(e.id.as_str());
+            }
+        }
+        if below.len() == before {
+            break;
+        }
+    }
+    all.into_iter()
+        .filter(|e| below.contains(e.id.as_str()))
+        .collect()
+}
+
 /// The state of the ask `ask` on `node` at `now`, from its thread in the
-/// store; `None` when it is not an ask that opens a thread.
+/// store (for a follow-up ask, what descends from it); `None` when it is
+/// not an ask.
 pub fn state_on(node: &crate::node::Node, ask: &Event, now: u64) -> Option<State> {
-    if ask.kind != Kind::Ask || ask.thread.is_some() {
+    if ask.kind != Kind::Ask {
         return None;
     }
-    let thread = node.store().thread(&ask.id, 1000).ok()?;
+    let thread = node.store().thread(ask.thread_root(), 1000).ok()?;
     Some(State::of(
         ask,
         thread.iter().map(|s| &*s.event),
@@ -765,6 +794,33 @@ mod tests {
 
     fn state(ask: &Event, thread: &[&Event], now: u64) -> State {
         State::of(ask, thread.iter().copied(), &grouping(&[]), Some(3), now)
+    }
+
+    /// A follow-up ask in a thread is its own request: only what descends
+    /// from it counts, not the root's answers.
+    #[test]
+    fn a_follow_up_ask_counts_only_its_own_replies() {
+        let root = ask(1, json!({}), &[]);
+        let answer = reply(2, &root, Kind::Answer, T0 + 10, json!({}));
+        let follow = reply(1, &answer, Kind::Ask, T0 + 20, json!({"mode": "one"}));
+        let claim = reply(2, &follow, Kind::Claim, T0 + 30, json!({}));
+        let redo = reply(2, &claim, Kind::Answer, T0 + 40, json!({}));
+        let thread = [&root, &answer, &follow, &claim, &redo];
+        let mine: Vec<&str> = replies_to(&follow, thread)
+            .iter()
+            .map(|e| e.id.as_str())
+            .collect();
+        assert_eq!(mine, [claim.id.as_str(), redo.id.as_str()]);
+        assert_eq!(
+            replies_to(&root, thread).len(),
+            4,
+            "the root: its whole thread"
+        );
+        let before = state(&follow, &[&root, &answer], T0 + 25);
+        assert!(before.answered.is_empty(), "the root's answer is not its");
+        assert_eq!(before.request.mode, Mode::One);
+        let after = state(&follow, &thread, T0 + 45);
+        assert_eq!(after.answered, [id(2)]);
     }
 
     #[test]

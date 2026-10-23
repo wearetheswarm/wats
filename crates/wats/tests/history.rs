@@ -1620,3 +1620,97 @@ async fn a_new_node_takes_an_old_keys_age_from_its_peers() -> anyhow::Result<()>
     }
     Ok(())
 }
+
+/// Anti-entropy (0.4.11): two neighbors, both caught up; an event reaches
+/// one of them outside gossip (as when a broadcast was lost on the way).
+/// The other gets it from its periodic read of its neighbors, with no
+/// restart and no new neighbor.
+#[tokio::test(flavor = "multi_thread")]
+async fn anti_entropy_brings_what_gossip_missed() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let a = reference(&dir.path().join("a")).await?;
+    let mut b_config = config(&dir.path().join("b"), &[&a]);
+    b_config.history.anti_entropy = Duration::from_secs(1);
+    let b = Node::start(b_config).await?;
+    done(&b).await;
+    let missed = note(4242, now_secs() - 60);
+    hold(&a, std::slice::from_ref(&missed));
+    eventually("anti-entropy brings the missed event", 30, || {
+        seq(&b, &missed.id).map(|_| ())
+    })
+    .await;
+    for node in [a, b] {
+        node.shutdown().await?;
+    }
+    Ok(())
+}
+
+/// What anti-entropy pulls goes on gossip at once: a chain A - B - C,
+/// where only B reads its neighbors. An event reaches A outside gossip; B
+/// pulls it and relays it, and C, which never pulls, gets it live.
+#[tokio::test(flavor = "multi_thread")]
+async fn anti_entropy_relays_what_it_pulls() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let a = reference(&dir.path().join("a")).await?;
+    let mut b_config = config(&dir.path().join("b"), &[&a]);
+    b_config.history.anti_entropy = Duration::from_secs(1);
+    let b = Node::start(b_config).await?;
+    done(&b).await;
+    let mut c_config = config(&dir.path().join("c"), &[&b]);
+    c_config.history.anti_entropy = Duration::ZERO;
+    let c = Node::start(c_config).await?;
+    done(&c).await;
+    eventually("C is B's gossip neighbor", 30, || {
+        (c.neighbor_count(PUBLIC_NET) > 0).then_some(())
+    })
+    .await;
+    let missed = note(4343, now_secs() - 30);
+    hold(&a, std::slice::from_ref(&missed));
+    eventually("C gets the relayed event", 30, || {
+        seq(&c, &missed.id).map(|_| ())
+    })
+    .await;
+    for node in [a, b, c] {
+        node.shutdown().await?;
+    }
+    Ok(())
+}
+
+/// The gossip ping (0.4.11): B says it pings but never does, so A hears
+/// nothing from it for three rounds and gives it a fresh gossip link.
+/// Gossip from A still reaches B afterwards.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_silent_gossip_neighbor_gets_a_fresh_link() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let mut b_config = config(&dir.path().join("b"), &[]);
+    b_config.gossip_ping = Duration::from_secs(3600);
+    let b = Node::start(b_config).await?;
+    let mut a_config = config(&dir.path().join("a"), &[&b]);
+    a_config.gossip_ping = Duration::from_millis(300);
+    let a = Node::start(a_config).await?;
+    eventually("A resets the silent link", 30, || {
+        (a.link_resets() > 0).then_some(())
+    })
+    .await;
+    assert_eq!(b.link_resets(), 0, "B heard A's pings");
+    let posted = a
+        .publish(
+            Draft {
+                net: PUBLIC_NET.into(),
+                kind: Some(Kind::Note),
+                title: Some("after the reset".into()),
+                text: "after the reset".into(),
+                ..Draft::default()
+            },
+            &[],
+        )
+        .await?;
+    eventually("B gets it by gossip", 30, || {
+        seq(&b, &posted.id).map(|_| ())
+    })
+    .await;
+    for node in [a, b] {
+        node.shutdown().await?;
+    }
+    Ok(())
+}

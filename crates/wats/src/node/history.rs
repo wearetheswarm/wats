@@ -10,6 +10,11 @@
 //! - **Catch-up** (after a stop or an offline period): a pending range from
 //!   now down to the watermark, walked newest first too, resumable from its
 //!   cursor. The watermark moves only once no range is pending.
+//! - **Anti-entropy** (while online): every few minutes, the newest pages
+//!   of each `sync_desc` neighbor since [`ANTI_ENTROPY_WINDOW`] ago, so
+//!   that an event gossip did not deliver (a broadcast lost on a link, a
+//!   neighbor set that changed under it) arrives anyway, hop by hop,
+//!   without waiting for a restart.
 //! - **Older peers** (neighbors without `sync_desc`), always pulled when
 //!   any is up: ascending windows of 7 days, then 14, 28…, each read until
 //!   it meets the history the previous one brought, until the budget is
@@ -104,6 +109,17 @@ const PROBE_MAX: Duration = Duration::from_secs(3600);
 const RETRY_MAX: Duration = Duration::from_secs(1800);
 /// Checks of neighbors that came up while online, per hour.
 const JOIN_CHECKS_PER_HOUR: usize = 12;
+/// Anti-entropy reads each `sync_desc` neighbor back this far: several
+/// rounds of [`Tuning::anti_entropy`], so that an event a hop takes a
+/// round to pass on still falls in the next hop's window.
+pub const ANTI_ENTROPY_WINDOW: Duration = Duration::from_secs(30 * 60);
+/// Default of `sync.anti_entropy`.
+pub const DEFAULT_ANTI_ENTROPY: Duration = Duration::from_secs(5 * 60);
+/// An event a neighbor held this long (by its `ts`) that gossip had not
+/// brought here: the link to that neighbor is taken for dead.
+const STALE_LAG: Duration = Duration::from_secs(120);
+/// Events relayed per anti-entropy round, at most.
+const RELAY_MAX: usize = 500;
 /// The first window asked from older peers; each next one doubles.
 const OLDER_WINDOW_SECS: u64 = 7 * 24 * 3600;
 
@@ -116,6 +132,8 @@ pub struct Tuning {
     pub page_pause: Duration,
     /// Pending ranges are tried again this often.
     pub retry: Duration,
+    /// Anti-entropy runs this often while no range is pending (zero: never).
+    pub anti_entropy: Duration,
     /// Test only: behave as 0.4.0 on `/wats/1` (no `sync_desc`, no `get`,
     /// no history task, an ascending pull from every new neighbor).
     pub legacy: bool,
@@ -136,6 +154,7 @@ impl Default for Tuning {
             page: proto::MAX_SYNC_PAGE,
             page_pause: Duration::ZERO,
             retry: Duration::from_secs(60),
+            anti_entropy: DEFAULT_ANTI_ENTROPY,
             legacy: false,
             rotation_check: Duration::from_secs(30),
             rotation_pause: Duration::from_millis(5),
@@ -269,6 +288,13 @@ struct Pass {
     completed: HashSet<EndpointId>,
     /// Neighbors whose union read brought events this node did not hold.
     brought: HashSet<EndpointId>,
+    /// Anti-entropy: keep what is new, to relay it on gossip.
+    relay: bool,
+    /// What anti-entropy brought, and from whom.
+    pulled: Vec<(Value, EndpointId)>,
+    /// Neighbors that held events older than [`STALE_LAG`] that gossip had
+    /// not brought here: their gossip link to this node looks dead.
+    stale: HashSet<EndpointId>,
 }
 
 impl Pass {
@@ -586,6 +612,10 @@ impl Node {
                 .retain(|f| f != proto::FEATURE_SYNC_DESC && f != proto::FEATURE_GET);
         } else if self.history_full() {
             info.features.push(proto::FEATURE_HISTORY_FULL.to_string());
+        }
+        // Not pinging: never judged silent by its neighbors.
+        if self.config.gossip_ping.is_zero() {
+            info.features.retain(|f| f != proto::FEATURE_GOSSIP_PING);
         }
         info
     }
@@ -1823,6 +1853,14 @@ impl Node {
             }
             match self.accept_value(value.clone(), Origin::Pulled).await {
                 Ok(Some((event, new))) => {
+                    if new && pass.relay {
+                        if pass.pulled.len() < RELAY_MAX {
+                            pass.pulled.push((value.clone(), peer));
+                        }
+                        if now_secs().saturating_sub(h.ts) > STALE_LAG.as_secs() {
+                            pass.stale.insert(peer);
+                        }
+                    }
                     if new && walk.author_cap.is_some() {
                         let used = pass.author_bytes.entry(chain).or_default();
                         *used = used.saturating_add(size);
@@ -2504,6 +2542,62 @@ impl Node {
         Ok(())
     }
 
+    /// Anti-entropy (ADR 0025 §5, amended in 0.4.11): the newest pages of
+    /// each `sync_desc` neighbor, down to [`ANTI_ENTROPY_WINDOW`] ago,
+    /// stopping at a neighbor once two pages in a row bring nothing new.
+    /// Cheap when gossip did its job; when it did not, what a neighbor
+    /// holds arrives within a round, and spreads a hop per round.
+    async fn anti_entropy(&self, net: &str) -> Result<()> {
+        let peers: Vec<EndpointId> = self
+            .neighbors_of(net)
+            .into_iter()
+            .filter(|p| self.has_feature(p, proto::FEATURE_SYNC_DESC))
+            .collect();
+        if peers.is_empty() {
+            return Ok(());
+        }
+        let now = now_secs();
+        let walk = Walk {
+            floor: now
+                .saturating_sub(ANTI_ENTROPY_WINDOW.as_secs())
+                .saturating_sub(MAX_CLOCK_SKEW_SECS),
+            stop_at: self.history_budget().map(|b| {
+                self.store
+                    .store_bytes()
+                    .saturating_add(percent(b, UNION_SHARE))
+            }),
+            ..Walk::default()
+        };
+        let mut pass = Pass {
+            relay: true,
+            ..Pass::default()
+        };
+        self.union_check(
+            net,
+            now.saturating_add(MAX_CLOCK_SKEW_SECS),
+            &peers,
+            &walk,
+            &mut pass,
+            false,
+        )
+        .await?;
+        if pass.pulled.is_empty() {
+            return Ok(());
+        }
+        info!(
+            %net,
+            events = pass.pulled.len(),
+            peers = pass.brought.len(),
+            "history: anti-entropy brought events gossip had not delivered; relaying them"
+        );
+        self.relay_pulled(net, &pass.pulled).await;
+        for peer in pass.stale {
+            self.reset_link(net, peer, "it held events gossip had not brought")
+                .await;
+        }
+        Ok(())
+    }
+
     /// Whether a pending range of `net` remains.
     fn history_pending(&self, net: &str) -> bool {
         self.store
@@ -2513,8 +2607,10 @@ impl Node {
 }
 
 /// The history task of one network: a pass on every kick (a neighbor up,
-/// a network change), and every `retry` while a range is pending.
+/// a network change), every `retry` while a range is pending, and
+/// anti-entropy every `anti_entropy` otherwise.
 async fn history_loop(weak: Weak<Node>, net: String, kick: Arc<Notify>) {
+    let mut last_anti = std::time::Instant::now();
     loop {
         let wait = {
             let Some(node) = weak.upgrade() else { return };
@@ -2524,14 +2620,25 @@ async fn history_loop(weak: Weak<Node>, net: String, kick: Arc<Notify>) {
             if let Err(e) = node.history_pass(&net).await {
                 debug!(%net, "history pass: {e:#}");
             }
+            let every = node.config.history.anti_entropy;
+            if !every.is_zero() && !node.history_pending(&net) && last_anti.elapsed() >= every {
+                last_anti = std::time::Instant::now();
+                if let Err(e) = node.anti_entropy(&net).await {
+                    debug!(%net, "anti-entropy: {e:#}");
+                }
+            }
             if node.history_pending(&net) {
                 let failed = node.set_progress(&net, |p| p.failed).unwrap_or(0);
                 let retry = node.config.history.retry;
                 retry
                     .saturating_mul(1u32 << failed.min(10))
                     .min(RETRY_MAX.max(retry))
-            } else {
+            } else if every.is_zero() {
                 Duration::from_secs(3600)
+            } else {
+                every
+                    .saturating_sub(last_anti.elapsed())
+                    .max(Duration::from_secs(1))
             }
         };
         let _ = tokio::time::timeout(wait, kick.notified()).await;

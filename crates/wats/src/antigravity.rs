@@ -20,8 +20,8 @@
 //!   antigravity`, that hard-denies every tool but the wats ones (the
 //!   rules do not cover the browser, subagents, messages or images).
 //!
-//! Only `swarm-only` in this version: `workspace` waits for check (d),
-//! `inherit` for a per-run MCP config.
+//! `workspace` by default since 0.4.11, `swarm-only` on request; no
+//! `inherit` until Antigravity has a per-run MCP config.
 
 use std::path::{Path, PathBuf};
 
@@ -54,10 +54,11 @@ pub const TOOL_ARGS: &str = "\n\nThe wats tools go through call_mcp_tool with Se
      ask|offer|announce|note, title, text; tags, refs, data}; digest {title, text, refs; \
      reply_to, supersedes, tags}; wait {thread, kinds, timeout}; who {tags}; status {}.";
 
-/// Antigravity's access level (ADR 0038 §2.2): swarm-only by default,
-/// workspace (check (d): Ask fails closed headless), never inherit.
+/// Antigravity's access level (ADR 0038 §2.2): workspace by default since
+/// 0.4.11 (check (d): Ask fails closed headless), swarm-only on request,
+/// never inherit.
 pub fn access(value: Option<&str>) -> Result<Access> {
-    let level = value.map_or(Ok(Access::SwarmOnly), str::parse)?;
+    let level = value.map_or(Ok(Access::Workspace), str::parse)?;
     if level == Access::Inherit {
         bail!(
             "agent.access = inherit is not available with Antigravity CLI: it has no per-run \
@@ -75,8 +76,12 @@ pub struct Lock {
     pub workspace: bool,
     /// `agent.tools` lists `shell` (run under `--sandbox`).
     pub shell: bool,
-    /// `agent.tools` lists `web`.
-    pub web: bool,
+    /// `agent.tools` lists `web-search` (or `web`, both).
+    pub web_search: bool,
+    /// `agent.tools` lists `web-fetch` (or `web`, both).
+    pub web_fetch: bool,
+    /// `agent.tools` lists `image`: `generate_image`.
+    pub image: bool,
     /// The lent MCP servers.
     pub servers: Vec<String>,
 }
@@ -92,7 +97,9 @@ impl Lock {
         Lock {
             workspace: true,
             shell: lists("shell"),
-            web: lists("web"),
+            web_search: lists("web") || lists("web-search"),
+            web_fetch: lists("web") || lists("web-fetch"),
+            image: lists("image"),
             servers: servers.to_vec(),
         }
     }
@@ -103,7 +110,9 @@ impl Lock {
         for (on, flag) in [
             (self.workspace, "--workspace"),
             (self.shell, "--shell"),
-            (self.web, "--web"),
+            (self.web_search, "--web-search"),
+            (self.web_fetch, "--web-fetch"),
+            (self.image, "--image"),
         ] {
             if on {
                 out.push(flag.to_string());
@@ -190,7 +199,7 @@ pub fn permissions(lock: &Lock) -> Value {
     if !lock.shell {
         deny.push("command(*)");
     }
-    if !lock.web {
+    if !lock.web_fetch {
         deny.extend(["read_url(*)", "execute_url(*)"]);
     }
     json!({"allow": allow, "deny": deny})
@@ -410,7 +419,9 @@ pub fn decide(payload: &Value, lock: &Lock) -> Value {
         server == SERVER || (lock.workspace && lock.servers.contains(&server))
     }) || (lock.workspace && is_file_tool(&name))
         || (lock.shell && is_shell_tool(&name))
-        || (lock.web && is_web_tool(&name));
+        || (lock.web_search && is_search_tool(&name))
+        || (lock.web_fetch && is_fetch_tool(&name))
+        || (lock.image && name == "generate_image");
     if allowed {
         json!({"decision": "allow"})
     } else {
@@ -468,9 +479,14 @@ fn is_shell_tool(name: &str) -> bool {
     !name.contains("browser") && (name.contains("command") || name.contains("terminal"))
 }
 
-/// Web tools (`search_web`, `read_url_content`), not the browser.
-fn is_web_tool(name: &str) -> bool {
-    !name.contains("browser") && (name.contains("web") || name.contains("url"))
+/// Web search tools (`search_web`), not the browser.
+fn is_search_tool(name: &str) -> bool {
+    !name.contains("browser") && name.contains("web") && !name.contains("url")
+}
+
+/// URL fetch tools (`read_url_content`), not the browser.
+fn is_fetch_tool(name: &str) -> bool {
+    !name.contains("browser") && name.contains("url")
 }
 
 /// The LLM tokens of a `result` event's usage.
@@ -495,7 +511,7 @@ mod tests {
 
     #[test]
     fn levels_and_arguments() {
-        assert_eq!(access(None).unwrap(), Access::SwarmOnly);
+        assert_eq!(access(None).unwrap(), Access::Workspace);
         assert_eq!(access(Some("workspace")).unwrap(), Access::Workspace);
         assert!(access(Some("inherit")).is_err());
         assert!(check_extra_args(&s(&["--effort=high"])).is_ok());
@@ -506,11 +522,19 @@ mod tests {
             Lock::default()
         );
         let lock = Lock::of(Access::Workspace, &s(&["web"]), &s(&["crm"]));
-        assert!(lock.workspace && lock.web && !lock.shell);
+        assert!(lock.workspace && lock.web_search && lock.web_fetch && !lock.shell);
         assert_eq!(
             lock.gate_args(),
-            s(&["--workspace", "--web", "--server", "crm"])
+            s(&[
+                "--workspace",
+                "--web-search",
+                "--web-fetch",
+                "--server",
+                "crm"
+            ])
         );
+        let split = Lock::of(Access::Workspace, &s(&["web-search", "image"]), &[]);
+        assert!(split.web_search && !split.web_fetch && split.image);
     }
 
     #[test]

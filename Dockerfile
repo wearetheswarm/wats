@@ -21,6 +21,7 @@ ENV RUSTUP_TOOLCHAIN=1.99.0 \
     CARGO_TERM_COLOR=never
 COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
+COPY vendor ./vendor
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/src/target \
     cargo build --release --locked --bin wats \

@@ -102,6 +102,8 @@ fn config(dir: &Path, command: PathBuf, access: Access) -> AgentConfig {
         mcp_file: None,
         env: Vec::new(),
         model: Some("azure/gpt-test".into()),
+        // The extra --variant wins: no second one.
+        effort: Some("high".into()),
         work_dir: work,
         data_dir: dir.join("data"),
         keep_runs: 100,

@@ -302,6 +302,17 @@ struct NodeArgs {
     /// router, bootstrap nodes, indexers).
     #[arg(long, global = true, env = "WATS_SYNC_INITIAL_MAX", value_parser = wats::settings::parse_initial_max)]
     sync_initial_max: Option<wats::settings::InitialMax>,
+    /// How often the node reads its gossip neighbors' newest events and
+    /// relays what gossip had not delivered, such as 5m (0: never).
+    #[arg(long, global = true, env = "WATS_SYNC_ANTI_ENTROPY")]
+    sync_anti_entropy: Option<String>,
+    /// Gossip neighbors the node keeps (default 5).
+    #[arg(long, global = true, env = "WATS_GOSSIP_ACTIVE_VIEW", value_parser = clap::value_parser!(u64).range(1..=64))]
+    gossip_active_view: Option<u64>,
+    /// How often the node pings its gossip neighbors, such as 1m (0: no
+    /// ping, no silent-link reset, no diversity join).
+    #[arg(long, global = true, env = "WATS_GOSSIP_PING")]
+    gossip_ping: Option<String>,
     /// For tests, with --hermetic only: collect blobs every this many
     /// milliseconds instead of hourly.
     #[arg(long, global = true, hide = true, env = "WATS_TEST_BLOB_GC_MS")]
@@ -445,9 +456,18 @@ enum Command {
         /// The shell is lent.
         #[arg(long)]
         shell: bool,
-        /// The web is lent.
+        /// Web search and URL fetch are lent (0.4.9 and 0.4.10 hooks).
         #[arg(long)]
         web: bool,
+        /// Web search is lent.
+        #[arg(long)]
+        web_search: bool,
+        /// URL fetch is lent.
+        #[arg(long)]
+        web_fetch: bool,
+        /// Image generation is lent.
+        #[arg(long)]
+        image: bool,
         /// A lent MCP server.
         #[arg(long = "server", value_name = "NAME")]
         servers: Vec<String>,
@@ -1565,19 +1585,17 @@ fn openclaw_mcp_set(
 ///    `<file>.bak-<UTC timestamp>`.
 /// 2. `openclaw config get` of the two hooks lists, merged with ours
 ///    (`patch` replaces arrays).
-/// 3. `hooks.token`: a SecretRef to the environment variable when `openclaw
-///    config set` supports `--ref-source`, else the `${VAR}` reference in
-///    the patch.
+/// 3. `hooks.token`: the `${VAR}` template in the patch (OpenClaw refuses a
+///    SecretRef there).
 /// 4. The patch is printed, then `openclaw config patch --stdin --dry-run`,
 ///    `openclaw config patch --stdin` and `openclaw config validate`.
 ///
 /// Any failure from the first write on restores the backup and fails.
-/// Returns whether `hooks.token` is a SecretRef.
 fn apply_openclaw_config(
     openclaw: &std::path::Path,
     agent_id: &str,
     hooks_token: &str,
-) -> Result<bool> {
+) -> Result<()> {
     use wats::openclaw as oc;
     let output = run_openclaw(openclaw, &["config", "file"])?;
     openclaw_ok(&output, "config file")?;
@@ -1618,43 +1636,31 @@ fn apply_openclaw_config(
         &list("hooks.allowedSessionKeyPrefixes"),
         &[oc::SESSION_PREFIX],
     );
-    // What `config set` supports: SecretRefs (`--ref-source`), and the
-    // provider its ref builder requires since 2026.6 (`--ref-provider`).
-    let help = run_openclaw(openclaw, &["config", "set", "--help"])
-        .ok()
-        .filter(|output| output.status.success())
-        .map(|output| {
-            format!(
-                "{}{}",
-                String::from_utf8_lossy(&output.stdout),
-                String::from_utf8_lossy(&output.stderr)
-            )
-        })
-        .unwrap_or_default();
-    let token_ref = help.contains("--ref-source");
-    let patch = serde_json::to_string_pretty(&oc::config_patch(
-        agent_id, &agent_ids, &prefixes, token_ref,
-    ))?;
+    // `patch` replaces the list: the user's agents go back in. Unset is
+    // empty; anything else unreadable stops here, before any write.
+    let agents = match run_openclaw(openclaw, &["config", "get", "agents.list"]) {
+        Ok(output) if output.status.success() => {
+            oc::parse_agents_list(&String::from_utf8_lossy(&output.stdout))?
+        }
+        _ => Vec::new(),
+    };
+    let patch =
+        serde_json::to_string_pretty(&oc::config_patch(agent_id, &agent_ids, &prefixes, &agents))?;
     println!("The patch for `openclaw config patch` (objects merge, lists replace):\n\n{patch}\n");
-    let secret_ref = oc::secret_ref_args(help.contains("--ref-provider"));
-    if token_ref {
-        println!(
-            "hooks.token: a SecretRef to the environment variable {} (`openclaw {}`)",
-            oc::HOOKS_TOKEN_ENV,
-            secret_ref.join(" ")
-        );
-    }
 
     let applied = (|| -> Result<()> {
-        if token_ref {
-            let output = run_openclaw(openclaw, &secret_ref)?;
-            openclaw_ok(&output, "config set hooks.token --ref-source env")?;
-        }
+        // The dry run and the write resolve `${VAR}` templates: the token
+        // is in their environment only, never written.
         for args in [
             &["config", "patch", "--stdin", "--dry-run"][..],
             &["config", "patch", "--stdin"][..],
         ] {
-            let output = run_openclaw_with(openclaw, args, Some(patch.as_bytes()), &[])?;
+            let output = run_openclaw_with(
+                openclaw,
+                args,
+                Some(patch.as_bytes()),
+                &[(oc::HOOKS_TOKEN_ENV, hooks_token)],
+            )?;
             openclaw_ok(&output, &args[1..].join(" "))?;
         }
         // The token is in this process's environment only, so that a
@@ -1669,7 +1675,7 @@ fn apply_openclaw_config(
     })();
     let Err(error) = applied else {
         println!("OpenClaw's config: applied, and `openclaw config validate` passes");
-        return Ok(token_ref);
+        return Ok(());
     };
     let error = anyhow::anyhow!("{}", format!("{error:#}").replace(hooks_token, "<token>"));
     let restored = match &backup {
@@ -2071,19 +2077,21 @@ fn setup_openclaw(
              openclaw.json{how}. Put this line in the environment the gateway runs in (e.g. \
              its launch agent or systemd unit). This is the only place the token is printed; \
              wats keeps it in {}:\n\n\
-             export {}={hooks_token}\n",
+             export {}={hooks_token}\n\n\
+             A gateway run as a service also reads OpenClaw's .env at start (~/.openclaw/.env, \
+             or $OPENCLAW_STATE_DIR/.env), with nothing to change in the service:\n\n  \
+             (umask 077; printf '{}=%s\\n' \"$(cat {})\" >> ~/.openclaw/.env)\n  \
+             openclaw gateway restart\n",
             oc::hooks_token_path(data_dir).display(),
-            oc::HOOKS_TOKEN_ENV
+            oc::HOOKS_TOKEN_ENV,
+            oc::HOOKS_TOKEN_ENV,
+            oc::hooks_token_path(data_dir).display(),
         )
     };
     if automatic {
-        let token_ref = apply_openclaw_config(openclaw, &agent_id, &hooks_token)?;
-        token_line(if token_ref {
-            " (hooks.token is a SecretRef to that variable)"
-        } else {
-            ""
-        });
-        println!("Then restart the gateway (e.g. `openclaw gateway restart`).");
+        apply_openclaw_config(openclaw, &agent_id, &hooks_token)?;
+        token_line(" (hooks.token is the template ${WATS_OPENCLAW_HOOKS_TOKEN})");
+        println!("Then restart the gateway (`openclaw gateway restart`).");
     } else {
         println!(
             "\nPaste this into OpenClaw's config (openclaw.json, JSON5; wats never edits it), \
@@ -2092,9 +2100,8 @@ fn setup_openclaw(
         );
         token_line("");
         println!(
-            "To keep even that reference out of openclaw.json, make hooks.token a SecretRef \
-             instead of its `token:` line:\n  openclaw {}",
-            oc::secret_ref_args(true).join(" ")
+            "If your config already has a hooks block, its token alone:\n  {}",
+            oc::hooks_token_command()
         );
         match run_openclaw(openclaw, &["config", "validate"]) {
             Ok(output) if output.status.success() => {
@@ -2586,13 +2593,13 @@ fn setup_tool(
         }
         // Said in the file, not only by default: Vibe's level is never
         // `workspace`, whatever a shared `[agent]` table says.
-        // Copilot's default level is swarm-only too (ADR 0038): said in
-        // the file as well.
-        if matches!(runtime, "vibe" | "copilot" | "antigravity")
-            && agent
-            && file.get(&key("access")).is_none()
-        {
+        if runtime == "vibe" && agent && file.get(&key("access")).is_none() {
             file.set(&key("access"), "swarm-only")?;
+        }
+        // What `wats share` would check: the runtime's own tools, the web
+        // included, no shell (0.4.11).
+        if agent {
+            apply_share_defaults(&mut file, &key, runtime)?;
         }
         file.save()?;
         if let Some(note) = keys.access.as_deref().and_then(wats::access::deprecation) {
@@ -2610,6 +2617,25 @@ fn setup_tool(
         let member = wats::roster::configured(&settings, data_dir, &os_user_profile())?
             .into_iter()
             .find(|m| m.name == agent_name);
+        // On a terminal, an agent nobody budgeted yet: the wizard's budget
+        // question (ADR 0034), as `wats setup` asks it (0.4.11).
+        if agent
+            && std::io::IsTerminal::is_terminal(&std::io::stdin())
+            && let Some(member) = &member
+            && !wats::firstrun::has_budget(&member.settings)
+            && !wats::budget::confirmed(&member.work_dir)
+            && let Some(line) = wats::firstrun::ask_agent_budget(
+                data_dir,
+                &mut std::io::stdin().lock(),
+                &mut std::io::stdout(),
+                &member.name,
+                runtime,
+                &member.settings,
+                &member.work_dir,
+            )?
+        {
+            println!("budget: {line}");
+        }
         if let Some(member) = &member
             && wats::access::level_for(
                 member.runtime.as_deref().unwrap_or_default(),
@@ -2827,6 +2853,7 @@ async fn setup_command(
             std::env::var_os("PATH").as_deref(),
         )?;
         print!("{}", welcome::step(2, style));
+        wizard_share_defaults(data_dir, &choices)?;
         let mcp = offer_integrations(node, data_dir, &choices, &found)?;
         if choices.runtime.is_some() {
             offer_more_agents(node, data_dir)?;
@@ -3374,6 +3401,7 @@ async fn setup_wizard(node: &NodeArgs, data_dir: &std::path::Path) -> Result<boo
         std::env::var_os("PATH").as_deref(),
     )?;
     print!("{}", welcome::step(2, style));
+    wizard_share_defaults(data_dir, &choices)?;
     let mcp = offer_integrations(node, data_dir, &choices, &found)?;
     if choices.runtime.is_some() {
         offer_more_agents(node, data_dir)?;
@@ -4123,6 +4151,68 @@ fn antigravity_login(args: &NodeArgs, work_dir: &std::path::Path) -> Result<()> 
             antigravity::COMMAND
         ),
     }
+    Ok(())
+}
+
+/// After the wizard: the agent it set up gets the share defaults
+/// ([`apply_share_defaults`]), in its `[agents.<runtime>]` table.
+fn wizard_share_defaults(
+    data_dir: &std::path::Path,
+    choices: &wats::firstrun::Choices,
+) -> Result<()> {
+    let Some(runtime) = choices.runtime.clone() else {
+        return Ok(());
+    };
+    let settings = Settings::load(data_dir)?;
+    let Some(member) = wats::roster::configured(&settings, data_dir, &os_user_profile())?
+        .into_iter()
+        .find(|m| m.runtime.as_deref() == Some(runtime.as_str()) && m.enabled)
+    else {
+        return Ok(());
+    };
+    let mut file = ConfigFile::open(data_dir)?;
+    let key = |leaf: &str| member_key(&member, leaf);
+    apply_share_defaults(&mut file, &key, &runtime)?;
+    file.save()
+}
+
+/// Before any `wats share`: an agent of a runtime that lends gets the
+/// default checklist (its native tools, not running commands, and their
+/// caps), when its table sets no `tools` yet. Said once.
+fn apply_share_defaults(
+    file: &mut ConfigFile,
+    key: &dyn Fn(&str) -> String,
+    runtime: &str,
+) -> Result<()> {
+    if !wats::share::supports(runtime) || file.get(&key("tools")).is_some() {
+        return Ok(());
+    }
+    let lending = wats::share::default_lending(runtime);
+    if lending.tools.is_empty() {
+        return Ok(());
+    }
+    file.set(&key("tools"), &lending.tools.join(","))?;
+    let mut caps: Vec<String> = file
+        .get(&key("caps"))
+        .map(|v| {
+            v.trim_matches(|c| c == '[' || c == ']')
+                .split(',')
+                .map(|c| c.trim().trim_matches('"').to_string())
+                .filter(|c| !c.is_empty())
+                .collect()
+        })
+        .unwrap_or_default();
+    for cap in lending.caps {
+        if !caps.contains(&cap) {
+            caps.push(cap);
+        }
+    }
+    file.set(&key("caps"), &caps.join(","))?;
+    println!(
+        "{}: [{}] (`wats share` changes them; running commands stays off)",
+        key("tools"),
+        lending.tools.join(", ")
+    );
     Ok(())
 }
 
@@ -5060,13 +5150,17 @@ async fn status_command(config: &NodeConfig, json: bool, local: bool) -> Result<
         {
             let s = |v: &serde_json::Value| v.as_str().unwrap_or("-").to_string();
             println!(
-                "agent {} ({}): {}, posts as {} · last run {} · budget {}",
+                "agent {} ({}): {}, posts as {} · last run {} · budget {}{}",
                 s(&agent["name"]),
                 s(&agent["runtime"]),
                 s(&agent["state"]),
                 s(&agent["profile"]),
                 s(&agent["last_run"]),
                 s(&agent["budget"]),
+                agent["shell"]
+                    .as_str()
+                    .map(|shell| format!(" · shell: {shell}"))
+                    .unwrap_or_default(),
             );
         }
         if let Some(retractions) = &retractions {
@@ -6323,6 +6417,19 @@ impl NodeArgs {
                 .map_err(|e| anyhow::anyhow!("config.toml sync.initial_max: {e}"))?
                 .unwrap_or_default(),
         };
+        match (&self.sync_anti_entropy, &file.sync.anti_entropy) {
+            (Some(every), _) => {
+                config.history.anti_entropy = wats::settings::parse_retention(every)
+                    .map_err(|e| anyhow::anyhow!("--sync-anti-entropy: {e}"))?
+                    .unwrap_or_default();
+            }
+            (None, Some(every)) => {
+                config.history.anti_entropy = wats::settings::parse_retention(every)
+                    .map_err(|e| anyhow::anyhow!("config.toml sync.anti_entropy: {e}"))?
+                    .unwrap_or_default();
+            }
+            (None, None) => {}
+        }
         for addr in &self.external_addrs {
             config.external_addrs.push(
                 addr.parse()
@@ -6420,6 +6527,19 @@ impl NodeArgs {
                 "config.toml reputation.threshold: not a number"
             );
             config.reputation.threshold = threshold;
+        }
+        if let Some(view) = self.gossip_active_view.or(file.gossip.active_view) {
+            anyhow::ensure!(
+                (1..=64).contains(&view),
+                "config.toml gossip.active_view: {view} is not 1-64"
+            );
+            config.gossip_active_view =
+                usize::try_from(view).unwrap_or(wats::node::GOSSIP_ACTIVE_VIEW);
+        }
+        if let Some(every) = self.gossip_ping.as_ref().or(file.gossip.ping.as_ref()) {
+            config.gossip_ping = wats::settings::parse_retention(every)
+                .map_err(|e| anyhow::anyhow!("gossip.ping: {e}"))?
+                .unwrap_or_default();
         }
         if let Some(after) = &file.health.no_peers_after {
             config.no_peers_after = wats::settings::parse_retention(after)
@@ -6564,6 +6684,15 @@ impl NodeArgs {
                 args.push(format!("--sync-initial-max={n}").into());
             }
             None => {}
+        }
+        if let Some(every) = &self.sync_anti_entropy {
+            args.push(format!("--sync-anti-entropy={every}").into());
+        }
+        if let Some(view) = self.gossip_active_view {
+            args.push(format!("--gossip-active-view={view}").into());
+        }
+        if let Some(every) = &self.gossip_ping {
+            args.push(format!("--gossip-ping={every}").into());
         }
         if let Some(file) = &self.secret_file {
             let mut arg = std::ffi::OsString::from("--secret-file=");
@@ -7001,6 +7130,18 @@ fn agent_info(
         running,
         work_dir: member.work_dir.clone(),
         budget,
+        shell: member.runtime.as_deref().and_then(|runtime| {
+            let workspace = wats::access::level_for(runtime, member.settings.access.as_deref())
+                .ok()
+                == Some(wats::access::Access::Workspace);
+            (workspace
+                && member
+                    .settings
+                    .tools
+                    .iter()
+                    .any(|t| wats::access::gives_shell(t)))
+            .then(|| wats::access::shell_sandbox(runtime))
+        }),
     }
 }
 
@@ -7150,6 +7291,11 @@ fn agent_config(
             wats::vibe::check_model(model.trim())?;
         }
     }
+    if file.effort.as_deref().is_some_and(|e| !e.trim().is_empty())
+        && !wats::agent::takes_effort(&runtime)
+    {
+        tracing::warn!("agent.effort is ignored: {runtime} runs take no effort setting");
+    }
     // Lent servers (ADR 0037): refused without review or allow.
     wats::share::check_lend(
         &runtime,
@@ -7182,6 +7328,7 @@ fn agent_config(
             .clone()
             .or(file.model.clone())
             .filter(|m| !m.trim().is_empty()),
+        effort: file.effort.clone().filter(|e| !e.trim().is_empty()),
         codex_disable: Vec::new(),
         codex_enable: Vec::new(),
         access,
@@ -7969,13 +8116,18 @@ fn main() -> Result<()> {
         workspace,
         shell,
         web,
+        web_search,
+        web_fetch,
+        image,
         servers,
     }) = &cli.command
     {
         let lock = wats::antigravity::Lock {
             workspace: *workspace,
             shell: *shell,
-            web: *web,
+            web_search: *web || *web_search,
+            web_fetch: *web || *web_fetch,
+            image: *image,
             servers: servers.clone(),
         };
         return gate_command(host, &lock);
