@@ -2277,7 +2277,8 @@ impl Node {
                     .title
                     .clone()
                     .unwrap_or_else(|| crate::event::title_from_text(&ask.event.text));
-                let text = crate::desktop::reply_text(&title, &reply);
+                let local = node.local_profile(&reply.author);
+                let text = crate::desktop::reply_text(&title, &reply, local.as_deref());
                 let notifier = notifier.clone();
                 tokio::spawn(async move {
                     match notifier.send(crate::desktop::TITLE, &text).await {

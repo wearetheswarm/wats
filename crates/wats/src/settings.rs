@@ -908,7 +908,8 @@ pub const KEYS: &[Key] = &[
         "notify.desktop",
         ValueType::Bool,
         "auto",
-        "a desktop notification (osascript, notify-send) when someone answers or clarifies \
+        "a desktop notification (terminal-notifier or osascript, notify-send) when someone \
+         answers or clarifies \
          one of your asks; auto: on with a desktop session (macOS, or DISPLAY or \
          WAYLAND_DISPLAY set; not over SSH), off on servers and in containers",
     ),

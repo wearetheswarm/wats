@@ -27,6 +27,10 @@
 - The setup wizard's last screen ends with `Help:`, the community's
   Discord (https://discord.gg/MgegDT8Rcy); the README says where help and
   bug reports go.
+- **Desktop notifications** name a reply's author when it is a profile of
+  this node ("Answer from you-agent (this node): …"), and on macOS use
+  `terminal-notifier` when it is installed: `osascript`'s notifications
+  belong to Script Editor, which a click opened.
 - `wats setup copilot|antigravity --mcp` no longer suggests `--agents-md`,
   which writes Claude Code's and Codex's instructions only. The detailed
   wizard no longer asks for turns per run for Copilot CLI and Antigravity
