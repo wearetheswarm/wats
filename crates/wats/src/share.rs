@@ -388,13 +388,94 @@ pub struct CodexLent {
     pub warnings: Vec<String>,
 }
 
+/// Words that make an argument, or the flag before it, look like it
+/// carries a secret.
+const SECRET_WORDS: [&str; 9] = [
+    "token",
+    "key",
+    "secret",
+    "password",
+    "passwd",
+    "bearer",
+    "auth",
+    "credential",
+    "cookie",
+];
+
+/// Prefixes of well-known credentials.
+const SECRET_PREFIXES: [&str; 8] = [
+    "sk-",
+    "ghp_",
+    "gho_",
+    "github_pat_",
+    "glpat-",
+    "xox",
+    "akia",
+    "aiza",
+];
+
+/// Whether one value looks like it holds a secret: a secret word, a
+/// credential prefix, or a long random-looking string.
+fn looks_secret(value: &str) -> bool {
+    let lower = value.to_ascii_lowercase();
+    SECRET_WORDS.iter().any(|w| lower.contains(w))
+        || SECRET_PREFIXES.iter().any(|p| lower.starts_with(p))
+        || (value.len() >= 32
+            && value
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | '=')))
+}
+
+/// Why a Codex server cannot be lent without a secret on Codex's command
+/// line, which other local users can list (`ps`): its `command`, `args`
+/// or `url` look like they hold one (a URL with a query or a user part,
+/// an argument or flag naming a token or key, a credential prefix). Codex
+/// takes lent servers only as `-c` overrides; `env`, `env_vars` and
+/// headers go through the environment ([`codex_lent`]).
+pub fn codex_secret_on_argv(definition: &Value) -> Option<String> {
+    if let Some(url) = definition["url"].as_str()
+        && (url.contains('?')
+            || url.contains('#')
+            || url
+                .split("://")
+                .nth(1)
+                .is_some_and(|r| r.split('/').next().is_some_and(|host| host.contains('@'))))
+    {
+        return Some("its url has a query or credentials".into());
+    }
+    if definition["command"].as_str().is_some_and(looks_secret) {
+        return Some("its command looks like it holds a secret".into());
+    }
+    let args: Vec<&str> = definition["args"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .collect();
+    if args.iter().any(|a| looks_secret(a)) {
+        return Some("an argument looks like it holds a secret".into());
+    }
+    None
+}
+
 /// [`CodexLent`] of `servers`, narrowed to the tools `agent.tools` names.
+/// A server whose command line would carry a secret is not lent
+/// ([`codex_secret_on_argv`]).
 pub fn codex_lent(servers: &[(String, Value)], tools: &[String]) -> CodexLent {
     let mut out = CodexLent::default();
     for (name, definition) in servers {
         let Some(fields) = definition.as_object() else {
             continue;
         };
+        if let Some(why) = codex_secret_on_argv(definition) {
+            out.warnings.push(format!(
+                "agent.servers {name:?}: not used with Codex: {why}, and Codex takes the \
+                 servers it is given on its command line, which other users of this machine \
+                 can list. Move the secret to the server's env (or env_vars, \
+                 bearer_token_env_var) in your Codex config.toml"
+            ));
+            continue;
+        }
         let mut env: Vec<(String, String)> = Vec::new();
         let mut forwarded: Vec<Value> = fields
             .get("env_vars")
@@ -737,6 +818,30 @@ mod tests {
         assert_eq!(lent.env, vec![("K".to_string(), "1".to_string())]);
         assert_eq!(lent.warnings.len(), 1);
         assert!(!lent.overrides.join(" ").contains("mcp_servers.b."));
+    }
+
+    #[test]
+    fn codex_never_lends_a_secret_on_its_command_line() {
+        for bad in [
+            json!({"command": "crm", "args": ["--api-key", "x"]}),
+            json!({"command": "crm", "args": ["--token=abc"]}),
+            json!({"command": "crm", "args": ["ghp_abcdef"]}),
+            json!({"command": "crm", "args": ["0123456789abcdef0123456789abcdef"]}),
+            json!({"url": "https://mcp.example.com/sse?key=abc"}),
+            json!({"url": "https://user:pw@mcp.example.com/"}),
+        ] {
+            assert!(codex_secret_on_argv(&bad).is_some(), "{bad}");
+            let lent = codex_lent(&[("x".to_string(), bad.clone())], &[]);
+            assert!(lent.overrides.is_empty(), "{bad}");
+            assert_eq!(lent.warnings.len(), 1);
+        }
+        for good in [
+            json!({"command": "npx", "args": ["-y", "@modelcontextprotocol/server-github"]}),
+            json!({"command": "/usr/local/bin/crm-mcp", "args": ["--stdio"], "env": {"CRM_KEY": "s"}}),
+            json!({"url": "https://mcp.example.com/mcp", "bearer_token_env_var": "CRM_TOKEN"}),
+        ] {
+            assert_eq!(codex_secret_on_argv(&good), None, "{good}");
+        }
     }
 
     #[test]
