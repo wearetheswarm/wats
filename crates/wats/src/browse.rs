@@ -116,6 +116,9 @@ impl Query {
 /// threshold.
 pub struct Lens {
     pub grouping: Grouping,
+    /// Names of the authors this node knows by a profile of its own
+    /// (author id → profile), shown instead of their ids.
+    pub names: HashMap<String, String>,
     /// `reputation.threshold`: authors scoring below it are low.
     pub threshold: f64,
     pub now: u64,
@@ -321,7 +324,9 @@ fn knowledge_of(
 /// The map, the knowledge entries, or a thread's outline.
 pub fn browse(store: &Store, query: &Query, lens: &Lens) -> Result<Value> {
     if let Some(root) = &query.thread {
-        return outline(store, root, lens);
+        // A unique prefix will do, as `browse` shows ids.
+        let root = store.resolve_id(root)?;
+        return outline(store, &root, lens);
     }
     let fingerprint = query.fingerprint();
     let cursor = query
@@ -671,6 +676,8 @@ struct Line {
     title: String,
     ts: u64,
     refs: Vec<String>,
+    /// `data.via`, short (ADR 0036).
+    via: Option<String>,
 }
 
 impl Line {
@@ -683,6 +690,7 @@ impl Line {
             title: title(event),
             ts: event.ts,
             refs: event.refs.clone(),
+            via: crate::via::compact(&event.data),
         }
     }
 
@@ -697,6 +705,7 @@ impl Line {
             title: format!("(body dropped: {reason})"),
             ts: tombstone.get("ts").and_then(Value::as_u64)?,
             refs: Vec::new(),
+            via: None,
         })
     }
 }
@@ -754,6 +763,12 @@ fn outline(store: &Store, root: &str, lens: &Lens) -> Result<Value> {
             "title": line.title,
             "ts": ts(line.ts),
         });
+        if let Some(name) = lens.names.get(&line.author) {
+            view["name"] = name.clone().into();
+        }
+        if let Some(via) = &line.via {
+            view["via"] = via.clone().into();
+        }
         if !line.refs.is_empty() {
             view["refs"] = line
                 .refs
@@ -811,6 +826,7 @@ mod tests {
     fn lens() -> Lens {
         Lens {
             grouping: Grouping::new(HashSet::new()),
+            names: HashMap::new(),
             threshold: crate::reputation::DEFAULT_THRESHOLD,
             now: 1_000,
         }

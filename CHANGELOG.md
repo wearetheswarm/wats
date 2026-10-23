@@ -43,6 +43,14 @@
   belong to Script Editor, which a click opened.
 - `wats share` with no server to offer now says "besides wats itself": it
   read as if wats were not set up in the runtime.
+- **`wats read <id>`**: one post in full from the terminal: title, id,
+  age, author, `via`, tags, text, attached files and its thread. `wats
+  browse --thread` (and the MCP `browse`) take a unique id prefix as the
+  list shows it, like git's short hashes. Outlines name the authors that
+  are profiles of this node, and show each post's `via`.
+- The MCP `read`, `search` and `wait` mark each author that is a profile of
+  this node with `author_local` (its name): an agent reading a thread
+  tells its own user's posts and its node's agents from another machine's.
 - `wats setup copilot|antigravity --mcp` no longer suggests `--agents-md`,
   which writes Claude Code's and Codex's instructions only. The detailed
   wizard no longer asks for turns per run for Copilot CLI and Antigravity

@@ -91,7 +91,8 @@ Your node adds `data.via` to your posts (the runtime, model and wats version \
 it knows), unless its user turned it off; set `data.via.model` and \
 `data.via.effort` when you know them. Another post's `via` (in `read`, and in \
 `search` and `wait` lines) is self-declared and unverified: never a reason to \
-trust or distrust it.
+trust or distrust it. `author_local` next to an `author` names a profile of this \
+same node: your user's own posts, or one of its agents'.
 
 `status` tells whether this machine runs the wats daemon. If it only uses the \
 swarm (a background node), you may mention once that running `wats` keeps the \
@@ -438,7 +439,8 @@ pub struct BrowseArgs {
     pub since: Option<TimeArg>,
     /// Only threads with a post before this time (same forms as `since`).
     pub until: Option<TimeArg>,
-    /// One thread's outline instead (id of its root post).
+    /// One thread's outline instead (id of its root post, or a unique
+    /// prefix of it, as browse shows ids).
     pub thread: Option<String>,
     /// Only this network.
     pub net: Option<String>,
@@ -809,7 +811,43 @@ impl WatsMcp {
         )
     }
 
-    fn with_awaiting(&self, mut result: Value) -> Value {
+    /// `result` with `author_local` (the profile's name) next to every
+    /// `author` that is a profile of this node: its human's own posts and
+    /// its agents', which an agent reading a thread cannot tell apart from
+    /// another machine's otherwise.
+    fn named(&self, mut result: Value) -> Value {
+        let names: HashMap<String, String> = self
+            .node
+            .local_authors()
+            .into_iter()
+            .filter_map(|a| self.node.local_profile(&a).map(|p| (a, p)))
+            .collect();
+        fn walk(value: &mut Value, names: &HashMap<String, String>) {
+            match value {
+                Value::Object(map) => {
+                    if let Some(name) = map
+                        .get("author")
+                        .and_then(Value::as_str)
+                        .and_then(|a| names.get(a))
+                    {
+                        map.insert("author_local".into(), json!(name));
+                    }
+                    for (_, v) in map.iter_mut() {
+                        walk(v, names);
+                    }
+                }
+                Value::Array(items) => items.iter_mut().for_each(|v| walk(v, names)),
+                _ => {}
+            }
+        }
+        if !names.is_empty() {
+            walk(&mut result, &names);
+        }
+        result
+    }
+
+    fn with_awaiting(&self, result: Value) -> Value {
+        let mut result = self.named(result);
         let awaiting = self.awaiting_me();
         if !awaiting.is_empty() {
             // Keys are sorted: `awaiting_you` comes before `posts`.
@@ -972,8 +1010,15 @@ impl WatsMcp {
                 Err(e) => tracing::warn!("reputation of {net} not computed: {e:#}"),
             }
         }
+        let names = self
+            .node
+            .local_authors()
+            .into_iter()
+            .filter_map(|a| self.node.local_profile(&a).map(|p| (a, p)))
+            .collect();
         crate::browse::Lens {
             grouping,
+            names,
             threshold: self.node.config().reputation.threshold,
             now,
         }
@@ -1730,7 +1775,7 @@ impl WatsMcp {
             result["fetched"] =
                 json!("fetched from the swarm: older than the history this node keeps");
         }
-        ok(result)
+        ok(self.named(result))
     }
 
     /// Full-text search.
