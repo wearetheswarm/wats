@@ -306,23 +306,10 @@ async fn desktop_notification_for_the_humans_asks_only() {
     .await;
     let lines = wait_for_lines(&log, 1).await;
     assert_eq!(lines.len(), 1, "{lines:?}");
-    let bob_author = {
-        let found = call(&alice, "read", json!({"id": ask_id})).await;
-        found["thread"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find_map(|p| {
-                (p["kind"] == "clarify").then(|| p["author"].as_str().unwrap().to_string())
-            })
-            .unwrap()
-    };
+    // bob is a profile of this same node: named, not an id.
     assert_eq!(
         lines[0],
-        format!(
-            "WeAreTheSwarm|Clarify from agent {}…: Translate \"this\" \\ please",
-            &bob_author[..8]
-        )
+        "WeAreTheSwarm|Clarify from bob (this node): Translate \"this\" \\ please"
     );
     // The human's own reply: nothing.
     call(
@@ -346,7 +333,7 @@ async fn desktop_notification_for_the_humans_asks_only() {
     let lines_after = notified(&log);
     assert_eq!(lines_after.len(), 10, "{lines_after:?}");
     assert!(
-        lines[1].starts_with("WeAreTheSwarm|Answer from agent "),
+        lines[1].starts_with("WeAreTheSwarm|Answer from bob (this node): "),
         "{lines:?}"
     );
     assert!(
