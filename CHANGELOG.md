@@ -36,6 +36,10 @@
   refuses the SecretRef wats set there ("must stay a plain string value"),
   so the automatic mode failed and restored the backup. The manual mode
   prints `openclaw config set hooks.token '${WATS_OPENCLAW_HOOKS_TOKEN}'`.
+  The dedicated agent goes in `agents.list` (an array, merged with your
+  agents), since OpenClaw's schema refuses `agents.entries`; the dry run
+  gets the token in its environment, as it resolves the template.
+  Checked end to end on a real OpenClaw 2026.6.35.
 - **Docs**: the runtimes checked on a real run (wats 0.4.9) say so.
 - **The manifesto** in the README.
 

@@ -192,10 +192,12 @@ writes `openclaw.json` itself):
    1. `openclaw config file` gives the config's path; wats copies that
       file to `<file>.bak-<UTC timestamp>` (e.g.
       `openclaw.json.bak-20261018T091500Z`) and prints the backup's path.
-   2. `openclaw config get hooks.allowedAgentIds` and `openclaw config get
-      hooks.allowedSessionKeyPrefixes`: `config patch` replaces arrays, so
-      wats adds `"wats"` and `"wats:"` to what is there (your `"main"`
-      stays).
+   2. `openclaw config get hooks.allowedAgentIds`, `openclaw config get
+      hooks.allowedSessionKeyPrefixes` and `openclaw config get
+      agents.list`: `config patch` replaces arrays, so wats adds `"wats"`,
+      `"wats:"` and the `wats` agent to what is there (your `"main"` and
+      your other agents stay; an older `wats` entry is replaced). A list it
+      cannot read stops setup before any write.
    3. The hook token: the patch sets `token: "${WATS_OPENCLAW_HOOKS_TOKEN}"`,
       the environment template of the manual block, so the token is never
       in `openclaw.json`. OpenClaw refuses a SecretRef there (2026.6.35:
@@ -203,7 +205,11 @@ writes `openclaw.json` itself):
       alone: `openclaw config set hooks.token '${WATS_OPENCLAW_HOOKS_TOKEN}'`.
    4. Prints the patch (the content of the block below, as JSON, with the
       merged lists), then runs `openclaw config patch --stdin --dry-run`,
-      `openclaw config patch --stdin`, and `openclaw config validate`.
+      `openclaw config patch --stdin`, and `openclaw config validate`, with
+      the token in their environment only (they resolve the `${VAR}`
+      template). Checked on a real OpenClaw 2026.6.35 (wats 0.4.11);
+      `scripts/openclaw-setup-check.sh` repeats that check against the
+      OpenClaw on your machine, in a throwaway config, after an upgrade.
    5. If any of these fails, wats copies the backup back over the file,
       says so, and exits non-zero (`config.toml` is not changed).
 
@@ -220,13 +226,15 @@ writes `openclaw.json` itself):
      allowRequestSessionKey: true,
      allowedSessionKeyPrefixes: ["wats:"],
    },
-   agents: { entries: { wats: {
+   // Add this entry to agents.list if you have one.
+   agents: { list: [ {
+     id: "wats",
      name: "wats (swarm)",
      workspace: "~/.openclaw/workspace-wats",
      sandbox: { mode: "all", scope: "agent" },
      tools: { allow: ["wats-agent__*"],
               deny: ["exec", "process", "write", "edit", "apply_patch", "browser", "message"] },
-   } } },
+   } ] },
    ```
 
    and the line `export WATS_OPENCLAW_HOOKS_TOKEN=<token>`, the only place

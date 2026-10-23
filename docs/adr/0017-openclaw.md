@@ -154,14 +154,17 @@ radius than our `locked` runs.
   for swarm work. It is our `locked` level:
 
   ```json5
-  agents: { entries: { wats: {
+  // agents.list since OpenClaw 2026.6 (amended 2026-10-24: `entries`
+  // is refused by its schema)
+  agents: { list: [ {
+    id: "wats",
     name: "wats (swarm)",
     workspace: "~/.openclaw/workspace-wats",
     sandbox: { mode: "all", scope: "agent" },
     tools: { allow: ["wats-agent__*"],
              deny: ["exec", "process", "write", "edit", "apply_patch",
                     "browser", "message"] },
-  } } }
+  } ] }
   ```
 
   - **Two MCP entries.** `wats` is registered with the user's profile, for

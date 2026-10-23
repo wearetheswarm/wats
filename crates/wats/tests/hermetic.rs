@@ -750,7 +750,7 @@ case "$1 $2" in
 'config file') echo '~/oc/openclaw.json';;
 'config get') if [ -f "{d}/get-$3" ]; then cat "{d}/get-$3"; else echo "Config path not found: $3" >&2; exit 1; fi;;
 'config set') case "$*" in *--ref-*) echo 'Config policy validation failed: unsupported SecretRef usage was detected. hooks.token: SecretRef objects are not supported at hooks.token.' >&2; exit 1;; esac; echo "// set $3" >> {d}/oc/openclaw.json;;
-'config patch') p=$(cat); case "$p" in *'"token": {'*) echo 'Config policy validation failed: SecretRef objects are not supported at hooks.token.' >&2; exit 1;; esac; if [ "$4" = --dry-run ]; then printf '%s' "$p" > {d}/dry.json; else printf '%s' "$p" > {d}/real.json; echo '// patched' >> {d}/oc/openclaw.json; fi;;
+'config patch') p=$(cat); [ -n "$WATS_OPENCLAW_HOOKS_TOKEN" ] || { echo 'SecretRefResolutionError: Environment variable "WATS_OPENCLAW_HOOKS_TOKEN" is missing or empty.' >&2; exit 1; }; case "$p" in *'"entries"'*) echo '- agents: Invalid input' >&2; exit 1;; esac; case "$p" in *'"token": {'*) echo 'Config policy validation failed: SecretRef objects are not supported at hooks.token.' >&2; exit 1;; esac; if [ "$4" = --dry-run ]; then printf '%s' "$p" > {d}/dry.json; else printf '%s' "$p" > {d}/real.json; echo '// patched' >> {d}/oc/openclaw.json; fi;;
 'config validate') if [ -f {d}/invalid ]; then echo 'Invalid config: hooks.token' >&2; exit 1; fi; [ -n "$WATS_OPENCLAW_HOOKS_TOKEN" ] || exit 2;;
 esac
 "#;
@@ -759,6 +759,11 @@ esac
     let original = "{\n  // the user's\n  hooks: { allowedAgentIds: [\"main\"] },\n}\n";
     std::fs::write(&cfg, original).unwrap();
     std::fs::write(d.join("get-hooks.allowedAgentIds"), "[\n  \"main\"\n]\n").unwrap();
+    std::fs::write(
+        d.join("get-agents.list"),
+        "[\n  {\n    \"id\": \"main\",\n    \"default\": true\n  }\n]\n",
+    )
+    .unwrap();
     let data = d.join("data");
     let path = format!("{}:/bin:/usr/bin", bin.display());
     let run = |args: &[&str]| {
@@ -809,6 +814,7 @@ esac
             &["config", "file"][..],
             &["config", "get", "hooks.allowedAgentIds"],
             &["config", "get", "hooks.allowedSessionKeyPrefixes"],
+            &["config", "get", "agents.list"],
             &["config", "patch", "--stdin", "--dry-run"],
             &["config", "patch", "--stdin"],
             &["config", "validate"],
@@ -836,8 +842,14 @@ esac
         patch["hooks"]["token"], "${WATS_OPENCLAW_HOOKS_TOKEN}",
         "{patch}"
     );
+    // agents.list: the user's agent stays, the dedicated one is added.
     assert_eq!(
-        patch["agents"]["entries"]["wats"]["tools"]["allow"],
+        patch["agents"]["list"][0],
+        serde_json::json!({"id": "main", "default": true})
+    );
+    assert_eq!(patch["agents"]["list"][1]["id"], "wats");
+    assert_eq!(
+        patch["agents"]["list"][1]["tools"]["allow"],
         serde_json::json!(["wats-agent__*"])
     );
     assert!(said.contains("\"allowedAgentIds\": ["), "{said}");

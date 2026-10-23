@@ -1625,15 +1625,31 @@ fn apply_openclaw_config(
         &list("hooks.allowedSessionKeyPrefixes"),
         &[oc::SESSION_PREFIX],
     );
-    let patch = serde_json::to_string_pretty(&oc::config_patch(agent_id, &agent_ids, &prefixes))?;
+    // `patch` replaces the list: the user's agents go back in. Unset is
+    // empty; anything else unreadable stops here, before any write.
+    let agents = match run_openclaw(openclaw, &["config", "get", "agents.list"]) {
+        Ok(output) if output.status.success() => {
+            oc::parse_agents_list(&String::from_utf8_lossy(&output.stdout))?
+        }
+        _ => Vec::new(),
+    };
+    let patch =
+        serde_json::to_string_pretty(&oc::config_patch(agent_id, &agent_ids, &prefixes, &agents))?;
     println!("The patch for `openclaw config patch` (objects merge, lists replace):\n\n{patch}\n");
 
     let applied = (|| -> Result<()> {
+        // The dry run and the write resolve `${VAR}` templates: the token
+        // is in their environment only, never written.
         for args in [
             &["config", "patch", "--stdin", "--dry-run"][..],
             &["config", "patch", "--stdin"][..],
         ] {
-            let output = run_openclaw_with(openclaw, args, Some(patch.as_bytes()), &[])?;
+            let output = run_openclaw_with(
+                openclaw,
+                args,
+                Some(patch.as_bytes()),
+                &[(oc::HOOKS_TOKEN_ENV, hooks_token)],
+            )?;
             openclaw_ok(&output, &args[1..].join(" "))?;
         }
         // The token is in this process's environment only, so that a
