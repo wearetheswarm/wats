@@ -115,6 +115,8 @@ pub struct Settings {
     #[serde(default)]
     pub health: HealthSettings,
     #[serde(default)]
+    pub gossip: GossipSettings,
+    #[serde(default)]
     pub ask: AskSettings,
     #[serde(default)]
     pub reputation: ReputationSettings,
@@ -191,6 +193,14 @@ pub struct AskSettings {
 #[serde(deny_unknown_fields)]
 pub struct ReputationSettings {
     pub threshold: Option<f64>,
+}
+
+/// `[gossip]`: the gossip mesh (`crate::node::links`).
+#[derive(Debug, Default, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GossipSettings {
+    pub active_view: Option<u64>,
+    pub ping: Option<String>,
 }
 
 /// `[health]`: infra health alerts (`crate::health`).
@@ -771,7 +781,7 @@ pub const KEYS: &[Key] = &[
     key(
         "sync.anti_entropy",
         ValueType::Retention,
-        "1m",
+        "5m",
         "how often the node reads its gossip neighbors' newest events (the last 30 minutes) and relays what gossip had not delivered; a neighbor that held old ones gets a fresh gossip link (0: never)",
     ),
     key(
@@ -893,6 +903,18 @@ pub const KEYS: &[Key] = &[
         ValueType::Bool,
         "false",
         "on a guardian halt, keep serving halt events instead of stopping (our router only)",
+    ),
+    key(
+        "gossip.active_view",
+        ValueType::Integer,
+        "5",
+        "gossip neighbors the node keeps (HyParView's active view); infrastructure nodes such as routers and seeds may keep more",
+    ),
+    key(
+        "gossip.ping",
+        ValueType::Retention,
+        "1m",
+        "how often the node pings its gossip neighbors; one that pings too and goes silent for three rounds gets a fresh gossip link, and a node whose neighbors are all on its own networks joins one outside them (0: none of this)",
     ),
     key(
         "health.no_peers_after",

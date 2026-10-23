@@ -113,13 +113,11 @@ const JOIN_CHECKS_PER_HOUR: usize = 12;
 /// rounds of [`Tuning::anti_entropy`], so that an event a hop takes a
 /// round to pass on still falls in the next hop's window.
 pub const ANTI_ENTROPY_WINDOW: Duration = Duration::from_secs(30 * 60);
-/// Default of `sync.anti_entropy`: short while the network is small.
-pub const DEFAULT_ANTI_ENTROPY: Duration = Duration::from_secs(60);
+/// Default of `sync.anti_entropy`.
+pub const DEFAULT_ANTI_ENTROPY: Duration = Duration::from_secs(5 * 60);
 /// An event a neighbor held this long (by its `ts`) that gossip had not
 /// brought here: the link to that neighbor is taken for dead.
 const STALE_LAG: Duration = Duration::from_secs(120);
-/// A neighbor's gossip link is reset at most this often.
-const RESET_EVERY: Duration = Duration::from_secs(600);
 /// Events relayed per anti-entropy round, at most.
 const RELAY_MAX: usize = 500;
 /// The first window asked from older peers; each next one doubles.
@@ -208,8 +206,6 @@ pub struct History {
     progress: std::sync::Mutex<HashMap<String, Progress>>,
     /// On-demand fetches in the last minute.
     gets: std::sync::Mutex<std::collections::VecDeque<std::time::Instant>>,
-    /// The last reset of each neighbor's gossip link.
-    resets: std::sync::Mutex<HashMap<EndpointId, std::time::Instant>>,
 }
 
 /// Which holes a request is served around (ADR 0025 §3).
@@ -616,6 +612,10 @@ impl Node {
                 .retain(|f| f != proto::FEATURE_SYNC_DESC && f != proto::FEATURE_GET);
         } else if self.history_full() {
             info.features.push(proto::FEATURE_HISTORY_FULL.to_string());
+        }
+        // Not pinging: never judged silent by its neighbors.
+        if self.config.gossip_ping.is_zero() {
+            info.features.retain(|f| f != proto::FEATURE_GOSSIP_PING);
         }
         info
     }
@@ -2592,27 +2592,8 @@ impl Node {
         );
         self.relay_pulled(net, &pass.pulled).await;
         for peer in pass.stale {
-            let due = self.history.resets.lock().is_ok_and(|mut r| {
-                let now = std::time::Instant::now();
-                let due = r
-                    .get(&peer)
-                    .is_none_or(|t| now.duration_since(*t) >= RESET_EVERY);
-                if due {
-                    r.insert(peer, now);
-                }
-                due
-            });
-            if !due {
-                continue;
-            }
-            match self.reset_gossip_link(peer).await {
-                Ok(()) => info!(
-                    %net,
-                    peer = %peer.fmt_short(),
-                    "gossip link looked dead (it held events gossip had not brought): reconnected"
-                ),
-                Err(e) => debug!(peer = %peer.fmt_short(), "gossip link reset: {e:#}"),
-            }
+            self.reset_link(net, peer, "it held events gossip had not brought")
+                .await;
         }
         Ok(())
     }

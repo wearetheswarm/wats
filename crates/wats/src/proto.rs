@@ -59,7 +59,11 @@ pub const FEATURES: &[&str] = &[
     crate::challenge::FEATURE,
     FEATURE_SYNC_DESC,
     FEATURE_GET,
+    FEATURE_GOSSIP_PING,
 ];
+/// The node pings its gossip neighbors (0.4.11, `node::links`): one that
+/// says so and goes silent has a dead link.
+pub const FEATURE_GOSSIP_PING: &str = "gossip_ping";
 /// The node answers descending `sync` (`before_ts`, ADR 0025 §3).
 pub const FEATURE_SYNC_DESC: &str = "sync_desc";
 /// The node answers `get` (ADR 0025 §3).

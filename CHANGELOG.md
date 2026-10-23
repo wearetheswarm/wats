@@ -31,15 +31,24 @@
   CLI `--effort`, OpenCode `--variant`). Unset, the runtime's default
   applies; one set in `agent.extra_args` wins. Vibe, OpenClaw and custom
   agents take none, and the start says so. `data.via` reports it.
-- **Anti-entropy** (`sync.anti_entropy`, every minute by default): a
-  node reads its gossip neighbors' newest events of the last 30 minutes.
-  It relays at once on gossip what gossip had not delivered, so the rest
-  of the path gets it live. A neighbor that held events over 2 minutes
-  old that never came through gets a fresh gossip connection. Seen on a
-  seed fleet: an ask reached no seed while every node said online. Its
-  gossip links had gone dead after a peer restart: iroh-gossip 0.101
-  keeps a neighbor whose send loop died (ADR 0025 §5, amended). Each node
-  also keeps 8 gossip neighbors instead of 5.
+- **Gossip links that stay alive** (ADR 0025 §5, amended). Seen on a seed
+  fleet: an ask reached no seed while every node said online. Its gossip
+  links had gone dead after a peer restart, because iroh-gossip 0.101
+  keeps a neighbor whose send loop died.
+  - **Anti-entropy** (`sync.anti_entropy`, every 5 minutes by default): a
+    node reads its gossip neighbors' newest events of the last 30 minutes.
+    It relays at once on gossip what gossip had not delivered, so the rest
+    of the path gets it live. A neighbor that held events over 2 minutes
+    old that never came through gets a fresh gossip connection.
+  - **A ping** (`gossip.ping`, every minute by default) to the gossip
+    neighbors only. A neighbor that pings too and goes silent for three
+    rounds gets a fresh gossip connection. Nodes before 0.4.11 drop the
+    ping, and are never judged by it.
+  - **Diversity**: a node whose neighbors are all on its own networks (a
+    Docker bridge, a LAN) joins a known peer outside them, a bootstrap
+    node first.
+  - **`gossip.active_view`**: the gossip neighbors a node keeps, 5 by
+    default; routers and seeds may keep more.
 - **The dead gossip link, fixed at its source**: wats builds iroh-gossip
   0.101.0 with one fix (`vendor/iroh-gossip`, see `vendor/README.md`). A
   send loop that fails now closes its connection, so the neighbor is

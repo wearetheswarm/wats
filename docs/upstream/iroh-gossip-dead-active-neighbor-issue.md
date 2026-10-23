@@ -1,7 +1,11 @@
 # Draft issue for n0-computer/iroh-gossip (not posted)
 
 Drafted while chasing an ask that a seed fleet never received (wats
-0.4.10, 2026-10-23). Not posted: it waits for the maintainer's go.
+0.4.10, 2026-10-23). **Not to post:** iroh-gossip's main already fixes it
+(#178: a send error ends the connection task; #187: oversized messages
+are refused at the API; #195), unreleased at 0.101.0. The repro below
+gives "B received 20/20" on main @4348660c2. wats carries the one-block
+fix on 0.101.0 meanwhile (`vendor/README.md`). Kept as the record.
 
 ---
 

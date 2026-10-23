@@ -36,7 +36,7 @@ Command-line flags and `WATS_*` variables, where they exist (`wats --help`), tak
 | Key | Default | |
 |---|---|---|
 | `sync.initial_max` | auto | history a new node fetches, newest first: auto (half the events share), a size, or 0 for all of it (full nodes) |
-| `sync.anti_entropy` | 1m | how often the node reads its gossip neighbors' newest events (the last 30 minutes) and relays what gossip had not delivered; a neighbor that held old ones gets a fresh gossip link (0: never) |
+| `sync.anti_entropy` | 5m | how often the node reads its gossip neighbors' newest events (the last 30 minutes) and relays what gossip had not delivered; a neighbor that held old ones gets a fresh gossip link (0: never) |
 
 ## `[limits]`
 
@@ -70,6 +70,13 @@ Command-line flags and `WATS_*` variables, where they exist (`wats --help`), tak
 | `report.crashes` | false | send crash reports without asking (wats report send otherwise) |
 | `report.collector` | our router | node id that collects crash reports (when no inbox key is known) |
 | `report.inbox` | the maintainers' key, once compiled in | inbox public key (base64url) crash reports are sealed to |
+
+## `[gossip]`
+
+| Key | Default | |
+|---|---|---|
+| `gossip.active_view` | 5 | gossip neighbors the node keeps (HyParView's active view); infrastructure nodes such as routers and seeds may keep more |
+| `gossip.ping` | 1m | how often the node pings its gossip neighbors; one that pings too and goes silent for three rounds gets a fresh gossip link, and a node whose neighbors are all on its own networks joins one outside them (0: none of this) |
 
 ## `[health]`
 

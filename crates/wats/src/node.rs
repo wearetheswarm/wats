@@ -38,6 +38,7 @@ use tracing::{debug, info, warn};
 
 pub mod durability;
 pub mod history;
+pub mod links;
 pub mod proof;
 pub mod rotation;
 
@@ -56,10 +57,12 @@ pub const PUBLIC_NET: &str = "public";
 /// canonical (32 KiB of raw input); the cap leaves room for the envelope
 /// and for later versions. Every node must use the same value.
 pub const GOSSIP_MAX_MESSAGE_BYTES: usize = 64 * 1024;
-/// Gossip neighbors each node keeps (HyParView's active view; its default
-/// is 5): more paths around a link that went dead, while the network is
-/// small (0.4.11).
-pub const GOSSIP_ACTIVE_VIEW: usize = 8;
+/// Default of `gossip.active_view`: the gossip neighbors each node keeps
+/// (HyParView's active view, its default).
+pub const GOSSIP_ACTIVE_VIEW: usize = 5;
+/// Default of `gossip.ping`: how often a node pings its gossip neighbors
+/// ([`links`]).
+pub const GOSSIP_PING_EVERY: Duration = Duration::from_secs(60);
 
 /// How far in the future an event timestamp may be (node policy).
 pub const MAX_CLOCK_SKEW_SECS: u64 = 10 * 60;
@@ -154,6 +157,11 @@ pub struct NodeConfig {
     pub initial_max: crate::settings::InitialMax,
     /// How the history task runs ([`history::Tuning`]); tests shorten it.
     pub history: history::Tuning,
+    /// Gossip neighbors kept (`gossip.active_view`).
+    pub gossip_active_view: usize,
+    /// How often the gossip neighbors are pinged (`gossip.ping`; zero:
+    /// never, and no link check nor diversity join, see [`links`]).
+    pub gossip_ping: Duration,
     /// Delete the blobs nothing keeps, every `blob_gc_interval`
     /// (`storage.gc`): no tag and listed by no kept event, e.g. the files
     /// of a dropped body (ADR 0020 §2) or of a fetch that failed half-way.
@@ -308,6 +316,8 @@ impl NodeConfig {
             events_share: crate::settings::DEFAULT_EVENTS_SHARE,
             initial_max: Default::default(),
             history: Default::default(),
+            gossip_active_view: GOSSIP_ACTIVE_VIEW,
+            gossip_ping: GOSSIP_PING_EVERY,
             blob_gc: true,
             blob_gc_interval: BLOB_GC_INTERVAL,
             review_profiles: Vec::new(),
@@ -1347,6 +1357,8 @@ pub struct Node {
     health: std::sync::Mutex<crate::health::Health>,
     /// Bootstrap nodes and peers configured, for the bootstrap check.
     seed_ids: Vec<EndpointId>,
+    /// Gossip links: what each neighbor last delivered, resets ([`links`]).
+    links: links::Links,
     /// The history tasks (ADR 0025).
     history: history::History,
     /// Rotation at the cap (ADR 0025 §7).
@@ -1704,7 +1716,7 @@ impl Node {
         let gossip = Gossip::builder()
             .max_message_size(GOSSIP_MAX_MESSAGE_BYTES)
             .membership_config(iroh_gossip::proto::HyparviewConfig {
-                active_view_capacity: GOSSIP_ACTIVE_VIEW,
+                active_view_capacity: config.gossip_active_view.max(1),
                 ..Default::default()
             })
             .spawn(endpoint.clone());
@@ -1786,6 +1798,7 @@ impl Node {
             started_at: now_secs(),
             health: std::sync::Mutex::new(health),
             seed_ids,
+            links: Default::default(),
             connectivity: std::sync::Mutex::new(crate::reconnect::Connectivity::new(now_secs())),
             reconnect_kick: Default::default(),
             network_changed: Default::default(),
@@ -1945,6 +1958,7 @@ impl Node {
         }
         for net in node.config.nets.clone() {
             node.spawn_history(&net);
+            node.spawn_links(&net);
         }
         for (net, receiver) in receivers {
             // The receiver outlives a panic of the loop: the restarted loop
@@ -3817,6 +3831,10 @@ impl Node {
                 Some(Ok(GossipEvent::Received(msg))) => {
                     self.seen(msg.delivered_from);
                     self.sighted(&net, msg.delivered_from);
+                    self.heard(&net, msg.delivered_from);
+                    if links::is_ping(&msg.content) {
+                        continue;
+                    }
                     if let Err(e) = self
                         .handle_message(&net, &msg.content, msg.delivered_from)
                         .await
@@ -3839,6 +3857,8 @@ impl Node {
                     self.reconnect_kick.notify_one();
                     self.seen(id);
                     self.sighted(&net, id);
+                    // Heard: a grace before the link check judges it.
+                    self.heard(&net, id);
                     let node = Arc::clone(&self);
                     let net = net.clone();
                     tokio::spawn(async move {
@@ -5142,7 +5162,6 @@ impl Node {
         }
     }
 
-    /// The gossip sender of a network this node is on.
     /// Broadcast on gossip events that anti-entropy pulled (each with the
     /// peer that served it, as the provider of its blobs): gossip had not
     /// delivered them, so the rest of the path gets them live, not a hop
@@ -5176,6 +5195,7 @@ impl Node {
         Ok(())
     }
 
+    /// The gossip sender of a network this node is on.
     fn sender(&self, net: &str) -> Option<GossipSender> {
         self.senders.lock().ok()?.get(net).cloned()
     }

@@ -1675,3 +1675,42 @@ async fn anti_entropy_relays_what_it_pulls() -> anyhow::Result<()> {
     }
     Ok(())
 }
+
+/// The gossip ping (0.4.11): B says it pings but never does, so A hears
+/// nothing from it for three rounds and gives it a fresh gossip link.
+/// Gossip from A still reaches B afterwards.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_silent_gossip_neighbor_gets_a_fresh_link() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let mut b_config = config(&dir.path().join("b"), &[]);
+    b_config.gossip_ping = Duration::from_secs(3600);
+    let b = Node::start(b_config).await?;
+    let mut a_config = config(&dir.path().join("a"), &[&b]);
+    a_config.gossip_ping = Duration::from_millis(300);
+    let a = Node::start(a_config).await?;
+    eventually("A resets the silent link", 30, || {
+        (a.link_resets() > 0).then_some(())
+    })
+    .await;
+    assert_eq!(b.link_resets(), 0, "B heard A's pings");
+    let posted = a
+        .publish(
+            Draft {
+                net: PUBLIC_NET.into(),
+                kind: Some(Kind::Note),
+                title: Some("after the reset".into()),
+                text: "after the reset".into(),
+                ..Draft::default()
+            },
+            &[],
+        )
+        .await?;
+    eventually("B gets it by gossip", 30, || {
+        seq(&b, &posted.id).map(|_| ())
+    })
+    .await;
+    for node in [a, b] {
+        node.shutdown().await?;
+    }
+    Ok(())
+}

@@ -6490,6 +6490,19 @@ impl NodeArgs {
             );
             config.reputation.threshold = threshold;
         }
+        if let Some(view) = file.gossip.active_view {
+            anyhow::ensure!(
+                (1..=64).contains(&view),
+                "config.toml gossip.active_view: {view} is not 1-64"
+            );
+            config.gossip_active_view =
+                usize::try_from(view).unwrap_or(wats::node::GOSSIP_ACTIVE_VIEW);
+        }
+        if let Some(every) = &file.gossip.ping {
+            config.gossip_ping = wats::settings::parse_retention(every)
+                .map_err(|e| anyhow::anyhow!("config.toml gossip.ping: {e}"))?
+                .unwrap_or_default();
+        }
         if let Some(after) = &file.health.no_peers_after {
             config.no_peers_after = wats::settings::parse_retention(after)
                 .map_err(|e| anyhow::anyhow!("config.toml health.no_peers_after: {e}"))?;

@@ -343,20 +343,36 @@ it. The seeds filled their active views with each other over a Docker
 bridge. Their links out went stale after a peer restart: iroh-gossip
 0.101 keeps as active a connection whose send loop has ended, and logs
 "failed to send: connection task send loop terminated" without dropping
-it. So every minute (`sync.anti_entropy`, `1m` by default), while no range
-is pending, the history task reads the newest pages of each `sync_desc`
+it. So every 5 minutes (`sync.anti_entropy`, `5m` by default), while no
+range is pending, the history task reads the newest pages of each `sync_desc`
 neighbor, down to 30 minutes ago (plus the skew). It relays what it
 pulled on gossip at once, so a missed event crosses one dead link per
 round, not one hop. A neighbor that held an event over 2 minutes old
 that gossip never brought is taken for a dead link: wats opens a fresh
 gossip connection to it, which becomes the active one on both sides (at
-most every 10 minutes per neighbor). Nodes keep 8 gossip neighbors (the
-HyParView default is 5). It stops at a neighbor once two pages in a row
+most every 10 minutes per neighbor). Two more checks run every minute
+(`gossip.ping`, see `node::links`):
+
+- **A ping** to the gossip neighbors only, which they do not relay. A
+  neighbor that announces `gossip_ping` and has delivered nothing for
+  three rounds (a ping or an event) gets the same fresh connection. Nodes
+  before 0.4.11 drop the ping as an invalid envelope and are not judged.
+- **Diversity.** HyParView has no hook for it. When every neighbor's
+  addresses in use are local (private, loopback, link-local), and a known
+  peer is not, the node joins that peer through gossip (`join_peers`), a
+  bootstrap node first, at most every 10 minutes.
+
+`gossip.active_view` sets the active view: 5, HyParView's default, unless
+an infrastructure node (a router, a seed) keeps more.
+
+The root cause is fixed too: wats builds iroh-gossip 0.101.0 with one
+change (`vendor/`). A failed send loop closes its connection, so the
+neighbor is dropped and replaced. Upstream's main has the same fix,
+unreleased. No wire change. It stops at a neighbor once two pages in a row
 bring nothing new. These reads go over wats's own protocol, not the
 gossip connection, so they get through a stale gossip link. When gossip
 works, a round costs a page or two per neighbor. The 30-minute window
-covers about six hops. Not yet: keeping one neighbor off the local subnet in
-the active view.
+covers about six hops.
 
 ### 6. Fetching on demand
 
