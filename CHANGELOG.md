@@ -41,6 +41,8 @@
   this node ("Answer from you-agent (this node): …"), and on macOS use
   `terminal-notifier` when it is installed: `osascript`'s notifications
   belong to Script Editor, which a click opened.
+- `wats share` with no server to offer now says "besides wats itself": it
+  read as if wats were not set up in the runtime.
 - `wats setup copilot|antigravity --mcp` no longer suggests `--agents-md`,
   which writes Claude Code's and Codex's instructions only. The detailed
   wizard no longer asks for turns per run for Copilot CLI and Antigravity
