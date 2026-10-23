@@ -1441,3 +1441,91 @@ fn a_named_socket_reaches_the_node_without_its_data_dir() {
     assert!(!node_dir.join("mcp.sock").exists());
     assert!(!other.join("secret.key").exists());
 }
+
+/// `wats share` (ADR 0037): the servers of a throwaway ~/.claude.json are
+/// offered unchecked, the natives checked but running commands; --add
+/// picks one, which turns review on; a later run marks new servers.
+#[test]
+fn share_lets_the_agent_use_chosen_servers() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("d");
+    let home = dir.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::write(
+        home.join(".claude.json"),
+        r#"{"mcpServers": {"crm": {"command": "crm-mcp", "env": {"CRM_KEY": "s3cret"}}}}"#,
+    )
+    .unwrap();
+    let share = |args: &[&str]| {
+        std::process::Command::new(env!("CARGO_BIN_EXE_wats"))
+            .env("WATS_HERMETIC", "1")
+            .envs(throwaway(&data))
+            .env_remove("CLAUDE_CONFIG_DIR")
+            .arg("--dir")
+            .arg(&data)
+            .arg("share")
+            .args(args)
+            .stdin(std::process::Stdio::null())
+            .output()
+            .unwrap()
+    };
+    assert!(
+        wats(&data, &["config", "set", "agents.claude.runtime", "claude"])
+            .status
+            .success()
+    );
+    let out = share(&["--list"]);
+    let listed = String::from_utf8_lossy(&out.stdout).into_owned();
+    assert!(out.status.success(), "{listed}");
+    assert!(listed.contains("[x] Read and search"), "{listed}");
+    assert!(listed.contains("[ ] Run commands"), "{listed}");
+    assert!(
+        listed.contains("[ ] let it use crm (an MCP server, local)"),
+        "{listed}"
+    );
+    assert!(!data.join("share.json").exists(), "--list changes nothing");
+
+    let refused = share(&[]);
+    assert!(!refused.status.success(), "no terminal, no --yes");
+
+    let out = share(&["--add", "crm"]);
+    let said = String::from_utf8_lossy(&out.stdout).into_owned();
+    assert!(
+        out.status.success(),
+        "{said}{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(said.contains("review: on"), "{said}");
+    assert!(said.contains("cap:crm"), "{said}");
+    let config = std::fs::read_to_string(data.join("config.toml")).unwrap();
+    assert!(!config.contains("s3cret"), "{config}");
+    let get = |key: &str| {
+        String::from_utf8_lossy(&wats(&data, &["config", "get", key]).stdout)
+            .trim()
+            .to_string()
+    };
+    assert_eq!(get("agents.claude.servers"), r#"["crm"]"#);
+    assert_eq!(get("agents.claude.review"), "true");
+    let tools = get("agents.claude.tools");
+    assert!(tools.contains("Read") && !tools.contains("Bash"), "{tools}");
+    let caps = get("agents.claude.caps");
+    assert!(caps.contains("crm") && caps.contains("web"), "{caps}");
+    let state = std::fs::read_to_string(data.join("share.json")).unwrap();
+    assert!(!state.contains("s3cret"), "{state}");
+
+    std::fs::write(
+        home.join(".claude.json"),
+        r#"{"mcpServers": {"crm": {"command": "crm-mcp"}, "mail": {"type": "http", "url": "https://m"}}}"#,
+    )
+    .unwrap();
+    let listed = String::from_utf8_lossy(&share(&["--list"]).stdout).into_owned();
+    assert!(listed.contains("[x] let it use crm"), "{listed}");
+    assert!(
+        listed.contains("[ ] let it use mail (an MCP server, remote)  NEW"),
+        "{listed}"
+    );
+    let out = share(&["--yes", "--remove", "crm"]);
+    assert!(out.status.success());
+    assert_eq!(get("agents.claude.servers"), "none (default)");
+    assert!(!get("agents.claude.caps").contains("crm"));
+}

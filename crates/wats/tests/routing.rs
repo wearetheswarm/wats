@@ -118,6 +118,7 @@ fn agent(root: &Path, data: &Path, caps: &[&str], every: Duration) -> AgentConfi
         access: wats::access::Access::SwarmOnly,
         workdir: PathBuf::from("/nonexistent"),
         tools: vec![],
+        servers: Vec::new(),
         model: None,
         work_dir: root.join("work"),
         data_dir: data.to_path_buf(),

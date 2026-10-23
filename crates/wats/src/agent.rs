@@ -95,6 +95,10 @@ pub struct AgentConfig {
     /// Built-in tools allowed with `workspace` access (Claude tool names;
     /// for Codex, features kept on).
     pub tools: Vec<String>,
+    /// MCP servers of the user's runtime configuration lent with
+    /// `workspace` access (`agent.servers`, ADR 0037): names, their
+    /// definitions read at each run.
+    pub servers: Vec<String>,
     /// The model, when set (`agent.model`); otherwise the runtime's own
     /// default.
     pub model: Option<String>,
@@ -669,12 +673,18 @@ pub fn prompt(node: &Node, config: &AgentConfig, since: i64, trigger: &Trigger) 
         config.about.trim()
     };
     let cursor = format!("since={since}");
-    let access = access::prompt_line(
+    let mut access = access::prompt_line(
         &config.runtime,
         config.access,
         &config.workdir,
         &config.tools,
     );
+    if config.access == Access::Workspace
+        && crate::share::supports(&config.runtime)
+        && !config.servers.is_empty()
+    {
+        access.push_str(&format!(" {}", crate::share::prompt_line(&config.servers)));
+    }
     let template = config.heartbeat_text.trim_end();
     let mut prompt = template
         .replace("{agent_profile}", &config.profile)
@@ -1173,11 +1183,17 @@ fn prepare_command(
             } else {
                 Default::default()
             };
-            let servers = if config.access == Access::Workspace {
+            let lent = lent_servers(config);
+            let mut servers = if config.access == Access::Workspace {
                 opencode::workspace_servers(&config.workdir)?
             } else {
                 Vec::new()
             };
+            for (name, _) in &lent {
+                if !servers.contains(name) {
+                    servers.push(name.clone());
+                }
+            }
             let permission = opencode::permission(&opencode::Permissions {
                 access: config.access,
                 tools: &tools,
@@ -1193,6 +1209,7 @@ fn prepare_command(
                 timeout: config.run_timeout,
                 steps: config.max_turns,
                 permission,
+                lent: &lent,
             });
             if config.access != Access::Inherit {
                 for key in opencode::removed_env(std::env::vars_os()) {
@@ -1208,11 +1225,20 @@ fn prepare_command(
                 .args(&config.extra_args);
         }
         "codex" => {
-            let (_, workspace_overrides) = if config.access == Access::Workspace {
+            let (_, mut workspace_overrides) = if config.access == Access::Workspace {
                 access::workspace_codex_overrides(&config.workdir)?
             } else {
                 Default::default()
             };
+            // Secrets go in the child's environment, never in its arguments.
+            let lent = crate::share::codex_lent(&lent_servers(config), &config.tools);
+            for warning in &lent.warnings {
+                warn!("{warning}");
+            }
+            workspace_overrides.extend(lent.overrides);
+            for (key, value) in lent.env {
+                command.env(key, value);
+            }
             // `--model` is an option of `codex exec`: it goes after it.
             let mut extra = model_args(config, "--model");
             extra.extend(config.extra_args.iter().cloned());
@@ -1233,6 +1259,7 @@ fn prepare_command(
                 &mcp_config,
                 config.access,
                 &config.workdir,
+                &lent_servers(config),
                 &config.mcp_command,
                 &config.mcp_args,
                 token,
@@ -1253,6 +1280,19 @@ fn prepare_command(
         }
     };
     Ok((command, file))
+}
+
+/// The servers a run lends ([`crate::share::lent`]), at `workspace` only;
+/// a server no longer in the user's configuration is logged and skipped.
+fn lent_servers(config: &AgentConfig) -> Vec<(String, serde_json::Value)> {
+    if config.access != Access::Workspace || !crate::share::supports(&config.runtime) {
+        return Vec::new();
+    }
+    let (servers, warnings) = crate::share::lent(&config.runtime, &config.servers);
+    for warning in warnings {
+        warn!("{warning}");
+    }
+    servers
 }
 
 /// OpenCode's `--model=<provider/model>`, as one argument (a value can
@@ -2106,6 +2146,7 @@ pub async fn run(
         access: config.access,
         workdir: &config.workdir,
         tools: &config.tools,
+        servers: &config.servers,
         caps: &config.caps,
     }) {
         warn!("{warning}");

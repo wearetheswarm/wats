@@ -372,6 +372,29 @@ enum Command {
         #[command(subcommand)]
         action: ConfigAction,
     },
+    /// Choose what this node's agent may use when it answers the swarm
+    /// (ADR 0037): its runtime's own tools, checked by default but running
+    /// commands, and the MCP servers of your own configuration for that
+    /// runtime, unchecked unless you pick them. One checklist sets
+    /// agent.tools, agent.servers and the caps the agent announces; run it
+    /// again to see servers added since. Claude Code, Codex and OpenCode.
+    Share {
+        /// The agent, by its name in config.toml [default: the only one].
+        #[arg(long, value_name = "NAME")]
+        agent: Option<String>,
+        /// Print the checklist and change nothing.
+        #[arg(long)]
+        list: bool,
+        /// Let the agent use these MCP servers (comma-separated names).
+        #[arg(long, value_delimiter = ',', value_name = "NAMES")]
+        add: Vec<String>,
+        /// Stop letting the agent use these MCP servers.
+        #[arg(long, value_delimiter = ',', value_name = "NAMES")]
+        remove: Vec<String>,
+        /// Do not ask: keep the checklist as shown, with --add and --remove.
+        #[arg(long)]
+        yes: bool,
+    },
     /// MCP server on stdio, the entry point of MCP hosts such as Claude
     /// Code. Sessions share the node of their data directory through
     /// `<dir>/mcp.sock`; one is started in the background if none runs.
@@ -2396,6 +2419,12 @@ fn setup_tool(
                 dir.display(),
                 key("tools")
             );
+            if wats::share::supports(runtime) {
+                println!(
+                    "  `wats share`: choose what it may use when it answers the swarm, your own \
+                     MCP servers included"
+                );
+            }
         }
         if runtime == "opencode"
             && let Some(member) = &member
@@ -3179,6 +3208,263 @@ fn safety_after(data_dir: &std::path::Path, before: Option<Vec<wats::safety::Cha
 }
 
 /// `wats config get | set | unset | list | ack`.
+/// The flags of `wats share`.
+struct ShareArgs {
+    agent: Option<String>,
+    list: bool,
+    add: Vec<String>,
+    remove: Vec<String>,
+    yes: bool,
+}
+
+/// `wats share` (ADR 0037): the checklist of what the agent may use when
+/// it answers the swarm, written to its table of config.toml.
+fn share_command(data_dir: &std::path::Path, args: &ShareArgs) -> Result<()> {
+    use wats::share;
+    let settings = Settings::load(data_dir)?;
+    let members = wats::roster::configured(&settings, data_dir, &os_user_profile())?;
+    let member = match &args.agent {
+        Some(name) => members
+            .into_iter()
+            .find(|m| m.name == *name)
+            .with_context(|| format!("no agent {name:?} in config.toml (`wats status`)"))?,
+        None => {
+            let mut runnable: Vec<_> = members
+                .into_iter()
+                .filter(|m| m.runtime.is_some())
+                .collect();
+            match runnable.len() {
+                0 => anyhow::bail!(
+                    "no agent is set up: `wats setup claude --agent` (or codex, opencode) first"
+                ),
+                1 => runnable.remove(0),
+                _ => anyhow::bail!(
+                    "several agents: pass --agent {}",
+                    runnable
+                        .iter()
+                        .map(|m| m.name.as_str())
+                        .collect::<Vec<_>>()
+                        .join("|")
+                ),
+            }
+        }
+    };
+    let runtime = member.runtime.clone().unwrap_or_default();
+    anyhow::ensure!(
+        share::supports(&runtime),
+        "{runtime} agents cannot use your MCP servers yet: Claude Code, Codex and OpenCode can"
+    );
+    let access = wats::access::level_for(&runtime, member.settings.access.as_deref())?;
+    if access == wats::access::Access::Inherit {
+        println!(
+            "agent {} has inherit access: it already uses your whole {} configuration, every \
+             MCP server included. `wats config set {} workspace` to choose instead.",
+            member.name,
+            share::runtime_label(&runtime),
+            member_key(&member, "access")
+        );
+        return Ok(());
+    }
+    let available = share::user_servers(&runtime)?;
+    let first = share::offered(data_dir, &runtime).is_none();
+    let seen = share::offered(data_dir, &runtime).unwrap_or_default();
+    let current = share::Lending {
+        tools: member.settings.tools.clone(),
+        lend: member.settings.servers.clone(),
+        caps: member.settings.caps.clone(),
+    };
+    let natives = share::natives(&runtime);
+    let mut names: Vec<String> = available.keys().cloned().collect();
+    for name in &current.lend {
+        if !names.contains(name) {
+            names.push(name.clone());
+        }
+    }
+    // Checked: what is on, and the defaults on a first run.
+    let mut checked: Vec<bool> = natives
+        .iter()
+        .map(|n| share::native_on(n, &current.tools) || (first && n.default))
+        .collect();
+    checked.extend(names.iter().map(|n| current.lend.contains(n)));
+    for name in &args.add {
+        let name = name.trim();
+        let i = names.iter().position(|n| n == name).with_context(|| {
+            format!(
+                "no MCP server {name:?} in your {} configuration",
+                share::runtime_label(&runtime)
+            )
+        })?;
+        checked[natives.len() + i] = true;
+    }
+    for name in &args.remove {
+        if let Some(i) = names.iter().position(|n| n == name.trim()) {
+            checked[natives.len() + i] = false;
+        }
+    }
+    let sources: Vec<String> = share::source_paths(&runtime)
+        .iter()
+        .filter(|p| p.exists())
+        .map(|p| p.display().to_string())
+        .collect();
+    let show = |checked: &[bool]| {
+        println!(
+            "What agent {} ({}) may use when it answers the swarm:",
+            member.name,
+            share::runtime_label(&runtime)
+        );
+        println!("  Its own tools:");
+        for (i, native) in natives.iter().enumerate() {
+            let caps: Vec<String> = native.caps.iter().map(|c| format!("cap:{c}")).collect();
+            println!(
+                "  {:>3} [{}] {}{}",
+                i + 1,
+                if checked[i] { "x" } else { " " },
+                native.label,
+                if caps.is_empty() {
+                    String::new()
+                } else {
+                    format!("  (announced as {})", caps.join(", "))
+                }
+            );
+        }
+        if names.is_empty() {
+            println!(
+                "  No MCP server in your {} configuration{}.",
+                share::runtime_label(&runtime),
+                if sources.is_empty() {
+                    String::new()
+                } else {
+                    format!(" ({})", sources.join(", "))
+                }
+            );
+        } else {
+            println!(
+                "  MCP servers of your own configuration{}: each {}.",
+                if sources.is_empty() {
+                    String::new()
+                } else {
+                    format!(" ({})", sources.join(", "))
+                },
+                share::SERVER_WARNING
+            );
+            for (j, name) in names.iter().enumerate() {
+                let i = natives.len() + j;
+                let what = available
+                    .get(name)
+                    .map_or("gone from your configuration", share::transport);
+                println!(
+                    "  {:>3} [{}] let it use {name} (an MCP server, {what}){}  (announced as cap:{})",
+                    i + 1,
+                    if checked[i] { "x" } else { " " },
+                    if !first && !seen.contains(name) && available.contains_key(name) {
+                        "  NEW"
+                    } else {
+                        ""
+                    },
+                    share::server_cap(name)
+                );
+            }
+        }
+    };
+    let interactive = std::io::IsTerminal::is_terminal(&std::io::stdin())
+        && std::io::IsTerminal::is_terminal(&std::io::stdout());
+    show(&checked);
+    if args.list {
+        return Ok(());
+    }
+    if !args.yes && args.add.is_empty() && args.remove.is_empty() {
+        anyhow::ensure!(
+            interactive,
+            "no terminal to ask: pass --yes to keep this checklist, or --add/--remove NAMES"
+        );
+        loop {
+            let line = ask_line("Numbers to switch (e.g. \"1 5\"), Enter when done: ")?;
+            if line.is_empty() {
+                break;
+            }
+            for word in line
+                .split(|c: char| c == ',' || c.is_whitespace())
+                .filter(|w| !w.is_empty())
+            {
+                match word.parse::<usize>() {
+                    Ok(n) if (1..=checked.len()).contains(&n) => checked[n - 1] = !checked[n - 1],
+                    _ => eprintln!("{word:?}: not a number of the list"),
+                }
+            }
+            show(&checked);
+        }
+    }
+    let chosen_natives: Vec<usize> = (0..natives.len()).filter(|i| checked[*i]).collect();
+    let chosen_servers: Vec<String> = names
+        .iter()
+        .enumerate()
+        .filter(|(j, _)| checked[natives.len() + j])
+        .map(|(_, n)| n.clone())
+        .collect();
+    let next = share::choose(&current, &runtime, &chosen_natives, &names, &chosen_servers);
+    let mut file = ConfigFile::open(data_dir)?;
+    for (leaf, values) in [
+        ("tools", &next.tools),
+        ("servers", &next.lend),
+        ("caps", &next.caps),
+    ] {
+        let key = member_key(&member, leaf);
+        if values.is_empty() {
+            file.unset(&key)?;
+        } else {
+            file.set(&key, &values.join(","))?;
+        }
+    }
+    let anything = !next.tools.is_empty() || !next.lend.is_empty();
+    if access == wats::access::Access::SwarmOnly && anything {
+        file.set(&member_key(&member, "access"), "workspace")?;
+        println!("access: swarm-only → workspace (what you chose needs it)");
+    }
+    let review = member.settings.review == Some(true);
+    if !next.lend.is_empty() && !review && member.settings.allow.is_empty() {
+        // Lending needs review or allow (ADR 0037 D2): review by default.
+        file.set(&member_key(&member, "review"), "true")?;
+        println!(
+            "review: on, its posts wait for you (`wats review`), since it uses your MCP \
+             servers. {}",
+            share::GUARDRAILS
+        );
+    }
+    file.save()?;
+    share::remember(
+        data_dir,
+        &runtime,
+        &available.keys().cloned().collect::<Vec<_>>(),
+    )?;
+    if !next.lend.is_empty() {
+        println!(
+            "It may use {} when it answers the swarm; each {}. Announced publicly as {}.",
+            next.lend.join(", "),
+            share::SERVER_WARNING,
+            next.lend
+                .iter()
+                .map(|n| format!("cap:{}", share::server_cap(n)))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+    println!(
+        "{}: saved. A running node applies it at its next start (`wats stop`, then `wats`).",
+        file.path().display()
+    );
+    Ok(())
+}
+
+/// The config.toml key of one of an agent's settings: `[agent]` for the
+/// old single agent, else `[agents.<name>]`.
+fn member_key(member: &wats::roster::Member, leaf: &str) -> String {
+    if member.legacy {
+        format!("agent.{leaf}")
+    } else {
+        format!("agents.{}.{leaf}", member.name)
+    }
+}
+
 fn config_command(node: &NodeArgs, data_dir: &std::path::Path, action: ConfigAction) -> Result<()> {
     let mut file = ConfigFile::open(data_dir)?;
     // `node.name` unset: the name drawn at the node's first start (ADR
@@ -6068,6 +6354,23 @@ fn agent_config(
             wats::vibe::check_model(model.trim())?;
         }
     }
+    // Lent servers (ADR 0037): refused without review or allow.
+    wats::share::check_lend(
+        &runtime,
+        access,
+        &file.servers,
+        &allow,
+        file.review == Some(true),
+    )?;
+    if let Some(note) = wats::share::ignored(&runtime, access, &file.servers) {
+        tracing::warn!("{note}");
+    } else if !file.servers.is_empty() {
+        tracing::warn!(
+            "agent may use your MCP servers {}: each {}",
+            file.servers.join(", "),
+            wats::share::SERVER_WARNING
+        );
+    }
     let catchup = match &file.catchup {
         Some(value) => wats::settings::parse_retention(value)
             .map_err(|e| anyhow::anyhow!("config.toml agent.catchup: {e}"))?,
@@ -6088,6 +6391,7 @@ fn agent_config(
         access,
         workdir: member.workspace(),
         tools: file.tools.clone(),
+        servers: file.servers.clone(),
         profile,
         user: std::env::var("USER")
             .or_else(|_| std::env::var("USERNAME"))
@@ -6895,6 +7199,25 @@ async fn async_main(mut cli: Cli) -> Result<()> {
             say_node(&data_dir, None);
             return config_command(&cli.node, &data_dir, action);
         }
+        Some(Command::Share {
+            agent,
+            list,
+            add,
+            remove,
+            yes,
+        }) => {
+            say_node(&data_dir, None);
+            return share_command(
+                &data_dir,
+                &ShareArgs {
+                    agent,
+                    list,
+                    add,
+                    remove,
+                    yes,
+                },
+            );
+        }
         // Works with a broken config.toml: a newer version may fix it.
         Some(Command::Upgrade {
             check,
@@ -7055,6 +7378,7 @@ async fn async_main(mut cli: Cli) -> Result<()> {
         }
         Some(
             Command::Config { .. }
+            | Command::Share { .. }
             | Command::Upgrade { .. }
             | Command::Agent { .. }
             | Command::Setup { .. }

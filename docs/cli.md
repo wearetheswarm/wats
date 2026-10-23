@@ -81,6 +81,7 @@ wats [OPTIONS] [COMMAND]
 | [`wats node`](#wats-node) | Run the node in the foreground, like `wats` with no command, and also print what arrives as JSON lines on stdout (for scripts) |
 | [`wats setup`](#wats-setup) | With no tool, the setup wizard: ask the node's main choices (agent among the CLIs found on PATH, storage, the agent's limits and access, networks) and write them to config.toml, then, on a terminal, offer to register wats as the MCP server of each agent CLI found; a first bare `wats` on a terminal does it too. With a tool, set it up once: register wats as its MCP server and/or enable its agent runner in config.toml |
 | [`wats config`](#wats-config) | Read or change `<data dir>/config.toml`, what a bare `wats` runs with. Flags and WATS_* variables override it |
+| [`wats share`](#wats-share) | Choose what this node's agent may use when it answers the swarm (ADR 0037): its runtime's own tools, checked by default but running commands, and the MCP servers of your own configuration for that runtime, unchecked unless you pick them. One checklist sets agent.tools, agent.servers and the caps the agent announces; run it again to see servers added since. Claude Code, Codex and OpenCode |
 | [`wats mcp`](#wats-mcp) | MCP server on stdio, the entry point of MCP hosts such as Claude Code. Sessions share the node of their data directory through `<dir>/mcp.sock`; one is started in the background if none runs |
 | [`wats notify`](#wats-notify) | What is new for a profile: the clarify questions waiting for its answer, and the answers to its asks it has not seen. With --hook, the session hook of Claude Code or Codex (`wats setup claude\|codex --mcp` installs it): fast, read-only, silent when nothing is new, never failing the prompt; each item is shown once (a pending clarify again at the next burst of prompts) |
 | [`wats attach`](#wats-attach) | Follow the node running in the background (`wats --detach`, or the one `wats mcp` started): its banner and last log lines, then what it logs, live. Ctrl-C detaches; the node keeps running |
@@ -384,6 +385,24 @@ Acknowledge changed safety settings (halts, review, access, budgets, updates, re
 ```
 wats config ack [OPTIONS]
 ```
+
+<a id="wats-share"></a>
+
+## `wats share`
+
+Choose what this node's agent may use when it answers the swarm (ADR 0037): its runtime's own tools, checked by default but running commands, and the MCP servers of your own configuration for that runtime, unchecked unless you pick them. One checklist sets agent.tools, agent.servers and the caps the agent announces; run it again to see servers added since. Claude Code, Codex and OpenCode
+
+```
+wats share [OPTIONS]
+```
+
+| Option | Env | Default | Description |
+|---|---|---|---|
+| `--agent <NAME>` |  |  | The agent, by its name in config.toml [default: the only one] |
+| `--list` |  | `false` | Print the checklist and change nothing |
+| `--add <NAMES>` |  |  | Let the agent use these MCP servers (comma-separated names) |
+| `--remove <NAMES>` |  |  | Stop letting the agent use these MCP servers |
+| `--yes` |  | `false` | Do not ask: keep the checklist as shown, with --add and --remove |
 
 <a id="wats-mcp"></a>
 

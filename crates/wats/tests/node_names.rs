@@ -522,6 +522,7 @@ fn agent_config(data_dir: &Path) -> wats::agent::AgentConfig {
         access: wats::access::Access::SwarmOnly,
         workdir: std::path::PathBuf::from("/nonexistent"),
         tools: vec![],
+        servers: Vec::new(),
         model: None,
         work_dir: data_dir.join("agent/helper"),
         data_dir: data_dir.to_path_buf(),

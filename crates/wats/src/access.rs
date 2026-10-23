@@ -358,9 +358,12 @@ pub fn claude_args(run: &ClaudeRun) -> Vec<String> {
         }
         Access::Workspace => {
             out.push("--strict-mcp-config".into());
+            // A server some `agent.tools` entry names a tool of
+            // (`mcp__crm__search`) is narrowed to the tools named.
             allowed.extend(
                 run.workspace_servers
                     .iter()
+                    .filter(|name| crate::share::server_tools(run.tools, name).is_empty())
                     .map(|name| format!("mcp__{name}__*")),
             );
             let rules: Vec<(String, String)> = run.tools.iter().map(|t| tool_rule(t)).collect();
@@ -419,11 +422,16 @@ pub fn check_workdir(workdir: &Path, data_dir: &Path) -> Result<()> {
 }
 
 /// Write the MCP config of one Claude Code run: the wats server (with the
-/// run's token), plus the workspace's servers. Returns their names.
+/// run's token), plus the workspace's servers and the lent ones (ADR
+/// 0037), a lent one replacing a workspace one of the same name. Written
+/// `0600`: it holds the runner token and the lent servers' secrets.
+/// Returns the servers' names.
+#[allow(clippy::too_many_arguments)]
 pub fn write_claude_mcp_config(
     path: &Path,
     access: Access,
     workdir: &Path,
+    lent: &[(String, Value)],
     wats_command: &Path,
     wats_args: &[String],
     runner_token: &str,
@@ -433,6 +441,11 @@ pub fn write_claude_mcp_config(
     } else {
         serde_json::Map::new()
     };
+    if access == Access::Workspace {
+        for (name, definition) in lent {
+            servers.insert(name.clone(), definition.clone());
+        }
+    }
     servers.remove("wats");
     let names: Vec<String> = servers.keys().cloned().collect();
     servers.insert(
@@ -447,11 +460,32 @@ pub fn write_claude_mcp_config(
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
     }
-    std::fs::write(
+    write_private(
         path,
-        serde_json::to_vec_pretty(&json!({"mcpServers": servers}))?,
+        &serde_json::to_vec_pretty(&json!({"mcpServers": servers}))?,
     )?;
     Ok(names)
+}
+
+/// Write a file only its owner can read (`0600` on Unix), also when it
+/// already exists with wider permissions.
+fn write_private(path: &Path, bytes: &[u8]) -> Result<()> {
+    use std::io::Write;
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        options.mode(0o600);
+        if path.exists() {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+        }
+    }
+    let mut file = options
+        .open(path)
+        .with_context(|| format!("write {}", path.display()))?;
+    file.write_all(bytes)?;
+    Ok(())
 }
 
 /// Codex features that could reach beyond the wats tools: shell, browser,
@@ -583,7 +617,8 @@ pub struct CodexRun<'a> {
     pub disable: &'a [String],
     /// Features `agent.tools` lists, enabled (workspace).
     pub enable: &'a [String],
-    /// `-c` overrides for the workspace's MCP servers.
+    /// `-c` overrides for the workspace's MCP servers, then the lent ones
+    /// ([`crate::share::codex_lent`]).
     pub workspace_overrides: &'a [String],
     pub extra: &'a [String],
 }
@@ -912,6 +947,8 @@ pub struct CapCheck<'a> {
     pub access: Access,
     pub workdir: &'a Path,
     pub tools: &'a [String],
+    /// `agent.servers`: lent servers give caps as workspace ones do.
+    pub servers: &'a [String],
     pub caps: &'a [String],
 }
 
@@ -946,6 +983,10 @@ pub fn cap_warnings(c: &CapCheck) -> Vec<String> {
         ),
         _ => (&[], Vec::new()),
     };
+    let mut servers = servers;
+    if c.access == Access::Workspace {
+        servers.extend(c.servers.iter().cloned());
+    }
     let runtime_tools = |need: &CapNeed| -> &'static [&'static str] {
         match c.runtime {
             "codex" => need.codex,
@@ -1023,6 +1064,7 @@ mod tests {
                 access,
                 workdir: dir.path(),
                 tools: &tools.iter().map(|t| t.to_string()).collect::<Vec<_>>(),
+                servers: &[],
                 caps: &caps.iter().map(|t| t.to_string()).collect::<Vec<_>>(),
             })
         };
@@ -1150,6 +1192,70 @@ mod tests {
     }
 
     use super::*;
+
+    /// Lent servers (ADR 0037) join a workspace run's MCP config, written
+    /// `0600`; a server `agent.tools` names a tool of is narrowed to it.
+    #[test]
+    fn claude_runs_get_the_lent_servers() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mcp.json");
+        let lent = vec![
+            (
+                "crm".to_string(),
+                json!({"command": "crm", "env": {"KEY": "s"}}),
+            ),
+            (
+                "docs".to_string(),
+                json!({"type": "http", "url": "https://d"}),
+            ),
+        ];
+        let names = write_claude_mcp_config(
+            &path,
+            Access::Workspace,
+            dir.path(),
+            &lent,
+            Path::new("/bin/wats"),
+            &[],
+            "token",
+        )
+        .unwrap();
+        assert_eq!(names, ["crm", "docs"]);
+        let v: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(v["mcpServers"]["crm"]["env"]["KEY"], "s");
+        assert!(v["mcpServers"]["wats"].is_object());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
+        let swarm_only = write_claude_mcp_config(
+            &path,
+            Access::SwarmOnly,
+            dir.path(),
+            &lent,
+            Path::new("/bin/wats"),
+            &[],
+            "token",
+        )
+        .unwrap();
+        assert!(swarm_only.is_empty());
+
+        let tools = vec!["mcp__crm__search".to_string()];
+        let args = claude_args(&ClaudeRun {
+            access: Access::Workspace,
+            mcp_config: &path,
+            workspace_servers: &names,
+            tools: &tools,
+            extra: &[],
+            data_dir: Path::new("/data"),
+            run_dir: dir.path(),
+        });
+        let allowed = &args[args.iter().position(|a| a == "--allowedTools").unwrap() + 1];
+        assert!(allowed.contains("mcp__docs__*"), "{allowed}");
+        assert!(allowed.contains("mcp__crm__search"), "{allowed}");
+        assert!(!allowed.contains("mcp__crm__*"), "{allowed}");
+    }
 
     #[test]
     fn claude_levels() {
