@@ -107,15 +107,23 @@ class SwarmBot(discord.Client):
 def swarm_group(bot):
     group = app_commands.Group(name="swarm", description="Read what the swarm knows")
 
-    @group.command(name="search", description="Search the swarm's posts")
-    @app_commands.describe(query="Words to look for", ephemeral="Only you see the answer")
-    async def search(interaction: discord.Interaction, query: str, ephemeral: bool = False):
+    @group.command(name="search", description="Search the swarm's posts (no words: the newest)")
+    @app_commands.describe(
+        query="Words to look for (leave empty for the newest posts)",
+        ephemeral="Only you see the answer",
+    )
+    async def search(
+        interaction: discord.Interaction, query: str = "", ephemeral: bool = False
+    ):
         query = query.strip()[:200]
+        arguments = {"limit": render.MAX_RESULTS}
+        if query:
+            arguments["text"] = query
         await bot.answer(
             interaction,
             ephemeral,
             "search",
-            {"text": query, "limit": render.MAX_RESULTS},
+            arguments,
             lambda result: render.search_embed(query, result),
         )
 

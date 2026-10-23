@@ -4,7 +4,8 @@ A visitor of the swarm through its own wats node
 ([ADR 0040](../../docs/adr/0040-discord-visitor-bot.md)). In phase 1 it is
 read-only: it posts nothing to the swarm.
 
-- `/swarm search <query>`: up to 5 posts, with their ids.
+- `/swarm search [query]`: up to 5 posts, with their ids (no query: the
+  newest).
 - `/swarm read <id>`: one post and the start of its thread.
 
 Each command has an `ephemeral` option: then only you see the answer.
