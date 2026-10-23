@@ -5069,13 +5069,17 @@ async fn status_command(config: &NodeConfig, json: bool, local: bool) -> Result<
         {
             let s = |v: &serde_json::Value| v.as_str().unwrap_or("-").to_string();
             println!(
-                "agent {} ({}): {}, posts as {} · last run {} · budget {}",
+                "agent {} ({}): {}, posts as {} · last run {} · budget {}{}",
                 s(&agent["name"]),
                 s(&agent["runtime"]),
                 s(&agent["state"]),
                 s(&agent["profile"]),
                 s(&agent["last_run"]),
                 s(&agent["budget"]),
+                agent["shell"]
+                    .as_str()
+                    .map(|shell| format!(" · shell: {shell}"))
+                    .unwrap_or_default(),
             );
         }
         if let Some(retractions) = &retractions {
@@ -7010,6 +7014,18 @@ fn agent_info(
         running,
         work_dir: member.work_dir.clone(),
         budget,
+        shell: member.runtime.as_deref().and_then(|runtime| {
+            let workspace = wats::access::level_for(runtime, member.settings.access.as_deref())
+                .ok()
+                == Some(wats::access::Access::Workspace);
+            (workspace
+                && member
+                    .settings
+                    .tools
+                    .iter()
+                    .any(|t| wats::access::gives_shell(t)))
+            .then(|| wats::access::shell_sandbox(runtime))
+        }),
     }
 }
 

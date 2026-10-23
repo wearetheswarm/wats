@@ -173,6 +173,9 @@ pub struct AgentInfo {
     /// Its budget, without the limits its runtime cannot be held to
     /// ([`budget::Budget::for_runtime`]).
     pub budget: budget::Budget,
+    /// A lent shell, and what holds its commands
+    /// ([`access::shell_sandbox`]): `None` without one.
+    pub shell: Option<&'static str>,
 }
 
 impl AgentInfo {
@@ -214,6 +217,9 @@ impl AgentInfo {
             "budget": budget::describe(&limits, &spend, self.runtime_name()),
             "usage": budget::status_json(&limits, &spend, self.runtime_name()),
         });
+        if let Some(sandbox) = self.shell {
+            status["shell"] = json!(format!("on, {sandbox}"));
+        }
         // Paused by a USD budget of 0 from before 0.4.5 (ADR 0034 §5).
         if let Some(notice) = limits.zero_notice(&self.name) {
             status["notice"] = json!(notice);

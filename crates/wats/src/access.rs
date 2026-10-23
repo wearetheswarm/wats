@@ -747,7 +747,7 @@ pub fn shell_sandbox(runtime: &str) -> &'static str {
 /// Whether an `agent.tools` entry is a shell: Claude Code's `Bash`,
 /// Codex's `shell_tool`, OpenCode's `bash` (or `shell`), with or without
 /// a pattern.
-fn gives_shell(tool: &str) -> bool {
+pub fn gives_shell(tool: &str) -> bool {
     let base = tool.split('(').next().unwrap_or(tool).trim();
     matches!(base, "Bash" | "shell_tool")
         || base.eq_ignore_ascii_case("bash")

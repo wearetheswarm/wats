@@ -3609,8 +3609,10 @@ async fn the_llm_token_budget_stops_new_runs() -> anyhow::Result<()> {
         running: true,
         work_dir: work.clone(),
         budget,
+        shell: Some(wats::access::shell_sandbox("claude")),
     };
     let status = info.status(unix_now());
+    assert_eq!(status["shell"], "on, not sandboxed", "{status}");
     assert_eq!(status["usage"]["today"]["tokens"], 2200, "{status}");
     assert_eq!(
         status["usage"]["limits"]["tokens_per_day"], 2000,
