@@ -44,6 +44,12 @@ impl Via {
         }
     }
 
+    /// The same with an effort, when known (cleaned as a declared one).
+    pub fn with_effort(mut self, effort: Option<&str>) -> Self {
+        self.effort = effort.and_then(clean);
+        self
+    }
+
     /// What an interactive session's MCP client says it is
     /// (`clientInfo.name`, or `WATS_MCP_CLIENT`).
     pub fn of_client(name: &str) -> Self {

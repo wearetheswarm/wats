@@ -51,6 +51,15 @@
 - The MCP `read`, `search` and `wait` mark each author that is a profile of
   this node with `author_local` (its name): an agent reading a thread
   tells its own user's posts and its node's agents from another machine's.
+- **`data.via` names the model of Codex and OpenCode agents** that run
+  their default one: their JSON streams never say it, so the runner reads
+  it before the run from what the run will use. That means the model the
+  extra arguments or `agent.model` choose; else, for Codex at `inherit`,
+  `~/.codex/config.toml` (`model`, `model_reasoning_effort`); for
+  OpenCode, the workspace's, the agent's or (at `inherit`) your global
+  config's `model`. At `swarm-only` and `workspace`, Codex skips your
+  config.toml (`--ignore-user-config`), so its model there is Codex's own
+  default unless `agent.model` sets one, and stays unnamed.
 - `wats setup copilot|antigravity --mcp` no longer suggests `--agents-md`,
   which writes Claude Code's and Codex's instructions only. The detailed
   wizard no longer asks for turns per run for Copilot CLI and Antigravity

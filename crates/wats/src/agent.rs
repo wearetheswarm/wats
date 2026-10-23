@@ -865,7 +865,7 @@ fn open_run(config: &AgentConfig, trigger: &Trigger) -> Result<(RunRecord, PathB
         &trigger.events(),
     );
     record.access = config.access.to_string();
-    record.model = config.model.clone().unwrap_or_default();
+    record.model = run_model(config).model.unwrap_or_default();
     std::fs::create_dir_all(runs::runs_dir(&config.work_dir))?;
     let base = record.id.clone();
     let mut n = 1;
@@ -1040,7 +1040,11 @@ async fn start_run(
         events: trigger.events(),
         profile: config.profile.clone(),
         file_roots: Vec::new(),
-        via: crate::via::Via::of_run(&via_runtime(config), config.model.as_deref()),
+        via: {
+            let resolved = run_model(config);
+            crate::via::Via::of_run(&via_runtime(config), resolved.model.as_deref())
+                .with_effort(resolved.effort.as_deref())
+        },
     });
     let guard = TokenGuard {
         node: node.as_ref(),
@@ -1124,6 +1128,21 @@ async fn start_run(
                 )
             })
             .flatten(),
+    })
+}
+
+/// The model and effort a run will use, resolved before it starts
+/// ([`crate::run_model`]): Codex and OpenCode never report them.
+fn run_model(config: &AgentConfig) -> crate::run_model::Resolved {
+    crate::run_model::resolve(&crate::run_model::Run {
+        runtime: &config.runtime,
+        access: config.access,
+        model: config.model.as_deref(),
+        extra_args: &config.extra_args,
+        work_dir: &config.work_dir,
+        workdir: &config.workdir,
+        codex_home: access::codex_home(),
+        opencode_global: crate::run_model::opencode_global_dir(),
     })
 }
 
