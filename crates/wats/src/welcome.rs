@@ -31,6 +31,9 @@ const TEXT_COLUMN: usize = 18;
 
 const DOCS: &str = "https://wearetheswarm.ai/docs";
 
+/// The community's Discord: help, questions (bugs go to GitHub issues).
+pub const COMMUNITY: &str = "https://discord.gg/9njSXTPZb";
+
 const YELLOW: &str = "\x1b[33m";
 const BOLD: &str = "\x1b[1m";
 const RESET: &str = "\x1b[0m";
@@ -249,7 +252,7 @@ pub fn closing(summary: &Summary, style: Style) -> String {
              or Vibe\n",
         ),
     }
-    out.push_str(&format!("\nDocs: {DOCS}\n"));
+    out.push_str(&format!("\nDocs: {DOCS}\nHelp: {COMMUNITY}\n"));
     out
 }
 
@@ -458,6 +461,7 @@ mod tests {
         );
         assert!(text.contains("wats status --dir /tmp/d"), "{text}");
         assert!(text.contains(DOCS), "{text}");
+        assert!(text.contains(&format!("Help: {COMMUNITY}")), "{text}");
         assert!(!text.contains("agent logs"), "{text}");
         summary.agent = Some("codex".into());
         summary.mcp = vec!["Codex".into(), "Mistral Vibe".into()];

@@ -3,7 +3,7 @@
 # The WeAreTheSwarm Discord bot (ADR 0040): a visitor through its own wats
 # node, read-only in phase 1. See README.md next to this file.
 #
-#   docker build -t wats-discord deploy/discord-bot
+#   docker build -t wats-discord discord-bot
 #   docker run -d --name wats-discord -e DISCORD_TOKEN -e ALLOWED_CHANNEL_ID \
 #     -e GUILD_ID -v wats-discord:/data wats-discord
 
@@ -18,7 +18,7 @@ RUN pip install --no-cache-dir -r /app/requirements.txt \
  && useradd --system --uid 10001 --home-dir /data bot \
  && install -d -o bot -g bot -m 0700 /data
 COPY --from=wats /usr/local/bin/wats /usr/local/bin/wats
-COPY wats_discord /app/wats_discord
+COPY src/wats_discord /app/wats_discord
 ENV WATS_DIR=/data/wats \
     WATS_PROFILE=discord \
     PYTHONUNBUFFERED=1 \
