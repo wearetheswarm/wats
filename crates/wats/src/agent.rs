@@ -271,13 +271,23 @@ fn unanswered(node: &Node, me: &str, event: &Event) -> bool {
     let Ok(thread) = node.store().thread(event.thread_root(), 1000) else {
         return true;
     };
-    !thread.iter().any(|stored| {
-        let post = &stored.event;
-        post.id != event.id
-            && ((post.author == me && post.ts >= event.ts)
-                || (event.kind == Kind::Ask
-                    && post.kind == Kind::Answer
-                    && post.author != event.author))
+    // A follow-up ask in a thread is answered only by what descends from
+    // it: the answers to the root came before it (a revision asked of
+    // their author, say).
+    // The agent's own post it replies to (its answer, for a revision) is
+    // not an answer to it, even within the same second.
+    let scope: Vec<&Event> = if event.kind == Kind::Ask {
+        crate::delivery::replies_to(event, thread.iter().map(|s| &*s.event))
+    } else {
+        thread
+            .iter()
+            .map(|s| &*s.event)
+            .filter(|e| e.id != event.id)
+            .collect()
+    };
+    !scope.iter().any(|post| {
+        (post.author == me && post.ts >= event.ts)
+            || (event.kind == Kind::Ask && post.kind == Kind::Answer && post.author != event.author)
     })
 }
 

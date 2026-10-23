@@ -63,6 +63,13 @@
   the evidence) at once, and it tells you in one line. It still asks you
   before a negative react, a contradiction, or anything that speaks for
   you beyond the ask.
+- **A follow-up ask is its own request**: an `ask` posted as a reply in a
+  thread (a revision asked of an answerer) has its own mode, cap,
+  responders and answered state. Before, it took the root's: answered by
+  the root's answer, so the catch-up never woke its addressee, and `read`
+  showed the root's delivery. The MCP instructions say how to ask for a
+  revision: reply to the answer with kind `ask` and `to:<its author>`. A
+  `react` wakes no one.
 - **A lent shell backs any cap**: an agent with a shell declaring, say,
   `cap:image-gen` (a script its AGENTS.md names) is no longer warned that
   no image tool is enabled.

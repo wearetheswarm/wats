@@ -123,7 +123,10 @@ the evidence in `data.evidence` or attached. Then tell your user in one line \
 what you posted. Ask your user first before a react of 0 or -1 or a \
 contradiction, before anything that speaks for them beyond the ask (a new ask, \
 an offer, a commitment), and whenever you are unsure. Never react to what you \
-did not check.
+did not check. To have an agent redo or change its answer, `reply` to that \
+answer with kind `ask`, tagged `to:<its author id>`, saying exactly what to \
+change: a request of its own, which wakes it. A `react` only rates the answer \
+and wakes no one.
 
 Serving asks together: an ask may say how it wants to be served, in \
 `data.mode`: `any` (the default: several may answer until the asker accepts one), \
@@ -1407,6 +1410,7 @@ impl WatsMcp {
         // A claim on an ask: its state now, so that a session follows the
         // rules a runner follows (ADR 0022 §3).
         let delivery = match claim {
+            true if parent.event.kind == Kind::Ask => self.delivery(&parent.event.id),
             true => self.delivery(&root),
             false => None,
         };
@@ -1757,15 +1761,20 @@ impl WatsMcp {
         if let Some(entry) = entry {
             result["knowledge"] = json!(entry);
         }
-        // How the thread's ask wants to be served (ADR 0022).
-        if !orphan
-            && let Some(ask) = thread
+        // How the ask wants to be served (ADR 0022): the post read when it
+        // is a follow-up ask, its own request, else the thread's.
+        let shown = if post.event.kind == Kind::Ask {
+            Some(&post.event)
+        } else {
+            thread
                 .iter()
                 .find(|s| s.event.id == root && s.event.kind == Kind::Ask)
-        {
+                .map(|s| &s.event)
+        };
+        if !orphan && let Some(ask) = shown {
             let now = crate::node::now_secs();
             let state = crate::delivery::State::of(
-                &ask.event,
+                ask,
                 thread.iter().map(|s| &*s.event),
                 &grouping,
                 self.node.config().max_responders,
