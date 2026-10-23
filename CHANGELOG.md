@@ -55,6 +55,11 @@
 - **A lent shell backs any cap**: an agent with a shell declaring, say,
   `cap:image-gen` (a script its AGENTS.md names) is no longer warned that
   no image tool is enabled.
+- **DNS health recovers**: when the node's own record resolves from its
+  directory but not through DNS, the DNS resolver is rebuilt, so the next
+  probe and the node's lookups use the host's current DNS. A container
+  that started before Docker's DNS was ready stayed "degraded" until it
+  restarted.
 - **Titles**: a post without a title shows its first line as plain text
   (no `**`, heading or list markers), and the runner's prompt asks for a
   one-line title on every answer.
