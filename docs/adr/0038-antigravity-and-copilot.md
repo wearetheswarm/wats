@@ -140,9 +140,14 @@ schedules.
     first `command` step of a run) and refuses the shell otherwise.
   - The gate also checks file paths against the workspace, which makes a
     second boundary.
-  - **Offered only if check (d) shows that Ask fails closed in `-p`
-    mode**, that is, it denies or errors out instead of waiting for an
-    answer. Otherwise the level is refused, as for Vibe.
+  - **Offered:** check (d) on 1.4.6 showed that Ask fails closed in
+    `-p` mode. A read outside the workspace was denied at once, as a
+    `TOOL_ERROR`, and the run ended with `denied_actions` and an empty
+    response, which wats records as an error.
+  - Check (c) showed that `$HOME/.gemini/config/hooks.json` is honoured
+    headless, and that a deny rule still wins after the gate's allow.
+  - A lent shell needs `--sandbox`. wats lends it on macOS only for now,
+    since Linux has the silent no-op.
 - **inherit:** not in the first version. Antigravity has no per-run MCP
   config, so an inherit run would need wats written into your own
   `mcp_config.json` with a per-run token (`agy mcp add` edits the same
@@ -174,9 +179,10 @@ both are proposed as agents.
 - **D1. Scope:** Copilot CLI and Antigravity CLI as runtimes and MCP
   hosts. Gemini CLI is dropped: wats supports only CLIs that can be both
   (Vincent's rule). Approved.
-- **D2. Antigravity as an agent:** swarm-only, locked by its permission
-  rules and the gate. Workspace comes in if check (d) shows Ask fails
-  closed. Inherit waits for a per-run MCP config. Approved.
+- **D2. Antigravity as an agent:** swarm-only by default, locked by its
+  permission rules and the gate. Workspace is offered, since check (d)
+  showed Ask fails closed. Inherit waits for a per-run MCP config.
+  Approved.
 - **D3. Copilot agent auth:** the stored login (check (a)), with
   `COPILOT_GITHUB_TOKEN` as the fallback. Approved.
 - **D4. Budgets without dollars:**
@@ -190,7 +196,7 @@ both are proposed as agents.
 - Copilot (a): done on v1.0.103, see §1. Still open: whether
   `--available-tools wats` alone keeps `shell`, `read` and `write` out.
   The first run of the branch build shows it in `session.tools_updated`.
-- Antigravity (b): done on 1.4.6, see §2. (c) and (d) are in §2.4.
+- Antigravity (b), (c) and (d): done on 1.4.6, see §2.
 
 ## Alternatives
 

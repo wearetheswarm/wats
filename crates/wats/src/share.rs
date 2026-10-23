@@ -19,7 +19,7 @@ use serde_json::Value;
 use crate::access::Access;
 
 /// The runtimes that lend servers in 0.4.8.
-pub const RUNTIMES: [&str; 3] = ["claude", "codex", "opencode"];
+pub const RUNTIMES: [&str; 5] = ["claude", "codex", "opencode", "copilot", "antigravity"];
 
 /// Whether `runtime` lends servers.
 pub fn supports(runtime: &str) -> bool {
@@ -123,12 +123,44 @@ const OPENCODE_NATIVES: &[Native] = &[
     },
 ];
 
+const COPILOT_NATIVES: &[Native] = &[
+    Native {
+        label: "Fetch the web",
+        tools: &["url"],
+        caps: &["web"],
+        default: true,
+    },
+    Native {
+        label: RUN_LABEL,
+        tools: &["shell"],
+        caps: &["code-exec"],
+        default: false,
+    },
+];
+
+const ANTIGRAVITY_NATIVES: &[Native] = &[
+    Native {
+        label: "Search and fetch the web",
+        tools: &["web"],
+        caps: &["web"],
+        default: true,
+    },
+    Native {
+        label: "Run commands, in its terminal sandbox (macOS)",
+        tools: &["shell"],
+        caps: &["code-exec"],
+        default: false,
+    },
+];
+
 /// The native capabilities `wats share` offers for `runtime`.
 pub fn natives(runtime: &str) -> &'static [Native] {
     match runtime {
         "claude" => CLAUDE_NATIVES,
         "codex" => CODEX_NATIVES,
         "opencode" => OPENCODE_NATIVES,
+        "copilot" => COPILOT_NATIVES,
+        "antigravity" => ANTIGRAVITY_NATIVES,
         _ => &[],
     }
 }
@@ -139,6 +171,8 @@ pub fn runtime_label(runtime: &str) -> &str {
         "claude" => "Claude Code",
         "codex" => "Codex",
         "opencode" => "OpenCode",
+        "copilot" => "GitHub Copilot CLI",
+        "antigravity" => "Antigravity CLI",
         other => other,
     }
 }
@@ -168,6 +202,14 @@ pub fn source_paths(runtime: &str) -> Vec<PathBuf> {
             .collect(),
         "codex" => crate::access::codex_home()
             .map(|d| d.join("config.toml"))
+            .into_iter()
+            .collect(),
+        "copilot" => crate::hosts::Host::Copilot
+            .user_path()
+            .into_iter()
+            .collect(),
+        "antigravity" => crate::hosts::Host::Antigravity
+            .user_path()
             .into_iter()
             .collect(),
         "opencode" => {
@@ -310,7 +352,7 @@ pub fn ignored(runtime: &str, access: Access, lend: &[String]) -> Option<String>
     if !supports(runtime) {
         return Some(format!(
             "agent.servers is ignored: {runtime} agents cannot use your MCP servers yet (Claude \
-             Code, Codex and OpenCode can)"
+             Code, Codex, OpenCode, Copilot CLI and Antigravity CLI can)"
         ));
     }
     match access {

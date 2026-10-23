@@ -278,9 +278,14 @@ pub struct Found {
 }
 
 impl Found {
+    /// The runtime it is (`agy` is Antigravity CLI's command).
+    pub fn runtime(&self) -> &'static str {
+        crate::settings::runtime_of_command(self.name)
+    }
+
     /// Whether wats can run it (an agent runtime).
     pub fn supported(&self) -> bool {
-        RUNTIMES.contains(&self.name)
+        RUNTIMES.contains(&self.runtime())
     }
 }
 
@@ -399,7 +404,7 @@ fn ask_runtime(
         for f in found {
             if f.supported() {
                 n += 1;
-                writeln!(out, "  {n}) {:<9} {}", f.name, f.path.display())?;
+                writeln!(out, "  {n}) {:<9} {}", f.runtime(), f.path.display())?;
             } else {
                 writeln!(
                     out,
@@ -418,7 +423,7 @@ fn ask_runtime(
     writeln!(out, "  0) none: the node runs no agent")?;
     let default = current
         .map(str::to_string)
-        .unwrap_or_else(|| supported[0].name.to_string());
+        .unwrap_or_else(|| supported[0].runtime().to_string());
     loop {
         write!(out, "Agent the node runs (agent.runtime) [{default}]: ")?;
         let Some(answer) = read_answer(input, out)? else {
@@ -431,7 +436,7 @@ fn ask_runtime(
         };
         let pick = match answer.parse::<usize>() {
             Ok(0) => Some("none"),
-            Ok(i) => supported.get(i - 1).map(|f| f.name),
+            Ok(i) => supported.get(i - 1).map(|f| f.runtime()),
             Err(_) if answer == "none" => Some("none"),
             Err(_) => RUNTIMES.iter().copied().find(|r| *r == answer),
         };
@@ -887,6 +892,11 @@ fn ask_mode(
                 .filter(|v| crate::vibe::access(Some(v)).is_ok())
                 .unwrap_or_else(|| "swarm-only".to_string());
             kept.push(format!("{access} access"));
+        } else if matches!(runtime, Some("copilot" | "antigravity")) {
+            // Their default level is swarm-only (ADR 0038).
+            let access = current(settings, table, "agent.access")
+                .unwrap_or_else(|| "swarm-only".to_string());
+            kept.push(format!("{access} access"));
         } else if runtime != Some("openclaw") {
             kept.push(format!("{} access", value("agent.access")));
         }
@@ -1247,6 +1257,8 @@ fn runtime_label(runtime: &str) -> &str {
         "vibe" => "Mistral Vibe",
         "opencode" => "OpenCode",
         "openclaw" => "OpenClaw",
+        "copilot" => "GitHub Copilot CLI",
+        "antigravity" => "Antigravity CLI",
         other => other,
     }
 }
@@ -2175,9 +2187,18 @@ fn next_steps(out: &mut impl Write, choices: &Choices, found: &[Found], hints: b
                 "codex" => "Codex",
                 "opencode" => "OpenCode",
                 "vibe" => "Mistral Vibe",
+                "copilot" => "GitHub Copilot CLI",
+                "antigravity" => "Antigravity CLI",
                 _ => "Claude Code",
             };
             write!(out, "`wats` now runs the node with a {name} agent.")?;
+            if runtime == "copilot" {
+                write!(
+                    out,
+                    " Its runs have the wats tools only (swarm-only), with their own Copilot \
+                     home (not ~/.copilot); `wats share` lends more."
+                )?;
+            }
             if runtime == "vibe" {
                 let inherit = choices
                     .values

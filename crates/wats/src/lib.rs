@@ -6,6 +6,7 @@
 
 pub mod access;
 pub mod agent;
+pub mod antigravity;
 pub mod attach;
 pub mod background;
 pub mod banner;
@@ -13,6 +14,7 @@ pub mod bootstrap;
 pub mod browse;
 pub mod budget;
 pub mod challenge;
+pub mod copilot;
 pub mod crash;
 pub mod delivery;
 pub mod desktop;

@@ -26,6 +26,7 @@ use tracing::{debug, info, warn};
 
 use crate::access::{self, Access};
 use crate::budget;
+use crate::copilot;
 use crate::event::{Draft, Event, Kind, title_from_text};
 use crate::identity::author_id;
 use crate::node::Node;
@@ -1034,7 +1035,14 @@ async fn start_run(
         node: node.as_ref(),
         token: Some(token.clone()),
     };
-    let prepared = prepare_command(config, &token, &transcript, remaining_usd, remaining_tokens);
+    let prepared = prepare_command(
+        config,
+        &token,
+        &transcript,
+        &prompt,
+        remaining_usd,
+        remaining_tokens,
+    );
     // Vibe reads at most 1 MiB of prompt from stdin.
     let prompt = if config.runtime == "vibe" {
         vibe::fit_prompt(prompt)
@@ -1079,7 +1087,10 @@ async fn start_run(
     });
     // The prompt goes on stdin: --mcp-config and --allowedTools take several
     // values and would swallow a positional prompt.
-    if let Some(mut stdin) = child.stdin.take() {
+    // Copilot has it in `-p`: its stdin closes empty.
+    if let Some(mut stdin) = child.stdin.take()
+        && !prompt_in_args(&config.runtime)
+    {
         stdin.write_all(prompt.as_bytes()).await?;
     }
     Ok(Running {
@@ -1105,12 +1116,18 @@ async fn start_run(
     })
 }
 
+/// Whether a runtime gets its prompt as an argument, not on stdin.
+fn prompt_in_args(runtime: &str) -> bool {
+    matches!(runtime, "copilot" | "antigravity")
+}
+
 /// The command of one spawned run, and its transcript file (stdout and
 /// stderr go there): the runtime's arguments, environment and directory.
 fn prepare_command(
     config: &AgentConfig,
     token: &str,
     transcript: &std::path::Path,
+    prompt: &str,
     remaining_usd: Option<f64>,
     remaining_tokens: Option<u64>,
 ) -> Result<(tokio::process::Command, std::fs::File)> {
@@ -1222,6 +1239,67 @@ fn prepare_command(
             command
                 .args(opencode::run_args())
                 .args(opencode_model_arg(config))
+                .args(&config.extra_args);
+        }
+        "antigravity" => {
+            // Its own home: its login, the wats server only, the locks
+            // (ADR 0038 §2).
+            crate::antigravity::check_ancestors(&dir)?;
+            let home = crate::antigravity::agent_home(&config.work_dir);
+            let lent = lent_servers(config);
+            let names: Vec<String> = lent.iter().map(|(n, _)| n.clone()).collect();
+            let lock = crate::antigravity::Lock::of(config.access, &config.tools, &names);
+            crate::antigravity::check_shell(&lock)?;
+            crate::antigravity::prepare_home(&crate::antigravity::Home {
+                home: &home,
+                wats_command: &config.mcp_command,
+                wats_args: &config.mcp_args,
+                token,
+                real_home: std::env::home_dir().as_deref(),
+                lock: &lock,
+                lent: &lent,
+            })?;
+            command.env("HOME", &home);
+            command
+                .args(crate::antigravity::run_args(&crate::antigravity::Run {
+                    prompt: &copilot::fit_prompt(prompt),
+                    sandbox: lock.shell,
+                    timeout: config.run_timeout,
+                    model: config.model.as_deref(),
+                }))
+                .args(&config.extra_args);
+        }
+        "copilot" => {
+            // The prompt goes in `-p` (stdin is ignored then).
+            let usage = copilot::usage_path(&config.work_dir);
+            let _ = std::fs::remove_file(&usage);
+            let wats = copilot::wats_entry(&config.mcp_command, &config.mcp_args, token);
+            let inherit_config = config.work_dir.join("copilot-inherit.json");
+            if config.access == Access::Inherit {
+                let mut servers = serde_json::Map::new();
+                servers.insert(copilot::SERVER.into(), wats);
+                copilot::write_mcp_config(&inherit_config, &servers)?;
+            } else {
+                let home = copilot::agent_home(&config.work_dir);
+                copilot::write_mcp_config(
+                    &home.join("mcp-config.json"),
+                    &copilot::run_servers(config.access, wats, &lent_servers(config)),
+                )?;
+                for key in copilot::removed_env(std::env::vars_os()) {
+                    command.env_remove(key);
+                }
+                command.env("COPILOT_HOME", &home);
+            }
+            command
+                .args(copilot::run_args(&copilot::Run {
+                    access: config.access,
+                    prompt: &copilot::fit_prompt(prompt),
+                    tools: &config.tools,
+                    inherit_config: (config.access == Access::Inherit)
+                        .then_some(inherit_config.as_path()),
+                    model: config.model.as_deref(),
+                    usage_file: &usage,
+                }))
                 .args(&config.extra_args);
         }
         "codex" => {
@@ -1490,6 +1568,16 @@ async fn finish_run(
             "error"
         }
         .into();
+    }
+    // Copilot's usage file (its AI credits and premium requests) goes
+    // into the transcript.
+    if config.runtime == "copilot"
+        && let Some(line) = copilot::usage_line(&copilot::usage_path(&config.work_dir))
+        && let Ok(mut f) = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&running.transcript)
+    {
+        let _ = runs::write_line(&mut f, &line);
     }
     // Vibe's run export (its cost, turns and error) goes into the
     // transcript, then the directory goes: it copies the session too.

@@ -529,7 +529,8 @@ Vibe cannot keep its tools inside one directory ([vibe.md](vibe.md#access-levels
 ### Your own tools and MCP servers: `wats share`
 
 `wats share` is a checklist of what the agent may use when it answers the
-swarm (Claude Code, Codex and OpenCode, at `workspace`):
+swarm (Claude Code, Codex, OpenCode, Copilot CLI and Antigravity CLI, at
+`workspace`):
 
 ```
 What agent claude (Claude Code) may use when it answers the swarm:
