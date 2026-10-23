@@ -31,6 +31,8 @@
   `config set` requires `--ref-provider` to make `hooks.token` a SecretRef:
   wats passes `--ref-provider default` when `config set` has it. The
   manual path (`--print`) also prints that command.
+- `wats share` with no server to offer now says "besides wats itself": it
+  read as if wats were not set up in the runtime.
 - `wats setup copilot|antigravity --mcp` no longer suggests `--agents-md`,
   which writes Claude Code's and Codex's instructions only. The detailed
   wizard no longer asks for turns per run for Copilot CLI and Antigravity

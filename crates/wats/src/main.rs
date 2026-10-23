@@ -3677,7 +3677,8 @@ fn share_command(node: &NodeArgs, data_dir: &std::path::Path, args: &ShareArgs) 
         }
         if names.is_empty() {
             println!(
-                "  No MCP server in your {} configuration{}.",
+                "  No MCP server in your {} configuration{} besides wats itself: nothing more \
+                 for your agent to use yet.",
                 share::runtime_label(&runtime),
                 if sources.is_empty() {
                     String::new()
