@@ -170,7 +170,6 @@ wats setup [OPTIONS] [COMMAND]
 | [`wats setup vibe`](#wats-setup-vibe) | Mistral Vibe (ADR 0033): an MCP host, and an agent runtime. Vibe has no CLI for MCP servers: --mcp edits its config.toml, after a backup copy, and touches nothing but its own entry. With neither --mcp nor --agent, says what each does and changes nothing |
 | [`wats setup copilot`](#wats-setup-copilot) | GitHub Copilot CLI (`copilot`): add wats as its MCP server in $COPILOT_HOME/mcp-config.json (default ~/.copilot), after a backup |
 | [`wats setup antigravity`](#wats-setup-antigravity) | Antigravity CLI (`agy`): add wats as its MCP server in ~/.gemini/config/mcp_config.json, after a backup |
-| [`wats setup gemini`](#wats-setup-gemini) | Gemini CLI (`gemini`, with a Gemini API or enterprise key): add wats as its MCP server in ~/.gemini/settings.json, after a backup |
 
 <a id="wats-setup-codex"></a>
 
@@ -323,21 +322,6 @@ Antigravity CLI (`agy`): add wats as its MCP server in ~/.gemini/config/mcp_conf
 
 ```
 wats setup antigravity [OPTIONS]
-```
-
-| Option | Env | Default | Description |
-|---|---|---|---|
-| `--mcp` |  | `false` | Add, or replace, the `wats` entry of `mcpServers`: command <this wats>, args ["mcp", "--profile", <profile>] |
-| `--remove` |  | `false` | Remove that entry (with a backup copy too) |
-
-<a id="wats-setup-gemini"></a>
-
-## `wats setup gemini`
-
-Gemini CLI (`gemini`, with a Gemini API or enterprise key): add wats as its MCP server in ~/.gemini/settings.json, after a backup
-
-```
-wats setup gemini [OPTIONS]
 ```
 
 | Option | Env | Default | Description |

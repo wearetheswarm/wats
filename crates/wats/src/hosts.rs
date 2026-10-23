@@ -1,6 +1,6 @@
 //! MCP hosts whose servers live under `mcpServers` in a JSON file that
-//! wats edits itself, after a backup (ADR 0038): GitHub Copilot CLI,
-//! Antigravity CLI and Gemini CLI.
+//! wats edits itself, after a backup (ADR 0038): GitHub Copilot CLI and
+//! Antigravity CLI.
 //!
 //! The file is parsed and written back whole: its other keys are kept,
 //! re-sorted, and the backup holds it as it was.
@@ -18,7 +18,6 @@ pub const SERVER: &str = "wats";
 pub enum Host {
     Copilot,
     Antigravity,
-    Gemini,
 }
 
 impl Host {
@@ -27,7 +26,6 @@ impl Host {
         match self {
             Host::Copilot => "copilot",
             Host::Antigravity => "antigravity",
-            Host::Gemini => "gemini",
         }
     }
 
@@ -36,7 +34,6 @@ impl Host {
         match self {
             Host::Copilot => "GitHub Copilot CLI",
             Host::Antigravity => "Antigravity CLI",
-            Host::Gemini => "Gemini CLI",
         }
     }
 
@@ -45,20 +42,18 @@ impl Host {
         match self {
             Host::Copilot => "copilot",
             Host::Antigravity => "agy",
-            Host::Gemini => "gemini",
         }
     }
 
     /// The host of a command found on PATH.
     pub fn of_command(command: &str) -> Option<Host> {
-        [Host::Copilot, Host::Antigravity, Host::Gemini]
+        [Host::Copilot, Host::Antigravity]
             .into_iter()
             .find(|h| h.command() == command)
     }
 
     /// Its user file of MCP servers: `$COPILOT_HOME/mcp-config.json`
-    /// (default `~/.copilot`), `~/.gemini/config/mcp_config.json`,
-    /// `~/.gemini/settings.json`.
+    /// (default `~/.copilot`), `~/.gemini/config/mcp_config.json`.
     pub fn path(self, home: Option<&Path>, copilot_home: Option<PathBuf>) -> Option<PathBuf> {
         match self {
             Host::Copilot => copilot_home
@@ -66,7 +61,6 @@ impl Host {
                 .or_else(|| home.map(|h| h.join(".copilot")))
                 .map(|d| d.join("mcp-config.json")),
             Host::Antigravity => home.map(|h| h.join(".gemini/config/mcp_config.json")),
-            Host::Gemini => home.map(|h| h.join(".gemini/settings.json")),
         }
     }
 
@@ -88,7 +82,7 @@ impl Host {
                 "env": {},
                 "tools": ["*"],
             }),
-            Host::Antigravity | Host::Gemini => json!({"command": command, "args": args}),
+            Host::Antigravity => json!({"command": command, "args": args}),
         }
     }
 }
@@ -165,7 +159,7 @@ mod tests {
         assert!(!has_server(&removed));
         assert_eq!(remove_server(&removed).unwrap(), None);
 
-        let fresh = upsert_server("", &Host::Gemini.entry("w", &[]))
+        let fresh = upsert_server("", &Host::Antigravity.entry("w", &[]))
             .unwrap()
             .unwrap();
         assert_eq!(
@@ -193,10 +187,6 @@ mod tests {
         assert_eq!(
             Host::Antigravity.path(Some(home), None).unwrap(),
             Path::new("/h/.gemini/config/mcp_config.json")
-        );
-        assert_eq!(
-            Host::Gemini.path(Some(home), None).unwrap(),
-            Path::new("/h/.gemini/settings.json")
         );
         assert_eq!(Host::of_command("agy"), Some(Host::Antigravity));
         assert_eq!(Host::of_command("claude"), None);

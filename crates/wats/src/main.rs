@@ -1118,17 +1118,6 @@ enum SetupTool {
         #[arg(long)]
         remove: bool,
     },
-    /// Gemini CLI (`gemini`, with a Gemini API or enterprise key): add wats
-    /// as its MCP server in ~/.gemini/settings.json, after a backup.
-    Gemini {
-        /// Add, or replace, the `wats` entry of `mcpServers`: command
-        /// <this wats>, args ["mcp", "--profile", <profile>].
-        #[arg(long, conflicts_with = "remove")]
-        mcp: bool,
-        /// Remove that entry (with a backup copy too).
-        #[arg(long)]
-        remove: bool,
-    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -1719,7 +1708,7 @@ fn setup_vibe(
     Ok(())
 }
 
-/// `wats setup copilot|antigravity|gemini` (ADR 0038): the `wats` entry of
+/// `wats setup copilot|antigravity` (ADR 0038): the `wats` entry of
 /// the host's JSON file of MCP servers, edited after a backup.
 fn setup_json_host(
     args: &NodeArgs,
@@ -2629,9 +2618,7 @@ impl SetupTool {
             } => *remove || *remove_hooks,
             SetupTool::Openclaw { remove, .. } | SetupTool::Opencode { remove, .. } => *remove,
             SetupTool::Vibe { mcp, agent, .. } => !*mcp && !*agent,
-            SetupTool::Copilot { mcp, .. }
-            | SetupTool::Antigravity { mcp, .. }
-            | SetupTool::Gemini { mcp, .. } => !*mcp,
+            SetupTool::Copilot { mcp, .. } | SetupTool::Antigravity { mcp, .. } => !*mcp,
         }
     }
 
@@ -2644,9 +2631,7 @@ impl SetupTool {
             | SetupTool::Openclaw { agent, .. }
             | SetupTool::Opencode { agent, .. }
             | SetupTool::Vibe { agent, .. } => *agent,
-            SetupTool::Copilot { .. }
-            | SetupTool::Antigravity { .. }
-            | SetupTool::Gemini { .. } => false,
+            SetupTool::Copilot { .. } | SetupTool::Antigravity { .. } => false,
         };
         agent && !self.sets_nothing_up()
     }
@@ -2841,9 +2826,6 @@ fn setup_tool_command(
             wats::hosts::Host::Antigravity,
             (mcp, remove),
         ),
-        SetupTool::Gemini { mcp, remove } => {
-            setup_json_host(node, data_dir, wats::hosts::Host::Gemini, (mcp, remove))
-        }
         SetupTool::Vibe {
             mcp,
             agent,
@@ -3031,9 +3013,9 @@ fn offer_integrations(
     let mut registered = Vec::new();
     if found.is_empty() {
         println!(
-            "None of Claude Code, Codex, OpenClaw, OpenCode, Mistral Vibe, GitHub Copilot CLI, \
-             Antigravity CLI or Gemini CLI is on your PATH: once one is, `wats setup <tool> \
-             --mcp` connects it."
+            "None of Claude Code, Codex, OpenClaw, OpenCode, Mistral Vibe, GitHub Copilot CLI \
+             or Antigravity CLI is on your PATH: once one is, `wats setup <tool> --mcp` \
+             connects it."
         );
     }
     let host = |f: &wats::firstrun::Found| {
@@ -3047,7 +3029,6 @@ fn offer_integrations(
             "vibe" => ("Mistral Vibe", "wats setup vibe --mcp"),
             "copilot" => ("GitHub Copilot CLI", "wats setup copilot --mcp"),
             "agy" => ("Antigravity CLI", "wats setup antigravity --mcp"),
-            "gemini" => ("Gemini CLI", "wats setup gemini --mcp"),
             _ => return None,
         };
         Some((openclaw_agent, label, command))

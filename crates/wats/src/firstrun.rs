@@ -35,8 +35,8 @@ use crate::update::Install;
 
 /// The agent CLIs looked for on `PATH`. Only [`RUNTIMES`] can run; any
 /// other would be listed as an MCP host only.
-pub const AGENT_CLIS: [&str; 8] = [
-    "claude", "codex", "openclaw", "opencode", "vibe", "copilot", "agy", "gemini",
+pub const AGENT_CLIS: [&str; 7] = [
+    "claude", "codex", "openclaw", "opencode", "vibe", "copilot", "agy",
 ];
 
 /// Shown when the node runs no agent (startup, `status`). A future
