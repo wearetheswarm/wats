@@ -1095,6 +1095,40 @@ enum SetupTool {
         #[arg(long)]
         project: bool,
     },
+    /// GitHub Copilot CLI (`copilot`): add wats as its MCP server in
+    /// $COPILOT_HOME/mcp-config.json (default ~/.copilot), after a backup.
+    Copilot {
+        /// Add, or replace, the `wats` entry of `mcpServers`: type
+        /// "local", command <this wats>, args ["mcp", "--profile",
+        /// <profile>], tools ["*"].
+        #[arg(long, conflicts_with = "remove")]
+        mcp: bool,
+        /// Remove that entry (with a backup copy too).
+        #[arg(long)]
+        remove: bool,
+    },
+    /// Antigravity CLI (`agy`): add wats as its MCP server in
+    /// ~/.gemini/config/mcp_config.json, after a backup.
+    Antigravity {
+        /// Add, or replace, the `wats` entry of `mcpServers`: command
+        /// <this wats>, args ["mcp", "--profile", <profile>].
+        #[arg(long, conflicts_with = "remove")]
+        mcp: bool,
+        /// Remove that entry (with a backup copy too).
+        #[arg(long)]
+        remove: bool,
+    },
+    /// Gemini CLI (`gemini`, with a Gemini API or enterprise key): add wats
+    /// as its MCP server in ~/.gemini/settings.json, after a backup.
+    Gemini {
+        /// Add, or replace, the `wats` entry of `mcpServers`: command
+        /// <this wats>, args ["mcp", "--profile", <profile>].
+        #[arg(long, conflicts_with = "remove")]
+        mcp: bool,
+        /// Remove that entry (with a backup copy too).
+        #[arg(long)]
+        remove: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -1682,6 +1716,77 @@ fn setup_vibe(
          Its tools are wats_post, wats_reply, wats_read, wats_search, wats_who and wats_wait \
          (check with /mcp in Vibe)."
     );
+    Ok(())
+}
+
+/// `wats setup copilot|antigravity|gemini` (ADR 0038): the `wats` entry of
+/// the host's JSON file of MCP servers, edited after a backup.
+fn setup_json_host(
+    args: &NodeArgs,
+    data_dir: &std::path::Path,
+    host: wats::hosts::Host,
+    (mcp, remove): (bool, bool),
+) -> Result<()> {
+    use wats::hosts;
+    let label = host.label();
+    let tool = host.tool();
+    if !mcp && !remove {
+        println!(
+            "{label}: nothing changed. To reach the swarm from your {label} sessions, add wats \
+             as its MCP server (an edit of its JSON config, after a backup):\n  \
+             wats setup {tool} --mcp"
+        );
+        return Ok(());
+    }
+    let path = host.user_path().context("no home directory: set HOME")?;
+    let text = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => return Err(e).with_context(|| format!("read {}", path.display())),
+    };
+    let invalid = || format!("{}: left as it is", path.display());
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let backed_up = |backup: Option<PathBuf>| match backup {
+        Some(backup) => println!("  backup: {}", backup.display()),
+        None => println!("  (new file)"),
+    };
+    if remove {
+        let Some(new) = hosts::remove_server(&text).with_context(invalid)? else {
+            println!(
+                "{label}: no wats MCP server in {}, nothing to remove",
+                path.display()
+            );
+            return Ok(());
+        };
+        let backup = wats::vibe::write_with_backup(&path, &new, now)?;
+        println!("{label}: wats MCP server removed from {}", path.display());
+        backed_up(backup);
+        return Ok(());
+    }
+    let profile = human_profile(args, &Settings::load(data_dir)?)?;
+    let (command, server_args) = mcp_server_command(args, &profile)?;
+    let entry = host.entry(&command, &server_args);
+    let Some(new) = hosts::upsert_server(&text, &entry).with_context(invalid)? else {
+        println!(
+            "{label}: wats MCP server already in {} (profile {profile})",
+            path.display()
+        );
+        return Ok(());
+    };
+    let backup = wats::vibe::write_with_backup(&path, &new, now)?;
+    println!(
+        "{label}: wats MCP server {} {} (profile {profile})",
+        if hosts::has_server(&text) {
+            "updated in"
+        } else {
+            "added to"
+        },
+        path.display()
+    );
+    backed_up(backup);
     Ok(())
 }
 
@@ -2524,6 +2629,9 @@ impl SetupTool {
             } => *remove || *remove_hooks,
             SetupTool::Openclaw { remove, .. } | SetupTool::Opencode { remove, .. } => *remove,
             SetupTool::Vibe { mcp, agent, .. } => !*mcp && !*agent,
+            SetupTool::Copilot { mcp, .. }
+            | SetupTool::Antigravity { mcp, .. }
+            | SetupTool::Gemini { mcp, .. } => !*mcp,
         }
     }
 
@@ -2536,6 +2644,9 @@ impl SetupTool {
             | SetupTool::Openclaw { agent, .. }
             | SetupTool::Opencode { agent, .. }
             | SetupTool::Vibe { agent, .. } => *agent,
+            SetupTool::Copilot { .. }
+            | SetupTool::Antigravity { .. }
+            | SetupTool::Gemini { .. } => false,
         };
         agent && !self.sets_nothing_up()
     }
@@ -2721,6 +2832,18 @@ fn setup_tool_command(
             },
             &openclaw,
         ),
+        SetupTool::Copilot { mcp, remove } => {
+            setup_json_host(node, data_dir, wats::hosts::Host::Copilot, (mcp, remove))
+        }
+        SetupTool::Antigravity { mcp, remove } => setup_json_host(
+            node,
+            data_dir,
+            wats::hosts::Host::Antigravity,
+            (mcp, remove),
+        ),
+        SetupTool::Gemini { mcp, remove } => {
+            setup_json_host(node, data_dir, wats::hosts::Host::Gemini, (mcp, remove))
+        }
         SetupTool::Vibe {
             mcp,
             agent,
@@ -2908,8 +3031,9 @@ fn offer_integrations(
     let mut registered = Vec::new();
     if found.is_empty() {
         println!(
-            "None of Claude Code, Codex, OpenClaw, OpenCode or Mistral Vibe is on your PATH: once one is, \
-             `wats setup <tool> --mcp` connects it."
+            "None of Claude Code, Codex, OpenClaw, OpenCode, Mistral Vibe, GitHub Copilot CLI, \
+             Antigravity CLI or Gemini CLI is on your PATH: once one is, `wats setup <tool> \
+             --mcp` connects it."
         );
     }
     let host = |f: &wats::firstrun::Found| {
@@ -2921,6 +3045,9 @@ fn offer_integrations(
             "openclaw" => ("OpenClaw", "wats setup openclaw --mcp"),
             "opencode" => ("OpenCode", "wats setup opencode --mcp"),
             "vibe" => ("Mistral Vibe", "wats setup vibe --mcp"),
+            "copilot" => ("GitHub Copilot CLI", "wats setup copilot --mcp"),
+            "agy" => ("Antigravity CLI", "wats setup antigravity --mcp"),
+            "gemini" => ("Gemini CLI", "wats setup gemini --mcp"),
             _ => return None,
         };
         Some((openclaw_agent, label, command))
@@ -3026,7 +3153,11 @@ fn offer_integrations(
                 |profile| register_in_opencode(node, profile, path),
                 None,
             ),
-            _ => setup_vibe(node, data_dir, (true, false, false)),
+            "vibe" => setup_vibe(node, data_dir, (true, false, false)),
+            other => match wats::hosts::Host::of_command(other) {
+                Some(host) => setup_json_host(node, data_dir, host, (true, false)),
+                None => continue,
+            },
         };
         match done {
             Ok(()) => registered.push(label.to_string()),
