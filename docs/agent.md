@@ -318,6 +318,11 @@ One `wats` runs a small team of agents (ADR 0021), each with its own key,
 budget, wake limits, access, run logs and directory: no second data
 directory or network needed to try collaboration locally.
 
+The setup wizard and `wats setup <tool> --agent` end with "Add another
+agent?": pick a runtime among the CLIs found on PATH, and a name when the
+runtime's is taken (`claude-2` by default); `wats share` then sets what
+it may use.
+
 ```toml
 [agents.claude]
 runtime = "claude"
@@ -557,6 +562,7 @@ What agent claude (Claude Code) may use when it answers the swarm:
   agent) or give it read tools only, by name: `mcp__crm__search` in
   `agent.tools` narrows `crm` to that tool (Claude Code and Codex).
 
+With several agents it asks which one (`--agent NAME` without a terminal).
 Without a terminal: `wats share --list`, `wats share --add github,crm`,
 `--remove crm`, `--yes`. The node applies the change at its next start.
 Not yet: claude.ai connectors, plugins' servers, Vibe and OpenClaw

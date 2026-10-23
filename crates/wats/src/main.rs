@@ -2526,6 +2526,19 @@ impl SetupTool {
             SetupTool::Vibe { mcp, agent, .. } => !*mcp && !*agent,
         }
     }
+
+    /// It sets up an agent (`--agent`, not a removal): "Add another
+    /// agent?" follows.
+    fn sets_up_an_agent(&self) -> bool {
+        let agent = match self {
+            SetupTool::Codex { agent, .. }
+            | SetupTool::Claude { agent, .. }
+            | SetupTool::Openclaw { agent, .. }
+            | SetupTool::Opencode { agent, .. }
+            | SetupTool::Vibe { agent, .. } => *agent,
+        };
+        agent && !self.sets_nothing_up()
+    }
 }
 
 /// `wats setup [tool]`, then the node in the background: started with
@@ -2570,6 +2583,9 @@ async fn setup_command(
         )?;
         print!("{}", welcome::step(2, style));
         let mcp = offer_integrations(node, data_dir, &choices, &found)?;
+        if choices.runtime.is_some() {
+            offer_more_agents(node, data_dir)?;
+        }
         print!("{}", welcome::step(3, style));
         let changed = std::fs::read(&config).ok() != before;
         offer_background(node, data_dir, detach, false, changed, true).await?;
@@ -2583,9 +2599,13 @@ async fn setup_command(
         );
         return Ok(());
     }
+    let agent = tool.as_ref().is_some_and(SetupTool::sets_up_an_agent);
     setup_tool_command(node, data_dir, tool)?;
     if !offer {
         return Ok(());
+    }
+    if agent {
+        offer_more_agents(node, data_dir)?;
     }
     let changed = std::fs::read(&config).ok() != before;
     offer_background(node, data_dir, detach, yes, changed, false).await
@@ -3042,6 +3062,9 @@ async fn setup_wizard(node: &NodeArgs, data_dir: &std::path::Path) -> Result<boo
     )?;
     print!("{}", welcome::step(2, style));
     let mcp = offer_integrations(node, data_dir, &choices, &found)?;
+    if choices.runtime.is_some() {
+        offer_more_agents(node, data_dir)?;
+    }
     print!("{}", welcome::step(3, style));
     // The background, recommended (Enter), or `d` to choose: here, or not
     // now (ADR 0027, 0.4.5). Native Windows has no `--detach`: here.
@@ -3219,7 +3242,7 @@ struct ShareArgs {
 
 /// `wats share` (ADR 0037): the checklist of what the agent may use when
 /// it answers the swarm, written to its table of config.toml.
-fn share_command(data_dir: &std::path::Path, args: &ShareArgs) -> Result<()> {
+fn share_command(node: &NodeArgs, data_dir: &std::path::Path, args: &ShareArgs) -> Result<()> {
     use wats::share;
     let settings = Settings::load(data_dir)?;
     let members = wats::roster::configured(&settings, data_dir, &os_user_profile())?;
@@ -3238,6 +3261,30 @@ fn share_command(data_dir: &std::path::Path, args: &ShareArgs) -> Result<()> {
                     "no agent is set up: `wats setup claude --agent` (or codex, opencode) first"
                 ),
                 1 => runnable.remove(0),
+                _ if interactive(node) => {
+                    println!("Which agent?");
+                    for (i, m) in runnable.iter().enumerate() {
+                        println!(
+                            "  {:>2} {} ({})",
+                            i + 1,
+                            m.name,
+                            m.runtime.as_deref().unwrap_or_default()
+                        );
+                    }
+                    loop {
+                        let line = ask_line(&format!("Agent [1-{}]: ", runnable.len()))?;
+                        match line.parse::<usize>() {
+                            Ok(n) if (1..=runnable.len()).contains(&n) => {
+                                break runnable.remove(n - 1);
+                            }
+                            // Enter (or the end of input) cancels.
+                            _ if line.is_empty() => {
+                                anyhow::bail!("no agent chosen (`wats share --agent NAME`)")
+                            }
+                            _ => eprintln!("{line:?}: a number of the list"),
+                        }
+                    }
+                }
                 _ => anyhow::bail!(
                     "several agents: pass --agent {}",
                     runnable
@@ -3366,8 +3413,7 @@ fn share_command(data_dir: &std::path::Path, args: &ShareArgs) -> Result<()> {
             }
         }
     };
-    let interactive = std::io::IsTerminal::is_terminal(&std::io::stdin())
-        && std::io::IsTerminal::is_terminal(&std::io::stdout());
+    let interactive = interactive(node);
     show(&checked);
     if args.list {
         return Ok(());
@@ -3452,6 +3498,110 @@ fn share_command(data_dir: &std::path::Path, args: &ShareArgs) -> Result<()> {
         "{}: saved. A running node applies it at its next start (`wats stop`, then `wats`).",
         file.path().display()
     );
+    Ok(())
+}
+
+/// A name for one more agent of `runtime`: `<runtime>-2`, `-3`… the first
+/// not `taken`.
+fn free_agent_name(taken: &[String], runtime: &str) -> String {
+    (2..)
+        .map(|i| format!("{runtime}-{i}"))
+        .find(|n| !taken.contains(n))
+        .unwrap_or_else(|| runtime.to_string())
+}
+
+/// "Add another agent?" at the end of the setup wizard and of `wats setup`
+/// on a terminal: a runtime among the agent CLIs found on PATH, a name
+/// (the runtime's, asked when taken), `wats setup <runtime> --agent --name
+/// <name>`, then `wats share` for it. Enter, or the end of input, says no.
+fn offer_more_agents(node: &NodeArgs, data_dir: &std::path::Path) -> Result<()> {
+    if !interactive(node) {
+        return Ok(());
+    }
+    let yes = |line: &str| matches!(line.to_ascii_lowercase().as_str(), "y" | "yes");
+    while yes(&ask_line("Add another agent? [y/N]: ")?) {
+        let found: Vec<_> = wats::firstrun::detect_agents(std::env::var_os("PATH").as_deref())
+            .into_iter()
+            .filter(|f| f.supported())
+            .collect();
+        let Some(first) = found.first() else {
+            println!(
+                "No agent CLI found on PATH ({}).",
+                wats::settings::RUNTIMES.join(", ")
+            );
+            return Ok(());
+        };
+        let runtime = if found.len() == 1 {
+            first.name
+        } else {
+            println!("Which runtime?");
+            for (i, f) in found.iter().enumerate() {
+                println!("  {:>2} {}", i + 1, f.name);
+            }
+            let line = ask_line(&format!("Runtime [1-{}, Enter: 1]: ", found.len()))?;
+            match line.parse::<usize>() {
+                _ if line.is_empty() => first.name,
+                Ok(n) if (1..=found.len()).contains(&n) => found[n - 1].name,
+                _ => {
+                    eprintln!("{line:?}: a number of the list");
+                    continue;
+                }
+            }
+        };
+        let settings = Settings::load(data_dir)?;
+        let taken: Vec<String> = wats::roster::configured(&settings, data_dir, &os_user_profile())?
+            .into_iter()
+            .map(|m| m.name)
+            .collect();
+        let name = if taken.iter().any(|t| t == runtime) {
+            let suggestion = free_agent_name(&taken, runtime);
+            loop {
+                let line = ask_line(&format!(
+                    "An agent is already named {runtime}: name of this one [{suggestion}]: "
+                ))?;
+                let name = if line.is_empty() {
+                    suggestion.clone()
+                } else {
+                    line
+                };
+                if taken.contains(&name) {
+                    eprintln!("{name}: already an agent of this node");
+                } else if let Err(e) = wats::roster::check_name(&name) {
+                    eprintln!("{name:?}: {e}");
+                } else {
+                    break name;
+                }
+            }
+        } else {
+            runtime.to_string()
+        };
+        let parsed = Cli::try_parse_from(["wats", "setup", runtime, "--agent", "--name", &name])?;
+        let Some(Command::Setup {
+            tool: Some(tool), ..
+        }) = parsed.command
+        else {
+            anyhow::bail!("wats setup {runtime} --agent: not a setup");
+        };
+        setup_tool_command(node, data_dir, Some(tool))?;
+        if wats::share::supports(runtime) {
+            let line = ask_line(
+                "Choose what it may use when it answers the swarm (`wats share`)? [Y/n]: ",
+            )?;
+            if !matches!(line.to_ascii_lowercase().as_str(), "n" | "no") {
+                share_command(
+                    node,
+                    data_dir,
+                    &ShareArgs {
+                        agent: Some(name),
+                        list: false,
+                        add: Vec::new(),
+                        remove: Vec::new(),
+                        yes: false,
+                    },
+                )?;
+            }
+        }
+    }
     Ok(())
 }
 
@@ -7208,6 +7358,7 @@ async fn async_main(mut cli: Cli) -> Result<()> {
         }) => {
             say_node(&data_dir, None);
             return share_command(
+                &cli.node,
                 &data_dir,
                 &ShareArgs {
                     agent,

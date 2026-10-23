@@ -1528,4 +1528,41 @@ fn share_lets_the_agent_use_chosen_servers() {
     assert!(out.status.success());
     assert_eq!(get("agents.claude.servers"), "none (default)");
     assert!(!get("agents.claude.caps").contains("crm"));
+
+    // Several agents: asked on a terminal, an error without one.
+    assert!(
+        wats(&data, &["config", "set", "agents.codex.runtime", "codex"])
+            .status
+            .success()
+    );
+    let out = share(&["--list"]);
+    assert!(!out.status.success());
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("several agents: pass --agent"),
+        "{out:?}"
+    );
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_wats"))
+        .env("WATS_HERMETIC", "1")
+        .env("WATS_TEST_INTERACTIVE", "1")
+        .envs(throwaway(&data))
+        .env_remove("CODEX_HOME")
+        .arg("--dir")
+        .arg(&data)
+        .args(["share", "--list"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    {
+        use std::io::Write;
+        child.stdin.take().unwrap().write_all(b"2\n").unwrap();
+    }
+    let out = child.wait_with_output().unwrap();
+    let said = String::from_utf8_lossy(&out.stdout).into_owned();
+    assert!(out.status.success(), "{said}");
+    assert!(
+        said.contains("   1 claude (claude)\n   2 codex (codex)"),
+        "{said}"
+    );
+    assert!(said.contains("What agent codex (Codex) may use"), "{said}");
 }

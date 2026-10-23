@@ -475,14 +475,15 @@ fn quick_and_detailed_with_an_agent() {
         machine.fake_cli(name);
     }
     // Claude (Enter), quick (Enter), a subscription (1), the line
-    // edited; all (Enter); not now (d, 3).
+    // edited; all (Enter); no other agent (Enter); not now (d, 3).
     let out = machine
-        .spawn(machine.wats(&[], true), "\n\n1\nmin=90 usd=1\n\nd\n3\n")
+        .spawn(machine.wats(&[], true), "\n\n1\nmin=90 usd=1\n\n\nd\n3\n")
         .wait_with_output()
         .unwrap();
     let said = text(&out.stdout);
     assert!(out.status.success(), "{out:?}");
     assert!(said.contains(MODE), "{said}");
+    assert!(said.contains("Add another agent? [y/N]: "), "{said}");
     // No default: typed.
     assert!(said.contains("How is this agent paid? [1/2/3]: "), "{said}");
     assert!(
@@ -1048,7 +1049,8 @@ fn the_wizard_offers_vibe_without_workspace() {
     // Vibe, detailed: storage, timeout, turns, the budget (paid, line),
     // then its access (workspace refused, inherit), networks, security
     // updates, name; one by one: Vibe yes; not now.
-    let input = "\nd\n\n\n\n1\n\nworkspace\ninherit\n\n\n\nd\n\nn\n";
+    // No other agent (Enter).
+    let input = "\nd\n\n\n\n1\n\nworkspace\ninherit\n\n\n\nd\n\n\nn\n";
     let out = machine
         .spawn(machine.wats(&["setup"], true), input)
         .wait_with_output()
@@ -1123,4 +1125,36 @@ fn setup_without_a_terminal_changes_no_budget() {
         text(&out.stdout).contains("budget_paused: agent claude"),
         "{out:?}"
     );
+}
+
+/// After an agent's setup, "Add another agent?": a runtime among those on
+/// PATH, the runtime's name unless taken (then asked, with a free one as
+/// the default), and `wats share` offered for it.
+#[test]
+fn setup_offers_another_agent() {
+    let machine = Machine::new();
+    for name in ["claude", "codex"] {
+        machine.fake_cli(name);
+    }
+    // Another (y): Claude (1), taken: its default name (Enter), no `wats
+    // share` (n); another (y): Codex (2), no `wats share` (n); no more
+    // (Enter); no node (n).
+    let out = machine
+        .spawn(
+            machine.wats(&["setup", "claude", "--agent"], true),
+            "y\n1\n\nn\ny\n2\nn\n\nn\n",
+        )
+        .wait_with_output()
+        .unwrap();
+    let said = text(&out.stdout);
+    assert!(out.status.success(), "{out:?}");
+    assert!(said.contains("Which runtime?"), "{said}");
+    assert!(
+        said.contains("An agent is already named claude: name of this one [claude-2]: "),
+        "{said}"
+    );
+    let config = std::fs::read_to_string(machine.data().join("config.toml")).unwrap();
+    for table in ["[agents.claude]", "[agents.claude-2]", "[agents.codex]"] {
+        assert!(config.contains(table), "{config}");
+    }
 }

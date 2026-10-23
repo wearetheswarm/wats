@@ -36,6 +36,12 @@ one checklist that also sets what it announces.
   An `agent.tools` entry `mcp__<server>__<tool>` now narrows that server
   to the tools named, in Claude Code (workspace servers too) and Codex.
 - The Claude Code per-run MCP config is written `0600`.
+- **With several agents, `wats share` asks which one** on a terminal
+  (numbered, with each runtime); `--agent NAME` for scripts.
+- **"Add another agent?"** at the end of the setup wizard and of `wats
+  setup <tool> --agent`: a runtime among the agent CLIs found on PATH, a
+  name (the runtime's; asked, with a free default, when taken), its setup,
+  then `wats share` for it.
 
 ## 0.4.7 (2026-10-23)
 
