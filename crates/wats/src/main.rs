@@ -377,7 +377,8 @@ enum Command {
     /// commands, and the MCP servers of your own configuration for that
     /// runtime, unchecked unless you pick them. One checklist sets
     /// agent.tools, agent.servers and the caps the agent announces; run it
-    /// again to see servers added since. Claude Code, Codex and OpenCode.
+    /// again to see servers added since. Claude Code, Codex, OpenCode,
+    /// Copilot CLI and Antigravity CLI.
     Share {
         /// The agent, by its name in config.toml [default: the only one].
         #[arg(long, value_name = "NAME")]
@@ -430,6 +431,26 @@ enum Command {
         /// The host event the hook runs on.
         #[arg(long, default_value = "user-prompt-submit", value_parser = ["user-prompt-submit", "session-start"])]
         event: String,
+    },
+    /// The tool gate of an agent run (ADR 0038 §2.1), called by its
+    /// runtime's hook: reads the hook payload on stdin, prints the
+    /// decision. Not for people.
+    #[command(hide = true)]
+    Gate {
+        /// The runtime whose hook calls it (antigravity).
+        host: String,
+        /// The run's level is workspace (else swarm-only).
+        #[arg(long)]
+        workspace: bool,
+        /// The shell is lent.
+        #[arg(long)]
+        shell: bool,
+        /// The web is lent.
+        #[arg(long)]
+        web: bool,
+        /// A lent MCP server.
+        #[arg(long = "server", value_name = "NAME")]
+        servers: Vec<String>,
     },
     /// Follow the node running in the background (`wats --detach`, or the
     /// one `wats mcp` started): its banner and last log lines, then what it
@@ -1096,24 +1117,41 @@ enum SetupTool {
         project: bool,
     },
     /// GitHub Copilot CLI (`copilot`): add wats as its MCP server in
-    /// $COPILOT_HOME/mcp-config.json (default ~/.copilot), after a backup.
+    /// $COPILOT_HOME/mcp-config.json (default ~/.copilot), after a backup,
+    /// and/or enable a Copilot agent (ADR 0038). With neither flag, both.
     Copilot {
         /// Add, or replace, the `wats` entry of `mcpServers`: type
         /// "local", command <this wats>, args ["mcp", "--profile",
         /// <profile>], tools ["*"].
         #[arg(long, conflicts_with = "remove")]
         mcp: bool,
+        /// Enable a Copilot CLI agent in config.toml (`[agents.copilot]`,
+        /// or `[agents.<name>]` with --name). Its access is swarm-only (the
+        /// wats tools only) unless --access says otherwise.
+        #[arg(long, conflicts_with = "remove")]
+        agent: bool,
+        #[command(flatten)]
+        keys: SetupKeys,
         /// Remove that entry (with a backup copy too).
         #[arg(long)]
         remove: bool,
     },
     /// Antigravity CLI (`agy`): add wats as its MCP server in
-    /// ~/.gemini/config/mcp_config.json, after a backup.
+    /// ~/.gemini/config/mcp_config.json, after a backup, and/or enable an
+    /// Antigravity agent (ADR 0038). With neither flag, both.
     Antigravity {
         /// Add, or replace, the `wats` entry of `mcpServers`: command
         /// <this wats>, args ["mcp", "--profile", <profile>].
         #[arg(long, conflicts_with = "remove")]
         mcp: bool,
+        /// Enable an Antigravity CLI agent in config.toml
+        /// (`[agents.antigravity]`, or `[agents.<name>]` with --name):
+        /// swarm-only unless --access workspace, with its own home and a
+        /// login offered on a terminal.
+        #[arg(long, conflicts_with = "remove")]
+        agent: bool,
+        #[command(flatten)]
+        keys: SetupKeys,
         /// Remove that entry (with a backup copy too).
         #[arg(long)]
         remove: bool,
@@ -1756,16 +1794,34 @@ fn setup_json_host(
         return Ok(());
     }
     let profile = human_profile(args, &Settings::load(data_dir)?)?;
-    let (command, server_args) = mcp_server_command(args, &profile)?;
-    let entry = host.entry(&command, &server_args);
-    let Some(new) = hosts::upsert_server(&text, &entry).with_context(invalid)? else {
+    if !register_json_host(args, host, &profile)? {
         println!(
             "{label}: wats MCP server already in {} (profile {profile})",
             path.display()
         );
-        return Ok(());
+    }
+    Ok(())
+}
+
+/// Add or replace the `wats` entry of a JSON host for `profile`, after a
+/// backup: whether the file changed (what it did is printed).
+fn register_json_host(args: &NodeArgs, host: wats::hosts::Host, profile: &str) -> Result<bool> {
+    use wats::hosts;
+    let label = host.label();
+    let path = host.user_path().context("no home directory: set HOME")?;
+    let text = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => return Err(e).with_context(|| format!("read {}", path.display())),
     };
-    let backup = wats::vibe::write_with_backup(&path, &new, now)?;
+    let (command, server_args) = mcp_server_command(args, profile)?;
+    let entry = host.entry(&command, &server_args);
+    let Some(new) = hosts::upsert_server(&text, &entry)
+        .with_context(|| format!("{}: left as it is", path.display()))?
+    else {
+        return Ok(false);
+    };
+    let backup = wats::vibe::write_with_backup(&path, &new, unix_now())?;
     println!(
         "{label}: wats MCP server {} {} (profile {profile})",
         if hosts::has_server(&text) {
@@ -1775,8 +1831,11 @@ fn setup_json_host(
         },
         path.display()
     );
-    backed_up(backup);
-    Ok(())
+    match backup {
+        Some(backup) => println!("  backup: {}", backup.display()),
+        None => println!("  (new file)"),
+    }
+    Ok(true)
 }
 
 /// One line from the terminal, trimmed.
@@ -2385,14 +2444,21 @@ fn setup_tool(
         "codex" => "Codex",
         "opencode" => "OpenCode",
         "vibe" => "Mistral Vibe",
+        "copilot" => "GitHub Copilot CLI",
+        "antigravity" => "Antigravity CLI",
         _ => "Claude Code",
     };
     let settings = Settings::load(data_dir)?;
     anyhow::ensure!(
-        !matches!(runtime, "opencode" | "vibe") || !(keys.agents_md || keys.remove_agents_md),
+        !matches!(runtime, "opencode" | "vibe" | "copilot" | "antigravity")
+            || !(keys.agents_md || keys.remove_agents_md),
         "--agents-md is for Claude Code and Codex: wats does not write {name}'s global \
          instructions"
     );
+    if runtime == "antigravity" {
+        // Checked before anything is written: no inherit for Antigravity.
+        wats::antigravity::access(keys.access.as_deref())?;
+    }
     if runtime == "vibe" {
         // Checked before anything is written: no workspace for Vibe.
         wats::vibe::access(keys.access.as_deref())?;
@@ -2475,7 +2541,12 @@ fn setup_tool(
         }
         // Said in the file, not only by default: Vibe's level is never
         // `workspace`, whatever a shared `[agent]` table says.
-        if runtime == "vibe" && agent && file.get(&key("access")).is_none() {
+        // Copilot's default level is swarm-only too (ADR 0038): said in
+        // the file as well.
+        if matches!(runtime, "vibe" | "copilot" | "antigravity")
+            && agent
+            && file.get(&key("access")).is_none()
+        {
             file.set(&key("access"), "swarm-only")?;
         }
         file.save()?;
@@ -2543,6 +2614,35 @@ fn setup_tool(
                      Google Vertex AI need nothing there: log in with `opencode auth login` and \
                      set their environment variables for the node.",
                     dir.display()
+                );
+            }
+        }
+        if runtime == "antigravity"
+            && agent
+            && let Some(member) = &member
+        {
+            antigravity_login(args, &member.work_dir)?;
+        }
+        if runtime == "copilot"
+            && let Some(member) = &member
+        {
+            let access = wats::copilot::access(member.settings.access.as_deref())?;
+            if access == wats::access::Access::Inherit {
+                println!("{}", wats::copilot::INHERIT_WARNING);
+                if let Err(e) = wats::copilot::check_access(
+                    access,
+                    &member.settings.allow,
+                    member.settings.review == Some(true),
+                ) {
+                    eprintln!("warning: {e:#}");
+                }
+            } else {
+                println!(
+                    "GitHub Copilot CLI agent: {access}. Its runs use their own Copilot home, {}, \
+                     with the wats server only (no builtin GitHub server); your Copilot login \
+                     is found as for your own sessions, else set COPILOT_GITHUB_TOKEN (a \
+                     fine-grained token with the Copilot Requests permission) for the node.",
+                    wats::copilot::agent_home(&member.work_dir).display()
                 );
             }
         }
@@ -2618,7 +2718,8 @@ impl SetupTool {
             } => *remove || *remove_hooks,
             SetupTool::Openclaw { remove, .. } | SetupTool::Opencode { remove, .. } => *remove,
             SetupTool::Vibe { mcp, agent, .. } => !*mcp && !*agent,
-            SetupTool::Copilot { mcp, .. } | SetupTool::Antigravity { mcp, .. } => !*mcp,
+            SetupTool::Copilot { remove, .. } => *remove,
+            SetupTool::Antigravity { remove, .. } => *remove,
         }
     }
 
@@ -2630,8 +2731,9 @@ impl SetupTool {
             | SetupTool::Claude { agent, .. }
             | SetupTool::Openclaw { agent, .. }
             | SetupTool::Opencode { agent, .. }
-            | SetupTool::Vibe { agent, .. } => *agent,
-            SetupTool::Copilot { .. } | SetupTool::Antigravity { .. } => false,
+            | SetupTool::Vibe { agent, .. }
+            | SetupTool::Copilot { agent, .. }
+            | SetupTool::Antigravity { agent, .. } => *agent,
         };
         agent && !self.sets_nothing_up()
     }
@@ -2817,15 +2919,49 @@ fn setup_tool_command(
             },
             &openclaw,
         ),
-        SetupTool::Copilot { mcp, remove } => {
-            setup_json_host(node, data_dir, wats::hosts::Host::Copilot, (mcp, remove))
+        SetupTool::Copilot {
+            mcp,
+            agent,
+            keys,
+            remove,
+        } => {
+            if remove {
+                return setup_json_host(node, data_dir, wats::hosts::Host::Copilot, (false, true));
+            }
+            setup_tool(
+                node,
+                data_dir,
+                "copilot",
+                (mcp, agent),
+                &keys,
+                |profile| register_json_host(node, wats::hosts::Host::Copilot, profile),
+                None,
+            )
         }
-        SetupTool::Antigravity { mcp, remove } => setup_json_host(
-            node,
-            data_dir,
-            wats::hosts::Host::Antigravity,
-            (mcp, remove),
-        ),
+        SetupTool::Antigravity {
+            mcp,
+            agent,
+            keys,
+            remove,
+        } => {
+            if remove {
+                return setup_json_host(
+                    node,
+                    data_dir,
+                    wats::hosts::Host::Antigravity,
+                    (false, true),
+                );
+            }
+            setup_tool(
+                node,
+                data_dir,
+                "antigravity",
+                (mcp, agent),
+                &keys,
+                |profile| register_json_host(node, wats::hosts::Host::Antigravity, profile),
+                None,
+            )
+        }
         SetupTool::Vibe {
             mcp,
             agent,
@@ -3411,7 +3547,8 @@ fn share_command(node: &NodeArgs, data_dir: &std::path::Path, args: &ShareArgs) 
     let runtime = member.runtime.clone().unwrap_or_default();
     anyhow::ensure!(
         share::supports(&runtime),
-        "{runtime} agents cannot use your MCP servers yet: Claude Code, Codex and OpenCode can"
+        "{runtime} agents cannot use your MCP servers yet: Claude Code, Codex, OpenCode, \
+         Copilot CLI and Antigravity CLI can"
     );
     let access = wats::access::level_for(&runtime, member.settings.access.as_deref())?;
     if access == wats::access::Access::Inherit {
@@ -3654,16 +3791,16 @@ fn offer_more_agents(node: &NodeArgs, data_dir: &std::path::Path) -> Result<()> 
             return Ok(());
         };
         let runtime = if found.len() == 1 {
-            first.name
+            first.runtime()
         } else {
             println!("Which runtime?");
             for (i, f) in found.iter().enumerate() {
-                println!("  {:>2} {}", i + 1, f.name);
+                println!("  {:>2} {}", i + 1, f.runtime());
             }
             let line = ask_line(&format!("Runtime [1-{}, Enter: 1]: ", found.len()))?;
             match line.parse::<usize>() {
-                _ if line.is_empty() => first.name,
-                Ok(n) if (1..=found.len()).contains(&n) => found[n - 1].name,
+                _ if line.is_empty() => first.runtime(),
+                Ok(n) if (1..=found.len()).contains(&n) => found[n - 1].runtime(),
                 _ => {
                     eprintln!("{line:?}: a number of the list");
                     continue;
@@ -3723,6 +3860,73 @@ fn offer_more_agents(node: &NodeArgs, data_dir: &std::path::Path) -> Result<()> 
                 )?;
             }
         }
+    }
+    Ok(())
+}
+
+/// `wats gate <host>`: one hook payload on stdin, one decision on
+/// stdout. Anything unreadable is denied: the gate fails closed.
+fn gate_command(host: &str, lock: &wats::antigravity::Lock) -> Result<()> {
+    use std::io::Read;
+    let mut input = String::new();
+    let _ = std::io::stdin().take(1 << 20).read_to_string(&mut input);
+    let payload: serde_json::Value = serde_json::from_str(&input).unwrap_or_default();
+    let decision = match host {
+        wats::antigravity::RUNTIME => wats::antigravity::decide(&payload, lock),
+        _ => serde_json::json!({"decision": "deny", "reason": format!("unknown gate {host}")}),
+    };
+    println!("{decision}");
+    Ok(())
+}
+
+/// After `wats setup antigravity --agent`: the agent's own home, and its
+/// one-time login there (Antigravity CLI has no login command: the OAuth
+/// comes with a first prompt). Asked on a terminal, else said.
+fn antigravity_login(args: &NodeArgs, work_dir: &std::path::Path) -> Result<()> {
+    use wats::antigravity;
+    let home = antigravity::agent_home(work_dir);
+    antigravity::prepare_login(&home, &wats::update::stable_exe()?)?;
+    let command = format!(
+        "cd {0} && HOME={0} {1} -p {2:?}",
+        home.display(),
+        antigravity::COMMAND,
+        antigravity::LOGIN_PROMPT
+    );
+    println!(
+        "Antigravity CLI agent: its own home {} holds its login, the wats server only, \
+         permission rules and a tool gate. {}.\n  \
+         Its login is a Google OAuth token kept in your keychain, or in that home's \
+         .gemini/antigravity-cli/ (0600); its scopes include cloud-platform. Deleting the \
+         agent's directory signs it out of this machine.",
+        home.display(),
+        antigravity::CLOSED_SOURCE
+    );
+    if !interactive(args)
+        || !wats::firstrun::ask_yes_no(
+            &mut std::io::stdin().lock(),
+            &mut std::io::stdout(),
+            "Sign the agent in to Antigravity now (a browser login, then one short prompt)?",
+            true,
+        )?
+    {
+        println!("  Later, sign it in with: {command}");
+        return Ok(());
+    }
+    let status = std::process::Command::new(antigravity::COMMAND)
+        .args(["-p", antigravity::LOGIN_PROMPT])
+        .env("HOME", &home)
+        .current_dir(&home)
+        .status();
+    match status {
+        Ok(s) if s.success() => println!("Antigravity CLI agent: signed in."),
+        Ok(s) => eprintln!(
+            "warning: {} exited with {s}; try again: {command}",
+            antigravity::COMMAND
+        ),
+        Err(e) => eprintln!(
+            "warning: {}: {e}; try again: {command}",
+            antigravity::COMMAND
+        ),
     }
     Ok(())
 }
@@ -6617,6 +6821,13 @@ fn agent_config(
             wats::opencode::check_model(model.trim())?;
         }
     }
+    if runtime == "antigravity" {
+        wats::antigravity::check_extra_args(&extra_args)?;
+    }
+    if runtime == "copilot" {
+        wats::copilot::check_access(access, &allow, file.review == Some(true))?;
+        wats::copilot::check_extra_args(&extra_args)?;
+    }
     if runtime == "vibe" {
         wats::vibe::check_access(access, &allow, file.review == Some(true))?;
         wats::vibe::check_extra_args(access, &extra_args)?;
@@ -6725,7 +6936,7 @@ fn short_duration(d: Duration) -> String {
 
 /// The CLI of an agent runtime: `claude` or `codex`.
 fn runtime_default_command(runtime: &str) -> PathBuf {
-    runtime.into()
+    wats::settings::runtime_command(runtime).into()
 }
 
 fn unix_now() -> u64 {
@@ -7049,7 +7260,10 @@ async fn agent_watch(
                             r.status,
                             r.seconds.map(|s| format!("{s:.1}")).unwrap_or_default(),
                             r.turns.map(|t| t.to_string()).unwrap_or_default(),
-                            r.cost_usd.map(|c| format!("${c:.4}")).unwrap_or_default(),
+                            r.cost_usd
+                                .map(|c| format!("${c:.4}"))
+                                .or(r.ai_credits.map(|c| format!("{c:.2} AIC")))
+                                .unwrap_or_default(),
                         )
                         .and_then(|()| match (&r.completion, &r.reply) {
                             (None, None) => Ok(()),
@@ -7434,6 +7648,22 @@ fn main() -> Result<()> {
     if let Some(Command::Notify { hook, host, event }) = &cli.command {
         return notify_command(&cli.node, *hook, host, event);
     }
+    if let Some(Command::Gate {
+        host,
+        workspace,
+        shell,
+        web,
+        servers,
+    }) = &cli.command
+    {
+        let lock = wats::antigravity::Lock {
+            workspace: *workspace,
+            shell: *shell,
+            web: *web,
+            servers: servers.clone(),
+        };
+        return gate_command(host, &lock);
+    }
     // Before any tokio signal handler replaces it (`nohup wats`).
     let _ = SIGHUP_INHERITED_IGNORED.set(wats_sys::sighup_ignored() == Some(true));
     tokio::runtime::Builder::new_multi_thread()
@@ -7652,6 +7882,7 @@ async fn async_main(mut cli: Cli) -> Result<()> {
         Some(
             Command::Config { .. }
             | Command::Share { .. }
+            | Command::Gate { .. }
             | Command::Upgrade { .. }
             | Command::Agent { .. }
             | Command::Setup { .. }

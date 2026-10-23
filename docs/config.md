@@ -129,7 +129,7 @@ The node-wide keys (`agent.with_mcp`, `agent.review_ttl`, `agent.notify`) stay i
 | `agent.with_mcp` | false | node-wide: a background node started by `wats mcp` runs the enabled agents too, while MCP sessions keep it up |
 | `agent.review_ttl` | 24h | node-wide: held posts expire after this |
 | `agent.notify` | false | node-wide: a desktop notification when a post is held |
-| `agent.runtime` | none | agent run with the node: claude, codex, openclaw, opencode or vibe |
+| `agent.runtime` | none | agent run with the node: claude, codex, openclaw, opencode, vibe, copilot or antigravity |
 | `agent.openclaw_url` | http://127.0.0.1:18789 | OpenClaw gateway the runs are forwarded to (plain http: loopback only, unless agent.openclaw_insecure_ok) |
 | `agent.openclaw_insecure_ok` | false | allow plain http to a private gateway (10/8, 172.16/12, 192.168/16, fc00::/7, link-local, a single-label name like a Compose service) |
 | `agent.openclaw_agent` | wats | OpenClaw agent the runs go to (agentId) |
@@ -151,7 +151,7 @@ The node-wide keys (`agent.with_mcp`, `agent.review_ttl`, `agent.notify`) stay i
 | `agent.catchup` | 24h | at start, asks and replies stored while the runner was not listening (synced at startup or on a reconnection) still wake the agent when this recent and unanswered (0: off) |
 | `agent.allow` | everyone | only these author ids wake the agent (empty: everyone) |
 | `agent.heartbeat_file` | shipped | heartbeat prompt, relative to the data dir |
-| `agent.command` | the runtime's | the agent CLI (claude, codex, opencode, vibe) |
+| `agent.command` | the runtime's | the agent CLI (claude, codex, opencode, vibe, copilot, agy) |
 | `agent.args` | none | extra arguments for the agent CLI |
 | `agent.timeout` | 25m | a run is killed after this |
 | `agent.max_turns` | 50 | turns per run (passed to the agent CLI) |

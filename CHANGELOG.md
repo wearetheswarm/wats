@@ -10,6 +10,27 @@
   (`~/.copilot/mcp-config.json`, `~/.gemini/config/mcp_config.json`), after
   a backup; `--remove` takes it out. The setup wizard finds `copilot` and
   `agy` on PATH and offers them.
+- **GitHub Copilot CLI as an agent runtime** ([docs/copilot.md](docs/copilot.md)):
+  `wats setup copilot --agent`. Each run is `copilot -p` with its own
+  Copilot home holding the wats server only, the builtin GitHub server off.
+  - Access levels: swarm-only by default (`--available-tools wats`, with
+    shell, write and url denied); workspace (files in its workspace, with
+    the shell and the web only when `wats share` or `agent.tools` lends
+    them, plus your Copilot MCP servers); inherit only with review or
+    allow.
+  - Login: your stored one, or `COPILOT_GITHUB_TOKEN`.
+  - Budget: runs (one premium request each) and minutes. The AI credits
+    of each run show in `wats agent runs`.
+- **Antigravity CLI as an agent runtime** ([docs/antigravity.md](docs/antigravity.md)):
+  `wats setup antigravity --agent`, with a one-time Google sign-in in the
+  agent's own home.
+  - Two locks per run: Antigravity's permission rules, and a `PreToolUse`
+    gate (`wats gate antigravity`) that denies every tool the level does
+    not allow.
+  - Levels: swarm-only by default; workspace with its files, plus the web,
+    a shell in its terminal sandbox (macOS) and your Antigravity MCP
+    servers when lent. No inherit.
+  - Budget: tokens, minutes and runs.
 
 ## 0.4.8 (2026-10-23)
 

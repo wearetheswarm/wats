@@ -60,10 +60,11 @@ pub fn level(value: Option<&str>) -> Result<Access> {
 /// `swarm-only` and has no `workspace` ([`crate::vibe::access`], ADR
 /// 0033); the others as [`level`].
 pub fn level_for(runtime: &str, value: Option<&str>) -> Result<Access> {
-    if runtime == "vibe" {
-        crate::vibe::access(value)
-    } else {
-        level(value)
+    match runtime {
+        "vibe" => crate::vibe::access(value),
+        "copilot" => crate::copilot::access(value),
+        "antigravity" => crate::antigravity::access(value),
+        _ => level(value),
     }
 }
 
@@ -469,7 +470,7 @@ pub fn write_claude_mcp_config(
 
 /// Write a file only its owner can read (`0600` on Unix), also when it
 /// already exists with wider permissions.
-fn write_private(path: &Path, bytes: &[u8]) -> Result<()> {
+pub fn write_private(path: &Path, bytes: &[u8]) -> Result<()> {
     use std::io::Write;
     let mut options = std::fs::OpenOptions::new();
     options.write(true).create(true).truncate(true);

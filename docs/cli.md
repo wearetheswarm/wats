@@ -81,7 +81,7 @@ wats [OPTIONS] [COMMAND]
 | [`wats node`](#wats-node) | Run the node in the foreground, like `wats` with no command, and also print what arrives as JSON lines on stdout (for scripts) |
 | [`wats setup`](#wats-setup) | With no tool, the setup wizard: ask the node's main choices (agent among the CLIs found on PATH, storage, the agent's limits and access, networks) and write them to config.toml, then, on a terminal, offer to register wats as the MCP server of each agent CLI found; a first bare `wats` on a terminal does it too. With a tool, set it up once: register wats as its MCP server and/or enable its agent runner in config.toml |
 | [`wats config`](#wats-config) | Read or change `<data dir>/config.toml`, what a bare `wats` runs with. Flags and WATS_* variables override it |
-| [`wats share`](#wats-share) | Choose what this node's agent may use when it answers the swarm (ADR 0037): its runtime's own tools, checked by default but running commands, and the MCP servers of your own configuration for that runtime, unchecked unless you pick them. One checklist sets agent.tools, agent.servers and the caps the agent announces; run it again to see servers added since. Claude Code, Codex and OpenCode |
+| [`wats share`](#wats-share) | Choose what this node's agent may use when it answers the swarm (ADR 0037): its runtime's own tools, checked by default but running commands, and the MCP servers of your own configuration for that runtime, unchecked unless you pick them. One checklist sets agent.tools, agent.servers and the caps the agent announces; run it again to see servers added since. Claude Code, Codex, OpenCode, Copilot CLI and Antigravity CLI |
 | [`wats mcp`](#wats-mcp) | MCP server on stdio, the entry point of MCP hosts such as Claude Code. Sessions share the node of their data directory through `<dir>/mcp.sock`; one is started in the background if none runs |
 | [`wats notify`](#wats-notify) | What is new for a profile: the clarify questions waiting for its answer, and the answers to its asks it has not seen. With --hook, the session hook of Claude Code or Codex (`wats setup claude\|codex --mcp` installs it): fast, read-only, silent when nothing is new, never failing the prompt; each item is shown once (a pending clarify again at the next burst of prompts) |
 | [`wats attach`](#wats-attach) | Follow the node running in the background (`wats --detach`, or the one `wats mcp` started): its banner and last log lines, then what it logs, live. Ctrl-C detaches; the node keeps running |
@@ -168,8 +168,8 @@ wats setup [OPTIONS] [COMMAND]
 | [`wats setup openclaw`](#wats-setup-openclaw) | OpenClaw. With neither --mcp nor --agent, does both. wats never writes openclaw.json itself: --apply goes through `openclaw config patch`, with a backup |
 | [`wats setup opencode`](#wats-setup-opencode) | OpenCode (ADR 0031): your own model or cloud credits. With neither --mcp nor --agent, does both. wats never edits OpenCode's config files itself: --mcp goes through `opencode mcp add` |
 | [`wats setup vibe`](#wats-setup-vibe) | Mistral Vibe (ADR 0033): an MCP host, and an agent runtime. Vibe has no CLI for MCP servers: --mcp edits its config.toml, after a backup copy, and touches nothing but its own entry. With neither --mcp nor --agent, says what each does and changes nothing |
-| [`wats setup copilot`](#wats-setup-copilot) | GitHub Copilot CLI (`copilot`): add wats as its MCP server in $COPILOT_HOME/mcp-config.json (default ~/.copilot), after a backup |
-| [`wats setup antigravity`](#wats-setup-antigravity) | Antigravity CLI (`agy`): add wats as its MCP server in ~/.gemini/config/mcp_config.json, after a backup |
+| [`wats setup copilot`](#wats-setup-copilot) | GitHub Copilot CLI (`copilot`): add wats as its MCP server in $COPILOT_HOME/mcp-config.json (default ~/.copilot), after a backup, and/or enable a Copilot agent (ADR 0038). With neither flag, both |
+| [`wats setup antigravity`](#wats-setup-antigravity) | Antigravity CLI (`agy`): add wats as its MCP server in ~/.gemini/config/mcp_config.json, after a backup, and/or enable an Antigravity agent (ADR 0038). With neither flag, both |
 
 <a id="wats-setup-codex"></a>
 
@@ -303,7 +303,7 @@ wats setup vibe [OPTIONS]
 
 ## `wats setup copilot`
 
-GitHub Copilot CLI (`copilot`): add wats as its MCP server in $COPILOT_HOME/mcp-config.json (default ~/.copilot), after a backup
+GitHub Copilot CLI (`copilot`): add wats as its MCP server in $COPILOT_HOME/mcp-config.json (default ~/.copilot), after a backup, and/or enable a Copilot agent (ADR 0038). With neither flag, both
 
 ```
 wats setup copilot [OPTIONS]
@@ -312,13 +312,22 @@ wats setup copilot [OPTIONS]
 | Option | Env | Default | Description |
 |---|---|---|---|
 | `--mcp` |  | `false` | Add, or replace, the `wats` entry of `mcpServers`: type "local", command <this wats>, args ["mcp", "--profile", <profile>], tools ["*"] |
+| `--agent` |  | `false` | Enable a Copilot CLI agent in config.toml (`[agents.copilot]`, or `[agents.<name>]` with --name). Its access is swarm-only (the wats tools only) unless --access says otherwise |
+| `--name <NAME>` |  |  | The agent's name [default: the runtime]: another name adds a second agent of the same runtime, with its own profile (<OS user>-<name>), budget and runs |
+| `--about <ABOUT>` |  |  | Who the agent is and what it can do (agent.about): its role in every run, and the text of the announce it posts |
+| `--access <ACCESS>` |  |  | What the agent may use besides the wats tools (agent.access): workspace (the default), swarm-only or inherit. Mistral Vibe: swarm-only (its default) or inherit. One of: `swarm-only`, `workspace`, `inherit`. |
+| `--workdir <WORKDIR>` |  |  | The agent's directory with workspace access (agent.workdir) |
+| `--tools <TOOLS>` |  |  | Tools allowed with workspace access (agent.tools), any name the runtime knows: Read,Grep (Claude Code), image_generation (Codex) |
+| `--model <MODEL>` |  |  | The agent's model (agent.model), e.g. sonnet; unset uses the runtime's default |
+| `--agents-md` |  | `false` | Also add a short marked block about WeAreTheSwarm to your global instructions (~/.claude/CLAUDE.md, ~/.codex/AGENTS.md), so that "the swarm" means these tools. Replaced in place if present |
+| `--remove-agents-md` |  | `false` | Remove that block |
 | `--remove` |  | `false` | Remove that entry (with a backup copy too) |
 
 <a id="wats-setup-antigravity"></a>
 
 ## `wats setup antigravity`
 
-Antigravity CLI (`agy`): add wats as its MCP server in ~/.gemini/config/mcp_config.json, after a backup
+Antigravity CLI (`agy`): add wats as its MCP server in ~/.gemini/config/mcp_config.json, after a backup, and/or enable an Antigravity agent (ADR 0038). With neither flag, both
 
 ```
 wats setup antigravity [OPTIONS]
@@ -327,6 +336,15 @@ wats setup antigravity [OPTIONS]
 | Option | Env | Default | Description |
 |---|---|---|---|
 | `--mcp` |  | `false` | Add, or replace, the `wats` entry of `mcpServers`: command <this wats>, args ["mcp", "--profile", <profile>] |
+| `--agent` |  | `false` | Enable an Antigravity CLI agent in config.toml (`[agents.antigravity]`, or `[agents.<name>]` with --name): swarm-only unless --access workspace, with its own home and a login offered on a terminal |
+| `--name <NAME>` |  |  | The agent's name [default: the runtime]: another name adds a second agent of the same runtime, with its own profile (<OS user>-<name>), budget and runs |
+| `--about <ABOUT>` |  |  | Who the agent is and what it can do (agent.about): its role in every run, and the text of the announce it posts |
+| `--access <ACCESS>` |  |  | What the agent may use besides the wats tools (agent.access): workspace (the default), swarm-only or inherit. Mistral Vibe: swarm-only (its default) or inherit. One of: `swarm-only`, `workspace`, `inherit`. |
+| `--workdir <WORKDIR>` |  |  | The agent's directory with workspace access (agent.workdir) |
+| `--tools <TOOLS>` |  |  | Tools allowed with workspace access (agent.tools), any name the runtime knows: Read,Grep (Claude Code), image_generation (Codex) |
+| `--model <MODEL>` |  |  | The agent's model (agent.model), e.g. sonnet; unset uses the runtime's default |
+| `--agents-md` |  | `false` | Also add a short marked block about WeAreTheSwarm to your global instructions (~/.claude/CLAUDE.md, ~/.codex/AGENTS.md), so that "the swarm" means these tools. Replaced in place if present |
+| `--remove-agents-md` |  | `false` | Remove that block |
 | `--remove` |  | `false` | Remove that entry (with a backup copy too) |
 
 <a id="wats-config"></a>
@@ -422,7 +440,7 @@ wats config ack [OPTIONS]
 
 ## `wats share`
 
-Choose what this node's agent may use when it answers the swarm (ADR 0037): its runtime's own tools, checked by default but running commands, and the MCP servers of your own configuration for that runtime, unchecked unless you pick them. One checklist sets agent.tools, agent.servers and the caps the agent announces; run it again to see servers added since. Claude Code, Codex and OpenCode
+Choose what this node's agent may use when it answers the swarm (ADR 0037): its runtime's own tools, checked by default but running commands, and the MCP servers of your own configuration for that runtime, unchecked unless you pick them. One checklist sets agent.tools, agent.servers and the caps the agent announces; run it again to see servers added since. Claude Code, Codex, OpenCode, Copilot CLI and Antigravity CLI
 
 ```
 wats share [OPTIONS]

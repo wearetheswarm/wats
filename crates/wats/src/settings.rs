@@ -41,7 +41,31 @@ use serde::Deserialize;
 pub const FILE_NAME: &str = "config.toml";
 
 /// The agent runtimes wats can run.
-pub const RUNTIMES: [&str; 5] = ["claude", "codex", "openclaw", "opencode", "vibe"];
+pub const RUNTIMES: [&str; 7] = [
+    "claude",
+    "codex",
+    "openclaw",
+    "opencode",
+    "vibe",
+    "copilot",
+    "antigravity",
+];
+
+/// The command of a runtime: its name, but Antigravity CLI's `agy`.
+pub fn runtime_command(runtime: &str) -> &str {
+    match runtime {
+        "antigravity" => "agy",
+        other => other,
+    }
+}
+
+/// The runtime of a command found on PATH: [`runtime_command`] reversed.
+pub fn runtime_of_command(command: &'static str) -> &'static str {
+    match command {
+        "agy" => "antigravity",
+        other => other,
+    }
+}
 
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -945,7 +969,7 @@ pub const KEYS: &[Key] = &[
         "agent.runtime",
         ValueType::Runtime,
         "none",
-        "agent run with the node: claude, codex, openclaw, opencode or vibe",
+        "agent run with the node: claude, codex, openclaw, opencode, vibe, copilot or antigravity",
     ),
     key(
         "agent.openclaw_url",
@@ -1091,7 +1115,7 @@ pub const KEYS: &[Key] = &[
         "agent.command",
         ValueType::Text,
         "the runtime's",
-        "the agent CLI (claude, codex, opencode, vibe)",
+        "the agent CLI (claude, codex, opencode, vibe, copilot, agy)",
     ),
     key(
         "agent.args",

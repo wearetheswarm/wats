@@ -1607,7 +1607,7 @@ fn setup_json_hosts_edit_their_mcp_files() {
     assert!(said.contains("(new file)"), "{said}");
     let copilot = read(".copilot/mcp-config.json");
     assert_eq!(copilot["mcpServers"]["wats"]["type"], "local");
-    assert!(setup(&["copilot", "--mcp"]).contains("already in"));
+    assert!(setup(&["copilot", "--mcp"]).contains("already"));
 
     let said = setup(&["antigravity", "--mcp"]);
     assert!(said.contains("backup: "), "{said}");

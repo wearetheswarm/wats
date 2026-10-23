@@ -63,6 +63,9 @@ pub struct RunRecord {
     /// OpenClaw: its `replyDisposition` (`visible`, `silent` or `empty`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reply: Option<String>,
+    /// Copilot CLI: the AI credits the run spent (ADR 0038).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ai_credits: Option<f64>,
 }
 
 fn unix_now() -> u64 {
@@ -210,7 +213,65 @@ pub fn read_result(transcript: &Path, record: &mut RunRecord) {
         // Codex: turns, LLM tokens and failures, no cost. OpenCode (`run
         // --format json`, ADR 0031): a turn, its estimated cost and its LLM
         // tokens per `step_finish`, and `error` events.
+        // Copilot CLI (ADR 0038): the model its `user.message` names, its
+        // usage file (AI credits), and its `result` (no turns nor cost).
+        if let Some((model, _)) = crate::copilot::model_of(&value)
+            && record.model.is_empty()
+        {
+            record.model = model;
+        }
+        // Antigravity CLI (ADR 0038): its `result` event, `{"event":
+        // "result", "result": {status, num_turns, usage}}`.
+        if value["event"] == "result" {
+            let result = &value["result"];
+            record.turns = result["num_turns"].as_u64();
+            if let Some(n) = crate::antigravity::tokens(&result["usage"]) {
+                record.tokens = Some(n);
+            }
+            // A tool it needed was denied (a headless run cannot ask): an
+            // empty response is a failed run, else a note.
+            let denied: Vec<&str> = result["denied_actions"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|d| d["action"].as_str())
+                .collect();
+            if !denied.is_empty() {
+                let note = format!("denied: {}", denied.join(", "));
+                if result["response"]
+                    .as_str()
+                    .is_none_or(|r| r.trim().is_empty())
+                    && record.status == "ok"
+                {
+                    record.status = "error".into();
+                }
+                record.error = Some(note.chars().take(200).collect());
+            }
+            if let Some(status) = result["status"].as_str()
+                && status != "SUCCESS"
+                && record.status == "ok"
+            {
+                record.status = "error".into();
+                record.error = result["error"]
+                    .as_str()
+                    .or(result["error"]["message"].as_str())
+                    .or(Some(status))
+                    .map(|m| m.chars().take(200).collect());
+            }
+            continue;
+        }
         match value["type"].as_str() {
+            Some("copilot_usage") => {
+                record.ai_credits = value["ai_credits"].as_f64();
+                continue;
+            }
+            Some("result") if value.get("exitCode").is_some() => {
+                if value["exitCode"].as_i64().is_some_and(|c| c != 0) && record.status == "ok" {
+                    record.status = "error".into();
+                    record.error = Some(format!("exit code {}", value["exitCode"]));
+                }
+                continue;
+            }
             Some("turn.completed") => {
                 record.turns = Some(record.turns.unwrap_or(0) + 1);
                 if let Some(n) = codex_tokens(&value["usage"]) {
@@ -983,6 +1044,38 @@ mod tests {
         ]);
         assert_eq!(claude.tokens, Some(23_812));
         assert_eq!(claude.cost_usd, Some(0.05));
+        let copilot = read(&[
+            r#"{"type":"user.message","data":{"responsesReasoning":{"model":"gpt-6-luna","effort":"medium"}}}"#,
+            r#"{"type":"result","exitCode":0,"usage":{"premiumRequests":1}}"#,
+            r#"{"type":"copilot_usage","ai_credits":0.18,"premium_requests":1}"#,
+        ]);
+        assert_eq!(copilot.model, "gpt-6-luna");
+        assert_eq!(copilot.ai_credits, Some(0.18));
+        assert_eq!(copilot.status, "ok");
+        assert_eq!(copilot.turns, None);
+        let failed = read(&[r#"{"type":"result","exitCode":1}"#]);
+        assert_eq!(failed.status, "error");
+        let agy = read(&[
+            r#"{"event":"init","conversation_id":"c","init":{"cwd":"/w","tools":[]}}"#,
+            r#"{"event":"result","result":{"status":"SUCCESS","response":"ok","num_turns":2,"usage":{"input_tokens":100,"output_tokens":20,"thinking_tokens":5,"cache_read_tokens":0,"total_tokens":125}}}"#,
+        ]);
+        assert_eq!(
+            (agy.turns, agy.tokens, agy.status.as_str()),
+            (Some(2), Some(125), "ok")
+        );
+        let agy =
+            read(&[r#"{"event":"result","result":{"status":"ERROR","error":"quota exhausted"}}"#]);
+        assert_eq!(agy.status, "error");
+        assert_eq!(agy.error.as_deref(), Some("quota exhausted"));
+        let agy = read(&[
+            r#"{"event":"result","result":{"status":"SUCCESS","response":"","denied_actions":[{"action":"read_file","display_name":"ReadFile"}]}}"#,
+        ]);
+        assert_eq!(agy.status, "error");
+        assert_eq!(agy.error.as_deref(), Some("denied: read_file"));
+        let agy = read(&[
+            r#"{"event":"result","result":{"status":"SUCCESS","response":"Done.","denied_actions":[{"action":"command"}]}}"#,
+        ]);
+        assert_eq!(agy.status, "ok");
         let codex = read(&[
             r#"{"type":"turn.completed","usage":{"input_tokens":1000,"cached_input_tokens":900,"output_tokens":50}}"#,
             r#"{"type":"turn.completed","usage":{"input_tokens":2000,"cached_input_tokens":1800,"output_tokens":70}}"#,
