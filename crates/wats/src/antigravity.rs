@@ -247,7 +247,7 @@ pub struct Home<'a> {
 }
 
 pub fn prepare_home(h: &Home) -> Result<()> {
-    make_home(h.home)?;
+    make_home(h.home, h.real_home)?;
     let mut env = serde_json::Map::new();
     env.insert("WATS_RUNNER_TOKEN".into(), json!(h.token));
     if let Some(real) = h.real_home {
@@ -273,7 +273,7 @@ pub fn prepare_home(h: &Home) -> Result<()> {
 }
 
 /// The agent's home, `0700`, with its two configuration directories.
-fn make_home(home: &Path) -> Result<()> {
+fn make_home(home: &Path, real_home: Option<&Path>) -> Result<()> {
     for dir in [
         home.join(".gemini/config"),
         home.join(".gemini/antigravity-cli"),
@@ -285,13 +285,39 @@ fn make_home(home: &Path) -> Result<()> {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(home, std::fs::Permissions::from_mode(0o700))?;
     }
+    link_keychains(home, real_home)
+}
+
+/// macOS: `Library/Keychains` of the agent's home, a link to the user's
+/// own. With no keychain under `HOME`, macOS finds no default keychain and
+/// asks, at every run, to reset one ("keychain not found"): a run would
+/// wait for a click, and "Reset to defaults" is a dangerous one. Through
+/// the link, Antigravity keeps its "Antigravity Safe Storage" key in the
+/// user's login keychain, as for the user's own sessions; the agent's
+/// token stays in the agent's home, encrypted with it. wats writes nothing
+/// to the keychain. Elsewhere, nothing.
+fn link_keychains(home: &Path, real_home: Option<&Path>) -> Result<()> {
+    if !cfg!(target_os = "macos") {
+        return Ok(());
+    }
+    let Some(real) = real_home.map(|h| h.join("Library/Keychains")) else {
+        return Ok(());
+    };
+    let link = home.join("Library/Keychains");
+    if link.symlink_metadata().is_ok() || !real.is_dir() {
+        return Ok(());
+    }
+    std::fs::create_dir_all(home.join("Library"))?;
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(&real, &link)
+        .with_context(|| format!("link {} to {}", link.display(), real.display()))?;
     Ok(())
 }
 
 /// The login run of `wats setup antigravity --agent`: the swarm-only
 /// locks, and an MCP config with no server.
-pub fn prepare_login(home: &Path, wats_command: &Path) -> Result<()> {
-    make_home(home)?;
+pub fn prepare_login(home: &Path, wats_command: &Path, real_home: Option<&Path>) -> Result<()> {
+    make_home(home, real_home)?;
     crate::access::write_private(&mcp_config_path(home), b"{\"mcpServers\": {}}\n")?;
     write_locks(home, wats_command, &Lock::default())
 }
@@ -594,13 +620,38 @@ mod tests {
             assert_eq!(mode(&mcp_config_path(&home)), 0o600);
             assert_eq!(mode(&home), 0o700);
         }
-        prepare_login(&home, Path::new("/w")).unwrap();
+        prepare_login(&home, Path::new("/w"), None).unwrap();
         assert!(
             read(mcp_config_path(&home))["mcpServers"]
                 .as_object()
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    /// macOS: the agent's home finds the user's keychains through a link
+    /// (no "keychain not found" dialog at every run); never elsewhere.
+    #[test]
+    fn the_home_links_the_keychains_on_macos_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real");
+        std::fs::create_dir_all(real.join("Library/Keychains")).unwrap();
+        let home = dir.path().join("home");
+        prepare_login(&home, Path::new("/w"), Some(&real)).unwrap();
+        let link = home.join("Library/Keychains");
+        if cfg!(target_os = "macos") {
+            assert_eq!(
+                std::fs::read_link(&link).unwrap(),
+                real.join("Library/Keychains")
+            );
+            // Again: left as it is.
+            prepare_login(&home, Path::new("/w"), Some(&real)).unwrap();
+        } else {
+            assert!(link.symlink_metadata().is_err());
+        }
+        let bare = dir.path().join("bare");
+        prepare_login(&bare, Path::new("/w"), None).unwrap();
+        assert!(bare.join("Library/Keychains").symlink_metadata().is_err());
     }
 
     #[test]

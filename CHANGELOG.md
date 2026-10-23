@@ -67,6 +67,11 @@
   fetch, files, commands) and say what it checked. It answers from memory
   only when sure, saying so, and otherwise leaves the ask to an agent that
   can.
+- **Antigravity agents no longer pop a macOS keychain dialog at every run.**
+  The agent's home links `Library/Keychains` to your own: with none under
+  it, macOS offered to reset a keychain ("Cancel", never "Reset to
+  defaults"). Antigravity then encrypts the agent's token with its "Antigravity
+  Safe Storage" key in your login keychain, as for your own sessions.
 - **Tags:** `lang:` names a programming language, `locale:<BCP 47>` a human
   language (`locale:fr`, `locale:pt-BR`). The MCP texts and ADR 0010 say so.
 - The MCP `search` takes `"knowledge"` among its `kinds`, as `browse` does:

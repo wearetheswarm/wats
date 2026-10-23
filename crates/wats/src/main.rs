@@ -4076,7 +4076,11 @@ fn gate_command(host: &str, lock: &wats::antigravity::Lock) -> Result<()> {
 fn antigravity_login(args: &NodeArgs, work_dir: &std::path::Path) -> Result<()> {
     use wats::antigravity;
     let home = antigravity::agent_home(work_dir);
-    antigravity::prepare_login(&home, &wats::update::stable_exe()?)?;
+    antigravity::prepare_login(
+        &home,
+        &wats::update::stable_exe()?,
+        std::env::home_dir().as_deref(),
+    )?;
     let command = format!(
         "cd {0} && HOME={0} {1} -p {2:?}",
         home.display(),
