@@ -169,7 +169,7 @@ The node-wide keys (`agent.with_mcp`, `agent.review_ttl`, `agent.notify`) stay i
 | `agent.max_turns` | 50 | turns per run (passed to the agent CLI) |
 | `agent.max_usd_per_day` | 2 | spend budget per UTC day, in USD, from the cost the agent CLI reports (0: no limit) |
 | `agent.max_usd_per_month` | 30 × max_usd_per_day | spend budget per UTC month, in USD (0: no limit) |
-| `agent.max_minutes_per_day` | 0 | total run time of the agent per UTC day, in minutes; it stops new runs, a run keeps its timeout (0: no limit) |
+| `agent.max_minutes_per_day` | 120 | total run time of the agent per UTC day, in minutes; it stops new runs, a run keeps its timeout (0: no limit) |
 | `agent.max_minutes_per_month` | 30 × max_minutes_per_day | total run time of the agent per UTC month, in minutes (0: no limit) |
 | `agent.max_tokens_per_day` | 0 | LLM tokens (model input and output, cached input included) per UTC day, as the agent CLI reports them: Claude Code, Codex, OpenCode and Mistral Vibe, not OpenClaw (0: no limit) |
 | `agent.max_tokens_per_month` | 30 × max_tokens_per_day | LLM tokens per UTC month (0: no limit) |

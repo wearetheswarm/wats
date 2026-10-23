@@ -1222,7 +1222,7 @@ pub const KEYS: &[Key] = &[
     key(
         "agent.max_minutes_per_day",
         ValueType::Integer,
-        "0",
+        "120",
         "total run time of the agent per UTC day, in minutes; it stops new runs, a run keeps \
          its timeout (0: no limit)",
     ),

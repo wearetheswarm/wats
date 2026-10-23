@@ -34,6 +34,10 @@ pub const MONTH_DAYS: u64 = 30;
 /// `agent.max_usd_per_day` when unset: conservative, a heartbeat run of a
 /// large model costs a few cents.
 pub const DEFAULT_USD_PER_DAY: f64 = 2.0;
+/// Default of `agent.max_minutes_per_day` (0.4.11; no limit before): the
+/// one limit every runtime reports, so that an agent nobody budgeted is
+/// still bounded.
+pub const DEFAULT_MINUTES_PER_DAY: u64 = 120;
 
 /// `agent.max_runs_per_day` when unset.
 pub const DEFAULT_RUNS_PER_DAY: usize = 48;
@@ -62,8 +66,9 @@ pub struct Budget {
 pub const ZERO_CONFIRMED_REVISION: u32 = 2;
 
 impl Default for Budget {
-    /// The defaults of config.toml: $2 a day ($60 a month), no time nor
-    /// LLM token limit, 48 runs a day without a reported cost.
+    /// The defaults of config.toml: $2 a day ($60 a month), 120 minutes a
+    /// day (3600 a month), no LLM token limit, 48 runs a day without a
+    /// reported cost.
     fn default() -> Self {
         Budget::of(&AgentSettings::default())
     }
@@ -83,7 +88,7 @@ impl Budget {
     /// default; each month, 30 × the day unless set.
     pub fn of(file: &AgentSettings) -> Budget {
         let usd = file.max_usd_per_day.unwrap_or(DEFAULT_USD_PER_DAY);
-        let minutes = file.max_minutes_per_day.unwrap_or(0);
+        let minutes = file.max_minutes_per_day.unwrap_or(DEFAULT_MINUTES_PER_DAY);
         let tokens = file.max_tokens_per_day.unwrap_or(0);
         Budget {
             max_usd_per_day: limit_f(usd),
@@ -745,8 +750,23 @@ pub fn describe(budget: &Budget, spend: &Spend, runtime: &str) -> String {
             " LLM tokens",
         ));
     }
+    if runtime != "openclaw" && unlimited(budget, runtime) {
+        parts.push(UNLIMITED.to_string());
+    }
     parts.join(" · ")
 }
+
+/// Whether nothing bounds the agent's day in what its runtime reports: no
+/// minutes limit, and no dollar or token limit it could enforce (0.4.11).
+/// Only the run caps and the timeout then hold it.
+pub fn unlimited(budget: &Budget, runtime: &str) -> bool {
+    budget.max_minutes_per_day.is_none()
+        && (!reports_cost(runtime) || budget.max_usd_per_day.is_none())
+        && (!reports_tokens(runtime) || budget.max_tokens_per_day.is_none())
+}
+
+/// Said by `status` and at start for an [`unlimited`] agent.
+pub const UNLIMITED: &str = "no daily limit: set its max_minutes_per_day";
 
 /// For `status` (CLI and MCP): what an agent of `runtime` used today and
 /// this month, and its limits (`null`: no limit, or not reported by the
@@ -833,6 +853,8 @@ mod tests {
             max_usd_per_day: Some(1.0),
             max_usd_per_month: Some(3.0),
             max_runs_per_day: 2,
+            max_minutes_per_day: None,
+            max_minutes_per_month: None,
             ..Budget::default()
         };
         // Last month, earlier this month, today.
@@ -908,12 +930,13 @@ mod tests {
         assert_eq!(b.max_usd_per_month, Some(150.0));
         assert_eq!(b.max_minutes_per_month, Some(3600));
         assert_eq!(b.max_tokens_per_month, Some(30_000_000));
-        // The defaults: $2 a day, so $60 a month; no time nor token limit.
+        // The defaults: $2 a day, so $60 a month; 120 minutes a day (since
+        // 0.4.11), so 3600 a month; no token limit.
         let d = Budget::default();
         assert_eq!(d.max_usd_per_day, Some(2.0));
         assert_eq!(d.max_usd_per_month, Some(60.0));
-        assert_eq!(d.max_minutes_per_day, None);
-        assert_eq!(d.max_minutes_per_month, None);
+        assert_eq!(d.max_minutes_per_day, Some(120));
+        assert_eq!(d.max_minutes_per_month, Some(3600));
         assert_eq!(d.max_tokens_per_day, None);
         assert_eq!(d.max_runs_per_day, 48);
         // An explicit month overrides, the old `max_usd_per_month` too.
@@ -956,6 +979,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let file = AgentSettings {
             max_usd_per_day: Some(0.0),
+            max_minutes_per_day: Some(0),
             ..AgentSettings::default()
         };
         let budget = Budget::of(&file);
@@ -983,7 +1007,7 @@ mod tests {
         assert_eq!(
             said,
             "$500.00 today (no limit) · 300 min today (no limit) · 250M LLM tokens today \
-             (no limit)"
+             (no limit) · no daily limit: set its max_minutes_per_day"
         );
     }
 
@@ -1053,6 +1077,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let file = AgentSettings {
             max_tokens_per_day: Some(10_000),
+            max_minutes_per_day: Some(0),
             ..AgentSettings::default()
         };
         record(
@@ -1155,6 +1180,7 @@ mod tests {
     fn a_zero_from_before_stays_paused() {
         let day = AgentSettings {
             max_usd_per_day: Some(0.0),
+            max_minutes_per_day: Some(0),
             ..AgentSettings::default()
         };
         let month = AgentSettings {

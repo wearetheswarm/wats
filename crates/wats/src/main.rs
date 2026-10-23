@@ -2617,6 +2617,25 @@ fn setup_tool(
         let member = wats::roster::configured(&settings, data_dir, &os_user_profile())?
             .into_iter()
             .find(|m| m.name == agent_name);
+        // On a terminal, an agent nobody budgeted yet: the wizard's budget
+        // question (ADR 0034), as `wats setup` asks it (0.4.11).
+        if agent
+            && std::io::IsTerminal::is_terminal(&std::io::stdin())
+            && let Some(member) = &member
+            && !wats::firstrun::has_budget(&member.settings)
+            && !wats::budget::confirmed(&member.work_dir)
+            && let Some(line) = wats::firstrun::ask_agent_budget(
+                data_dir,
+                &mut std::io::stdin().lock(),
+                &mut std::io::stdout(),
+                &member.name,
+                runtime,
+                &member.settings,
+                &member.work_dir,
+            )?
+        {
+            println!("budget: {line}");
+        }
         if let Some(member) = &member
             && wats::access::level_for(
                 member.runtime.as_deref().unwrap_or_default(),

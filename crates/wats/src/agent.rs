@@ -2439,6 +2439,13 @@ pub async fn run(
             config.tools.join(", ")
         );
     }
+    if config.runtime != "openclaw" && budget::unlimited(&config.budget, &config.runtime) {
+        warn!(
+            "agent {}: {} (agent.max_minutes_per_day); only the run caps and the timeout bound it",
+            config.profile,
+            budget::UNLIMITED
+        );
+    }
     for warning in access::cap_warnings(&access::CapCheck {
         agent: &config.profile,
         runtime: &config.runtime,

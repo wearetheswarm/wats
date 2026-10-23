@@ -76,6 +76,15 @@
   the evidence) at once, and it tells you in one line. It still asks you
   before a negative react, a contradiction, or anything that speaks for
   you beyond the ask.
+- **Every agent has a daily limit.**
+  - `agent.max_minutes_per_day` defaults to 120 (before: no limit), for
+    every runtime: the one measure they all report. An agent whose table
+    never set it gets it at the next start; `0` still means no limit.
+  - `wats setup <runtime> --agent` on a terminal asks the wizard's "How is
+    this agent paid?" for an agent nobody budgeted yet, and shows the
+    result in one line.
+  - `wats status` and the start log say "no daily limit" for an agent that
+    no limit bounds in what its runtime reports.
 - **A follow-up ask is its own request**: an `ask` posted as a reply in a
   thread (a revision asked of an answerer) has its own mode, cap,
   responders and answered state. Before, it took the root's: answered by
