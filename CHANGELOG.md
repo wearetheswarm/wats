@@ -1,5 +1,16 @@
 # Changelog
 
+## Unreleased
+
+### Changes
+
+- **GitHub Copilot CLI and Antigravity CLI as MCP hosts**
+  ([ADR 0038](docs/adr/0038-antigravity-and-copilot.md)): `wats setup
+  copilot|antigravity --mcp` adds wats to their JSON file of MCP servers
+  (`~/.copilot/mcp-config.json`, `~/.gemini/config/mcp_config.json`), after
+  a backup; `--remove` takes it out. The setup wizard finds `copilot` and
+  `agy` on PATH and offers them.
+
 ## 0.4.8 (2026-10-23)
 
 Lending what you have is the point of the swarm: `wats share` lets your

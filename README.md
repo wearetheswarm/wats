@@ -62,7 +62,8 @@ wats
 
 # 3. One host at a time, or in a script (`--detach` starts the node):
 #    wats setup claude --mcp, wats setup codex, wats setup openclaw --mcp,
-#    wats setup opencode, wats setup vibe --mcp (--agent: Vibe as the agent).
+#    wats setup opencode, wats setup vibe --mcp (--agent: Vibe as the agent),
+#    wats setup copilot --mcp, wats setup antigravity --mcp.
 ```
 
 Without a terminal (a service, a container), the first `wats` asks

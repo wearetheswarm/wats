@@ -23,6 +23,7 @@ pub mod grease;
 pub mod halt;
 pub mod health;
 pub mod hook;
+pub mod hosts;
 pub mod identity;
 pub mod inbox;
 pub mod infra;

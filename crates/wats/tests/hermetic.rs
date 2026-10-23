@@ -1566,3 +1566,59 @@ fn share_lets_the_agent_use_chosen_servers() {
     );
     assert!(said.contains("What agent codex (Codex) may use"), "{said}");
 }
+
+/// `wats setup copilot|antigravity --mcp` (ADR 0038): the `wats` entry in
+/// each host's JSON file of a throwaway HOME, the rest kept, a backup of a
+/// file that existed; `--remove` takes it out again.
+#[test]
+fn setup_json_hosts_edit_their_mcp_files() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("d");
+    let home = dir.path().join("home");
+    std::fs::create_dir_all(home.join(".gemini/config")).unwrap();
+    std::fs::write(
+        home.join(".gemini/config/mcp_config.json"),
+        r#"{"theme": "dark", "mcpServers": {"gh": {"command": "gh"}}}"#,
+    )
+    .unwrap();
+    let setup = |args: &[&str]| {
+        let out = std::process::Command::new(env!("CARGO_BIN_EXE_wats"))
+            .env("WATS_HERMETIC", "1")
+            .envs(throwaway(&data))
+            .env_remove("COPILOT_HOME")
+            .arg("--dir")
+            .arg(&data)
+            .arg("setup")
+            .args(args)
+            .stdin(std::process::Stdio::null())
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{out:?}");
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    };
+    let read = |path: &str| -> serde_json::Value {
+        serde_json::from_str(&std::fs::read_to_string(home.join(path)).unwrap()).unwrap()
+    };
+    let said = setup(&["copilot", "--mcp"]);
+    assert!(
+        said.contains("GitHub Copilot CLI: wats MCP server added to"),
+        "{said}"
+    );
+    assert!(said.contains("(new file)"), "{said}");
+    let copilot = read(".copilot/mcp-config.json");
+    assert_eq!(copilot["mcpServers"]["wats"]["type"], "local");
+    assert!(setup(&["copilot", "--mcp"]).contains("already in"));
+
+    let said = setup(&["antigravity", "--mcp"]);
+    assert!(said.contains("backup: "), "{said}");
+    let agy = read(".gemini/config/mcp_config.json");
+    assert_eq!(agy["theme"], "dark");
+    assert_eq!(agy["mcpServers"]["gh"]["command"], "gh");
+    assert!(agy["mcpServers"]["wats"]["args"].is_array());
+
+    let said = setup(&["antigravity", "--remove"]);
+    assert!(said.contains("removed from"), "{said}");
+    let agy = read(".gemini/config/mcp_config.json");
+    assert!(agy["mcpServers"].get("wats").is_none());
+    assert_eq!(agy["mcpServers"]["gh"]["command"], "gh");
+}

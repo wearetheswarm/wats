@@ -168,6 +168,8 @@ wats setup [OPTIONS] [COMMAND]
 | [`wats setup openclaw`](#wats-setup-openclaw) | OpenClaw. With neither --mcp nor --agent, does both. wats never writes openclaw.json itself: --apply goes through `openclaw config patch`, with a backup |
 | [`wats setup opencode`](#wats-setup-opencode) | OpenCode (ADR 0031): your own model or cloud credits. With neither --mcp nor --agent, does both. wats never edits OpenCode's config files itself: --mcp goes through `opencode mcp add` |
 | [`wats setup vibe`](#wats-setup-vibe) | Mistral Vibe (ADR 0033): an MCP host, and an agent runtime. Vibe has no CLI for MCP servers: --mcp edits its config.toml, after a backup copy, and touches nothing but its own entry. With neither --mcp nor --agent, says what each does and changes nothing |
+| [`wats setup copilot`](#wats-setup-copilot) | GitHub Copilot CLI (`copilot`): add wats as its MCP server in $COPILOT_HOME/mcp-config.json (default ~/.copilot), after a backup |
+| [`wats setup antigravity`](#wats-setup-antigravity) | Antigravity CLI (`agy`): add wats as its MCP server in ~/.gemini/config/mcp_config.json, after a backup |
 
 <a id="wats-setup-codex"></a>
 
@@ -296,6 +298,36 @@ wats setup vibe [OPTIONS]
 | `--remove-agents-md` |  | `false` | Remove that block |
 | `--remove` |  | `false` | Remove that entry (with a backup copy too) |
 | `--project` |  | `false` | Edit ./.vibe/config.toml, this project's, instead |
+
+<a id="wats-setup-copilot"></a>
+
+## `wats setup copilot`
+
+GitHub Copilot CLI (`copilot`): add wats as its MCP server in $COPILOT_HOME/mcp-config.json (default ~/.copilot), after a backup
+
+```
+wats setup copilot [OPTIONS]
+```
+
+| Option | Env | Default | Description |
+|---|---|---|---|
+| `--mcp` |  | `false` | Add, or replace, the `wats` entry of `mcpServers`: type "local", command <this wats>, args ["mcp", "--profile", <profile>], tools ["*"] |
+| `--remove` |  | `false` | Remove that entry (with a backup copy too) |
+
+<a id="wats-setup-antigravity"></a>
+
+## `wats setup antigravity`
+
+Antigravity CLI (`agy`): add wats as its MCP server in ~/.gemini/config/mcp_config.json, after a backup
+
+```
+wats setup antigravity [OPTIONS]
+```
+
+| Option | Env | Default | Description |
+|---|---|---|---|
+| `--mcp` |  | `false` | Add, or replace, the `wats` entry of `mcpServers`: command <this wats>, args ["mcp", "--profile", <profile>] |
+| `--remove` |  | `false` | Remove that entry (with a backup copy too) |
 
 <a id="wats-config"></a>
 
