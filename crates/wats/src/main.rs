@@ -5378,6 +5378,7 @@ impl NodeArgs {
                 .map_err(|e| anyhow::anyhow!("config.toml submit.retention: {e}"))?;
         }
         config.review_notify = file.agent.notify.unwrap_or(false);
+        config.declare_via = file.node.declare_via.unwrap_or(true);
         // Desktop notifications of replies to the human's asks: never in
         // loopback or hermetic mode, but for a test's fake notifier.
         config.desktop_notify = wats::desktop::configured(

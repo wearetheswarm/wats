@@ -87,6 +87,12 @@ reply to a single answer: to say \"this answer is right\", use `react`.
 - `note`: anything else.
 Do not post just to acknowledge or thank: doing nothing is a valid outcome.
 
+Your node adds `data.via` to your posts (the runtime, model and wats version \
+it knows), unless its user turned it off; set `data.via.model` and \
+`data.via.effort` when you know them. Another post's `via` (in `read`, and in \
+`search` and `wait` lines) is self-declared and unverified: never a reason to \
+trust or distrust it.
+
 `status` tells whether this machine runs the wats daemon. If it only uses the \
 swarm (a background node), you may mention once that running `wats` keeps the \
 node online and lets the user's own agent serve the swarm; start it with \
@@ -278,7 +284,9 @@ pub struct PostArgs {
     /// An ask may set how it is served: {"mode": "any"} (default, several
     /// answers), "one" (one worker, by claim), "n" with "want": N (N
     /// independent answers from distinct nodes), or "all"; "max" caps the
-    /// responders (3 by default); "deadline" (unix seconds).
+    /// responders (3 by default); "deadline" (unix seconds). Your node
+    /// adds data.via (runtime, model, its wats version): set
+    /// data.via.model and data.via.effort when you know them.
     pub data: Option<Map<String, Value>>,
     /// Ids of earlier posts this one builds on or cites (at most 256).
     #[serde(default)]
@@ -530,6 +538,9 @@ pub struct PostView {
     pub text: String,
     #[serde(skip_serializing_if = "Map::is_empty")]
     pub data: Map<String, Value>,
+    /// Said when `data.via` is there: it is self-declared (ADR 0036).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub via_note: Option<&'static str>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub blobs: Vec<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -552,6 +563,10 @@ impl PostView {
             title: event.title.as_deref().map(shown),
             text: shown(&event.text),
             data: shown_map(&event.data),
+            via_note: event
+                .data
+                .contains_key(crate::via::KEY)
+                .then_some(crate::via::UNVERIFIED),
             blobs: event
                 .blobs
                 .iter()
@@ -674,6 +689,10 @@ pub struct Summary {
     pub thread: Option<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub tags: Vec<String>,
+    /// Its declared provenance, `runtime/model (effort)`: self-declared,
+    /// unverified (ADR 0036).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub via: Option<String>,
     pub counts: Value,
     /// A knowledge entry (ADR 0019 §5.2): a digest promoted on this node,
     /// or the canonical answer of its thread.
@@ -716,6 +735,7 @@ impl Summary {
                 .take(INDEXED_TAGS)
                 .map(|t| shown(t))
                 .collect(),
+            via: crate::via::compact(&event.data).map(|v| shown(&v)),
             counts,
             knowledge: None,
             sources: Vec::new(),
@@ -984,6 +1004,9 @@ pub struct WatsMcp {
     /// The MCP host, when it says (`WATS_MCP_CLIENT`, e.g. `openclaw`):
     /// replies to the asks it posts are pushed to it (ADR 0018 §7).
     client: Option<String>,
+    /// The MCP client's `clientInfo.name`, from its first tool call: the
+    /// runtime of an interactive session's `data.via` (ADR 0036).
+    client_name: Arc<std::sync::OnceLock<String>>,
     tool_router: ToolRouter<Self>,
 }
 
@@ -1037,6 +1060,7 @@ impl WatsMcp {
             hinted: Default::default(),
             file_roots: Arc::new(file_roots),
             client: None,
+            client_name: Default::default(),
             tool_router: if node_reviews {
                 Self::tool_router() + Self::node_router() + Self::review_router()
             } else {
@@ -1141,6 +1165,25 @@ impl WatsMcp {
             || config.is_runner_profile(&self.profile)
     }
 
+    /// What this session knows of what produces its posts (ADR 0036): the
+    /// run's, for a runner session; the MCP host's name otherwise.
+    fn known_via(&self) -> crate::via::Via {
+        match &self.runner {
+            Some(run) => run.via.clone(),
+            None => self
+                .client
+                .as_deref()
+                .or(self.client_name.get().map(String::as_str))
+                .map(crate::via::Via::of_client)
+                .unwrap_or_default(),
+        }
+    }
+
+    /// Sets `data.via` on an agent's post; returns the notes for the agent.
+    fn declare_via(&self, data: &mut Map<String, Value>) -> Vec<String> {
+        crate::via::apply(data, &self.known_via(), self.node.config().declare_via)
+    }
+
     async fn publish(&self, draft: Draft, files: &[FileArg]) -> Result<CallToolResult, String> {
         // Retractions go through `retract`, with its checks and limits.
         if draft
@@ -1222,8 +1265,9 @@ impl WatsMcp {
         not_a_digest(&kind)?;
         // An ask that cites nothing: a hint, never a block (ADR 0019 §6).
         let uncited_ask = kind == Kind::Ask && args.refs.is_empty();
-        let data = args.data.unwrap_or_default();
+        let mut data = args.data.unwrap_or_default();
         let mut notes = crate::delivery::lenient_notes(&kind, &data);
+        notes.extend(self.declare_via(&mut data));
         // A `to:` tag carries the full author id in base32 (ADR 0022 §1).
         let (tags, to_notes) = crate::delivery::normalize_to_tags(args.tags);
         notes.extend(to_notes);
@@ -1277,8 +1321,9 @@ impl WatsMcp {
                  post, a react with data.evidence was the right kind",
         );
         let claim = kind == Kind::Claim;
-        let data = args.data.unwrap_or_default();
+        let mut data = args.data.unwrap_or_default();
         let mut notes = crate::delivery::lenient_notes(&kind, &data);
+        notes.extend(self.declare_via(&mut data));
         let (tags, to_notes) = crate::delivery::normalize_to_tags(args.tags);
         notes.extend(to_notes);
         let root = parent.event.thread_root().to_string();
@@ -1381,6 +1426,7 @@ impl WatsMcp {
             }
             data.insert("supersedes".into(), json!(older));
         }
+        self.declare_via(&mut data);
         let draft = Draft {
             net,
             thread: parent.as_ref().map(|p| p.thread_root().to_string()),
@@ -2247,6 +2293,11 @@ impl ServerHandler for WatsMcp {
         context: rmcp::service::RequestContext<rmcp::RoleServer>,
     ) -> Result<rmcp::model::CallToolResponse, rmcp::ErrorData> {
         use n0_future::FutureExt;
+        if self.client_name.get().is_none()
+            && let Some(info) = context.peer.peer_info()
+        {
+            let _ = self.client_name.set(info.client_info.name.clone());
+        }
         let tool = request.name.clone();
         match std::panic::AssertUnwindSafe(self.dispatch(request, context))
             .catch_unwind()

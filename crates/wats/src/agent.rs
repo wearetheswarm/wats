@@ -1018,6 +1018,7 @@ async fn start_run(
         events: trigger.events(),
         profile: config.profile.clone(),
         file_roots: Vec::new(),
+        via: crate::via::Via::of_run(&config.runtime, config.model.as_deref()),
     });
     let guard = TokenGuard {
         node: node.as_ref(),

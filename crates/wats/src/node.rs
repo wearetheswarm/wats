@@ -165,6 +165,9 @@ pub struct NodeConfig {
     pub review_ttl: Duration,
     /// A desktop notification when a draft is held (`agent.notify`).
     pub review_notify: bool,
+    /// Agent posts carry `data.via`, their declared provenance
+    /// (`node.declare_via`, ADR 0036).
+    pub declare_via: bool,
     /// How this node runs: a daemon (`wats`), a background node started by
     /// `wats mcp`, or inside one MCP process.
     pub role: NodeRole,
@@ -299,6 +302,7 @@ impl NodeConfig {
             review_profiles: Vec::new(),
             review_ttl: Duration::from_secs(24 * 3600),
             review_notify: false,
+            declare_via: true,
             role: NodeRole::Daemon,
             runners: Vec::new(),
             agents: Vec::new(),
@@ -432,6 +436,8 @@ pub struct RunnerRun {
     /// (`$CODEX_HOME/generated_images/<thread id>`), registered by the
     /// runner when the thread starts.
     pub file_roots: Vec<PathBuf>,
+    /// What the runner knows of what produces its posts (ADR 0036).
+    pub via: crate::via::Via,
 }
 
 /// What a node did about a guardian halt (ADR 0016 §3).
@@ -3333,6 +3339,7 @@ impl Node {
                     .unwrap_or_default()
                     .to_string(),
                 file_roots: Vec::new(),
+                via: crate::via::Via::of_run("openclaw", None),
             }
         })
     }

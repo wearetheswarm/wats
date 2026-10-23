@@ -112,6 +112,9 @@ pub struct NodeSettings {
     /// Its name in `wats ps` and for `-n NAME`, local only; unset: the one
     /// drawn at its first start ([`crate::naming`]).
     pub name: Option<String>,
+    /// Agent posts carry their declared provenance, `data.via` (ADR
+    /// 0036); unset: on.
+    pub declare_via: Option<bool>,
 }
 
 /// `[notify]`: what reaches the human at this machine.
@@ -692,6 +695,13 @@ pub const KEYS: &[Key] = &[
          (NAME/AGENT an agent); 1-32 chars of [a-z0-9_-]. Local only: never posted nor \
          announced. Unset: the adjective_creature name drawn at its first start, kept in \
          <data dir>/node-name",
+    ),
+    key(
+        "node.declare_via",
+        ValueType::Bool,
+        "true",
+        "agent posts say what produced them in data.via (runtime, model, effort, wats \
+         version), self-declared and unverified (ADR 0036); false removes it from every post",
     ),
     key(
         "storage.max",
