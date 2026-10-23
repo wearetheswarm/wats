@@ -74,6 +74,24 @@ class EmbedTest(unittest.TestCase):
         _, description = render.read_embed(two, now=0)
         self.assertIn("**Thread** (2):", description)
 
+    def test_files(self):
+        result = {"post": {"id": ID, "kind": "answer", "text": "PNG attached.", "ts": 0,
+                           "blobs": [{"name": "logo.png", "size": 245760,
+                                      "url": "https://evil.example/x.png", "hash": "h"}]}}
+        _, description = render.read_embed(result, now=0)
+        self.assertIn("📎 1 attached file, not shown: `logo.png` · 240 KB", description)
+        self.assertNotIn("evil.example", description)
+        self.assertEqual(render.files_line([]), "")
+        line = render.files_line([{"name": "a`b", "size": 1}] * 7)
+        self.assertIn("7 attached files", line)
+        self.assertIn("(+2)", line)
+        self.assertNotIn("a`b", line)
+        self.assertEqual(render.size(3 * 1024 * 1024), "3 MB")
+        self.assertEqual(render.size(1536), "1.5 KB")
+        posts = [{"id": ID, "kind": "answer", "title": "x", "ts": 0, "counts": {"blobs": 2}}]
+        _, description = render.search_embed("x", {"posts": posts}, now=0)
+        self.assertIn("📎 2", description)
+
 
 class RateLimitTest(unittest.TestCase):
     def test_window(self):

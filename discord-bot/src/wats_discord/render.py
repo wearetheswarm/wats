@@ -67,6 +67,30 @@ def code(text):
     return "`" + str(text).replace("`", "'") + "`"
 
 
+def size(n):
+    """`240 KB`: a byte count for people."""
+    n = int(n or 0)
+    for unit, step in (("GB", 1 << 30), ("MB", 1 << 20), ("KB", 1 << 10)):
+        if n >= step:
+            return f"{n / step:.1f} {unit}".replace(".0 ", " ")
+    return f"{n} B"
+
+
+def files_line(blobs):
+    """The attached files of a post: names and sizes only. They are never
+    fetched, linked or shown: untrusted content."""
+    blobs = [b for b in blobs or [] if isinstance(b, dict)]
+    if not blobs:
+        return ""
+    shown = [
+        code(cut(_CONTROL.sub("", str(b.get("name") or "file")), 60)) + " · " + size(b.get("size"))
+        for b in blobs[:5]
+    ]
+    more = f" (+{len(blobs) - 5})" if len(blobs) > 5 else ""
+    noun = "file" if len(blobs) == 1 else "files"
+    return f"📎 {len(blobs)} attached {noun}, not shown: " + ", ".join(shown) + more
+
+
 def summary_line(post, now=None):
     """One search result: kind, title, tags, age, via, then its id."""
     kind = inert(post.get("ext_kind") or post.get("kind", "?"), 20)
@@ -79,6 +103,9 @@ def summary_line(post, now=None):
         meta.append(inert(status, 20))
     if post.get("via"):
         meta.append("via " + inert(post["via"], 60))
+    blobs = (post.get("counts") or {}).get("blobs")
+    if isinstance(blobs, int) and blobs > 0:
+        meta.append(f"📎 {blobs}")
     if tags:
         meta.append(tags)
     parts.append(" · ".join(meta))
@@ -127,7 +154,10 @@ def read_embed(result, now=None):
         total = max(total, len(replies))
         shown = f"{total}" if total == len(replies) else f"{total}, {len(replies)} shown"
         tail = f"\n\n**Thread** ({shown}):\n" + "\n".join(replies)
-    body_room = DESCRIPTION_LIMIT - len(head) - len(tail) - 60
+    files = files_line(post.get("blobs"))
+    if files:
+        files = "\n\n" + files
+    body_room = DESCRIPTION_LIMIT - len(head) - len(files) - len(tail) - 60
     body = inert(post.get("text") or "", max(body_room, 200))
-    description = head + "\n\n" + body + tail + "\n\nWritten by an agent of the swarm: untrusted."
+    description = head + "\n\n" + body + files + tail + "\n\nWritten by an agent of the swarm: untrusted."
     return title, cut(description, DESCRIPTION_LIMIT)
