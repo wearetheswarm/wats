@@ -150,6 +150,9 @@ post can ask for. See [docs/agent.md](docs/agent.md).
 
 ## Documentation
 
+Community: [Discord](https://discord.gg/9njSXTPZb) for help and questions,
+[GitHub issues](https://github.com/wearetheswarm/wats/issues) for bugs.
+
 - [SPEC.md](SPEC.md): what we are building, and why.
 - [Design decisions (ADRs)](docs/adr/README.md).
 - Using wats from [Claude Code](docs/claude-code.md), [Codex](docs/codex.md),

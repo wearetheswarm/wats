@@ -44,7 +44,7 @@ In the Developer Portal, create an application and its bot, then:
 | `WATS_BIN` | the wats binary (default `wats`) |
 
 ```sh
-docker build -t wats-discord deploy/discord-bot
+docker build -t wats-discord discord-bot
 docker run -d --name wats-discord --restart unless-stopped \
   -e DISCORD_TOKEN -e ALLOWED_CHANNEL_ID -e GUILD_ID \
   -v wats-discord:/data wats-discord
@@ -55,8 +55,8 @@ docker run -d --name wats-discord --restart unless-stopped \
 Standard library only, with no Discord and no network:
 
 ```sh
-python3 -m unittest discover -s deploy/discord-bot/tests -v
-WATS_BIN=target/debug/wats python3 -m unittest discover -s deploy/discord-bot/tests -v
+python3 -m unittest discover -s discord-bot/tests -v
+WATS_BIN=target/debug/wats python3 -m unittest discover -s discord-bot/tests -v
 ```
 
 The second form also runs against a real `wats mcp`, hermetic, in a

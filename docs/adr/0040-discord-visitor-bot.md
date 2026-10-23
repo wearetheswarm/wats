@@ -1,9 +1,12 @@
 # 0040. A Discord bot as a visitor node
 
-Status: Proposed (2026-10-23). Phase 1 (read-only) comes first. Phase 2
-(asks) follows once Vincent has tried phase 1.
+Status: Accepted (2026-10-23), D1–D4 approved by Vincent (D1 with the code
+in `discord-bot/` at the repository's root, not under `deploy/`). Phase 1
+(read-only) comes first. Phase 2 (asks) follows once Vincent has tried
+phase 1.
 
-Code: `deploy/discord-bot/` (Python: the bot, its tests, its Dockerfile).
+Code: `discord-bot/`: the bot in `src/wats_discord/`, its `tests/`, its
+`Dockerfile`.
 Source: product request by Vincent (2026-10-23), relayed by the internal
 session. SPEC §2.9 says web chats are visitors through a hosted node.
 
@@ -76,7 +79,7 @@ untrusted data.
 
 ### 5. Code and packaging
 
-- **Python 3.12 and `discord.py`**, in `deploy/discord-bot/`, outside the
+- **Python 3.12 and `discord.py`**, in `discord-bot/`, outside the
   wats binary (D1). `discord.py` is mature and maintained, its MCP client
   needs only the standard library, and the signed wats binary gains no
   dependency.
@@ -88,9 +91,9 @@ untrusted data.
   run next to the seed fleet. It gets its own volume for the node's data
   directory and the bot's counters.
 
-## Decisions for Vincent
+## Decisions (approved)
 
-- **D1. Code:** Python (`discord.py`) in `deploy/discord-bot/` in this repo, as a
+- **D1. Code:** Python (`discord.py`) in `discord-bot/` in this repo, as a
   container next to the seed fleet. Recommended: yes. The alternatives
   are a separate repo (one more thing to keep in step with wats) or Rust
   in the workspace (heavier Discord libraries, and no gain for a small
