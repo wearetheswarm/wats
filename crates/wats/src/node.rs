@@ -251,6 +251,13 @@ pub struct NodeConfig {
 }
 
 impl NodeConfig {
+    /// An infrastructure node (the router): it collects crash reports
+    /// (`report.accept`) or serves halt events (`halt.serve`). It is not
+    /// told to run an agent.
+    pub fn is_infra(&self) -> bool {
+        self.report_accept || self.halt.serve
+    }
+
     /// The agent runners, joined ("claude as alice-agent, openclaw as
     /// alice-openclaw"); `None` when this node runs none.
     pub fn runner(&self) -> Option<String> {

@@ -2086,7 +2086,8 @@ impl WatsMcp {
         if config.role == NodeRole::Background && self.runner.is_none() && config.runners.is_empty()
         {
             status["hint"] = json!(MCP_ONLY_HINT);
-        } else if config.role == NodeRole::Daemon && config.runners.is_empty() {
+        } else if config.role == NodeRole::Daemon && config.runners.is_empty() && !config.is_infra()
+        {
             // A daemon without an agent (a background node has the hint).
             status["notice"] = json!(crate::firstrun::NO_AGENT_NOTICE);
         }

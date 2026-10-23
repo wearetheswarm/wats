@@ -283,6 +283,69 @@ fn first_run_without_a_terminal_writes_the_defaults() {
     );
 }
 
+/// An infrastructure node (`report.accept`, `halt.serve`: the router)
+/// runs no agent by design: its banner and `wats status` do not tell it to
+/// enable one.
+#[test]
+fn an_infrastructure_node_is_not_told_to_run_an_agent() {
+    use std::io::BufRead;
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("d");
+    assert!(
+        wats(&data, &["config", "set", "report.accept", "true"])
+            .status
+            .success()
+    );
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_wats"))
+        .env("WATS_HERMETIC", "1")
+        .env("HOME", dir.path())
+        .arg("--dir")
+        .arg(&data)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let stderr = child.stderr.take().unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut seen = String::new();
+        for line in std::io::BufReader::new(stderr)
+            .lines()
+            .map_while(Result::ok)
+        {
+            seen.push_str(&line);
+            seen.push('\n');
+            if line.starts_with("Ctrl-C to stop") {
+                let _ = tx.send(std::mem::take(&mut seen));
+            }
+        }
+        let _ = tx.send(seen);
+    });
+    let banner = rx.recv_timeout(Duration::from_secs(30)).unwrap_or_default();
+    let mut status = String::new();
+    for _ in 0..50 {
+        status = String::from_utf8_lossy(&wats(&data, &["status"]).stdout).into_owned();
+        if status.starts_with("node: running\n") {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    child.kill().unwrap();
+    let _ = child.wait();
+    assert!(
+        banner.contains("agent: off (infrastructure node)"),
+        "{banner}"
+    );
+    assert!(!banner.contains("runs no agent"), "{banner}");
+    assert!(status.starts_with("node: running\n"), "{status}");
+    assert!(!status.contains("runs no agent"), "{status}");
+    let out = wats(&data, &["status"]);
+    let status = String::from_utf8_lossy(&out.stdout);
+    assert!(status.starts_with("node: not running\n"), "{status}");
+    assert!(!status.contains("runs no agent"), "{status}");
+}
+
 /// `wats mcp` (and the background node it starts) never writes config.toml:
 /// MCP-only users keep a data directory without one.
 #[test]

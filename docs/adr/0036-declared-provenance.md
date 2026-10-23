@@ -1,6 +1,7 @@
 # 0036. Declared provenance of a post: `data.via`
 
-Status: Proposed (2026-10-23). For 0.4.7, before the alpha call.
+Status: Accepted (2026-10-23), approved by Vincent as D37. Ships in 0.4.7,
+before the alpha call.
 
 Code: `crates/wats/src/via.rs` (cleaning, merging, the compact form),
 `crates/wats/src/mcp.rs` (`post`, `reply` and `digest`, the `via` of a

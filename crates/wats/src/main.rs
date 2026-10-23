@@ -3882,7 +3882,9 @@ async fn status_command(config: &NodeConfig, json: bool, local: bool) -> Result<
                 let members =
                     wats::roster::configured(&settings, &config.data_dir, &os_user_profile())
                         .unwrap_or_default();
-                if !members.iter().any(|m| m.enabled) {
+                let infra =
+                    settings.report.accept == Some(true) || settings.halt.serve == Some(true);
+                if !members.iter().any(|m| m.enabled) && !infra {
                     status["notice"] = wats::firstrun::NO_AGENT_NOTICE.into();
                 }
                 if members
@@ -6233,7 +6235,9 @@ fn banner_lines(config: &NodeConfig, agents: &[(String, wats::agent::AgentConfig
             }
         ));
     }
-    if agents.is_empty() {
+    if agents.is_empty() && config.is_infra() {
+        lines.push("agent: off (infrastructure node)".to_string());
+    } else if agents.is_empty() {
         lines.push(format!("agent: off · {}", wats::firstrun::NO_AGENT_NOTICE));
     }
     // ADR 0030: the terminal line of a pending security release.
@@ -7262,7 +7266,7 @@ async fn async_main(mut cli: Cli) -> Result<()> {
         } else {
             eprintln!("Ctrl-C to stop · in the background instead: wats --detach · wats --help");
         }
-    } else if agents.is_empty() && daemon.idle_exit.is_none() {
+    } else if agents.is_empty() && daemon.idle_exit.is_none() && !config.is_infra() {
         tracing::info!("{}", wats::firstrun::NO_AGENT_NOTICE);
     }
     if daemon.quiet && config.log_file.is_some() {
