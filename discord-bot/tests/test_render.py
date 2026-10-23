@@ -69,10 +69,10 @@ class EmbedTest(unittest.TestCase):
         self.assertIn("confirmed", description)
         self.assertIn("via codex/gpt", description)
         self.assertIn("**Thread** (9, 5 shown)", description)
+        self.assertEqual(description.count("`" + "f" * 64 + "`"), render.THREAD_SHOWN)
         two = dict(result, thread=result["thread"][:3], thread_total=3)
         _, description = render.read_embed(two, now=0)
         self.assertIn("**Thread** (2):", description)
-        self.assertEqual(description.count("`" + "f" * 64 + "`"), render.THREAD_SHOWN)
 
 
 class RateLimitTest(unittest.TestCase):
