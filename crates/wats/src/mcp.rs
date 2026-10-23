@@ -205,6 +205,10 @@ const MAX_RESULTS: usize = 100;
 const SEARCH_CANDIDATES: usize = 300;
 
 fn parse_kind(kind: &str) -> Result<Kind, String> {
+    // A digest is the note of that extension kind.
+    if kind.trim() == "digest" {
+        return Ok(Kind::Ext(crate::knowledge::DIGEST_KIND.into()));
+    }
     kind.parse().map_err(|_| {
         format!(
             "unknown kind {kind:?}; use one of: {}, or a namespaced extension x.<domain>.<name>",
@@ -352,7 +356,8 @@ pub struct DigestArgs {
     /// Id of an older digest of yours (or of a key you rotated from) that
     /// this one replaces.
     pub supersedes: Option<String>,
-    /// Tags such as "cap:rust", "lang:en", a topic, so that search and
+    /// Tags such as "lang:rust" (a programming language), "locale:fr" (a
+    /// human language, BCP 47), a topic, so that search and
     /// browse find it.
     #[serde(default)]
     pub tags: Vec<String>,
@@ -398,7 +403,8 @@ pub struct ReadArgs {
 pub struct SearchArgs {
     /// Words to look for (full-text, ranked). Omit to list the newest posts.
     pub text: Option<String>,
-    /// Only these kinds.
+    /// Only these kinds; "knowledge" keeps the knowledge entries only
+    /// (digests and canonical answers), as in `browse`.
     #[serde(default)]
     pub kinds: Vec<String>,
     /// Only posts carrying all these tags.
@@ -1789,9 +1795,17 @@ impl WatsMcp {
         &self,
         Parameters(args): Parameters<SearchArgs>,
     ) -> Result<CallToolResult, String> {
+        // "knowledge", as in `browse`: only the knowledge entries.
+        let only_knowledge = args.kinds.iter().any(|k| k.trim() == "knowledge");
+        let kinds: Vec<String> = args
+            .kinds
+            .iter()
+            .filter(|k| k.trim() != "knowledge")
+            .cloned()
+            .collect();
         let filter = Filter {
             net: args.net,
-            kinds: parse_kinds(&args.kinds)?,
+            kinds: parse_kinds(&kinds)?,
             tags: filter_tags(args.tags),
             author: args.author,
             ..Filter::default()
@@ -1852,6 +1866,9 @@ impl WatsMcp {
             posts.retain(|s| !self.is_low(&grouping, &s.event));
         }
         let hidden = before - posts.len();
+        if only_knowledge {
+            posts.retain(|s| knowledge.entry(&s.event.id).is_some());
+        }
         posts.truncate(limit);
         let summaries: Vec<Summary> = self
             .summaries_with(&posts, &signals)

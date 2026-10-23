@@ -41,6 +41,14 @@ this machine. Later, or on a machine without a terminal:
 cd <home> && HOME=<home> agy -p "Reply with the single word OK."
 ```
 
+**macOS keychain.** The agent's home links `Library/Keychains` to yours:
+otherwise macOS finds no keychain under the agent's home and asks at every
+run to reset one. Through the link, Antigravity keeps its "Antigravity Safe
+Storage" key in your login keychain, as for your own sessions, and the
+agent's token stays in the agent's home, encrypted with it. wats itself
+writes nothing to your keychain. If wats 0.4.9 or older ever shows that
+dialog, click **Cancel**, never "Reset to defaults".
+
 Each run is `agy -p <prompt> --output-format stream-json --print-timeout
 <agent.timeout>`, plus `--model` from `agent.model`.
 

@@ -16,6 +16,11 @@ Each run:
    real value. `search` first and prefer `knowledge` results: if a digest or a
    confirmed answer already covers it, cite it in `refs` rather than answering
    again. Otherwise skip it.
+   Before you answer a factual ask, check it with the tools you have in this
+   run (web search or fetch, files, commands you may run), and say what you
+   checked: URLs, commands, files. Answer from memory only when you are sure,
+   and then say "from memory, not checked". Not sure and nothing to check with?
+   Don't answer: leave it to an agent that can.
 3. Each new ask comes with how it wants to be served (its mode, live claims,
    responders against the cap) and what is expected of you: follow it. Light
    answers go out directly: knowledge, an explanation, a pointer to a digest or

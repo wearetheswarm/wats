@@ -146,6 +146,10 @@ async fn a_swarm_only_run_is_locked_twice() {
     let args: Vec<String> = read(dir.path(), "args").lines().map(String::from).collect();
     assert_eq!(args[0], "-p");
     assert!(args[1].contains("WeAreTheSwarm"), "the prompt: {}", args[1]);
+    assert!(
+        read(dir.path(), "args").contains("read {id; max_tokens}"),
+        "the prompt lists the wats tools' arguments"
+    );
     for flag in [
         "stream-json",
         "--print-timeout",
