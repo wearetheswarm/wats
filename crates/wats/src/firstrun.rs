@@ -2017,15 +2017,15 @@ fn ask_and_write(
         api_key: asker.api_key,
     };
     let mut choices = prompt_after(input, out, &found, &settings, &QUESTIONS, revision, &ctx)?;
-    // Quick: notify.desktop stays as it is (unset: on with a desktop
-    // session), the security updates as recommended.
+    // Quick: notify.desktop stays as it is (unset: off since 0.4.11), the
+    // security updates as recommended.
     if desktop && DESKTOP_SINCE > revision && !choices.quick {
         let on = ask_yes_no(
             input,
             out,
             "Desktop notification when someone answers or clarifies one of your asks \
              (notify.desktop)",
-            settings.notify.desktop.unwrap_or(true),
+            settings.notify.desktop.unwrap_or(false),
         )?;
         choices.values.push(("notify.desktop", on.to_string()));
     }
@@ -2436,9 +2436,9 @@ mod tests {
         assert!(!config.contains("\nmodel = "), "{config}");
     }
 
-    /// On a desktop session, setup asks notify.desktop (default yes) and
-    /// writes the answer; elsewhere it does not ask. Quick keeps it as it
-    /// is (unset: on with a desktop session).
+    /// On a desktop session, setup asks notify.desktop (default no since
+    /// 0.4.11) and writes the answer; elsewhere it does not ask. Quick keeps
+    /// it as it is (unset: off).
     #[test]
     fn setup_asks_desktop_notifications_on_a_desktop() {
         let data = tempfile::tempdir().unwrap();
@@ -2451,16 +2451,14 @@ mod tests {
         let mut out = Vec::new();
         let choices = setup_with(data.path(), &mut "d\n".as_bytes(), &mut out, None, true).unwrap();
         let said = String::from_utf8(out).unwrap();
-        assert!(said.contains("(notify.desktop) [Y/n]"), "{said}");
-        assert!(choices.values.contains(&("notify.desktop", "true".into())));
-        let settings = Settings::load(data.path()).unwrap();
-        assert_eq!(settings.notify.desktop, Some(true));
-        // Asked again (no agent CLI: storage and networks first): "n"
-        // turns it off.
+        assert!(said.contains("(notify.desktop) [y/N]"), "{said}");
+        assert!(choices.values.contains(&("notify.desktop", "false".into())));
+        // Asked again (no agent CLI: storage and networks first): "y"
+        // turns it on.
         let mut out = Vec::new();
         setup_with(
             data.path(),
-            &mut "d\n\n\nn\n".as_bytes(),
+            &mut "d\n\n\ny\n".as_bytes(),
             &mut out,
             None,
             true,
@@ -2468,7 +2466,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             Settings::load(data.path()).unwrap().notify.desktop,
-            Some(false)
+            Some(true)
         );
         // Headless: not asked, not written.
         let other = tempfile::tempdir().unwrap();

@@ -76,6 +76,9 @@
   the evidence) at once, and it tells you in one line. It still asks you
   before a negative react, a contradiction, or anything that speaks for
   you beyond the ask.
+- **Desktop notifications are off by default** (`notify.desktop`, before:
+  on with a desktop session). A config that sets it keeps its value; the
+  wizard's question defaults to no.
 - **Every agent has a daily limit.**
   - `agent.max_minutes_per_day` defaults to 120 (before: no limit), for
     every runtime: the one measure they all report. An agent whose table

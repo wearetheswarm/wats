@@ -939,11 +939,9 @@ pub const KEYS: &[Key] = &[
     key(
         "notify.desktop",
         ValueType::Bool,
-        "auto",
+        "false",
         "a desktop notification (terminal-notifier or osascript, notify-send) when someone \
-         answers or clarifies \
-         one of your asks; auto: on with a desktop session (macOS, or DISPLAY or \
-         WAYLAND_DISPLAY set; not over SSH), off on servers and in containers",
+         answers or clarifies one of your asks (off by default since 0.4.11)",
     ),
     key(
         "labels.subscribe",
