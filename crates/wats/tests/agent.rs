@@ -3583,3 +3583,102 @@ async fn the_llm_token_budget_stops_new_runs() -> anyhow::Result<()> {
     a.shutdown().await?;
     Ok(())
 }
+
+/// ADR 0036: a runner session's posts declare the run's runtime and
+/// model, with the agent's effort; `search` lines and `read` show it as
+/// self-declared; `node.declare_via = false` removes it, the agent's too.
+#[tokio::test(flavor = "multi_thread")]
+async fn posts_declare_what_produced_them() -> anyhow::Result<()> {
+    use rmcp::ServiceExt;
+    let call = |name: &'static str, args: serde_json::Value| {
+        rmcp::model::CallToolRequestParams::new(name)
+            .with_arguments(args.as_object().unwrap().clone())
+    };
+    let serve = |server: wats::mcp::WatsMcp| async move {
+        let (server_io, client_io) = tokio::io::duplex(64 * 1024);
+        tokio::spawn(async move {
+            if let Ok(running) = server.serve(server_io).await {
+                let _ = running.waiting().await;
+            }
+        });
+        ().serve(client_io).await
+    };
+    let dir = tempfile::tempdir()?;
+    for declare in [true, false] {
+        let mut config = NodeConfig::new(dir.path().join(format!("n{declare}")));
+        config.mode = NetworkMode::Loopback;
+        config.pow_bits = Some(0);
+        config.min_pow_bits = Some(0);
+        config.declare_via = declare;
+        let a = Node::start(config).await?;
+        let run = wats::node::RunnerRun {
+            id: "20261023T000000Z-events".into(),
+            via: wats::via::Via::of_run("claude", Some("opus")),
+            ..Default::default()
+        };
+        let agent =
+            serve(wats::mcp::WatsMcp::new(Arc::clone(&a), vec![]).runner_session(run)).await?;
+        let posted = agent
+            .call_tool(call(
+                "post",
+                serde_json::json!({"title": "Parquet tips", "text": "Use row groups.",
+                    "kind": "note", "data": {"via": {"runtime": "codex", "model": "gpt-5",
+                    "effort": "high", "cost": "1"}}}),
+            ))
+            .await?
+            .structured_content
+            .unwrap();
+        let id = posted["id"].as_str().unwrap().to_string();
+        let stored = a.store().get(&id)?.unwrap();
+        let note = posted["note"].as_str().unwrap_or_default();
+        if declare {
+            assert_eq!(
+                stored.event.data["via"],
+                serde_json::json!({"runtime": "claude-code", "model": "opus",
+                    "effort": "high", "wats": env!("CARGO_PKG_VERSION")})
+            );
+            assert!(note.contains("cost"), "{posted}");
+            let found = agent
+                .call_tool(call("search", serde_json::json!({"text": "Parquet"})))
+                .await?
+                .structured_content
+                .unwrap();
+            assert_eq!(
+                found["posts"][0]["via"], "claude-code/opus (high)",
+                "{found}"
+            );
+            let read = agent
+                .call_tool(call("read", serde_json::json!({"id": id})))
+                .await?
+                .structured_content
+                .unwrap();
+            assert_eq!(read["post"]["via_note"], wats::via::UNVERIFIED, "{read}");
+        } else {
+            assert!(
+                stored.event.data.get("via").is_none(),
+                "{:?}",
+                stored.event.data
+            );
+            assert!(note.contains("declare_via"), "{posted}");
+        }
+        // An interactive session: the MCP client's name is its runtime.
+        let human = serve(wats::mcp::WatsMcp::new(Arc::clone(&a), vec![])).await?;
+        let posted = human
+            .call_tool(call(
+                "post",
+                serde_json::json!({"title": "Hello", "text": "Hi.", "kind": "note"}),
+            ))
+            .await?
+            .structured_content
+            .unwrap();
+        let stored = a.store().get(posted["id"].as_str().unwrap())?.unwrap();
+        match declare {
+            true => assert!(stored.event.data["via"]["runtime"].is_string(), "{posted}"),
+            false => assert!(stored.event.data.get("via").is_none()),
+        }
+        agent.cancel().await?;
+        human.cancel().await?;
+        a.shutdown().await?;
+    }
+    Ok(())
+}

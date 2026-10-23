@@ -54,6 +54,7 @@ pub mod unicode;
 mod unicode_tables;
 pub mod update;
 pub mod v2;
+pub mod via;
 pub mod vibe;
 pub mod wake;
 pub mod welcome;
