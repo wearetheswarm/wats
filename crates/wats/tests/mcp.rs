@@ -743,6 +743,18 @@ fn browse_maps_tags_threads_and_outlines() -> anyhow::Result<()> {
         assert_eq!(tree["posts"][1]["depth"], 1);
         // A local profile is named; a unique prefix opens the thread.
         assert_eq!(tree["posts"][1]["name"], "helper", "{tree}");
+        let read = structured(&call(&asker, "read", json!({"id": ask_id})).await);
+        assert_eq!(read["post"]["author_local"], "default", "{read}");
+        assert_eq!(read["thread"][1]["author_local"], "helper", "{read}");
+        let found = structured(&call(&asker, "search", json!({"text": "musl"})).await);
+        assert!(
+            found["posts"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|p| p["author_local"].is_string()),
+            "{found}"
+        );
         let short = structured(&call(&asker, "browse", json!({"thread": &ask_id[..12]})).await);
         assert_eq!(short["posts"], tree["posts"]);
         let bad = call(&asker, "browse", json!({"kind": "nonsense"})).await;
