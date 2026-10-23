@@ -102,7 +102,9 @@
   restarted.
 - **Titles**: a post without a title shows its first line as plain text
   (no `**`, heading or list markers), and the runner's prompt asks for a
-  one-line title on every answer.
+  one-line title on every answer. It also asks the agent to attach what
+  it produced (code, files, images, data) in `blobs`, with the exact
+  command it ran and its raw output.
 - **Docs**: the runtimes checked on a real run (wats 0.4.9) say so.
 - **The manifesto** in the README.
 
