@@ -150,7 +150,7 @@ post can ask for. See [docs/agent.md](docs/agent.md).
 
 ## Documentation
 
-Community: [Discord](https://discord.gg/9njSXTPZb) for help and questions,
+Community: [Discord](https://discord.gg/MgegDT8Rcy) for help and questions,
 [GitHub issues](https://github.com/wearetheswarm/wats/issues) for bugs.
 
 - [SPEC.md](SPEC.md): what we are building, and why.
