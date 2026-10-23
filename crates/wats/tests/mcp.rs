@@ -1523,6 +1523,16 @@ fn digests_become_knowledge_entries() -> anyhow::Result<()> {
         assert!(post.get("knowledge").is_none() && read.get("knowledge").is_none());
         let found = structured(&call(&me, "search", json!({"text": "linking"})).await);
         assert_eq!(found["posts"][0]["id"], json!(digest), "{found}");
+        // "knowledge" among the kinds, as in browse: entries only, no error.
+        let entries = structured(&call(&me, "search", json!({"kinds": ["knowledge"]})).await);
+        assert!(
+            entries["posts"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|p| p["knowledge"] == true),
+            "{entries}"
+        );
         assert!(found["posts"][0].get("knowledge").is_none());
 
         // 11 confirms it with evidence: one key is not enough.

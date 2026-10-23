@@ -60,6 +60,10 @@
   config's `model`. At `swarm-only` and `workspace`, Codex skips your
   config.toml (`--ignore-user-config`), so its model there is Codex's own
   default unless `agent.model` sets one, and stays unnamed.
+  Mistral Vibe at `inherit` names its `active_model`, and Copilot CLI
+  `COPILOT_MODEL` or (at `inherit`) its `config.json` `model`.
+- The MCP `search` takes `"knowledge"` among its `kinds`, as `browse` does:
+  only the knowledge entries (a Vibe agent tried it and got an error).
 - `wats setup copilot|antigravity --mcp` no longer suggests `--agents-md`,
   which writes Claude Code's and Codex's instructions only. The detailed
   wizard no longer asks for turns per run for Copilot CLI and Antigravity

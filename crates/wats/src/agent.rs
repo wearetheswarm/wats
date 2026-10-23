@@ -1143,6 +1143,12 @@ fn run_model(config: &AgentConfig) -> crate::run_model::Resolved {
         workdir: &config.workdir,
         codex_home: access::codex_home(),
         opencode_global: crate::run_model::opencode_global_dir(),
+        vibe_home: vibe::home(std::env::var_os("VIBE_HOME"), std::env::home_dir()),
+        copilot_home: std::env::var_os("COPILOT_HOME")
+            .filter(|h| !h.is_empty())
+            .map(std::path::PathBuf::from)
+            .or_else(|| std::env::home_dir().map(|h| h.join(".copilot"))),
+        copilot_model_env: std::env::var("COPILOT_MODEL").ok(),
     })
 }
 

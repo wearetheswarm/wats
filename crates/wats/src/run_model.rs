@@ -16,6 +16,10 @@
 //!      `workspace`), else of the agent's own OpenCode directory (at
 //!      `swarm-only` and `workspace`), else of the user's global config
 //!      (at `inherit`).
+//!    - Mistral Vibe, at `inherit`: `active_model` of its `config.toml`
+//!      (at `swarm-only` its own home sets none: Vibe's default).
+//!    - Copilot CLI: `COPILOT_MODEL`, else at `inherit` `model` of its
+//!      `config.json`.
 
 use std::path::{Path, PathBuf};
 
@@ -44,6 +48,12 @@ pub struct Run<'a> {
     pub codex_home: Option<PathBuf>,
     /// The user's OpenCode global config directory (`~/.config/opencode`).
     pub opencode_global: Option<PathBuf>,
+    /// The user's Vibe home (`$VIBE_HOME`, or `~/.vibe`).
+    pub vibe_home: Option<PathBuf>,
+    /// The user's Copilot home (`$COPILOT_HOME`, or `~/.copilot`).
+    pub copilot_home: Option<PathBuf>,
+    /// `COPILOT_MODEL`, which Copilot runs keep.
+    pub copilot_model_env: Option<String>,
 }
 
 /// A value the extra arguments give to `long` or `short` (`--model X`,
@@ -149,6 +159,28 @@ pub fn resolve(r: &Run) -> Resolved {
                     }),
             };
         }
+        // At swarm-only, Vibe's own home holds no model: its default.
+        "vibe" if out.model.is_none() && r.access == Access::Inherit => {
+            out.model = r
+                .vibe_home
+                .as_deref()
+                .and_then(|h| std::fs::read_to_string(h.join("config.toml")).ok())
+                .and_then(|t| toml::from_str::<toml::Table>(&t).ok())
+                .and_then(|t| non_empty(t.get("active_model")?.as_str().map(str::to_string)));
+        }
+        "copilot" if out.model.is_none() => {
+            out.model = non_empty(r.copilot_model_env.clone()).or_else(|| {
+                (r.access == Access::Inherit)
+                    .then(|| {
+                        let text =
+                            std::fs::read_to_string(r.copilot_home.as_ref()?.join("config.json"))
+                                .ok()?;
+                        let config: Value = serde_json::from_str(&text).ok()?;
+                        non_empty(config["model"].as_str().map(str::to_string))
+                    })
+                    .flatten()
+            });
+        }
         _ => {}
     }
     out
@@ -173,7 +205,39 @@ mod tests {
             workdir: dir,
             codex_home: Some(dir.join("codex")),
             opencode_global: Some(dir.join("global")),
+            vibe_home: Some(dir.join("vibe")),
+            copilot_home: Some(dir.join("copilot")),
+            copilot_model_env: None,
         }
+    }
+
+    #[test]
+    fn vibe_and_copilot_read_the_user_config_at_inherit() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("vibe")).unwrap();
+        std::fs::write(
+            dir.path().join("vibe/config.toml"),
+            "active_model = \"devstral-2\"\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(dir.path().join("copilot")).unwrap();
+        std::fs::write(
+            dir.path().join("copilot/config.json"),
+            r#"{"model": "gpt-6"}"#,
+        )
+        .unwrap();
+        let none: Vec<String> = Vec::new();
+        let model = |runtime, access| resolve(&run(runtime, access, dir.path(), &none)).model;
+        assert_eq!(
+            model("vibe", Access::Inherit).as_deref(),
+            Some("devstral-2")
+        );
+        assert_eq!(model("vibe", Access::SwarmOnly), None);
+        assert_eq!(model("copilot", Access::Inherit).as_deref(), Some("gpt-6"));
+        assert_eq!(model("copilot", Access::SwarmOnly), None);
+        let mut env = run("copilot", Access::SwarmOnly, dir.path(), &none);
+        env.copilot_model_env = Some("claude-sonnet-5".into());
+        assert_eq!(resolve(&env).model.as_deref(), Some("claude-sonnet-5"));
     }
 
     #[test]
@@ -254,7 +318,14 @@ mod tests {
     fn nothing_is_guessed() {
         let dir = tempfile::tempdir().unwrap();
         let none: Vec<String> = Vec::new();
-        for runtime in ["codex", "opencode", "claude"] {
+        for runtime in [
+            "codex",
+            "opencode",
+            "claude",
+            "vibe",
+            "copilot",
+            "antigravity",
+        ] {
             assert_eq!(
                 resolve(&run(runtime, Access::Workspace, dir.path(), &none)),
                 Resolved::default(),

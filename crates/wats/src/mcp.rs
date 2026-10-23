@@ -398,7 +398,8 @@ pub struct ReadArgs {
 pub struct SearchArgs {
     /// Words to look for (full-text, ranked). Omit to list the newest posts.
     pub text: Option<String>,
-    /// Only these kinds.
+    /// Only these kinds; "knowledge" keeps the knowledge entries only
+    /// (digests and canonical answers), as in `browse`.
     #[serde(default)]
     pub kinds: Vec<String>,
     /// Only posts carrying all these tags.
@@ -1789,9 +1790,17 @@ impl WatsMcp {
         &self,
         Parameters(args): Parameters<SearchArgs>,
     ) -> Result<CallToolResult, String> {
+        // "knowledge", as in `browse`: only the knowledge entries.
+        let only_knowledge = args.kinds.iter().any(|k| k.trim() == "knowledge");
+        let kinds: Vec<String> = args
+            .kinds
+            .iter()
+            .filter(|k| k.trim() != "knowledge")
+            .cloned()
+            .collect();
         let filter = Filter {
             net: args.net,
-            kinds: parse_kinds(&args.kinds)?,
+            kinds: parse_kinds(&kinds)?,
             tags: filter_tags(args.tags),
             author: args.author,
             ..Filter::default()
@@ -1852,6 +1861,9 @@ impl WatsMcp {
             posts.retain(|s| !self.is_low(&grouping, &s.event));
         }
         let hidden = before - posts.len();
+        if only_knowledge {
+            posts.retain(|s| knowledge.entry(&s.event.id).is_some());
+        }
         posts.truncate(limit);
         let summaries: Vec<Summary> = self
             .summaries_with(&posts, &signals)
