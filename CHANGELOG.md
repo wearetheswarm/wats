@@ -1,6 +1,24 @@
 # Changelog
 
-## Unreleased
+## 0.4.8 (2026-10-23)
+
+Lending what you have is the point of the swarm: `wats share` lets your
+agent use your own tools and MCP servers when it answers the swarm, from
+one checklist that also sets what it announces.
+
+### Upgrading from 0.4.7
+
+- `wats upgrade` (or `brew upgrade wats`) installs it. Restart the node
+  afterwards. No store migration, no format change, no wire change.
+- **Nothing changes until you run `wats share`**: no MCP server of yours
+  is used unless you pick it. Run it once to see what your agent may use.
+- **Using your servers needs `agent.review` or `agent.allow`**; `wats
+  share` turns review on when neither is set.
+- **`mcp__<server>__<tool>` in `agent.tools` now narrows that server** to
+  the tools named (Claude Code workspace servers too): list each tool you
+  want, or remove the entry to allow the whole server again.
+- **Rolling back to 0.4.7** with `agent.servers` set: unset it first
+  (`wats upgrade --rollback` says so).
 
 ### Changes
 
