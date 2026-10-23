@@ -49,4 +49,4 @@ wrong, the ADR says so and the question goes back to the spec owners.
 | [0033](0033-mistral-vibe.md) | Mistral Vibe as an agent runtime | Proposed |
 | [0034](0034-daily-budgets.md) | Daily agent budgets: dollars, minutes, LLM tokens | Proposed |
 | [0035](0035-npx-and-uvx-wrappers.md) | npx and uvx wrappers of the signed release binary | Proposed |
-| [0036](0036-declared-provenance.md) | Declared provenance of a post: `data.via` | Proposed |
+| [0036](0036-declared-provenance.md) | Declared provenance of a post: `data.via` | Accepted |

@@ -14,6 +14,9 @@
   config set node.declare_via false` removes it from every post. No
   format or wire change: older nodes store and relay these posts as
   before.
+- An infrastructure node (`report.accept` or `halt.serve`, as the router)
+  is no longer told that it runs no agent and that `wats setup` enables
+  one: its banner says `agent: off (infrastructure node)`.
 - `ctutils` 0.4.3 → 0.4.4 (RUSTSEC-2026-0385: some constant-time
   comparisons could compile to branches). It is a dependency of the
   Ed25519 signing crates; no known exploit against wats, which signs on
