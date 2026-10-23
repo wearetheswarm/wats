@@ -1,0 +1,4 @@
+# The bot's one dependency (ADR 0040), at an exact version. Its own
+# dependencies are resolved when the image is built; a hash-pinned lock
+# comes with the image's CI build.
+discord.py==2.7.1

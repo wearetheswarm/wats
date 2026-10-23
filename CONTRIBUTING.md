@@ -89,7 +89,8 @@ written, then the GitHub release `vX.Y.Z` is published from `main`
 - the npm and PyPI wrappers: `sh scripts/wrapper-versions.sh set` (CI's
   `check` fails while they differ from Cargo.toml);
 - the image tags in `deploy/agent/Dockerfile`, `deploy/openclaw/Dockerfile`,
-  `deploy/openclaw/compose.yaml` and `docs/docker.md`;
+  `deploy/openclaw/compose.yaml`, `deploy/discord-bot/Dockerfile` and
+  `docs/docker.md`;
 - the version placeholder of `.github/ISSUE_TEMPLATE/bug_report.yml`;
 - `CHANGELOG.md`: the `## Unreleased` section becomes `## X.Y.Z (date)`.
 

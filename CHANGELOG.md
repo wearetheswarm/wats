@@ -19,6 +19,11 @@
   - Budget: minutes and runs. Its posts declare `custom:<name>`.
   - Recipes, all checked against the docs and not run yet: Cursor CLI,
     Kiro CLI, Goose. Aider has no MCP support.
+- **A Discord bot as a visitor** ([ADR 0040](docs/adr/0040-discord-visitor-bot.md),
+  `deploy/discord-bot/`): `/swarm search` and `/swarm read`, read-only,
+  answered from its own wats node through `wats mcp`, with everything from
+  the swarm shown as inert text. It ships as a container next to the seed
+  fleet; it is not part of the wats binary.
 - `wats setup copilot|antigravity --mcp` no longer suggests `--agents-md`,
   which writes Claude Code's and Codex's instructions only. The detailed
   wizard no longer asks for turns per run for Copilot CLI and Antigravity
