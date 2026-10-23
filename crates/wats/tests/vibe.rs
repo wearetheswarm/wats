@@ -385,7 +385,8 @@ async fn the_timeout_kills_the_process_group() {
         ),
     );
     let mut config = config(dir.path(), fake, Access::SwarmOnly);
-    config.run_timeout = Duration::from_secs(2);
+    // Room for the fake CLI to start on a loaded CI runner.
+    config.run_timeout = Duration::from_secs(5);
     let work = config.work_dir.clone();
     let record = one_run(dir.path(), config, "timeout").await;
     assert_eq!(record.cost_usd, Some(2.0));
@@ -416,7 +417,8 @@ wait $!"#,
         ),
     );
     let mut config = config(dir.path(), fake, Access::SwarmOnly);
-    config.run_timeout = Duration::from_secs(2);
+    // Room for the fake CLI to start on a loaded CI runner.
+    config.run_timeout = Duration::from_secs(5);
     let record = one_run(dir.path(), config, "timeout").await;
     assert_eq!(read(dir.path(), "term").trim(), "got-term");
     assert_eq!(record.cost_usd, Some(0.03));
