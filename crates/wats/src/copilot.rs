@@ -2,8 +2,10 @@
 //!
 //! Each run spawns, from the run directory:
 //!
-//!     copilot -p <prompt> --output-format json --no-ask-user
-//!             --no-auto-update --allow-all-tools [level flags] [extra args]
+//! ```text
+//! copilot -p <prompt> --output-format json --no-ask-user
+//!         --no-auto-update --allow-all-tools [level flags] [extra args]
+//! ```
 //!
 //! - **swarm-only** (the default): `COPILOT_HOME` is the agent's own, its
 //!   `mcp-config.json` holds the wats server only; `--disable-builtin-mcps`,

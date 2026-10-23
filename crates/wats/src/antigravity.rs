@@ -3,8 +3,10 @@
 //! Each run spawns, from the run directory, with `HOME` set to the agent's
 //! own home (`<data dir>/agent/<name>/home`):
 //!
-//!     agy -p <prompt> --output-format stream-json --print-timeout <n>s
-//!         [--model <m>] [extra args]
+//! ```text
+//! agy -p <prompt> --output-format stream-json --print-timeout <n>s
+//!     [--model <m>] [extra args]
+//! ```
 //!
 //! That home holds the agent's Antigravity state: its login (the OAuth
 //! token, in the keychain or `.gemini/antigravity-cli/`), and three files
