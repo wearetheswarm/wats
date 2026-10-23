@@ -7,7 +7,7 @@ with the pinned release key, caches the binary, and execs `wats mcp`.
 
 #: The wats release this package runs: always the wats version
 #: (scripts/wrapper-versions.sh keeps it equal to Cargo.toml's).
-__version__ = "0.4.6"
+__version__ = "0.4.7"
 
 #: The distribution name (pyproject.toml's `name`; a placeholder until the
 #: name is reserved on PyPI). A test keeps the two equal.

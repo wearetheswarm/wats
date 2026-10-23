@@ -31,7 +31,7 @@ body:
     attributes:
       label: wats version
       description: The output of `wats --version`.
-      placeholder: wats 0.4.6
+      placeholder: wats 0.4.7
     validations:
       required: true
   - type: dropdown
