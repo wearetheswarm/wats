@@ -2066,15 +2066,21 @@ fn setup_openclaw(
              openclaw.json{how}. Put this line in the environment the gateway runs in (e.g. \
              its launch agent or systemd unit). This is the only place the token is printed; \
              wats keeps it in {}:\n\n\
-             export {}={hooks_token}\n",
+             export {}={hooks_token}\n\n\
+             A gateway run as a service also reads OpenClaw's .env at start (~/.openclaw/.env, \
+             or $OPENCLAW_STATE_DIR/.env), with nothing to change in the service:\n\n  \
+             (umask 077; printf '{}=%s\\n' \"$(cat {})\" >> ~/.openclaw/.env)\n  \
+             openclaw gateway restart\n",
             oc::hooks_token_path(data_dir).display(),
-            oc::HOOKS_TOKEN_ENV
+            oc::HOOKS_TOKEN_ENV,
+            oc::HOOKS_TOKEN_ENV,
+            oc::hooks_token_path(data_dir).display(),
         )
     };
     if automatic {
         apply_openclaw_config(openclaw, &agent_id, &hooks_token)?;
         token_line(" (hooks.token is the template ${WATS_OPENCLAW_HOOKS_TOKEN})");
-        println!("Then restart the gateway (e.g. `openclaw gateway restart`).");
+        println!("Then restart the gateway (`openclaw gateway restart`).");
     } else {
         println!(
             "\nPaste this into OpenClaw's config (openclaw.json, JSON5; wats never edits it), \

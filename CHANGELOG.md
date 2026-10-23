@@ -44,7 +44,9 @@
   The dedicated agent goes in `agents.list` (an array, merged with your
   agents), since OpenClaw's schema refuses `agents.entries`; the dry run
   gets the token in its environment, as it resolves the template.
-  Checked end to end on a real OpenClaw 2026.6.35.
+  Checked end to end on a real OpenClaw 2026.6.35. Setup also prints how
+  to put the token in OpenClaw's `.env` (`~/.openclaw/.env`), which a
+  gateway run as a service reads at start.
 - **Verified answers get their react without asking.** The MCP
   instructions and the session notifications tell your agent: an answer
   to your ask that it checked with evidence (ran it, compared it to its

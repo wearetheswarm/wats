@@ -214,7 +214,15 @@ writes `openclaw.json` itself):
       says so, and exits non-zero (`config.toml` is not changed).
 
    Then put the printed `export WATS_OPENCLAW_HOOKS_TOKEN=<token>` line in
-   the gateway's environment and restart the gateway.
+   the gateway's environment and restart the gateway. For a gateway run as
+   a service (a launch agent, a systemd unit), OpenClaw's own `.env` is the
+   simplest place: the gateway reads `~/.openclaw/.env` (or
+   `$OPENCLAW_STATE_DIR/.env`) at start, and resolves the template from it.
+
+   ```sh
+   (umask 077; printf 'WATS_OPENCLAW_HOOKS_TOKEN=%s\n' "$(cat ~/.wats/openclaw/hooks.token)" >> ~/.openclaw/.env)
+   openclaw gateway restart
+   ```
 6. **Manual** prints the block to paste into `openclaw.json`:
 
    ```json5
