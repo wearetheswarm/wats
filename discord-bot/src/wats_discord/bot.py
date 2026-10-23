@@ -44,9 +44,12 @@ def wats_argv():
 
 class SwarmBot(discord.Client):
     def __init__(self):
-        # Slash commands only: no message content, no members.
+        # Slash commands only: the (non-privileged) guilds intent that
+        # discord.py's state needs, no message content, no members.
+        intents = discord.Intents.none()
+        intents.guilds = True
         super().__init__(
-            intents=discord.Intents.none(),
+            intents=intents,
             allowed_mentions=discord.AllowedMentions.none(),
         )
         self.tree = app_commands.CommandTree(self)
