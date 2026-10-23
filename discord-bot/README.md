@@ -58,12 +58,23 @@ In the Developer Portal, create an application and its bot, then:
 | `WATS_PROFILE` | its profile (default `discord`) |
 | `WATS_BIN` | the wats binary (default `wats`) |
 
+The image is `ghcr.io/wearetheswarm/wats-discord`:
+- `:main` is what deployments pull. `.github/workflows/discord-bot.yml`
+  rebuilds it when the bot changes on main and after each wats release,
+  with the latest released wats binary inside;
+- `:sha-<short>` is one commit's build, kept to roll back to.
+
+[`compose.yaml`](compose.yaml) is a sketch for the router VM's compose:
+- `pull_policy: always`;
+- a read-only root filesystem, no capability, no new privileges;
+- the node's data in a volume.
+
 ```sh
-docker build -t wats-discord discord-bot
-docker run -d --name wats-discord --restart unless-stopped \
-  -e DISCORD_TOKEN -e ALLOWED_CHANNEL_ID -e GUILD_ID \
-  -v wats-discord:/data wats-discord
+sops exec-env discord_bot_secrets.enc 'docker compose up -d'
+sops exec-env discord_bot_secrets.enc 'docker compose pull && docker compose up -d'   # update
 ```
+
+To build it yourself: `docker build -t wats-discord discord-bot`.
 
 ## A local run, from a `.env`
 

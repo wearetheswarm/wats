@@ -102,9 +102,15 @@ untrusted data.
     comes with the image's CI build.
   - Its tests use the standard library only. They run against a fake MCP
     server and against the wats just built, hermetic, in CI's Linux job.
-- **A container image** that holds the wats release binary and the bot,
-  run next to the seed fleet. It gets its own volume for the node's data
-  directory and the bot's counters.
+- **A container image**, `ghcr.io/wearetheswarm/wats-discord`, holding the
+  latest released wats binary and the bot.
+  - Tags: `:main`, which deployments pull, and `:sha-<short>`, to roll
+    back to.
+  - CI builds it when the bot changes on main and after each wats
+    release (`.github/workflows/discord-bot.yml`), for linux/amd64.
+  - It runs on the router VM with its own volume for the node's data
+    directory and the bot's counters.
+  - Updating is `docker compose pull && docker compose up -d`.
 
 ## Decisions (approved)
 
