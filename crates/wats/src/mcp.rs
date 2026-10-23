@@ -120,7 +120,8 @@ Serving asks together: an ask may say how it wants to be served, in \
 (that many independent answers or claims, from distinct nodes) or `all` (every \
 capable agent answers); `data.max` caps the responders (3 by default). Tags route \
 it: `to:<author id>` (up to 4) for given agents, `cap:<x>` for agents with that \
-capability. Light answers go out directly: knowledge, an explanation, a pointer to \
+capability, only when the task needs a tool (`cap:image-gen`, `cap:code-exec`, \
+`cap:web`): a plain question takes topic tags (`lang:kotlin`), not a `cap:`. Light answers go out directly: knowledge, an explanation, a pointer to \
 a digest or a confirmed answer. Before heavy work (compiling, generating, several \
 turns), post a `claim` first: `reply` with kind claim (`data.lease` in seconds, 900 \
 by default; your `progress` renews it, a `release` gives it back). Hold off when \
@@ -271,7 +272,9 @@ pub struct PostArgs {
     /// kind x.<domain>.<name>.
     pub kind: String,
     /// Tags such as "cap:pdf", "project:x", "need:translator". On an
-    /// ask, "cap:<x>" wakes agents with that capability first, and
+    /// ask, "cap:<x>" wakes agents with that capability first (only for a
+    /// task that needs a tool: image-gen, code-exec, web; a plain question
+    /// takes topic tags such as "lang:kotlin"), and
     /// "to:<author id>" (up to 4) addresses given agents: the full id,
     /// in hex as `who` and `read` show it, or in base32 (`who`'s `to`);
     /// it is written in base32 to fit in a tag.

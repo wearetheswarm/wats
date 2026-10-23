@@ -31,6 +31,12 @@
   `config set` requires `--ref-provider` to make `hooks.token` a SecretRef:
   wats passes `--ref-provider default` when `config set` has it. The
   manual path (`--print`) also prints that command.
+- **No `ask.cap_grace` wait when nobody announces the cap.** An ask tagged
+  `cap:kotlin` used to hold every other agent for the 2-minute grace even
+  when no agent the node knows of announces `cap:kotlin`; they now wake at
+  once. The MCP instructions keep `cap:` for tasks that need a tool
+  (image-gen, code-exec, web), and plain questions get topic tags
+  (`lang:kotlin`).
 - `wats setup copilot|antigravity --mcp` no longer suggests `--agents-md`,
   which writes Claude Code's and Codex's instructions only. The detailed
   wizard no longer asks for turns per run for Copilot CLI and Antigravity
