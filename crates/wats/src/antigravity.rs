@@ -75,8 +75,12 @@ pub struct Lock {
     pub workspace: bool,
     /// `agent.tools` lists `shell` (run under `--sandbox`).
     pub shell: bool,
-    /// `agent.tools` lists `web`.
-    pub web: bool,
+    /// `agent.tools` lists `web-search` (or `web`, both).
+    pub web_search: bool,
+    /// `agent.tools` lists `web-fetch` (or `web`, both).
+    pub web_fetch: bool,
+    /// `agent.tools` lists `image`: `generate_image`.
+    pub image: bool,
     /// The lent MCP servers.
     pub servers: Vec<String>,
 }
@@ -92,7 +96,9 @@ impl Lock {
         Lock {
             workspace: true,
             shell: lists("shell"),
-            web: lists("web"),
+            web_search: lists("web") || lists("web-search"),
+            web_fetch: lists("web") || lists("web-fetch"),
+            image: lists("image"),
             servers: servers.to_vec(),
         }
     }
@@ -103,7 +109,9 @@ impl Lock {
         for (on, flag) in [
             (self.workspace, "--workspace"),
             (self.shell, "--shell"),
-            (self.web, "--web"),
+            (self.web_search, "--web-search"),
+            (self.web_fetch, "--web-fetch"),
+            (self.image, "--image"),
         ] {
             if on {
                 out.push(flag.to_string());
@@ -190,7 +198,7 @@ pub fn permissions(lock: &Lock) -> Value {
     if !lock.shell {
         deny.push("command(*)");
     }
-    if !lock.web {
+    if !lock.web_fetch {
         deny.extend(["read_url(*)", "execute_url(*)"]);
     }
     json!({"allow": allow, "deny": deny})
@@ -410,7 +418,9 @@ pub fn decide(payload: &Value, lock: &Lock) -> Value {
         server == SERVER || (lock.workspace && lock.servers.contains(&server))
     }) || (lock.workspace && is_file_tool(&name))
         || (lock.shell && is_shell_tool(&name))
-        || (lock.web && is_web_tool(&name));
+        || (lock.web_search && is_search_tool(&name))
+        || (lock.web_fetch && is_fetch_tool(&name))
+        || (lock.image && name == "generate_image");
     if allowed {
         json!({"decision": "allow"})
     } else {
@@ -468,9 +478,14 @@ fn is_shell_tool(name: &str) -> bool {
     !name.contains("browser") && (name.contains("command") || name.contains("terminal"))
 }
 
-/// Web tools (`search_web`, `read_url_content`), not the browser.
-fn is_web_tool(name: &str) -> bool {
-    !name.contains("browser") && (name.contains("web") || name.contains("url"))
+/// Web search tools (`search_web`), not the browser.
+fn is_search_tool(name: &str) -> bool {
+    !name.contains("browser") && name.contains("web") && !name.contains("url")
+}
+
+/// URL fetch tools (`read_url_content`), not the browser.
+fn is_fetch_tool(name: &str) -> bool {
+    !name.contains("browser") && name.contains("url")
 }
 
 /// The LLM tokens of a `result` event's usage.
@@ -506,11 +521,19 @@ mod tests {
             Lock::default()
         );
         let lock = Lock::of(Access::Workspace, &s(&["web"]), &s(&["crm"]));
-        assert!(lock.workspace && lock.web && !lock.shell);
+        assert!(lock.workspace && lock.web_search && lock.web_fetch && !lock.shell);
         assert_eq!(
             lock.gate_args(),
-            s(&["--workspace", "--web", "--server", "crm"])
+            s(&[
+                "--workspace",
+                "--web-search",
+                "--web-fetch",
+                "--server",
+                "crm"
+            ])
         );
+        let split = Lock::of(Access::Workspace, &s(&["web-search", "image"]), &[]);
+        assert!(split.web_search && !split.web_fetch && split.image);
     }
 
     #[test]

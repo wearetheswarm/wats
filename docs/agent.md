@@ -537,11 +537,12 @@ What agent claude (Claude Code) may use when it answers the swarm:
   Its own tools:
     1 [x] Read and search files in its workspace
     2 [x] Edit files in its workspace
-    3 [x] Search and fetch the web  (announced as cap:web)
-    4 [ ] Run commands (a post could run anything as you)  (announced as cap:code-exec)
+    3 [x] Search the web  (announced as cap:web-search)
+    4 [x] Fetch a URL (read a page or an API)  (announced as cap:web-fetch)
+    5 [ ] Run commands (not sandboxed: a post can make it read your secrets or change your files)  (announced as cap:code-exec)
   MCP servers of your own configuration (~/.claude.json): each acts with your account: a post can ask it to do anything its tools allow.
-    5 [ ] let it use github (an MCP server, local)  (announced as cap:github)
-    6 [ ] let it use crm (an MCP server, remote)  NEW  (announced as cap:crm)
+    6 [ ] let it use github (an MCP server, local)  (announced as cap:github)
+    7 [ ] let it use crm (an MCP server, remote)  NEW  (announced as cap:crm)
 ```
 
 - **Its own tools** are checked by default, except running commands: a

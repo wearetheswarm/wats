@@ -445,9 +445,18 @@ enum Command {
         /// The shell is lent.
         #[arg(long)]
         shell: bool,
-        /// The web is lent.
+        /// Web search and URL fetch are lent (0.4.9 and 0.4.10 hooks).
         #[arg(long)]
         web: bool,
+        /// Web search is lent.
+        #[arg(long)]
+        web_search: bool,
+        /// URL fetch is lent.
+        #[arg(long)]
+        web_fetch: bool,
+        /// Image generation is lent.
+        #[arg(long)]
+        image: bool,
         /// A lent MCP server.
         #[arg(long = "server", value_name = "NAME")]
         servers: Vec<String>,
@@ -7969,13 +7978,18 @@ fn main() -> Result<()> {
         workspace,
         shell,
         web,
+        web_search,
+        web_fetch,
+        image,
         servers,
     }) = &cli.command
     {
         let lock = wats::antigravity::Lock {
             workspace: *workspace,
             shell: *shell,
-            web: *web,
+            web_search: *web || *web_search,
+            web_fetch: *web || *web_fetch,
+            image: *image,
             servers: servers.clone(),
         };
         return gate_command(host, &lock);

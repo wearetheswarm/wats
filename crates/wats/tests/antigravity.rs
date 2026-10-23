@@ -197,7 +197,10 @@ async fn a_workspace_run_has_its_files_and_what_is_lent() {
         .as_str()
         .unwrap()
         .to_string();
-    assert_eq!(gate, "/opt/wats gate antigravity --workspace --web");
+    assert_eq!(
+        gate,
+        "/opt/wats gate antigravity --workspace --web-search --web-fetch"
+    );
     let cwd = PathBuf::from(read(dir.path(), "cwd").trim_end());
     assert!(cwd.ends_with("workspace"), "{}", cwd.display());
 }

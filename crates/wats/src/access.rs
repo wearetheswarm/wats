@@ -777,10 +777,45 @@ pub fn prompt_line(runtime: &str, access: Access, workdir: &Path, tools: &[Strin
         ),
         Access::Inherit => "The tools of your runtime's own configuration.".to_string(),
     };
+    let mut line = line;
+    if access == Access::Workspace && runtime != "openclaw" {
+        let (search, fetch) = web_abilities(runtime, tools);
+        let yes = |b: bool| if b { "yes" } else { "no" };
+        line.push_str(&format!(
+            " You can search the web: {}. You can fetch a URL (read a page or an API): {}.",
+            yes(search),
+            yes(fetch)
+        ));
+        if runtime == "antigravity" && fetch {
+            line.push_str(
+                " To read a page or an API URL, use read_url_content; search_web returns \
+                 snippets only.",
+            );
+        }
+    }
     if codex_generates_images(runtime, access, tools) {
         format!("{line} {IMAGES_LINE}")
     } else {
         line
+    }
+}
+
+/// Whether a `workspace` run can search the web, and fetch a URL, with
+/// `agent.tools`: each runtime's own tools for it.
+pub fn web_abilities(runtime: &str, tools: &[String]) -> (bool, bool) {
+    let has = |names: &[&str]| {
+        tools.iter().any(|t| {
+            let base = t.split('(').next().unwrap_or(t).trim();
+            names.iter().any(|n| base.eq_ignore_ascii_case(n))
+        })
+    };
+    match runtime {
+        "claude" => (has(&["WebSearch"]), has(&["WebFetch"])),
+        "codex" => (has(&["web_search", "standalone_web_search"]), false),
+        "opencode" => (has(&["websearch"]), has(&["webfetch"])),
+        "copilot" => (false, has(&["url"])),
+        "antigravity" => (has(&["web", "web-search"]), has(&["web", "web-fetch"])),
+        _ => (false, false),
     }
 }
 
@@ -942,11 +977,27 @@ const CAP_NEEDS: &[CapNeed] = &[
         mcp: None,
     },
     CapNeed {
-        caps: &["web", "web-search"],
+        caps: &["web"],
         what: "web",
         claude: &["WebFetch", "WebSearch"],
         codex: &["web_search", "standalone_web_search"],
         opencode: &["webfetch", "websearch"],
+        mcp: None,
+    },
+    CapNeed {
+        caps: &["web-search"],
+        what: "web search",
+        claude: &["WebSearch"],
+        codex: &["web_search", "standalone_web_search"],
+        opencode: &["websearch"],
+        mcp: None,
+    },
+    CapNeed {
+        caps: &["web-fetch"],
+        what: "URL fetch",
+        claude: &["WebFetch"],
+        codex: &[],
+        opencode: &["webfetch"],
         mcp: None,
     },
 ];
@@ -1177,10 +1228,22 @@ mod tests {
         assert!(swarm_only.ends_with(cannot), "{swarm_only}");
         assert!(prompt_line("openclaw", Access::SwarmOnly, dir, &[]).ends_with(cannot));
         let read_only = prompt_line("claude", Access::Workspace, dir, &["Read".into()]);
+        let no_web = "You can search the web: no. You can fetch a URL (read a page or an API): no.";
         assert_eq!(
             read_only,
-            format!("The wats tools plus Read in /w, nothing outside it. No shell: {cannot}")
+            format!(
+                "The wats tools plus Read in /w, nothing outside it. No shell: {cannot} {no_web}"
+            )
         );
+        let web = prompt_line("claude", Access::Workspace, dir, &["WebSearch".into()]);
+        assert!(
+            web.ends_with(
+                "You can search the web: yes. You can fetch a URL (read a page or an API): no."
+            ),
+            "{web}"
+        );
+        let agy = prompt_line("antigravity", Access::Workspace, dir, &["web-fetch".into()]);
+        assert!(agy.contains("use read_url_content"), "{agy}");
         let shell = prompt_line(
             "claude",
             Access::Workspace,
@@ -1189,9 +1252,9 @@ mod tests {
         );
         assert_eq!(
             shell,
-            "The wats tools plus Read, Bash(cargo:*) in /w, nothing outside it."
+            format!("The wats tools plus Read, Bash(cargo:*) in /w, nothing outside it. {no_web}")
         );
-        assert!(prompt_line("claude", Access::Workspace, dir, &[]).ends_with(cannot));
+        assert!(prompt_line("claude", Access::Workspace, dir, &[]).contains(cannot));
         assert_eq!(
             prompt_line("claude", Access::Inherit, dir, &[]),
             "The tools of your runtime's own configuration."

@@ -46,7 +46,10 @@ pub struct Native {
     pub default: bool,
 }
 
-const RUN_LABEL: &str = "Run commands (a post could run anything as you)";
+const RUN_LABEL: &str =
+    "Run commands (not sandboxed: a post can make it read your secrets or change your files)";
+
+const FETCH_LABEL: &str = "Fetch a URL (read a page or an API)";
 
 const CLAUDE_NATIVES: &[Native] = &[
     Native {
@@ -62,9 +65,15 @@ const CLAUDE_NATIVES: &[Native] = &[
         default: true,
     },
     Native {
-        label: "Search and fetch the web",
-        tools: &["WebSearch", "WebFetch"],
-        caps: &["web"],
+        label: "Search the web",
+        tools: &["WebSearch"],
+        caps: &["web-search"],
+        default: true,
+    },
+    Native {
+        label: FETCH_LABEL,
+        tools: &["WebFetch"],
+        caps: &["web-fetch"],
         default: true,
     },
     Native {
@@ -85,11 +94,11 @@ const CODEX_NATIVES: &[Native] = &[
     Native {
         label: "Search the web",
         tools: &["standalone_web_search"],
-        caps: &["web"],
+        caps: &["web-search"],
         default: true,
     },
     Native {
-        label: "Run commands, read-only sandbox (it reads files through them)",
+        label: "Run commands, read-only sandbox (it can still read your files and secrets)",
         tools: &["shell_tool"],
         caps: &["code-exec"],
         default: false,
@@ -110,9 +119,15 @@ const OPENCODE_NATIVES: &[Native] = &[
         default: true,
     },
     Native {
-        label: "Search and fetch the web",
-        tools: &["websearch", "webfetch"],
-        caps: &["web"],
+        label: "Search the web",
+        tools: &["websearch"],
+        caps: &["web-search"],
+        default: true,
+    },
+    Native {
+        label: FETCH_LABEL,
+        tools: &["webfetch"],
+        caps: &["web-fetch"],
         default: true,
     },
     Native {
@@ -125,9 +140,9 @@ const OPENCODE_NATIVES: &[Native] = &[
 
 const COPILOT_NATIVES: &[Native] = &[
     Native {
-        label: "Fetch the web",
+        label: FETCH_LABEL,
         tools: &["url"],
-        caps: &["web"],
+        caps: &["web-fetch"],
         default: true,
     },
     Native {
@@ -140,13 +155,25 @@ const COPILOT_NATIVES: &[Native] = &[
 
 const ANTIGRAVITY_NATIVES: &[Native] = &[
     Native {
-        label: "Search and fetch the web",
-        tools: &["web"],
-        caps: &["web"],
+        label: "Generate images",
+        tools: &["image"],
+        caps: &["image-gen"],
         default: true,
     },
     Native {
-        label: "Run commands, in its terminal sandbox (macOS)",
+        label: "Search the web",
+        tools: &["web-search"],
+        caps: &["web-search"],
+        default: true,
+    },
+    Native {
+        label: FETCH_LABEL,
+        tools: &["web-fetch"],
+        caps: &["web-fetch"],
+        default: true,
+    },
+    Native {
+        label: "Run commands, in its terminal sandbox (macOS: nothing outside its workspace)",
         tools: &["shell"],
         caps: &["code-exec"],
         default: false,
@@ -656,10 +683,13 @@ pub struct Lending {
 
 /// Whether a native is on in `tools`: all its tools listed.
 pub fn native_on(native: &Native, tools: &[String]) -> bool {
-    native
-        .tools
-        .iter()
-        .all(|t| tools.iter().any(|x| x.trim() == *t))
+    // Antigravity's `web` (0.4.9 and 0.4.10) lends both search and fetch.
+    native.tools.iter().all(|t| {
+        tools.iter().any(|x| {
+            let x = x.trim();
+            x == *t || (x == "web" && matches!(*t, "web-search" | "web-fetch"))
+        })
+    })
 }
 
 /// The cap a lent server proposes (ADR 0037 D3): its name, lowercase.
@@ -678,10 +708,13 @@ pub fn choose(
     chosen_servers: &[String],
 ) -> Lending {
     let natives = natives(runtime);
-    let managed_tools: Vec<&str> = natives
+    let mut managed_tools: Vec<&str> = natives
         .iter()
         .flat_map(|n| n.tools.iter().copied())
         .collect();
+    if runtime == "antigravity" {
+        managed_tools.push("web");
+    }
     let mut tools: Vec<String> = current
         .tools
         .iter()
@@ -698,6 +731,19 @@ pub fn choose(
         } else {
             caps_off.extend(caps);
         }
+    }
+    // `cap:web` stays an alias of either web ability (asks tagged before
+    // the split, ADR 0037).
+    if caps_on
+        .iter()
+        .any(|c| c == "web-search" || c == "web-fetch")
+    {
+        caps_on.push("web".to_string());
+    } else if caps_off
+        .iter()
+        .any(|c| c == "web-search" || c == "web-fetch")
+    {
+        caps_off.push("web".to_string());
     }
     for name in offered_servers {
         if chosen_servers.contains(name) {
@@ -896,7 +942,7 @@ mod tests {
         let next = choose(
             &current,
             "claude",
-            &[0, 2],
+            &[0, 2, 3],
             &s(&["crm", "old", "mail"]),
             &s(&["crm"]),
         );
@@ -913,9 +959,24 @@ mod tests {
             ])
         );
         assert_eq!(next.lend, s(&["crm"]));
-        assert_eq!(next.caps, s(&["pdf", "web", "crm"]));
+        assert_eq!(
+            next.caps,
+            s(&["pdf", "web-search", "web-fetch", "web", "crm"])
+        );
         assert!(native_on(&CLAUDE_NATIVES[0], &next.tools));
-        assert!(!native_on(&CLAUDE_NATIVES[3], &next.tools));
+        assert!(!native_on(&CLAUDE_NATIVES[4], &next.tools));
+        // Antigravity's old `web` reads as both web items, and goes.
+        let old = Lending {
+            tools: s(&["web"]),
+            ..Lending::default()
+        };
+        let natives = natives("antigravity");
+        let web: Vec<usize> = (0..natives.len())
+            .filter(|i| native_on(&natives[*i], &old.tools))
+            .collect();
+        assert_eq!(web.len(), 2);
+        let next = choose(&old, "antigravity", &web, &[], &[]);
+        assert_eq!(next.tools, s(&["web-search", "web-fetch"]));
     }
 
     #[test]
