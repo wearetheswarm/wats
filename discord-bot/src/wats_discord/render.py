@@ -87,7 +87,7 @@ def files_line(blobs, post_id=""):
     if len(blobs) == 1:
         return (
             f"📎 1 attached file: {name(blobs[0])} · {size(blobs[0].get('size'))}\n"
-            f"To get it (images only, checked, to you only): "
+            f"To get it (images and text only, checked, to you only): "
             f"/swarm file id:{code(post_id)}"
         )
     lines = [
@@ -97,7 +97,7 @@ def files_line(blobs, post_id=""):
         lines.append(f"(+{len(blobs) - 9} more)")
     return (
         f"📎 {len(blobs)} attached files:\n" + "\n".join(lines) + "\n"
-        f"To get one (images only, checked, to you only): "
+        f"To get one (images and text only, checked, to you only): "
         f"/swarm file id:{code(post_id)} number:<its number>"
     )
 

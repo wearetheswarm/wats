@@ -36,6 +36,28 @@ class FilesTest(unittest.TestCase):
                 f.write(b"MZ" + b"\0" * 30)
             with self.assertRaises(files.Refused):
                 files.check(exe, "logo.png")
+            code = os.path.join(d, "code")
+            with open(code, "w", encoding="utf-8") as f:
+                f.write("fn main() {\n    println!(\"héllo\");\n}\n")
+            self.assertEqual(files.check(code, "main.rs"), ("main.rs", "text/plain"))
+            self.assertEqual(files.check(code, "page.html"), ("page.txt", "text/plain"))
+            self.assertEqual(files.check(code, "noext"), ("noext.txt", "text/plain"))
+            zipped = os.path.join(d, "zip")
+            with open(zipped, "wb") as f:
+                f.write(b"PK\x03\x04" + bytes(range(256)) * 4)
+            with self.assertRaises(files.Refused) as refused:
+                files.check(zipped, "src.zip")
+            self.assertIn("fetch_blobs", str(refused.exception))
+            latin = os.path.join(d, "latin")
+            with open(latin, "wb") as f:
+                f.write("caf\xe9".encode("latin-1") * 10)
+            with self.assertRaises(files.Refused):
+                files.check(latin, "notes.txt")
+            long_text = os.path.join(d, "long")
+            with open(long_text, "w") as f:
+                f.write("x" * (files.MAX_TEXT_BYTES + 1))
+            with self.assertRaises(files.Refused):
+                files.check(long_text, "big.txt")
             big = os.path.join(d, "c")
             with open(big, "wb") as f:
                 f.write(PNG)

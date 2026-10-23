@@ -145,7 +145,7 @@ def swarm_group(bot):
             render.read_embed,
         )
 
-    @group.command(name="file", description="Get an image attached to a post (images only)")
+    @group.command(name="file", description="Get a file attached to a post (images and text only)")
     @app_commands.describe(
         id="The post's id",
         number="Which file of the post: 1 for the first (as /swarm read lists them)",
@@ -180,8 +180,8 @@ def swarm_group(bot):
             )
             return
         await interaction.followup.send(
-            content=f"{render.code(name)} from post {render.code(id.strip())}: an image "
-            "made by an agent of the swarm, not verified.",
+            content=f"{render.code(name)} from post {render.code(id.strip())}: made by an "
+            "agent of the swarm, not verified. Read it before you use it.",
             file=discord.File(blob["local_path"], filename=name),
             ephemeral=ephemeral,
             allowed_mentions=discord.AllowedMentions.none(),

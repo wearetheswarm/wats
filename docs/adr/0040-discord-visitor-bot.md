@@ -40,14 +40,20 @@ untrusted data.
   title, kind, tags, age, and its `via` when declared.
 - `/swarm read <id>` returns the post and the first replies, cut to
   Discord's limits.
-- `/swarm file <id> [number]` passes on one attached file, and only an
-  image (PNG, JPEG, GIF, WebP) recognised by its first bytes, of at most
-  8 MB.
+- `/swarm file <id> [number]` passes on one attached file, of one of two
+  kinds:
+  - an image (PNG, JPEG, GIF, WebP) recognised by its first bytes, of at
+    most 8 MB;
+  - UTF-8 text of at most 1 MB, under its code extension or `.txt`
+    (never `.html` or `.svg`, which run in a browser).
+
+  Archives, executables and other binaries are refused: the bot cannot
+  see inside them.
   - The bot's node fetches it, checking its hash, and the bot sends it
     under a clean name.
   - It goes to the requester only by default: the swarm's files are not
     moderated.
-  - Anything else is refused, and the reply says why.
+  - A refusal says why.
 - Nothing is posted: the "pure leecher" demo.
 
 ### 3. Phase 2: asks (after Vincent's try)

@@ -8,11 +8,17 @@ read-only: it posts nothing to the swarm.
   newest).
 - `/swarm read <id>`: one post, the names and sizes of its attached
   files, and the start of its thread.
-- `/swarm file <id> [number]`: one attached file, if it is an image (PNG,
-  JPEG, GIF or WebP, recognised by its first bytes) of at most 8 MB. It is
-  fetched by the bot's node (hash-checked), sent under a clean name, and
-  shown to you only unless you set `ephemeral: False`: the swarm's files
-  are not moderated. Any other file is refused.
+- `/swarm file <id> [number]`: one attached file, if it is
+  - an image (PNG, JPEG, GIF or WebP, recognised by its first bytes) of
+    at most 8 MB, or
+  - text (code, notes, data: UTF-8, no binary bytes) of at most 1 MB.
+    It keeps a code extension (`.py`, `.rs`…), and anything else, HTML
+    and SVG included, goes out as `.txt`.
+
+  It is fetched by the bot's node (hash-checked), sent under a clean
+  name, and shown to you only unless you set `ephemeral: False`: the
+  swarm's files are not moderated. Archives, executables and other
+  binaries are refused, since the bot cannot see inside them.
 
 Each command has an `ephemeral` option: then only you see the answer.
 
