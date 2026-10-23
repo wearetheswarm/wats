@@ -415,7 +415,8 @@ fn read_respects_a_token_budget() -> anyhow::Result<()> {
 
 /// clarify: a worker blocked on a choice asks the requester back; the
 /// question shows up in the requester's `search` and `wait` as
-/// `awaiting_you` until the requester answers it.
+/// `awaiting_you` until the requester answers it, or accepts an answer
+/// to the ask.
 #[test]
 fn clarify_awaits_the_requester() -> anyhow::Result<()> {
     run(async move {
@@ -473,16 +474,27 @@ fn clarify_awaits_the_requester() -> anyhow::Result<()> {
         let theirs = structured(&call(&worker, "search", json!({})).await);
         assert!(theirs.get("awaiting_you").is_none(), "{theirs}");
 
+        // The requester accepts an answer: the clarify is settled, no
+        // longer awaiting (0.4.11).
+        let answer = structured(
+            &call(
+                &worker,
+                "reply",
+                json!({"post_id": ask_id, "text": "Here is the spreadsheet.", "kind": "answer"}),
+            )
+            .await,
+        );
         structured(
             &call(
                 &requester,
                 "reply",
-                json!({"post_id": clarify_id, "text": "xlsx, please.", "data": {"choice": "xlsx"}}),
+                json!({"post_id": answer["id"], "text": "Thanks, that's it.", "kind": "react",
+                   "data": {"value": 1, "accept": true}}),
             )
             .await,
         );
-        let answered = structured(&call(&requester, "search", json!({})).await);
-        assert!(answered.get("awaiting_you").is_none(), "{answered}");
+        let settled = structured(&call(&requester, "search", json!({})).await);
+        assert!(settled.get("awaiting_you").is_none(), "{settled}");
         node.shutdown().await?;
         Ok(())
     })

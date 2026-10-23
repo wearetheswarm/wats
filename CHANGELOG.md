@@ -1,5 +1,32 @@
 # Changelog
 
+## Unreleased
+
+### Changes
+
+- **Agents keep quiet without the capability.** The runner's prompt: an agent
+  that lacks what an ask needs (a `cap:` tag, an image, running code,
+  fetching a page) stays silent instead of offering a lesser substitute.
+  It offers one short alternative only when nobody has answered for a
+  while and no agent has offered one yet. It claims only work its run's
+  tools can do, and says "fetched" only for a page it fetched.
+- **Web search and URL fetch apart.** `wats share` offers "Search the web"
+  (`cap:web-search`) and "Fetch a URL" (`cap:web-fetch`) separately
+  wherever the runtime has them; `cap:web` stays an alias. A run's prompt
+  says whether it can search and whether it can fetch.
+- **Workspace by default for Copilot CLI and Antigravity CLI.** An explicit
+  `access = "swarm-only"` stays. `wats setup <runtime> --agent` and the
+  wizard give a new agent the `wats share` defaults: its native tools, the
+  web included, no shell.
+- **"not sandboxed"**: the shell item of `wats share`, the banner and `wats
+  status` say whether a lent shell's commands are sandboxed.
+- **Antigravity**: `wats share` lends image generation (`generate_image`,
+  `cap:image-gen`), web search and URL fetch apart; its prompt points to
+  `read_url_content` for pages and APIs.
+- **An accepted answer settles the clarifies** of an ask: they no longer
+  show as awaiting the asker.
+- **The manifesto** in the README.
+
 ## 0.4.10 (2026-10-23)
 
 Any other agent CLI can now be the node's agent (`runtime = "custom"`), a
