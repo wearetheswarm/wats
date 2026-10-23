@@ -78,9 +78,14 @@ prompt or the banner. A lent definition goes only to the run:
   runner token, is written `0600` in the data directory (itself `0700`),
   rewritten at each run: the same protection as `~/.claude.json`.
 - **Codex:** environment values go into the child's environment and are
-  forwarded by name (`env_vars`); a bearer token by
-  `bearer_token_env_var`. A secret is never a command-line argument,
-  which other local users can list.
+  forwarded by name (`env_vars`); headers by `env_http_headers`. Codex
+  takes the other fields only as `-c` overrides on its command line, which
+  other local users can list. A per-run `CODEX_HOME` would also need
+  moving `auth.json`, which wats never touches. So a server whose `args`,
+  `command` or `url` look like they hold a secret (a query or user part in
+  the URL, a token or key in an argument, a credential prefix) is not lent
+  to Codex. `wats share` and the run say why, and the fix is to move it
+  to the server's `env`.
 - **OpenCode:** in `OPENCODE_CONFIG_CONTENT`, the child's environment.
 
 A server that logs in by OAuth through the runtime keeps its login in the

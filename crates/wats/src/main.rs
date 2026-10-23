@@ -3511,8 +3511,13 @@ fn share_command(node: &NodeArgs, data_dir: &std::path::Path, args: &ShareArgs) 
                 let what = available
                     .get(name)
                     .map_or("gone from your configuration", share::transport);
+                let refused = runtime == "codex"
+                    && available
+                        .get(name)
+                        .and_then(share::codex_secret_on_argv)
+                        .is_some();
                 println!(
-                    "  {:>3} [{}] let it use {name} (an MCP server, {what}){}  (announced as cap:{})",
+                    "  {:>3} [{}] let it use {name} (an MCP server, {what}){}  (announced as cap:{}){}",
                     i + 1,
                     if checked[i] { "x" } else { " " },
                     if !first && !seen.contains(name) && available.contains_key(name) {
@@ -3520,7 +3525,12 @@ fn share_command(node: &NodeArgs, data_dir: &std::path::Path, args: &ShareArgs) 
                     } else {
                         ""
                     },
-                    share::server_cap(name)
+                    share::server_cap(name),
+                    if refused {
+                        "\n        not used with Codex: a secret would be on its command line (move it to the server's env)"
+                    } else {
+                        ""
+                    }
                 );
             }
         }
@@ -3583,7 +3593,7 @@ fn share_command(node: &NodeArgs, data_dir: &std::path::Path, args: &ShareArgs) 
         // Lending needs review or allow (ADR 0037 D2): review by default.
         file.set(&member_key(&member, "review"), "true")?;
         println!(
-            "review: on, its posts wait for you (`wats review`), since it uses your MCP \
+            "review: on, its posts wait for you (`wats agent pending`), since it uses your MCP \
              servers. {}",
             share::GUARDRAILS
         );
