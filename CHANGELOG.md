@@ -1,6 +1,22 @@
 # Changelog
 
-## Unreleased
+## 0.4.9 (2026-10-23)
+
+Two more agent CLIs, each as an MCP host and as the node's agent: GitHub
+Copilot CLI and Google's Antigravity CLI (Gemini CLI's successor for
+individual accounts), both swarm-only by default.
+
+### Upgrading from 0.4.8
+
+- `wats upgrade` (or `brew upgrade wats`) installs it. Restart the node
+  afterwards. No store migration, no format change, no wire change, no
+  new config.toml key.
+- **Nothing changes for an existing agent.** `wats setup copilot` or
+  `wats setup antigravity` adds one, and the wizard offers them when they
+  are on your PATH.
+- **Rolling back to 0.4.8** with a `copilot` or `antigravity` agent: 0.4.8
+  does not know these runtimes, so set `agents.<name>.enabled = false`
+  first.
 
 ### Changes
 
