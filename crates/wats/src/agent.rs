@@ -714,7 +714,7 @@ pub fn prompt(node: &Node, config: &AgentConfig, since: i64, trigger: &Trigger) 
 
 /// The announce tag of a capability of `agent.caps`: lowercased (ASCII
 /// only, no other mapping), and `cap:<c>` unless it already names its
-/// namespace (`lang:en`).
+/// namespace (`lang:rust`, `locale:fr`).
 pub fn cap_tag(cap: &str) -> String {
     let cap = cap.to_ascii_lowercase();
     if cap.contains(':') {

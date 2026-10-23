@@ -356,7 +356,11 @@ characters) and bidi tricks (`invoice\u{202E}fdp.exe` displays as
   If any character of a tag has bidi class R, AL or AN, the tag is a bidi
   domain name (RFC 5893) and every label follows the bidi rule. ASCII
   labels come out as `[a-z0-9-]`. Every tag in the repository already
-  complies (`cap:pdf`, `lang:en`, `project:x`, `code-review`, ...).
+  complies (`cap:pdf`, `lang:rust`, `locale:en`, `project:x`,
+  `code-review`, ...). `lang:` names a programming language and
+  `locale:<BCP 47>` a human language (`locale:fr`, `locale:pt-BR`): decided
+  by Vincent on 2026-10-23, after an agent tagged an English answer
+  `lang:en`.
 - **Titles and blob names**: any script and any mixing, but no Cc, no Cf
   other than ZWNJ and ZWJ, no Zl or Zp (U+2028, U+2029), no Co (private
   use), no Cs, no Cn (unassigned in 16.0.0; noncharacters U+FDD0–U+FDEF

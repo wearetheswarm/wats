@@ -352,7 +352,8 @@ pub struct DigestArgs {
     /// Id of an older digest of yours (or of a key you rotated from) that
     /// this one replaces.
     pub supersedes: Option<String>,
-    /// Tags such as "cap:rust", "lang:en", a topic, so that search and
+    /// Tags such as "lang:rust" (a programming language), "locale:fr" (a
+    /// human language, BCP 47), a topic, so that search and
     /// browse find it.
     #[serde(default)]
     pub tags: Vec<String>,
