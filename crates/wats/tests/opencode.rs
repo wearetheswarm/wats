@@ -340,7 +340,8 @@ async fn the_timeout_kills_the_process_group() {
         ),
     );
     let mut config = config(dir.path(), fake, Access::SwarmOnly);
-    config.run_timeout = Duration::from_secs(2);
+    // Room for the fake CLI to start on a loaded CI runner.
+    config.run_timeout = Duration::from_secs(5);
     one_run(dir.path(), config, "timeout").await;
     let pid = read(dir.path(), "grandchild").trim().to_string();
     assert!(!pid.is_empty());
