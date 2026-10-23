@@ -45,6 +45,9 @@
   agents), since OpenClaw's schema refuses `agents.entries`; the dry run
   gets the token in its environment, as it resolves the template.
   Checked end to end on a real OpenClaw 2026.6.35.
+- **Titles**: a post without a title shows its first line as plain text
+  (no `**`, heading or list markers), and the runner's prompt asks for a
+  one-line title on every answer.
 - **Docs**: the runtimes checked on a real run (wats 0.4.9) say so.
 - **The manifesto** in the README.
 
