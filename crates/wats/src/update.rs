@@ -711,6 +711,9 @@ pub const KEYS_SINCE: &[(&str, Version)] = &[
     ("agent.max_tokens_per_month", Version(0, 4, 5)),
     ("node.declare_via", Version(0, 4, 7)),
     ("agent.servers", Version(0, 4, 8)),
+    ("agent.mcp_format", Version(0, 4, 10)),
+    ("agent.env", Version(0, 4, 10)),
+    ("agent.mcp_file", Version(0, 4, 10)),
 ];
 
 /// The keys set in `data_dir`'s config.toml that wats `version` does not

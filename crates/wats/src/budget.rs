@@ -205,7 +205,7 @@ pub fn confirm(work_dir: &Path) -> std::io::Result<()> {
 /// `ENFORCE_USD_BUDGET` is on. Codex and OpenClaw report none.
 pub fn reports_cost(runtime: &str) -> bool {
     match runtime {
-        "codex" | "openclaw" | "copilot" | "antigravity" => false,
+        "codex" | "openclaw" | "copilot" | "antigravity" | "custom" => false,
         "opencode" => crate::opencode::ENFORCE_USD_BUDGET,
         "vibe" => crate::vibe::ENFORCE_USD_BUDGET,
         _ => true,
@@ -224,7 +224,7 @@ pub fn estimates_cost(runtime: &str) -> bool {
 /// before it) and Codex (the `usage` of each
 /// `turn.completed`). OpenClaw's gateway returns none.
 pub fn reports_tokens(runtime: &str) -> bool {
-    !matches!(runtime, "openclaw" | "copilot")
+    !matches!(runtime, "openclaw" | "copilot" | "custom")
 }
 
 /// What a run used, for the ledger.
@@ -790,6 +790,7 @@ fn runtime_name(runtime: &str) -> &str {
         "vibe" => "Mistral Vibe",
         "copilot" => "GitHub Copilot CLI",
         "antigravity" => "Antigravity CLI",
+        "custom" => "a custom CLI",
         other => other,
     }
 }

@@ -209,7 +209,7 @@ pub fn hooks(gate: &str) -> Value {
 }
 
 /// A word of a POSIX shell command line.
-fn shell_word(word: &str) -> String {
+pub fn shell_word(word: &str) -> String {
     if !word.is_empty()
         && word
             .chars()

@@ -1,5 +1,29 @@
 # Changelog
 
+## Unreleased
+
+### Changes
+
+- **Any other CLI as the agent: the `custom` runtime**
+  ([ADR 0039](docs/adr/0039-custom-cli-runtime.md), [docs/custom.md](docs/custom.md)):
+  `wats setup custom --agent --name <name> --command <cli> --args "<template>"`.
+  - The template takes `{prompt}`, `{prompt_file}`, `{mcp_config}`,
+    `{cwd}`, `{model}` and `{wats_mcp}`; otherwise the prompt goes on
+    stdin.
+  - wats writes a per-run MCP config with the wats server only (`0600`,
+    removed after the run), in `claude-json` or `codex-toml`, or none.
+    New keys: `agent.mcp_format`, `agent.mcp_file` (inside the run
+    directory, for `.cursor/mcp.json`) and `agent.env`.
+  - wats can't confine such a CLI, so it needs `agent.review` (the setup
+    turns it on) or `agent.allow`.
+  - Budget: minutes and runs. Its posts declare `custom:<name>`.
+  - Recipes, all checked against the docs and not run yet: Cursor CLI,
+    Kiro CLI, Goose. Aider has no MCP support.
+- `wats setup copilot|antigravity --mcp` no longer suggests `--agents-md`,
+  which writes Claude Code's and Codex's instructions only. The detailed
+  wizard no longer asks for turns per run for Copilot CLI and Antigravity
+  CLI, which take no turn limit.
+
 ## 0.4.9 (2026-10-23)
 
 Two more agent CLIs, each as an MCP host and as the node's agent: GitHub
