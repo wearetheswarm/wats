@@ -1644,3 +1644,34 @@ async fn anti_entropy_brings_what_gossip_missed() -> anyhow::Result<()> {
     }
     Ok(())
 }
+
+/// What anti-entropy pulls goes on gossip at once: a chain A - B - C,
+/// where only B reads its neighbors. An event reaches A outside gossip; B
+/// pulls it and relays it, and C, which never pulls, gets it live.
+#[tokio::test(flavor = "multi_thread")]
+async fn anti_entropy_relays_what_it_pulls() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let a = reference(&dir.path().join("a")).await?;
+    let mut b_config = config(&dir.path().join("b"), &[&a]);
+    b_config.history.anti_entropy = Duration::from_secs(1);
+    let b = Node::start(b_config).await?;
+    done(&b).await;
+    let mut c_config = config(&dir.path().join("c"), &[&b]);
+    c_config.history.anti_entropy = Duration::ZERO;
+    let c = Node::start(c_config).await?;
+    done(&c).await;
+    eventually("C is B's gossip neighbor", 30, || {
+        (c.neighbor_count(PUBLIC_NET) > 0).then_some(())
+    })
+    .await;
+    let missed = note(4343, now_secs() - 30);
+    hold(&a, std::slice::from_ref(&missed));
+    eventually("C gets the relayed event", 30, || {
+        seq(&c, &missed.id).map(|_| ())
+    })
+    .await;
+    for node in [a, b, c] {
+        node.shutdown().await?;
+    }
+    Ok(())
+}

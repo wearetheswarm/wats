@@ -715,6 +715,7 @@ pub const KEYS_SINCE: &[(&str, Version)] = &[
     ("agent.env", Version(0, 4, 10)),
     ("agent.mcp_file", Version(0, 4, 10)),
     ("agent.effort", Version(0, 4, 11)),
+    ("sync.anti_entropy", Version(0, 4, 11)),
 ];
 
 /// The keys set in `data_dir`'s config.toml that wats `version` does not

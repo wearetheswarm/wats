@@ -31,11 +31,15 @@
   CLI `--effort`, OpenCode `--variant`). Unset, the runtime's default
   applies; one set in `agent.extra_args` wins. Vibe, OpenClaw and custom
   agents take none, and the start says so. `data.via` reports it.
-- **Anti-entropy**: every 5 minutes, a node reads its neighbors' newest
-  events of the last 30 minutes. An event gossip did not deliver now
-  arrives within minutes, instead of at the next restart. Seen on a seed
-  fleet: an ask reached no seed while every node said online. Its gossip
-  links had gone stale after a peer restart (ADR 0025 §5, amended).
+- **Anti-entropy** (`sync.anti_entropy`, every minute by default): a
+  node reads its gossip neighbors' newest events of the last 30 minutes.
+  It relays at once on gossip what gossip had not delivered, so the rest
+  of the path gets it live. A neighbor that held events over 2 minutes
+  old that never came through gets a fresh gossip connection. Seen on a
+  seed fleet: an ask reached no seed while every node said online. Its
+  gossip links had gone dead after a peer restart: iroh-gossip 0.101
+  keeps a neighbor whose send loop died (ADR 0025 §5, amended). Each node
+  also keeps 8 gossip neighbors instead of 5.
 - **`wats setup openclaw --agent`, automatic mode**: `hooks.token` is the
   template `${WATS_OPENCLAW_HOOKS_TOKEN}` in the patch. OpenClaw 2026.6.35
   refuses the SecretRef wats set there ("must stay a plain string value"),

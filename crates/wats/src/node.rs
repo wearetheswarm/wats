@@ -56,6 +56,10 @@ pub const PUBLIC_NET: &str = "public";
 /// canonical (32 KiB of raw input); the cap leaves room for the envelope
 /// and for later versions. Every node must use the same value.
 pub const GOSSIP_MAX_MESSAGE_BYTES: usize = 64 * 1024;
+/// Gossip neighbors each node keeps (HyParView's active view; its default
+/// is 5): more paths around a link that went dead, while the network is
+/// small (0.4.11).
+pub const GOSSIP_ACTIVE_VIEW: usize = 8;
 
 /// How far in the future an event timestamp may be (node policy).
 pub const MAX_CLOCK_SKEW_SECS: u64 = 10 * 60;
@@ -1699,6 +1703,10 @@ impl Node {
         .await?;
         let gossip = Gossip::builder()
             .max_message_size(GOSSIP_MAX_MESSAGE_BYTES)
+            .membership_config(iroh_gossip::proto::HyparviewConfig {
+                active_view_capacity: GOSSIP_ACTIVE_VIEW,
+                ..Default::default()
+            })
             .spawn(endpoint.clone());
         let downloader = blobs.downloader(&endpoint);
         let proof_guard = Arc::new(proof::Guard::default());
@@ -5135,6 +5143,39 @@ impl Node {
     }
 
     /// The gossip sender of a network this node is on.
+    /// Broadcast on gossip events that anti-entropy pulled (each with the
+    /// peer that served it, as the provider of its blobs): gossip had not
+    /// delivered them, so the rest of the path gets them live, not a hop
+    /// per round.
+    pub(crate) async fn relay_pulled(&self, net: &str, pulled: &[(serde_json::Value, EndpointId)]) {
+        let Some(sender) = self.sender(net) else {
+            return;
+        };
+        for (value, from) in pulled {
+            let envelope = Envelope::new(value.clone(), *from);
+            if let Ok(bytes) = serde_json::to_vec(&envelope)
+                && let Err(e) = sender.broadcast(bytes.into()).await
+            {
+                debug!("relay of a pulled event: {e:#}");
+            }
+        }
+    }
+
+    /// Give gossip a fresh connection to `peer`. iroh-gossip 0.101 keeps a
+    /// neighbor whose send loop died on a live connection as active, and
+    /// drops every message to it (docs/upstream); the new connection
+    /// becomes the active one on both sides, as after a reconnect.
+    pub(crate) async fn reset_gossip_link(&self, peer: EndpointId) -> Result<()> {
+        let conn = tokio::time::timeout(
+            Duration::from_secs(10),
+            self.endpoint().connect(peer, iroh_gossip::ALPN),
+        )
+        .await
+        .map_err(|_| anyhow::anyhow!("timed out"))??;
+        self.gossip.handle_connection(conn).await?;
+        Ok(())
+    }
+
     fn sender(&self, net: &str) -> Option<GossipSender> {
         self.senders.lock().ok()?.get(net).cloned()
     }

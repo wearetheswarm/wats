@@ -323,6 +323,8 @@ pub struct StorageSettings {
 pub struct SyncSettings {
     /// Budget of the initial fill: `auto`, a size, or 0 for no limit.
     pub initial_max: Option<String>,
+    /// How often the node reads its neighbors' newest events (0: never).
+    pub anti_entropy: Option<String>,
 }
 
 /// Default share of `storage.max` for the event store, in percent.
@@ -765,6 +767,12 @@ pub const KEYS: &[Key] = &[
         ValueType::InitialMax,
         "auto",
         "history a new node fetches, newest first: auto (half the events share), a size, or 0 for all of it (full nodes)",
+    ),
+    key(
+        "sync.anti_entropy",
+        ValueType::Retention,
+        "1m",
+        "how often the node reads its gossip neighbors' newest events (the last 30 minutes) and relays what gossip had not delivered; a neighbor that held old ones gets a fresh gossip link (0: never)",
     ),
     key(
         "limits.hello_per_min",

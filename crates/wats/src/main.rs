@@ -6387,6 +6387,11 @@ impl NodeArgs {
                 .map_err(|e| anyhow::anyhow!("config.toml sync.initial_max: {e}"))?
                 .unwrap_or_default(),
         };
+        if let Some(every) = &file.sync.anti_entropy {
+            config.history.anti_entropy = wats::settings::parse_retention(every)
+                .map_err(|e| anyhow::anyhow!("config.toml sync.anti_entropy: {e}"))?
+                .unwrap_or_default();
+        }
         for addr in &self.external_addrs {
             config.external_addrs.push(
                 addr.parse()

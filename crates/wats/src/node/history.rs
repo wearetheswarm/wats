@@ -113,6 +113,15 @@ const JOIN_CHECKS_PER_HOUR: usize = 12;
 /// rounds of [`Tuning::anti_entropy`], so that an event a hop takes a
 /// round to pass on still falls in the next hop's window.
 pub const ANTI_ENTROPY_WINDOW: Duration = Duration::from_secs(30 * 60);
+/// Default of `sync.anti_entropy`: short while the network is small.
+pub const DEFAULT_ANTI_ENTROPY: Duration = Duration::from_secs(60);
+/// An event a neighbor held this long (by its `ts`) that gossip had not
+/// brought here: the link to that neighbor is taken for dead.
+const STALE_LAG: Duration = Duration::from_secs(120);
+/// A neighbor's gossip link is reset at most this often.
+const RESET_EVERY: Duration = Duration::from_secs(600);
+/// Events relayed per anti-entropy round, at most.
+const RELAY_MAX: usize = 500;
 /// The first window asked from older peers; each next one doubles.
 const OLDER_WINDOW_SECS: u64 = 7 * 24 * 3600;
 
@@ -147,7 +156,7 @@ impl Default for Tuning {
             page: proto::MAX_SYNC_PAGE,
             page_pause: Duration::ZERO,
             retry: Duration::from_secs(60),
-            anti_entropy: Duration::from_secs(5 * 60),
+            anti_entropy: DEFAULT_ANTI_ENTROPY,
             legacy: false,
             rotation_check: Duration::from_secs(30),
             rotation_pause: Duration::from_millis(5),
@@ -199,6 +208,8 @@ pub struct History {
     progress: std::sync::Mutex<HashMap<String, Progress>>,
     /// On-demand fetches in the last minute.
     gets: std::sync::Mutex<std::collections::VecDeque<std::time::Instant>>,
+    /// The last reset of each neighbor's gossip link.
+    resets: std::sync::Mutex<HashMap<EndpointId, std::time::Instant>>,
 }
 
 /// Which holes a request is served around (ADR 0025 §3).
@@ -281,6 +292,13 @@ struct Pass {
     completed: HashSet<EndpointId>,
     /// Neighbors whose union read brought events this node did not hold.
     brought: HashSet<EndpointId>,
+    /// Anti-entropy: keep what is new, to relay it on gossip.
+    relay: bool,
+    /// What anti-entropy brought, and from whom.
+    pulled: Vec<(Value, EndpointId)>,
+    /// Neighbors that held events older than [`STALE_LAG`] that gossip had
+    /// not brought here: their gossip link to this node looks dead.
+    stale: HashSet<EndpointId>,
 }
 
 impl Pass {
@@ -1835,6 +1853,14 @@ impl Node {
             }
             match self.accept_value(value.clone(), Origin::Pulled).await {
                 Ok(Some((event, new))) => {
+                    if new && pass.relay {
+                        if pass.pulled.len() < RELAY_MAX {
+                            pass.pulled.push((value.clone(), peer));
+                        }
+                        if now_secs().saturating_sub(h.ts) > STALE_LAG.as_secs() {
+                            pass.stale.insert(peer);
+                        }
+                    }
                     if new && walk.author_cap.is_some() {
                         let used = pass.author_bytes.entry(chain).or_default();
                         *used = used.saturating_add(size);
@@ -2542,7 +2568,10 @@ impl Node {
             }),
             ..Walk::default()
         };
-        let mut pass = Pass::default();
+        let mut pass = Pass {
+            relay: true,
+            ..Pass::default()
+        };
         self.union_check(
             net,
             now.saturating_add(MAX_CLOCK_SKEW_SECS),
@@ -2552,12 +2581,38 @@ impl Node {
             false,
         )
         .await?;
-        if !pass.brought.is_empty() {
-            info!(
-                %net,
-                peers = pass.brought.len(),
-                "history: anti-entropy brought events gossip had not delivered"
-            );
+        if pass.pulled.is_empty() {
+            return Ok(());
+        }
+        info!(
+            %net,
+            events = pass.pulled.len(),
+            peers = pass.brought.len(),
+            "history: anti-entropy brought events gossip had not delivered; relaying them"
+        );
+        self.relay_pulled(net, &pass.pulled).await;
+        for peer in pass.stale {
+            let due = self.history.resets.lock().is_ok_and(|mut r| {
+                let now = std::time::Instant::now();
+                let due = r
+                    .get(&peer)
+                    .is_none_or(|t| now.duration_since(*t) >= RESET_EVERY);
+                if due {
+                    r.insert(peer, now);
+                }
+                due
+            });
+            if !due {
+                continue;
+            }
+            match self.reset_gossip_link(peer).await {
+                Ok(()) => info!(
+                    %net,
+                    peer = %peer.fmt_short(),
+                    "gossip link looked dead (it held events gossip had not brought): reconnected"
+                ),
+                Err(e) => debug!(peer = %peer.fmt_short(), "gossip link reset: {e:#}"),
+            }
         }
         Ok(())
     }
