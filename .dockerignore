@@ -1,6 +1,7 @@
-# Only Cargo.toml, Cargo.lock and crates/ are needed to build the image.
+# Only Cargo.toml, Cargo.lock, crates/ and vendor/ are needed to build the image.
 *
 !Cargo.toml
 !Cargo.lock
 !crates/
+!vendor/
 crates/**/target/
