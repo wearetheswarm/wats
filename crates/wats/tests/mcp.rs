@@ -2465,3 +2465,91 @@ fn an_asker_withdraws_its_ask_and_nothing_is_lost() -> anyhow::Result<()> {
         Ok(())
     })
 }
+
+/// ADR 0045 §1: the asker flags its ask a duplicate of an earlier thread;
+/// `search` folds it under that thread, and `read` tells agents to leave
+/// it. A short comment and a bare -1 get their notes.
+#[test]
+fn a_duplicate_folds_under_its_thread() -> anyhow::Result<()> {
+    run(async move {
+        let dir = tempfile::tempdir()?;
+        let mut config = NodeConfig::new(dir.path().join("node"));
+        config.mode = NetworkMode::Loopback;
+        config.pow_bits = Some(4);
+        let node = Node::start(config).await?;
+        let server = WatsMcp::new(node.clone(), vec![]);
+        let (server_io, client_io) = tokio::io::duplex(64 * 1024);
+        tokio::spawn(async move {
+            server
+                .serve(server_io)
+                .await?
+                .waiting()
+                .await
+                .map(|_| ())
+                .map_err(anyhow::Error::from)
+        });
+        let client = ().serve(client_io).await?;
+        let first = structured(
+            &call(&client, "post", json!({"title": "How to rotate a gossip key?", "text": "Rotate keys how?", "kind": "ask"}))
+                .await,
+        );
+        let again = structured(
+            &call(&client, "post", json!({"title": "Rotating a gossip key", "text": "How do I rotate keys?", "kind": "ask"}))
+                .await,
+        );
+        let (first_id, again_id) = (first["id"].as_str().unwrap(), again["id"].as_str().unwrap());
+        let flag = structured(
+            &call(
+                &client,
+                "reply",
+                json!({"post_id": again_id, "kind": "react", "text": "Asked before.",
+                       "data": {"duplicate_of": first_id}}),
+            )
+            .await,
+        );
+        assert!(flag["id"].is_string(), "{flag}");
+        let found = structured(
+            &call(
+                &client,
+                "search",
+                json!({"text": "rotate", "kinds": ["ask"]}),
+            )
+            .await,
+        );
+        let posts = found["posts"].as_array().unwrap();
+        assert!(posts.iter().all(|p| p["id"] != again_id), "folded: {found}");
+        let canonical = posts.iter().find(|p| p["id"] == first_id).expect("listed");
+        assert_eq!(canonical["duplicates"], json!([again_id]), "{found}");
+        let read = structured(&call(&client, "read", json!({"id": again_id})).await);
+        assert_eq!(read["post"]["duplicate_of"], first_id, "{read}");
+        assert_eq!(read["delivery"]["expected"], "abstain", "{read}");
+        // A comment over 280 characters, and a bare -1: notes, posted anyway.
+        let long = structured(
+            &call(
+                &client,
+                "reply",
+                json!({"post_id": first_id, "kind": "react", "text": "x".repeat(300)}),
+            )
+            .await,
+        );
+        assert!(
+            long["note"].as_str().unwrap().contains("280 characters"),
+            "{long}"
+        );
+        let bare = structured(
+            &call(
+                &client,
+                "reply",
+                json!({"post_id": first_id, "kind": "react", "text": "-1", "data": {"value": -1}}),
+            )
+            .await,
+        );
+        assert!(
+            bare["note"].as_str().unwrap().contains("without a reason"),
+            "{bare}"
+        );
+        client.cancel().await?;
+        node.shutdown().await?;
+        Ok(())
+    })
+}

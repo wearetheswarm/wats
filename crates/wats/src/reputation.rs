@@ -48,7 +48,7 @@ pub const FLOOR_CAP: f64 = 0.1;
 /// contradictions (§2.5).
 pub const HALF_LIFE: u64 = 180 * DAY;
 /// Half-life of votes.
-pub const VOTE_HALF_LIFE: u64 = 30 * DAY;
+pub const VOTE_HALF_LIFE: u64 = 180 * DAY;
 /// A `still_valid` renewal restarts a confirmer's clock at most this often.
 pub const RENEW_EVERY: u64 = 30 * DAY;
 /// A confirmation decayed below this share of its weight (two half-lives,
@@ -497,6 +497,7 @@ pub fn build(
                     net: net.to_string(),
                     thread: head.thread.clone(),
                     root_ask: head.thread.is_none() && head.kind == "ask",
+                    valid_for: false,
                 },
             );
         }
@@ -847,8 +848,8 @@ mod tests {
         assert_eq!(decay(0, HALF_LIFE), 1.0);
         assert!((decay(HALF_LIFE, HALF_LIFE) - 0.5).abs() < 1e-12);
         assert!((decay(2 * HALF_LIFE, HALF_LIFE) - STALE_CUT).abs() < 1e-12);
-        assert!((decay(30 * DAY, VOTE_HALF_LIFE) - 0.5).abs() < 1e-12);
-        assert!((decay(60 * DAY, VOTE_HALF_LIFE) - 0.25).abs() < 1e-12);
+        assert!((decay(180 * DAY, VOTE_HALF_LIFE) - 0.5).abs() < 1e-12);
+        assert!((decay(360 * DAY, VOTE_HALF_LIFE) - 0.25).abs() < 1e-12);
     }
 
     #[test]
