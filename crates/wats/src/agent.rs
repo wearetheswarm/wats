@@ -2181,7 +2181,9 @@ fn serve(node: &Node, me: &str, config: &AgentConfig, ask: &Event, now: u64) -> 
     };
     let request = &state.request;
     let mut urgent = false;
-    if !request.to.is_empty() {
+    // Once every addressee declined, it is served as an ask without `to:`
+    // (ADR 0047 §2).
+    if !request.to.is_empty() && !state.open_to_all() {
         if request.addresses(me) {
             urgent = true;
         } else {
@@ -2510,13 +2512,85 @@ async fn release_failed_claims(
         {
             continue;
         }
-        let ended = match status {
-            "error" => "exited with an error",
-            "timeout" => "timed out",
-            _ => "failed",
-        };
-        let why = format!("its run {ended} before it answered");
+        let why = format!("its run {} before it answered", failed_how(status));
         publish_release(node, config, &ask.event, &claim.id, &why).await;
+    }
+}
+
+/// After a run that failed: the node declines, for the agent, each ask
+/// addressed to it that woke the run and that the agent neither answered
+/// nor declined (ADR 0047 §4), so that it is open to others now, not at
+/// its deadline. `data.by_node` says the agent did not choose it.
+async fn decline_for_failed_run(
+    node: &Arc<Node>,
+    me: &str,
+    config: &AgentConfig,
+    woke: &[Queued],
+    status: &str,
+) {
+    let now = unix_now();
+    let mut done: std::collections::HashSet<&str> = Default::default();
+    for queued in woke {
+        if !done.insert(queued.id.as_str()) {
+            continue;
+        }
+        let Some(ask) = node.store().get(&queued.id).ok().flatten() else {
+            continue;
+        };
+        let Some(state) = crate::delivery::state_on(node, &ask.event, now) else {
+            continue;
+        };
+        if !state.request.addresses(me)
+            || state.declined_by(me).is_some()
+            || state.answered.iter().any(|a| a == me)
+            || state.accepted
+            || state.withdrawn.is_some()
+        {
+            continue;
+        }
+        let ended = failed_how(status);
+        let mut data = serde_json::Map::new();
+        data.insert("decline".into(), json!(true));
+        data.insert("reason".into(), json!(format!("its run {ended}")));
+        data.insert("by_node".into(), json!(true));
+        let draft = Draft {
+            net: ask.event.net.clone(),
+            thread: Some(ask.event.thread_root().to_string()),
+            parent: Some(ask.event.id.clone()),
+            kind: Some(Kind::Release),
+            title: Some("Declined".into()),
+            text: format!(
+                "Declined by this agent's node: its run {ended} on this ask addressed to it. \
+                 It is open to others once every addressee declined."
+            ),
+            data,
+            ..Draft::default()
+        };
+        let published = match node.author_key(&config.profile) {
+            Ok(key) => node.publish_as(&key, draft, &[]).await,
+            Err(e) => Err(e),
+        };
+        match published {
+            Ok(event) => info!(
+                ask = short(&ask.event.id),
+                decline = short(&event.id),
+                "declined the ask addressed to the agent: its run {ended}"
+            ),
+            Err(e) => warn!(
+                ask = short(&ask.event.id),
+                "could not decline the ask addressed to the agent: {e:#}"
+            ),
+        }
+    }
+}
+
+/// How a failed run ended, for people: `exited with an error`, `timed
+/// out`, `failed`.
+fn failed_how(status: &str) -> &'static str {
+    match status {
+        "error" => "exited with an error",
+        "timeout" => "timed out",
+        _ => "failed",
     }
 }
 
@@ -2941,6 +3015,7 @@ pub async fn run(
                     let run_started = run.record.started;
                     let (finished, status) = finish_run(&node, &config, run, outcome).await;
                     if run_failed(&status) {
+                        decline_for_failed_run(&node, &me, &config, &woke, &status).await;
                         release_failed_claims(&node, &me, &config, run_started, &status, &mut released).await;
                     }
                     if let Some(note) = unattached_note(&node, &me, &config, run_started) {
