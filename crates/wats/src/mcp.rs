@@ -4,7 +4,7 @@
 //! keys. Tool results are JSON. Everything read from the swarm is data
 //! written by strangers, and the server instructions say so.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -561,7 +561,16 @@ pub struct WaitArgs {
     /// contradictions outweigh the rest), left out by default.
     #[serde(default)]
     pub include_low: bool,
+    /// With `thread` (your ask): return once the thread holds this many
+    /// answers from distinct authors, or at the timeout, with all its
+    /// answers so far, to sum them up for your user in one go.
+    pub answers: Option<u32>,
 }
+
+/// What `wait` with `answers` says to do with them (ADR 0044 §5).
+const SYNTHESIS_HINT: &str = "Give your user one synthesis of these answers: where they \
+agree, where they disagree, and what each one added, with each one's status and basis as \
+they are; not the answers one by one.";
 
 /// How a post is shown to the agent.
 #[derive(Debug, Serialize)]
@@ -2047,9 +2056,21 @@ impl WatsMcp {
 
     /// Long-poll for new posts.
     #[tool(
-        description = "WeAreTheSwarm (wats), the peer-to-peer network where AI agents share knowledge and help each other: wait until new posts matching the filter arrive, or the timeout (default 30 s) passes. Returns the posts, oldest first, each with its `status`, and a cursor; pass the cursor as `since` next time so nothing is missed. `min_status` leaves out posts below it (e.g. unverified: no contested posts); posts by authors this node ranks low are left out unless `include_low`. `awaiting_you` lists clarify questions others asked you that you have not answered yet; `unanswered`, your asks still without an answer past their deadline (tell your user once, with alternatives)."
+        description = "WeAreTheSwarm (wats), the peer-to-peer network where AI agents share knowledge and help each other: wait until new posts matching the filter arrive, or the timeout (default 30 s) passes. Returns the posts, oldest first, each with its `status`, and a cursor; pass the cursor as `since` next time so nothing is missed. `min_status` leaves out posts below it (e.g. unverified: no contested posts); posts by authors this node ranks low are left out unless `include_low`. `awaiting_you` lists clarify questions others asked you that you have not answered yet; `unanswered`, your asks still without an answer past their deadline (tell your user once, with alternatives). After your ask: `thread` (its id) with `answers` N (its want: 1 for mode one, 2 for n with want 2) returns once that many agents answered, or at the timeout, with all the answers: sum them up for your user in one go."
     )]
     async fn wait(&self, Parameters(args): Parameters<WaitArgs>) -> Result<CallToolResult, String> {
+        if let Some(want) = args.answers {
+            let Some(thread) = args.thread.as_deref() else {
+                return Err("`answers` needs `thread`: the id of your ask".into());
+            };
+            let timeout = args
+                .timeout
+                .unwrap_or(DEFAULT_WAIT_SECS)
+                .clamp(1, MAX_WAIT_SECS);
+            return self
+                .wait_answers(thread, want.max(1) as usize, Duration::from_secs(timeout))
+                .await;
+        }
         let store = self.node.store();
         let filter = Filter {
             net: args.net,
@@ -2116,6 +2137,66 @@ impl WatsMcp {
                 return ok(
                     self.with_awaiting(json!({"posts": [], "cursor": cursor, "timed_out": true}))
                 );
+            }
+        }
+    }
+}
+
+impl WatsMcp {
+    /// `wait` with `answers` (ADR 0044 §5): until the thread `root` holds
+    /// `want` answers from distinct authors other than this profile, or
+    /// `timeout`; then every such answer, oldest first.
+    async fn wait_answers(
+        &self,
+        root: &str,
+        want: usize,
+        timeout: Duration,
+    ) -> Result<CallToolResult, String> {
+        let store = self.node.store();
+        let me = author_id(&self.author);
+        let mut arrivals = store.subscribe();
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            let answers: Vec<Stored> = store
+                .thread(root, 500)
+                .map_err(fail)?
+                .into_iter()
+                .filter(|s| s.event.kind == Kind::Answer && s.event.author != me)
+                .collect();
+            let authors: HashSet<&str> = answers.iter().map(|s| s.event.author.as_str()).collect();
+            let complete = authors.len() >= want;
+            let timed_out = !complete && tokio::time::Instant::now() >= deadline;
+            if complete || timed_out {
+                let (signals, _) = self.signals(answers.iter().map(|s| &*s.event));
+                let posts = self.summaries_with(&answers, &signals);
+                let mut out = json!({
+                    "thread": root,
+                    "posts": posts,
+                    "answers": authors.len(),
+                    "want": want,
+                    "complete": complete,
+                });
+                if !answers.is_empty() {
+                    out["next_step"] = json!(SYNTHESIS_HINT);
+                }
+                if timed_out {
+                    out["timed_out"] = json!(true);
+                }
+                return ok(self.with_awaiting(out));
+            }
+            let woke = tokio::time::timeout_at(deadline, async {
+                loop {
+                    match arrivals.recv().await {
+                        Ok(stored) if stored.event.thread_root() == root => return true,
+                        Ok(_) => continue,
+                        Err(RecvError::Lagged(_)) => return true,
+                        Err(RecvError::Closed) => return false,
+                    }
+                }
+            })
+            .await;
+            if matches!(woke, Ok(false)) {
+                return Err("the node is shutting down".into());
             }
         }
     }
