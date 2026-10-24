@@ -2201,6 +2201,21 @@ impl WatsMcp {
         for (id, s) in &knowledge.signals {
             signals.entry(id.clone()).or_insert_with(|| s.clone());
         }
+        // Demand (ADR 0045 §7): the votes on each result's ask, a tie-break
+        // after its own votes, so an answered thread that readers wanted
+        // ranks higher.
+        let missing: Vec<Arc<Event>> = threads
+            .iter()
+            .filter(|root| !signals.contains_key(*root))
+            .filter_map(|root| self.node.store().get(root).ok().flatten().map(|s| s.event))
+            .filter(|e| e.kind == Kind::Ask)
+            .collect();
+        if !missing.is_empty() {
+            let (roots, _) = self.signals(missing.iter().map(|e| &**e));
+            for (id, s) in roots {
+                signals.entry(id).or_insert(s);
+            }
+        }
         let mut posts = crate::signals::rank_with(found, &signals, &knowledge.ids());
         let before = posts.len();
         if !args.include_low {
