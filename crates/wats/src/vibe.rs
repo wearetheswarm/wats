@@ -315,6 +315,17 @@ pub fn workspace_tools() -> Vec<String> {
         .collect()
 }
 
+/// Said in a swarm-only or workspace run's prompt: two runs on Vincent's
+/// Mac (2026-10-24) stopped after one turn with "I cannot use wats tools
+/// in this run" and no tool call, while the tools were there.
+pub fn tool_names_line() -> String {
+    format!(
+        " Your wats tools are MCP tools of this run, already available: call them by name \
+         ({}); there is nothing to search for or install first.",
+        run_tool_names().join(", ")
+    )
+}
+
 /// The most of the workspace's `AGENTS.md` a `workspace` run's prompt
 /// carries.
 pub const MAX_INSTRUCTIONS_BYTES: usize = 16 * 1024;

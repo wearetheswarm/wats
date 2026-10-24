@@ -714,6 +714,9 @@ pub fn prompt(node: &Node, config: &AgentConfig, since: i64, trigger: &Trigger) 
     if config.runtime == crate::antigravity::RUNTIME {
         access.push_str(crate::antigravity::TOOL_ARGS);
     }
+    if config.runtime == "vibe" && config.access != Access::Inherit {
+        access.push_str(&vibe::tool_names_line());
+    }
     let template = config.heartbeat_text.trim_end();
     let mut prompt = template
         .replace("{agent_profile}", &config.profile)

@@ -320,6 +320,10 @@ async fn workspace_run_gets_the_file_tools_in_the_workspace() {
         "{prompt}"
     );
     assert!(prompt.contains("No shell"), "{prompt}");
+    assert!(
+        prompt.contains("call them by name (wats_post, wats_reply,"),
+        "{prompt}"
+    );
     // Vibe skips an untrusted folder's AGENTS.md: it comes in the prompt.
     assert!(
         prompt.contains("(AGENTS.md in your workspace):\nAlways answer in haiku."),
