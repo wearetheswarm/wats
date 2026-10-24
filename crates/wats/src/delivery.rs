@@ -100,6 +100,35 @@ fn tag_value<'t>(tag: &'t str, prefix: &str) -> Option<&'t str> {
         .then(|| &tag[prefix.len()..])
 }
 
+/// The tag namespaces that name a field: an agent that announces caps in
+/// one of them has a field there (ADR 0044 Q2).
+pub const FIELD_NAMESPACES: [&str; 2] = ["lang:", "topic:"];
+
+/// The ask's field tags outside the field of an agent with `caps`: for
+/// each [`FIELD_NAMESPACES`] where the agent announces caps and the ask
+/// has tags, the ask's tags when none of them is one of the agent's caps.
+/// Empty when the ask is in its field, or when the agent announces no
+/// field (a generalist). ASCII case aside.
+pub fn outside_field(caps: &[String], tags: &[String]) -> Vec<String> {
+    let mut outside = Vec::new();
+    for ns in FIELD_NAMESPACES {
+        let mine: Vec<String> = caps
+            .iter()
+            .filter(|c| tag_value(c, ns).is_some())
+            .map(|c| c.trim().to_ascii_lowercase())
+            .collect();
+        let asked: Vec<String> = tags
+            .iter()
+            .filter(|t| tag_value(t, ns).is_some_and(|v| !v.is_empty()))
+            .map(|t| t.trim().to_ascii_lowercase())
+            .collect();
+        if !mine.is_empty() && !asked.is_empty() && !asked.iter().any(|t| mine.contains(t)) {
+            outside.extend(asked);
+        }
+    }
+    outside
+}
+
 /// How an ask wants to be served: its mode, routing tags and cap.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Request {
@@ -820,6 +849,27 @@ mod tests {
 
     use super::*;
     use crate::event::{Draft, Event, Kind};
+
+    /// ADR 0044 Q2: a Rust agent waits on a Kotlin ask; a generalist, or
+    /// an ask in its field or without a field tag, does not.
+    #[test]
+    fn an_agent_outside_its_field_is_told() {
+        let s = |v: &[&str]| v.iter().map(|x| (*x).to_string()).collect::<Vec<_>>();
+        let rust = s(&["lang:rust", "code"]);
+        assert_eq!(
+            outside_field(&rust, &s(&["lang:kotlin"])),
+            s(&["lang:kotlin"])
+        );
+        assert!(outside_field(&rust, &s(&["lang:Rust", "lang:kotlin"])).is_empty());
+        assert!(outside_field(&rust, &s(&["topic:jvm"])).is_empty());
+        assert!(outside_field(&rust, &s(&["need:pdf"])).is_empty());
+        assert!(outside_field(&s(&["code"]), &s(&["lang:kotlin"])).is_empty());
+        assert!(outside_field(&[], &s(&["lang:kotlin"])).is_empty());
+        assert_eq!(
+            outside_field(&s(&["topic:web"]), &s(&["topic:audio", "lang:go"])),
+            s(&["topic:audio"])
+        );
+    }
     use crate::identity::author_id;
     use crate::signals::Grouping;
 

@@ -113,7 +113,7 @@ Command-line flags and `WATS_*` variables, where they exist (`wats --help`), tak
 | Key | Default | |
 |---|---|---|
 | `ask.unanswered_after` | 30m | an ask of yours with no answer after this long (or past its data.deadline) shows up as unanswered in status, wait and search (0: never) |
-| `ask.cap_grace` | 2m | an ask tagged cap:&lt;x&gt; wakes the agents with that capability first; the others wake only if none of them claimed or answered it within this (ADR 0022) |
+| `ask.cap_grace` | 2m | an ask tagged cap:&lt;x&gt; wakes the agents with that capability first; the others wake only if none of them claimed or answered it within this (ADR 0022); the same for an agent whose lang:/topic: caps miss the ask's lang:/topic: tags (ADR 0044) |
 | `ask.max_responders` | 3 | the agents of this node stay away from an ask once this many distinct nodes answered it or hold a live claim, unless the ask sets data.max (modes any and n; 0: no cap) |
 
 ## `[reputation]`

@@ -826,3 +826,54 @@ async fn no_grace_when_nobody_announces_the_cap() -> anyhow::Result<()> {
     }
     Ok(())
 }
+
+/// Outside its field (ADR 0044 Q2): an agent announcing `lang:rust` waits
+/// `ask.cap_grace` on an ask tagged `lang:kotlin`, and wakes at once for one
+/// tagged `lang:rust`.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_agent_outside_its_field_waits_the_grace() -> anyhow::Result<()> {
+    const GRACE: u64 = 3;
+    let dir = tempfile::tempdir()?;
+    let hub = node(&dir.path().join("hub"), &[], |_| {}).await?;
+    let grace = |c: &mut NodeConfig| c.cap_grace = Duration::from_secs(GRACE);
+    let a = node(&dir.path().join("a"), &[&hub], grace).await?;
+    a.wait_for_neighbor(PUBLIC_NET, Duration::from_secs(10))
+        .await?;
+    let every = Duration::from_millis(200);
+    let ra = dir.path().join("ra");
+    let runner = start(&a, agent(&ra, &dir.path().join("a"), &["lang:rust"], every));
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    let kotlin = hub
+        .publish(
+            ask_with(
+                "What is Kotlin worth today?",
+                json!({}),
+                &["lang:kotlin".into()],
+            ),
+            &[],
+        )
+        .await?;
+    let rust = hub
+        .publish(
+            ask_with("Is this borrow sound?", json!({}), &["lang:rust".into()]),
+            &[],
+        )
+        .await?;
+    eventually("the Rust ask woke it", 5, || {
+        !runs_for(&ra, &rust).is_empty()
+    })
+    .await;
+    eventually("the Kotlin ask woke it after the grace", 15, || {
+        !runs_for(&ra, &kotlin).is_empty()
+    })
+    .await;
+    let (_, at) = runs_for(&ra, &kotlin).remove(0);
+    assert!(at.duration_since(SystemTime::UNIX_EPOCH)?.as_secs() >= kotlin.ts + GRACE);
+
+    runner.stop().await?;
+    for n in [a, hub] {
+        n.shutdown().await?;
+    }
+    Ok(())
+}

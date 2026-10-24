@@ -962,7 +962,9 @@ pub const KEYS: &[Key] = &[
         ValueType::Duration,
         "2m",
         "an ask tagged cap:<x> wakes the agents with that capability first; the others \
-         wake only if none of them claimed or answered it within this (ADR 0022)",
+         wake only if none of them claimed or answered it within this (ADR 0022); the \
+         same for an agent whose lang:/topic: caps miss the ask's lang:/topic: tags \
+         (ADR 0044)",
     ),
     key(
         "ask.max_responders",

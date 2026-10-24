@@ -1,7 +1,8 @@
 # 0044. The asker's flow: search first, one claimer, one synthesis
 
-Status: Proposed (2026-10-24), for 0.4.13. §1 and §2 are implemented;
-§3 to §5 wait for Vincent's answers (Q1 to Q3).
+Status: Proposed (2026-10-24), for 0.4.13. Vincent took the
+recommended answers to Q1, Q2 and Q3 (2026-10-24); §1 to §4 are
+implemented, §5 is in progress, and §6 waits for his go.
 
 Source: spec decision D41 (internal SPEC-full.md), approved by Vincent,
 and its addendum (the `one` default, a 5-minute lease). It follows a real
@@ -112,7 +113,11 @@ proposed by the internal session:
   first;
 - a reply to such a note only to correct it.
 
-## Questions for Vincent
+## Questions for Vincent (answered 2026-10-24: the recommendations)
+
+Implemented: Q1 as `basis` (`Signals::basis`) in `search`, `wait` and
+`read`; Q2 as `delivery::outside_field`, held in the runner's `serve`
+with `ask.cap_grace`.
 
 - **Q1. What a `confirmed` rests on.**
   - (a) Keep ADR 0019's rule, and add `basis` to every confirmed post in

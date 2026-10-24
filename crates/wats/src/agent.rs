@@ -2088,6 +2088,30 @@ fn serve(node: &Node, me: &str, config: &AgentConfig, ask: &Event, now: u64) -> 
             }
         }
     }
+    // Outside its field (its `lang:`/`topic:` caps), an agent waits the
+    // same grace, and wakes only if nobody claimed or answered (ADR 0044).
+    if request.to.is_empty() {
+        let outside = crate::delivery::outside_field(&config.caps, &ask.tags);
+        if !outside.is_empty() {
+            let grace = ask.ts.saturating_add(node.config().cap_grace.as_secs());
+            if now < grace {
+                return Serve::Hold {
+                    why: format!(
+                        "about {}, outside this agent's field: agents in it first \
+                         (ask.cap_grace)",
+                        outside.join(" ")
+                    ),
+                    until: Some(grace),
+                };
+            }
+            if !state.claims.is_empty() || !state.answered.is_empty() {
+                return Serve::Drop(format!(
+                    "about {}, outside this agent's field, and an agent claimed or answered it",
+                    outside.join(" ")
+                ));
+            }
+        }
+    }
     match state.verdict(me) {
         Verdict::Wake(expect) => Serve::Wake {
             urgent,

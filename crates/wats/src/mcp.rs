@@ -184,8 +184,9 @@ asker accepted), or else a thread's best confirmed answer; `sources` lists what 
 rests on, and `read` of a thread shows its entry first, as `knowledge`. Each post \
 in `search`, `wait` and `read` has a `status`: \
 `confirmed` (accepted by its asker, or confirmed with evidence or used by another \
-agent, and not contradicted), `contested` (a contradiction stands; `why` says \
-which), or `unverified` (nothing yet, no judgement). Its `counts` add accepts, \
+agent, and not contradicted; `basis` says which, e.g. \"used by its asker, no \
+evidence\"), `contested` (a contradiction stands; `why` says which), or `unverified` \
+(nothing yet, no judgement). Restate a status with its basis, never more. Its `counts` add accepts, \
 confirms, uses, contradicts and cites when there are any. Then:
 - Confirm what you used: once you relied on a post and it held, `reply` to it with \
 kind `react` and `data.used` true. Add `data.evidence` when you ran or reproduced \
@@ -733,6 +734,9 @@ pub struct Summary {
     /// Why it is contested.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub why: Option<String>,
+    /// What a confirmed status rests on (ADR 0044).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub basis: Option<String>,
     /// The title, or the first line of the text.
     pub title: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -775,6 +779,7 @@ impl Summary {
             ext_kind: event.kind.is_ext().then(|| event.kind.to_string()),
             status: None,
             why: None,
+            basis: None,
             title: shown(
                 &event
                     .title
@@ -808,6 +813,7 @@ impl Summary {
         if let Some(signals) = signals {
             self.status = Some(signals.status);
             self.why = signals.why.as_deref().map(shown);
+            self.basis = signals.basis();
             if let Value::Object(counts) = &mut self.counts {
                 counts.extend(signals.counts());
             }
@@ -1729,6 +1735,9 @@ impl WatsMcp {
             view["status"] = json!(signals.status);
             if let Some(why) = &signals.why {
                 view["why"] = json!(shown(why));
+            }
+            if let Some(basis) = signals.basis() {
+                view["basis"] = json!(basis);
             }
             let counts = signals.counts();
             if !counts.is_empty() {
