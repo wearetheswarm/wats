@@ -1316,14 +1316,17 @@ impl Cache {
     }
 }
 
-/// Whether a check is due: none yet, a day since the last, or a clock that
-/// went back more than a day.
+/// Whether a check is due: none yet, a day since the last, a clock that
+/// went back more than a day, or a cached latest release older than the
+/// running version (the node was upgraded since: its cache says nothing
+/// any more, and `status` showed "latest 0.4.9" on a 0.4.16 node).
 pub fn check_due(cache: Option<&Cache>, now: u64) -> bool {
     match cache {
         None => true,
         Some(c) => {
             now >= c.checked_at.saturating_add(CHECK_EVERY_SECS)
                 || c.checked_at > now.saturating_add(CHECK_EVERY_SECS)
+                || c.latest().is_some_and(|latest| latest < Version::current())
         }
     }
 }
@@ -2370,6 +2373,12 @@ mod tests {
         // A clock that went back more than a day.
         assert!(check_due(Some(&c), t0 - 2 * DAY));
         assert!(!check_due(Some(&c), t0 - 60));
+        // A cache older than the running version: due at once.
+        let stale = Cache {
+            latest: Some("0.0.1".into()),
+            ..c.clone()
+        };
+        assert!(check_due(Some(&stale), t0 + 60));
     }
 
     fn release(tag: &str, body: &str) -> Release {

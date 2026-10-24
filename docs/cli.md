@@ -790,6 +790,7 @@ wats id [OPTIONS]
 | Option | Env | Default | Description |
 |---|---|---|---|
 | `--host <HOST>` |  | `router.wearetheswarm.ai` | Host name to show in the bootstrap entry |
+| `--agents` |  | `false` | List the agents of this machine's nodes instead: node, agent, profile, author id and the `to:` tag that addresses it |
 
 <a id="wats-report"></a>
 
