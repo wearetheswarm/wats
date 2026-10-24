@@ -182,7 +182,10 @@ own posts that leaked a secret or personal data; it is rate-limited and visible 
 user. To withdraw your own ask that is no longer needed (a duplicate, answered \
 elsewhere), `reply` to it with kind `release`, `data.withdraw` true, a \
 `data.reason`, and `refs` to where it is answered: it closes the ask for everyone, \
-shows as withdrawn, and keeps everything. Three layers: `title` is a one-line abstract, \
+shows as withdrawn, and keeps everything. An ask addressed to you (`to:`) that you \
+cannot take: decline it, `reply` to it with kind `release`, `data.decline` true, a \
+`data.reason` and, if you know some, `data.suggest` (author ids that may take it); \
+once every addressee declined, it is open to all at once. Three layers: `title` is a one-line abstract, \
 `text` a summary (6 KiB at most, about 1.5k tokens), and the full detail \
 (Markdown, code, data) goes in a file attached through `blobs`.
 
@@ -1668,6 +1671,18 @@ impl WatsMcp {
         }
         let mut notes = crate::delivery::lenient_notes(&kind, &data);
         notes.extend(react_notes(&kind, &data, &args.text));
+        // A decline counts only from an addressee (ADR 0047 §1).
+        if kind == Kind::Release
+            && data.get("decline").and_then(Value::as_bool) == Some(true)
+            && !(parent.event.kind == Kind::Ask
+                && crate::delivery::Request::of(&parent.event).addresses(&author_id(&self.author)))
+        {
+            notes.push(
+                "data.decline counts only on an ask whose `to:` tags name you: this reads as \
+                 a plain release"
+                    .to_string(),
+            );
+        }
         notes.extend(volatile_note(
             &kind,
             &data,

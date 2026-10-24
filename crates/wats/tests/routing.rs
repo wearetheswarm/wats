@@ -776,6 +776,123 @@ async fn to_wakes_the_addressee_at_once() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// ADR 0047: the addressee declines, and another agent wakes at once, not
+/// at the deadline; an addressee whose run fails is declined for by its
+/// node, with the same effect.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_declined_ask_is_open_to_others() -> anyhow::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir()?;
+    let hub = node(&dir.path().join("hub"), &[], |_| {}).await?;
+    let a = node(&dir.path().join("a"), &[&hub], |_| {}).await?;
+    let b = node(&dir.path().join("b"), &[&hub], |_| {}).await?;
+    let c = node(&dir.path().join("c"), &[&hub], |_| {}).await?;
+    for n in [&a, &b, &c] {
+        n.wait_for_neighbor(PUBLIC_NET, Duration::from_secs(10))
+            .await?;
+    }
+    let every = Duration::from_millis(200);
+    let (ra, rb, rc) = (
+        dir.path().join("ra"),
+        dir.path().join("rb"),
+        dir.path().join("rc"),
+    );
+    let runner_a = start(&a, agent(&ra, &dir.path().join("a"), &[], every));
+    let runner_b = start(&b, agent(&rb, &dir.path().join("b"), &[], every));
+    // c's CLI keeps its prompt and fails.
+    let config_c = agent(&rc, &dir.path().join("c"), &[], every);
+    std::fs::write(
+        &config_c.command,
+        format!(
+            "#!/bin/sh\nn=$(ls {out} | grep -c prompt)\ncat > {out}/run-$n.tmp\nmv {out}/run-$n.tmp {out}/run-$n.prompt\nexit 1\n",
+            out = rc.join("runs").display(),
+        ),
+    )?;
+    std::fs::set_permissions(&config_c.command, std::fs::Permissions::from_mode(0o755))?;
+    let runner_c = start(&c, config_c);
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // To a's agent alone, deadline in 10 min: b waits.
+    let deadline = wats::node::now_secs() + 600;
+    let to_a = wats::delivery::to_tag(&agent_id(&a)).unwrap();
+    let ask = hub
+        .publish(
+            ask_with(
+                "Needs a GPU",
+                json!({"mode": "one", "deadline": deadline}),
+                &[to_a],
+            ),
+            &[],
+        )
+        .await?;
+    eventually("a woke", 10, || !runs_for(&ra, &ask).is_empty()).await;
+    let (prompt, _) = runs_for(&ra, &ask).remove(0);
+    let expected = expected(&prompt, &ask).unwrap_or_default();
+    assert!(expected.contains("addressed to you alone"), "{prompt}");
+    assert!(expected.contains("data.decline"), "{prompt}");
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert!(runs_for(&rb, &ask).is_empty(), "addressed to a");
+    let decline = a
+        .publish_as(
+            &a.author_key("agent")?,
+            reply(
+                &ask,
+                Kind::Release,
+                json!({"decline": true, "reason": "no GPU here"}),
+            ),
+            &[],
+        )
+        .await?;
+    everywhere(&[&b], &decline.id).await;
+    eventually("b woke once a declined", 10, || {
+        !runs_for(&rb, &ask).is_empty()
+    })
+    .await;
+    let (prompt, _) = runs_for(&rb, &ask).remove(0);
+    assert!(
+        prompt.contains("every addressee declined: open to all"),
+        "{prompt}"
+    );
+    assert_eq!(runs_for(&ra, &ask).len(), 1, "a declined: not woken again");
+
+    // To c's agent alone: its run fails, its node declines for it.
+    let to_c = wats::delivery::to_tag(&agent_id(&c)).unwrap();
+    let ask = hub
+        .publish(
+            ask_with(
+                "Render this",
+                json!({"mode": "one", "deadline": deadline}),
+                &[to_c],
+            ),
+            &[],
+        )
+        .await?;
+    eventually("c's node declined", 10, || {
+        in_thread(&hub, &ask, Kind::Release)
+            .iter()
+            .any(|r| r.author == agent_id(&c) && r.data.get("by_node") == Some(&json!(true)))
+    })
+    .await;
+    let state = wats::delivery::state_on(&hub, &ask, wats::node::now_secs()).unwrap();
+    assert!(state.open_to_all());
+    assert_eq!(
+        state.declined[0].reason.as_deref(),
+        Some("its run exited with an error")
+    );
+    eventually("a or b woke once c's node declined", 10, || {
+        !runs_for(&ra, &ask).is_empty() || !runs_for(&rb, &ask).is_empty()
+    })
+    .await;
+
+    for r in [runner_a, runner_b, runner_c] {
+        r.stop().await?;
+    }
+    for n in [a, b, c, hub] {
+        n.shutdown().await?;
+    }
+    Ok(())
+}
+
 /// `cap:` wakes the agents with that capability first; the others wake
 /// after `ask.cap_grace` only if none of them claimed or answered.
 #[tokio::test(flavor = "multi_thread")]
