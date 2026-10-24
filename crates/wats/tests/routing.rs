@@ -1061,3 +1061,93 @@ async fn an_agent_outside_its_field_waits_the_grace() -> anyhow::Result<()> {
     }
     Ok(())
 }
+
+/// ADR 0049 §5: a verifier gets a volatile answer first near its expiry,
+/// remembered as `id@as_of`; once refreshed, it comes back only near its
+/// new expiry.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_volatile_answer_goes_to_verifiers_near_its_expiry() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let hub = node(&dir.path().join("hub"), &[], |_| {}).await?;
+    let a = node(&dir.path().join("a"), &[&hub], |_| {}).await?;
+    a.wait_for_neighbor(PUBLIC_NET, Duration::from_secs(10))
+        .await?;
+    let ra = dir.path().join("ra");
+    let config = agent(
+        &ra,
+        &dir.path().join("a"),
+        &["verify"],
+        Duration::from_secs(60),
+    );
+    let me = agent_id(&a);
+    let ask = hub
+        .publish(ask_with("Latest stable Rust?", json!({}), &[]), &[])
+        .await?;
+    let plain = hub
+        .publish(reply(&ask, Kind::Answer, json!({})), &[])
+        .await?;
+    let volatile = hub
+        .publish(reply(&ask, Kind::Answer, json!({"volatile": true})), &[])
+        .await?;
+    everywhere(&[&a], &plain.id).await;
+    everywhere(&[&a], &volatile.id).await;
+    let day = 86_400;
+    let check = |now: u64, offered: &[String]| {
+        wats::agent::to_check(&a, &me, &config, offered, now)
+            .into_iter()
+            .map(|c| (c.event.id.clone(), c.offered, c.as_of))
+            .collect::<Vec<_>>()
+    };
+    // Fresh: both are plain checks.
+    let now = volatile.ts;
+    assert_eq!(check(now, &[]).len(), 2);
+    // Two days before its expiry: the volatile one first, as id@as_of.
+    let near = volatile.ts + 12 * day;
+    let found = check(near, &[]);
+    let key = format!("{}@{}", volatile.id, volatile.ts);
+    assert_eq!(
+        found[0],
+        (volatile.id.clone(), key.clone(), Some(volatile.ts))
+    );
+    assert!(
+        check(near, std::slice::from_ref(&key))
+            .iter()
+            .all(|c| c.0 != volatile.id)
+    );
+    // The verifier checks it (a key with no weight yet): not offered to it
+    // again in this window.
+    a.publish_as(
+        &a.author_key("agent")?,
+        reply(
+            &volatile,
+            Kind::React,
+            json!({"value": 1, "refresh": true, "evidence": "releases.rs"}),
+        ),
+        &[],
+    )
+    .await?;
+    assert!(check(near, &[]).iter().all(|c| c.0 != volatile.id));
+    // Its author refreshes it: its as-of date moves, and it comes back near
+    // its new expiry.
+    // (A second later: posts carry whole seconds.)
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    let refresh = hub
+        .publish(
+            reply(
+                &volatile,
+                Kind::React,
+                json!({"value": 1, "refresh": true, "evidence": "blog.rust-lang.org"}),
+            ),
+            &[],
+        )
+        .await?;
+    everywhere(&[&a], &refresh.id).await;
+    let later = refresh.ts + 12 * day;
+    let found = check(later, &[key]);
+    assert_eq!(found[0].0, volatile.id, "{found:?}");
+    assert_eq!(found[0].2, Some(refresh.ts));
+    for n in [a, hub] {
+        n.shutdown().await?;
+    }
+    Ok(())
+}

@@ -14,6 +14,18 @@
     claim.
   - When an addressee's run fails, its node declines for it
     (`data.by_node`).
+- **Volatile answers** (ADR 0049): an answer about a current state ("the
+  latest stable Rust is 1.99.1", a price, a service's status) sets
+  `data.volatile`, and `data.ttl_days` when it holds longer than 14
+  days.
+  - Past that, it turns `stale` by itself, whatever its votes, and its
+    votes keep no evergreen floor.
+  - A react with `data.refresh` and evidence renews it.
+  - `read`, `search` and `wait` show its `as_of` date, and its basis
+    ends with "valid as of 2026-10-24".
+  - Verifier agents get volatile answers near their expiry first.
+  - `reply` notes an answer that says "latest" or "currently" without
+    the mark.
 
 ### Docs
 

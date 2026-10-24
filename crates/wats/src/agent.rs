@@ -331,19 +331,38 @@ pub const CHECK_MAX_AGE: Duration = Duration::from_secs(30 * 86_400);
 /// The cap an agent announces to work the verification queue.
 pub const VERIFY_CAP: &str = "verify";
 
+/// A volatile answer is offered for a refresh from this long before it
+/// expires (ADR 0049 §5)...
+pub const REFRESH_BEFORE: Duration = Duration::from_secs(3 * 86_400);
+/// ...to this long after.
+pub const REFRESH_AFTER: Duration = Duration::from_secs(30 * 86_400);
+
+/// An answer offered to a verifier.
+pub struct Check {
+    pub event: Arc<Event>,
+    /// What the offer is remembered as: its id, or `id@as_of` for a
+    /// volatile answer, which comes back each time its as-of date moves.
+    pub offered: String,
+    /// A volatile answer's as-of date: it wants a refresh.
+    pub as_of: Option<u64>,
+}
+
 /// The verification queue for an agent with the [`VERIFY_CAP`] cap (ADR
-/// 0046 §2): up to [`CHECKS_PER_HEARTBEAT`] answers by others, at most
+/// 0046 §2): up to [`CHECKS_PER_HEARTBEAT`] answers by others. First the
+/// volatile answers from [`REFRESH_BEFORE`] their expiry to
+/// [`REFRESH_AFTER`] it, not offered since their as-of date moved and that
+/// this agent has not reacted to since (ADR 0049 §5). Then answers at most
 /// [`CHECK_MAX_AGE`] old, never offered before, that nobody but their
 /// asker backs (`unverified`, or confirmed by the asker alone, without
-/// evidence) and that this agent has not reacted to; the ones whose asks
-/// readers want most first.
+/// evidence) and that this agent has not reacted to. The ones whose asks
+/// readers want most first, in each group.
 pub fn to_check(
     node: &Node,
     me: &str,
     config: &AgentConfig,
     offered: &[String],
     now: u64,
-) -> Vec<Arc<Event>> {
+) -> Vec<Check> {
     if !config
         .caps
         .iter()
@@ -365,17 +384,18 @@ pub fn to_check(
         author: Some(me.to_string()),
         ..Filter::default()
     };
-    let reacted: std::collections::HashSet<String> = store
-        .search(None, &mine, 2000)
-        .unwrap_or_default()
-        .into_iter()
-        .filter_map(|s| s.event.parent.clone())
-        .collect();
+    // This agent's latest react on each post.
+    let mut reacted: std::collections::HashMap<String, u64> = Default::default();
+    for e in store.search(None, &mine, 2000).unwrap_or_default() {
+        if let Some(parent) = &e.event.parent {
+            let ts = reacted.entry(parent.clone()).or_default();
+            *ts = (*ts).max(e.event.ts);
+        }
+    }
     let candidates: Vec<Arc<Event>> = found
         .into_iter()
         .map(|s| s.event)
-        .filter(|e| e.ts >= oldest && e.author != me && !node.is_local_author(&e.author))
-        .filter(|e| !offered.contains(&e.id) && !reacted.contains(&e.id))
+        .filter(|e| e.author != me && !node.is_local_author(&e.author))
         .collect();
     let Some(first) = candidates.first() else {
         return Vec::new();
@@ -391,30 +411,67 @@ pub fn to_check(
                 && s.confirms == 0
                 && s.uses <= u64::from(s.asker_used))
     };
-    let kept: Vec<Arc<Event>> = candidates
-        .into_iter()
-        .filter(|e| signals.get(&e.id).is_some_and(backed_by_asker_only))
-        .collect();
+    let mut kept: Vec<Check> = Vec::new();
+    for e in candidates {
+        let Some(s) = signals.get(&e.id) else {
+            continue;
+        };
+        if let (Some(as_of), Some(expires)) = (s.as_of, s.expires)
+            && now.saturating_add(REFRESH_BEFORE.as_secs()) >= expires
+            && now <= expires.saturating_add(REFRESH_AFTER.as_secs())
+        {
+            let key = format!("{}@{as_of}", e.id);
+            if !offered.contains(&key) && reacted.get(&e.id).is_none_or(|ts| *ts < as_of) {
+                kept.push(Check {
+                    event: e,
+                    offered: key,
+                    as_of: Some(as_of),
+                });
+            }
+            continue;
+        }
+        if e.ts >= oldest
+            && !offered.contains(&e.id)
+            && !reacted.contains_key(&e.id)
+            && backed_by_asker_only(s)
+        {
+            kept.push(Check {
+                offered: e.id.clone(),
+                event: e,
+                as_of: None,
+            });
+        }
+    }
     // Demand: the votes on each answer's ask, then the answer's own uses.
     let roots: Vec<Arc<Event>> = kept
         .iter()
-        .filter_map(|e| store.get(e.thread_root()).ok().flatten().map(|s| s.event))
+        .filter_map(|c| {
+            store
+                .get(c.event.thread_root())
+                .ok()
+                .flatten()
+                .map(|s| s.event)
+        })
         .collect();
     let root_refs: Vec<&Event> = roots.iter().map(|e| &**e).collect();
     let asks = crate::signals::compute(store, &grouping, &root_refs).unwrap_or_default();
-    let mut queue: Vec<(f64, Arc<Event>)> = kept
+    let mut queue: Vec<(bool, f64, Check)> = kept
         .into_iter()
-        .map(|e| {
-            let wanted = asks.get(e.thread_root()).map_or(0.0, |s| s.up_weight);
-            let used = signals.get(&e.id).map_or(0, |s| s.uses) as f64;
-            (wanted * 10.0 + used, e)
+        .map(|c| {
+            let wanted = asks.get(c.event.thread_root()).map_or(0.0, |s| s.up_weight);
+            let used = signals.get(&c.event.id).map_or(0, |s| s.uses) as f64;
+            (c.as_of.is_none(), wanted * 10.0 + used, c)
         })
         .collect();
-    queue.sort_by(|(a, ea), (b, eb)| b.total_cmp(a).then(eb.ts.cmp(&ea.ts)));
+    queue.sort_by(|(va, a, ca), (vb, b, cb)| {
+        va.cmp(vb)
+            .then(b.total_cmp(a))
+            .then(cb.event.ts.cmp(&ca.event.ts))
+    });
     queue
         .into_iter()
         .take(CHECKS_PER_HEARTBEAT)
-        .map(|(_, e)| e)
+        .map(|(_, _, c)| c)
         .collect()
 }
 
@@ -3271,7 +3328,7 @@ pub async fn run(
                 }
                 // A verifier's queue (ADR 0046 §2).
                 if !checks.is_empty() {
-                    let ids: Vec<String> = checks.iter().map(|e| e.id.clone()).collect();
+                    let ids: Vec<String> = checks.iter().map(|c| c.event.id.clone()).collect();
                     info!("heartbeat: offering {} to check", count(ids.len(), "answer", "answers"));
                     text.push_str(&format!(
                         "\n\nAnswers waiting for a check (optional): check one where the tools of \
@@ -3279,7 +3336,26 @@ pub async fn run(
                          reason if not), or leave it:\n{}\n",
                         event_lines(&node, &ids).join("\n")
                     ));
-                    save_offered(&config.work_dir, read_offered(&config.work_dir), &ids);
+                    let volatile: Vec<String> = checks
+                        .iter()
+                        .filter_map(|c| {
+                            c.as_of.map(|t| {
+                                format!("- {} (valid as of {})", c.event.id, crate::signals::day(t))
+                            })
+                        })
+                        .collect();
+                    if !volatile.is_empty() {
+                        text.push_str(&format!(
+                            "Volatile among them (a current state, near or past its expiry): \
+                             check the state today. If it still holds, react with value 1, \
+                             `data.refresh` true and `data.evidence`: that renews it. If not, \
+                             answer its ask anew with `refs` to it, and comment on it with \
+                             `data.outdated` true:\n{}\n",
+                            volatile.join("\n")
+                        ));
+                    }
+                    let keys: Vec<String> = checks.iter().map(|c| c.offered.clone()).collect();
+                    save_offered(&config.work_dir, read_offered(&config.work_dir), &keys);
                 }
                 if let Some(note) = unattached.take() {
                     text.push_str(&format!("\n\n{note}\n"));

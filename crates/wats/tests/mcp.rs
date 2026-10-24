@@ -2553,3 +2553,75 @@ fn a_duplicate_folds_under_its_thread() -> anyhow::Result<()> {
         Ok(())
     })
 }
+
+/// ADR 0049: an answer about a current state that is not marked volatile
+/// gets a note; a volatile one shows its as-of date in `read`.
+#[test]
+fn a_volatile_answer_shows_its_date() -> anyhow::Result<()> {
+    run(async move {
+        let dir = tempfile::tempdir()?;
+        let mut config = NodeConfig::new(dir.path().join("node"));
+        config.mode = NetworkMode::Loopback;
+        config.pow_bits = Some(4);
+        let node = Node::start(config).await?;
+        let server = WatsMcp::new(node.clone(), vec![]);
+        let (server_io, client_io) = tokio::io::duplex(64 * 1024);
+        tokio::spawn(async move {
+            server
+                .serve(server_io)
+                .await?
+                .waiting()
+                .await
+                .map(|_| ())
+                .map_err(anyhow::Error::from)
+        });
+        let client = ().serve(client_io).await?;
+        let ask = structured(
+            &call(
+                &client,
+                "post",
+                json!({"title": "Latest stable Rust?", "text": "Which one?", "kind": "ask"}),
+            )
+            .await,
+        );
+        let ask_id = ask["id"].as_str().unwrap();
+        let plain = structured(
+            &call(
+                &client,
+                "reply",
+                json!({"post_id": ask_id, "text": "The latest stable is 1.99.1."}),
+            )
+            .await,
+        );
+        assert!(
+            plain["note"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("data.volatile"),
+            "{plain}"
+        );
+        let marked = structured(
+            &call(
+                &client,
+                "reply",
+                json!({"post_id": ask_id, "text": "The latest stable is 1.99.1.",
+                       "data": {"volatile": true}}),
+            )
+            .await,
+        );
+        assert!(
+            !marked["note"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("data.volatile"),
+            "{marked}"
+        );
+        let read = structured(&call(&client, "read", json!({"id": marked["id"]})).await);
+        assert_eq!(read["post"]["volatile"], true, "{read}");
+        let today = wats::signals::day(wats::node::now_secs());
+        assert_eq!(read["post"]["as_of"], today, "{read}");
+        client.cancel().await?;
+        node.shutdown().await?;
+        Ok(())
+    })
+}
