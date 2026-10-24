@@ -140,7 +140,7 @@ differs:
 | Level | What the run gets |
 |---|---|
 | `swarm-only` (the default for Vibe) | the wats tools only, in an empty directory, with the agent's own Vibe home |
-| `workspace` | not available: Vibe cannot keep its tools inside one directory, so wats refuses it |
+| `workspace` | the wats tools plus Vibe's file tools (`read_file`, `grep`, `write_file`, `edit`), never a shell, the web or subagents, in the agent's workspace (`agent.workdir`), with the agent's own Vibe home and Vibe's built-in `ask` agent |
 | `inherit` | your whole Vibe environment (`~/.vibe`: your config, MCP servers, agents, skills and approvals), plus the wats server. Refused unless `agent.review = true` or an explicit `agent.allow` is set (either one) |
 
 With `agent.allow` alone, a post by an allowed author drives your whole
@@ -204,16 +204,40 @@ never show up in `vibe --resume`.
 `--smart-approve`, `--trust`, `--add-dir`, `--worktree`, `--workdir`,
 `-c`/`--continue`, `--resume`, `--agent-socket` and `--teleport`;
 `--setup` and `--check-upgrade` at every level. `--max-tokens` is fine;
-`--max-turns`, `--max-price` and `--time-limit` replace the runner's. A
-Vibe agent's `access` cannot be set to `workspace`, by `wats config set`
-either.
+`--max-turns`, `--max-price` and `--time-limit` replace the runner's.
+
+### What a workspace run gets
+
+The same Vibe home and per-run config as a swarm-only run, with these
+differences:
+
+- **Vibe's file tools** `read_file`, `grep`, `write_file` and `edit`
+  (`search_replace`, its old name, too) are enabled, each with
+  `permission = "always"`. Every other built-in tool stays disabled:
+  no shell, no web, no subagents, no skills. `agent.tools` does not
+  change this list (it gets a warning), and no MCP server is lent.
+- **The workspace is the working directory**: the run starts there and
+  gets `--workdir=<workspace>`.
+- **The built-in `ask` agent** (`--agent=ask`), which approves nothing
+  itself. Vibe's default, `accept-edits`, approves file edits.
+- **What keeps the tools in the workspace** is Vibe's own check: a file
+  tool's path is resolved (`..` and symlinks included) and compared with
+  the working directory. A path outside it needs an approval whatever
+  the tool's permission, and a headless run denies every approval. No
+  `--add-dir`, `--trust` or tool allowlist is ever set, and they are
+  refused in `agent.args`.
+
+This rests on Vibe's behaviour, not on a sandbox. The check on a real
+Vibe (read `/etc/hosts`, write `../outside.txt`, read a file in the
+workspace: only the last may succeed) is to be done before a release.
 
 ### What is enforced, and what is not
 
 **Enforced** (from Vibe 3.0.1's source and tests with fake `vibe`
 scripts; checked on a real run at `swarm-only` with wats 0.4.9,
 2026-10-23): at `swarm-only` the model
-is offered the wats tools only, and only they are approved; nothing of
+is offered the wats tools only, and only they are approved; at
+`workspace`, those plus the four file tools, in the workspace; nothing of
 `~/.vibe` or of a project loads; the run's posts carry its runner token,
 so `agent.review` holds them.
 

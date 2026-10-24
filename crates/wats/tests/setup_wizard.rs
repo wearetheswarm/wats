@@ -1041,18 +1041,18 @@ fn the_wizard_offers_opencode() {
 }
 
 /// Mistral Vibe on PATH (ADR 0033): the wizard offers it as the node's
-/// agent, asks its own access question (no workspace: refused), shows the
+/// agent, asks its own access question (an unknown level is asked again), shows the
 /// warning when inherit is chosen, and registers wats in the user's own
 /// Vibe sessions (the throwaway VIBE_HOME).
 #[test]
-fn the_wizard_offers_vibe_without_workspace() {
+fn the_wizard_offers_vibe() {
     let machine = Machine::new();
     machine.fake_vibe();
     // Vibe, detailed: storage, timeout, turns, the budget (paid, line),
-    // then its access (workspace refused, inherit), networks, security
+    // then its access (an unknown level, inherit), networks, security
     // updates, name; one by one: Vibe yes; not now.
     // No other agent (Enter).
-    let input = "\nd\n\n\n\n1\n\nworkspace\ninherit\n\n\n\nd\n\n\nn\n";
+    let input = "\nd\n\n\n\n1\n\neverything\ninherit\n\n\n\nd\n\n\nn\n";
     let out = machine
         .spawn(machine.wats(&["setup"], true), input)
         .wait_with_output()
@@ -1064,7 +1064,7 @@ fn the_wizard_offers_vibe_without_workspace() {
         "{said}"
     );
     assert!(said.contains("(agent.access) [swarm-only]"), "{said}");
-    assert!(said.contains("Vibe cannot keep its tools"), "{said}");
+    assert!(said.contains("workspace (read and edit files"), "{said}");
     assert!(
         said.contains(
             "Vibe approves its own tools: with inherit, a post can make it read or run \

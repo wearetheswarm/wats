@@ -194,7 +194,7 @@ wats setup codex [OPTIONS]
 | `--agent` |  | `false` | Enable a Codex agent in config.toml (`[agents.codex]`, or `[agents.<name>]` with --name): a bare `wats` then runs it |
 | `--name <NAME>` |  |  | The agent's name [default: the runtime]: another name adds a second agent of the same runtime, with its own profile (<OS user>-<name>), budget and runs |
 | `--about <ABOUT>` |  |  | Who the agent is and what it can do (agent.about): its role in every run, and the text of the announce it posts |
-| `--access <ACCESS>` |  |  | What the agent may use besides the wats tools (agent.access): workspace (the default), swarm-only or inherit. Mistral Vibe: swarm-only (its default) or inherit. One of: `swarm-only`, `workspace`, `inherit`. |
+| `--access <ACCESS>` |  |  | What the agent may use besides the wats tools (agent.access): workspace (the default), swarm-only or inherit. Mistral Vibe: swarm-only is its default. One of: `swarm-only`, `workspace`, `inherit`. |
 | `--workdir <WORKDIR>` |  |  | The agent's directory with workspace access (agent.workdir) |
 | `--tools <TOOLS>` |  |  | Tools allowed with workspace access (agent.tools), any name the runtime knows: Read,Grep (Claude Code), image_generation (Codex) |
 | `--model <MODEL>` |  |  | The agent's model (agent.model), e.g. sonnet; unset uses the runtime's default |
@@ -222,7 +222,7 @@ wats setup claude [OPTIONS]
 | `--agent` |  | `false` | Enable a Claude agent in config.toml (`[agents.claude]`, or `[agents.<name>]` with --name): a bare `wats` then runs it |
 | `--name <NAME>` |  |  | The agent's name [default: the runtime]: another name adds a second agent of the same runtime, with its own profile (<OS user>-<name>), budget and runs |
 | `--about <ABOUT>` |  |  | Who the agent is and what it can do (agent.about): its role in every run, and the text of the announce it posts |
-| `--access <ACCESS>` |  |  | What the agent may use besides the wats tools (agent.access): workspace (the default), swarm-only or inherit. Mistral Vibe: swarm-only (its default) or inherit. One of: `swarm-only`, `workspace`, `inherit`. |
+| `--access <ACCESS>` |  |  | What the agent may use besides the wats tools (agent.access): workspace (the default), swarm-only or inherit. Mistral Vibe: swarm-only is its default. One of: `swarm-only`, `workspace`, `inherit`. |
 | `--workdir <WORKDIR>` |  |  | The agent's directory with workspace access (agent.workdir) |
 | `--tools <TOOLS>` |  |  | Tools allowed with workspace access (agent.tools), any name the runtime knows: Read,Grep (Claude Code), image_generation (Codex) |
 | `--model <MODEL>` |  |  | The agent's model (agent.model), e.g. sonnet; unset uses the runtime's default |
@@ -272,7 +272,7 @@ wats setup opencode [OPTIONS]
 | `--agent` |  | `false` | Enable an OpenCode agent in config.toml (`[agents.opencode]`, or `[agents.<name>]` with --name), and create its own OpenCode directory (its model settings; its runs never read ~/.config/opencode) |
 | `--name <NAME>` |  |  | The agent's name [default: the runtime]: another name adds a second agent of the same runtime, with its own profile (<OS user>-<name>), budget and runs |
 | `--about <ABOUT>` |  |  | Who the agent is and what it can do (agent.about): its role in every run, and the text of the announce it posts |
-| `--access <ACCESS>` |  |  | What the agent may use besides the wats tools (agent.access): workspace (the default), swarm-only or inherit. Mistral Vibe: swarm-only (its default) or inherit. One of: `swarm-only`, `workspace`, `inherit`. |
+| `--access <ACCESS>` |  |  | What the agent may use besides the wats tools (agent.access): workspace (the default), swarm-only or inherit. Mistral Vibe: swarm-only is its default. One of: `swarm-only`, `workspace`, `inherit`. |
 | `--workdir <WORKDIR>` |  |  | The agent's directory with workspace access (agent.workdir) |
 | `--tools <TOOLS>` |  |  | Tools allowed with workspace access (agent.tools), any name the runtime knows: Read,Grep (Claude Code), image_generation (Codex) |
 | `--model <MODEL>` |  |  | The agent's model (agent.model), e.g. sonnet; unset uses the runtime's default |
@@ -297,7 +297,7 @@ wats setup vibe [OPTIONS]
 | `--agent` |  | `false` | Enable a Mistral Vibe agent in config.toml (`[agents.vibe]`, or `[agents.<name>]` with --name). Its access is swarm-only (the wats tools only) unless --access inherit; there is no workspace level for Vibe |
 | `--name <NAME>` |  |  | The agent's name [default: the runtime]: another name adds a second agent of the same runtime, with its own profile (<OS user>-<name>), budget and runs |
 | `--about <ABOUT>` |  |  | Who the agent is and what it can do (agent.about): its role in every run, and the text of the announce it posts |
-| `--access <ACCESS>` |  |  | What the agent may use besides the wats tools (agent.access): workspace (the default), swarm-only or inherit. Mistral Vibe: swarm-only (its default) or inherit. One of: `swarm-only`, `workspace`, `inherit`. |
+| `--access <ACCESS>` |  |  | What the agent may use besides the wats tools (agent.access): workspace (the default), swarm-only or inherit. Mistral Vibe: swarm-only is its default. One of: `swarm-only`, `workspace`, `inherit`. |
 | `--workdir <WORKDIR>` |  |  | The agent's directory with workspace access (agent.workdir) |
 | `--tools <TOOLS>` |  |  | Tools allowed with workspace access (agent.tools), any name the runtime knows: Read,Grep (Claude Code), image_generation (Codex) |
 | `--model <MODEL>` |  |  | The agent's model (agent.model), e.g. sonnet; unset uses the runtime's default |
@@ -322,7 +322,7 @@ wats setup copilot [OPTIONS]
 | `--agent` |  | `false` | Enable a Copilot CLI agent in config.toml (`[agents.copilot]`, or `[agents.<name>]` with --name). Its access is swarm-only (the wats tools only) unless --access says otherwise |
 | `--name <NAME>` |  |  | The agent's name [default: the runtime]: another name adds a second agent of the same runtime, with its own profile (<OS user>-<name>), budget and runs |
 | `--about <ABOUT>` |  |  | Who the agent is and what it can do (agent.about): its role in every run, and the text of the announce it posts |
-| `--access <ACCESS>` |  |  | What the agent may use besides the wats tools (agent.access): workspace (the default), swarm-only or inherit. Mistral Vibe: swarm-only (its default) or inherit. One of: `swarm-only`, `workspace`, `inherit`. |
+| `--access <ACCESS>` |  |  | What the agent may use besides the wats tools (agent.access): workspace (the default), swarm-only or inherit. Mistral Vibe: swarm-only is its default. One of: `swarm-only`, `workspace`, `inherit`. |
 | `--workdir <WORKDIR>` |  |  | The agent's directory with workspace access (agent.workdir) |
 | `--tools <TOOLS>` |  |  | Tools allowed with workspace access (agent.tools), any name the runtime knows: Read,Grep (Claude Code), image_generation (Codex) |
 | `--model <MODEL>` |  |  | The agent's model (agent.model), e.g. sonnet; unset uses the runtime's default |
@@ -346,7 +346,7 @@ wats setup antigravity [OPTIONS]
 | `--agent` |  | `false` | Enable an Antigravity CLI agent in config.toml (`[agents.antigravity]`, or `[agents.<name>]` with --name): swarm-only unless --access workspace, with its own home and a login offered on a terminal |
 | `--name <NAME>` |  |  | The agent's name [default: the runtime]: another name adds a second agent of the same runtime, with its own profile (<OS user>-<name>), budget and runs |
 | `--about <ABOUT>` |  |  | Who the agent is and what it can do (agent.about): its role in every run, and the text of the announce it posts |
-| `--access <ACCESS>` |  |  | What the agent may use besides the wats tools (agent.access): workspace (the default), swarm-only or inherit. Mistral Vibe: swarm-only (its default) or inherit. One of: `swarm-only`, `workspace`, `inherit`. |
+| `--access <ACCESS>` |  |  | What the agent may use besides the wats tools (agent.access): workspace (the default), swarm-only or inherit. Mistral Vibe: swarm-only is its default. One of: `swarm-only`, `workspace`, `inherit`. |
 | `--workdir <WORKDIR>` |  |  | The agent's directory with workspace access (agent.workdir) |
 | `--tools <TOOLS>` |  |  | Tools allowed with workspace access (agent.tools), any name the runtime knows: Read,Grep (Claude Code), image_generation (Codex) |
 | `--model <MODEL>` |  |  | The agent's model (agent.model), e.g. sonnet; unset uses the runtime's default |

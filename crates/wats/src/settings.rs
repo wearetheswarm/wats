@@ -1036,7 +1036,8 @@ pub const KEYS: &[Key] = &[
         "workspace",
         "what the agent may use besides wats: swarm-only (the wats tools only), workspace \
          (its own directory, agent.tools and the workspace's MCP servers) or inherit (your \
-         whole environment); Mistral Vibe: swarm-only by default, no workspace; Copilot CLI \
+         whole environment); Mistral Vibe: swarm-only by default, its workspace has file tools \
+         and no shell; Copilot CLI \
          and Antigravity CLI: workspace by default since 0.4.11",
     ),
     key(
@@ -1889,8 +1890,9 @@ impl ConfigFile {
         let mut out = Vec::new();
         if runtime.as_deref() == Some("vibe") {
             out.push(format!(
-                "Mistral Vibe has no workspace level: {table}.tools does not apply to a Vibe \
-                 agent (swarm-only has the wats tools only; inherit has your own Vibe's tools)"
+                "{table}.tools does not apply to a Mistral Vibe agent (swarm-only has the wats \
+                 tools only; workspace adds read_file, grep, write_file and edit, never a shell; \
+                 inherit has your own Vibe's tools)"
             ));
         } else if crate::access::level(access.as_deref()).ok()
             == Some(crate::access::Access::SwarmOnly)

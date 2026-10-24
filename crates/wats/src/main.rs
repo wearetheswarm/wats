@@ -966,7 +966,7 @@ struct SetupKeys {
     about: Option<String>,
     /// What the agent may use besides the wats tools (agent.access):
     /// workspace (the default), swarm-only or inherit. Mistral Vibe:
-    /// swarm-only (its default) or inherit.
+    /// swarm-only is its default.
     #[arg(long, value_parser = wats::access::value_parser())]
     access: Option<String>,
     /// The agent's directory with workspace access (agent.workdir).
@@ -2531,12 +2531,13 @@ fn setup_tool(
         wats::antigravity::access(keys.access.as_deref())?;
     }
     if runtime == "vibe" {
-        // Checked before anything is written: no workspace for Vibe.
+        // Checked before anything is written.
         wats::vibe::access(keys.access.as_deref())?;
         anyhow::ensure!(
-            keys.workdir.is_none() && keys.tools.is_none(),
-            "--workdir and --tools are for the workspace level, which Mistral Vibe does not \
-             have"
+            keys.tools.is_none(),
+            "--tools does not apply to Mistral Vibe: at workspace, its runs get {} and the wats \
+             tools, never a shell",
+            wats::vibe::workspace_tools().join(", ")
         );
         if let Some(model) = &keys.model {
             wats::vibe::check_model(model.trim())?;
@@ -2751,11 +2752,19 @@ fn setup_tool(
                     eprintln!("warning: {e:#}");
                 }
             } else {
+                let level = if access == wats::access::Access::Workspace {
+                    format!(
+                        "workspace, the wats tools plus {} (no shell)",
+                        wats::vibe::workspace_tools().join(", ")
+                    )
+                } else {
+                    "swarm-only, the wats tools only".to_string()
+                };
                 println!(
-                    "Mistral Vibe agent: swarm-only, the wats tools only. Its runs use their own \
-                     Vibe home, {}, not ~/.vibe; your API key is found in your OS keyring \
-                     (`vibe --setup`) or in MISTRAL_API_KEY in the node's environment (a key \
-                     kept only in ~/.vibe/.env is not read).",
+                    "Mistral Vibe agent: {level}. Its runs use their own Vibe home, {}, not \
+                     ~/.vibe; your API key is found in your OS keyring (`vibe --setup`) or in \
+                     MISTRAL_API_KEY in the node's environment (a key kept only in \
+                     ~/.vibe/.env is not read).",
                     wats::vibe::agent_home(&member.work_dir).display()
                 );
             }
@@ -4335,8 +4344,8 @@ fn config_command(node: &NodeArgs, data_dir: &std::path::Path, action: ConfigAct
             {
                 wats::access::check_workdir(&data_dir.join(&value), data_dir)?;
             }
-            // A Vibe agent has no workspace level (ADR 0033): refused here
-            // too, whichever of the two keys is set last.
+            // A Vibe agent's level is checked (ADR 0033), whichever of the
+            // two keys is set last.
             if let Some((table, leaf @ ("access" | "runtime"))) = key.rsplit_once('.')
                 && (table == "agent" || table.starts_with("agents."))
             {

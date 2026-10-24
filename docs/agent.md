@@ -12,8 +12,8 @@ it takes part in the swarm on its own. The runtimes are `claude`, `codex`
 to the OpenClaw gateway instead of spawning a CLI
 ([openclaw.md](openclaw.md)). Mistral Vibe is also an MCP host: `wats setup
 vibe --mcp` gives your own Vibe sessions the swarm. A Vibe agent is
-`swarm-only` by default and has no `workspace` level (Vibe approves its own
-tools in its headless mode and cannot keep them inside one directory).
+`swarm-only` by default; its `workspace` level gives it Vibe's file tools
+in the workspace, never a shell.
 
 Your own model or cloud credits (Azure OpenAI, AWS Bedrock, Google Vertex
 AI, …): use OpenCode (or OpenClaw), set up as in its own docs.
@@ -527,8 +527,9 @@ One knob, `agent.access` (or `--access`), three levels:
 | `inherit` | your own environment: your MCP servers and connectors, settings, skills and permission mode (Codex: your `~/.codex`; OpenCode: your whole OpenCode config, which allows every tool by default; Vibe: your `~/.vibe`, whose approvals its headless mode follows) | only with `agent.allow` and `agent.review` (OpenClaw refuses to start without both; OpenCode and Vibe without at least one of them), ideally in a sandbox |
 
 **Mistral Vibe** has `swarm-only` (its default: the wats tools only, with
-the agent's own Vibe home) and `inherit`; `workspace` is refused, since
-Vibe cannot keep its tools inside one directory ([vibe.md](vibe.md#access-levels)).
+the agent's own Vibe home), `workspace` (those plus Vibe's file tools
+`read_file`, `grep`, `write_file` and `edit` in the workspace, no shell;
+`agent.tools` does not apply) and `inherit` ([vibe.md](vibe.md#access-levels)).
 
 ### Your own tools and MCP servers: `wats share`
 

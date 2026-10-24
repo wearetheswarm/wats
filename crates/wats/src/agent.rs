@@ -1243,7 +1243,7 @@ fn prepare_command(
             } else {
                 vibe::write_run_config(
                     &vibe::agent_home(&config.work_dir),
-                    &vibe::run_config(&server),
+                    &vibe::run_config(&server, config.access),
                 )?;
                 for key in vibe::removed_env(std::env::vars_os()) {
                     command.env_remove(key);
@@ -1262,6 +1262,7 @@ fn prepare_command(
                     // The only runtime with a per-run token cap (ADR 0034).
                     max_tokens: remaining_tokens,
                     export_dir: &export_dir,
+                    workdir: &dir,
                     timeout: config.run_timeout,
                     extra: &config.extra_args,
                 }))
@@ -2431,15 +2432,10 @@ async fn check_opencode(config: &AgentConfig) -> Result<()> {
     Ok(())
 }
 
-/// Before a Mistral Vibe runner starts (ADR 0033): its version, the level
-/// (no `workspace`), the extra arguments and the model, the agent's own
-/// Vibe home, and where its runs find the API key.
+/// Before a Mistral Vibe runner starts (ADR 0033): its version, the extra
+/// arguments and the model, the agent's own Vibe home, and where its runs
+/// find the API key.
 async fn check_vibe(config: &AgentConfig) -> Result<()> {
-    anyhow::ensure!(
-        config.access != Access::Workspace,
-        "{}",
-        vibe::WORKSPACE_REFUSED
-    );
     let found = vibe::version(&config.command).await;
     if let Some(warning) = vibe::check_version(found)
         .with_context(|| format!("Mistral Vibe ({})", config.command.display()))?
@@ -2450,13 +2446,29 @@ async fn check_vibe(config: &AgentConfig) -> Result<()> {
     if let Some(model) = &config.model {
         vibe::check_model(model)?;
     }
-    if config.access == Access::SwarmOnly {
+    if config.access != Access::Inherit {
         let home = vibe::agent_home(&config.work_dir);
         std::fs::create_dir_all(&home).with_context(|| format!("create {}", home.display()))?;
+        let tools = if config.access == Access::Workspace {
+            format!(
+                "the wats tools plus {} in {}, no shell",
+                vibe::workspace_tools().join(", "),
+                config.workdir.display()
+            )
+        } else {
+            "the wats tools only".to_string()
+        };
         info!(
-            "Mistral Vibe runs use their own Vibe home {} (the wats tools only), not ~/.vibe",
+            "Mistral Vibe runs use their own Vibe home {} ({tools}), not ~/.vibe",
             home.display()
         );
+        if config.access == Access::Workspace && !config.tools.is_empty() {
+            warn!(
+                "agent.tools does not apply to a Mistral Vibe agent: at workspace, its runs get {} \
+                 and the wats tools, never a shell",
+                vibe::workspace_tools().join(", ")
+            );
+        }
         if std::env::var_os("MISTRAL_API_KEY").is_none() {
             info!(
                 "Mistral Vibe runs find your API key in your OS keyring (`vibe --setup`), or in \

@@ -73,9 +73,10 @@ agents, register wats as its MCP server: wats setup openclaw --mcp";
 pub const VIBE_MCP_HINT: &str = "Mistral Vibe found: to reach the swarm from your Vibe \
 sessions, add wats as its MCP server: wats setup vibe --mcp";
 
-/// The access question for Mistral Vibe (ADR 0033): no `workspace`.
+/// The access question for Mistral Vibe (ADR 0033): swarm-only first.
 pub const VIBE_ACCESS_QUESTION: &str = "What the agent may use besides the wats tools: \
-swarm-only, or inherit (your whole Vibe environment; Vibe has no workspace level)";
+swarm-only, workspace (read and edit files in its workspace, no shell), or inherit (your \
+whole Vibe environment)";
 
 /// Shown by setup when OpenClaw is the node's agent: the gateway side is
 /// set up apart (tokens, MCP entries, the config block to paste).
@@ -479,7 +480,8 @@ fn ask(
 }
 
 /// The access level of a Vibe agent: swarm-only (the default, or the
-/// current level) or inherit, which is followed by its warning.
+/// current level), workspace, or inherit, which is followed by its
+/// warning.
 fn ask_vibe_access(
     input: &mut impl BufRead,
     out: &mut impl Write,
@@ -892,7 +894,7 @@ fn ask_mode(
             }
         ));
         if runtime == Some("vibe") {
-            // Vibe refuses workspace: unset is swarm-only.
+            // Unset is swarm-only for Vibe.
             let access = current(settings, table, "agent.access")
                 .filter(|v| crate::vibe::access(Some(v)).is_ok())
                 .unwrap_or_else(|| "swarm-only".to_string());
@@ -2877,11 +2879,11 @@ mod tests {
     }
 
     /// Mistral Vibe on PATH (looked up, never run) is a runtime (ADR
-    /// 0033): offered as the agent, with its own access question (no
-    /// workspace, swarm-only by default, inherit with its warning).
+    /// 0033): offered as the agent, with its own access question
+    /// (swarm-only by default, inherit with its warning).
     #[cfg(unix)]
     #[test]
-    fn vibe_is_a_runtime_without_workspace() {
+    fn vibe_is_a_runtime_with_its_own_access_question() {
         let bin = tempfile::tempdir().unwrap();
         let vibe = fake_cli(bin.path(), "vibe");
         let path = std::env::join_paths([bin.path()]).unwrap();
@@ -2933,10 +2935,11 @@ mod tests {
         let config = std::fs::read_to_string(data.path().join(FILE_NAME)).unwrap();
         assert!(config.contains("[agents.vibe]"), "{config}");
         assert!(config.contains("access = \"swarm-only\""), "{config}");
-        // workspace is refused, inherit is taken, with its warning.
+        // An unknown level is asked again, inherit is taken, with its
+        // warning.
         let data = tempfile::tempdir().unwrap();
         let mut out = Vec::new();
-        let input = "vibe\nd\n\n\n\n1\n\nworkspace\ninherit\n";
+        let input = "vibe\nd\n\n\n\n1\n\neverything\ninherit\n";
         let choices = setup_with(
             data.path(),
             &mut input.as_bytes(),
@@ -2947,7 +2950,7 @@ mod tests {
         .unwrap();
         let said = String::from_utf8(out).unwrap();
         assert_eq!(choices.runtime.as_deref(), Some("vibe"));
-        assert!(said.contains("Vibe cannot keep its tools"), "{said}");
+        assert_eq!(said.matches(VIBE_ACCESS_QUESTION).count(), 2, "{said}");
         assert!(said.contains(crate::vibe::INHERIT_WARNING), "{said}");
         assert!(said.contains("agent.review = true"), "{said}");
         let config = std::fs::read_to_string(data.path().join(FILE_NAME)).unwrap();

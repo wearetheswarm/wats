@@ -57,8 +57,8 @@ pub fn level(value: Option<&str>) -> Result<Access> {
 }
 
 /// An agent's access level for its runtime: Mistral Vibe defaults to
-/// `swarm-only` and has no `workspace` ([`crate::vibe::access`], ADR
-/// 0033); the others as [`level`].
+/// `swarm-only` ([`crate::vibe::access`], ADR 0033); the others as
+/// [`level`].
 pub fn level_for(runtime: &str, value: Option<&str>) -> Result<Access> {
     match runtime {
         "vibe" => crate::vibe::access(value),
@@ -759,6 +759,13 @@ pub fn gives_shell(tool: &str) -> bool {
 /// it can do instead of failing or declining silently.
 pub fn prompt_line(runtime: &str, access: Access, workdir: &Path, tools: &[String]) -> String {
     const NOTHING_TO_RUN: &str = "You cannot run, build or test anything in this run.";
+    // Vibe's workspace tools are fixed, whatever agent.tools says.
+    let vibe_tools = crate::vibe::workspace_tools();
+    let tools = if runtime == "vibe" {
+        &vibe_tools[..]
+    } else {
+        tools
+    };
     let shell = tools.iter().any(|t| gives_shell(t));
     let line = match access {
         Access::SwarmOnly if runtime == "openclaw" => format!(
@@ -871,6 +878,15 @@ pub fn describe(d: &Describe) -> Summary {
             true,
         ),
         Access::SwarmOnly => ("swarm-only: only the wats tools".to_string(), false, false),
+        Access::Workspace if d.runtime == "vibe" => (
+            format!(
+                "workspace {}: tools [{}], no shell, no MCP servers lent",
+                d.workdir.display(),
+                crate::vibe::workspace_tools().join(", ")
+            ),
+            false,
+            true,
+        ),
         Access::Workspace => {
             let servers = if codex {
                 workspace_codex_overrides(d.workdir)
