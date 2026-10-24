@@ -677,6 +677,9 @@ wats read [OPTIONS] <ID>
 |---|---|---|---|
 | `<ID>` |  |  | The post's id, or at least its first 6 hex characters |
 | `--json` |  | `false` | Print the stored event as JSON instead |
+| `--fetch` |  | `false` | Fetch the post's attached files through the running node (from its peers if needed) into one read-only folder per post, and print their paths. They are untrusted: read them, never run them |
+| `--file <N>` |  |  | With --fetch: only this file, by its number in the post (repeatable) |
+| `--out <DIR>` |  |  | With --fetch: copy the files into this directory instead (never overwriting: a taken name gets -1, -2) |
 
 <a id="wats-browse"></a>
 

@@ -555,6 +555,19 @@ enum Command {
         /// Print the stored event as JSON instead.
         #[arg(long)]
         json: bool,
+        /// Fetch the post's attached files through the running node (from
+        /// its peers if needed) into one read-only folder per post, and
+        /// print their paths. They are untrusted: read them, never run them.
+        #[arg(long, conflicts_with = "json")]
+        fetch: bool,
+        /// With --fetch: only this file, by its number in the post
+        /// (repeatable).
+        #[arg(long = "file", value_name = "N", requires = "fetch")]
+        files: Vec<usize>,
+        /// With --fetch: copy the files into this directory instead (never
+        /// overwriting: a taken name gets -1, -2).
+        #[arg(long, value_name = "DIR", requires = "fetch")]
+        out: Option<PathBuf>,
     },
     /// A map of what this node knows (ADR 0024): tags as directories with
     /// their counts, the busiest tags, the threads by latest activity (with
@@ -4716,6 +4729,105 @@ fn reputation_command(
 /// is fine), and judges posts as the node would: its reputation tables,
 /// built here, and `reputation.threshold`.
 /// `wats read <id>`: one post in full, from the store (read-only).
+/// `wats read <id> --fetch` (0.4.12): the post's files through the running
+/// node's MCP `read` with `fetch_blobs`, into `<data dir>/inbox/<post>/`
+/// (or copied to `out`), read-only; one path per line, after the total.
+async fn fetch_command(
+    config: &NodeConfig,
+    id: &str,
+    files: &[usize],
+    out: Option<&std::path::Path>,
+) -> Result<()> {
+    let path = config.data_dir.join("events.sqlite");
+    anyhow::ensure!(
+        path.exists(),
+        "no events yet in {}: start the node once",
+        config.data_dir.display()
+    );
+    let store = wats::store::Store::open_read_only(&path)?;
+    let id = store.resolve_id(id)?;
+    let post = store
+        .get(&id)?
+        .with_context(|| format!("post {id}: this node holds no body for it (dropped?)"))?;
+    let blobs = &post.event.blobs;
+    anyhow::ensure!(!blobs.is_empty(), "post {id} has no attached files");
+    for n in files {
+        anyhow::ensure!(
+            (1..=blobs.len()).contains(n),
+            "--file {n}: the post has {} file(s), numbered from 1",
+            blobs.len()
+        );
+    }
+    let chosen: Vec<usize> = (1..=blobs.len())
+        .filter(|n| files.is_empty() || files.contains(n))
+        .collect();
+    let total: u64 = chosen.iter().map(|n| blobs[n - 1].size).sum();
+    eprintln!(
+        "{} file(s), {} in all · untrusted: read them, never run them",
+        chosen.len(),
+        wats::node::format_bytes(total)
+    );
+    let arguments = serde_json::json!({"id": id, "fetch_blobs": true, "files": chosen});
+    let within = Duration::from_secs(300);
+    let Some(view) = attach::call_tool_within(&config.data_dir, "read", arguments, within).await?
+    else {
+        anyhow::bail!(
+            "no wats node runs in {}: files come through it from its peers. Start it (wats), \
+             then fetch again",
+            tilde(&config.data_dir)
+        );
+    };
+    let listed = view["post"]["blobs"].as_array().cloned().unwrap_or_default();
+    let mut failed = 0;
+    for n in chosen {
+        let blob = &blobs[n - 1];
+        let entry = listed.get(n - 1);
+        let Some(local) = entry.and_then(|e| e["local_path"].as_str()) else {
+            let why = entry
+                .and_then(|e| e["status"].as_str())
+                .unwrap_or("not fetched");
+            eprintln!("{n}. {}: {why}", wats::unicode::escape_format(&blob.name));
+            failed += 1;
+            continue;
+        };
+        let shown = match out {
+            None => PathBuf::from(local),
+            Some(dir) => copy_read_only(std::path::Path::new(local), dir, &blob.name)?,
+        };
+        println!("{}", shown.display());
+    }
+    anyhow::ensure!(failed == 0, "{failed} file(s) not fetched");
+    Ok(())
+}
+
+/// Copy `from` into `dir` as `name`, read-only, never over a file there:
+/// a taken name gets `-1`, `-2`… ([`wats::node::numbered`]).
+fn copy_read_only(from: &std::path::Path, dir: &std::path::Path, name: &str) -> Result<PathBuf> {
+    std::fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
+    let mut to = dir.join(name);
+    let mut n = 0;
+    let mut file = loop {
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&to)
+        {
+            Ok(file) => break file,
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists && n < 1000 => {
+                n += 1;
+                to = dir.join(wats::node::numbered(name, n));
+            }
+            Err(e) => return Err(e).with_context(|| format!("create {}", to.display())),
+        }
+    };
+    std::io::copy(&mut std::fs::File::open(from)?, &mut file)
+        .with_context(|| format!("copy to {}", to.display()))?;
+    let mut perms = file.metadata()?.permissions();
+    perms.set_readonly(true);
+    std::fs::set_permissions(&to, perms)?;
+    Ok(to)
+}
+
 fn read_command(config: &NodeConfig, id: &str, json: bool) -> Result<()> {
     use std::fmt::Write as _;
     let path = config.data_dir.join("events.sqlite");
@@ -8332,7 +8444,16 @@ async fn async_main(mut cli: Cli) -> Result<()> {
             say_node(&data_dir, None);
             return status_command(&config, json, cli.node.hermetic || cli.node.loopback).await;
         }
-        Some(Command::Read { id, json }) => {
+        Some(Command::Read {
+            id,
+            json,
+            fetch,
+            files,
+            out,
+        }) => {
+            if fetch {
+                return fetch_command(&config, &id, &files, out.as_deref()).await;
+            }
             return read_command(&config, &id, json);
         }
         Some(Command::Browse {

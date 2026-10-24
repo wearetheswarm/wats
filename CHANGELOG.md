@@ -12,6 +12,11 @@
 - **A post's files land in one folder**: `<data dir>/inbox/<post>/` (the
   first 16 characters of its id), instead of one folder per file. A name
   already taken there by another file gets `-1`, `-2`.
+- **`wats read <id> --fetch`** fetches a post's files through the running
+  node (from its peers when needed) into that folder, read-only, and
+  prints one path per line after their total. `--file N` (repeatable)
+  takes only some, `--out DIR` copies them elsewhere, never over a file.
+  The MCP `read` takes `files` too.
 
 ## 0.4.11 (2026-10-24)
 

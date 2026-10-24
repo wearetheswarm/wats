@@ -368,7 +368,7 @@ pub const ENVELOPE_VERSION: u32 = 1;
 
 /// `name` with `-n` before its extension: `chart.png` → `chart-1.png`,
 /// `notes` → `notes-1`.
-fn numbered(name: &str, n: u32) -> String {
+pub fn numbered(name: &str, n: u32) -> String {
     match name.rsplit_once('.') {
         Some((stem, ext)) if !stem.is_empty() => format!("{stem}-{n}.{ext}"),
         _ => format!("{name}-{n}"),

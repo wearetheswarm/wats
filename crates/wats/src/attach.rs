@@ -1176,6 +1176,23 @@ pub async fn call_tool(
     tool: &str,
     arguments: serde_json::Value,
 ) -> Result<Option<serde_json::Value>> {
+    call_tool_within(
+        data_dir,
+        tool,
+        arguments,
+        std::time::Duration::from_secs(10),
+    )
+    .await
+}
+
+/// [`call_tool`], waiting up to `within` for the answer (a fetch of files
+/// from peers takes longer than a status).
+pub async fn call_tool_within(
+    data_dir: &Path,
+    tool: &str,
+    arguments: serde_json::Value,
+    within: std::time::Duration,
+) -> Result<Option<serde_json::Value>> {
     use serde_json::json;
     let Ok(stream) = tokio::net::UnixStream::connect(socket_path(data_dir)).await else {
         return Ok(None);
@@ -1233,13 +1250,20 @@ pub async fn call_tool(
                 if result["isError"] == true {
                     bail!("{tool}: {}", result["content"][0]["text"]);
                 }
+                // Tools that answer with JSON text only: that text.
+                if result["structuredContent"].is_null()
+                    && let Some(text) = result["content"][0]["text"].as_str()
+                    && let Ok(value) = serde_json::from_str(text)
+                {
+                    return Ok(value);
+                }
                 return Ok(result["structuredContent"].clone());
             }
         }
     };
-    tokio::time::timeout(std::time::Duration::from_secs(10), exchange)
+    tokio::time::timeout(within, exchange)
         .await
-        .context("the node did not answer within 10 s")?
+        .with_context(|| format!("the node did not answer within {} s", within.as_secs()))?
         .map(Some)
 }
 
@@ -1248,6 +1272,16 @@ pub async fn call_tool(
     _: &Path,
     _: &str,
     _: serde_json::Value,
+) -> Result<Option<serde_json::Value>> {
+    Ok(None)
+}
+
+#[cfg(not(unix))]
+pub async fn call_tool_within(
+    _: &Path,
+    _: &str,
+    _: serde_json::Value,
+    _: std::time::Duration,
 ) -> Result<Option<serde_json::Value>> {
     Ok(None)
 }
