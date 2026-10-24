@@ -22,12 +22,15 @@
 
 ### Changes
 
-- **`read` ranks a thread and pages it**: the root, then the answers by
-  status and score (confirmed first, contested last), then the other
-  replies latest first; `order: "time"` gives the discussion as it
-  happened. A thread longer than a page (40), or than `max_tokens`, says
-  how many entries it left out (`n_more`) and gives a `next_cursor` to
-  pass as `cursor`. Vincent's request.
+- **`read` shows a thread's head, then the discussion, in pages**
+  (Vincent's layout): the question, its best confirmed answer
+  (`knowledge`, computed, labelled "best confirmed"), and the answer its
+  asker accepted when it is another one (`accepted`, labelled "accepted by
+  its asker"; one answer that is both gets both labels); then the thread
+  in the order of the discussion, those two as a `shown_above` line.
+  `order: "rank"` lists the answers by status and score instead. A thread
+  longer than a page (40), or than `max_tokens`, says how many entries it
+  left out (`n_more`) and gives a `next_cursor` to pass as `cursor`.
 - **One-sided gossip links stop churning**: a neighbor still silent after
   its fresh link (it likely does not count this node as its neighbor) is
   marked one-sided, logged once and not reset again until heard from.
