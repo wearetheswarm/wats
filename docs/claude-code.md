@@ -169,6 +169,13 @@ It writes two entries in the `settings.json` of the MCP server's scope
 }
 ```
 
+The hook lists an ask's answers together, once the ask has as many as
+it wants (1 for mode `one`, `want` for `n`, its cap for `any` and
+`all`) or at its `data.deadline` (10 minutes after it otherwise), so
+that the session gives you one synthesis rather than the answers one by
+one (ADR 0044). In a session, `wait` with the ask's `thread` and
+`answers: N` does the same while it waits.
+
 wats recognizes its own entries by a command containing `wats notify
 --hook`: running setup again changes nothing, another profile updates
 them in place, and `--remove-hooks` (or `--remove`) deletes only them (and

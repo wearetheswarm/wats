@@ -203,6 +203,26 @@ pub fn seen_path(data_dir: &Path, profile: &str) -> PathBuf {
 struct Item {
     id: String,
     line: String,
+    /// The answers it shows, marked seen with it (an ask's answers listed
+    /// together); empty for a clarify.
+    marks: Vec<String>,
+}
+
+/// How long the hook holds the answers to an ask without a
+/// `data.deadline` that has fewer than it wants (ADR 0044 §5): about the
+/// lease plus the grace.
+pub const SYNTHESIS_WAIT: Duration = Duration::from_secs(10 * 60);
+
+/// How many answers an ask waits for before the hook lists them together:
+/// 1 for `one`, `want` for `n`, its cap (3 by default) for `any` and `all`.
+fn answers_wanted(ask: &Event) -> usize {
+    let request = crate::delivery::Request::of(ask);
+    match request.mode {
+        crate::delivery::Mode::One => 1,
+        crate::delivery::Mode::N => request.want,
+        _ => request.max.unwrap_or(3),
+    }
+    .max(1)
 }
 
 /// The text for `request`, recording what it shows; `None`: nothing new.
@@ -247,6 +267,7 @@ fn news(request: &Request) -> Result<Option<String>> {
             clarifies.push(Item {
                 id: c.id.clone(),
                 line: clarify_line(&store, c),
+                marks: Vec::new(),
             });
         }
     }
@@ -271,22 +292,63 @@ fn news(request: &Request) -> Result<Option<String>> {
             exclude_author: Some(me.clone()),
             ..Filter::default()
         };
+        // Per ask: its answers by others, and the ones not shown yet.
+        let mut per_ask: BTreeMap<String, (Vec<Event>, HashSet<String>)> = BTreeMap::new();
         for stored in store.search(None, &replies, 200)? {
             let a = &stored.event;
-            if a.ts < oldest || seen.answers.contains_key(&a.id) {
+            if a.ts < oldest || !my_asks.iter().any(|s| s.event.id == a.thread_root()) {
                 continue;
             }
-            let Some(ask) = my_asks.iter().find(|s| s.event.id == a.thread_root()) else {
+            let entry = per_ask.entry(a.thread_root().to_string()).or_default();
+            entry.1.insert(a.author.clone());
+            if !seen.answers.contains_key(&a.id) {
+                entry.0.push((**a).clone());
+            }
+        }
+        for (root, (mut new, authors)) in per_ask {
+            let Some(ask) = my_asks.iter().find(|s| s.event.id == root) else {
                 continue;
             };
-            answers.push(Item {
-                id: a.id.clone(),
-                line: format!(
-                    "answer to your ask \"{}\": \"{}\"",
-                    short(&title(&ask.event), 60),
-                    short(&title(a), 80)
-                ),
-            });
+            if new.is_empty() {
+                continue;
+            }
+            // Held until the ask has the answers it wants, or its
+            // deadline: then listed together, for one synthesis.
+            let deadline = ask
+                .event
+                .data
+                .get("deadline")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or_else(|| ask.event.ts.saturating_add(SYNTHESIS_WAIT.as_secs()));
+            if authors.len() < answers_wanted(&ask.event) && now < deadline {
+                continue;
+            }
+            new.sort_by_key(|a| a.ts);
+            let asked = short(&title(&ask.event), 60);
+            let item = match new.as_slice() {
+                [one] => Item {
+                    id: one.id.clone(),
+                    line: format!(
+                        "answer to your ask \"{asked}\": \"{}\"",
+                        short(&title(one), 80)
+                    ),
+                    marks: vec![one.id.clone()],
+                },
+                many => Item {
+                    id: root.clone(),
+                    line: format!(
+                        "{} answers to your ask \"{asked}\", give the user one synthesis \
+                         (agreement, disagreement, what each added): {}; ask",
+                        many.len(),
+                        many.iter()
+                            .map(|a| format!("\"{}\" (post {})", short(&title(a), 50), a.id))
+                            .collect::<Vec<_>>()
+                            .join("; ")
+                    ),
+                    marks: many.iter().map(|a| a.id.clone()).collect(),
+                },
+            };
+            answers.push(item);
         }
     }
 
@@ -352,6 +414,7 @@ fn render(
     );
     let footer_room = 40;
     let (mut shown_c, mut shown_a) = (Vec::new(), Vec::new());
+    let mut listed_a = 0;
     let mut left = 0;
     for (item, is_clarify) in clarifies
         .iter()
@@ -359,7 +422,7 @@ fn render(
         .chain(answers.iter().map(|i| (i, false)))
     {
         let line = format!("- {} (post {})\n", item.line, item.id);
-        let fits = shown_c.len() + shown_a.len() < MAX_ITEMS
+        let fits = shown_c.len() + listed_a < MAX_ITEMS
             && text.chars().count() + line.chars().count() + footer_room <= MAX_CHARS;
         if !fits {
             left += 1;
@@ -369,7 +432,8 @@ fn render(
         if is_clarify {
             shown_c.push(item.id.clone());
         } else {
-            shown_a.push(item.id.clone());
+            shown_a.extend(item.marks.iter().cloned());
+            listed_a += 1;
         }
     }
     if left > 0 {
@@ -1383,6 +1447,7 @@ mod tests {
             .map(|i| Item {
                 id: format!("{i:064x}"),
                 line: format!("answer to your ask \"{}\": \"x\"", "y".repeat(60)),
+                marks: vec![format!("{i:064x}")],
             })
             .collect();
         let (text, c, a) = render("alice", &[], &items).unwrap();

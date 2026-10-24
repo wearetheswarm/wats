@@ -2,7 +2,8 @@
 
 Status: Proposed (2026-10-24), for 0.4.13. Vincent took the
 recommended answers to Q1, Q2 and Q3 (2026-10-24); §1 to §4 are
-implemented, §5 is in progress, and §6 waits for his go.
+implemented, §5 too (`wait` with `answers`; the session hook's
+`answers_wanted` and `SYNTHESIS_WAIT`), and §6 waits for his go.
 
 Source: spec decision D41 (internal SPEC-full.md), approved by Vincent,
 and its addendum (the `one` default, a 5-minute lease). It follows a real

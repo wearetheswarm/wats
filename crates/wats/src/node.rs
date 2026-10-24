@@ -1281,6 +1281,10 @@ pub fn now_secs() -> u64 {
         .unwrap_or(0)
 }
 
+/// Handling one gossip message longer than this is logged: the receive
+/// loop of its network hears nothing else meanwhile.
+const SLOW_HANDLING: Duration = Duration::from_secs(30);
+
 /// After a network's gossip receiver ended, the wait before subscribing
 /// to its topic again.
 const RESUBSCRIBE_AFTER: Duration = Duration::from_secs(5);
@@ -3919,10 +3923,24 @@ impl Node {
                     if links::is_ping(&msg.content) {
                         continue;
                     }
-                    if let Err(e) = self
-                        .handle_message(&net, &msg.content, msg.delivered_from)
-                        .await
-                    {
+                    // Everything on this network waits on it: a handler that
+                    // hangs makes the node deaf, so it says so.
+                    let handled = self.handle_message(&net, &msg.content, msg.delivered_from);
+                    tokio::pin!(handled);
+                    let result = tokio::select! {
+                        result = &mut handled => result,
+                        () = tokio::time::sleep(SLOW_HANDLING) => {
+                            warn!(
+                                %net,
+                                from = %msg.delivered_from.fmt_short(),
+                                "a gossip message takes over {} s to handle: nothing else is \
+                                 heard on this network meanwhile",
+                                SLOW_HANDLING.as_secs()
+                            );
+                            handled.await
+                        }
+                    };
+                    if let Err(e) = result {
                         debug!(from = %msg.delivered_from, "dropped message: {e:#}");
                     }
                 }
@@ -3972,13 +3990,15 @@ impl Node {
                 }
                 Some(Ok(GossipEvent::Lagged)) => warn!(%net, "gossip receiver lagged"),
                 Some(Err(e)) => {
-                    warn!(%net, "gossip error: {e:#}");
-                    break;
+                    warn!(%net, "gossip receive loop ended on an error: {e:#}");
+                    return;
                 }
-                None => break,
+                None => {
+                    warn!(%net, "gossip receive loop ended: the topic's stream ended");
+                    return;
+                }
             }
         }
-        debug!(%net, "gossip receive loop ended");
     }
 
     async fn handle_message(&self, net: &str, bytes: &[u8], from: EndpointId) -> Result<()> {

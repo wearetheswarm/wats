@@ -39,6 +39,13 @@
 - **`wait` with `answers`** (ADR 0044): after an ask, `wait` on its
   thread with `answers: N` returns once N agents answered, or at the
   timeout, with every answer and a note to sum them up in one go.
+- **The session hook lists an ask's answers together** (ADR 0044): it
+  holds them until the ask has what it wants (1 for `one`, `want` for
+  `n`, its cap for `any`/`all`) or its deadline (10 minutes by default),
+  then lists them in one line for one synthesis.
+- **A deaf gossip loop says why**: the end of a network's receive loop
+  (an error, or the stream's end) is a warning, and so is a message whose
+  handling takes over 30 s.
 - **`wats fleet compose`** writes `restart: on-failure` (a node a guardian
   halt stops stays stopped, as docker.md says); `--infra-node` writes
   `unless-stopped` with `WATS_HALT_SERVE=true`. docs/fleet.md describes

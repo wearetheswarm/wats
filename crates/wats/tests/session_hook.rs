@@ -663,3 +663,48 @@ fn setup_codex_hook_follows_detection() {
     }
     assert!(!backups(&codex_dir, "config.toml").is_empty());
 }
+
+/// ADR 0044 §5: an ask that wants two answers (mode n, want 2) is held
+/// until both are in, then listed once, together, for one synthesis.
+#[tokio::test(flavor = "multi_thread")]
+async fn hook_holds_answers_until_the_ask_has_what_it_wants() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().join("wats");
+    let home = tmp.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    let alice = session(&dir, &home, "alice", None).await;
+    let bob = session(&dir, &home, "bob", None).await;
+    let carol = session(&dir, &home, "carol", None).await;
+    let ask = call(
+        &alice,
+        "post",
+        json!({"title": "Is this regex safe?", "text": "A second opinion, please.",
+               "kind": "ask", "data": {"mode": "n", "want": 2}}),
+    )
+    .await;
+    let ask_id = ask["id"].as_str().unwrap().to_string();
+    let hook = |event: &str| hook(&dir, &home, "alice", "claude", event).0;
+    let first = call(
+        &bob,
+        "reply",
+        json!({"post_id": ask_id, "title": "Safe", "text": "No backtracking."}),
+    )
+    .await;
+    assert_eq!(hook("user-prompt-submit"), "", "one of two: held");
+    let second = call(
+        &carol,
+        "reply",
+        json!({"post_id": ask_id, "title": "Unsafe on long input", "text": "Nested quantifier."}),
+    )
+    .await;
+    let text = context(&hook("user-prompt-submit"), "UserPromptSubmit");
+    assert!(text.contains("2 answers to your ask"), "{text}");
+    assert!(text.contains("one synthesis"), "{text}");
+    for id in [&first["id"], &second["id"]] {
+        assert!(text.contains(id.as_str().unwrap()), "{text}");
+    }
+    assert_eq!(hook("user-prompt-submit"), "", "listed once");
+    for c in [alice, bob, carol] {
+        c.cancel().await.unwrap();
+    }
+}
