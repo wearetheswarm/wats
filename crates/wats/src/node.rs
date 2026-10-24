@@ -1281,6 +1281,10 @@ pub fn now_secs() -> u64 {
         .unwrap_or(0)
 }
 
+/// After a network's gossip receiver ended, the wait before subscribing
+/// to its topic again.
+const RESUBSCRIBE_AFTER: Duration = Duration::from_secs(5);
+
 pub fn topic_for(net: &str) -> TopicId {
     TopicId::from_bytes(blake3::derive_key(TOPIC_CONTEXT, net.as_bytes()))
 }
@@ -1977,10 +1981,25 @@ impl Node {
             let loop_node = Arc::clone(&node);
             let loop_net = net.clone();
             let handle = tokio::spawn(async move {
-                supervise(&name, || {
-                    Arc::clone(&loop_node).receive_loop(loop_net.clone(), Arc::clone(&receiver))
-                })
-                .await;
+                let mut receiver = receiver;
+                loop {
+                    let ended = supervise(&name, || {
+                        Arc::clone(&loop_node).receive_loop(loop_net.clone(), Arc::clone(&receiver))
+                    })
+                    .await;
+                    // Cancelled, or the network was left (a halt).
+                    if ended.is_none() || !loop_node.joined(&loop_net) {
+                        return;
+                    }
+                    // The topic's receiver ended (a gossip error): the
+                    // node would go on sending and never hear anything on
+                    // this network again. Subscribe anew.
+                    tokio::time::sleep(RESUBSCRIBE_AFTER).await;
+                    match loop_node.resubscribe(&loop_net).await {
+                        Some(fresh) => receiver = Arc::new(tokio::sync::Mutex::new(fresh)),
+                        None => continue,
+                    }
+                }
             });
             if let Ok(mut loops) = node.receive_loops.lock() {
                 loops.insert(net, handle.abort_handle());
@@ -3854,6 +3873,35 @@ impl Node {
         tokio::fs::set_permissions(&tmp, perms).await?;
         tokio::fs::rename(&tmp, &path).await?;
         Ok(Some(path))
+    }
+
+    /// A fresh subscription to `net`'s topic, through this node's current
+    /// neighbors and known peers, after its receiver ended: the new sender
+    /// replaces the old one. `None` (logged) when it fails, or when the
+    /// network was left meanwhile.
+    async fn resubscribe(&self, net: &str) -> Option<GossipReceiver> {
+        let mut peers = self.neighbors_of(net);
+        for p in self.known_peers() {
+            if !peers.contains(&p) {
+                peers.push(p);
+            }
+        }
+        match self.gossip.subscribe(topic_for(net), peers).await {
+            Ok(topic) => {
+                let (sender, receiver) = topic.split();
+                let mut senders = self.senders.lock().ok()?;
+                if !senders.contains_key(net) {
+                    return None;
+                }
+                senders.insert(net.to_string(), sender);
+                warn!(%net, "gossip receive loop ended: subscribed to the network again");
+                Some(receiver)
+            }
+            Err(e) => {
+                warn!(%net, "gossip receive loop ended, subscribing again failed: {e:#}");
+                None
+            }
+        }
     }
 
     async fn receive_loop(

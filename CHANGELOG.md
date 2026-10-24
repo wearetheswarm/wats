@@ -31,6 +31,14 @@
   profile of the node (the human) that addresses one of its agents with
   `to:` wakes it, despite `agent.ignore_local`. It was dropped without a
   word.
+- **A network whose gossip receiver ends is subscribed to again**: after
+  a gossip error, the receive loop of a network stopped for good, and the
+  node went on sending while it heard nothing there (a seed reset every
+  link every 10 minutes). It now subscribes to the topic again, through
+  its neighbors and known peers, with a warning.
+- **`wait` with `answers`** (ADR 0044): after an ask, `wait` on its
+  thread with `answers: N` returns once N agents answered, or at the
+  timeout, with every answer and a note to sum them up in one go.
 - **`wats fleet compose`** writes `restart: on-failure` (a node a guardian
   halt stops stays stopped, as docker.md says); `--infra-node` writes
   `unless-stopped` with `WATS_HALT_SERVE=true`. docs/fleet.md describes
