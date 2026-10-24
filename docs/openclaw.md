@@ -228,16 +228,32 @@ writes `openclaw.json` itself):
       asked: build it with OpenClaw's `scripts/sandbox-setup.sh`, or every
       hook to the agent fails with "Sandbox image not found".
 
-   Then put the printed `export WATS_OPENCLAW_HOOKS_TOKEN=<token>` line in
-   the gateway's environment and restart the gateway. For a gateway run as
-   a service (a launch agent, a systemd unit), OpenClaw's own `.env` is the
-   simplest place: the gateway reads `~/.openclaw/.env` (or
-   `$OPENCLAW_STATE_DIR/.env`) at start, and resolves the template from it.
+   7. The agent's tools: `tools.allow: ["wats-agent__*"]`, and the same
+      in `tools.sandbox.tools.allow`. OpenClaw's sandbox has its own tool
+      policy, and each level only narrows. Without the sandbox's allow,
+      no tool is left to call, and every run fails with "No callable
+      tools remain after resolving explicit tool allowlist" (fixed in
+      0.4.17).
+   8. **The token goes into OpenClaw's `.env`** (0.4.17). The gateway
+      reads `~/.openclaw/.env`, or `$OPENCLAW_STATE_DIR/.env`, at start,
+      and resolves the template from it. Setup writes the line
+      `WATS_OPENCLAW_HOOKS_TOKEN=<token>` there:
+      - the file is created if missing, with mode 600;
+      - an existing file is backed up first, its line is replaced, and
+        every other line is kept;
+      - the token is never printed.
+   9. **A live check**: setup sends the gateway an authenticated request
+      that cannot start a run, and says what came back:
+      - "The gateway takes the hook token" (400, a request it refuses as
+        invalid, so the token passed);
+      - refused (401: the gateway does not have the token yet, most
+        often because it was not restarted since the `.env` was written);
+      - unreachable (the gateway is not running at that URL).
 
-   ```sh
-   (umask 077; printf 'WATS_OPENCLAW_HOOKS_TOKEN=%s\n' "$(cat ~/.wats/openclaw/hooks.token)" >> ~/.openclaw/.env)
-   openclaw gateway restart
-   ```
+   Then restart the gateway (`openclaw gateway restart`), and check that
+   it runs (`openclaw gateway status`). If the `.env` could not be
+   written, setup prints the `export WATS_OPENCLAW_HOOKS_TOKEN=<token>`
+   line instead, for the gateway's environment.
 6. **Manual** prints the block to paste into `openclaw.json`:
 
    ```json5
@@ -260,15 +276,25 @@ writes `openclaw.json` itself):
      workspace: "~/.openclaw/workspace-wats",
      sandbox: { mode: "all", scope: "agent" },
      tools: { allow: ["wats-agent__*"],
-              deny: ["exec", "process", "write", "edit", "apply_patch", "browser", "message"] },
+              deny: ["exec", "process", "write", "edit", "apply_patch", "browser", "message"],
+              // The sandbox's own tool policy: without it, no tool is left.
+              sandbox: { tools: { allow: ["wats-agent__*"] } } },
    } ] },
    ```
 
    and the line `export WATS_OPENCLAW_HOOKS_TOKEN=<token>`, the only place
-   the token is printed. **Put that line in the gateway's environment**
-   (for example its launch agent or systemd unit), not in
-   `openclaw.json`: OpenClaw reads the token from the environment
-   reference. Then it runs `openclaw config validate`.
+   the token is printed. **It is required**: until the gateway has that
+   variable in its environment, every hook to it fails with 401. Put it in
+   OpenClaw's `.env` (`~/.openclaw/.env`, or `$OPENCLAW_STATE_DIR/.env`),
+   which the gateway reads at start, or in its launch agent or systemd
+   unit. Never put it in `openclaw.json`: OpenClaw reads the token from
+   the environment reference. Then setup runs `openclaw config validate`.
+   `--apply` does all of this for you (step 5).
+
+   ```sh
+   (umask 077; printf 'WATS_OPENCLAW_HOOKS_TOKEN=%s\n' "$(cat ~/.wats/openclaw/hooks.token)" >> ~/.openclaw/.env)
+   openclaw gateway restart
+   ```
 7. Sets `agent.runtime = "openclaw"` and `agent.openclaw_url` in
    `config.toml`. `agent.openclaw_agent` (default `wats`) names the agent
    the runs go to.
@@ -277,7 +303,9 @@ writes `openclaw.json` itself):
 
 1. Paste the block (manual mode), set the variable in the gateway's
    environment, restart the gateway, and run `openclaw config validate`
-   again. To undo the automatic mode, copy the backup back.
+   again. In automatic mode, the live check already said whether the
+   gateway takes the token. To undo the automatic mode, copy the backups
+   back: `openclaw.json`'s, and the `.env`'s if it existed.
 2. `openclaw mcp show wats-agent` shows the agent's entry.
 3. Start `wats`: the banner says `agent forwards to OpenClaw <url> (agent
    wats) · budget: managed by OpenClaw`.

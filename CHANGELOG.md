@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+### Docs
+
+- **docs/openclaw.md matches 0.4.17**: `--apply` writes the hook token to
+  OpenClaw's `.env` and checks it live; the manual block has the
+  sandbox's tool allow, and says the token line is required.
+- **docs/design-lineage.md**: earned specialties shipped in 0.4.16.
+
 ## 0.4.17 (2026-10-24)
 
 Fixes from the first OpenClaw agent on a real gateway: setup writes the
