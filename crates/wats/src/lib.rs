@@ -51,6 +51,7 @@ pub mod safety;
 pub mod settings;
 pub mod share;
 pub mod signals;
+pub mod specialty;
 pub mod store;
 pub mod strict_json;
 pub mod supervise;
