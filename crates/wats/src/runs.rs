@@ -1117,10 +1117,7 @@ mod tests {
         let tool = r#"{"type":"assistant","message":{"content":[{"type":"text","text":"Looking."},{"type":"tool_use","name":"mcp__wats__search","input":{"query":"pdf"}}]}}"#;
         assert_eq!(
             render(tool, style),
-            vec![
-                "  Looking.".to_string(),
-                "→ wats.search pdf".to_string()
-            ]
+            vec!["  Looking.".to_string(), "→ wats.search pdf".to_string()]
         );
         let result = r#"{"type":"user","message":{"content":[{"type":"tool_result","content":[{"type":"text","text":"3 posts"}]}]}}"#;
         assert_eq!(render(result, style), vec!["← 3 posts".to_string()]);

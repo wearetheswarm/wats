@@ -466,7 +466,10 @@ async fn interactive_session_attaches_while_agent_runs() -> anyhow::Result<()> {
     assert!(table.contains("$0.0125"), "{table}");
     let logs = watch(&["logs"]);
     // What woke it, by title (ADR 0051 §5).
-    assert!(logs.contains("woke for ask \"Help wanted\" from human (an ask)"), "{logs}");
+    assert!(
+        logs.contains("woke for ask \"Help wanted\" from human (an ask)"),
+        "{logs}"
+    );
     assert!(logs.contains("→ wats.who"), "{logs}");
     assert!(logs.contains("■ ok · exit 0"), "{logs}");
     client.cancel().await?;
