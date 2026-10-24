@@ -465,7 +465,8 @@ async fn interactive_session_attaches_while_agent_runs() -> anyhow::Result<()> {
     let table = watch(&["runs"]);
     assert!(table.contains("$0.0125"), "{table}");
     let logs = watch(&["logs"]);
-    assert!(logs.contains(&format!("woke for {id}")), "{logs}");
+    // What woke it, by title (ADR 0051 §5).
+    assert!(logs.contains("woke for ask \"Help wanted\" from human (an ask)"), "{logs}");
     assert!(logs.contains("→ wats.who"), "{logs}");
     assert!(logs.contains("■ ok · exit 0"), "{logs}");
     client.cancel().await?;
@@ -2793,6 +2794,7 @@ async fn openclaw_watches_a_dispatched_run() -> anyhow::Result<()> {
             agent: "wats".into(),
             token_file,
             log_dir: dir.path().join("oc-logs"),
+            state_dir: Some(dir.path().join("oc-state")),
         },
         catchup: None,
         idle_heartbeat: true,
@@ -2838,6 +2840,28 @@ async fn openclaw_watches_a_dispatched_run() -> anyhow::Result<()> {
     // The agent posts in the thread: ok.
     let second = a.publish_as(&human, ask("second question"), &[]).await?;
     eventually("the second forward", || requests() == 2).await;
+    // Its OpenClaw session's transcript: followed into the run's (ADR 0051).
+    let sessions = dir.path().join("oc-state/agents/wats/sessions");
+    std::fs::create_dir_all(&sessions)?;
+    let session_file = sessions.join("s2.jsonl");
+    std::fs::write(
+        sessions.join("sessions.json"),
+        serde_json::json!({format!("agent:wats:wats:{}", second.id): {"sessionId": "s2", "sessionFile": session_file}}).to_string(),
+    )?;
+    std::fs::write(
+        &session_file,
+        concat!(
+            r#"{"type":"session","id":"s2"}"#,
+            "\n",
+            r#"{"type":"message","message":{"role":"assistant","content":[{"type":"thinking","thinking":"Check the releases page."},{"type":"toolCall","name":"web_fetch","arguments":{"url":"https://releases.rs"}}]}}"#,
+            "\n",
+            r#"{"type":"message","message":{"role":"toolResult","toolName":"web_fetch","content":[{"type":"text","text":"Rust 1.99.1"}]}}"#,
+            "\n",
+            r#"{"type":"message","message":{"role":"assistant","content":[{"type":"text","text":"It is 1.99.1."}]}}"#,
+            "\n",
+        ),
+    )?;
+    tokio::time::sleep(Duration::from_millis(2500)).await;
     let answer = Draft {
         net: PUBLIC_NET.into(),
         kind: Some(Kind::Answer),
@@ -2854,6 +2878,19 @@ async fn openclaw_watches_a_dispatched_run() -> anyhow::Result<()> {
         ("ok", Some("run-2"))
     );
     assert!(run.seconds.unwrap() > 0.0, "{run:?}");
+    let shown: Vec<String> = std::fs::read_to_string(wats::runs::transcript_path(&work, &run.id))?
+        .lines()
+        .flat_map(|l| wats::runs::render(l, wats::runs::Style { color: false }))
+        .collect();
+    let shown = shown.join("\n");
+    assert!(
+        shown.contains("woke for ask \"second question\""),
+        "{shown}"
+    );
+    assert!(shown.contains("→ web_fetch https://releases.rs"), "{shown}");
+    assert!(shown.contains("← Rust 1.99.1"), "{shown}");
+    assert!(shown.contains("  It is 1.99.1."), "{shown}");
+    assert!(shown.contains("✓ posted answer \"an answer\""), "{shown}");
 
     // Completed without a post: an abstention.
     a.publish_as(&human, ask("third question"), &[]).await?;
@@ -2943,6 +2980,7 @@ async fn openclaw_forwards_wakes_to_the_gateway() -> anyhow::Result<()> {
             agent: "wats".into(),
             token_file,
             log_dir: dir.path().join("oc-logs"),
+            state_dir: None,
         },
         catchup: None,
         idle_heartbeat: true,
@@ -2994,7 +3032,13 @@ async fn openclaw_forwards_wakes_to_the_gateway() -> anyhow::Result<()> {
     let transcript = std::fs::read_to_string(wats::runs::transcript_path(&work, &run.id))?;
     assert!(transcript.contains("openclaw_forward"), "{transcript}");
     assert!(!transcript.contains(&token), "the token is never written");
-    assert!(!transcript.contains("first question"), "nor the message");
+    // Nor the forwarded message; the ask's title is in the `wats_woke`
+    // line (ADR 0051 §5), a public post's.
+    assert!(
+        !transcript.contains(wats::openclaw::PREAMBLE),
+        "nor the message"
+    );
+    assert!(transcript.contains("\"wats_woke\""), "{transcript}");
 
     // 400 on the session policy: the same run retries without a session
     // key, and so do the later ones.
@@ -4078,5 +4122,106 @@ async fn a_follow_up_ask_to_an_answer_wakes_its_author() -> anyhow::Result<()> {
     runner.await??;
     a.shutdown().await?;
     b.shutdown().await?;
+    Ok(())
+}
+
+/// ADR 0051 §1: the brief lines of a node, for an ask, its agent's claim,
+/// answer and decline, and a vote on that answer by someone else.
+#[tokio::test(flavor = "multi_thread")]
+async fn brief_lines_tell_the_story() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let a = node(&dir.path().join("a"), &[]).await?;
+    let b = node(&dir.path().join("b"), &[&a]).await?;
+    b.wait_for_neighbor(PUBLIC_NET, Duration::from_secs(10))
+        .await?;
+    let line = |event: &wats::event::Event| wats::brief::line_for(&a, event);
+    let mut asked = ask("Latest stable Rust?");
+    asked.tags = vec!["lang:rust".into()];
+    let ask = b.publish(asked, &[]).await?;
+    let wait = |id: String| {
+        let a = Arc::clone(&a);
+        async move {
+            eventually("replicated", || a.store().get(&id).unwrap().is_some()).await;
+        }
+    };
+    wait(ask.id.clone()).await;
+    let from = &wats::identity::author_id(&b.author_key("default")?)[..8];
+    assert_eq!(
+        line(&ask).as_deref(),
+        Some(format!("ask from {from}: Latest stable Rust? [lang:rust]").as_str())
+    );
+    let agent = a.author_key("agent")?;
+    let reply = |kind: Kind, text: &str, data: serde_json::Value| Draft {
+        net: PUBLIC_NET.into(),
+        kind: Some(kind),
+        thread: Some(ask.id.clone()),
+        parent: Some(ask.id.clone()),
+        text: text.into(),
+        data: data.as_object().cloned().unwrap_or_default(),
+        ..Draft::default()
+    };
+    let claim = a
+        .publish_as(
+            &agent,
+            reply(Kind::Claim, "on it", serde_json::json!({})),
+            &[],
+        )
+        .await?;
+    assert_eq!(
+        line(&claim).as_deref(),
+        Some("agent claimed: Latest stable Rust?")
+    );
+    let answer = a
+        .publish_as(
+            &agent,
+            reply(Kind::Answer, "Rust 1.99.1", serde_json::json!({})),
+            &[],
+        )
+        .await?;
+    assert_eq!(
+        line(&answer).as_deref(),
+        Some("agent answered: Rust 1.99.1")
+    );
+    let decline = a
+        .publish_as(
+            &agent,
+            reply(
+                Kind::Release,
+                "no",
+                serde_json::json!({"decline": true, "reason": "no GPU"}),
+            ),
+            &[],
+        )
+        .await?;
+    assert_eq!(
+        line(&decline).as_deref(),
+        Some("agent declined \"Latest stable Rust?\": no GPU")
+    );
+    wait(answer.id.clone()).await;
+    let vote = b
+        .publish(
+            Draft {
+                net: PUBLIC_NET.into(),
+                kind: Some(Kind::React),
+                thread: Some(ask.id.clone()),
+                parent: Some(answer.id.clone()),
+                text: "+1".into(),
+                data: serde_json::json!({"value": 1, "evidence": "checked"})
+                    .as_object()
+                    .cloned()
+                    .unwrap(),
+                ..Draft::default()
+            },
+            &[],
+        )
+        .await?;
+    wait(vote.id.clone()).await;
+    assert_eq!(
+        line(&vote).as_deref(),
+        Some(format!("{from} confirmed your answer: Rust 1.99.1").as_str())
+    );
+    for n in [b, a] {
+        n.shutdown().await?;
+    }
     Ok(())
 }

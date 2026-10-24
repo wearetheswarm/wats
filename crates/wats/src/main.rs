@@ -485,6 +485,11 @@ enum Command {
         /// How many of the last log lines to show first.
         #[arg(long, default_value_t = 20)]
         lines: usize,
+        /// The log as it is. On a terminal, `wats attach` shows only the
+        /// brief lines (asks, the agents' work, answers, votes) and the
+        /// warnings, as hh:mm:ss; without one, the full log is the default.
+        #[arg(long)]
+        full: bool,
         /// The node of this machine named NAME (`wats ps`) [default:
         /// --dir, else ~/.wats].
         #[arg(short = 'n', long = "node", value_name = "NAME")]
@@ -6390,7 +6395,12 @@ fn print_art(settings: &Settings, stdout: bool) {
 /// `wats attach` (ADR 0023): the banner of the node running in the
 /// background, its last log lines, then what it logs until Ctrl-C (which
 /// only ends this command) or until it stops.
-async fn attach_command(node: &NodeArgs, lines: usize, mut shutdown: Shutdown) -> Result<()> {
+async fn attach_command(
+    node: &NodeArgs,
+    lines: usize,
+    full: bool,
+    mut shutdown: Shutdown,
+) -> Result<()> {
     let entry = chosen_node(node).await?;
     say_node(&entry.dir, None);
     let flag = entry.dir_flag();
@@ -6452,12 +6462,31 @@ async fn attach_command(node: &NodeArgs, lines: usize, mut shutdown: Shutdown) -
          stop{flag}",
         entry.mode()
     )?;
+    // The brief view on a terminal (ADR 0051): brief lines and warnings.
+    let terminal = std::io::IsTerminal::is_terminal(&std::io::stdout());
+    let paint = wats::brief::Paint { color: terminal };
+    let brief = !full && terminal;
+    let shown = |line: &str| -> Option<String> {
+        if brief {
+            wats::brief::render(line, paint)
+        } else {
+            Some(line.to_string())
+        }
+    };
+    if brief {
+        writeln!(
+            out,
+            "(brief view: asks, the agents' work, answers, warnings; `--full` for the log)"
+        )?;
+    }
     // Follow from here; first the last lines, without the banner shown
-    // above.
+    // above. The brief view looks further back for as many.
     let mut follower = wats::background::Follower::at_end(&log);
-    for line in wats::background::tail(&log, lines + banner.len())
+    let back = if brief { lines * 50 } else { lines } + banner.len();
+    for line in wats::background::tail(&log, back)
         .into_iter()
         .filter(|l| !banner.contains(l))
+        .filter_map(|l| shown(&l))
         .collect::<Vec<_>>()
         .iter()
         .rev()
@@ -6467,6 +6496,7 @@ async fn attach_command(node: &NodeArgs, lines: usize, mut shutdown: Shutdown) -
         writeln!(out, "{line}")?;
     }
     out.flush()?;
+    let mut partial = String::new();
     let mut checked = tokio::time::Instant::now();
     loop {
         tokio::select! {
@@ -6477,6 +6507,19 @@ async fn attach_command(node: &NodeArgs, lines: usize, mut shutdown: Shutdown) -
             _ = tokio::time::sleep(Duration::from_millis(200)) => {}
         }
         let new = follower.read_new()?;
+        let new = if brief && !new.is_empty() {
+            partial.push_str(&String::from_utf8_lossy(&new));
+            let complete = partial.rfind('\n').map_or(0, |i| i + 1);
+            let text: String = partial[..complete]
+                .lines()
+                .filter_map(&shown)
+                .map(|l| format!("{l}\n"))
+                .collect();
+            partial.drain(..complete);
+            text.into_bytes()
+        } else {
+            new
+        };
         if !new.is_empty() {
             match out.write_all(&new).and_then(|()| out.flush()) {
                 // `wats attach | head`
@@ -7921,6 +7964,14 @@ fn agent_config(
             openclaw.agent = agent.trim().to_string();
         }
         openclaw.token_file = wats::openclaw::hooks_token_path(data_dir);
+        // Its sessions' transcripts, read into the runs' (ADR 0051 §4);
+        // never in hermetic runs.
+        if !wats::update::hermetic_env() {
+            openclaw.state_dir = wats::openclaw::state_dir(
+                std::env::var_os("OPENCLAW_STATE_DIR").map(PathBuf::from),
+                std::env::home_dir(),
+            );
+        }
     }
     if runtime == "opencode" {
         wats::opencode::check_access(access, &allow, file.review == Some(true))?;
@@ -8702,19 +8753,21 @@ async fn run_mcp(node: Arc<Node>, mut shutdown: Shutdown) -> Result<()> {
     node.shutdown().await
 }
 
-/// `RUST_LOG`, or `wats=info` by default. Unless `RUST_LOG` already
-/// mentions Iroh's structured events, two of them are always shown: the
-/// network path chosen for each peer (`path::selected`: an IP address means
-/// a direct connection, a relay URL means relayed) and home relay changes.
-/// They are what a NAT test needs to see.
+/// `RUST_LOG`, or `wats=info` and the brief lines (ADR 0051) by default.
+/// Unless `RUST_LOG` already mentions Iroh's structured events, home relay
+/// changes are shown, and with `WATS_LOG_PATHS=1` the network path chosen
+/// for each peer (`path::selected`: an IP address means a direct
+/// connection, a relay URL means relayed), what a NAT test needs to see:
+/// off by default since 0.4.19, it filled the log.
 fn log_filter() -> EnvFilter {
-    let mut filter =
-        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("wats=info"));
+    let mut filter = EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| EnvFilter::new(format!("wats=info,{}=info", wats::brief::TARGET)));
     if !std::env::var("RUST_LOG").is_ok_and(|v| v.contains("_events")) {
-        for directive in [
-            "iroh::_events::path::selected=debug",
-            "iroh::_events::relay::home_changed=debug",
-        ] {
+        let mut directives = vec!["iroh::_events::relay::home_changed=debug"];
+        if std::env::var("WATS_LOG_PATHS").is_ok_and(|v| v == "1") {
+            directives.push("iroh::_events::path::selected=debug");
+        }
+        for directive in directives {
             if let Ok(directive) = directive.parse() {
                 filter = filter.add_directive(directive);
             }
@@ -8909,8 +8962,8 @@ async fn async_main(mut cli: Cli) -> Result<()> {
             return guardian_command(&cli.node, &data_dir, action).await;
         }
         Some(Command::Resume) => return resume_command(&data_dir),
-        Some(Command::Attach { lines, .. }) => {
-            return attach_command(&cli.node, lines, shutdown).await;
+        Some(Command::Attach { lines, full, .. }) => {
+            return attach_command(&cli.node, lines, full, shutdown).await;
         }
         Some(Command::Ps { all, json }) => return ps_command(&cli.node, all, json).await,
         Some(Command::Stop { all, timeout, .. }) => {

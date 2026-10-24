@@ -1,5 +1,30 @@
 # Changelog
 
+## Unreleased
+
+### Changes
+
+- **`wats attach` reads like a story on a terminal** (ADR 0051): one
+  `hh:mm:ss` line per event, in plain words and colour:
+  - `ask from …: <title> [tags]`;
+  - `<agent> woke for ask "…" (addressed to it)`;
+  - `<agent> claimed …`, `answered …`, `declined …: <reason>`;
+  - `<agent> run ok · 14 s · posted answer`, or `retries in 1 min: …`;
+  - `answer from … to your ask`, `… confirmed your answer`.
+
+  Warnings show too, without spans and module paths. `--full` (or a
+  pipe) shows the log as it is; node.log keeps everything.
+- **Quieter log by default**: Iroh's per-peer `path::selected` events are
+  off (`WATS_LOG_PATHS=1` brings them back for a NAT test), and "heartbeat:
+  nothing new, no run" is at debug level.
+- **`wats agent logs` and `attach` show an OpenClaw run's work** (ADR
+  0051), read from its OpenClaw session transcript when this machine can
+  read it: the assistant's text, its thinking, its tool calls with their
+  main argument (`→ web_fetch https://releases.rs`), and their results.
+- **Every run's log says what woke it and what it posted**, for every
+  runtime: `woke for ask "…" from … (addressed to it)` at the start,
+  then `✓ posted answer "…"` or `· no post` at the end.
+
 ## 0.4.18 (2026-10-24)
 
 Agents say no, and knowledge says when: an addressed agent can decline,

@@ -610,6 +610,76 @@ fn status_text(style: Style, status: &str) -> String {
     }
 }
 
+/// The argument of a tool call worth showing: a URL, a query, a title, an
+/// id, else the arguments cut.
+fn main_argument(args: &Value) -> String {
+    for key in ["url", "query", "title", "post_id", "id", "text", "q"] {
+        if let Some(value) = args[key].as_str() {
+            return preview(value, 100);
+        }
+    }
+    preview(&args.to_string(), 100)
+}
+
+/// One message of an OpenClaw session transcript: the assistant's text,
+/// its thinking (dimmed, cut), its tool calls and their results.
+fn openclaw_entry(message: &Value, style: Style) -> Vec<String> {
+    let mut out = Vec::new();
+    let parts: Vec<Value> = match &message["content"] {
+        Value::Array(parts) => parts.clone(),
+        Value::String(text) => vec![serde_json::json!({"type": "text", "text": text})],
+        _ => Vec::new(),
+    };
+    match message["role"].as_str() {
+        Some("assistant") => {
+            for part in &parts {
+                match part["type"].as_str() {
+                    Some("text") => {
+                        for line in part["text"].as_str().unwrap_or("").trim().lines() {
+                            out.push(format!("  {line}"));
+                        }
+                    }
+                    Some("thinking") => {
+                        let text = part["thinking"].as_str().unwrap_or("");
+                        if !text.trim().is_empty() {
+                            out.push(style.dim(&format!("  … {}", preview(text, 120))));
+                        }
+                    }
+                    Some("toolCall") => out.push(format!(
+                        "{} {}",
+                        style.cyan(&format!("→ {}", part["name"].as_str().unwrap_or("?"))),
+                        style.dim(&main_argument(
+                            part.get("arguments").unwrap_or(&part["input"])
+                        )),
+                    )),
+                    _ => {}
+                }
+            }
+            if let Some(error) = message["errorMessage"].as_str() {
+                out.push(style.red(&format!("✗ {}", preview(error, TOOL_PREVIEW))));
+            }
+        }
+        Some("toolResult") => {
+            let text: Vec<String> = parts
+                .iter()
+                .filter_map(|p| p["text"].as_str().or(p["content"].as_str()))
+                .map(str::to_string)
+                .collect();
+            let mut text = preview(&text.join(" "), TOOL_PREVIEW);
+            if text.is_empty() {
+                text = "(no text)".into();
+            }
+            if message["isError"] == true {
+                out.push(style.red(&format!("← ✗ {text}")));
+            } else {
+                out.push(style.dim(&format!("← {text}")));
+            }
+        }
+        _ => {}
+    }
+    out
+}
+
 /// Human-readable lines for one transcript line.
 pub fn render(line: &str, style: Style) -> Vec<String> {
     let Ok(value) = serde_json::from_str::<Value>(line) else {
@@ -637,10 +707,35 @@ pub fn render(line: &str, style: Style) -> Vec<String> {
                 why,
                 value["profile"].as_str().unwrap_or("?"),
             )));
-            for id in value["events"].as_array().into_iter().flatten().take(10) {
-                out.push(style.dim(&format!("  woke for {}", id.as_str().unwrap_or("?"))));
+        }
+        // What woke it (ADR 0051 §5).
+        "wats_woke" => {
+            for e in value["events"].as_array().into_iter().flatten().take(10) {
+                out.push(style.dim(&format!(
+                    "  woke for {} \"{}\" from {} ({})",
+                    e["kind"].as_str().unwrap_or("?"),
+                    e["title"].as_str().unwrap_or(""),
+                    e["author"].as_str().unwrap_or("?"),
+                    e["why"].as_str().unwrap_or("?"),
+                )));
             }
         }
+        // What it posted (ADR 0051 §5).
+        "wats_outcome" => {
+            let posts = value["posts"].as_array().cloned().unwrap_or_default();
+            if posts.is_empty() {
+                out.push(style.dim("· no post"));
+            }
+            for p in posts {
+                out.push(style.green(&format!(
+                    "✓ posted {} \"{}\"",
+                    p["kind"].as_str().unwrap_or("?"),
+                    p["title"].as_str().unwrap_or("")
+                )));
+            }
+        }
+        // An entry of the run's OpenClaw session (ADR 0051 §4).
+        "openclaw_entry" => out.extend(openclaw_entry(&value["entry"]["message"], style)),
         "wats_end" => {
             let mut parts = vec![status_text(style, value["status"].as_str().unwrap_or(""))];
             if let Some(exit) = value["exit"].as_i64() {
@@ -720,7 +815,7 @@ pub fn render(line: &str, style: Style) -> Vec<String> {
                             "→ {}",
                             tool_name(part["name"].as_str().unwrap_or("?"))
                         )),
-                        style.dim(&preview(&part["input"].to_string(), TOOL_PREVIEW)),
+                        style.dim(&main_argument(&part["input"])),
                     )),
                     _ => {}
                 }
@@ -762,7 +857,7 @@ pub fn render(line: &str, style: Style) -> Vec<String> {
                             item["server"].as_str().unwrap_or("?"),
                             item["tool"].as_str().unwrap_or("?")
                         )),
-                        style.dim(&preview(&item["arguments"].to_string(), TOOL_PREVIEW)),
+                        style.dim(&main_argument(&item["arguments"])),
                     ));
                     if let Some(error) = item["error"]["message"].as_str() {
                         out.push(style.red(&format!("← ✗ {}", preview(error, TOOL_PREVIEW))));
@@ -806,7 +901,7 @@ pub fn render(line: &str, style: Style) -> Vec<String> {
             out.push(format!(
                 "{} {}",
                 style.cyan(&format!("→ {}", part["tool"].as_str().unwrap_or("?"))),
-                style.dim(&preview(&state["input"].to_string(), TOOL_PREVIEW)),
+                style.dim(&main_argument(&state["input"])),
             ));
             if state["status"] == "error" {
                 out.push(style.red(&format!(
@@ -1024,7 +1119,7 @@ mod tests {
             render(tool, style),
             vec![
                 "  Looking.".to_string(),
-                r#"→ wats.search {"query":"pdf"}"#.to_string()
+                "→ wats.search pdf".to_string()
             ]
         );
         let result = r#"{"type":"user","message":{"content":[{"type":"tool_result","content":[{"type":"text","text":"3 posts"}]}]}}"#;

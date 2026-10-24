@@ -11,6 +11,7 @@ pub mod attach;
 pub mod background;
 pub mod banner;
 pub mod bootstrap;
+pub mod brief;
 pub mod browse;
 pub mod budget;
 pub mod challenge;

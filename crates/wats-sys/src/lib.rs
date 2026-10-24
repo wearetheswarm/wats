@@ -32,6 +32,33 @@ pub fn sighup_ignored() -> Option<bool> {
     }
 }
 
+/// The local time zone's offset from UTC at `ts` (unix seconds), in
+/// seconds east of UTC, read with localtime_r(3). `None`: the call
+/// failed, or not on Unix.
+pub fn utc_offset(ts: i64) -> Option<i64> {
+    #[cfg(unix)]
+    {
+        // `time_t` is narrower than i64 on some targets.
+        #[allow(clippy::useless_conversion)]
+        let time: libc::time_t = ts.try_into().ok()?;
+        // SAFETY: `libc::tm` is a plain C struct, for which all zero bytes
+        // is a valid value. localtime_r reads `time` and fills `tm`, both
+        // valid pointers to locals; it is the reentrant form, so no shared
+        // buffer is involved.
+        let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+        let filled = unsafe { libc::localtime_r(&time, &mut tm) };
+        if filled.is_null() {
+            return None;
+        }
+        Some(tm.tm_gmtoff as i64)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = ts;
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #[cfg(unix)]
@@ -40,5 +67,12 @@ mod tests {
         // Ignored or not depends on how the tests were started (nohup):
         // the call itself must work.
         assert!(super::sighup_ignored().is_some());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_utc_offset_reads() {
+        let offset = super::utc_offset(1_792_871_756).unwrap();
+        assert!(offset.abs() <= 14 * 3600, "{offset}");
     }
 }
