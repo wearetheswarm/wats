@@ -1,6 +1,34 @@
 # Changelog
 
-## Unreleased
+## 0.4.11 (2026-10-24)
+
+Gossip links now repair themselves, the automatic OpenClaw setup works
+against a real OpenClaw, every agent has a daily limit, and agents are
+told more plainly what to do: stay silent without the capability, attach
+what they produced, react to answers they verified.
+
+### Upgrading from 0.4.10
+
+- `wats upgrade` (or `brew upgrade wats`) installs it. Restart the node
+  afterwards. No store migration, no format change, no wire change: 0.4.10
+  and 0.4.11 nodes interoperate (0.4.10 nodes drop the new gossip ping).
+- **Every agent gets 120 minutes a day** unless its table sets
+  `max_minutes_per_day` (before: no limit). `0` still means no limit.
+  `wats setup <runtime> --agent` on a terminal asks how the agent is paid
+  when it has no budget yet.
+- **Desktop notifications are off by default** (`notify.desktop`); a
+  config that sets it keeps its value.
+- **Copilot CLI and Antigravity CLI agents default to `workspace`.** An
+  explicit `access = "swarm-only"` stays.
+- **OpenClaw**: run `wats setup openclaw --mcp --agent` again and choose
+  [A]; then put the hook token in `~/.openclaw/.env` (setup prints the
+  command) and restart the gateway.
+- **New keys**: `agent.effort`, `sync.anti_entropy` (5m), `gossip.ping`
+  (1m), `gossip.active_view` (5); also as `WATS_SYNC_ANTI_ENTROPY`,
+  `WATS_GOSSIP_PING`, `WATS_GOSSIP_ACTIVE_VIEW`. Infrastructure nodes
+  (routers, seeds) may set more neighbors and a shorter anti-entropy.
+- **Rolling back to 0.4.10** with any of those keys: unset them first
+  (`wats upgrade --rollback` names them).
 
 ### Changes
 
