@@ -253,7 +253,17 @@ pub enum Expect {
     /// Others hold live claims (`any`): leave it unless bringing something
     /// clearly different.
     AbstainUnlessDifferent,
+    /// Addressed to this agent alone (`to:`), in mode `one` or `any`:
+    /// answer directly, nobody competes for it (ADR 0047 §3).
+    AnswerAddressed,
 }
+
+/// How an addressee declines an ask (ADR 0047): in its prompt line and
+/// its `delivery` view.
+pub const DECLINE_HOW: &str = "if you cannot take it, decline it: `reply` to the ask with kind \
+     `release`, `data.decline` true and `data.reason` (a few words), and `data.suggest` (up to \
+     4 author ids) if you know agents that may take it; once every addressee declined, it is \
+     open to all";
 
 impl Expect {
     pub fn label(self) -> &'static str {
@@ -262,6 +272,7 @@ impl Expect {
             Expect::ClaimFirst => "claim_first",
             Expect::Answer => "answer",
             Expect::AbstainUnlessDifferent => "abstain_unless_different",
+            Expect::AnswerAddressed => "answer_addressed",
         }
     }
 
@@ -286,6 +297,10 @@ impl Expect {
             }
             Expect::AbstainUnlessDifferent => {
                 "others are on it: leave it, unless you bring something clearly different"
+            }
+            Expect::AnswerAddressed => {
+                "addressed to you alone: answer it directly, no claim needed (post `progress` \
+                 on long work)"
             }
         }
     }
@@ -335,6 +350,57 @@ impl Withdrawal {
     }
 }
 
+/// An addressee's decline of an ask (ADR 0047 §1): a `release` replying
+/// to the ask with `data.decline` true, by a key its `to:` tags name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Decline {
+    /// The decline's id.
+    pub id: String,
+    pub author: String,
+    /// The `to:` id it answers for: the author, or a key it rotated from.
+    pub addressee: String,
+    /// `data.reason`, at most 120 characters.
+    pub reason: Option<String>,
+    /// `data.suggest`: author ids (lowercase hex), at most [`MAX_TO`].
+    pub suggest: Vec<String>,
+    /// `data.by_node`: posted by the agent's node after a failed run.
+    pub by_node: bool,
+}
+
+/// Whether `e` is a decline, by anyone: a `release` with `data.decline`
+/// true. Only an addressee's declines the ask (see [`Decline`]).
+pub fn is_decline(e: &Event) -> bool {
+    e.kind == Kind::Release && e.data.get("decline").and_then(Value::as_bool) == Some(true)
+}
+
+/// An author id read leniently: 64 hex characters, or its base32 form
+/// (52 characters, either case); in lowercase hex.
+pub fn author_id_of(text: &str) -> Option<String> {
+    let text = text.trim();
+    if text.len() == 64 && text.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Some(text.to_ascii_lowercase());
+    }
+    author_id_from_base32(text)
+}
+
+/// `data.suggest` read leniently: the author ids among its strings, at
+/// most [`MAX_TO`], without repeats.
+fn suggestions(data: &serde_json::Map<String, Value>) -> Vec<String> {
+    let mut ids: Vec<String> = Vec::new();
+    let list = data.get("suggest").and_then(Value::as_array);
+    for id in list
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .filter_map(author_id_of)
+    {
+        if ids.len() < MAX_TO && !ids.contains(&id) {
+            ids.push(id);
+        }
+    }
+    ids
+}
+
 /// Whether `e` withdraws the post it replies to: a `release` with
 /// `data.withdraw` true.
 pub fn is_withdrawal(e: &Event) -> bool {
@@ -352,6 +418,8 @@ pub struct State {
     pub accepted: bool,
     /// Its asker withdrew it ([`Withdrawal`]).
     pub withdrawn: Option<Withdrawal>,
+    /// Its addressees' declines, oldest first, one per author (ADR 0047).
+    pub declined: Vec<Decline>,
     /// Live claims, oldest first (`ts`, then id).
     pub claims: Vec<Claim>,
     /// The claims that hold a slot of `one` or `n`, by the tie-break:
@@ -409,6 +477,34 @@ impl State {
                     .map(|r| r.chars().take(120).collect()),
                 refs: e.refs.clone(),
             });
+        let mut declined: Vec<Decline> = Vec::new();
+        for e in events
+            .iter()
+            .filter(|e| is_decline(e) && e.parent.as_deref() == Some(ask.id.as_str()))
+        {
+            let Some(addressee) = request
+                .to
+                .iter()
+                .find(|to| grouping.same_key(net, to, &e.author))
+            else {
+                continue;
+            };
+            if declined.iter().any(|d| d.author == e.author) {
+                continue;
+            }
+            declined.push(Decline {
+                id: e.id.clone(),
+                author: e.author.clone(),
+                addressee: addressee.clone(),
+                reason: e
+                    .data
+                    .get("reason")
+                    .and_then(Value::as_str)
+                    .map(|r| r.chars().take(120).collect()),
+                suggest: suggestions(&e.data),
+                by_node: e.data.get("by_node").and_then(Value::as_bool) == Some(true),
+            });
+        }
         let accepted = accepts.iter().rposition(|(_, yes)| *yes).is_some_and(|i| {
             let parent = &accepts[i].0.parent;
             !accepts[i + 1..]
@@ -501,6 +597,7 @@ impl State {
             request,
             accepted,
             withdrawn,
+            declined,
             claims,
             winners,
             responders,
@@ -508,6 +605,28 @@ impl State {
             answered_groups,
             now,
         }
+    }
+
+    /// The decline of `me`, if it declined the ask as an addressee.
+    pub fn declined_by(&self, me: &str) -> Option<&Decline> {
+        self.declined.iter().find(|d| d.author == me)
+    }
+
+    /// Whether every addressee declined (ADR 0047 §2): the ask is served
+    /// as one without `to:`, nobody waits for its deadline.
+    pub fn open_to_all(&self) -> bool {
+        !self.request.to.is_empty()
+            && self
+                .request
+                .to
+                .iter()
+                .all(|to| self.declined.iter().any(|d| &d.addressee == to))
+    }
+
+    /// Whether `me` is an addressee that has not declined, while the ask
+    /// is still addressed: it is told how to decline.
+    fn may_decline(&self, me: &str) -> bool {
+        self.request.addresses(me) && self.declined_by(me).is_none() && !self.open_to_all()
     }
 
     /// The live claim of `me`, if any.
@@ -543,6 +662,9 @@ impl State {
         }
         if let Some(w) = &self.withdrawn {
             return skip(format!("its asker {} it", w.label()), None);
+        }
+        if self.declined_by(me).is_some() {
+            return skip("you declined it".into(), None);
         }
         if self.claim_of(me).is_some() {
             return match self.lost(me) {
@@ -591,7 +713,10 @@ impl State {
                 self.next_expiry(),
             );
         }
+        // Addressed to `me` alone: nobody competes (ADR 0047 §3).
+        let alone = self.request.to.len() == 1 && self.may_decline(me);
         Verdict::Wake(match self.request.mode {
+            Mode::One | Mode::Any if alone => Expect::AnswerAddressed,
             Mode::One | Mode::N => Expect::ClaimFirst,
             Mode::Any if self.claims.iter().any(|c| c.author != me) => {
                 Expect::AbstainUnlessDifferent
@@ -634,11 +759,23 @@ impl State {
             None => format!("{} responders, no cap", self.responders),
         };
         let expected = match self.verdict(me) {
+            Verdict::Wake(expect) if self.may_decline(me) => {
+                format!("{}; {DECLINE_HOW}", expect.instruction())
+            }
             Verdict::Wake(expect) => expect.instruction().to_string(),
             Verdict::Skip { why, .. } => format!("leave it ({why})"),
         };
+        let declined = match (self.declined.len(), self.open_to_all()) {
+            (0, _) => String::new(),
+            (_, true) => "; every addressee declined: open to all".to_string(),
+            (n, false) => format!(
+                "; declined by {} of {} addressees",
+                n,
+                self.request.to.len()
+            ),
+        };
         format!(
-            "- {}: mode {mode}; {claims}; {count}. Expected: {expected}.",
+            "- {}: mode {mode}; {claims}; {count}{declined}. Expected: {expected}.",
             self.ask
         )
     }
@@ -668,15 +805,41 @@ impl State {
             view["withdrawn"] =
                 json!({"id": w.id, "reason": w.reason, "refs": w.refs, "label": w.label()});
         }
+        if !self.declined.is_empty() {
+            view["declined"] = json!(
+                self.declined
+                    .iter()
+                    .map(|d| json!({
+                        "id": d.id,
+                        "author": d.author,
+                        "reason": d.reason,
+                        "suggest": d.suggest,
+                        "by_node": d.by_node,
+                    }))
+                    .collect::<Vec<_>>()
+            );
+        }
+        if self.open_to_all() {
+            view["open_to_all"] = json!(true);
+        }
         match self.verdict(me) {
             // Addressed to others: theirs, whatever else a session or a
             // heartbeat run finds about it (the runner wakes the others
-            // only past its deadline, unanswered).
-            _ if !self.request.to.is_empty() && !self.request.addresses(me) => {
+            // only past its deadline, unanswered), until every addressee
+            // declined it.
+            _ if !self.request.to.is_empty()
+                && !self.request.addresses(me)
+                && !self.open_to_all() =>
+            {
                 view["expected"] = json!("abstain");
                 view["why"] = json!("addressed to other agents (to:): leave it to them");
             }
-            Verdict::Wake(expect) => view["expected"] = json!(expect.label()),
+            Verdict::Wake(expect) => {
+                view["expected"] = json!(expect.label());
+                if self.may_decline(me) {
+                    view["decline"] = json!(DECLINE_HOW);
+                }
+            }
             Verdict::Skip { why, .. } => {
                 view["expected"] = json!("abstain");
                 view["why"] = json!(why);
@@ -793,6 +956,27 @@ pub fn lenient_notes(kind: &Kind, data: &serde_json::Map<String, Value>) -> Vec<
             if data.contains_key("max") && count(data.get("max")).is_none() {
                 notes.push(
                     "data.max is not a positive integer: each node's ask.max_responders applies"
+                        .to_string(),
+                );
+            }
+        }
+        Kind::Release if data.get("decline").and_then(Value::as_bool) == Some(true) => {
+            if data
+                .get("reason")
+                .and_then(Value::as_str)
+                .is_none_or(|r| r.trim().is_empty())
+            {
+                notes.push(
+                    "a decline gives data.reason: why, in a few words, for the asker".to_string(),
+                );
+            }
+            let given = data
+                .get("suggest")
+                .map_or(0, |v| v.as_array().map_or(1, Vec::len));
+            if given > 0 && suggestions(data).len() < given.min(MAX_TO) {
+                notes.push(
+                    "data.suggest is a list of author ids (hex or base32): the others are \
+                     ignored"
                         .to_string(),
                 );
             }
@@ -978,7 +1162,74 @@ mod tests {
                 .unwrap()
                 .contains("addressed to other agents")
         );
+        assert_eq!(s.view(&id(2), T0)["expected"], "answer_addressed");
+    }
+
+    /// ADR 0047: an addressee's decline is listed, anyone else's is not;
+    /// once every addressee declined, the ask is open to all; a single
+    /// addressee answers directly, two compete by claim.
+    #[test]
+    fn addressees_decline_and_open_the_ask() {
+        let (to2, to3) = (to_tag(&id(2)).unwrap(), to_tag(&id(3)).unwrap());
+        let a = ask(1, json!({"mode": "one"}), &[to2.as_str(), to3.as_str()]);
+        let decline = |seed: u8, ts: u64| {
+            reply(
+                seed,
+                &a,
+                Kind::Release,
+                ts,
+                json!({"decline": true, "reason": "needs a GPU", "suggest": [id(5), "x"]}),
+            )
+        };
+        let s = state(&a, &[], T0);
         assert_eq!(s.view(&id(2), T0)["expected"], "claim_first");
+        assert!(s.view(&id(2), T0)["decline"].is_string());
+        assert!(s.view(&id(4), T0).get("decline").is_none());
+
+        let by4 = decline(4, T0 + 1);
+        let by2 = decline(2, T0 + 2);
+        let s = state(&a, &[&by4, &by2], T0 + 3);
+        assert_eq!(s.declined.len(), 1, "{:?}", s.declined);
+        assert_eq!(s.declined[0].author, id(2));
+        assert_eq!(s.declined[0].reason.as_deref(), Some("needs a GPU"));
+        assert_eq!(s.declined[0].suggest, [id(5)]);
+        assert!(!s.open_to_all());
+        assert!(matches!(s.verdict(&id(2)), Verdict::Skip { .. }));
+        assert_eq!(s.view(&id(4), T0 + 3)["expected"], "abstain");
+        assert!(
+            s.prompt_line(&id(3), T0 + 3)
+                .contains("declined by 1 of 2 addressees")
+        );
+
+        let by3 = decline(3, T0 + 4);
+        let s = state(&a, &[&by4, &by2, &by3], T0 + 5);
+        assert!(s.open_to_all());
+        let view = s.view(&id(4), T0 + 5);
+        assert_eq!(view["expected"], "claim_first");
+        assert_eq!(view["open_to_all"], true);
+        assert!(s.prompt_line(&id(4), T0 + 5).contains("open to all"));
+
+        // One addressee: no claim needed in `one` and `any`, but in `n`.
+        for (mode, expected) in [
+            ("one", "answer_addressed"),
+            ("any", "answer_addressed"),
+            ("n", "claim_first"),
+        ] {
+            let a = ask(1, json!({"mode": mode, "want": 2}), &[to2.as_str()]);
+            assert_eq!(
+                state(&a, &[], T0).view(&id(2), T0)["expected"],
+                expected,
+                "{mode}"
+            );
+        }
+        assert_eq!(
+            lenient_notes(
+                &Kind::Release,
+                json!({"decline": true}).as_object().unwrap()
+            )
+            .len(),
+            1
+        );
     }
 
     /// A follow-up ask in a thread is its own request: only what descends
