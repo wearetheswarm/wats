@@ -106,6 +106,49 @@ pub fn hooks_token_path(data_dir: &Path) -> PathBuf {
     dir(data_dir).join("hooks.token")
 }
 
+/// OpenClaw's own `.env`, which its gateway reads at start:
+/// `$OPENCLAW_STATE_DIR/.env`, else `~/.openclaw/.env`.
+pub fn env_file(state_dir: Option<PathBuf>, home: Option<PathBuf>) -> Option<PathBuf> {
+    state_dir
+        .filter(|d| !d.as_os_str().is_empty())
+        .or_else(|| home.map(|h| h.join(".openclaw")))
+        .map(|d| d.join(".env"))
+}
+
+/// `text` (a `.env`) with `key=value`: the line of `key` replaced, or one
+/// added. `None` when it already holds exactly that line.
+pub fn upsert_env(text: &str, key: &str, value: &str) -> Option<String> {
+    let line = format!("{key}={value}");
+    let prefix = format!("{key}=");
+    let mut found = false;
+    let mut lines: Vec<String> = Vec::new();
+    for l in text.lines() {
+        let bare = l
+            .trim_start()
+            .strip_prefix("export ")
+            .unwrap_or(l.trim_start());
+        if bare.starts_with(&prefix) {
+            if found {
+                continue;
+            }
+            found = true;
+            if l == line {
+                lines.push(l.to_string());
+                continue;
+            }
+            lines.push(line.clone());
+        } else {
+            lines.push(l.to_string());
+        }
+    }
+    if !found {
+        lines.push(line.clone());
+    }
+    let mut out = lines.join("\n");
+    out.push('\n');
+    (out != text).then_some(out)
+}
+
 pub fn runner_token_path(data_dir: &Path) -> PathBuf {
     dir(data_dir).join("runner.token")
 }
@@ -364,6 +407,45 @@ pub fn notify_text(ask_title: &str, reply: &crate::event::Event, from: &str) -> 
     text.chars().take(NOTIFY_MAX_CHARS).collect()
 }
 
+/// What the gateway makes of this node's hook token (`probe_token`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Probe {
+    /// It took the token: anything but 401/403 (an empty body gets 400).
+    Accepted,
+    /// 401 or 403: the gateway's `${WATS_OPENCLAW_HOOKS_TOKEN}` is not this
+    /// node's token, most often unset in its environment.
+    Refused,
+    /// No answer: the gateway is not running, or not at that URL.
+    Unreachable(String),
+}
+
+/// Ask the gateway at `url` whether it takes `token`: `POST
+/// <url>/hooks/agent` with an empty object, which no agent runs on (400
+/// once authenticated, 401 otherwise). The token is never logged.
+pub async fn probe_token(url: &str, token: &str) -> Probe {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let Ok(client) = reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(5))
+        .timeout(Duration::from_secs(10))
+        .build()
+    else {
+        return Probe::Unreachable("no HTTP client".into());
+    };
+    let endpoint = format!("{}/hooks/agent", url.trim_end_matches('/'));
+    match client
+        .post(&endpoint)
+        .bearer_auth(token)
+        .header("Content-Type", "application/json")
+        .body("{}")
+        .send()
+        .await
+    {
+        Ok(response) if matches!(response.status().as_u16(), 401 | 403) => Probe::Refused,
+        Ok(_) => Probe::Accepted,
+        Err(e) => Probe::Unreachable(e.without_url().to_string()),
+    }
+}
+
 /// Wake the human's OpenClaw main session with `text` (`POST
 /// /hooks/wake`, `mode: "now"`). The token is never logged.
 pub async fn wake(notify: &Notify, text: &str) -> Result<()> {
@@ -583,7 +665,10 @@ pub async fn forward(request: Request, isolated: &AtomicBool) -> Reply {
             401 | 403 => Reply::Failed {
                 error: format!(
                     "the OpenClaw gateway refused the hook token ({status}): its hooks.token \
-                     must be the token of {HOOKS_TOKEN_ENV} (wats setup openclaw --agent)"
+                     is ${{{HOOKS_TOKEN_ENV}}}, so the gateway must have that variable, with this \
+                     node's token, in its environment. Most often it is unset there: put it in \
+                     OpenClaw's .env (~/.openclaw/.env, or $OPENCLAW_STATE_DIR/.env; `wats \
+                     setup openclaw --agent --apply` writes it) and restart the gateway"
                 ),
                 retry_after: retry_after.map(Duration::from_secs),
             },
@@ -654,7 +739,9 @@ pub fn config_block(agent: &str) -> String {
              default: false,\n  name: \"wats (swarm)\",\n  \
              workspace: \"~/.openclaw/workspace-wats\",\n  \
              sandbox: {{ mode: \"all\", scope: \"agent\" }},\n  \
-             tools: {{ allow: [\"{AGENT_SERVER}__*\"],\n           deny: [{deny}] }},\n}} ] }},\n"
+             tools: {{ allow: [\"{AGENT_SERVER}__*\"],\n           deny: [{deny}],\n           \
+             // the sandbox's own tool policy: each level only narrows\n           \
+             sandbox: {{ tools: {{ allow: [\"{AGENT_SERVER}__*\"] }} }} }},\n}} ] }},\n"
         ));
     }
     block
@@ -745,7 +832,14 @@ pub fn config_patch(
             "name": "wats (swarm)",
             "workspace": "~/.openclaw/workspace-wats",
             "sandbox": { "mode": "all", "scope": "agent" },
-            "tools": { "allow": [format!("{AGENT_SERVER}__*")], "deny": DENIED_TOOLS },
+            // The sandbox has its own tool policy (`tools.sandbox.tools`),
+            // and each level only narrows: without its own allow, nothing
+            // is left to call (OpenClaw 2026.6.35, Vincent's Mac).
+            "tools": {
+                "allow": [format!("{AGENT_SERVER}__*")],
+                "deny": DENIED_TOOLS,
+                "sandbox": { "tools": { "allow": [format!("{AGENT_SERVER}__*")] } },
+            },
         }));
         patch["agents"] = json!({ "list": list });
     }
@@ -1093,6 +1187,28 @@ mod tests {
             config_patch("main", &ids, &prefixes, &[])
                 .get("agents")
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn the_env_file_gets_one_token_line() {
+        assert_eq!(upsert_env("", "K", "v").as_deref(), Some("K=v\n"));
+        assert_eq!(
+            upsert_env("A=1\nK=old\nB=2\n", "K", "v").as_deref(),
+            Some("A=1\nK=v\nB=2\n")
+        );
+        assert_eq!(upsert_env("A=1\nK=v\n", "K", "v"), None);
+        assert_eq!(
+            upsert_env("export K=old\nK=dup\n", "K", "v").as_deref(),
+            Some("K=v\n")
+        );
+        assert_eq!(
+            env_file(None, Some(PathBuf::from("/h"))),
+            Some(PathBuf::from("/h/.openclaw/.env"))
+        );
+        assert_eq!(
+            env_file(Some(PathBuf::from("/s")), Some(PathBuf::from("/h"))),
+            Some(PathBuf::from("/s/.env"))
         );
     }
 
