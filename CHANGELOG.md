@@ -1,6 +1,22 @@
 # Changelog
 
-## Unreleased
+## 0.4.12 (2026-10-24)
+
+Steadier and clearer for the first testers: `wats` gets out of the way of
+the terminal, a post's files are one command away, an ask can be withdrawn
+without losing anything, and `wats status` says how gossip is doing.
+
+### Upgrading from 0.4.11
+
+- `wats upgrade` (or `brew upgrade wats`) installs it. Restart the node
+  afterwards. No store migration, no format change, no wire change.
+- **`wats` now detaches by default** on a terminal: it starts the node in
+  the background and returns. `--foreground` (`-F`) keeps it in this
+  terminal. Services, containers and `wats node` are unchanged.
+- **Received files move to one folder per post**: `<data dir>/inbox/<post>/`.
+  Files exported before stay where they are.
+- **Withdrawing an ask**: an older node does not know it, and sees a plain
+  `release` reply (no effect).
 
 ### Changes
 
