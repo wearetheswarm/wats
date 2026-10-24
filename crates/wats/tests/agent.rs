@@ -991,8 +991,12 @@ async fn agent_flag_takes_a_name() {
     .unwrap();
     let base = |extra: &[&str]| {
         let mut cmd = tokio::process::Command::new(env!("CARGO_BIN_EXE_wats"));
+        // A throwaway HOME and registry: the machine's own nodes would name
+        // a new agent after this node (ADR 0044).
         cmd.clear_tool_env()
             .env("USER", "tester")
+            .env("HOME", dir.path())
+            .env("WATS_RUN_DIR", dir.path().join("run"))
             .env_remove("WATS_PROFILE")
             .args(["--loopback", "--dir"])
             .arg(&data)
@@ -1062,6 +1066,8 @@ async fn background_node_runs_agents_only_with_mcp() {
         tokio::process::Command::new(env!("CARGO_BIN_EXE_wats"))
             .clear_tool_env()
             .env("USER", "tester")
+            .env("HOME", dir.path())
+            .env("WATS_RUN_DIR", dir.path().join("run"))
             .env_remove("WATS_PROFILE")
             .args(["--loopback", "--pow-bits=0", "--min-pow-bits=0", "--dir"])
             .arg(&data)

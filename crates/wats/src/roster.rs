@@ -133,9 +133,9 @@ pub fn default_profile(user: &str, name: &str) -> String {
 /// machine's default one (`~/.wats`): `<user>-<name>-<node name>`, the
 /// user part shortened to fit 64 chars, so that two nodes of one machine
 /// do not both post as `<user>-<name>` with different keys (ADR 0044).
-/// `None` on the default node, without a machine (hermetic), or for an
-/// agent that has run already (its directory exists: its profile, and so
-/// its key, stay).
+/// `None` on the default node, without a machine (hermetic), without
+/// another node that has started on the machine, or for an agent that has
+/// run already (its directory exists: its profile, and so its key, stay).
 pub fn node_profile(
     member: &Member,
     user: &str,
@@ -147,6 +147,15 @@ pub fn node_profile(
     }
     let default_dir = machine.default_dir.as_deref()?;
     if crate::naming::same_dir(data_dir, default_dir) {
+        return None;
+    }
+    // Only beside another node of this machine, one that has started (its
+    // key exists): that is when two of them would share the name.
+    let beside = machine
+        .dirs()
+        .iter()
+        .any(|d| !crate::naming::same_dir(d, data_dir) && d.join("secret.key").exists());
+    if !beside {
         return None;
     }
     let node = crate::naming::stored(data_dir)?;
@@ -400,6 +409,9 @@ mod tests {
             default_dir: Some(home.clone()),
         };
         let vibe = unnamed("vibe", &second, "alice");
+        // No other node has started yet: no collision to avoid.
+        assert_eq!(node_profile(&vibe, "alice", &second, &machine), None);
+        std::fs::write(home.join("secret.key"), "x").unwrap();
         assert_eq!(
             node_profile(&vibe, "alice", &second, &machine).as_deref(),
             Some("alice-vibe-bubbly_gnat")
