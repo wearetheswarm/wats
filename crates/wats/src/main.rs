@@ -678,6 +678,10 @@ enum Command {
         /// Host name to show in the bootstrap entry.
         #[arg(long, default_value = "router.wearetheswarm.ai")]
         host: String,
+        /// List the agents of this machine's nodes instead: node, agent,
+        /// profile, author id and the `to:` tag that addresses it.
+        #[arg(long)]
+        agents: bool,
     },
     /// Crash reports of this node: list, show (exactly what would be
     /// sent), send to the collector, discard.
@@ -1609,6 +1613,71 @@ fn openclaw_mcp_set(
 ///    `openclaw config patch --stdin` and `openclaw config validate`.
 ///
 /// Any failure from the first write on restores the backup and fails.
+/// Say whether the gateway at `url` takes the hook token now (an
+/// authenticated probe: 400, not 401).
+fn report_token_probe(url: &str, token: &str) {
+    use wats::openclaw::Probe;
+    let (url, token) = (url.to_string(), token.to_string());
+    let probe = std::thread::spawn(move || {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map(|rt| rt.block_on(wats::openclaw::probe_token(&url, &token)))
+    })
+    .join();
+    match probe {
+        Ok(Ok(Probe::Accepted)) => {
+            println!("The gateway takes the hook token: hooks reach it.")
+        }
+        Ok(Ok(Probe::Refused)) => println!(
+            "The running gateway refuses the hook token (401): it has not read it yet. Restart \
+             it (`openclaw gateway restart`); until then every hook to it fails."
+        ),
+        Ok(Ok(Probe::Unreachable(why))) => println!(
+            "The gateway did not answer ({why}): start it (`openclaw gateway restart`); it reads \
+             the token at start."
+        ),
+        _ => {}
+    }
+}
+
+/// Set the hook token in OpenClaw's `.env` ([`oc::env_file`]), after a
+/// backup copy of an existing file, owner-only. `Ok(None)` without a home
+/// to find it in.
+fn write_openclaw_env(hooks_token: &str) -> Result<Option<PathBuf>> {
+    use wats::openclaw as oc;
+    let state_dir = std::env::var_os("OPENCLAW_STATE_DIR").map(PathBuf::from);
+    // A hermetic run writes only into an OpenClaw state directory it was
+    // given, never the user's ~/.openclaw.
+    if wats::update::hermetic_env() && state_dir.is_none() {
+        return Ok(None);
+    }
+    let Some(path) = oc::env_file(state_dir, std::env::home_dir()) else {
+        return Ok(None);
+    };
+    let text = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => return Err(e).with_context(|| format!("read {}", path.display())),
+    };
+    let Some(new) = oc::upsert_env(&text, oc::HOOKS_TOKEN_ENV, hooks_token) else {
+        return Ok(Some(path));
+    };
+    if path.exists() {
+        let backup = oc::backup_path(&path, unix_now());
+        std::fs::copy(&path, &backup)
+            .with_context(|| format!("back up {} to {}", path.display(), backup.display()))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&backup, std::fs::Permissions::from_mode(0o600))?;
+        }
+    }
+    wats::background::write_file(&path, &new)
+        .with_context(|| format!("write {}", path.display()))?;
+    Ok(Some(path))
+}
+
 fn apply_openclaw_config(
     openclaw: &std::path::Path,
     agent_id: &str,
@@ -2141,8 +2210,34 @@ fn setup_openclaw(
     };
     if automatic {
         apply_openclaw_config(openclaw, &agent_id, &hooks_token)?;
-        token_line(" (hooks.token is the template ${WATS_OPENCLAW_HOOKS_TOKEN})");
-        println!("Then restart the gateway (`openclaw gateway restart`).");
+        // The gateway resolves ${WATS_OPENCLAW_HOOKS_TOKEN} from its own
+        // .env: written here, not left to a line the user may lose (the
+        // first [A] run on Vincent's Mac got 401s).
+        match write_openclaw_env(&hooks_token) {
+            Ok(Some(path)) => {
+                println!(
+                    "OpenClaw's .env: {} sets {} (mode 600; the token is not printed). The \
+                     gateway reads it at start: restart it (`openclaw gateway restart`), then \
+                     check that it runs (`openclaw gateway status`).",
+                    path.display(),
+                    oc::HOOKS_TOKEN_ENV
+                );
+                // Never in tests: the default URL may be the user's own
+                // gateway, which rate-limits refused tokens.
+                if !wats::update::hermetic_env() {
+                    report_token_probe(&gateway, &hooks_token);
+                }
+            }
+            Ok(None) => {
+                token_line(" (hooks.token is the template ${WATS_OPENCLAW_HOOKS_TOKEN})");
+                println!("Then restart the gateway (`openclaw gateway restart`).");
+            }
+            Err(e) => {
+                eprintln!("warning: OpenClaw's .env not written: {e:#}");
+                token_line(" (hooks.token is the template ${WATS_OPENCLAW_HOOKS_TOKEN})");
+                println!("Then restart the gateway (`openclaw gateway restart`).");
+            }
+        }
     } else {
         println!(
             "\nPaste this into OpenClaw's config (openclaw.json, JSON5; wats never edits it), \
@@ -2150,6 +2245,11 @@ fn setup_openclaw(
             oc::config_block(&agent_id)
         );
         token_line("");
+        println!(
+            "Required: until the gateway has {} in its environment, every hook to it fails \
+             with 401.",
+            oc::HOOKS_TOKEN_ENV
+        );
         println!(
             "If your config already has a hooks block, its token alone:\n  {}",
             oc::hooks_token_command()
@@ -6329,6 +6429,43 @@ fn status_lines(prefix: &str, value: &serde_json::Value) -> Vec<String> {
     }
 }
 
+/// `wats id --agents`: the agents of this node and of the other nodes of
+/// this machine (their agents.json), each with its `to:` tag.
+fn print_agent_ids(config: &NodeConfig) -> Result<()> {
+    let root = match &config.secret_file {
+        Some(file) => wats::identity::RootSecret::load(file)?,
+        None => wats::identity::RootSecret::load(&config.data_dir.join("secret.key"))
+            .context("this node has no key yet: start it once")?,
+    };
+    let machine = wats::naming::Machine::of_user(config.registry.clone());
+    let here = wats::naming::display(&config.data_dir, machine.default_dir.as_deref());
+    let settings = Settings::load(&config.data_dir)?;
+    let mut rows: Vec<(String, String, String, String)> =
+        wats::roster::configured(&settings, &config.data_dir, &os_user_profile())?
+            .into_iter()
+            .map(|m| {
+                let id = wats::identity::author_id(&root.profile_key(&m.profile));
+                (here.clone(), m.name, m.profile, id)
+            })
+            .collect();
+    for (node, dir, agent) in wats::node::machine_agents(&machine) {
+        if wats::naming::same_dir(&dir, &config.data_dir) {
+            continue;
+        }
+        let field = |k: &str| agent[k].as_str().unwrap_or_default().to_string();
+        rows.push((node, field("name"), field("profile"), field("author")));
+    }
+    if rows.is_empty() {
+        println!("no agent on this machine's nodes");
+        return Ok(());
+    }
+    for (node, name, profile, id) in rows {
+        let to = wats::delivery::to_tag(&id).unwrap_or_default();
+        println!("{node}\t{name}\t{profile}\t{id}\t{to}");
+    }
+    Ok(())
+}
+
 fn print_id(config: &NodeConfig, host: &str) -> Result<()> {
     let (root, path, existed) = match &config.secret_file {
         Some(file) => (wats::identity::RootSecret::load(file)?, file.clone(), true),
@@ -8526,7 +8663,8 @@ async fn async_main(mut cli: Cli) -> Result<()> {
             }
             return result;
         }
-        Some(Command::Id { host }) => return print_id(&config, &host),
+        Some(Command::Id { agents: true, .. }) => return print_agent_ids(&config),
+        Some(Command::Id { host, .. }) => return print_id(&config, &host),
         Some(Command::Status { json, .. }) => {
             say_node(&data_dir, None);
             return status_command(&config, json, cli.node.hermetic || cli.node.loopback).await;

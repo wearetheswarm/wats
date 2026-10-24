@@ -770,6 +770,7 @@ esac
         std::process::Command::new(env!("CARGO_BIN_EXE_wats"))
             .env("WATS_HERMETIC", "1")
             .env("HOME", d)
+            .env("OPENCLAW_STATE_DIR", d.join("oc-state"))
             .env("PATH", &path)
             .env("USER", "alice")
             .env_remove("WATS_PROFILE")
@@ -853,6 +854,25 @@ esac
     );
     assert_eq!(patch["agents"]["list"][1]["id"], "wats");
     assert_eq!(patch["agents"]["list"][1]["default"], false);
+    // The sandbox's own tool policy lets the wats tools through.
+    assert_eq!(
+        patch["agents"]["list"][1]["tools"]["sandbox"]["tools"]["allow"],
+        serde_json::json!(["wats-agent__*"])
+    );
+    // The token goes into OpenClaw's .env, owner-only, and is not printed
+    // by the automatic mode.
+    let env = d.join("oc-state").join(".env");
+    let hooks_token = std::fs::read_to_string(data.join("openclaw/hooks.token")).unwrap();
+    assert_eq!(
+        std::fs::read_to_string(&env).unwrap(),
+        format!("WATS_OPENCLAW_HOOKS_TOKEN={}\n", hooks_token.trim())
+    );
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&env).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
+    }
+    assert!(said.contains("OpenClaw's .env:"), "{said}");
     assert!(said.contains("openclaw gateway status"), "{said}");
     // Docker is not on this test's PATH: the sandbox image is pointed to.
     assert!(
@@ -866,13 +886,8 @@ esac
     assert!(said.contains("\"allowedAgentIds\": ["), "{said}");
     assert!(said.contains("applied"), "{said}");
     let hooks = std::fs::read_to_string(data.join("openclaw/hooks.token")).unwrap();
-    assert!(
-        said.contains(&format!(
-            "export WATS_OPENCLAW_HOOKS_TOKEN={}",
-            hooks.trim()
-        )),
-        "{said}"
-    );
+    // Written to OpenClaw's .env: the automatic mode never prints it.
+    assert!(!said.contains(hooks.trim()), "{said}");
     assert!(
         !std::fs::read_to_string(&cfg)
             .unwrap()
