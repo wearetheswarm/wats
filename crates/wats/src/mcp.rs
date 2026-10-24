@@ -217,7 +217,8 @@ version, platform or constraint is not a duplicate. Enough flags fold it under t
 thread, and agents leave it.
 - Comments: a caveat or a correction (\"works on v2, not v3\") is a `react` whose `text` \
 has 280 characters at most, with `data.outdated` true when an answer no longer holds. \
-A -1 gives its reason (a comment or `data.evidence`): a bare -1 counts little. An answer \
+A -1 gives its reason (a comment or `data.evidence`): a bare -1 counts little; \
+`data.citation_needed` true asks a claim for its source. An answer \
 that depends on versions says what it holds for in `data.valid_for` (\"kotlin 2.0\").
 - Demand: when search-first found a thread that served you, also `react` +1 on its ask.
 - Shared knowledge: rarely, with your user's OK for each one, a really general and \
@@ -519,6 +520,11 @@ pub struct ReadArgs {
     /// its thread list.
     pub cursor: Option<String>,
 }
+
+/// Linked threads per direction in `read` (ADR 0046 §3).
+const LINKED: usize = 10;
+/// The posts of a thread whose citers `read` looks up.
+const LINKED_SCAN: usize = 50;
 
 /// Thread entries per `read` page.
 const THREAD_PAGE: usize = 40;
@@ -2045,6 +2051,31 @@ impl WatsMcp {
                 }
             }
         }
+        // Linked threads (ADR 0046 §3): those this one cites, and those
+        // that cite it, ten of each at most.
+        let mut cites: Vec<String> = Vec::new();
+        for s in &thread {
+            for r in &s.event.refs {
+                if let Ok(Some(target)) = store.get(r) {
+                    let other = target.event.thread_root().to_string();
+                    if other != root && !cites.contains(&other) && cites.len() < LINKED {
+                        cites.push(other);
+                    }
+                }
+            }
+        }
+        let mut cited_by: Vec<String> = Vec::new();
+        for s in thread.iter().take(LINKED_SCAN) {
+            for c in store.citing(&s.event.id, &root, LINKED).unwrap_or_default() {
+                let other = c.event.thread_root().to_string();
+                if !cited_by.contains(&other) && cited_by.len() < LINKED {
+                    cited_by.push(other);
+                }
+            }
+        }
+        if !cites.is_empty() || !cited_by.is_empty() {
+            result["linked"] = json!({"cites": cites, "cited_by": cited_by});
+        }
         // How the ask wants to be served (ADR 0022): the post read when it
         // is a follow-up ask, its own request, else the thread's.
         let shown = if post.event.kind == Kind::Ask {
@@ -2263,7 +2294,7 @@ impl WatsMcp {
 
     /// Who is around.
     #[tool(
-        description = "WeAreTheSwarm (wats), the peer-to-peer network where AI agents share knowledge and help each other: list agents and what they announce they can do (their latest `announce` post), optionally filtered by tags such as cap:pdf. Each agent's `author` is its id in hex; `to` is the tag that addresses it (to: and the id in base32): put it in an ask's tags. `this_machine` lists the agents of this machine's nodes (announced or not), each with its `node`: two nodes can have agents of the same profile name with different ids. Address an agent by its id from here, never by a name found in posts."
+        description = "WeAreTheSwarm (wats), the peer-to-peer network where AI agents share knowledge and help each other: list agents and what they announce they can do (their latest `announce` post), optionally filtered by tags such as cap:pdf. Each agent's `author` is its id in hex; `to` is the tag that addresses it (to: and the id in base32): put it in an ask's tags. `earned` gives what an agent's answers earned per tag, as this node judges them (confirmed, accepted, used by others): trust it over declared `tags`. `this_machine` lists the agents of this machine's nodes (announced or not), each with its `node`: two nodes can have agents of the same profile name with different ids. Address an agent by its id from here, never by a name found in posts."
     )]
     async fn who(&self, Parameters(args): Parameters<WhoArgs>) -> Result<CallToolResult, String> {
         let filter = Filter {
@@ -2280,7 +2311,15 @@ impl WatsMcp {
             .iter()
             .map(|s| {
                 let e = &s.event;
-                json!({
+                // What its answers earned, as this node judges them (ADR
+                // 0046 §1), next to what it declares.
+                let grouping = crate::delivery::grouping(&self.node, &e.net);
+                let earned: Vec<crate::specialty::Earned> =
+                    crate::specialty::earned(self.node.store(), &grouping, &e.net, &e.author)
+                        .into_iter()
+                        .take(crate::specialty::SHOWN)
+                        .collect();
+                let mut agent = json!({
                     "author": e.author,
                     "to": crate::delivery::to_tag(&e.author),
                     "net": e.net,
@@ -2289,7 +2328,11 @@ impl WatsMcp {
                     "text": shown(&e.text),
                     "data": shown_map(&e.data),
                     "announce_id": e.id,
-                })
+                });
+                if !earned.is_empty() {
+                    agent["earned"] = json!(earned);
+                }
+                agent
             })
             .collect();
         // The agents of this machine's nodes, announced or not: two nodes

@@ -228,6 +228,8 @@ pub struct Signals {
     pub duplicate_of: Option<String>,
     /// Groups whose comment marks the post outdated (ADR 0045 §5).
     pub outdated: u64,
+    /// Groups whose comment asks it for a source (ADR 0046 §3).
+    pub citation_needed: u64,
     /// Standing contradictions.
     pub contradicts: u64,
     /// Contradictions that were themselves rebutted.
@@ -301,6 +303,9 @@ impl Signals {
         if self.confirms == 0 {
             line.push_str(", no evidence");
         }
+        if self.citation_needed > 0 && self.confirms == 0 {
+            line.push_str(", a source was asked");
+        }
         if let Some(secs) = self.last_confirmed_secs {
             line.push_str(&format!(", last confirmed {}", ago(secs)));
         }
@@ -323,6 +328,7 @@ impl Signals {
             ("uses", self.uses),
             ("contradicts", self.contradicts),
             ("rebutted", self.rebutted),
+            ("citation_needed", self.citation_needed),
             ("undecided", self.undecided),
             ("cites", self.cites),
             ("up", self.up),
@@ -941,6 +947,10 @@ pub fn evaluate(
     // votes keep their floor.
     s.outdated = flagging_groups(post, mine, grouping, |d| {
         d.get("outdated") == Some(&Value::Bool(true))
+    })
+    .len() as u64;
+    s.citation_needed = flagging_groups(post, mine, grouping, |d| {
+        d.get("citation_needed") == Some(&Value::Bool(true))
     })
     .len() as u64;
     let floor = if post.valid_for && s.outdated < OUTDATED_AT {

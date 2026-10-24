@@ -115,12 +115,12 @@ pub fn outside_field(caps: &[String], tags: &[String]) -> Vec<String> {
         let mine: Vec<String> = caps
             .iter()
             .filter(|c| tag_value(c, ns).is_some())
-            .map(|c| c.trim().to_ascii_lowercase())
+            .map(|c| tag_key(c))
             .collect();
         let asked: Vec<String> = tags
             .iter()
             .filter(|t| tag_value(t, ns).is_some_and(|v| !v.is_empty()))
-            .map(|t| t.trim().to_ascii_lowercase())
+            .map(|t| tag_key(t))
             .collect();
         if !mine.is_empty() && !asked.is_empty() && !asked.iter().any(|t| mine.contains(t)) {
             outside.extend(asked);
@@ -719,7 +719,8 @@ pub fn normalize_to_tag(tag: String) -> (String, Option<String>) {
     }
 }
 
-/// [`normalize_to_tag`] on each tag, and the notes.
+/// [`normalize_to_tag`] on each tag, then [`canonical_tag`], and the
+/// notes.
 pub fn normalize_to_tags(tags: Vec<String>) -> (Vec<String>, Vec<String>) {
     let mut notes = Vec::new();
     let tags = tags
@@ -727,10 +728,37 @@ pub fn normalize_to_tags(tags: Vec<String>) -> (Vec<String>, Vec<String>) {
         .map(|tag| {
             let (tag, note) = normalize_to_tag(tag);
             notes.extend(note);
-            tag
+            canonical_tag(&tag).unwrap_or(tag)
         })
         .collect();
     (tags, notes)
+}
+
+/// Tag synonyms shipped with wats (ADR 0046 §3): the short spelling, then
+/// the one posts and filters use.
+pub const TAG_SYNONYMS: [(&str, &str); 7] = [
+    ("lang:js", "lang:javascript"),
+    ("lang:ts", "lang:typescript"),
+    ("lang:py", "lang:python"),
+    ("lang:golang", "lang:go"),
+    ("lang:rs", "lang:rust"),
+    ("lang:kt", "lang:kotlin"),
+    ("topic:k8s", "topic:kubernetes"),
+];
+
+/// The spelling posts and filters use for `tag`, when it is a synonym
+/// ([`TAG_SYNONYMS`], ASCII case aside). `None`: keep it as it is.
+pub fn canonical_tag(tag: &str) -> Option<String> {
+    let lower = tag.trim().to_ascii_lowercase();
+    TAG_SYNONYMS
+        .iter()
+        .find(|(short, _)| *short == lower)
+        .map(|(_, long)| (*long).to_string())
+}
+
+/// `tag` in its canonical spelling, lowercase.
+pub fn tag_key(tag: &str) -> String {
+    canonical_tag(tag).unwrap_or_else(|| tag.trim().to_ascii_lowercase())
 }
 
 fn short_tag(tag: &str) -> String {
@@ -869,6 +897,14 @@ mod tests {
             s(&["lang:kotlin"])
         );
         assert!(outside_field(&rust, &s(&["lang:Rust", "lang:kotlin"])).is_empty());
+        // Synonyms (ADR 0046 §3): lang:rs is lang:rust.
+        assert!(outside_field(&s(&["lang:rs"]), &s(&["lang:rust"])).is_empty());
+        assert_eq!(canonical_tag("LANG:JS").as_deref(), Some("lang:javascript"));
+        assert_eq!(canonical_tag("lang:javascript"), None);
+        assert_eq!(
+            normalize_to_tags(s(&["lang:ts"])).0,
+            s(&["lang:typescript"])
+        );
         assert!(outside_field(&rust, &s(&["topic:jvm"])).is_empty());
         assert!(outside_field(&rust, &s(&["need:pdf"])).is_empty());
         assert!(outside_field(&s(&["code"]), &s(&["lang:kotlin"])).is_empty());

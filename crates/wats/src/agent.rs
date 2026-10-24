@@ -324,6 +324,100 @@ fn save_offered(work_dir: &std::path::Path, mut offered: Vec<String>, new: &[Str
     }
 }
 
+/// Answers offered per heartbeat to a verifier (ADR 0046 §2).
+pub const CHECKS_PER_HEARTBEAT: usize = 3;
+/// Answers older than this are not offered for a check.
+pub const CHECK_MAX_AGE: Duration = Duration::from_secs(30 * 86_400);
+/// The cap an agent announces to work the verification queue.
+pub const VERIFY_CAP: &str = "verify";
+
+/// The verification queue for an agent with the [`VERIFY_CAP`] cap (ADR
+/// 0046 §2): up to [`CHECKS_PER_HEARTBEAT`] answers by others, at most
+/// [`CHECK_MAX_AGE`] old, never offered before, that nobody but their
+/// asker backs (`unverified`, or confirmed by the asker alone, without
+/// evidence) and that this agent has not reacted to; the ones whose asks
+/// readers want most first.
+pub fn to_check(
+    node: &Node,
+    me: &str,
+    config: &AgentConfig,
+    offered: &[String],
+    now: u64,
+) -> Vec<Arc<Event>> {
+    if !config
+        .caps
+        .iter()
+        .any(|c| c.trim().eq_ignore_ascii_case(VERIFY_CAP))
+    {
+        return Vec::new();
+    }
+    let oldest = now.saturating_sub(CHECK_MAX_AGE.as_secs());
+    let store = node.store();
+    let answers = Filter {
+        kinds: vec![Kind::Answer],
+        ..Filter::default()
+    };
+    let Ok(found) = store.search(None, &answers, 500) else {
+        return Vec::new();
+    };
+    let mine = Filter {
+        kinds: vec![Kind::React],
+        author: Some(me.to_string()),
+        ..Filter::default()
+    };
+    let reacted: std::collections::HashSet<String> = store
+        .search(None, &mine, 2000)
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|s| s.event.parent.clone())
+        .collect();
+    let candidates: Vec<Arc<Event>> = found
+        .into_iter()
+        .map(|s| s.event)
+        .filter(|e| e.ts >= oldest && e.author != me && !node.is_local_author(&e.author))
+        .filter(|e| !offered.contains(&e.id) && !reacted.contains(&e.id))
+        .collect();
+    let Some(first) = candidates.first() else {
+        return Vec::new();
+    };
+    let grouping = crate::delivery::grouping(node, &first.net);
+    let refs: Vec<&Event> = candidates.iter().map(|e| &**e).collect();
+    let Ok(signals) = crate::signals::compute(store, &grouping, &refs) else {
+        return Vec::new();
+    };
+    let backed_by_asker_only = |s: &crate::signals::Signals| {
+        s.status == crate::signals::Status::Unverified
+            || (s.status == crate::signals::Status::Confirmed
+                && s.confirms == 0
+                && s.uses <= u64::from(s.asker_used))
+    };
+    let kept: Vec<Arc<Event>> = candidates
+        .into_iter()
+        .filter(|e| signals.get(&e.id).is_some_and(backed_by_asker_only))
+        .collect();
+    // Demand: the votes on each answer's ask, then the answer's own uses.
+    let roots: Vec<Arc<Event>> = kept
+        .iter()
+        .filter_map(|e| store.get(e.thread_root()).ok().flatten().map(|s| s.event))
+        .collect();
+    let root_refs: Vec<&Event> = roots.iter().map(|e| &**e).collect();
+    let asks = crate::signals::compute(store, &grouping, &root_refs).unwrap_or_default();
+    let mut queue: Vec<(f64, Arc<Event>)> = kept
+        .into_iter()
+        .map(|e| {
+            let wanted = asks.get(e.thread_root()).map_or(0.0, |s| s.up_weight);
+            let used = signals.get(&e.id).map_or(0, |s| s.uses) as f64;
+            (wanted * 10.0 + used, e)
+        })
+        .collect();
+    queue.sort_by(|(a, ea), (b, eb)| b.total_cmp(a).then(eb.ts.cmp(&ea.ts)));
+    queue
+        .into_iter()
+        .take(CHECKS_PER_HEARTBEAT)
+        .map(|(_, e)| e)
+        .collect()
+}
+
 /// Up to [`OLDER_ASKS_PER_HEARTBEAT`] asks for a heartbeat run, oldest
 /// first: between `window` (`agent.catchup`) and [`OLDER_ASKS_MAX_AGE`]
 /// old, of interest to the agent, unanswered, and never offered before
@@ -783,7 +877,8 @@ pub fn prompt(node: &Node, config: &AgentConfig, since: i64, trigger: &Trigger) 
 pub fn cap_tag(cap: &str) -> String {
     let cap = cap.to_ascii_lowercase();
     if cap.contains(':') {
-        cap
+        // A synonym in its shared spelling (ADR 0046 §3).
+        crate::delivery::canonical_tag(&cap).unwrap_or(cap)
     } else {
         format!("cap:{cap}")
     }
@@ -2139,6 +2234,51 @@ fn serve(node: &Node, me: &str, config: &AgentConfig, ask: &Event, now: u64) -> 
     {
         return Serve::Drop(format!("a duplicate of {target}: answered there"));
     }
+    // Proven specialists first (ADR 0046 §1): when another agent this node
+    // knows has earned answers under the ask's field tags and this one has
+    // none there, it waits a short grace, then wakes only if nobody claimed
+    // or answered.
+    if request.to.is_empty() {
+        let tags: Vec<String> = crate::specialty::field_tags(ask)
+            .into_iter()
+            .filter(|t| t.starts_with("lang:") || t.starts_with("topic:"))
+            .collect();
+        if !tags.is_empty() {
+            let store = node.store();
+            let mine = crate::specialty::earned(store, &grouping, &ask.net, me);
+            if !crate::specialty::proven_in(&mine, &tags) {
+                let filter = crate::store::Filter {
+                    net: Some(ask.net.clone()),
+                    ..Default::default()
+                };
+                let proven_other = store
+                    .latest_announces(&filter, PROVEN_LOOKUP)
+                    .unwrap_or_default()
+                    .iter()
+                    .filter(|a| a.event.author != me && a.event.author != ask.author)
+                    .any(|a| {
+                        let record =
+                            crate::specialty::earned(store, &grouping, &ask.net, &a.event.author);
+                        crate::specialty::proven_in(&record, &tags)
+                    });
+                if proven_other {
+                    let grace = ask.ts.saturating_add(PROVEN_GRACE.as_secs());
+                    if now < grace {
+                        return Serve::Hold {
+                            why: format!("agents with a track record in {} first", tags.join(" ")),
+                            until: Some(grace),
+                        };
+                    }
+                    if !state.claims.is_empty() || !state.answered.is_empty() {
+                        return Serve::Drop(format!(
+                            "an agent with a track record in {} claimed or answered it",
+                            tags.join(" ")
+                        ));
+                    }
+                }
+            }
+        }
+    }
     // Outside its field (its `lang:`/`topic:` caps), an agent waits the
     // same grace, and wakes only if nobody claimed or answered (ADR 0044).
     if request.to.is_empty() {
@@ -2180,6 +2320,12 @@ fn serve(node: &Node, me: &str, config: &AgentConfig, ask: &Event, now: u64) -> 
         },
     }
 }
+
+/// How long an agent with no track record in an ask's field waits for one
+/// that has (ADR 0046 §1).
+pub const PROVEN_GRACE: Duration = Duration::from_secs(60);
+/// The announcing agents looked up for a track record.
+const PROVEN_LOOKUP: usize = 20;
 
 /// A random delay in `range`, to the millisecond; its start when the
 /// range holds a single value (or none).
@@ -2887,13 +3033,16 @@ pub async fn run(
                 // reactions to its posts, its human's feedback. Otherwise
                 // nothing is spent (0.4.13).
                 let mut older = Vec::new();
+                let mut checks = Vec::new();
                 if matches!(trigger, Trigger::Heartbeat) {
+                    let offered = read_offered(&config.work_dir);
                     if let Some(window) = config.catchup {
-                        let offered = read_offered(&config.work_dir);
                         older = older_asks(&node, &me, &config, window, &offered, unix_now);
                     }
+                    checks = to_check(&node, &me, &config, &offered, unix_now);
                     if !config.idle_heartbeat
                         && older.is_empty()
+                        && checks.is_empty()
                         && unattached.is_none()
                         && feedback.is_empty()
                         && !crate::review::has_feedback(&config.data_dir, &config.profile)
@@ -2976,6 +3125,18 @@ pub async fn run(
                         ));
                         save_offered(&config.work_dir, offered, &ids);
                     }
+                }
+                // A verifier's queue (ADR 0046 §2).
+                if !checks.is_empty() {
+                    let ids: Vec<String> = checks.iter().map(|e| e.id.clone()).collect();
+                    info!("heartbeat: offering {} to check", count(ids.len(), "answer", "answers"));
+                    text.push_str(&format!(
+                        "\n\nAnswers waiting for a check (optional): check one where the tools of \
+                         this run let you, then react with evidence (+1 if it holds, -1 with the \
+                         reason if not), or leave it:\n{}\n",
+                        event_lines(&node, &ids).join("\n")
+                    ));
+                    save_offered(&config.work_dir, read_offered(&config.work_dir), &ids);
                 }
                 if let Some(note) = unattached.take() {
                     text.push_str(&format!("\n\n{note}\n"));
