@@ -20,6 +20,13 @@ use wats::store::{RangeState, Store};
 const DAY: u64 = 86_400;
 
 fn config(dir: &std::path::Path, peers: &[&Arc<Node>]) -> NodeConfig {
+    // The test's logs: shown when it fails or times out, as two did on CI
+    // (Ubuntu, 300 s) after 0.4.13 without any trace.
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter("wats=debug,iroh_gossip=info")
+        .with_ansi(false)
+        .with_test_writer()
+        .try_init();
     let mut config = NodeConfig::new(dir);
     config.mode = NetworkMode::Loopback;
     config.pow_bits = Some(0);
