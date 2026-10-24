@@ -1417,6 +1417,11 @@ pub fn rank_with(
         }
     };
     let none = Signals::default();
+    let demand = |stored: &Stored| {
+        signals
+            .get(stored.event.thread_root())
+            .map_or(0.0, |s| s.up_weight)
+    };
     let mut keyed: Vec<(i64, bool, &Signals, Stored)> = found
         .into_iter()
         .enumerate()
@@ -1427,13 +1432,15 @@ pub fn rank_with(
         })
         .collect();
     // Stable: equal keys keep the store's order.
-    keyed.sort_by(|(band_a, entry_a, a, _), (band_b, entry_b, b, _)| {
+    keyed.sort_by(|(band_a, entry_a, a, sa), (band_b, entry_b, b, sb)| {
         band_a
             .cmp(band_b)
             .then(entry_b.cmp(entry_a))
             .then(b.status.rank().cmp(&a.status.rank()))
             // The votes' lower bound, not their net (ADR 0045 §6).
             .then(b.lower_bound().total_cmp(&a.lower_bound()))
+            // Then the demand for its thread (ADR 0045 §7).
+            .then(demand(sb).total_cmp(&demand(sa)))
             .then(b.score.total_cmp(&a.score))
             .then(b.author_score.total_cmp(&a.author_score))
     });
@@ -2359,6 +2366,35 @@ pub(crate) mod tests {
         assert_eq!(t.status, Status::Stale);
         assert_eq!(t.why.as_deref(), Some("marked outdated by 2 readers"));
         assert!((t.up_weight - p.up_weight).abs() < 1e-9, "{}", t.up_weight);
+    }
+
+    /// ADR 0045 §7: between two answers alike, the one whose ask readers
+    /// wanted more ranks first in search.
+    #[test]
+    fn demand_breaks_ties_in_search() {
+        let mut g = Graph::new();
+        let wanted = g.root(1, Kind::Ask, "wanted?");
+        let quiet = g.root(2, Kind::Ask, "quiet?");
+        for voter in 3..6 {
+            g.reply(voter, &wanted, Kind::React, json!({"value": 1}));
+        }
+        let a = g.reply(7, &quiet, Kind::Answer, json!({}));
+        let b = g.reply(8, &wanted, Kind::Answer, json!({}));
+        let table = g.table(&[]);
+        let grouping = Grouping::new(table.local.clone()).with_table(table);
+        let posts = [&wanted, &quiet, &a, &b];
+        let signals = compute_at(&g.store, &grouping, &posts, g.ts).unwrap();
+        let stored = |e: &Event| {
+            (
+                Stored {
+                    seq: 0,
+                    event: Arc::new(e.clone()),
+                },
+                Some(-1.0),
+            )
+        };
+        let ranked = rank(vec![stored(&a), stored(&b)], &signals);
+        assert_eq!(ranked[0].event.id, b.id, "the wanted thread's answer first");
     }
 
     /// ADR 0045 §2: a bare −1 is a fifth of a vote; one with a reason, a
