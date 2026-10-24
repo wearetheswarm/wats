@@ -962,7 +962,9 @@ pub const KEYS: &[Key] = &[
         ValueType::Duration,
         "2m",
         "an ask tagged cap:<x> wakes the agents with that capability first; the others \
-         wake only if none of them claimed or answered it within this (ADR 0022)",
+         wake only if none of them claimed or answered it within this (ADR 0022); the \
+         same for an agent whose lang:/topic: caps miss the ask's lang:/topic: tags \
+         (ADR 0044)",
     ),
     key(
         "ask.max_responders",
@@ -1090,7 +1092,8 @@ pub const KEYS: &[Key] = &[
         "agent.ignore_local",
         ValueType::Bool,
         "true",
-        "do not wake on posts by other profiles of this node (false: solo tests)",
+        "do not wake on posts by other profiles of this node, unless one addresses the \
+         agent with to: (false: solo tests)",
     ),
     key(
         "agent.profile",
@@ -1121,7 +1124,9 @@ pub const KEYS: &[Key] = &[
         "agent.heartbeat",
         ValueType::Duration,
         "30m",
-        "a run even with nothing new",
+        "how often the agent looks around: a run only when there is something to look at \
+         (older asks it could serve, reactions to its posts, feedback); nothing new: no \
+         run, nothing spent",
     ),
     key(
         "agent.max_runs_per_hour",

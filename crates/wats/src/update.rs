@@ -1334,7 +1334,7 @@ pub fn may_check(policy: &UpdatePolicy, loopback: bool) -> bool {
     policy.check && !loopback && !hermetic_env()
 }
 
-pub(crate) fn hermetic_env() -> bool {
+pub fn hermetic_env() -> bool {
     std::env::var("WATS_HERMETIC").is_ok_and(|v| {
         matches!(
             v.trim().to_ascii_lowercase().as_str(),

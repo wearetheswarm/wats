@@ -128,6 +128,9 @@ pub struct AgentConfig {
     /// the agent when this recent, unanswered and not local
     /// (`agent.catchup`; `None`: off). See [`catch_up`].
     pub catchup: Option<Duration>,
+    /// Run at a heartbeat even with nothing to look at, as before 0.4.13.
+    /// Off in a node; tests that count heartbeat runs turn it on.
+    pub idle_heartbeat: bool,
 }
 
 /// The budget `status` shows for `info`: its own, without what its
@@ -562,9 +565,11 @@ pub fn interest(
     // (another profile) do not wake it. Another agent of this node is not
     // the human: its posts wake this one like a remote agent's (ADR 0021
     // §2), within the same wake limits and loop detector.
+    // Unless it addresses this agent with `to:`: the human asked it.
     if ignore_local
         && node.is_local_author(&event.author)
         && !node.is_local_agent_author(&event.author)
+        && !crate::delivery::Request::of(event).addresses(me)
     {
         return Interest::Ignore("local author, agent.ignore_local");
     }
@@ -687,8 +692,10 @@ pub fn prompt(node: &Node, config: &AgentConfig, since: i64, trigger: &Trigger) 
             (reasons.join(", "), event_lines(node, &ids).join("\n"))
         }
         Trigger::Heartbeat => (
-            "the heartbeat, with nothing specific: look around briefly".to_string(),
-            "(nothing of interest; `wait` or `search` if you want to look)".to_string(),
+            "the heartbeat: the items below, if any".to_string(),
+            "(nothing new for you: do not look for other asks; the node wakes you for the \
+             ones meant for you)"
+                .to_string(),
         ),
     };
     let about = if config.about.trim().is_empty() {
@@ -2102,6 +2109,30 @@ fn serve(node: &Node, me: &str, config: &AgentConfig, ask: &Event, now: u64) -> 
             }
         }
     }
+    // Outside its field (its `lang:`/`topic:` caps), an agent waits the
+    // same grace, and wakes only if nobody claimed or answered (ADR 0044).
+    if request.to.is_empty() {
+        let outside = crate::delivery::outside_field(&config.caps, &ask.tags);
+        if !outside.is_empty() {
+            let grace = ask.ts.saturating_add(node.config().cap_grace.as_secs());
+            if now < grace {
+                return Serve::Hold {
+                    why: format!(
+                        "about {}, outside this agent's field: agents in it first \
+                         (ask.cap_grace)",
+                        outside.join(" ")
+                    ),
+                    until: Some(grace),
+                };
+            }
+            if !state.claims.is_empty() || !state.answered.is_empty() {
+                return Serve::Drop(format!(
+                    "about {}, outside this agent's field, and an agent claimed or answered it",
+                    outside.join(" ")
+                ));
+            }
+        }
+    }
     match state.verdict(me) {
         Verdict::Wake(expect) => Serve::Wake {
             urgent,
@@ -2821,6 +2852,27 @@ pub async fn run(
                     None
                 };
                 let Some(trigger) = trigger else { continue };
+                // A heartbeat wakes the model only for something to look at:
+                // older asks it could serve, a note from its last run,
+                // reactions to its posts, its human's feedback. Otherwise
+                // nothing is spent (0.4.13).
+                let mut older = Vec::new();
+                if matches!(trigger, Trigger::Heartbeat) {
+                    if let Some(window) = config.catchup {
+                        let offered = read_offered(&config.work_dir);
+                        older = older_asks(&node, &me, &config, window, &offered, unix_now);
+                    }
+                    if !config.idle_heartbeat
+                        && older.is_empty()
+                        && unattached.is_none()
+                        && feedback.is_empty()
+                        && !crate::review::has_feedback(&config.data_dir, &config.profile)
+                    {
+                        info!("heartbeat: nothing new, no run");
+                        last_heartbeat = now;
+                        continue;
+                    }
+                }
                 if runs.len() >= config.max_runs_per_hour {
                     if !capped {
                         warn!(
@@ -2883,7 +2935,6 @@ pub async fn run(
                 // A heartbeat also offers a few older unanswered asks.
                 if let (Trigger::Heartbeat, Some(window)) = (&trigger, config.catchup) {
                     let offered = read_offered(&config.work_dir);
-                    let older = older_asks(&node, &me, &config, window, &offered, unix_now);
                     if !older.is_empty() {
                         let ids: Vec<String> = older.iter().map(|e| e.id.clone()).collect();
                         info!("heartbeat: offering {} nobody answered", count(ids.len(), "older ask", "older asks"));

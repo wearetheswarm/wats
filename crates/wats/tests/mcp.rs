@@ -221,6 +221,30 @@ fn two_agents_converse() -> anyhow::Result<()> {
         &call(&alice, "post", json!({"title": "Notes to PDF?", "text": "Can someone render my notes as PDF?", "kind": "ask", "tags": ["need:pdf"]})).await,
     );
         let ask_id = ask["id"].as_str().unwrap().to_string();
+        // A new ask names its mode, `one` by default (ADR 0044); a claim
+        // names its lease, 300 s by default.
+        let opened = structured(&call(&alice, "read", json!({"id": ask_id})).await);
+        assert_eq!(opened["post"]["data"]["mode"], "one");
+        let ideas = structured(
+            &call(
+                &alice,
+                "post",
+                json!({"title": "Ideas?", "text": "Ideas for a name?", "kind": "ask", "data": {"mode": "any"}}),
+            )
+            .await,
+        );
+        let opened = structured(&call(&alice, "read", json!({"id": ideas["id"]})).await);
+        assert_eq!(opened["post"]["data"]["mode"], "any");
+        let claim = structured(
+            &call(
+                &alice,
+                "reply",
+                json!({"post_id": ideas["id"], "text": "On it.", "kind": "claim"}),
+            )
+            .await,
+        );
+        let opened = structured(&call(&alice, "read", json!({"id": claim["id"]})).await);
+        assert_eq!(opened["post"]["data"]["lease"], 300);
         let waited = structured(
             &call(
                 &bob,
@@ -257,6 +281,33 @@ fn two_agents_converse() -> anyhow::Result<()> {
         assert_eq!(waited["posts"][0]["thread"], ask_id.as_str());
         assert_eq!(waited["posts"][0]["title"], "Done, attached.");
         assert_eq!(waited["posts"][0]["counts"]["blobs"], 1);
+        // Waiting for N answers (ADR 0044 §5): one is in, two are not.
+        let one = structured(
+            &call(
+                &alice,
+                "wait",
+                json!({"thread": ask_id, "answers": 1, "timeout": 20}),
+            )
+            .await,
+        );
+        assert_eq!(one["complete"], true);
+        assert_eq!(one["posts"][0]["id"], answer_id.as_str());
+        assert!(one["next_step"].as_str().unwrap().contains("one synthesis"));
+        let two = structured(
+            &call(
+                &alice,
+                "wait",
+                json!({"thread": ask_id, "answers": 2, "timeout": 1}),
+            )
+            .await,
+        );
+        assert_eq!(
+            (two["complete"].clone(), two["timed_out"].clone()),
+            (json!(false), json!(true))
+        );
+        assert_eq!(two["answers"], 1);
+        let e = call(&alice, "wait", json!({"answers": 2})).await;
+        assert_eq!(e.is_error, Some(true));
 
         let read = structured(
             &call(

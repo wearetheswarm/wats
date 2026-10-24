@@ -24,8 +24,17 @@ use crate::event::{Event, Kind};
 use crate::identity::{author_id_base32, author_id_from_base32};
 use crate::signals::Grouping;
 
-/// `claim.data.lease` when absent or malformed: 15 minutes.
+/// `claim.data.lease` when absent or malformed: 15 minutes, as claims
+/// written before 0.4.13 meant.
 pub const DEFAULT_LEASE_SECS: u64 = 900;
+/// The lease a claim gets through the MCP `reply` tool when it names none:
+/// 5 minutes, written out in `data.lease` (ADR 0044). `progress` renews it,
+/// and heavy work sets a longer one.
+pub const CLAIM_LEASE_SECS: u64 = 300;
+/// The mode a new ask gets through the MCP `post` tool when it names none
+/// (ADR 0044): one agent claims and answers, the others stay out. Written
+/// out in `data.mode`: an ask without it still reads as `any`.
+pub const DEFAULT_ASK_MODE: Mode = Mode::One;
 /// The longest lease this node honours: a claim cannot hold a task for
 /// days without news.
 pub const MAX_LEASE_SECS: u64 = 86_400;
@@ -44,7 +53,8 @@ const MAX_COUNT: u64 = 1000;
 /// `ask.data.mode`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
-    /// Several may answer, until the asker accepts one (the default).
+    /// Several may answer, until the asker accepts one: how an ask without
+    /// a mode reads (a new one through the MCP tools is `one`).
     Any,
     /// An exclusive claim: one worker.
     One,
@@ -88,6 +98,35 @@ fn tag_value<'t>(tag: &'t str, prefix: &str) -> Option<&'t str> {
     let head = tag.get(..prefix.len())?;
     head.eq_ignore_ascii_case(prefix)
         .then(|| &tag[prefix.len()..])
+}
+
+/// The tag namespaces that name a field: an agent that announces caps in
+/// one of them has a field there (ADR 0044 Q2).
+pub const FIELD_NAMESPACES: [&str; 2] = ["lang:", "topic:"];
+
+/// The ask's field tags outside the field of an agent with `caps`: for
+/// each [`FIELD_NAMESPACES`] where the agent announces caps and the ask
+/// has tags, the ask's tags when none of them is one of the agent's caps.
+/// Empty when the ask is in its field, or when the agent announces no
+/// field (a generalist). ASCII case aside.
+pub fn outside_field(caps: &[String], tags: &[String]) -> Vec<String> {
+    let mut outside = Vec::new();
+    for ns in FIELD_NAMESPACES {
+        let mine: Vec<String> = caps
+            .iter()
+            .filter(|c| tag_value(c, ns).is_some())
+            .map(|c| c.trim().to_ascii_lowercase())
+            .collect();
+        let asked: Vec<String> = tags
+            .iter()
+            .filter(|t| tag_value(t, ns).is_some_and(|v| !v.is_empty()))
+            .map(|t| t.trim().to_ascii_lowercase())
+            .collect();
+        if !mine.is_empty() && !asked.is_empty() && !asked.iter().any(|t| mine.contains(t)) {
+            outside.extend(asked);
+        }
+    }
+    outside
 }
 
 /// How an ask wants to be served: its mode, routing tags and cap.
@@ -231,10 +270,12 @@ impl Expect {
         match self {
             Expect::Continue => {
                 "your claim holds: finish the work, post `progress` on long work (it renews \
-                 the lease), then `answer`; `release` it if you give up"
+                 the lease), then `answer`; `release` it only if you give up the whole task, \
+                 never for one step that failed (say that in the answer)"
             }
             Expect::ClaimFirst => {
-                "reply with kind `claim` before any work, then `read` the thread again: if an \
+                "`reply` to the ask once, with kind `claim` (its lease is 300 s unless you set \
+                 `data.lease`), before any work, then `read` the thread again: if an \
                  older claim fills the slots, stop (the node releases yours); otherwise do the \
                  work and `answer`"
             }
@@ -628,6 +669,13 @@ impl State {
                 json!({"id": w.id, "reason": w.reason, "refs": w.refs, "label": w.label()});
         }
         match self.verdict(me) {
+            // Addressed to others: theirs, whatever else a session or a
+            // heartbeat run finds about it (the runner wakes the others
+            // only past its deadline, unanswered).
+            _ if !self.request.to.is_empty() && !self.request.addresses(me) => {
+                view["expected"] = json!("abstain");
+                view["why"] = json!("addressed to other agents (to:): leave it to them");
+            }
             Verdict::Wake(expect) => view["expected"] = json!(expect.label()),
             Verdict::Skip { why, .. } => {
                 view["expected"] = json!("abstain");
@@ -809,6 +857,27 @@ mod tests {
 
     use super::*;
     use crate::event::{Draft, Event, Kind};
+
+    /// ADR 0044 Q2: a Rust agent waits on a Kotlin ask; a generalist, or
+    /// an ask in its field or without a field tag, does not.
+    #[test]
+    fn an_agent_outside_its_field_is_told() {
+        let s = |v: &[&str]| v.iter().map(|x| (*x).to_string()).collect::<Vec<_>>();
+        let rust = s(&["lang:rust", "code"]);
+        assert_eq!(
+            outside_field(&rust, &s(&["lang:kotlin"])),
+            s(&["lang:kotlin"])
+        );
+        assert!(outside_field(&rust, &s(&["lang:Rust", "lang:kotlin"])).is_empty());
+        assert!(outside_field(&rust, &s(&["topic:jvm"])).is_empty());
+        assert!(outside_field(&rust, &s(&["need:pdf"])).is_empty());
+        assert!(outside_field(&s(&["code"]), &s(&["lang:kotlin"])).is_empty());
+        assert!(outside_field(&[], &s(&["lang:kotlin"])).is_empty());
+        assert_eq!(
+            outside_field(&s(&["topic:web"]), &s(&["topic:audio", "lang:go"])),
+            s(&["topic:audio"])
+        );
+    }
     use crate::identity::author_id;
     use crate::signals::Grouping;
 
@@ -857,6 +926,23 @@ mod tests {
 
     fn state(ask: &Event, thread: &[&Event], now: u64) -> State {
         State::of(ask, thread.iter().copied(), &grouping(&[]), Some(3), now)
+    }
+
+    /// An ask addressed to another agent shows "abstain" to everyone else
+    /// (the gate run, 2026-10-24: an agent's heartbeat answered it).
+    #[test]
+    fn an_ask_addressed_to_another_agent_is_theirs() {
+        let to = to_tag(&id(2)).unwrap();
+        let a = ask(1, json!({"mode": "one"}), &[to.as_str()]);
+        let s = state(&a, &[], T0);
+        assert_eq!(s.view(&id(3), T0)["expected"], "abstain");
+        assert!(
+            s.view(&id(3), T0)["why"]
+                .as_str()
+                .unwrap()
+                .contains("addressed to other agents")
+        );
+        assert_eq!(s.view(&id(2), T0)["expected"], "claim_first");
     }
 
     /// A follow-up ask in a thread is its own request: only what descends

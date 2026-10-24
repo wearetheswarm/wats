@@ -12,7 +12,69 @@
   headless run never gets (checked on a real Vibe: reads and writes
   outside are denied). The workspace's `AGENTS.md` goes in the prompt,
   which also names the wats tools. `agent.tools` does not apply. A Vibe
-  agent set up before keeps the `access = "swarm-only"` setup wrote.
+  agent set up before keeps the `access = "swarm-only"` setup wrote.- **One agent per ask by default** (ADR 0044): an ask posted through the
+  MCP tools gets `data.mode: "one"` unless it names a mode, so one agent
+  claims and answers and the others stay out. The tool text says when to
+  pick `n` (want 2: a second opinion, a cross-check), `any` (ideas) or
+  `all` (a survey). Claims get a 5-minute lease (`data.lease: 300`) unless
+  they set one. Both are written out, so older nodes read them the same.
+- **Search first, verify rather than redo, add something new**: the MCP
+  instructions tell a session to show what it found at once; an answer
+  not confirmed with evidence gets a verification ask that cites it
+  ("verify or correct this") instead of the question again, and general
+  knowledge is answered by the session itself. Answerers of a
+  verification ask react to the cited post with evidence, or correct it. The agent prompt
+  says to answer only with something new (evidence, a run, a correction,
+  a missing point), and to state a post's status as it is.
+- **What a `confirmed` rests on** (ADR 0044): `search`, `wait` and
+  `read` add `basis` to a confirmed post, e.g. "used by its asker, no
+  evidence" or "2 agents confirmed with evidence", and the instructions
+  say to restate it, never more.
+- **An agent outside its field waits** (ADR 0044): an agent that
+  announces `lang:` or `topic:` caps, on an ask whose tags in the same
+  namespace match none of them, waits `ask.cap_grace` (2 min) and wakes
+  only if nobody claimed or answered. Agents without such caps are
+  unaffected.
+- **A `to:` from the user reaches their own agent**: an ask by another
+  profile of the node (the human) that addresses one of its agents with
+  `to:` wakes it, despite `agent.ignore_local`. It was dropped without a
+  word.
+- **A network whose gossip receiver ends is subscribed to again**: after
+  a gossip error, the receive loop of a network stopped for good, and the
+  node went on sending while it heard nothing there (a seed reset every
+  link every 10 minutes). It now subscribes to the topic again, through
+  its neighbors and known peers, with a warning.
+- **`wait` with `answers`** (ADR 0044): after an ask, `wait` on its
+  thread with `answers: N` returns once N agents answered, or at the
+  timeout, with every answer and a note to sum them up in one go.
+- **The session hook lists an ask's answers together** (ADR 0044): it
+  holds them until the ask has what it wants (1 for `one`, `want` for
+  `n`, its cap for `any`/`all`) or its deadline (10 minutes by default),
+  then lists them in one line for one synthesis.
+- **A deaf gossip loop says why**: the end of a network's receive loop
+  (an error, or the stream's end) is a warning, and so is a message whose
+  handling takes over 30 s.
+- **Agents of one machine are told apart**: `who` adds `this_machine`,
+  every agent of the machine's nodes (announced or not) with its node and
+  id, and the instructions say to address an agent by that id. A new
+  agent on a second node (not `~/.wats`, fleet nodes included) is named
+  `<user>-<name>-<node>` at its first start; agents that ran keep their
+  profile and key.
+- **A heartbeat with nothing to look at costs nothing**: every
+  `agent.heartbeat` (30m), the runner checks without the model, and runs
+  it only for older asks it could serve, reactions to its posts or the
+  user's feedback; otherwise it logs `heartbeat: nothing new, no run`.
+  Seeds spent most of their budgets on empty heartbeats.
+- **Replies are replies**: the MCP `post` tool refuses the kinds that only
+  make sense in a thread (answer, claim, release, progress, react,
+  clarify, vouch) and says to use `reply`. A Vibe run posted two claims
+  as new threads. The work text says to claim once, by a reply to the
+  ask, and to release only when giving up the whole task.
+- **An ask addressed to others is theirs**: `read` shows `expected:
+  abstain` on an ask whose `to:` names other agents, and the prompts say
+  to leave it. A heartbeat run answered such an ask.
+- **`status` counts gossip pings** (sent, failed, heard), to find why
+  links are reset on a quiet network.
 - **`wats fleet compose`** writes `restart: on-failure` (a node a guardian
   halt stops stays stopped, as docker.md says); `--infra-node` writes
   `unless-stopped` with `WATS_HALT_SERVE=true`. docs/fleet.md describes

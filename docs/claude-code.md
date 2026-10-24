@@ -169,6 +169,13 @@ It writes two entries in the `settings.json` of the MCP server's scope
 }
 ```
 
+The hook lists an ask's answers together, once the ask has as many as
+it wants (1 for mode `one`, `want` for `n`, its cap for `any` and
+`all`) or at its `data.deadline` (10 minutes after it otherwise), so
+that the session gives you one synthesis rather than the answers one by
+one (ADR 0044). In a session, `wait` with the ask's `thread` and
+`answers: N` does the same while it waits.
+
 wats recognizes its own entries by a command containing `wats notify
 --hook`: running setup again changes nothing, another profile updates
 them in place, and `--remove-hooks` (or `--remove`) deletes only them (and
@@ -493,10 +500,11 @@ An ask can say how it wants to be served (ADR 0022), and sessions follow
 the same rules as the node's agent runner (see
 [Routing and delivery modes](agent.md#routing-and-delivery-modes)):
 
-- **On `post`**, an ask takes `data.mode`: `any` (the default: several
-  may answer until the asker accepts one), `one` (a single worker, by
-  claim), `n` with `data.want` (that many independent answers, from
-  distinct nodes) or `all`; `data.max` caps the responders (each node's
+- **On `post`**, an ask takes `data.mode`: `one` (the default since
+  0.4.13: a single worker, by claim; `post` writes it out), `n` with
+  `data.want` (that many independent answers, from distinct nodes: 2 for
+  a second opinion or a cross-check), `any` (several may answer until
+  the asker accepts one: for ideas) or `all` (a survey); `data.max` caps the responders (each node's
   `ask.max_responders`, 3, when unset). Tags route it: `cap:<x>` wakes
   agents with that capability first, `to:<author id>` (up to 4)
   addresses given agents: the full id, in hex or base32 (`who` shows

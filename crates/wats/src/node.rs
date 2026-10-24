@@ -1281,6 +1281,46 @@ pub fn now_secs() -> u64 {
         .unwrap_or(0)
 }
 
+/// The public ids of a node's agents, in its data directory, for `who` on
+/// the other nodes of the machine (ADR 0044).
+pub const AGENTS_FILE: &str = "agents.json";
+
+/// The agents of this machine's nodes: each data directory's
+/// [`AGENTS_FILE`], with the node's name. Unreadable files are skipped.
+pub fn machine_agents(
+    machine: &crate::naming::Machine,
+) -> Vec<(String, PathBuf, serde_json::Value)> {
+    let mut out = Vec::new();
+    for dir in machine.dirs() {
+        let Ok(bytes) = std::fs::read(dir.join(AGENTS_FILE)) else {
+            continue;
+        };
+        let Ok(serde_json::Value::Object(file)) =
+            serde_json::from_slice::<serde_json::Value>(&bytes)
+        else {
+            continue;
+        };
+        let name = crate::naming::display(&dir, machine.default_dir.as_deref());
+        for agent in file
+            .get("agents")
+            .and_then(|a| a.as_array())
+            .into_iter()
+            .flatten()
+        {
+            out.push((name.clone(), dir.clone(), agent.clone()));
+        }
+    }
+    out
+}
+
+/// Handling one gossip message longer than this is logged: the receive
+/// loop of its network hears nothing else meanwhile.
+const SLOW_HANDLING: Duration = Duration::from_secs(30);
+
+/// After a network's gossip receiver ended, the wait before subscribing
+/// to its topic again.
+const RESUBSCRIBE_AFTER: Duration = Duration::from_secs(5);
+
 pub fn topic_for(net: &str) -> TopicId {
     TopicId::from_bytes(blake3::derive_key(TOPIC_CONTEXT, net.as_bytes()))
 }
@@ -1626,6 +1666,27 @@ impl Node {
         };
         let author = root.profile_key(&config.profile);
         let secret = SecretKey::from_bytes(&root.transport_key_bytes());
+        // The agents' public ids, for the `who` of other nodes on this
+        // machine: two data directories derive the same profile names.
+        let agents: Vec<serde_json::Value> = config
+            .agents
+            .iter()
+            .filter(|a| is_valid_profile(&a.profile))
+            .map(|a| {
+                serde_json::json!({
+                    "name": a.name,
+                    "profile": a.profile,
+                    "author": author_id(&root.profile_key(&a.profile)),
+                    "runtime": a.runtime,
+                })
+            })
+            .collect();
+        if let Err(e) = crate::background::write_file(
+            &config.data_dir.join(AGENTS_FILE),
+            &serde_json::json!({ "agents": agents }).to_string(),
+        ) {
+            debug!("could not write {AGENTS_FILE}: {e}");
+        }
 
         let lookup = MemoryLookup::new();
         let port = config.port.unwrap_or(0);
@@ -1977,10 +2038,30 @@ impl Node {
             let loop_node = Arc::clone(&node);
             let loop_net = net.clone();
             let handle = tokio::spawn(async move {
-                supervise(&name, || {
-                    Arc::clone(&loop_node).receive_loop(loop_net.clone(), Arc::clone(&receiver))
-                })
-                .await;
+                let mut receiver = receiver;
+                loop {
+                    let ended = supervise(&name, || {
+                        Arc::clone(&loop_node).receive_loop(loop_net.clone(), Arc::clone(&receiver))
+                    })
+                    .await;
+                    // Cancelled, or the network was left (a halt).
+                    if ended.is_none() || !loop_node.joined(&loop_net) {
+                        return;
+                    }
+                    // The topic's receiver ended (a gossip error): the
+                    // node would go on sending and never hear anything on
+                    // this network again. Subscribe anew, never polling
+                    // the ended receiver again.
+                    receiver = loop {
+                        tokio::time::sleep(RESUBSCRIBE_AFTER).await;
+                        if !loop_node.joined(&loop_net) {
+                            return;
+                        }
+                        if let Some(fresh) = loop_node.resubscribe(&loop_net).await {
+                            break Arc::new(tokio::sync::Mutex::new(fresh));
+                        }
+                    };
+                }
             });
             if let Ok(mut loops) = node.receive_loops.lock() {
                 loops.insert(net, handle.abort_handle());
@@ -3856,6 +3937,35 @@ impl Node {
         Ok(Some(path))
     }
 
+    /// A fresh subscription to `net`'s topic, through this node's current
+    /// neighbors and known peers, after its receiver ended: the new sender
+    /// replaces the old one. `None` (logged) when it fails, or when the
+    /// network was left meanwhile.
+    async fn resubscribe(&self, net: &str) -> Option<GossipReceiver> {
+        let mut peers = self.neighbors_of(net);
+        for p in self.known_peers() {
+            if !peers.contains(&p) {
+                peers.push(p);
+            }
+        }
+        match self.gossip.subscribe(topic_for(net), peers).await {
+            Ok(topic) => {
+                let (sender, receiver) = topic.split();
+                let mut senders = self.senders.lock().ok()?;
+                if !senders.contains_key(net) {
+                    return None;
+                }
+                senders.insert(net.to_string(), sender);
+                warn!(%net, "gossip receive loop ended: subscribed to the network again");
+                Some(receiver)
+            }
+            Err(e) => {
+                warn!(%net, "gossip receive loop ended, subscribing again failed: {e:#}");
+                None
+            }
+        }
+    }
+
     async fn receive_loop(
         self: Arc<Self>,
         net: String,
@@ -3869,12 +3979,27 @@ impl Node {
                     self.sighted(&net, msg.delivered_from);
                     self.heard(&net, msg.delivered_from);
                     if links::is_ping(&msg.content) {
+                        self.ping_heard();
                         continue;
                     }
-                    if let Err(e) = self
-                        .handle_message(&net, &msg.content, msg.delivered_from)
-                        .await
-                    {
+                    // Everything on this network waits on it: a handler that
+                    // hangs makes the node deaf, so it says so.
+                    let handled = self.handle_message(&net, &msg.content, msg.delivered_from);
+                    tokio::pin!(handled);
+                    let result = tokio::select! {
+                        result = &mut handled => result,
+                        () = tokio::time::sleep(SLOW_HANDLING) => {
+                            warn!(
+                                %net,
+                                from = %msg.delivered_from.fmt_short(),
+                                "a gossip message takes over {} s to handle: nothing else is \
+                                 heard on this network meanwhile",
+                                SLOW_HANDLING.as_secs()
+                            );
+                            handled.await
+                        }
+                    };
+                    if let Err(e) = result {
                         debug!(from = %msg.delivered_from, "dropped message: {e:#}");
                     }
                 }
@@ -3924,13 +4049,15 @@ impl Node {
                 }
                 Some(Ok(GossipEvent::Lagged)) => warn!(%net, "gossip receiver lagged"),
                 Some(Err(e)) => {
-                    warn!(%net, "gossip error: {e:#}");
-                    break;
+                    warn!(%net, "gossip receive loop ended on an error: {e:#}");
+                    return;
                 }
-                None => break,
+                None => {
+                    warn!(%net, "gossip receive loop ended: the topic's stream ended");
+                    return;
+                }
             }
         }
-        debug!(%net, "gossip receive loop ended");
     }
 
     async fn handle_message(&self, net: &str, bytes: &[u8], from: EndpointId) -> Result<()> {
@@ -5591,6 +5718,13 @@ impl Node {
     pub async fn shutdown(&self) -> Result<()> {
         self.save_peer_cache().await;
         self.save_swarm().await;
+        // The receive loops first: gossip's shutdown ends their streams,
+        // which they would take for a gossip failure.
+        if let Ok(mut loops) = self.receive_loops.lock() {
+            for (_, task) in loops.drain() {
+                task.abort();
+            }
+        }
         self.gossip.shutdown().await.ok();
         self.router.shutdown().await?;
         // The router shuts the blob protocol down, which also closes the store.
@@ -5693,6 +5827,32 @@ mod storage_tests {
     clippy::arithmetic_side_effects
 )]
 mod tests {
+    /// `who`'s `this_machine` (ADR 0044): each node's agents file, with
+    /// the node's name; a missing or broken file is skipped.
+    #[test]
+    fn machine_agents_reads_each_nodes_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let data = dir.path().join("wats");
+        std::fs::create_dir_all(&data).unwrap();
+        crate::naming::write(&data, "bubbly_gnat").unwrap();
+        let machine = crate::naming::Machine {
+            registry: None,
+            default_dir: Some(data.clone()),
+        };
+        assert!(super::machine_agents(&machine).is_empty());
+        std::fs::write(data.join(super::AGENTS_FILE), "{not json").unwrap();
+        assert!(super::machine_agents(&machine).is_empty());
+        std::fs::write(
+            data.join(super::AGENTS_FILE),
+            r#"{"agents":[{"name":"vibe","profile":"alice-vibe","author":"f543","runtime":"vibe"}]}"#,
+        )
+        .unwrap();
+        let found = super::machine_agents(&machine);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].0, "bubbly_gnat");
+        assert_eq!(found[0].2["author"], "f543");
+    }
+
     #[test]
     fn numbered_names_keep_their_extension() {
         assert_eq!(super::numbered("chart.png", 1), "chart-1.png");

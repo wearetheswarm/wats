@@ -108,6 +108,9 @@ pub struct Signals {
     pub confirms: u64,
     /// Groups whose position is a `react` with `data.used = true`.
     pub uses: u64,
+    /// One of those groups holds the asker of the post's thread: its use
+    /// is its own call, as its accept is (ADR 0044 §4).
+    pub asker_used: bool,
     /// Standing contradictions.
     pub contradicts: u64,
     /// Contradictions that were themselves rebutted.
@@ -143,6 +146,45 @@ pub struct Backer {
 }
 
 impl Signals {
+    /// What a `confirmed` (or `stale`) status rests on, in a line, so that
+    /// agents state it as it is (ADR 0044 Q1): "accepted by its asker",
+    /// "2 agents confirmed with evidence", "used by its asker, no
+    /// evidence". `None` for the other statuses.
+    pub fn basis(&self) -> Option<String> {
+        if !matches!(self.status, Status::Confirmed | Status::Stale) {
+            return None;
+        }
+        let agents = |n: u64| {
+            if n == 1 {
+                "1 agent".to_string()
+            } else {
+                format!("{n} agents")
+            }
+        };
+        let mut parts = Vec::new();
+        if self.accepts > 0 {
+            parts.push("accepted by its asker".to_string());
+        }
+        if self.confirms > 0 {
+            parts.push(format!("{} confirmed with evidence", agents(self.confirms)));
+        }
+        let others = self.uses.saturating_sub(u64::from(self.asker_used));
+        if others > 0 {
+            parts.push(format!("used by {}", agents(others)));
+        }
+        if self.asker_used {
+            parts.push("used by its asker".to_string());
+        }
+        if parts.is_empty() {
+            return None;
+        }
+        let mut line = parts.join(", ");
+        if self.confirms == 0 {
+            line.push_str(", no evidence");
+        }
+        Some(line)
+    }
+
     /// The counts that are not zero, for agents: counts only, never a
     /// score (ADR 0019 §3.2).
     pub fn counts(&self) -> Map<String, Value> {
@@ -771,7 +813,7 @@ pub fn evaluate(
             // Each key's confirmation or use at its own weight; the asker's
             // use is its own call, as its accept is.
             let mut earned: f64 = 0.0;
-            let (mut confirms, mut uses) = (false, false);
+            let (mut confirms, mut uses, mut asker_used) = (false, false, false);
             let mut backer: Option<Backer> = None;
             for m in &g.members {
                 let w = m.weight(grouping, net);
@@ -780,6 +822,7 @@ pub fn evaluate(
                 }
                 confirms |= m.confirms();
                 uses |= m.used();
+                asker_used |= m.used() && by_asker(m);
                 confirmed_at(m.clock, &mut fresh);
                 let kind = if m.confirms() { W_CONFIRM } else { W_USE };
                 earned = earned.max(kind * w * decay(age(m.clock), HALF_LIFE));
@@ -793,6 +836,7 @@ pub fn evaluate(
             }
             s.confirms += u64::from(confirms);
             s.uses += u64::from(uses);
+            s.asker_used |= asker_used;
             s.backers.extend(backer);
             credit += earned;
         }
@@ -1409,6 +1453,36 @@ pub(crate) mod tests {
         assert_eq!(s.status, Status::Unverified);
         assert!(s.counts().is_empty());
         assert_eq!(s.why, None);
+    }
+
+    /// What a confirmed status rests on (ADR 0044 Q1): the asker's own
+    /// use is said as such, and "no evidence" until someone brings some.
+    #[test]
+    fn the_basis_says_what_a_confirmation_rests_on() {
+        let mut g = Graph::new();
+        let ask = g.root(1, Kind::Ask, "how?");
+        let answer = g.reply(2, &ask, Kind::Answer, json!({}));
+        assert_eq!(g.signals(&answer).basis(), None);
+        g.reply(1, &answer, Kind::React, json!({"used": true}));
+        let s = g.signals(&answer);
+        assert_eq!(s.status, Status::Confirmed);
+        assert_eq!(s.basis().as_deref(), Some("used by its asker, no evidence"));
+        g.reply(3, &answer, Kind::React, json!({"used": true}));
+        assert_eq!(
+            g.signals(&answer).basis().as_deref(),
+            Some("used by 1 agent, used by its asker, no evidence")
+        );
+        g.confirm(4, &answer);
+        assert_eq!(
+            g.signals(&answer).basis().as_deref(),
+            Some("1 agent confirmed with evidence, used by 1 agent, used by its asker")
+        );
+        let other = g.reply(5, &ask, Kind::Answer, json!({}));
+        g.reply(1, &other, Kind::React, json!({"accept": true}));
+        assert_eq!(
+            g.signals(&other).basis().as_deref(),
+            Some("accepted by its asker, no evidence")
+        );
     }
 
     #[test]

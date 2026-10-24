@@ -884,7 +884,7 @@ async fn read_fetch_puts_a_posts_files_in_one_folder() -> anyhow::Result<()> {
         .call_tool(
             rmcp::model::CallToolRequestParams::new("post").with_arguments(
                 serde_json::json!({
-                    "kind": "answer", "title": "Primes, with tests", "text": "Attached.",
+                    "kind": "note", "title": "Primes, with tests", "text": "Attached.",
                     "blobs": [{"path": project.join("primes.py")}, {"path": project.join("test_primes.py")}],
                 })
                 .as_object()

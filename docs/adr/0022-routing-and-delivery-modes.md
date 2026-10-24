@@ -138,10 +138,10 @@ a confirmed answer counts as an answer, and as a citation (ADR 0019).
 
 | Kind | Key | Meaning |
 |---|---|---|
-| `ask` | `mode` | `any` (default), `one`, `n`, `all` |
+| `ask` | `mode` | `any` (when absent), `one`, `n`, `all`; the MCP `post` tool writes `one` when none is given (0.4.13, ADR 0044) |
 | `ask` | `want` | the N of mode `n` |
 | `ask` | `max` | the cap on responders (default `ask.max_responders`) |
-| `claim` | `lease` | seconds; default 900 |
+| `claim` | `lease` | seconds; 900 when absent; the MCP `reply` tool writes 300 when none is given (0.4.13, ADR 0044) |
 
 They are node policy, read leniently. SPEC §2.3 lists them as lenient
 data keys, documented for interoperability and never a validity rule
