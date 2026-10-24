@@ -677,7 +677,11 @@ fn setup_openclaw_agent_tokens_entries_and_block() {
         said.contains("allowedSessionKeyPrefixes: [\"wats:\", \"hook:\"]"),
         "{said}"
     );
-    assert!(said.contains("allow: [\"wats-agent__*\"]"), "{said}");
+    // A first setup gives the agent web_fetch (ADR 0050).
+    assert!(
+        said.contains("allow: [\"wats-agent__*\", \"web_fetch\"]"),
+        "{said}"
+    );
     assert!(said.contains("\"exec\", \"process\", \"write\""), "{said}");
     assert!(said.contains("Spend caps belong"), "{said}");
     assert_eq!(said.matches(&hooks).count(), 1, "{said}");
@@ -854,10 +858,11 @@ esac
     );
     assert_eq!(patch["agents"]["list"][1]["id"], "wats");
     assert_eq!(patch["agents"]["list"][1]["default"], false);
-    // The sandbox's own tool policy lets the wats tools through.
+    // The sandbox's own tool policy lets the wats tools through, and
+    // web_fetch on a first setup (ADR 0050).
     assert_eq!(
         patch["agents"]["list"][1]["tools"]["sandbox"]["tools"]["allow"],
-        serde_json::json!(["wats-agent__*"])
+        serde_json::json!(["wats-agent__*", "web_fetch"])
     );
     // The token goes into OpenClaw's .env, owner-only, and is not printed
     // by the automatic mode.
@@ -881,7 +886,7 @@ esac
     );
     assert_eq!(
         patch["agents"]["list"][1]["tools"]["allow"],
-        serde_json::json!(["wats-agent__*"])
+        serde_json::json!(["wats-agent__*", "web_fetch"])
     );
     assert!(said.contains("\"allowedAgentIds\": ["), "{said}");
     assert!(said.contains("applied"), "{said}");
@@ -895,6 +900,8 @@ esac
     );
     let toml = std::fs::read_to_string(data.join("config.toml")).unwrap();
     assert!(toml.contains("runtime = \"openclaw\""), "{toml}");
+    assert!(toml.contains("tools = [\"web_fetch\"]"), "{toml}");
+    assert!(toml.contains("caps = [\"web-fetch\""), "{toml}");
 
     // validate fails: the file is restored byte for byte, non-zero exit.
     std::fs::write(d.join("invalid"), "").unwrap();
@@ -943,6 +950,40 @@ esac
         .output()
         .unwrap();
     assert!(!out.status.success());
+
+    // `wats share` adds web_search: config.toml, then both allow lists
+    // through `openclaw config patch` (ADR 0050 §2).
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_wats"))
+        .env("WATS_HERMETIC", "1")
+        .env("HOME", d)
+        .env("OPENCLAW_STATE_DIR", d.join("oc-state"))
+        .env("PATH", &path)
+        .env("USER", "alice")
+        .env("WATS_OPENCLAW", &fake)
+        .env_remove("WATS_PROFILE")
+        .env_remove("WATS_OPENCLAW_HOOKS_TOKEN")
+        .arg("--dir")
+        .arg(&data)
+        .args(["share", "--agent", "openclaw", "--add", "web_search"])
+        .output()
+        .unwrap();
+    let said = String::from_utf8_lossy(&out.stdout).into_owned();
+    assert!(out.status.success(), "{out:?}");
+    assert!(said.contains("needs a search provider"), "{said}");
+    let patch = json("real.json");
+    let both = serde_json::json!(["wats-agent__*", "web_fetch", "web_search"]);
+    assert_eq!(patch["agents"]["list"][1]["tools"]["allow"], both);
+    assert_eq!(
+        patch["agents"]["list"][1]["tools"]["sandbox"]["tools"]["allow"],
+        both
+    );
+    let toml = std::fs::read_to_string(data.join("config.toml")).unwrap();
+    assert!(
+        toml.contains("tools = [\"web_fetch\", \"web_search\"]"),
+        "{toml}"
+    );
+    assert!(toml.contains("web-search"), "{toml}");
+    assert_eq!(backups().len(), 3, "a backup before each write");
 }
 
 /// `wats` with `stdin` written to its standard input.

@@ -1119,6 +1119,8 @@ fn fail_run(
 /// Start one OpenClaw run: post the wake to the gateway (ADR 0017 §2), in
 /// the session of its thread (`wats:<root>`), or `wats:heartbeat`.
 fn start_forward(
+    node: &Arc<Node>,
+    me: &str,
     config: &AgentConfig,
     trigger: &Trigger,
     prompt: &str,
@@ -1161,15 +1163,32 @@ fn start_forward(
         );
     }
     let isolated = Arc::clone(isolated);
-    let task = tokio::spawn(async move { openclaw::forward(request, &isolated).await });
+    let watch = Watch {
+        node: Arc::clone(node),
+        me: me.to_string(),
+        thread: thread.map(str::to_string),
+        since: record.started,
+        log: openclaw::LogWatch::new(&config.openclaw.log_dir),
+        until: tokio::time::Instant::now() + config.run_timeout + WATCH_GRACE,
+    };
+    let task = tokio::spawn(async move {
+        match openclaw::forward(request, &isolated).await {
+            openclaw::Reply::Dispatched { run_id, isolated } => {
+                watch.outcome(run_id, isolated).await
+            }
+            reply => reply,
+        }
+    });
     Ok(Running {
         record,
         token: None,
         work: Work::Forward(task),
         started: Instant::now(),
-        // A backstop: the HTTP request times out first.
+        // A backstop: the HTTP request times out first, then the watch.
         deadline: tokio::time::Instant::now()
             + openclaw::http_timeout(config.run_timeout)
+            + config.run_timeout
+            + WATCH_GRACE
             + Duration::from_secs(5),
         transcript,
         woke: Vec::new(),
@@ -1177,6 +1196,72 @@ fn start_forward(
         group: GroupGuard(None),
         charge_usd: None,
     })
+}
+
+/// How long past `timeoutSeconds` a dispatched OpenClaw run is watched
+/// (ADR 0048 §1).
+const WATCH_GRACE: Duration = Duration::from_secs(30);
+/// How often it is looked at.
+const WATCH_EVERY: Duration = Duration::from_secs(2);
+
+/// What the runner watches for a dispatched OpenClaw run's outcome (ADR
+/// 0048 §1): the agent's posts, and the gateway's log.
+struct Watch {
+    node: Arc<Node>,
+    me: String,
+    /// The run's thread; `None` (a heartbeat): any.
+    thread: Option<String>,
+    /// When the run started (unix seconds).
+    since: u64,
+    log: crate::openclaw::LogWatch,
+    until: tokio::time::Instant,
+}
+
+impl Watch {
+    /// Whether the agent posted since the run started.
+    fn posted(&self) -> bool {
+        let mine = Filter {
+            author: Some(self.me.clone()),
+            thread: self.thread.clone(),
+            ..Filter::default()
+        };
+        self.node
+            .store()
+            .search(None, &mine, 20)
+            .unwrap_or_default()
+            .iter()
+            .any(|s| s.event.ts >= self.since)
+    }
+
+    async fn outcome(mut self, run_id: String, isolated: bool) -> crate::openclaw::Reply {
+        use crate::openclaw::{HookEnd, Reply};
+        let watched = |status, detail: Option<&str>| Reply::Watched {
+            run_id: run_id.clone(),
+            status,
+            detail: detail.map(str::to_string),
+            isolated,
+        };
+        loop {
+            if self.posted() {
+                return watched("ok", None);
+            }
+            match self.log.poll(&run_id) {
+                Some(HookEnd::Error(error)) => return watched("failed", Some(&error)),
+                Some(HookEnd::Completed) if self.posted() => return watched("ok", None),
+                Some(HookEnd::Completed) => {
+                    return watched("abstained", Some("completed without a post"));
+                }
+                None => {}
+            }
+            if tokio::time::Instant::now() >= self.until {
+                return watched(
+                    "silent",
+                    Some("no post, and no outcome in the gateway's log"),
+                );
+            }
+            tokio::time::sleep(WATCH_EVERY).await;
+        }
+    }
 }
 
 /// Start one run: a transcript header, then the agent CLI with its output
@@ -1916,7 +2001,7 @@ async fn finish_run(
     config: &AgentConfig,
     mut running: Running,
     outcome: Outcome,
-) -> (Finished, String) {
+) -> (Finished, String, Option<String>) {
     use crate::openclaw::Reply;
     if let Some(token) = &running.token {
         node.end_runner_token(token);
@@ -1986,6 +2071,28 @@ async fn finish_run(
                         if *isolated { " (isolated session)" } else { "" }
                     )
                 }
+                Reply::Watched {
+                    run_id,
+                    status,
+                    detail,
+                    isolated,
+                } => {
+                    record.status = (*status).into();
+                    record.error = detail.clone();
+                    record.openclaw_run = Some(run_id.clone());
+                    format!(
+                        "run {run_id}: {status}{}{}",
+                        detail
+                            .as_deref()
+                            .map_or(String::new(), |d| format!(" ({d})")),
+                        if *isolated { " (isolated session)" } else { "" }
+                    )
+                }
+                Reply::Dispatched { run_id, .. } => {
+                    record.status = "silent".into();
+                    record.openclaw_run = Some(run_id.clone());
+                    format!("run {run_id}: dispatched, not watched")
+                }
                 Reply::Failed { error, retry_after } => {
                     record.status = "failed".into();
                     record.error = Some(error.clone());
@@ -2020,7 +2127,7 @@ async fn finish_run(
         }
         let _ = std::fs::remove_file(&running.transcript);
         let _ = std::fs::remove_file(runs::current_path(&config.work_dir));
-        return (finished, String::new());
+        return (finished, String::new(), None);
     }
     if record.status.is_empty() {
         record.status = if record.exit == Some(0) {
@@ -2136,7 +2243,7 @@ async fn finish_run(
     if let Err(e) = runs::prune(&config.work_dir, config.keep_runs, config.keep_days) {
         warn!("agent runs retention: {e}");
     }
-    (finished, record.status)
+    (finished, record.status, record.error)
 }
 
 async fn wait_running(running: &mut Option<Running>) -> Outcome {
@@ -2525,6 +2632,117 @@ async fn settle_claims(
         return;
     }
     publish_release(node, config, &ask.event, &mine.id, &why).await;
+}
+
+/// Words of an error that says a run failed for infra reasons, and may
+/// work if tried again (ADR 0048 §3): the model's API overloaded or
+/// rate-limited, a server error, the network.
+pub const INFRA_ERRORS: &[&str] = &[
+    "overloaded",
+    "rate limit",
+    "rate_limit",
+    "rate-limit",
+    "too many requests",
+    "unavailable",
+    "server error",
+    "internal error",
+    "bad gateway",
+    "gateway timeout",
+    "connection reset",
+    "connection refused",
+    "connection closed",
+    "econnreset",
+    "econnrefused",
+    "etimedout",
+    "network",
+    "timed out",
+];
+/// HTTP statuses that mean the same.
+const INFRA_STATUSES: &[&str] = &["429", "500", "502", "503", "504", "529"];
+
+/// Whether a failed run's error says it failed for infra reasons. No
+/// error text: no.
+pub fn infra_failure(error: Option<&str>) -> bool {
+    let Some(error) = error else {
+        return false;
+    };
+    let error = error.to_ascii_lowercase();
+    INFRA_ERRORS.iter().any(|w| error.contains(w))
+        || error
+            .split(|c: char| !c.is_ascii_alphanumeric())
+            .any(|t| INFRA_STATUSES.contains(&t))
+}
+
+/// The asks a failed run missed, one `<id> <unix seconds>` per line in
+/// `work_dir` (ADR 0048 §4).
+const FAILED_FILE: &str = "failed";
+/// How many are kept, and for how long.
+const FAILED_KEEP: usize = 50;
+const FAILED_FOR_SECS: u64 = 86_400;
+/// Offered per heartbeat.
+const MISSED_PER_HEARTBEAT: usize = 3;
+/// How an offer of a missed ask is remembered among the offered ones.
+const MISSED_PREFIX: &str = "missed:";
+
+fn read_failed(work_dir: &std::path::Path, now: u64) -> Vec<(String, u64)> {
+    std::fs::read_to_string(work_dir.join(FAILED_FILE))
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|l| {
+            let (id, ts) = l.split_once(' ')?;
+            Some((id.to_string(), ts.trim().parse().ok()?))
+        })
+        .filter(|(_, ts)| now.saturating_sub(*ts) <= FAILED_FOR_SECS)
+        .collect()
+}
+
+/// Keep `ids` as asks a failed run missed.
+fn remember_failed(work_dir: &std::path::Path, ids: &[String], now: u64) {
+    if ids.is_empty() {
+        return;
+    }
+    let mut kept = read_failed(work_dir, now);
+    kept.retain(|(id, _)| !ids.contains(id));
+    kept.extend(ids.iter().map(|id| (id.clone(), now)));
+    let skip = kept.len().saturating_sub(FAILED_KEEP);
+    let text: String = kept
+        .iter()
+        .skip(skip)
+        .map(|(id, ts)| format!("{id} {ts}\n"))
+        .collect();
+    let path = work_dir.join(FAILED_FILE);
+    let tmp = work_dir.join(format!("{FAILED_FILE}.tmp"));
+    if let Err(e) = std::fs::write(&tmp, text).and_then(|()| std::fs::rename(&tmp, &path)) {
+        debug!(
+            "cannot save the asks failed runs missed to {}: {e}",
+            path.display()
+        );
+    }
+}
+
+/// The asks a failed run missed that a heartbeat offers (ADR 0048 §4):
+/// at most [`MISSED_PER_HEARTBEAT`], each once, while still unanswered by
+/// the agent, not accepted or withdrawn, and not declined by it.
+pub fn failed_asks(
+    node: &Node,
+    me: &str,
+    config: &AgentConfig,
+    offered: &[String],
+    now: u64,
+) -> Vec<Arc<Event>> {
+    read_failed(&config.work_dir, now)
+        .into_iter()
+        .rev()
+        .filter(|(id, _)| !offered.contains(&format!("{MISSED_PREFIX}{id}")))
+        .filter_map(|(id, _)| node.store().get(&id).ok().flatten().map(|s| s.event))
+        .filter(|e| e.kind == Kind::Ask && unanswered(node, me, e))
+        .filter(|e| {
+            crate::delivery::state_on(node, e, now).is_none_or(|state| {
+                !state.accepted && state.withdrawn.is_none() && state.declined_by(me).is_none()
+            })
+        })
+        .take(MISSED_PER_HEARTBEAT)
+        .collect()
 }
 
 /// Whether a run's recorded status says it ended without finishing its
@@ -2992,6 +3210,9 @@ pub async fn run(
     let mut parked: HashMap<String, Parked> = HashMap::new();
     let mut touched: std::collections::HashSet<String> = Default::default();
     let mut released: std::collections::HashSet<String> = Default::default();
+    // Attempts so far of the events whose runs failed for infra reasons
+    // (ADR 0048 §3).
+    let mut attempts: HashMap<String, usize> = HashMap::new();
     let mut wakes = wake_history(&node, &config, unix_now());
     let mut feedback: Vec<String> = Vec::new();
     let mut since = node.store().last_seq()?;
@@ -3070,9 +3291,42 @@ pub async fn run(
                     let woke = std::mem::take(&mut run.woke);
                     let taken = std::mem::take(&mut run.feedback);
                     let run_started = run.record.started;
-                    let (finished, status) = finish_run(&node, &config, run, outcome).await;
+                    let (finished, status, error) = finish_run(&node, &config, run, outcome).await;
                     if run_failed(&status) {
-                        decline_for_failed_run(&node, &me, &config, &woke, &status).await;
+                        // An infra failure is tried again (ADR 0048 §3);
+                        // only the last attempt's failure declines.
+                        let attempt = woke.iter().filter_map(|q| attempts.get(&q.id)).max().copied().unwrap_or(0);
+                        let retries = config.wakes.retry_after;
+                        if !woke.is_empty() && attempt < retries.len() && infra_failure(error.as_deref()) {
+                            let after = retries[attempt];
+                            warn!(
+                                "agent run {status}: {}; retrying in {} s (attempt {} of {})",
+                                error.as_deref().unwrap_or_default(),
+                                after.as_secs(),
+                                attempt + 2,
+                                retries.len() + 1
+                            );
+                            let at = Instant::now() + after;
+                            for q in &woke {
+                                attempts.insert(q.id.clone(), attempt + 1);
+                                if !pending.iter().any(|p| p.id == q.id) {
+                                    pending.push(Queued {
+                                        held: None,
+                                        skipped: None,
+                                        not_before: Some(at),
+                                        ..q.clone()
+                                    });
+                                }
+                            }
+                        } else {
+                            for q in &woke {
+                                attempts.remove(&q.id);
+                            }
+                            decline_for_failed_run(&node, &me, &config, &woke, &status).await;
+                            let asks: Vec<String> =
+                                woke.iter().filter(|q| q.why == WHY_ASK).map(|q| q.id.clone()).collect();
+                            remember_failed(&config.work_dir, &asks, unix_now());
+                        }
                         release_failed_claims(&node, &me, &config, run_started, &status, &mut released).await;
                     }
                     if let Some(note) = unattached_note(&node, &me, &config, run_started) {
@@ -3234,15 +3488,18 @@ pub async fn run(
                 // nothing is spent (0.4.13).
                 let mut older = Vec::new();
                 let mut checks = Vec::new();
+                let mut missed = Vec::new();
                 if matches!(trigger, Trigger::Heartbeat) {
                     let offered = read_offered(&config.work_dir);
                     if let Some(window) = config.catchup {
                         older = older_asks(&node, &me, &config, window, &offered, unix_now);
                     }
                     checks = to_check(&node, &me, &config, &offered, unix_now);
+                    missed = failed_asks(&node, &me, &config, &offered, unix_now);
                     if !config.idle_heartbeat
                         && older.is_empty()
                         && checks.is_empty()
+                        && missed.is_empty()
                         && unattached.is_none()
                         && feedback.is_empty()
                         && !crate::review::has_feedback(&config.data_dir, &config.profile)
@@ -3326,6 +3583,18 @@ pub async fn run(
                         save_offered(&config.work_dir, offered, &ids);
                     }
                 }
+                // Asks a failed run missed (ADR 0048 §4).
+                if !missed.is_empty() {
+                    let ids: Vec<String> = missed.iter().map(|e| e.id.clone()).collect();
+                    info!("heartbeat: offering {} a failed run missed", count(ids.len(), "ask", "asks"));
+                    text.push_str(&format!(
+                        "\n\nAn earlier run on these asks failed: take them up if you can, \
+                         otherwise skip them:\n{}\n",
+                        event_lines(&node, &ids).join("\n")
+                    ));
+                    let keys: Vec<String> = ids.iter().map(|id| format!("{MISSED_PREFIX}{id}")).collect();
+                    save_offered(&config.work_dir, read_offered(&config.work_dir), &keys);
+                }
                 // A verifier's queue (ADR 0046 §2).
                 if !checks.is_empty() {
                     let ids: Vec<String> = checks.iter().map(|c| c.event.id.clone()).collect();
@@ -3388,7 +3657,7 @@ pub async fn run(
                 last_heartbeat = now;
                 info!(trigger = %trigger.label(), "waking the agent");
                 let started = if openclaw {
-                    start_forward(run_config, &trigger, &text, thread.as_deref(), &isolated)
+                    start_forward(&node, &me, run_config, &trigger, &text, thread.as_deref(), &isolated)
                 } else {
                     start_run(&node, run_config, &trigger, text, remaining_usd, remaining_tokens)
                         .await
@@ -3427,6 +3696,32 @@ pub async fn run(
 
 #[cfg(test)]
 mod tests {
+
+    /// ADR 0048 §3: an overloaded API, a rate limit, a 5xx or the network
+    /// are infra; an auth error, a missing model or no text are not.
+    #[test]
+    fn infra_failures_are_told_apart() {
+        for error in [
+            "error_during_execution: API Error: 529 {\"type\":\"overloaded_error\"}",
+            "Rate limit reached",
+            "the OpenClaw gateway answered 502: bad",
+            "connect ECONNREFUSED 127.0.0.1:443",
+            "stream error: network timed out",
+        ] {
+            assert!(super::infra_failure(Some(error)), "{error}");
+        }
+        for error in [
+            "No API key found for provider \"openai\"",
+            "No callable tools remain after resolving explicit tool allowlist",
+            "exit code 1",
+            "error_max_turns",
+            "model 5029 not found",
+        ] {
+            assert!(!super::infra_failure(Some(error)), "{error}");
+        }
+        assert!(!super::infra_failure(None));
+    }
+
     /// The files a run wrote in its workspace: new ones only, hidden
     /// directories left out.
     #[test]

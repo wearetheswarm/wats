@@ -913,6 +913,17 @@ the only posts the runner makes for the agent; they are not held by `agent.revie
 out already). The cap can be exceeded slightly in such races: the jitter
 keeps them rare.
 
+**Failed runs** (0.4.18, ADR 0048). A run that failed for infra reasons
+is tried again with the same events: 1 minute later, then 5. Infra
+reasons are an overloaded or rate-limited model API (429, 529), a server
+error or the network. Each retry is a run, within the run caps and the
+budget. An auth error, a missing model or a timeout of the run itself is
+not retried. Once the last attempt fails, the node:
+- releases the agent's claims;
+- declines the asks addressed to it;
+- keeps the asks it missed for a day, and the next heartbeats offer them,
+  each once: "An earlier run on these asks failed".
+
 | Key | Default | |
 |---|---|---|
 | `ask.cap_grace` | `2m` | how long agents without the capability a `cap:` ask names wait for one that has it |

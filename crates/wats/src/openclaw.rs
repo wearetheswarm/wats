@@ -317,6 +317,9 @@ pub struct Target {
     pub agent: String,
     /// The hook token file.
     pub token_file: PathBuf,
+    /// Where the gateway writes its file log ([`LOG_DIR`]): a hook run's
+    /// outcome, by its `runId` (ADR 0048 §1).
+    pub log_dir: PathBuf,
 }
 
 impl Default for Target {
@@ -325,7 +328,121 @@ impl Default for Target {
             url: DEFAULT_URL.into(),
             agent: DEFAULT_AGENT.into(),
             token_file: PathBuf::new(),
+            log_dir: PathBuf::from(LOG_DIR),
         }
+    }
+}
+
+/// The gateway's file log directory (OpenClaw 2026.6.35):
+/// `openclaw-<date>.log`, one JSON object per line.
+pub const LOG_DIR: &str = "/tmp/openclaw";
+
+/// A hook run's end, as the gateway's log says it (ADR 0048 §1).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HookEnd {
+    /// "hook agent run completed without announcement", or status ok.
+    Completed,
+    /// `status: "error"`, with its summary.
+    Error(String),
+}
+
+/// What one line of the gateway's log says about the hook run `run_id`:
+/// a `gateway/hooks` entry `{"1": {"runId", "status", "summary"}, "2":
+/// message}`; `None` for any other line.
+pub fn hook_end(line: &str, run_id: &str) -> Option<HookEnd> {
+    if !line.contains(run_id) {
+        return None;
+    }
+    let value: Value = serde_json::from_str(line).ok()?;
+    let fields = &value["1"];
+    if fields["runId"].as_str() != Some(run_id) {
+        return None;
+    }
+    let message = value["2"].as_str().unwrap_or_default();
+    match fields["status"].as_str() {
+        Some("error") => {
+            let summary = fields["summary"]
+                .as_str()
+                .or(fields["error"].as_str())
+                .unwrap_or(message);
+            Some(HookEnd::Error(summary.chars().take(200).collect()))
+        }
+        Some("ok") => Some(HookEnd::Completed),
+        _ if message.contains("completed") => Some(HookEnd::Completed),
+        _ => None,
+    }
+}
+
+/// Reads what the gateway's log files gained since it was made.
+pub struct LogWatch {
+    dir: PathBuf,
+    offsets: std::collections::HashMap<PathBuf, u64>,
+}
+
+impl LogWatch {
+    /// Where each `openclaw-*.log` of `dir` stands now: only later lines
+    /// are read.
+    pub fn new(dir: &Path) -> Self {
+        let mut watch = LogWatch {
+            dir: dir.to_path_buf(),
+            offsets: Default::default(),
+        };
+        for path in watch.files() {
+            let len = std::fs::metadata(&path).map_or(0, |m| m.len());
+            watch.offsets.insert(path, len);
+        }
+        watch
+    }
+
+    fn files(&self) -> Vec<PathBuf> {
+        let Ok(entries) = std::fs::read_dir(&self.dir) else {
+            return Vec::new();
+        };
+        entries
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| {
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.starts_with("openclaw-") && n.ends_with(".log"))
+            })
+            .collect()
+    }
+
+    /// The end of the hook run `run_id`, if the lines written since the
+    /// last look say it.
+    pub fn poll(&mut self, run_id: &str) -> Option<HookEnd> {
+        use std::io::{BufRead, Seek};
+        let mut found = None;
+        for path in self.files() {
+            let from = self.offsets.get(&path).copied().unwrap_or(0);
+            let Ok(mut file) = std::fs::File::open(&path) else {
+                continue;
+            };
+            let len = file.metadata().map_or(0, |m| m.len());
+            // Rotated or truncated: read it again from its start.
+            let from = if len < from { 0 } else { from };
+            if file.seek(std::io::SeekFrom::Start(from)).is_err() {
+                continue;
+            }
+            let mut read = from;
+            let mut reader = std::io::BufReader::new(file);
+            let mut line = String::new();
+            loop {
+                line.clear();
+                match reader.read_line(&mut line) {
+                    Ok(0) | Err(_) => break,
+                    // A line still being written waits for the next look.
+                    Ok(_) if !line.ends_with('\n') => break,
+                    Ok(n) => read += n as u64,
+                }
+                if found.is_none() {
+                    found = hook_end(&line, run_id);
+                }
+            }
+            self.offsets.insert(path, read);
+        }
+        found
     }
 }
 
@@ -526,6 +643,18 @@ pub enum Reply {
         /// Sent without a session key (the gateway's session policy).
         isolated: bool,
     },
+    /// Accepted with a `runId` and no completion (OpenClaw 2026.6.35 runs
+    /// the turn in the background): the runner watches for its outcome
+    /// (ADR 0048 §1). `status`: `ok`, `failed`, `abstained` or `silent`.
+    Watched {
+        run_id: String,
+        status: &'static str,
+        detail: Option<String>,
+        isolated: bool,
+    },
+    /// Accepted with this `runId`, no completion yet: what
+    /// [`forward`] returns for the runner to watch.
+    Dispatched { run_id: String, isolated: bool },
     /// The run fails: a bad token, a rate limit, a configuration error.
     Failed {
         error: String,
@@ -656,6 +785,14 @@ pub async fn forward(request: Request, isolated: &AtomicBool) -> Reply {
                     .as_str()
                     .or(value["completion"]["replyDisposition"].as_str())
                     .map(str::to_string);
+                if completion.is_none()
+                    && let Some(run_id) = value["runId"].as_str()
+                {
+                    return Reply::Dispatched {
+                        run_id: run_id.to_string(),
+                        isolated: alone,
+                    };
+                }
                 Reply::Done {
                     completion,
                     disposition,
@@ -718,7 +855,26 @@ pub async fn forward(request: Request, isolated: &AtomicBool) -> Reply {
 /// The JSON5 block to paste into OpenClaw's config: hooks with the token
 /// read from [`HOOKS_TOKEN_ENV`], and the dedicated agent when `agent` is
 /// [`DEFAULT_AGENT`].
-pub fn config_block(agent: &str) -> String {
+/// The OpenClaw tools the dedicated agent may be given besides the wats
+/// tools (ADR 0050): those of `wats share`.
+pub const AGENT_TOOLS: [&str; 2] = ["web_fetch", "web_search"];
+/// What a first setup gives it.
+pub const DEFAULT_TOOLS: [&str; 1] = ["web_fetch"];
+
+/// The dedicated agent's allow list, in `tools.allow` and in
+/// `tools.sandbox.tools.allow`: the wats tools, then those of `tools`
+/// that are [`AGENT_TOOLS`].
+pub fn agent_allow(tools: &[String]) -> Vec<String> {
+    let mut allow = vec![format!("{AGENT_SERVER}__*")];
+    for tool in AGENT_TOOLS {
+        if tools.iter().any(|t| t.trim() == tool) {
+            allow.push(tool.to_string());
+        }
+    }
+    allow
+}
+
+pub fn config_block(agent: &str, tools: &[String]) -> String {
     let mut block = format!(
         "hooks: {{\n  enabled: true,\n  token: \"${{{HOOKS_TOKEN_ENV}}}\",\n  path: \"/hooks\",\n  \
          allowedAgentIds: [\"{agent}\"],\n  allowRequestSessionKey: true,\n  \
@@ -732,6 +888,11 @@ pub fn config_block(agent: &str) -> String {
             .map(|t| format!("\"{t}\""))
             .collect::<Vec<_>>()
             .join(", ");
+        let allow = agent_allow(tools)
+            .iter()
+            .map(|t| format!("\"{t}\""))
+            .collect::<Vec<_>>()
+            .join(", ");
         block.push_str(&format!(
             "// Add this entry to agents.list if you have one. Without a list, keep\n\
              // `main` first and default, or the wats agent takes your channels.\n\
@@ -739,12 +900,37 @@ pub fn config_block(agent: &str) -> String {
              default: false,\n  name: \"wats (swarm)\",\n  \
              workspace: \"~/.openclaw/workspace-wats\",\n  \
              sandbox: {{ mode: \"all\", scope: \"agent\" }},\n  \
-             tools: {{ allow: [\"{AGENT_SERVER}__*\"],\n           deny: [{deny}],\n           \
+             tools: {{ allow: [{allow}],\n           deny: [{deny}],\n           \
              // the sandbox's own tool policy: each level only narrows\n           \
-             sandbox: {{ tools: {{ allow: [\"{AGENT_SERVER}__*\"] }} }} }},\n}} ] }},\n"
+             sandbox: {{ tools: {{ allow: [{allow}] }} }} }},\n}} ] }},\n"
         ));
     }
     block
+}
+
+/// The self-test's message (ADR 0050 §3).
+pub const SELF_TEST_MESSAGE: &str = "wats self-test: reply OK, call no tool.";
+/// Its session key.
+pub const SELF_TEST_SESSION: &str = "wats:selftest";
+
+/// What to do about a self-test's failure, for the failures seen so far.
+pub fn self_test_hint(summary: &str) -> Option<&'static str> {
+    let s = summary.to_ascii_lowercase();
+    if s.contains("no api key") || s.contains("provider auth") {
+        Some(
+            "give the wats agent model auth: `openclaw agents add wats`, or copy the main \
+             agent's auth profile to it",
+        )
+    } else if s.contains("no callable tools") {
+        Some(
+            "run `wats setup openclaw --agent --apply` again: it gives the sandbox its own \
+             tool allow (0.4.17)",
+        )
+    } else if s.contains("sandbox image") {
+        Some("build OpenClaw's sandbox image with its scripts/sandbox-setup.sh")
+    } else {
+        None
+    }
 }
 
 /// The session key prefix of wats's forwards (`wats:<root>`).
@@ -805,6 +991,7 @@ pub fn config_patch(
     agent_ids: &[String],
     prefixes: &[String],
     agents: &[Value],
+    tools: &[String],
 ) -> Value {
     let hooks = json!({
         "enabled": true,
@@ -836,9 +1023,9 @@ pub fn config_patch(
             // and each level only narrows: without its own allow, nothing
             // is left to call (OpenClaw 2026.6.35, Vincent's Mac).
             "tools": {
-                "allow": [format!("{AGENT_SERVER}__*")],
+                "allow": agent_allow(tools),
                 "deny": DENIED_TOOLS,
-                "sandbox": { "tools": { "allow": [format!("{AGENT_SERVER}__*")] } },
+                "sandbox": { "tools": { "allow": agent_allow(tools) } },
             },
         }));
         patch["agents"] = json!({ "list": list });
@@ -941,6 +1128,60 @@ pub fn backup_path(file: &Path, now: u64) -> PathBuf {
 
 #[cfg(test)]
 mod tests {
+    /// ADR 0050: the wats tools, then the chosen OpenClaw tools, in both
+    /// allow lists; tools wats does not offer stay out.
+    #[test]
+    fn the_agent_gets_its_chosen_tools_in_both_lists() {
+        let tools = |v: &[&str]| v.iter().map(|t| t.to_string()).collect::<Vec<_>>();
+        assert_eq!(super::agent_allow(&[]), ["wats-agent__*"]);
+        assert_eq!(
+            super::agent_allow(&tools(&["web_search", "exec", "web_fetch"])),
+            ["wats-agent__*", "web_fetch", "web_search"]
+        );
+        let patch = super::config_patch("wats", &[], &[], &[], &tools(&["web_fetch"]));
+        let agent = &patch["agents"]["list"][1]["tools"];
+        assert_eq!(
+            agent["allow"],
+            serde_json::json!(["wats-agent__*", "web_fetch"])
+        );
+        assert_eq!(agent["sandbox"]["tools"]["allow"], agent["allow"]);
+        let block = super::config_block("wats", &tools(&["web_fetch"]));
+        assert_eq!(
+            block.matches("[\"wats-agent__*\", \"web_fetch\"]").count(),
+            2,
+            "{block}"
+        );
+        assert_eq!(crate::share::natives("openclaw").len(), 2);
+        assert!(super::self_test_hint("No API key found for provider \"openai\"").is_some());
+        assert!(super::self_test_hint("No callable tools remain after resolving").is_some());
+        assert!(super::self_test_hint("Sandbox image not found").is_some());
+        assert!(super::self_test_hint("something else").is_none());
+    }
+
+    /// ADR 0048 §1: the gateway's log lines for one hook run.
+    #[test]
+    fn the_gateway_log_gives_a_hook_runs_end() {
+        let error = r#"{"0":"{\"subsystem\":\"gateway/hooks\"}","1":{"runId":"r1","status":"error","summary":"No API key"},"2":"hook agent run returned non-ok status"}"#;
+        let done = r#"{"1":{"runId":"r2","completedAt":"x"},"2":"hook agent run completed without announcement"}"#;
+        assert_eq!(
+            super::hook_end(error, "r1"),
+            Some(super::HookEnd::Error("No API key".into()))
+        );
+        assert_eq!(super::hook_end(error, "r2"), None);
+        assert_eq!(super::hook_end(done, "r2"), Some(super::HookEnd::Completed));
+        assert_eq!(super::hook_end("not json r1", "r1"), None);
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("openclaw-2026-10-24.log");
+        std::fs::write(&log, format!("{error}\n")).unwrap();
+        let mut watch = super::LogWatch::new(dir.path());
+        assert_eq!(watch.poll("r1"), None, "a line from before");
+        use std::io::Write;
+        let mut f = std::fs::OpenOptions::new().append(true).open(&log).unwrap();
+        write!(f, "{done}").unwrap();
+        assert_eq!(watch.poll("r2"), None, "a line still being written");
+        writeln!(f).unwrap();
+        assert_eq!(watch.poll("r2"), Some(super::HookEnd::Completed));
+    }
 
     #[test]
     fn the_hook_token_is_an_environment_template() {
@@ -948,7 +1189,7 @@ mod tests {
             hooks_token_command(),
             "openclaw config set hooks.token '${WATS_OPENCLAW_HOOKS_TOKEN}'"
         );
-        assert!(config_block(DEFAULT_AGENT).contains(&hooks_token_template()));
+        assert!(config_block(DEFAULT_AGENT, &[]).contains(&hooks_token_template()));
     }
 
     #[test]
@@ -1094,18 +1335,18 @@ mod tests {
         let isolated = body(&request, true);
         assert!(isolated.get("sessionKey").is_none());
         assert_eq!(isolated["sessionMode"], "isolated");
-        let block = config_block("wats");
+        let block = config_block("wats", &[]);
         assert!(block.contains("token: \"${WATS_OPENCLAW_HOOKS_TOKEN}\""));
         assert!(block.contains("allow: [\"wats-agent__*\"]"));
         assert!(block.contains("\"apply_patch\""));
-        assert!(!config_block("main").contains("agents:"));
+        assert!(!config_block("main", &[]).contains("agents:"));
     }
 
     /// The restricted agent `wats setup openclaw` prints may use the wats
     /// tools only: no shell, no file writes, so it cannot edit config.toml.
     #[test]
     fn restricted_agent_cannot_exec_or_write() {
-        let block = config_block(DEFAULT_AGENT);
+        let block = config_block(DEFAULT_AGENT, &[]);
         let tools = block
             .split("tools: {")
             .nth(1)
@@ -1123,7 +1364,7 @@ mod tests {
     }
 
     fn block_has_main_default() -> bool {
-        config_block(DEFAULT_AGENT).contains("{ id: \"main\", default: true }")
+        config_block(DEFAULT_AGENT, &[]).contains("{ id: \"main\", default: true }")
     }
 
     /// The patch is the printed block, as JSON, with the merged lists; the
@@ -1141,14 +1382,14 @@ mod tests {
         assert_eq!(session_prefixes(&["x:".into()], true), ["x:", "wats:"]);
         let mine = json!({"id": "main", "workspace": "~/w"});
         let old = json!({"id": "wats", "name": "old"});
-        let patch = config_patch(DEFAULT_AGENT, &ids, &prefixes, &[mine.clone(), old]);
+        let patch = config_patch(DEFAULT_AGENT, &ids, &prefixes, &[mine.clone(), old], &[]);
         let list = patch["agents"]["list"].as_array().unwrap();
         assert_eq!(list.len(), 2, "{list:?}");
         assert_eq!(list[0], mine, "the user's agents stay");
         assert_eq!(list[1]["id"], "wats");
         assert_eq!(list[1]["default"], false);
         // No list yet: `main` first and default, so the channels stay its.
-        let fresh = config_patch(DEFAULT_AGENT, &ids, &prefixes, &[]);
+        let fresh = config_patch(DEFAULT_AGENT, &ids, &prefixes, &[], &[]);
         assert_eq!(
             fresh["agents"]["list"][0],
             json!({"id": "main", "default": true})
@@ -1179,12 +1420,12 @@ mod tests {
         let tools = &patch["agents"]["list"][1]["tools"];
         assert_eq!(tools["allow"], json!(["wats-agent__*"]));
         assert_eq!(tools["deny"], json!(DENIED_TOOLS));
-        let block = config_block(DEFAULT_AGENT);
+        let block = config_block(DEFAULT_AGENT, &[]);
         for value in ["/hooks", "wats (swarm)", "~/.openclaw/workspace-wats"] {
             assert!(block.contains(value) && patch.to_string().contains(value));
         }
         assert!(
-            config_patch("main", &ids, &prefixes, &[])
+            config_patch("main", &ids, &prefixes, &[], &[])
                 .get("agents")
                 .is_none()
         );

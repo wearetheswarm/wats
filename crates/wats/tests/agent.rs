@@ -2480,6 +2480,7 @@ async fn loop_detector_pauses_a_thread_until_a_third_party_posts() -> anyhow::Re
         wakes: wats::wake::WakeLimits {
             per_author_per_hour: 0,
             loop_max_exchanges: 3,
+            ..wats::wake::WakeLimits::unlimited()
         },
         codex_disable: vec![],
         codex_enable: vec![],
@@ -2728,6 +2729,149 @@ fn gateway_stub(
     (url, seen)
 }
 
+/// ADR 0048 §1: the gateway answers with a `runId` and runs the turn in
+/// the background; the runner watches for its outcome. An error in the
+/// gateway's log fails the run, a post by the agent makes it ok, and a
+/// completion without a post is an abstention.
+#[tokio::test(flavor = "multi_thread")]
+async fn openclaw_watches_a_dispatched_run() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let a = node(&dir.path().join("a"), &[]).await?;
+    let (url, seen) = gateway_stub(vec![
+        (200, r#"{"ok":true,"runId":"run-1"}"#, Duration::ZERO),
+        (200, r#"{"ok":true,"runId":"run-2"}"#, Duration::ZERO),
+        (200, r#"{"ok":true,"runId":"run-3"}"#, Duration::ZERO),
+    ]);
+    let token = "ab".repeat(32);
+    let token_file = dir.path().join("hooks.token");
+    std::fs::write(&token_file, format!("{token}\n"))?;
+    let work = dir.path().join("work");
+    let logs = dir.path().join("oc-logs");
+    std::fs::create_dir_all(&logs)?;
+    let log = logs.join("openclaw-2026-10-24.log");
+    std::fs::write(
+        &log,
+        "{\"1\":{\"runId\":\"run-1\",\"status\":\"error\",\"summary\":\"an old line\"}}\n",
+    )?;
+    let config = AgentConfig {
+        runtime: "openclaw".into(),
+        profile: "agent".into(),
+        user: "alice".into(),
+        about: String::new(),
+        caps: vec![],
+        every: Duration::from_secs(1),
+        heartbeat: Duration::from_secs(3600),
+        max_runs_per_hour: 100,
+        allow: vec![],
+        ignore_local: false,
+        heartbeat_text: DEFAULT_HEARTBEAT.into(),
+        command: "/nonexistent/openclaw".into(),
+        mcp_command: "/usr/bin/true".into(),
+        mcp_args: vec![],
+        extra_args: vec![],
+        run_timeout: Duration::from_secs(20),
+        max_turns: 10,
+        budget: wats::budget::Budget::default(),
+        wakes: wats::wake::WakeLimits::unlimited(),
+        codex_disable: vec![],
+        codex_enable: vec![],
+        access: wats::access::Access::SwarmOnly,
+        workdir: std::path::PathBuf::from("/nonexistent"),
+        tools: vec![],
+        servers: Vec::new(),
+        mcp_format: Default::default(),
+        mcp_file: None,
+        env: Vec::new(),
+        model: Some("cheap-model".into()),
+        effort: None,
+        work_dir: work.clone(),
+        data_dir: work.parent().unwrap().to_path_buf(),
+        keep_runs: 50,
+        keep_days: 30,
+        openclaw: wats::openclaw::Target {
+            url: url.clone(),
+            agent: "wats".into(),
+            token_file,
+            log_dir: dir.path().join("oc-logs"),
+        },
+        catchup: None,
+        idle_heartbeat: true,
+    };
+    let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+    let runner = tokio::spawn(wats::agent::run(Arc::clone(&a), config, async {
+        let _ = stopped.await;
+    }));
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let human = a.author_key("human")?;
+    let agent = a.author_key("agent")?;
+    let requests = || seen.lock().unwrap().len();
+    let records = || -> Vec<wats::runs::RunRecord> {
+        wats::runs::list(&work)
+            .into_iter()
+            .filter(|r| !r.status.is_empty() && r.status != "running")
+            .collect()
+    };
+    let append = |line: &str| {
+        use std::io::Write;
+        let mut f = std::fs::OpenOptions::new().append(true).open(&log).unwrap();
+        writeln!(f, "{line}").unwrap();
+    };
+
+    // An error for this run in the gateway's log (the line from before
+    // the forward does not count).
+    a.publish_as(&human, ask("first question"), &[]).await?;
+    eventually("the first forward", || requests() == 1).await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(records().is_empty(), "watched, not closed: {:?}", records());
+    append(
+        r#"{"0":"{\"subsystem\":\"gateway/hooks\"}","1":{"runId":"run-1","status":"error","summary":"No API key found for provider \"openai\""},"2":"hook agent run returned non-ok status"}"#,
+    );
+    eventually("a failed run", || records().len() == 1).await;
+    let run = records().remove(0);
+    assert_eq!(run.status, "failed", "{run:?}");
+    assert_eq!(run.openclaw_run.as_deref(), Some("run-1"));
+    assert!(
+        run.error.as_deref().unwrap().contains("No API key"),
+        "{run:?}"
+    );
+
+    // The agent posts in the thread: ok.
+    let second = a.publish_as(&human, ask("second question"), &[]).await?;
+    eventually("the second forward", || requests() == 2).await;
+    let answer = Draft {
+        net: PUBLIC_NET.into(),
+        kind: Some(Kind::Answer),
+        thread: Some(second.id.clone()),
+        parent: Some(second.id.clone()),
+        text: "an answer".into(),
+        ..Draft::default()
+    };
+    a.publish_as(&agent, answer, &[]).await?;
+    eventually("an ok run", || records().len() == 2).await;
+    let run = records().remove(1);
+    assert_eq!(
+        (run.status.as_str(), run.openclaw_run.as_deref()),
+        ("ok", Some("run-2"))
+    );
+    assert!(run.seconds.unwrap() > 0.0, "{run:?}");
+
+    // Completed without a post: an abstention.
+    a.publish_as(&human, ask("third question"), &[]).await?;
+    eventually("the third forward", || requests() == 3).await;
+    append(
+        r#"{"0":"{\"subsystem\":\"gateway/hooks\"}","1":{"runId":"run-3","completedAt":"2026-10-24T19:38:46.191Z"},"2":"hook agent run completed without announcement"}"#,
+    );
+    eventually("an abstention", || records().len() == 3).await;
+    let run = records().remove(2);
+    assert_eq!(run.status, "abstained", "{run:?}");
+    assert_eq!(run.error.as_deref(), Some("completed without a post"));
+
+    let _ = stop.send(());
+    runner.await??;
+    a.shutdown().await?;
+    Ok(())
+}
+
 /// `--agent openclaw`: each run is a POST to the gateway's /hooks/agent
 /// with the hook token, the run id as idempotency key, and the wake in the
 /// thread's session. 200 records the completion; a 400 on the session
@@ -2798,6 +2942,7 @@ async fn openclaw_forwards_wakes_to_the_gateway() -> anyhow::Result<()> {
             url: url.clone(),
             agent: "wats".into(),
             token_file,
+            log_dir: dir.path().join("oc-logs"),
         },
         catchup: None,
         idle_heartbeat: true,

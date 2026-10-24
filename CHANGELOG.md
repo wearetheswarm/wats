@@ -4,6 +4,36 @@
 
 ### Changes
 
+- **OpenClaw runs say what happened** (ADR 0048). The gateway answers a
+  hook at once and runs the turn in the background. The runner now
+  watches the run's outcome, from the agent's posts and the gateway's
+  log, and records it, with OpenClaw's `runId`:
+  - `ok`: the agent posted;
+  - `failed`: with OpenClaw's summary, e.g. "No API key found for
+    provider";
+  - `abstained`: completed without a post;
+  - `silent`: no outcome could be read.
+
+  Every OpenClaw run used to be recorded "ok, 0.0 s".
+- **Runs that failed for infra reasons are tried again** (ADR 0048): an
+  overloaded or rate-limited model API, a server error or the network.
+  - When: 1 minute, then 5 minutes later, within the run caps and the
+    budget.
+  - Only the last attempt's failure declines the asks addressed to the
+    agent.
+  - The next heartbeats offer the asks a failed run missed.
+- **The OpenClaw agent can read the web** (ADR 0050). A first setup gives
+  the dedicated agent `web_fetch`. `wats share --agent openclaw` adds
+  `web_search` (it needs a search provider in OpenClaw) or removes
+  `web_fetch`. Both of the agent's allow lists are written through
+  `openclaw config patch`, after a backup.
+- **`wats setup openclaw --self-test`** (ADR 0050) sends one hook, then
+  reads its outcome in the gateway's log. For the failures seen so far,
+  it says how to fix them: no model auth for the agent, "No callable
+  tools remain", no sandbox image.
+- **Claude Code run errors keep their message**: "error_during_execution:
+  API Error: 529 overloaded", not only the subtype.
+
 - **An addressee can decline a `to:` ask** (ADR 0047): a `release`
   replying to the ask with `data.decline`, a `data.reason`, and
   optionally `data.suggest` (agents that may take it).

@@ -254,6 +254,7 @@ wats setup openclaw [OPTIONS]
 | `-y, --yes` |  | `false` | Confirm that spend caps are set on the OpenClaw side (wats cannot enforce its USD budgets there); needed without a terminal |
 | `--url <URL>` |  |  | The OpenClaw gateway (agent.openclaw_url); default http://127.0.0.1:18789, asked on a terminal. Plain http is for loopback only, or a private address with agent.openclaw_insecure_ok (e.g. http://openclaw:18789 in Docker) |
 | `--name <NAME>` |  |  | The agent's name in config.toml ([agents.<name>]) [default: openclaw]. A node runs one OpenClaw agent |
+| `--self-test` |  | `false` | Only check the set-up agent: one hook to the gateway (one short model turn), then its outcome from the gateway's log (ADR 0050 §3) |
 | `--openclaw <OPENCLAW>` | `WATS_OPENCLAW` | `openclaw` | The OpenClaw CLI |
 
 <a id="wats-setup-opencode"></a>
