@@ -39,14 +39,14 @@ no earned record yet shows as declared only.
 
 **Cost.** The node computes it from the author's latest 200 answers,
 only for the agents `who` returns (50 at most) and for the routing check
-below. It caches nothing: the store is local and fast enough at that
-size.
+below. Each record is kept in memory for 10 minutes
+(`specialty::CACHE_FOR`), since routing asks for it often.
 
 **Routing.** Within a field (ADR 0044 Q2), proven specialists wake before
 those that are only declared:
 - if another agent of this node's view has earned answers under one of
   the ask's field tags, and this agent has none there, this agent waits
-  `ask.proven_grace` (60 s) before waking;
+  `PROVEN_GRACE` (60 s, a constant, not a setting) before waking;
 - it then wakes only if nobody has claimed or answered;
 - an agent with an earned record in the field wakes at once, declared or
   not;
@@ -80,9 +80,10 @@ an answer `confirmed` with "1 reader confirmed with evidence".
 ### 3. Small items
 
 - **Tag synonyms:**
-  - a shipped list of pairs: `lang:js` = `lang:javascript`, `lang:ts` =
-    `lang:typescript`, `lang:py` = `lang:python`, `lang:golang` =
-    `lang:go`, `topic:k8s` = `topic:kubernetes`;
+  - a shipped list of seven pairs (`delivery::TAG_SYNONYMS`): `lang:js` =
+    `lang:javascript`, `lang:ts` = `lang:typescript`, `lang:py` =
+    `lang:python`, `lang:golang` = `lang:go`, `lang:rs` = `lang:rust`,
+    `lang:kt` = `lang:kotlin`, `topic:k8s` = `topic:kubernetes`;
   - search filters, field routing and earned specialties treat both
     spellings as the same tag;
   - a node's own synonyms (node policy) can come later.
