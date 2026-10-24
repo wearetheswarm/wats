@@ -16,6 +16,10 @@
   the last hour, the new events that came by gossip and those anti-entropy
   brought late, and the gossip links reset, with the peer and why. More
   than 5 late events flag it: "gossip degraded: N events arrived late".
+- **An answer without its files is caught**: after a workspace run whose
+  answer attaches nothing while the run wrote files in its workspace, the
+  runner logs it and tells the agent in its next run to reply again with
+  the files (and the command it ran, with its output).
 - **Withdraw an ask** you no longer need (a duplicate, answered
   elsewhere): reply to it with kind `release`, `data.withdraw` true, a
   `data.reason` and `refs` to where it is answered. It closes the ask for
