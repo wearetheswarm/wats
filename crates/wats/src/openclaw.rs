@@ -602,7 +602,7 @@ pub async fn forward(request: Request, isolated: &AtomicBool) -> Reply {
                         "the OpenClaw gateway refuses caller session keys ({}): falling back \
                          to isolated sessions for this process. For one session per thread, \
                          set hooks.allowRequestSessionKey: true and \
-                         hooks.allowedSessionKeyPrefixes: [\"wats:\"]",
+                         hooks.allowedSessionKeyPrefixes: [\"wats:\", \"hook:\"]",
                         shown(&text)
                     );
                 }
@@ -637,7 +637,9 @@ pub fn config_block(agent: &str) -> String {
     let mut block = format!(
         "hooks: {{\n  enabled: true,\n  token: \"${{{HOOKS_TOKEN_ENV}}}\",\n  path: \"/hooks\",\n  \
          allowedAgentIds: [\"{agent}\"],\n  allowRequestSessionKey: true,\n  \
-         allowedSessionKeyPrefixes: [\"wats:\"],\n}},\n"
+         // \"hook:\" too unless hooks.defaultSessionKey is set: the gateway does not\n  \
+         // start without it.\n  \
+         allowedSessionKeyPrefixes: [\"wats:\", \"hook:\"],\n}},\n"
     );
     if agent == DEFAULT_AGENT {
         let deny = DENIED_TOOLS
@@ -646,8 +648,10 @@ pub fn config_block(agent: &str) -> String {
             .collect::<Vec<_>>()
             .join(", ");
         block.push_str(&format!(
-            "// Add this entry to agents.list if you have one.\n\
-             agents: {{ list: [ {{\n  id: \"wats\",\n  name: \"wats (swarm)\",\n  \
+            "// Add this entry to agents.list if you have one. Without a list, keep\n\
+             // `main` first and default, or the wats agent takes your channels.\n\
+             agents: {{ list: [ {{ id: \"main\", default: true }}, {{\n  id: \"wats\",\n  \
+             default: false,\n  name: \"wats (swarm)\",\n  \
              workspace: \"~/.openclaw/workspace-wats\",\n  \
              sandbox: {{ mode: \"all\", scope: \"agent\" }},\n  \
              tools: {{ allow: [\"{AGENT_SERVER}__*\"],\n           deny: [{deny}] }},\n}} ] }},\n"
@@ -658,6 +662,50 @@ pub fn config_block(agent: &str) -> String {
 
 /// The session key prefix of wats's forwards (`wats:<root>`).
 pub const SESSION_PREFIX: &str = "wats:";
+
+/// The prefix of OpenClaw's own hook sessions: the gateway refuses to
+/// start when `hooks.allowedSessionKeyPrefixes` lacks it and
+/// `hooks.defaultSessionKey` is unset (OpenClaw 2026.6.35; Vincent's
+/// gateway crash-looped on it, 2026-10-24).
+pub const HOOK_PREFIX: &str = "hook:";
+
+/// `hooks.allowedSessionKeyPrefixes` after setup: the user's, plus
+/// [`SESSION_PREFIX`], plus [`HOOK_PREFIX`] unless the user set
+/// `hooks.defaultSessionKey`.
+pub fn session_prefixes(existing: &[String], default_key_set: bool) -> Vec<String> {
+    if default_key_set {
+        merge_list(existing, &[SESSION_PREFIX])
+    } else {
+        merge_list(existing, &[SESSION_PREFIX, HOOK_PREFIX])
+    }
+}
+
+/// The OpenClaw agent that keeps the user's channels when setup creates
+/// `agents.list`: an empty list made the wats agent the default, and
+/// Telegram went to it (2026-10-24).
+pub const MAIN_AGENT: &str = "main";
+
+/// The sandbox image OpenClaw uses unless
+/// `agents.defaults.sandbox.docker.image` names another.
+pub const SANDBOX_IMAGE: &str = "openclaw-sandbox:bookworm-slim";
+
+/// What setup says about the sandbox image of the wats agent (`sandbox.mode
+/// all`): `present` is whether `docker image inspect` found it, `None` when
+/// Docker could not be asked. `None` when the image is there.
+pub fn sandbox_note(image: &str, present: Option<bool>) -> Option<String> {
+    let build = "build it with OpenClaw's scripts/sandbox-setup.sh (in the OpenClaw source)";
+    match present {
+        Some(true) => None,
+        Some(false) => Some(format!(
+            "the wats agent runs sandboxed, and the sandbox image {image} is missing: {build}. \
+             Until then every hook to it fails (\"Sandbox image not found\")"
+        )),
+        None => Some(format!(
+            "the wats agent runs sandboxed in Docker, which could not be asked here: check that \
+             Docker runs and that the image {image} exists, else {build}"
+        )),
+    }
+}
 
 /// The patch `wats setup openclaw --apply` sends to `openclaw config patch`:
 /// the content of [`config_block`] as JSON. `patch` replaces arrays, so
@@ -686,8 +734,14 @@ pub fn config_patch(
             .filter(|a| a.get("id").and_then(Value::as_str) != Some(DEFAULT_AGENT))
             .cloned()
             .collect();
+        // A list that only has ours would make it the default agent, the
+        // one every channel goes to.
+        if list.is_empty() {
+            list.push(json!({ "id": MAIN_AGENT, "default": true }));
+        }
         list.push(json!({
             "id": DEFAULT_AGENT,
+            "default": false,
             "name": "wats (swarm)",
             "workspace": "~/.openclaw/workspace-wats",
             "sandbox": { "mode": "all", "scope": "agent" },
@@ -974,13 +1028,23 @@ mod tests {
         assert!(block.contains("sandbox: { mode: \"all\""), "{block}");
     }
 
+    fn block_has_main_default() -> bool {
+        config_block(DEFAULT_AGENT).contains("{ id: \"main\", default: true }")
+    }
+
     /// The patch is the printed block, as JSON, with the merged lists; the
     /// token is an environment reference.
     #[test]
     fn patch_matches_the_block() {
         let ids = merge_list(&["main".into(), "wats".into()], &["wats"]);
         assert_eq!(ids, ["main", "wats"]);
-        let prefixes = merge_list(&[], &[SESSION_PREFIX]);
+        let prefixes = session_prefixes(&[], false);
+        assert_eq!(
+            prefixes,
+            ["wats:", "hook:"],
+            "the gateway starts only with hook:"
+        );
+        assert_eq!(session_prefixes(&["x:".into()], true), ["x:", "wats:"]);
         let mine = json!({"id": "main", "workspace": "~/w"});
         let old = json!({"id": "wats", "name": "old"});
         let patch = config_patch(DEFAULT_AGENT, &ids, &prefixes, &[mine.clone(), old]);
@@ -988,6 +1052,26 @@ mod tests {
         assert_eq!(list.len(), 2, "{list:?}");
         assert_eq!(list[0], mine, "the user's agents stay");
         assert_eq!(list[1]["id"], "wats");
+        assert_eq!(list[1]["default"], false);
+        // No list yet: `main` first and default, so the channels stay its.
+        let fresh = config_patch(DEFAULT_AGENT, &ids, &prefixes, &[]);
+        assert_eq!(
+            fresh["agents"]["list"][0],
+            json!({"id": "main", "default": true})
+        );
+        assert_eq!(fresh["agents"]["list"][1]["id"], "wats");
+        assert!(block_has_main_default());
+        assert_eq!(sandbox_note(SANDBOX_IMAGE, Some(true)), None);
+        assert!(
+            sandbox_note(SANDBOX_IMAGE, Some(false))
+                .unwrap()
+                .contains("sandbox-setup.sh")
+        );
+        assert!(
+            sandbox_note(SANDBOX_IMAGE, None)
+                .unwrap()
+                .contains("Docker")
+        );
         assert!(parse_agents_list("").unwrap().is_empty());
         assert_eq!(parse_agents_list("[{\"id\": \"main\"}]").unwrap().len(), 1);
         assert!(parse_agents_list("[main]").is_err(), "never replaced blind");
@@ -995,7 +1079,7 @@ mod tests {
         assert_eq!(patch["hooks"]["allowedAgentIds"], json!(["main", "wats"]));
         assert_eq!(
             patch["hooks"]["allowedSessionKeyPrefixes"],
-            json!(["wats:"])
+            json!(["wats:", "hook:"])
         );
         assert_eq!(patch["hooks"]["allowRequestSessionKey"], true);
         let tools = &patch["agents"]["list"][1]["tools"];

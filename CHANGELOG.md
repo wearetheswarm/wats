@@ -2,6 +2,24 @@
 
 ## Unreleased
 
+### Fixes
+
+- **`wats setup openclaw --agent` broke the gateway and the channels**
+  (found on Vincent's Mac, OpenClaw 2026.6.35):
+  - `hooks.allowedSessionKeyPrefixes` gets `"hook:"` too, unless
+    `hooks.defaultSessionKey` is set: the gateway refused to start
+    without it, and `openclaw config validate` does not check it.
+    Checked against a real gateway, in a throwaway config: it starts with
+    the patch, and fails without `"hook:"`.
+  - With no `agents.list` yet, setup writes `main` first, as the default,
+    and its own agent with `default: false`: the `wats` agent had become
+    the default, and Telegram went to it.
+  - Setup checks the sandbox image of the `wats` agent (`docker image
+    inspect`) and says how to build it when it is missing: every hook to
+    the agent failed with "Sandbox image not found".
+  - After `--apply`, setup says to restart the gateway and check it with
+    `openclaw gateway status`.
+
 ### Docs
 
 - `wats setup vibe|copilot|antigravity --agent --help` and docs/cli.md

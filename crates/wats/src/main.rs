@@ -1650,10 +1650,12 @@ fn apply_openclaw_config(
         }
     };
     let agent_ids = oc::merge_list(&list("hooks.allowedAgentIds"), &[agent_id]);
-    let prefixes = oc::merge_list(
-        &list("hooks.allowedSessionKeyPrefixes"),
-        &[oc::SESSION_PREFIX],
-    );
+    let default_key_set = run_openclaw(openclaw, &["config", "get", "hooks.defaultSessionKey"])
+        .is_ok_and(|o| {
+            let value = String::from_utf8_lossy(&o.stdout);
+            o.status.success() && !matches!(value.trim(), "" | "undefined" | "null")
+        });
+    let prefixes = oc::session_prefixes(&list("hooks.allowedSessionKeyPrefixes"), default_key_set);
     // `patch` replaces the list: the user's agents go back in. Unset is
     // empty; anything else unreadable stops here, before any write.
     let agents = match run_openclaw(openclaw, &["config", "get", "agents.list"]) {
@@ -1692,7 +1694,38 @@ fn apply_openclaw_config(
         openclaw_ok(&output, "config validate")
     })();
     let Err(error) = applied else {
-        println!("OpenClaw's config: applied, and `openclaw config validate` passes");
+        println!(
+            "OpenClaw's config: applied, and `openclaw config validate` passes. Restart the \
+             gateway (`openclaw gateway restart`), then check that it runs: `openclaw gateway \
+             status`"
+        );
+        if agent_id == oc::DEFAULT_AGENT {
+            let image = run_openclaw(
+                openclaw,
+                &["config", "get", "agents.defaults.sandbox.docker.image"],
+            )
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| {
+                String::from_utf8_lossy(&o.stdout)
+                    .trim()
+                    .trim_matches('"')
+                    .to_string()
+            })
+            .filter(|i| !i.is_empty() && i != "undefined" && i != "null")
+            .unwrap_or_else(|| oc::SANDBOX_IMAGE.to_string());
+            let present = std::process::Command::new("docker")
+                .args(["image", "inspect", "--format", "{{.Id}}", &image])
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .ok()
+                .map(|s| s.success());
+            if let Some(note) = oc::sandbox_note(&image, present) {
+                eprintln!("warning: {note}");
+            }
+        }
         return Ok(());
     };
     let error = anyhow::anyhow!("{}", format!("{error:#}").replace(hooks_token, "<token>"));

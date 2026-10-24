@@ -198,6 +198,15 @@ writes `openclaw.json` itself):
       `"wats:"` and the `wats` agent to what is there (your `"main"` and
       your other agents stay; an older `wats` entry is replaced). A list it
       cannot read stops setup before any write.
+      - **`"hook:"` too**, unless `hooks.defaultSessionKey` is set
+        (`openclaw config get hooks.defaultSessionKey`): without it the
+        gateway refuses to start ("hooks.allowedSessionKeyPrefixes must
+        include 'hook:' when hooks.defaultSessionKey is unset"), which
+        `openclaw config validate` does not catch (fixed in 0.4.14).
+      - **No `agents.list` yet:** wats writes `{ id: "main", default: true }`
+        first, and its own agent with `default: false`. Otherwise the
+        `wats` agent becomes the default one, and your channels (Telegram…)
+        go to it (fixed in 0.4.14).
    3. The hook token: the patch sets `token: "${WATS_OPENCLAW_HOOKS_TOKEN}"`,
       the environment template of the manual block, so the token is never
       in `openclaw.json`. OpenClaw refuses a SecretRef there (2026.6.35:
@@ -212,6 +221,12 @@ writes `openclaw.json` itself):
       OpenClaw on your machine, in a throwaway config, after an upgrade.
    5. If any of these fails, wats copies the backup back over the file,
       says so, and exits non-zero (`config.toml` is not changed).
+   6. The `wats` agent runs sandboxed (`sandbox.mode: "all"`), in OpenClaw's
+      sandbox image (`agents.defaults.sandbox.docker.image`, else
+      `openclaw-sandbox:bookworm-slim`). Setup checks it with `docker
+      image inspect` and warns when it is missing, or when Docker cannot be
+      asked: build it with OpenClaw's `scripts/sandbox-setup.sh`, or every
+      hook to the agent fails with "Sandbox image not found".
 
    Then put the printed `export WATS_OPENCLAW_HOOKS_TOKEN=<token>` line in
    the gateway's environment and restart the gateway. For a gateway run as
@@ -232,11 +247,15 @@ writes `openclaw.json` itself):
      path: "/hooks",
      allowedAgentIds: ["wats"],
      allowRequestSessionKey: true,
-     allowedSessionKeyPrefixes: ["wats:"],
+     // "hook:" too unless hooks.defaultSessionKey is set: the gateway does not
+     // start without it.
+     allowedSessionKeyPrefixes: ["wats:", "hook:"],
    },
-   // Add this entry to agents.list if you have one.
-   agents: { list: [ {
+   // Add this entry to agents.list if you have one. Without a list, keep
+   // `main` first and default, or the wats agent takes your channels.
+   agents: { list: [ { id: "main", default: true }, {
      id: "wats",
+     default: false,
      name: "wats (swarm)",
      workspace: "~/.openclaw/workspace-wats",
      sandbox: { mode: "all", scope: "agent" },
