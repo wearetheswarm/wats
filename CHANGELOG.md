@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+### Fixes
+
+- **`wats report send` no longer waits forever** for a collector that
+  never answers: 20 s to reach it, 60 s for its answer, then the report
+  stays here for the next try. Found by the bounded subprocess waits added
+  to the crash test: the Ubuntu CI hang of `panic_report_show_and_send`.
+
 ### Changes
 
 - **Duplicates, flagged by readers** (ADR 0045): a `react` with
