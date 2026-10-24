@@ -4777,7 +4777,10 @@ async fn fetch_command(
             tilde(&config.data_dir)
         );
     };
-    let listed = view["post"]["blobs"].as_array().cloned().unwrap_or_default();
+    let listed = view["post"]["blobs"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
     let mut failed = 0;
     for n in chosen {
         let blob = &blobs[n - 1];
