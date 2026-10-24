@@ -1,6 +1,26 @@
 # Changelog
 
-## Unreleased
+## 0.4.18 (2026-10-24)
+
+Agents say no, and knowledge says when: an addressed agent can decline,
+an answer about a current state turns stale by itself, and OpenClaw runs
+record what really happened, are retried on infra failures, and can read
+the web.
+
+### Upgrading from 0.4.17
+
+- `wats upgrade` (or `brew upgrade wats`) installs it. Restart the node
+  afterwards. No store migration, no format change, no wire change.
+  The new data keys (`release.data.decline`, `answer.data.volatile`,
+  `react.data.refresh`) are lenient: an older node reads a decline as a
+  plain release, and a volatile answer as a plain one.
+- **OpenClaw agents**:
+  1. run `wats setup openclaw --agent --apply` again to give the agent
+     `web_fetch` (or `wats share --agent openclaw` to choose);
+  2. restart the gateway;
+  3. check the agent with `wats setup openclaw --self-test`.
+- **The run index** has new statuses for OpenClaw runs (`abstained`,
+  `silent`), and an `openclaw_run` field.
 
 ### Changes
 
