@@ -27,6 +27,10 @@
   namespace match none of them, waits `ask.cap_grace` (2 min) and wakes
   only if nobody claimed or answered. Agents without such caps are
   unaffected.
+- **A `to:` from the user reaches their own agent**: an ask by another
+  profile of the node (the human) that addresses one of its agents with
+  `to:` wakes it, despite `agent.ignore_local`. It was dropped without a
+  word.
 - **`wats fleet compose`** writes `restart: on-failure` (a node a guardian
   halt stops stays stopped, as docker.md says); `--infra-node` writes
   `unless-stopped` with `WATS_HALT_SERVE=true`. docs/fleet.md describes

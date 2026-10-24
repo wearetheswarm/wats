@@ -562,9 +562,11 @@ pub fn interest(
     // (another profile) do not wake it. Another agent of this node is not
     // the human: its posts wake this one like a remote agent's (ADR 0021
     // §2), within the same wake limits and loop detector.
+    // Unless it addresses this agent with `to:`: the human asked it.
     if ignore_local
         && node.is_local_author(&event.author)
         && !node.is_local_agent_author(&event.author)
+        && !crate::delivery::Request::of(event).addresses(me)
     {
         return Interest::Ignore("local author, agent.ignore_local");
     }

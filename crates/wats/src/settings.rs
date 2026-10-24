@@ -1091,7 +1091,8 @@ pub const KEYS: &[Key] = &[
         "agent.ignore_local",
         ValueType::Bool,
         "true",
-        "do not wake on posts by other profiles of this node (false: solo tests)",
+        "do not wake on posts by other profiles of this node, unless one addresses the \
+         agent with to: (false: solo tests)",
     ),
     key(
         "agent.profile",

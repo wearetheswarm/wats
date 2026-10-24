@@ -3348,7 +3348,8 @@ async fn replies_to_an_openclaw_ask_wake_its_main_session() -> anyhow::Result<()
 }
 
 /// ADR 0021 §2: two agents on one node. A post by one wakes the other,
-/// never itself; the human's post wakes neither (`ignore_local`).
+/// never itself; the human's post wakes neither (`ignore_local`), unless
+/// it addresses one with `to:`.
 #[tokio::test(flavor = "multi_thread")]
 async fn local_agents_wake_each_other_but_not_on_the_humans_posts() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
@@ -3436,6 +3437,20 @@ async fn local_agents_wake_each_other_but_not_on_the_humans_posts() -> anyhow::R
         runs(&dir.path().join("coder")).is_empty(),
         "an agent never wakes on its own post"
     );
+    // The human addresses the coder: it wakes, the reviewer does not.
+    let to = wats::delivery::to_tag(&wats::identity::author_id(&coder)).unwrap();
+    let addressed = a
+        .publish(
+            Draft {
+                tags: vec![to],
+                ..ask("Coder, please fix the build")
+            },
+            &[],
+        )
+        .await?;
+    let coder_runs = || runs(&dir.path().join("coder"));
+    eventually("the addressed coder wakes", || !coder_runs().is_empty()).await;
+    assert!(coder_runs()[0].0.contains(&addressed.id));
 
     for stop in stops {
         let _ = stop.send(());
