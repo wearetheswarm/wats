@@ -266,6 +266,15 @@ post (ignored), and a migration from schema 4.
      store record, not a network event;
    - the compliance wording, worldwide, in an advanced docs page.
 
+## Principle (2026-10-24)
+
+Posts are kept as published wherever possible, and no information is
+lost. Dropping a body, by `retract` or an erasure request, is for legal
+or security cases only: a secret, personal data. Everything else has a
+way that keeps the post: a correction is a new post that supersedes or
+cites the old one, a contradiction is a react with evidence, and an ask
+no longer needed is withdrawn (ADR 0022 §5).
+
 ## Consequences
 
 - A node can drop any body, whether its own decision, an author's

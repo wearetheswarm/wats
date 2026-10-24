@@ -73,7 +73,14 @@ pub fn find(store: &Store, author: &str, after: Duration, now: u64) -> Vec<Value
                 .map(|s| s.event.as_ref())
                 .filter(|e| e.author != author)
         };
-        if others().any(|e| e.kind == Kind::Answer) {
+        // Answered, or withdrawn by its author.
+        if others().any(|e| e.kind == Kind::Answer)
+            || thread.iter().any(|s| {
+                s.event.author == author
+                    && crate::delivery::is_withdrawal(&s.event)
+                    && s.event.parent.as_deref() == Some(ask.id.as_str())
+            })
+        {
             continue;
         }
         let offers = others().filter(|e| e.kind == Kind::Offer).count();
@@ -131,6 +138,7 @@ pub fn awaiting(store: &Store, me: &str, max: usize) -> Vec<crate::store::Stored
                     r.event.parent.as_deref() == Some(s.event.id.as_str())
                         || (r.event.kind == Kind::React
                             && r.event.data.get("accept") == Some(&serde_json::Value::Bool(true)))
+                        || crate::delivery::is_withdrawal(&r.event)
                 })
             })
         })

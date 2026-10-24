@@ -262,6 +262,44 @@ pub enum Verdict {
     },
 }
 
+/// An asker's withdrawal of its own ask (0.4.12, ADR 0022 amended): a
+/// `release` replying to the ask, by the asker's key group, with
+/// `data.withdraw` true. It closes the ask for everyone, like an accept,
+/// and deletes nothing. Said "withdrawn" to people: "release" stays the
+/// wire kind, with no format change.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Withdrawal {
+    /// The withdrawal's id.
+    pub id: String,
+    /// `data.reason` (e.g. "duplicate", "no longer needed").
+    pub reason: Option<String>,
+    /// Its `refs`: where the ask is answered, for readers.
+    pub refs: Vec<String>,
+}
+
+impl Withdrawal {
+    /// `withdrawn (duplicate; see 3f16ab12…)`.
+    pub fn label(&self) -> String {
+        let mut parts = Vec::new();
+        if let Some(reason) = &self.reason {
+            parts.push(reason.clone());
+        }
+        if let Some(first) = self.refs.first() {
+            parts.push(format!("see {}…", short(first)));
+        }
+        match parts.is_empty() {
+            true => "withdrawn".to_string(),
+            false => format!("withdrawn ({})", parts.join("; ")),
+        }
+    }
+}
+
+/// Whether `e` withdraws the post it replies to: a `release` with
+/// `data.withdraw` true.
+pub fn is_withdrawal(e: &Event) -> bool {
+    e.kind == Kind::Release && e.data.get("withdraw").and_then(Value::as_bool) == Some(true)
+}
+
 /// The state of an ask, from its thread.
 #[derive(Debug, Clone)]
 pub struct State {
@@ -271,6 +309,8 @@ pub struct State {
     pub cap: Option<usize>,
     /// Its asker accepted an answer.
     pub accepted: bool,
+    /// Its asker withdrew it ([`Withdrawal`]).
+    pub withdrawn: Option<Withdrawal>,
     /// Live claims, oldest first (`ts`, then id).
     pub claims: Vec<Claim>,
     /// The claims that hold a slot of `one` or `n`, by the tie-break:
@@ -313,6 +353,21 @@ impl State {
             .filter(|e| e.kind == Kind::React && by_asker(e))
             .filter_map(|e| Some((*e, e.data.get("accept")?.as_bool()?)))
             .collect();
+        let withdrawn = events
+            .iter()
+            .rev()
+            .find(|e| {
+                by_asker(e) && is_withdrawal(e) && e.parent.as_deref() == Some(ask.id.as_str())
+            })
+            .map(|e| Withdrawal {
+                id: e.id.clone(),
+                reason: e
+                    .data
+                    .get("reason")
+                    .and_then(Value::as_str)
+                    .map(|r| r.chars().take(120).collect()),
+                refs: e.refs.clone(),
+            });
         let accepted = accepts.iter().rposition(|(_, yes)| *yes).is_some_and(|i| {
             let parent = &accepts[i].0.parent;
             !accepts[i + 1..]
@@ -404,6 +459,7 @@ impl State {
             cap: request.cap(default_max),
             request,
             accepted,
+            withdrawn,
             claims,
             winners,
             responders,
@@ -443,6 +499,9 @@ impl State {
         let skip = |why: String, until: Option<u64>| Verdict::Skip { why, until };
         if self.accepted {
             return skip("its asker accepted an answer".into(), None);
+        }
+        if let Some(w) = &self.withdrawn {
+            return skip(format!("its asker {} it", w.label()), None);
         }
         if self.claim_of(me).is_some() {
             return match self.lost(me) {
@@ -563,6 +622,10 @@ impl State {
         }
         if self.accepted {
             view["accepted"] = json!(true);
+        }
+        if let Some(w) = &self.withdrawn {
+            view["withdrawn"] =
+                json!({"id": w.id, "reason": w.reason, "refs": w.refs, "label": w.label()});
         }
         match self.verdict(me) {
             Verdict::Wake(expect) => view["expected"] = json!(expect.label()),

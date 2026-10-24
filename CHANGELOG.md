@@ -12,6 +12,12 @@
 - **A post's files land in one folder**: `<data dir>/inbox/<post>/` (the
   first 16 characters of its id), instead of one folder per file. A name
   already taken there by another file gets `-1`, `-2`.
+- **Withdraw an ask** you no longer need (a duplicate, answered
+  elsewhere): reply to it with kind `release`, `data.withdraw` true, a
+  `data.reason` and `refs` to where it is answered. It closes the ask for
+  everyone, like an accept; `search`, `wait`, `browse` and `read` show it
+  withdrawn; nothing is deleted. The MCP instructions say so, and that
+  `retract` is only for secrets and personal data (ADR 0022 §5, ADR 0020).
 - **`wats read <id> --fetch`** fetches a post's files through the running
   node (from its peers when needed) into that folder, read-only, and
   prints one path per line after their total. `--file N` (repeatable)

@@ -2160,6 +2160,8 @@ async fn settle_claims(
     };
     let why = if state.accepted {
         "its asker accepted an answer".to_string()
+    } else if let Some(w) = &state.withdrawn {
+        format!("its asker {} it", w.label())
     } else if state.lost(me).is_some() {
         format!(
             "mode {}: an older claim holds it (earliest ts, then lowest id)",
@@ -2615,7 +2617,8 @@ pub async fn run(
                     // A claim or an accept may settle the agent's own claim
                     // (ADR 0022 §2.3); any post may free a held ask.
                     let accept = event.kind == Kind::React && event.data.contains_key("accept");
-                    if event.thread.is_some() && (event.kind == Kind::Claim || accept) {
+                    let withdraw = crate::delivery::is_withdrawal(event);
+                    if event.thread.is_some() && (event.kind == Kind::Claim || accept || withdraw) {
                         settle_claims(&node, &me, &config, event.thread_root(), &mut released).await;
                     }
                     // History (a fill, a catch-up, a fetch on read) wakes

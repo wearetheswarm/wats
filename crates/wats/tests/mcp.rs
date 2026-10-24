@@ -2250,3 +2250,83 @@ fn browse_lists_knowledge_entries() -> anyhow::Result<()> {
         Ok(())
     })
 }
+
+/// Withdrawing an ask (0.4.12): its asker replies with kind release and
+/// data.withdraw, a reason and a ref. The ask leaves the asker's
+/// unanswered list, `search` shows it withdrawn, `read` shows the
+/// withdrawal in its delivery, and agents are told to abstain. Nothing is
+/// deleted: the ask reads in full.
+#[test]
+fn an_asker_withdraws_its_ask_and_nothing_is_lost() -> anyhow::Result<()> {
+    run(async move {
+        let dir = tempfile::tempdir()?;
+        let node = loopback_node(&dir.path().join("n"), None).await?;
+        let asker = client_for(WatsMcp::new(node.clone(), vec![])).await?;
+        let helper = client_for(WatsMcp::new(node.clone(), vec![]).with_profile("helper")?).await?;
+        let past = wats::node::now_secs() - 1;
+        let original = structured(
+            &call(
+                &asker,
+                "post",
+                json!({"title": "Parse CSV in Rust", "text": "Which crate?", "kind": "ask"}),
+            )
+            .await,
+        );
+        let ask = structured(
+            &call(
+                &asker,
+                "post",
+                json!({"title": "Parse CSV in Rust, again", "text": "Which crate?", "kind": "ask",
+                       "data": {"deadline": past}}),
+            )
+            .await,
+        );
+        let ask_id = ask["id"].as_str().unwrap();
+        let listed = structured(&call(&asker, "search", json!({})).await);
+        assert_eq!(listed["unanswered"][0]["id"], ask_id, "{listed}");
+
+        // Only the asker's own release withdraws it.
+        structured(
+            &call(
+                &helper,
+                "reply",
+                json!({"post_id": ask_id, "text": "Not mine to withdraw.",
+                   "kind": "release", "data": {"withdraw": true}}),
+            )
+            .await,
+        );
+        let read = structured(&call(&helper, "read", json!({"id": ask_id})).await);
+        assert!(read["delivery"].get("withdrawn").is_none(), "{read}");
+
+        structured(
+            &call(
+                &asker,
+                "reply",
+                json!({"post_id": ask_id, "text": "Asked twice.",
+                   "kind": "release", "refs": [original["id"]],
+                   "data": {"withdraw": true, "reason": "duplicate"}}),
+            )
+            .await,
+        );
+        let after = structured(&call(&asker, "search", json!({})).await);
+        assert!(after.get("unanswered").is_none(), "{after}");
+        let line = after["posts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["id"] == ask_id)
+            .expect("still found")
+            .clone();
+        let label = line["withdrawn"].as_str().unwrap();
+        assert!(label.starts_with("withdrawn (duplicate; see "), "{line}");
+        let read = structured(&call(&helper, "read", json!({"id": ask_id})).await);
+        assert_eq!(read["post"]["text"], "Which crate?", "nothing is deleted");
+        assert_eq!(
+            read["delivery"]["withdrawn"]["reason"], "duplicate",
+            "{read}"
+        );
+        assert_eq!(read["delivery"]["expected"], "abstain", "{read}");
+        node.shutdown().await?;
+        Ok(())
+    })
+}

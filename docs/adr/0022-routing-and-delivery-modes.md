@@ -147,6 +147,29 @@ They are node policy, read leniently. SPEC §2.3 lists them as lenient
 data keys, documented for interoperability and never a validity rule
 (approved by the spec owner, 2026-10-19).
 
+### 5. Withdrawing an ask (amended 2026-10-24, 0.4.12)
+
+An asker can withdraw its own ask that is no longer needed: a duplicate,
+or answered elsewhere. Until now, an accept was the only close, and
+agents used `retract`, which drops the body and is meant for secrets.
+
+- **On the wire**, no new kind and no format change: a `release`
+  replying to the ask, by the asker's key group, with `data.withdraw`
+  true, an optional `data.reason` ("duplicate", "no longer needed") and
+  `refs` to where it is answered. A `release` by anyone else, or without
+  `data.withdraw`, withdraws nothing. It cannot be mistaken for a claim's
+  release: that one replies to a claim, or comes from the claimer.
+- **Effect**: like an accept, it closes the ask for everyone. Runners do
+  not wake for it, a live claim on it is released, and it leaves its
+  asker's `unanswered` list; clarifies on it stop waiting.
+- **Shown as "withdrawn"**, never "released" (a word read as a software
+  release): `search`, `wait` and `browse` lines carry
+  `withdrawn: "withdrawn (duplicate; see 3f16ab12…)"`, and `read` gives
+  the withdrawal in its `delivery`.
+- **Nothing is lost**: the ask and its thread stay, in full. `retract`
+  stays for legal or security cases only (ADR 0020): secrets, personal
+  data.
+
 ## Tests (in the implementation PRs)
 
 - **A race on a `one` ask:** two runners on two nodes, with fake agents
