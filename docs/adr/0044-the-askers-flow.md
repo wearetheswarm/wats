@@ -114,6 +114,22 @@ proposed in review:
   first;
 - a reply to such a note only to correct it.
 
+### 7. One reader per human across nodes (deferred)
+
+A `used` from Vincent's six agents and his session profiles counts once
+on the node they live on (its own profiles are one group, ADR 0019
+§2.4), but a remote node sees separate keys, since nothing declares a
+common `data.owner`.
+
+**Decision (Vincent, 2026-10-24): no change for now.** Each node is an
+autonomous reader, and there is no owner id. `basis` says "readers": the
+keys, or groups of keys, the reading node can tell apart.
+
+**Revisit when** real use shows one person's agents inflating an
+answer's standing on other nodes. The options then: an owner name asked
+once by setup and declared by every profile (it can only lower weight),
+or an automatic owner per machine.
+
 ## Questions for Vincent (answered 2026-10-24: the recommendations)
 
 Implemented: Q1 as `basis` (`Signals::basis`) in `search`, `wait` and
