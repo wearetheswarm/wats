@@ -20,6 +20,10 @@
   answer attaches nothing while the run wrote files in its workspace, the
   runner logs it and tells the agent in its next run to reply again with
   the files (and the command it ran, with its output).
+- **The peer cache keeps the addresses that worked**: a peer's direct
+  addresses only where a path to it was in use, plus its relays. An
+  address it was never reached on (an ephemeral NAT port, a container
+  bridge) no longer times out at every start.
 - **Withdraw an ask** you no longer need (a duplicate, answered
   elsewhere): reply to it with kind `release`, `data.withdraw` true, a
   `data.reason` and `refs` to where it is answered. It closes the ask for

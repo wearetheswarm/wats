@@ -5182,7 +5182,24 @@ impl Node {
             let Some(info) = self.endpoint().remote_info(id).await else {
                 continue;
             };
-            let addr = EndpointAddr::from_parts(id, info.into_addrs().map(TransportAddr::from));
+            // Direct addresses only where a path to the peer is in use: one
+            // it was never reached on (an ephemeral NAT port, a bridge
+            // address) times out at every start (0.4.12). Relays always.
+            // Nothing left (no path in use, no relay: loopback): all of them.
+            let all: Vec<_> = info.into_addrs().collect();
+            let kept: Vec<TransportAddr> = all
+                .iter()
+                .filter(|a| {
+                    !matches!(a.addr(), TransportAddr::Ip(_))
+                        || matches!(a.usage(), iroh::endpoint::TransportAddrUsage::Active)
+                })
+                .map(|a| a.addr().clone())
+                .collect();
+            let addrs = match kept.is_empty() {
+                true => all.iter().map(|a| a.addr().clone()).collect(),
+                false => kept,
+            };
+            let addr = EndpointAddr::from_parts(id, addrs);
             let seen = last_seen.get(&id).copied().unwrap_or_else(now_secs);
             fresh.push(crate::peer_cache::CachedPeer::from_addr(&addr, seen));
         }
