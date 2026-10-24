@@ -234,9 +234,10 @@ differences:
   `--add-dir`, `--trust` or tool allowlist is ever set, and they are
   refused in `agent.args`.
 
-This rests on Vibe's behaviour, not on a sandbox. The check on a real
-Vibe (read `/etc/hosts`, write `../outside.txt`, read a file in the
-workspace: only the last may succeed) is to be done before a release.
+This rests on Vibe's behaviour, not on a sandbox. It was checked on a real
+Vibe before 0.4.13 (2026-10-24): reads of `/etc/hosts` and writes to
+`../outside.txt` and `/tmp` were denied, and a file in the workspace was
+read.
 
 ### What is enforced, and what is not
 
