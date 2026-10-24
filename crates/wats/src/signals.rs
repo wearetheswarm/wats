@@ -253,6 +253,12 @@ pub struct Signals {
     /// decayed past [`STALE_CUT`]: what promotes a post to a knowledge
     /// entry ([`crate::knowledge`], ADR 0019 §5.2).
     pub backers: Vec<Backer>,
+    /// A volatile answer's as-of date (unix seconds, ADR 0049): its `ts`,
+    /// or its latest refresh. `None` for any other post.
+    pub as_of: Option<u64>,
+    /// When a volatile answer turns stale (unix seconds): `as_of` plus
+    /// its TTL.
+    pub expires: Option<u64>,
 }
 
 /// One group of keys behind a post (see [`Signals::backers`]).
@@ -308,6 +314,9 @@ impl Signals {
         }
         if let Some(secs) = self.last_confirmed_secs {
             line.push_str(&format!(", last confirmed {}", ago(secs)));
+        }
+        if let Some(as_of) = self.as_of {
+            line.push_str(&format!(", valid as of {}", day(as_of)));
         }
         Some(line)
     }
@@ -439,6 +448,8 @@ pub struct PostRef {
     /// It says what it holds for (`data.valid_for`, ADR 0045 §5): its
     /// votes keep a floor while nobody marks it outdated.
     pub valid_for: bool,
+    /// A volatile answer (ADR 0049): its `ts` and its TTL in seconds.
+    pub volatile: Option<(u64, u64)>,
 }
 
 impl PostRef {
@@ -450,8 +461,45 @@ impl PostRef {
             thread: event.thread.clone(),
             root_ask: event.thread.is_none() && event.kind == crate::event::Kind::Ask,
             valid_for: valid_for(&event.data).is_some(),
+            volatile: (event.kind == crate::event::Kind::Answer)
+                .then(|| volatile_ttl(&event.data))
+                .flatten()
+                .map(|ttl| (event.ts, ttl)),
         }
     }
+}
+
+/// The TTL of a volatile answer, in days, when `data.ttl_days` is absent
+/// or invalid (ADR 0049 §1).
+pub const VOLATILE_TTL_DAYS: u64 = 14;
+/// The longest `data.ttl_days` read.
+pub const MAX_TTL_DAYS: u64 = 365;
+
+/// A volatile answer's TTL in seconds (`data.volatile` true, ADR 0049):
+/// `data.ttl_days` kept within 1 to [`MAX_TTL_DAYS`], or
+/// [`VOLATILE_TTL_DAYS`]. `None` when it is not volatile.
+pub fn volatile_ttl(data: &Map<String, Value>) -> Option<u64> {
+    if data.get("volatile").and_then(Value::as_bool) != Some(true) {
+        return None;
+    }
+    let days = data
+        .get("ttl_days")
+        .and_then(|v| {
+            v.as_u64().or_else(|| {
+                v.as_f64()
+                    .filter(|f| f.is_finite() && *f >= 1.0)
+                    .map(|f| f as u64)
+            })
+        })
+        .filter(|d| *d >= 1)
+        .map_or(VOLATILE_TTL_DAYS, |d| d.min(MAX_TTL_DAYS));
+    Some(days * crate::reputation::DAY)
+}
+
+/// A date for people: `2026-10-24` (UTC).
+pub fn day(ts: u64) -> String {
+    let (y, m, d, ..) = crate::runs::civil(ts);
+    format!("{y:04}-{m:02}-{d:02}")
 }
 
 /// `data.valid_for` (ADR 0045 §5): a short non-empty string.
@@ -615,6 +663,7 @@ fn has_evidence(data: &Map<String, Value>) -> bool {
 /// leave it unchanged.
 fn takes_position(data: &Map<String, Value>) -> bool {
     data.get("value").and_then(Value::as_i64).is_some()
+        || data.get("refresh") == Some(&Value::Bool(true))
         || data.get("used").is_some_and(Value::is_boolean)
         || data.get("still_valid") == Some(&Value::Bool(true))
 }
@@ -665,7 +714,16 @@ impl<'r> Stance<'r> {
     }
 
     fn confirms(&self) -> bool {
-        self.value() == Some(1) && self.evidence()
+        (self.value() == Some(1) || self.refreshes()) && self.evidence()
+    }
+
+    /// A refresh of a volatile answer (ADR 0049 §4): `data.refresh` true
+    /// with evidence.
+    fn refreshes(&self) -> bool {
+        self.evidence()
+            && self
+                .react
+                .is_some_and(|r| r.data.get("refresh") == Some(&Value::Bool(true)))
     }
 
     /// A −1 with a reason (ADR 0045 §2): evidence, or a comment of some
@@ -953,7 +1011,8 @@ pub fn evaluate(
         d.get("citation_needed") == Some(&Value::Bool(true))
     })
     .len() as u64;
-    let floor = if post.valid_for && s.outdated < OUTDATED_AT {
+    // A volatile answer keeps no floor (ADR 0049 §2).
+    let floor = if post.valid_for && post.volatile.is_none() && s.outdated < OUTDATED_AT {
         EVERGREEN_FLOOR
     } else {
         0.0
@@ -1062,12 +1121,49 @@ pub fn evaluate(
         }
     });
     s.last_confirmed_secs = latest.map(age);
+    // A volatile answer's as-of date: its own, or its latest refresh by
+    // its author or a group that weighs (ADR 0049 §4).
+    let mut expired = None;
+    if let Some((ts, ttl)) = post.volatile {
+        // The author's own reacts take no position: read from the rows.
+        let by_author = mine
+            .iter()
+            .filter(|r| {
+                r.kind == "react"
+                    && r.reply
+                    && grouping.same_hard(net, &post.author, &r.author)
+                    && r.data.get("refresh") == Some(&Value::Bool(true))
+                    && has_evidence(&r.data)
+            })
+            .map(|r| r.ts);
+        let as_of = groups
+            .iter()
+            .flat_map(|g| &g.members)
+            .filter(|m| m.refreshes() && m.weight(grouping, net) > 0.0)
+            .filter_map(|m| m.react.map(|r| r.ts))
+            .chain(by_author)
+            .fold(ts, u64::max);
+        let expires = as_of.saturating_add(ttl);
+        s.as_of = Some(as_of);
+        s.expires = Some(expires);
+        if now >= expires {
+            expired = Some(format!(
+                "volatile: valid as of {}, older than its {} days",
+                day(as_of),
+                ttl / crate::reputation::DAY
+            ));
+        }
+    }
     if !dispute.standing.is_empty() || !dispute.undecided.is_empty() {
         s.status = Status::Contested;
         s.why = Some(why(&dispute));
     } else if s.outdated >= OUTDATED_AT {
         s.status = Status::Stale;
         s.why = Some(format!("marked outdated by {} readers", s.outdated));
+    } else if let Some(why) = expired {
+        // Past its TTL, whatever its votes and confirmations (ADR 0049 §2).
+        s.status = Status::Stale;
+        s.why = Some(why);
     } else if fresh {
         s.status = Status::Confirmed;
         s.why = rebutted;
@@ -1164,6 +1260,7 @@ fn dispute(post: &PostRef, rows: &Rows, grouping: &Grouping, missing: &mut Vec<S
                 thread: None,
                 root_ask: false,
                 valid_for: false,
+                volatile: None,
             };
             for g in positions(theirs, &attacked, grouping) {
                 let Some((weight, best)) = g.best(grouping, net, Stance::contradicts) else {
@@ -2335,6 +2432,91 @@ pub(crate) mod tests {
 
     /// ADR 0045 §6: the lower bound ranks 40/45 above 2/2, and a
     /// still-valid answer keeps a floor while an outdated one fades.
+    /// ADR 0049: a volatile answer is confirmed within its TTL and stale
+    /// past it, whatever its confirmations; `ttl_days` overrides the
+    /// default; its votes keep no floor; a confirmation does not renew it,
+    /// a refresh does.
+    #[test]
+    fn a_volatile_answer_turns_stale_past_its_ttl() {
+        let mut g = Graph::new();
+        let ask = g.root(1, Kind::Ask, "latest stable Rust?");
+        let answer = g.reply(
+            2,
+            &ask,
+            Kind::Answer,
+            json!({"volatile": true, "valid_for": "stable"}),
+        );
+        let long = g.reply(
+            2,
+            &ask,
+            Kind::Answer,
+            json!({"volatile": true, "ttl_days": 60}),
+        );
+        let as_of = super::day(answer.ts);
+        g.confirm(3, &answer);
+        g.confirm(3, &long);
+        g.reply(4, &answer, Kind::React, json!({"value": 1}));
+        g.later(13 * DAY);
+        let s = g.signals(&answer);
+        assert_eq!(s.status, Status::Confirmed);
+        assert!(
+            s.basis()
+                .unwrap()
+                .ends_with(&format!(", valid as of {as_of}")),
+            "{:?}",
+            s.basis()
+        );
+        assert_eq!(s.expires, Some(answer.ts + 14 * DAY));
+        g.later(2 * DAY);
+        // A confirmation now counts for its as-of date only.
+        g.confirm(5, &answer);
+        let s = g.signals(&answer);
+        assert_eq!(s.status, Status::Stale);
+        assert_eq!(
+            s.why.as_deref(),
+            Some(format!("volatile: valid as of {as_of}, older than its 14 days").as_str())
+        );
+        assert_eq!(g.signals(&long).status, Status::Confirmed);
+        // Its author's refresh moves its as-of date too.
+        let own = g.reply(
+            2,
+            &long,
+            Kind::React,
+            json!({"refresh": true, "evidence": "checked again"}),
+        );
+        assert_eq!(g.signals(&long).as_of, Some(own.ts));
+        // A refresh with evidence moves its as-of date.
+        let refresh = g.reply(
+            6,
+            &answer,
+            Kind::React,
+            json!({"value": 1, "refresh": true, "evidence": "releases.rs, today"}),
+        );
+        let s = g.signals(&answer);
+        assert_eq!(s.status, Status::Confirmed);
+        assert_eq!(s.as_of, Some(refresh.ts));
+        // No floor: after three years its vote is nearly gone.
+        g.later(3 * 365 * DAY);
+        let s = g.signals(&answer);
+        assert_eq!(s.status, Status::Stale);
+        assert!(s.up_weight < 0.05, "{}", s.up_weight);
+        // Lenient TTLs.
+        let ttl = |v: Value| super::volatile_ttl(v.as_object().unwrap());
+        assert_eq!(
+            ttl(json!({"volatile": true, "ttl_days": 0})),
+            Some(14 * DAY)
+        );
+        assert_eq!(
+            ttl(json!({"volatile": true, "ttl_days": 9999})),
+            Some(365 * DAY)
+        );
+        assert_eq!(
+            ttl(json!({"volatile": true, "ttl_days": "x"})),
+            Some(14 * DAY)
+        );
+        assert_eq!(ttl(json!({"ttl_days": 3})), None);
+    }
+
     #[test]
     fn the_lower_bound_ranks_and_valid_for_keeps_a_floor() {
         assert_eq!(wilson(0.0, 0.0), 0.0);
