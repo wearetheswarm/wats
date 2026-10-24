@@ -274,6 +274,9 @@ pub struct Target {
     pub agent: String,
     /// The hook token file.
     pub token_file: PathBuf,
+    /// Where the gateway writes its file log ([`LOG_DIR`]): a hook run's
+    /// outcome, by its `runId` (ADR 0048 §1).
+    pub log_dir: PathBuf,
 }
 
 impl Default for Target {
@@ -282,7 +285,121 @@ impl Default for Target {
             url: DEFAULT_URL.into(),
             agent: DEFAULT_AGENT.into(),
             token_file: PathBuf::new(),
+            log_dir: PathBuf::from(LOG_DIR),
         }
+    }
+}
+
+/// The gateway's file log directory (OpenClaw 2026.6.35):
+/// `openclaw-<date>.log`, one JSON object per line.
+pub const LOG_DIR: &str = "/tmp/openclaw";
+
+/// A hook run's end, as the gateway's log says it (ADR 0048 §1).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HookEnd {
+    /// "hook agent run completed without announcement", or status ok.
+    Completed,
+    /// `status: "error"`, with its summary.
+    Error(String),
+}
+
+/// What one line of the gateway's log says about the hook run `run_id`:
+/// a `gateway/hooks` entry `{"1": {"runId", "status", "summary"}, "2":
+/// message}`; `None` for any other line.
+pub fn hook_end(line: &str, run_id: &str) -> Option<HookEnd> {
+    if !line.contains(run_id) {
+        return None;
+    }
+    let value: Value = serde_json::from_str(line).ok()?;
+    let fields = &value["1"];
+    if fields["runId"].as_str() != Some(run_id) {
+        return None;
+    }
+    let message = value["2"].as_str().unwrap_or_default();
+    match fields["status"].as_str() {
+        Some("error") => {
+            let summary = fields["summary"]
+                .as_str()
+                .or(fields["error"].as_str())
+                .unwrap_or(message);
+            Some(HookEnd::Error(summary.chars().take(200).collect()))
+        }
+        Some("ok") => Some(HookEnd::Completed),
+        _ if message.contains("completed") => Some(HookEnd::Completed),
+        _ => None,
+    }
+}
+
+/// Reads what the gateway's log files gained since it was made.
+pub struct LogWatch {
+    dir: PathBuf,
+    offsets: std::collections::HashMap<PathBuf, u64>,
+}
+
+impl LogWatch {
+    /// Where each `openclaw-*.log` of `dir` stands now: only later lines
+    /// are read.
+    pub fn new(dir: &Path) -> Self {
+        let mut watch = LogWatch {
+            dir: dir.to_path_buf(),
+            offsets: Default::default(),
+        };
+        for path in watch.files() {
+            let len = std::fs::metadata(&path).map_or(0, |m| m.len());
+            watch.offsets.insert(path, len);
+        }
+        watch
+    }
+
+    fn files(&self) -> Vec<PathBuf> {
+        let Ok(entries) = std::fs::read_dir(&self.dir) else {
+            return Vec::new();
+        };
+        entries
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| {
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.starts_with("openclaw-") && n.ends_with(".log"))
+            })
+            .collect()
+    }
+
+    /// The end of the hook run `run_id`, if the lines written since the
+    /// last look say it.
+    pub fn poll(&mut self, run_id: &str) -> Option<HookEnd> {
+        use std::io::{BufRead, Seek};
+        let mut found = None;
+        for path in self.files() {
+            let from = self.offsets.get(&path).copied().unwrap_or(0);
+            let Ok(mut file) = std::fs::File::open(&path) else {
+                continue;
+            };
+            let len = file.metadata().map_or(0, |m| m.len());
+            // Rotated or truncated: read it again from its start.
+            let from = if len < from { 0 } else { from };
+            if file.seek(std::io::SeekFrom::Start(from)).is_err() {
+                continue;
+            }
+            let mut read = from;
+            let mut reader = std::io::BufReader::new(file);
+            let mut line = String::new();
+            loop {
+                line.clear();
+                match reader.read_line(&mut line) {
+                    Ok(0) | Err(_) => break,
+                    // A line still being written waits for the next look.
+                    Ok(_) if !line.ends_with('\n') => break,
+                    Ok(n) => read += n as u64,
+                }
+                if found.is_none() {
+                    found = hook_end(&line, run_id);
+                }
+            }
+            self.offsets.insert(path, read);
+        }
+        found
     }
 }
 
@@ -444,6 +561,18 @@ pub enum Reply {
         /// Sent without a session key (the gateway's session policy).
         isolated: bool,
     },
+    /// Accepted with a `runId` and no completion (OpenClaw 2026.6.35 runs
+    /// the turn in the background): the runner watches for its outcome
+    /// (ADR 0048 §1). `status`: `ok`, `failed`, `abstained` or `silent`.
+    Watched {
+        run_id: String,
+        status: &'static str,
+        detail: Option<String>,
+        isolated: bool,
+    },
+    /// Accepted with this `runId`, no completion yet: what
+    /// [`forward`] returns for the runner to watch.
+    Dispatched { run_id: String, isolated: bool },
     /// The run fails: a bad token, a rate limit, a configuration error.
     Failed {
         error: String,
@@ -574,6 +703,14 @@ pub async fn forward(request: Request, isolated: &AtomicBool) -> Reply {
                     .as_str()
                     .or(value["completion"]["replyDisposition"].as_str())
                     .map(str::to_string);
+                if completion.is_none()
+                    && let Some(run_id) = value["runId"].as_str()
+                {
+                    return Reply::Dispatched {
+                        run_id: run_id.to_string(),
+                        isolated: alone,
+                    };
+                }
                 Reply::Done {
                     completion,
                     disposition,

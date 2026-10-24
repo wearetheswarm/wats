@@ -39,7 +39,9 @@ pub struct RunRecord {
     pub started: u64,
     /// `ok`, `error` (non-zero exit), `timeout`, `stopped` (node shut down)
     /// or `failed` (could not start, or refused by the OpenClaw gateway);
-    /// empty while running.
+    /// for a watched OpenClaw run, also `abstained` (it completed without
+    /// a post) or `silent` (no outcome seen, ADR 0048 §2); empty while
+    /// running.
     #[serde(default)]
     pub status: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -66,6 +68,9 @@ pub struct RunRecord {
     /// Copilot CLI: the AI credits the run spent (ADR 0038).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ai_credits: Option<f64>,
+    /// OpenClaw: the hook run's `runId` (ADR 0048 §1).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub openclaw_run: Option<String>,
 }
 
 fn unix_now() -> u64 {
@@ -359,7 +364,17 @@ pub fn read_result(transcript: &Path, record: &mut RunRecord) {
             record.status = "error".into();
         }
         if value["is_error"] == true {
-            record.error = value["subtype"].as_str().map(str::to_string);
+            // Its subtype, and what it said ("API Error: 529 …"): what
+            // tells an overloaded API from the agent's own failure.
+            let said = value["result"]
+                .as_str()
+                .map(str::trim)
+                .filter(|r| !r.is_empty());
+            record.error = match (value["subtype"].as_str(), said) {
+                (Some(subtype), Some(said)) => Some(format!("{subtype}: {said}")),
+                (subtype, said) => subtype.or(said).map(str::to_string),
+            }
+            .map(|m| m.chars().take(200).collect());
         }
     }
 }

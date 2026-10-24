@@ -7628,6 +7628,7 @@ fn agent_config(
                     .loop_max_exchanges
                     .or(file.loop_max_exchanges)
                     .unwrap_or(default.loop_max_exchanges),
+                retry_after: default.retry_after,
             }
         },
         keep_runs: file.keep_runs.unwrap_or(200),

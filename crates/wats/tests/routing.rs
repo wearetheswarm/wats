@@ -1061,3 +1061,75 @@ async fn an_agent_outside_its_field_waits_the_grace() -> anyhow::Result<()> {
     }
     Ok(())
 }
+
+/// ADR 0048 §3, §4: a run that fails on an overloaded API is tried again,
+/// and declines nothing when the retry works; a run that keeps failing is
+/// final after two retries, and the next heartbeat offers what it missed.
+#[tokio::test(flavor = "multi_thread")]
+async fn infra_failures_are_retried_then_offered_again() -> anyhow::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir()?;
+    let hub = node(&dir.path().join("hub"), &[], |_| {}).await?;
+    let a = node(&dir.path().join("a"), &[&hub], |_| {}).await?;
+    a.wait_for_neighbor(PUBLIC_NET, Duration::from_secs(10))
+        .await?;
+    let ra = dir.path().join("ra");
+    let mut config = agent(&ra, &dir.path().join("a"), &[], Duration::from_millis(200));
+    // Each run keeps its prompt; while `fails` holds a number above 0, it
+    // counts down and fails as an overloaded API does.
+    let fails = ra.join("fails");
+    std::fs::write(&fails, "1")?;
+    std::fs::write(
+        &config.command,
+        format!(
+            "#!/bin/sh\nn=$(ls {out} | grep -c prompt)\ncat > {out}/run-$n.tmp\nmv {out}/run-$n.tmp {out}/run-$n.prompt\nleft=$(cat {fails})\nif [ \"$left\" -gt 0 ]; then echo $((left - 1)) > {fails}; echo '{{\"type\":\"result\",\"subtype\":\"error_during_execution\",\"is_error\":true,\"result\":\"API Error: 529 overloaded\"}}'; exit 1; fi\necho '{{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"num_turns\":1}}'\n",
+            out = ra.join("runs").display(),
+            fails = fails.display(),
+        ),
+    )?;
+    std::fs::set_permissions(&config.command, std::fs::Permissions::from_mode(0o755))?;
+    config.heartbeat = Duration::from_secs(4);
+    let runner = start(&a, config);
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // Addressed to a's agent: the first run fails, the retry works, and
+    // nothing is declined.
+    let to_a = wats::delivery::to_tag(&agent_id(&a)).unwrap();
+    let ask = hub
+        .publish(
+            ask_with("Summarize this", json!({"mode": "one"}), &[to_a]),
+            &[],
+        )
+        .await?;
+    eventually("the retry", 10, || runs_for(&ra, &ask).len() >= 2).await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(runs_for(&ra, &ask).len(), 2, "one retry, then it worked");
+    assert!(
+        in_thread(&a, &ask, Kind::Release).is_empty(),
+        "nothing declined"
+    );
+
+    // It keeps failing: three attempts, then the next heartbeat offers it.
+    std::fs::write(&fails, "3")?;
+    let other = hub
+        .publish(ask_with("Translate this", json!({}), &[]), &[])
+        .await?;
+    eventually("three attempts", 15, || runs_for(&ra, &other).len() >= 3).await;
+    eventually("the heartbeat's offer", 15, || {
+        runs(&ra).iter().any(|(p, _)| {
+            p.contains("An earlier run on these asks failed") && p.contains(&other.id)
+        })
+    })
+    .await;
+    let offers = runs(&ra)
+        .iter()
+        .filter(|(p, _)| p.contains("An earlier run on these asks failed"))
+        .count();
+    assert_eq!(offers, 1, "offered once");
+
+    runner.stop().await?;
+    for n in [a, hub] {
+        n.shutdown().await?;
+    }
+    Ok(())
+}

@@ -17,6 +17,7 @@
 //! Time is unix seconds, given by the caller.
 
 use std::collections::{HashMap, VecDeque};
+use std::time::Duration;
 
 /// The window of the per-author limit.
 const HOUR: u64 = 3600;
@@ -29,13 +30,20 @@ pub struct WakeLimits {
     /// Turns the agent and one other author may take in a row in a thread
     /// before the thread is paused for the agent; 0: no loop detector.
     pub loop_max_exchanges: usize,
+    /// When a run that failed for infra reasons is tried again, attempt
+    /// after attempt (ADR 0048 §3): two retries.
+    pub retry_after: [Duration; 2],
 }
+
+/// [`WakeLimits::retry_after`] by default: 1 minute, then 5.
+pub const RETRY_AFTER: [Duration; 2] = [Duration::from_secs(60), Duration::from_secs(300)];
 
 impl Default for WakeLimits {
     fn default() -> Self {
         WakeLimits {
             per_author_per_hour: 0,
             loop_max_exchanges: 30,
+            retry_after: RETRY_AFTER,
         }
     }
 }
@@ -46,6 +54,7 @@ impl WakeLimits {
         WakeLimits {
             per_author_per_hour: 0,
             loop_max_exchanges: 0,
+            retry_after: [Duration::ZERO; 2],
         }
     }
 
