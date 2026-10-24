@@ -1621,10 +1621,11 @@ async fn a_new_node_takes_an_old_keys_age_from_its_peers() -> anyhow::Result<()>
     Ok(())
 }
 
-/// Anti-entropy (0.4.11): two neighbors, both caught up; an event reaches
-/// one of them outside gossip (as when a broadcast was lost on the way).
-/// The other gets it from its periodic read of its neighbors, with no
-/// restart and no new neighbor.
+/// Two neighbors, both caught up; an event reaches one of them outside
+/// gossip (as when a broadcast was lost on the way). The other gets it
+/// while both stay online, with no restart and no new neighbor: here by
+/// the periodic passes of its history task (its start's range still
+/// covers the event), else by anti-entropy (the next test).
 #[tokio::test(flavor = "multi_thread")]
 async fn anti_entropy_brings_what_gossip_missed() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
@@ -1639,6 +1640,7 @@ async fn anti_entropy_brings_what_gossip_missed() -> anyhow::Result<()> {
         seq(&b, &missed.id).map(|_| ())
     })
     .await;
+    // `status` counts it as late (0.4.12).
     for node in [a, b] {
         node.shutdown().await?;
     }
@@ -1693,6 +1695,20 @@ async fn a_silent_gossip_neighbor_gets_a_fresh_link() -> anyhow::Result<()> {
     })
     .await;
     assert_eq!(b.link_resets(), 0, "B heard A's pings");
+    // `status` names the peer and why (0.4.12).
+    let gossip = a.gossip_json();
+    assert_eq!(
+        gossip["resets"][0]["peer"],
+        b.endpoint().id().to_string(),
+        "{gossip}"
+    );
+    assert!(
+        gossip["resets"][0]["why"]
+            .as_str()
+            .unwrap()
+            .starts_with("nothing heard from it"),
+        "{gossip}"
+    );
     let posted = a
         .publish(
             Draft {

@@ -1634,6 +1634,75 @@ enum Finished {
     Backoff(Duration),
 }
 
+/// Files of `dir` modified at or after `since` (unix seconds): regular
+/// files, hidden directories skipped, at most 4 levels and 2000 entries
+/// looked at; their paths relative to `dir`, at most `max`.
+pub fn written_since(dir: &std::path::Path, since: u64, max: usize) -> Vec<String> {
+    let since = std::time::UNIX_EPOCH + Duration::from_secs(since);
+    let mut found = Vec::new();
+    let mut seen = 0usize;
+    let mut stack = vec![(dir.to_path_buf(), 0usize)];
+    while let Some((path, depth)) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&path) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            seen += 1;
+            if seen > 2000 || found.len() >= max {
+                return found;
+            }
+            let name = entry.file_name();
+            if name.to_string_lossy().starts_with('.') {
+                continue;
+            }
+            let Ok(meta) = entry.metadata() else { continue };
+            if meta.is_dir() && depth < 4 {
+                stack.push((entry.path(), depth + 1));
+            } else if meta.is_file() && meta.modified().is_ok_and(|m| m >= since) {
+                let rel = entry.path();
+                let rel = rel.strip_prefix(dir).unwrap_or(&rel);
+                found.push(rel.display().to_string());
+            }
+        }
+    }
+    found.sort();
+    found
+}
+
+/// After a workspace run (0.4.12): its answers carry no file while the run
+/// wrote some in the workspace, so the asker cannot check anything. The
+/// note for the next run, also logged; `None` when there is nothing to say.
+fn unattached_note(node: &Node, me: &str, config: &AgentConfig, started: u64) -> Option<String> {
+    if config.access != Access::Workspace {
+        return None;
+    }
+    let mine = Filter {
+        kinds: vec![Kind::Answer],
+        author: Some(me.to_string()),
+        ..Filter::default()
+    };
+    let bare: Vec<Arc<Event>> = node
+        .store()
+        .search(None, &mine, 20)
+        .ok()?
+        .into_iter()
+        .map(|s| s.event)
+        .filter(|e| e.ts >= started && e.blobs.is_empty())
+        .collect();
+    let answer = bare.first()?;
+    let written = written_since(&config.workdir, started, 5);
+    if written.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "Your answer {} carries no files, while your last run wrote {} in your workspace. If \
+         they are the result, reply to the same ask again with them in `blobs`, and the \
+         command you ran with its raw output: without them, the asker cannot check anything.",
+        short(&answer.id),
+        written.join(", ")
+    ))
+}
+
 /// `completion.status` as a run status.
 fn completion_status(completion: Option<&str>) -> &'static str {
     match completion.map(str::to_ascii_lowercase).as_deref() {
@@ -2160,6 +2229,8 @@ async fn settle_claims(
     };
     let why = if state.accepted {
         "its asker accepted an answer".to_string()
+    } else if let Some(w) = &state.withdrawn {
+        format!("its asker {} it", w.label())
     } else if state.lost(me).is_some() {
         format!(
             "mode {}: an older claim holds it (earliest ts, then lowest id)",
@@ -2530,6 +2601,8 @@ pub async fn run(
     let mut last_heartbeat = Instant::now();
     let mut runs: VecDeque<Instant> = VecDeque::new();
     let mut running: Option<Running> = None;
+    // A note for the next run: its last answer carried no files it wrote.
+    let mut unattached: Option<String> = None;
     let mut capped = false;
     let mut paused_until: Option<u64> = None;
     let openclaw = config.runtime == "openclaw";
@@ -2568,7 +2641,13 @@ pub async fn run(
                 if let Some(mut run) = running.take() {
                     let woke = std::mem::take(&mut run.woke);
                     let taken = std::mem::take(&mut run.feedback);
-                    match finish_run(&node, &config, run, outcome).await {
+                    let run_started = run.record.started;
+                    let finished = finish_run(&node, &config, run, outcome).await;
+                    if let Some(note) = unattached_note(&node, &me, &config, run_started) {
+                        warn!("agent {}: {note}", config.profile);
+                        unattached = Some(note);
+                    }
+                    match finished {
                         Finished::Deferred(why) => {
                             // Not a run: it does not count, and what woke
                             // it waits for the next one.
@@ -2615,7 +2694,8 @@ pub async fn run(
                     // A claim or an accept may settle the agent's own claim
                     // (ADR 0022 §2.3); any post may free a held ask.
                     let accept = event.kind == Kind::React && event.data.contains_key("accept");
-                    if event.thread.is_some() && (event.kind == Kind::Claim || accept) {
+                    let withdraw = crate::delivery::is_withdrawal(event);
+                    if event.thread.is_some() && (event.kind == Kind::Claim || accept || withdraw) {
                         settle_claims(&node, &me, &config, event.thread_root(), &mut released).await;
                     }
                     // History (a fill, a catch-up, a fetch on read) wakes
@@ -2791,6 +2871,9 @@ pub async fn run(
                         save_offered(&config.work_dir, offered, &ids);
                     }
                 }
+                if let Some(note) = unattached.take() {
+                    text.push_str(&format!("\n\n{note}\n"));
+                }
                 let taken = std::mem::take(&mut feedback);
                 text.push_str(&feedback_section(&node, &taken));
                 // What the human said about the posts they rejected.
@@ -2858,6 +2941,33 @@ pub async fn run(
 
 #[cfg(test)]
 mod tests {
+    /// The files a run wrote in its workspace: new ones only, hidden
+    /// directories left out.
+    #[test]
+    fn written_since_lists_what_the_run_wrote() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path();
+        std::fs::write(d.join("old.txt"), "x").unwrap();
+        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+        std::fs::File::options()
+            .write(true)
+            .open(d.join("old.txt"))
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+        let start = crate::node::now_secs() - 1;
+        std::fs::create_dir_all(d.join("src")).unwrap();
+        std::fs::create_dir_all(d.join(".git")).unwrap();
+        std::fs::write(d.join("src/primes.py"), "x").unwrap();
+        std::fs::write(d.join("test_primes.py"), "x").unwrap();
+        std::fs::write(d.join(".git/index"), "x").unwrap();
+        assert_eq!(
+            super::written_since(d, start, 5),
+            ["src/primes.py", "test_primes.py"]
+        );
+        assert_eq!(super::written_since(d, start, 1).len(), 1);
+    }
+
     #[test]
     fn caps_become_lowercase_tags() {
         use super::{cap_tag, check_cap};

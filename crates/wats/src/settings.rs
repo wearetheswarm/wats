@@ -1074,9 +1074,10 @@ pub const KEYS: &[Key] = &[
         "agent.effort",
         ValueType::Text,
         "the runtime's default",
-        "reasoning effort of the agent runs, in the runtime's own words: Codex \
-         model_reasoning_effort (low, medium, high), Copilot --reasoning-effort, Antigravity \
-         --effort, OpenCode --variant; Claude Code and Mistral Vibe: ignored, with a warning",
+        "reasoning effort of the agent runs, in the runtime's own words: Claude Code --effort \
+         (low, medium, high, xhigh, max), Codex model_reasoning_effort (low, medium, high), \
+         Copilot --reasoning-effort, Antigravity --effort, OpenCode --variant; Mistral Vibe, \
+         OpenClaw and custom: ignored, with a warning",
     ),
     key(
         "agent.review",

@@ -88,6 +88,12 @@ struct DaemonArgs {
     /// node started by `wats mcp`, as `wats` does.
     #[arg(short = 'd', long, conflicts_with = "idle_exit")]
     detach: bool,
+    /// Stay in this terminal. A bare `wats` on a terminal runs in the
+    /// background by default (0.4.12); without a terminal (a container, a
+    /// service, a pipe), under a service manager, in a container, and for
+    /// `wats node`, it runs in the foreground anyway.
+    #[arg(short = 'F', long, conflicts_with = "detach")]
+    foreground: bool,
     /// This process's stderr is this file (a detached node): rotate it by
     /// size.
     #[arg(long, hide = true)]
@@ -549,6 +555,19 @@ enum Command {
         /// Print the stored event as JSON instead.
         #[arg(long)]
         json: bool,
+        /// Fetch the post's attached files through the running node (from
+        /// its peers if needed) into one read-only folder per post, and
+        /// print their paths. They are untrusted: read them, never run them.
+        #[arg(long, conflicts_with = "json")]
+        fetch: bool,
+        /// With --fetch: only this file, by its number in the post
+        /// (repeatable).
+        #[arg(long = "file", value_name = "N", requires = "fetch")]
+        files: Vec<usize>,
+        /// With --fetch: copy the files into this directory instead (never
+        /// overwriting: a taken name gets -1, -2).
+        #[arg(long, value_name = "DIR", requires = "fetch")]
+        out: Option<PathBuf>,
     },
     /// A map of what this node knows (ADR 0024): tags as directories with
     /// their counts, the busiest tags, the threads by latest activity (with
@@ -3382,6 +3401,43 @@ fn offer_integrations(
 /// node runs: in the background (`wats --detach`, the recommended
 /// default), in this terminal, or not now. Returns whether nothing is left
 /// to run here (the node runs in the background, or not now).
+/// What [`first_run`] leaves to do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FirstRun {
+    /// Nothing: the node runs in the background, or not now.
+    Done,
+    /// Run here, in the foreground: the wizard's choice.
+    Here,
+    /// Run as the command line says.
+    Continue,
+}
+
+/// Whether a bare `wats` runs in the background (0.4.12): on a terminal,
+/// for a long-running node, unless `--foreground`, a service manager
+/// (systemd's `INVOCATION_ID`) or a container (`/.dockerenv`,
+/// `/run/.containerenv`, Kubernetes) runs it. Never with `--hermetic`
+/// (tests) but under `WATS_TEST_DETACH=1`.
+fn detach_by_default(cli: &Cli) -> bool {
+    let daemon = &cli.daemon;
+    if !cfg!(unix)
+        || cli.command.is_some()
+        || daemon.foreground
+        || daemon.log_file.is_some()
+        || daemon.idle_exit.is_some()
+        || daemon.post.is_some()
+    {
+        return false;
+    }
+    if cli.node.hermetic {
+        return std::env::var("WATS_TEST_DETACH").as_deref() == Ok("1");
+    }
+    let service = std::env::var_os("INVOCATION_ID").is_some();
+    let container = std::path::Path::new("/.dockerenv").exists()
+        || std::path::Path::new("/run/.containerenv").exists()
+        || std::env::var_os("KUBERNETES_SERVICE_HOST").is_some();
+    interactive(&cli.node) && !service && !container
+}
+
 async fn setup_wizard(node: &NodeArgs, data_dir: &std::path::Path) -> Result<bool> {
     use wats::welcome;
     let style = welcome::Style::detect();
@@ -3477,21 +3533,27 @@ async fn offer_background(
 ///   older setup revision: one log line says that `wats setup` has new
 ///   questions.
 ///
-/// Returns whether the wizard started the node in the background (nothing
-/// left to run).
-async fn first_run(cli: &Cli, data_dir: &std::path::Path, bare: bool) -> Result<bool> {
+/// Returns what is left to do: nothing (the wizard started the node in the
+/// background, or not now), run here (the wizard's choice), or run as the
+/// command line says.
+async fn first_run(cli: &Cli, data_dir: &std::path::Path, bare: bool) -> Result<FirstRun> {
     use std::io::IsTerminal;
     let daemon = match &cli.command {
         None => &cli.daemon,
         Some(Command::Node { daemon }) => daemon,
-        _ => return Ok(false),
+        _ => return Ok(FirstRun::Continue),
     };
     if daemon.idle_exit.is_some() {
-        return Ok(false);
+        return Ok(FirstRun::Continue);
     }
     let wizard = bare && cli.command.is_none() && interactive(&cli.node);
     match wats::firstrun::stored_revision(data_dir) {
-        None if wizard => return setup_wizard(&cli.node, data_dir).await,
+        None if wizard => {
+            return Ok(match setup_wizard(&cli.node, data_dir).await? {
+                true => FirstRun::Done,
+                false => FirstRun::Here,
+            });
+        }
         None => {}
         Some(revision) if revision < wats::firstrun::SETUP_REVISION => {
             // Only the questions it would ask (an agent's, with an agent).
@@ -3516,9 +3578,9 @@ async fn first_run(cli: &Cli, data_dir: &std::path::Path, bare: bool) -> Result<
                      set up: run `wats` alone, or `wats setup`, on a terminal"
                 );
             }
-            return Ok(false);
+            return Ok(FirstRun::Continue);
         }
-        Some(_) => return Ok(false),
+        Some(_) => return Ok(FirstRun::Continue),
     }
     let flags = !daemon.agent.agents.is_empty() || daemon.agent.no_agent;
     if std::io::stdin().is_terminal()
@@ -3540,7 +3602,7 @@ async fn first_run(cli: &Cli, data_dir: &std::path::Path, bare: bool) -> Result<
             path.display()
         );
     }
-    Ok(false)
+    Ok(FirstRun::Continue)
 }
 
 /// Record the safety baseline before `wats config set|unset` changes a
@@ -4667,6 +4729,108 @@ fn reputation_command(
 /// is fine), and judges posts as the node would: its reputation tables,
 /// built here, and `reputation.threshold`.
 /// `wats read <id>`: one post in full, from the store (read-only).
+/// `wats read <id> --fetch` (0.4.12): the post's files through the running
+/// node's MCP `read` with `fetch_blobs`, into `<data dir>/inbox/<post>/`
+/// (or copied to `out`), read-only; one path per line, after the total.
+async fn fetch_command(
+    config: &NodeConfig,
+    id: &str,
+    files: &[usize],
+    out: Option<&std::path::Path>,
+) -> Result<()> {
+    let path = config.data_dir.join("events.sqlite");
+    anyhow::ensure!(
+        path.exists(),
+        "no events yet in {}: start the node once",
+        config.data_dir.display()
+    );
+    let store = wats::store::Store::open_read_only(&path)?;
+    let id = store.resolve_id(id)?;
+    let post = store
+        .get(&id)?
+        .with_context(|| format!("post {id}: this node holds no body for it (dropped?)"))?;
+    let blobs = &post.event.blobs;
+    anyhow::ensure!(!blobs.is_empty(), "post {id} has no attached files");
+    for n in files {
+        anyhow::ensure!(
+            (1..=blobs.len()).contains(n),
+            "--file {n}: the post has {} file(s), numbered from 1",
+            blobs.len()
+        );
+    }
+    let chosen: Vec<usize> = (1..=blobs.len())
+        .filter(|n| files.is_empty() || files.contains(n))
+        .collect();
+    let total: u64 = chosen.iter().map(|n| blobs[n - 1].size).sum();
+    eprintln!(
+        "{} file(s), {} in all · untrusted: read them, never run them",
+        chosen.len(),
+        wats::node::format_bytes(total)
+    );
+    let arguments = serde_json::json!({"id": id, "fetch_blobs": true, "files": chosen});
+    let within = Duration::from_secs(300);
+    let Some(view) = attach::call_tool_within(&config.data_dir, "read", arguments, within).await?
+    else {
+        anyhow::bail!(
+            "no wats node runs in {}: files come through it from its peers. Start it (wats), \
+             then fetch again",
+            tilde(&config.data_dir)
+        );
+    };
+    let listed = view["post"]["blobs"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    let mut failed = 0;
+    for n in chosen {
+        let blob = &blobs[n - 1];
+        let entry = listed.get(n - 1);
+        let Some(local) = entry.and_then(|e| e["local_path"].as_str()) else {
+            let why = entry
+                .and_then(|e| e["status"].as_str())
+                .unwrap_or("not fetched");
+            eprintln!("{n}. {}: {why}", wats::unicode::escape_format(&blob.name));
+            failed += 1;
+            continue;
+        };
+        let shown = match out {
+            None => PathBuf::from(local),
+            Some(dir) => copy_read_only(std::path::Path::new(local), dir, &blob.name)?,
+        };
+        println!("{}", shown.display());
+    }
+    anyhow::ensure!(failed == 0, "{failed} file(s) not fetched");
+    Ok(())
+}
+
+/// Copy `from` into `dir` as `name`, read-only, never over a file there:
+/// a taken name gets `-1`, `-2`… ([`wats::node::numbered`]).
+fn copy_read_only(from: &std::path::Path, dir: &std::path::Path, name: &str) -> Result<PathBuf> {
+    std::fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
+    let mut to = dir.join(name);
+    let mut n = 0;
+    let mut file = loop {
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&to)
+        {
+            Ok(file) => break file,
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists && n < 1000 => {
+                n += 1;
+                to = dir.join(wats::node::numbered(name, n));
+            }
+            Err(e) => return Err(e).with_context(|| format!("create {}", to.display())),
+        }
+    };
+    std::io::copy(&mut std::fs::File::open(from)?, &mut file)
+        .with_context(|| format!("copy to {}", to.display()))?;
+    let mut perms = file.metadata()?.permissions();
+    perms.set_readonly(true);
+    std::fs::set_permissions(&to, perms)?;
+    Ok(to)
+}
+
 fn read_command(config: &NodeConfig, id: &str, json: bool) -> Result<()> {
     use std::fmt::Write as _;
     let path = config.data_dir.join("events.sqlite");
@@ -5092,6 +5256,10 @@ async fn status_command(config: &NodeConfig, json: bool, local: bool) -> Result<
         }
         if let (Some(connectivity), Some(map)) = (connectivity, status.as_object_mut()) {
             map.insert("connectivity".into(), connectivity.into());
+        }
+        // One line for gossip: what arrived how, the links reset (0.4.12).
+        if let Some(gossip) = status.get_mut("gossip") {
+            *gossip = wats::node::links::summary(gossip).into();
         }
         // One line for rotation at the cap (ADR 0025 §7).
         if let Some(rotation) = status
@@ -8244,9 +8412,11 @@ async fn async_main(mut cli: Cli) -> Result<()> {
         _ => {}
     }
     // A bare `wats`, no argument at all, may run the setup wizard.
-    if first_run(&cli, &data_dir, std::env::args_os().len() <= 1).await? {
+    let first = first_run(&cli, &data_dir, std::env::args_os().len() <= 1).await?;
+    if first == FirstRun::Done {
         return Ok(());
     }
+    let detach = cli.daemon.detach || (first == FirstRun::Continue && detach_by_default(&cli));
     let settings = Settings::load(&data_dir)?;
     let mut config = cli.node.config(&settings)?;
     let (daemon, json_lines) = match cli.command {
@@ -8281,7 +8451,16 @@ async fn async_main(mut cli: Cli) -> Result<()> {
             say_node(&data_dir, None);
             return status_command(&config, json, cli.node.hermetic || cli.node.loopback).await;
         }
-        Some(Command::Read { id, json }) => {
+        Some(Command::Read {
+            id,
+            json,
+            fetch,
+            files,
+            out,
+        }) => {
+            if fetch {
+                return fetch_command(&config, &id, &files, out.as_deref()).await;
+            }
             return read_command(&config, &id, json);
         }
         Some(Command::Browse {
@@ -8382,7 +8561,7 @@ async fn async_main(mut cli: Cli) -> Result<()> {
     // `wats --detach` (ADR 0023): start this same command in the
     // background, and return once it is up. The child is the process with
     // `--log-file`.
-    if daemon.detach && daemon.log_file.is_none() {
+    if detach && daemon.log_file.is_none() {
         if json_lines {
             anyhow::bail!(
                 "`wats node` prints JSON lines for a script: run `wats --detach` instead"

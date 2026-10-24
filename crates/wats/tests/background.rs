@@ -815,3 +815,134 @@ async fn setup_detach_brings_back_a_stopped_session() -> anyhow::Result<()> {
     client.cancel().await?;
     Ok(())
 }
+
+/// A bare `wats` on a terminal runs in the background by default (0.4.12):
+/// no `--detach`, and it returns once the node is up, saying how to watch
+/// and stop it.
+#[test]
+fn a_bare_wats_on_a_terminal_detaches_by_default() {
+    let machine = Machine::new();
+    let dir = machine.dir("node");
+    let out = machine
+        .wats()
+        .env("WATS_TEST_INTERACTIVE", "1")
+        .env("WATS_TEST_DETACH", "1")
+        .args([
+            "--infra",
+            "none",
+            "--pow-bits=0",
+            "--min-pow-bits=0",
+            "--dir",
+        ])
+        .arg(&dir)
+        .arg("--no-agent")
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{out:?}");
+    let said = text(&out.stderr);
+    assert!(said.contains("running in the background"), "{said}");
+    assert!(said.contains("stop it: wats stop"), "{said}");
+    assert!(machine.running(&dir).is_some(), "it runs on");
+    let stopped = machine.stop(&["--all", "--timeout", "5s"]);
+    assert!(stopped.status.success(), "{stopped:?}");
+}
+
+/// `wats read <id> --fetch` (0.4.12): a post's files through the running
+/// node, into one read-only folder per post, one path per line; `--file N`
+/// and `--out DIR` copy one of them elsewhere, never over a file there.
+#[tokio::test(flavor = "multi_thread")]
+async fn read_fetch_puts_a_posts_files_in_one_folder() -> anyhow::Result<()> {
+    use rmcp::ServiceExt;
+    let machine = Machine::new();
+    let dir = machine.dir("node");
+    let out = machine.detach(&dir, &[]);
+    assert!(out.status.success(), "{out:?}");
+    let project = machine.dir("project");
+    std::fs::create_dir_all(&project)?;
+    std::fs::write(project.join("primes.py"), "def primes(): ...\n")?;
+    std::fs::write(project.join("test_primes.py"), "def test(): ...\n")?;
+    let mut cmd = tokio::process::Command::new(env!("CARGO_BIN_EXE_wats"));
+    cmd.env("WATS_HERMETIC", "1")
+        .env("HOME", machine.dir("home"))
+        .env("WATS_RUN_DIR", machine.run_dir())
+        .env_remove("WATS_RUNNER_TOKEN")
+        .env_remove("WATS_DIR")
+        .env_remove("WATS_PROFILE")
+        .env_remove("WATS_MCP_SOCKET")
+        .current_dir(&project)
+        .args([
+            "--infra",
+            "none",
+            "--pow-bits=0",
+            "--min-pow-bits=0",
+            "--dir",
+        ])
+        .arg(&dir)
+        .args(["mcp", "--idle-exit", "30"]);
+    let client = ().serve(rmcp::transport::TokioChildProcess::new(cmd)?).await?;
+    let posted = client
+        .call_tool(
+            rmcp::model::CallToolRequestParams::new("post").with_arguments(
+                serde_json::json!({
+                    "kind": "answer", "title": "Primes, with tests", "text": "Attached.",
+                    "blobs": [{"path": project.join("primes.py")}, {"path": project.join("test_primes.py")}],
+                })
+                .as_object()
+                .unwrap()
+                .clone(),
+            ),
+        )
+        .await?;
+    let id = posted.structured_content.as_ref().unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    client.cancel().await?;
+
+    let fetch = |extra: &[&str]| {
+        machine
+            .wats()
+            .args(["--dir"])
+            .arg(&dir)
+            .args(["read", &id, "--fetch"])
+            .args(extra)
+            .output()
+            .unwrap()
+    };
+    let out = fetch(&[]);
+    assert!(out.status.success(), "{out:?}");
+    assert!(text(&out.stderr).contains("2 file(s)"), "{out:?}");
+    assert!(text(&out.stderr).contains("never run them"), "{out:?}");
+    let paths: Vec<PathBuf> = text(&out.stdout).lines().map(PathBuf::from).collect();
+    assert_eq!(paths.len(), 2, "{out:?}");
+    let folder = dir.join("inbox").join(&id[..16]);
+    for (path, name) in paths.iter().zip(["primes.py", "test_primes.py"]) {
+        assert_eq!(
+            path.parent(),
+            Some(folder.as_path()),
+            "one folder: {path:?}"
+        );
+        assert_eq!(path.file_name().unwrap(), name);
+        assert!(std::fs::metadata(path)?.permissions().readonly());
+    }
+    // One of them, elsewhere: twice gives a numbered copy.
+    let elsewhere = machine.dir("elsewhere");
+    let dest = elsewhere.to_str().unwrap();
+    for want in ["test_primes.py", "test_primes-1.py"] {
+        let out = fetch(&["--file", "2", "--out", dest]);
+        assert!(out.status.success(), "{out:?}");
+        assert_eq!(
+            text(&out.stdout).trim(),
+            elsewhere.join(want).to_str().unwrap()
+        );
+    }
+    assert_eq!(
+        std::fs::read_to_string(elsewhere.join("test_primes-1.py"))?,
+        "def test(): ...\n"
+    );
+    // Not a file of the post: said, before anything is fetched.
+    let out = fetch(&["--file", "3"]);
+    assert!(!out.status.success());
+    assert!(text(&out.stderr).contains("has 2 file(s)"), "{out:?}");
+    Ok(())
+}

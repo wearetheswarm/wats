@@ -72,6 +72,11 @@ pub enum FleetAction {
     /// log has no error in the last hour. A table, and a non-zero exit code
     /// when a node fails (for cron).
     Check(CheckArgs),
+    /// Print a Docker Compose file for N nodes (0.4.12): one service per
+    /// node, each with its own published UDP port, volume and limits, a
+    /// read-only root, every capability dropped and no new privileges. It
+    /// drives no Docker: `docker compose -f <file> up -d` does.
+    Compose(ComposeArgs),
     /// Stop every node of the fleet (as `wats stop` does, in parallel).
     Stop {
         /// How long to wait for each node's graceful stop before killing
@@ -93,6 +98,143 @@ pub enum FleetAction {
         #[arg(short = 'f', long)]
         follow: bool,
     },
+}
+
+#[derive(Debug, clap::Args)]
+pub struct ComposeArgs {
+    /// How many nodes.
+    #[arg(short = 'n', long, value_parser = clap::value_parser!(u16).range(1..=500))]
+    pub nodes: u16,
+    /// The first node's UDP port; node i gets port-base + i - 1.
+    #[arg(long, default_value_t = 7850)]
+    pub port_base: u16,
+    /// The services' names: `<name>-1`, `<name>-2`… (also the project's).
+    #[arg(long, default_value = "wats")]
+    pub name: String,
+    /// The image [default: ghcr.io/wearetheswarm/wats:<this version>].
+    #[arg(long)]
+    pub image: Option<String>,
+    /// The command each node runs, after `wats` (e.g. "--agent opencode").
+    #[arg(long, default_value = "node --quiet", allow_hyphen_values = true)]
+    pub command: String,
+    /// CPUs per node.
+    #[arg(long, default_value = "1.0")]
+    pub cpus: String,
+    /// Memory per node.
+    #[arg(long, default_value = "2G")]
+    pub memory: String,
+    /// Processes per node.
+    #[arg(long, default_value_t = 512)]
+    pub pids: u32,
+    /// Infrastructure nodes (routers, seeds): 8 gossip neighbors, a
+    /// 1-minute anti-entropy and ping.
+    #[arg(long)]
+    pub infra_node: bool,
+    /// More environment for every node (`KEY=value`, repeatable).
+    #[arg(long = "env", value_name = "KEY=VALUE")]
+    pub env: Vec<String>,
+}
+
+/// A quoted YAML scalar: JSON's string syntax is valid YAML.
+fn yaml(s: &str) -> String {
+    serde_json::to_string(s).unwrap_or_else(|_| "\"\"".into())
+}
+
+/// The Compose file of `wats fleet compose` (0.4.12).
+pub fn compose_file(args: &ComposeArgs) -> Result<String> {
+    use std::fmt::Write as _;
+    anyhow::ensure!(
+        !args.name.is_empty()
+            && args
+                .name
+                .chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-'),
+        "--name: lowercase letters, digits and '-' only (a Compose project name)"
+    );
+    let last = u32::from(args.port_base) + u32::from(args.nodes) - 1;
+    anyhow::ensure!(
+        last <= u32::from(u16::MAX),
+        "--port-base {} with {} nodes goes past port 65535",
+        args.port_base,
+        args.nodes
+    );
+    let mut env: Vec<(String, String)> = Vec::new();
+    if args.infra_node {
+        for (k, v) in [
+            ("WATS_GOSSIP_ACTIVE_VIEW", "8"),
+            ("WATS_SYNC_ANTI_ENTROPY", "1m"),
+            ("WATS_GOSSIP_PING", "1m"),
+        ] {
+            env.push((k.into(), v.into()));
+        }
+    }
+    for kv in &args.env {
+        let (k, v) = kv
+            .split_once('=')
+            .with_context(|| format!("--env {kv}: KEY=value"))?;
+        anyhow::ensure!(
+            !k.is_empty() && k.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'),
+            "--env {kv}: the key is letters, digits and '_'"
+        );
+        anyhow::ensure!(
+            k != "WATS_PORT",
+            "--env WATS_PORT: each node has its own port"
+        );
+        env.push((k.into(), v.into()));
+    }
+    let image = args
+        .image
+        .clone()
+        .unwrap_or_else(|| format!("ghcr.io/wearetheswarm/wats:{}", env!("CARGO_PKG_VERSION")));
+    let command: Vec<String> = args.command.split_whitespace().map(yaml).collect();
+    let mut out = String::new();
+    let _ = writeln!(
+        out,
+        "# {} wats nodes, from `wats fleet compose` (wats {}): one service per node, its own\n\
+         # UDP port and volume. Start: docker compose -f <this file> up -d",
+        args.nodes,
+        env!("CARGO_PKG_VERSION")
+    );
+    let _ = writeln!(out, "name: {}\n", yaml(&args.name));
+    let _ = writeln!(out, "x-node: &node");
+    let _ = writeln!(out, "  image: {}", yaml(&image));
+    // The release image is linux/amd64 only: emulated on an arm64 host.
+    if args.image.is_none() {
+        let _ = writeln!(out, "  platform: linux/amd64");
+    }
+    let _ = writeln!(out, "  command: [{}]", command.join(", "));
+    let _ = writeln!(out, "  restart: unless-stopped");
+    let _ = writeln!(out, "  read_only: true");
+    let _ = writeln!(out, "  tmpfs: [\"/tmp:size=256m\"]");
+    let _ = writeln!(out, "  cap_drop: [ALL]");
+    let _ = writeln!(out, "  security_opt: [\"no-new-privileges:true\"]");
+    let _ = writeln!(out, "  stop_grace_period: 30s");
+    let _ = writeln!(out, "  deploy:\n    resources:\n      limits:");
+    let _ = writeln!(out, "        cpus: {}", yaml(&args.cpus));
+    let _ = writeln!(out, "        memory: {}", yaml(&args.memory));
+    let _ = writeln!(out, "        pids: {}", args.pids);
+    let _ = writeln!(
+        out,
+        "  logging:\n    driver: json-file\n    options:\n      max-size: 10m\n      max-file: \"3\""
+    );
+    let _ = writeln!(out, "\nservices:");
+    for i in 1..=u32::from(args.nodes) {
+        let port = u32::from(args.port_base) + i - 1;
+        let _ = writeln!(out, "  {}-{i}:", args.name);
+        let _ = writeln!(out, "    <<: *node");
+        let _ = writeln!(out, "    environment:");
+        let _ = writeln!(out, "      WATS_PORT: \"{port}\"");
+        for (k, v) in &env {
+            let _ = writeln!(out, "      {k}: {}", yaml(v));
+        }
+        let _ = writeln!(out, "    ports: [\"{port}:{port}/udp\"]");
+        let _ = writeln!(out, "    volumes: [\"{}-{i}:/data\"]", args.name);
+    }
+    let _ = writeln!(out, "\nvolumes:");
+    for i in 1..=args.nodes {
+        let _ = writeln!(out, "  {}-{i}:", args.name);
+    }
+    Ok(out)
 }
 
 #[derive(Debug, clap::Args)]
@@ -279,6 +421,10 @@ pub async fn run(
 ) -> Result<()> {
     let base = base_dir(command.base.as_deref())?;
     match command.action {
+        FleetAction::Compose(args) => {
+            print!("{}", compose_file(&args)?);
+            Ok(())
+        }
         FleetAction::Up(args) => up(&ctx, &base, args).await,
         FleetAction::Check(args) => {
             let manifest = existing(&base)?;
@@ -1396,6 +1542,70 @@ async fn logs(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn compose_args(extra: &[&str]) -> ComposeArgs {
+        #[derive(clap::Parser)]
+        struct Cli {
+            #[command(flatten)]
+            args: ComposeArgs,
+        }
+        let mut argv = vec!["compose"];
+        argv.extend_from_slice(extra);
+        <Cli as clap::Parser>::parse_from(argv).args
+    }
+
+    /// One service per node, each with its port, volume and the hardening;
+    /// the infrastructure settings and extra environment on each.
+    #[test]
+    fn compose_gives_each_node_its_port_and_volume() {
+        let file = compose_file(&compose_args(&[
+            "-n",
+            "3",
+            "--infra-node",
+            "--command",
+            "--agent opencode",
+            "--env",
+            "KEY=a b",
+        ]))
+        .unwrap();
+        for i in 0..3u32 {
+            let port = 7850 + i;
+            assert!(
+                file.contains(&format!("  wats-{}:\n    <<: *node", i + 1)),
+                "{file}"
+            );
+            assert!(file.contains(&format!("WATS_PORT: \"{port}\"")), "{file}");
+            assert!(
+                file.contains(&format!("ports: [\"{port}:{port}/udp\"]")),
+                "{file}"
+            );
+            assert!(
+                file.contains(&format!("volumes: [\"wats-{}:/data\"]", i + 1)),
+                "{file}"
+            );
+        }
+        assert!(!file.contains("wats-4"), "{file}");
+        for line in [
+            "command: [\"--agent\", \"opencode\"]",
+            "platform: linux/amd64",
+            "read_only: true",
+            "cap_drop: [ALL]",
+            "no-new-privileges:true",
+            "pids: 512",
+            "WATS_GOSSIP_ACTIVE_VIEW: \"8\"",
+            "WATS_SYNC_ANTI_ENTROPY: \"1m\"",
+            "KEY: \"a b\"",
+        ] {
+            assert!(file.contains(line), "{line}: {file}");
+        }
+        // Another image: no platform forced.
+        let own = compose_file(&compose_args(&["-n", "1", "--image", "me/wats:dev"])).unwrap();
+        assert!(!own.contains("platform:"), "{own}");
+        // Refused: a bad name, a port overflow, WATS_PORT in --env.
+        assert!(compose_file(&compose_args(&["-n", "1", "--name", "Bad_Name"])).is_err());
+        assert!(compose_file(&compose_args(&["-n", "10", "--port-base", "65530"])).is_err());
+        assert!(compose_file(&compose_args(&["-n", "1", "--env", "WATS_PORT=1"])).is_err());
+    }
 
     #[test]
     fn log_times_parse() {

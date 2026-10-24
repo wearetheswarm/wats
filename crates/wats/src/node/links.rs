@@ -52,6 +52,66 @@ pub struct Links {
     joined: Mutex<HashMap<String, Instant>>,
     /// Links reset since the node started.
     reset_count: std::sync::atomic::AtomicU64,
+    /// New events of the last hour: when, and whether anti-entropy (not
+    /// gossip) brought them (0.4.12, for `status`).
+    arrivals: Mutex<std::collections::VecDeque<(Instant, bool)>>,
+    /// Link resets of the last hour: when, the peer, and why.
+    reset_log: Mutex<std::collections::VecDeque<(Instant, EndpointId, String)>>,
+}
+
+/// The window of the `status` counters.
+pub const WINDOW: Duration = Duration::from_secs(3600);
+/// Events anti-entropy brings in [`WINDOW`] before `status` says that
+/// gossip is degraded: a few late ones are normal (a node that just came
+/// back, a neighbor's restart).
+pub const LATE_FLAG: usize = 5;
+/// The arrivals kept, at most (a busy hour counts up to here).
+const ARRIVALS_MAX: usize = 100_000;
+
+/// `status`'s gossip line: `gossip: 120 new events by gossip, 3 late by
+/// anti-entropy (last hour) · 1 link reset: 9f5d9e24df (nothing heard…)`.
+pub fn summary(gossip: &serde_json::Value) -> String {
+    use serde_json::Value;
+    let str_of = |v: &Value, k: &str| v.get(k).and_then(Value::as_str).map(str::to_string);
+    let n = |k: &str| {
+        gossip
+            .get("last_hour")
+            .and_then(|h| h.get(k))
+            .and_then(Value::as_u64)
+            .unwrap_or(0)
+    };
+    let mut line = format!(
+        "{} new events by gossip, {} late by anti-entropy (last hour)",
+        n("by_gossip"),
+        n("by_anti_entropy")
+    );
+    if let Some(resets) = gossip
+        .get("resets")
+        .and_then(Value::as_array)
+        .filter(|r| !r.is_empty())
+    {
+        let peers: Vec<String> = resets
+            .iter()
+            .map(|r| {
+                format!(
+                    "{} ({})",
+                    str_of(r, "peer")
+                        .and_then(|p| p.get(..10).map(str::to_string))
+                        .unwrap_or_else(|| "?".into()),
+                    str_of(r, "why").unwrap_or_default()
+                )
+            })
+            .collect();
+        line.push_str(&format!(
+            " · {} link reset(s): {}",
+            resets.len(),
+            peers.join(", ")
+        ));
+    }
+    if let Some(flag) = str_of(gossip, "degraded") {
+        line = format!("degraded: {flag} · {line}");
+    }
+    line
 }
 
 /// The peer to join when every neighbor is near (`Some(true)`): the first
@@ -118,6 +178,67 @@ impl Node {
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 
+    /// A new event stored: by gossip, or `late`, by anti-entropy.
+    pub(crate) fn note_arrivals(&self, late: bool, n: usize) {
+        if let Ok(mut arrivals) = self.links.arrivals.lock() {
+            let now = Instant::now();
+            for _ in 0..n {
+                arrivals.push_back((now, late));
+            }
+            while arrivals.len() > ARRIVALS_MAX
+                || arrivals.front().is_some_and(|(t, _)| t.elapsed() > WINDOW)
+            {
+                arrivals.pop_front();
+            }
+        }
+    }
+
+    /// For `status` (0.4.12): what arrived how in the last hour, the links
+    /// reset, and a `degraded` flag when anti-entropy brought more than
+    /// [`LATE_FLAG`] events: gossip lost them on the way.
+    pub fn gossip_json(&self) -> serde_json::Value {
+        let (by_gossip, late) = self
+            .links
+            .arrivals
+            .lock()
+            .map(|a| {
+                let recent = a.iter().filter(|(t, _)| t.elapsed() <= WINDOW);
+                recent.fold((0usize, 0usize), |(g, l), (_, late)| match late {
+                    true => (g, l.saturating_add(1)),
+                    false => (g.saturating_add(1), l),
+                })
+            })
+            .unwrap_or_default();
+        let resets: Vec<serde_json::Value> = self
+            .links
+            .reset_log
+            .lock()
+            .map(|r| {
+                r.iter()
+                    .filter(|(t, _, _)| t.elapsed() <= WINDOW)
+                    .map(|(t, peer, why)| {
+                        serde_json::json!({"peer": peer.to_string(), "why": why,
+                                           "secs_ago": t.elapsed().as_secs()})
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let mut out = serde_json::json!({
+            "last_hour": {"by_gossip": by_gossip, "by_anti_entropy": late},
+            "resets": resets,
+        });
+        if late > LATE_FLAG
+            && let Some(map) = out.as_object_mut()
+        {
+            map.insert(
+                "degraded".into(),
+                format!("{late} events arrived late (anti-entropy brought what gossip had not)")
+                    .into(),
+            );
+        }
+        out
+    }
+
     /// `peer` delivered a gossip message on `net`.
     pub(super) fn heard(&self, net: &str, peer: EndpointId) {
         if let Ok(mut heard) = self.links.heard.lock() {
@@ -146,6 +267,14 @@ impl Node {
                 self.links
                     .reset_count
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if let Ok(mut log) = self.links.reset_log.lock() {
+                    log.push_back((Instant::now(), peer, why.to_string()));
+                    while log.len() > 64
+                        || log.front().is_some_and(|(t, _, _)| t.elapsed() > WINDOW)
+                    {
+                        log.pop_front();
+                    }
+                }
                 info!(%net, peer = %peer.fmt_short(), "gossip link looked dead ({why}): reconnected");
                 // A grace before it is judged again.
                 self.heard(net, peer);
@@ -341,6 +470,26 @@ mod tests {
         assert_eq!(
             outside_peer(me, &island, &[(me, Some(false)), (b, Some(true))]),
             None
+        );
+    }
+
+    #[test]
+    fn the_status_line_says_how_events_arrived() {
+        let quiet = serde_json::json!({"last_hour": {"by_gossip": 120, "by_anti_entropy": 0}, "resets": []});
+        assert_eq!(
+            summary(&quiet),
+            "120 new events by gossip, 0 late by anti-entropy (last hour)"
+        );
+        let bad = serde_json::json!({
+            "last_hour": {"by_gossip": 3, "by_anti_entropy": 9},
+            "resets": [{"peer": "9f5d9e24df0123", "why": "nothing heard from it for 180 s"}],
+            "degraded": "9 events arrived late (anti-entropy brought what gossip had not)",
+        });
+        assert_eq!(
+            summary(&bad),
+            "degraded: 9 events arrived late (anti-entropy brought what gossip had not) · 3 new \
+             events by gossip, 9 late by anti-entropy (last hour) · 1 link reset(s): 9f5d9e24df \
+             (nothing heard from it for 180 s)"
         );
     }
 

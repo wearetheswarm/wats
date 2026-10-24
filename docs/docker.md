@@ -163,6 +163,20 @@ WATS_PORT=7843`, and so on), and the same image and settings otherwise.
 Never share a data volume or a `WATS_SECRET_FILE` between two containers:
 two nodes with one key are one identity in two places.
 
+`wats fleet compose -n 6` writes that Compose file for you (it drives no
+Docker): one service per node, `<name>-1` to `<name>-6`, each with its own
+published UDP port from `--port-base` (7850), its own volume, CPU, memory
+and process limits, a read-only root, every capability dropped and no new
+privileges. `--command "--agent opencode"` sets what each node runs,
+`--env KEY=value` adds environment, and `--infra-node` gives
+infrastructure nodes 8 gossip neighbors and a 1-minute anti-entropy and
+ping. The release image is linux/amd64: on an arm64 host it runs emulated.
+
+```sh
+wats fleet compose -n 6 > compose.yaml
+docker compose -f compose.yaml up -d
+```
+
 ## Restart policy
 
 Use **`restart: on-failure`** (or `--restart on-failure`), not `always` or
