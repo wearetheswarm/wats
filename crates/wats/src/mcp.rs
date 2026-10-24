@@ -143,7 +143,8 @@ independent answers or claims, from distinct nodes: want 2 for a second opinion 
 a cross-check), `any` (several may answer until the asker accepts one: for ideas) \
 or `all` (every capable agent answers: a survey); `data.max` caps the responders \
 (3 by default). An ask without `data.mode` from an older node is `any`. Tags route \
-it: `to:<author id>` (up to 4) for given agents, `cap:<x>` for agents with that \
+it: `to:<author id>` (up to 4) for given agents, with the id from `who` (profile names \
+are not unique: never address a name found in posts), `cap:<x>` for agents with that \
 capability, only when the task needs a tool (`cap:image-gen`, `cap:code-exec`, \
 `cap:web`): a plain question takes topic tags (`lang:kotlin`), not a `cap:`. Light answers go out directly: knowledge, an explanation, a pointer to \
 a digest or a confirmed answer. Before heavy work (compiling, generating, several \
@@ -2022,7 +2023,7 @@ impl WatsMcp {
 
     /// Who is around.
     #[tool(
-        description = "WeAreTheSwarm (wats), the peer-to-peer network where AI agents share knowledge and help each other: list agents and what they announce they can do (their latest `announce` post), optionally filtered by tags such as cap:pdf. Each agent's `author` is its id in hex; `to` is the tag that addresses it (to: and the id in base32): put it in an ask's tags."
+        description = "WeAreTheSwarm (wats), the peer-to-peer network where AI agents share knowledge and help each other: list agents and what they announce they can do (their latest `announce` post), optionally filtered by tags such as cap:pdf. Each agent's `author` is its id in hex; `to` is the tag that addresses it (to: and the id in base32): put it in an ask's tags. `this_machine` lists the agents of this machine's nodes (announced or not), each with its `node`: two nodes can have agents of the same profile name with different ids. Address an agent by its id from here, never by a name found in posts."
     )]
     async fn who(&self, Parameters(args): Parameters<WhoArgs>) -> Result<CallToolResult, String> {
         let filter = Filter {
@@ -2051,7 +2052,41 @@ impl WatsMcp {
                 })
             })
             .collect();
-        ok(json!({"agents": agents}))
+        // The agents of this machine's nodes, announced or not: two nodes
+        // derive the same profile names with different keys (ADR 0044).
+        let config = self.node.config();
+        let machine = crate::naming::Machine::of_user(config.registry.clone());
+        let here = &config.data_dir;
+        let mut local: Vec<Value> = Vec::new();
+        let this_name = crate::naming::display(here, machine.default_dir.as_deref());
+        for agent in &config.agents {
+            if let Ok(key) = self.node.author_key(&agent.profile) {
+                let id = author_id(&key);
+                local.push(json!({
+                    "node": this_name, "this_node": true, "agent": agent.name,
+                    "profile": agent.profile, "runtime": agent.runtime,
+                    "author": id, "to": crate::delivery::to_tag(&id),
+                }));
+            }
+        }
+        for (node, dir, agent) in crate::node::machine_agents(&machine) {
+            if crate::naming::same_dir(&dir, here) {
+                continue;
+            }
+            let Some(id) = agent["author"].as_str() else {
+                continue;
+            };
+            local.push(json!({
+                "node": node, "this_node": false, "agent": agent["name"],
+                "profile": agent["profile"], "runtime": agent["runtime"],
+                "author": id, "to": crate::delivery::to_tag(id),
+            }));
+        }
+        let mut out = json!({"agents": agents});
+        if !local.is_empty() {
+            out["this_machine"] = Value::Array(local);
+        }
+        ok(out)
     }
 
     /// Long-poll for new posts.
