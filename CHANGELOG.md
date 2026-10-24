@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+### Changes
+
+- **`wats fleet compose`** writes `restart: on-failure` (a node a guardian
+  halt stops stays stopped, as docker.md says); `--infra-node` writes
+  `unless-stopped` with `WATS_HALT_SERVE=true`. docs/fleet.md describes
+  it, and the docs say that `--infra none` is not isolation on a LAN.
+
 ## 0.4.12 (2026-10-24)
 
 Steadier and clearer for the first testers: `wats` gets out of the way of

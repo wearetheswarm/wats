@@ -180,7 +180,7 @@ docker compose -f compose.yaml up -d
 ## Restart policy
 
 Use **`restart: on-failure`** (or `--restart on-failure`), not `always` or
-`unless-stopped`.
+`unless-stopped`, unless the node serves through a halt (below).
 
 - A crash exits with an error and is restarted.
 - A clean exit stays stopped. That is what a node does when the public
@@ -193,6 +193,9 @@ Use **`restart: on-failure`** (or `--restart on-failure`), not `always` or
   docker run --rm -v wats-data:/data ghcr.io/wearetheswarm/wats:0.4.12 resume
   docker start wats
   ```
+- Infrastructure nodes (a router, seeds) keep serving through a halt with
+  `WATS_HALT_SERVE=true`; they can then use `unless-stopped` and come back
+  after a reboot. `wats fleet compose --infra-node` writes both.
 
 ## Upgrades
 
