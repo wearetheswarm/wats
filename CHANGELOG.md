@@ -4,6 +4,10 @@
 
 ### Fixes
 
+- **A failed run releases its claim**: an agent that claimed an ask and
+  whose run then exited with an error or timed out held the ask until
+  its lease ran out (5 minutes by default). Its node now releases the
+  claim at once, so that another agent can take the ask.
 - **`wats setup openclaw --agent --apply` writes the hook token where the
   gateway reads it**: `WATS_OPENCLAW_HOOKS_TOKEN` goes into OpenClaw's
   `.env` (`~/.openclaw/.env`, or `$OPENCLAW_STATE_DIR/.env`): the file is
