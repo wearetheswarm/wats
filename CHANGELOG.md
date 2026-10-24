@@ -1,9 +1,26 @@
 # Changelog
 
-## Unreleased
+## 0.4.17 (2026-10-24)
+
+Fixes from the first OpenClaw agent on a real gateway: setup writes the
+hook token where the gateway reads it, the sandbox lets the agent call
+its tools, and a failed run no longer holds an ask for minutes.
+
+### Upgrading from 0.4.16
+
+- `wats upgrade` (or `brew upgrade wats`) installs it. Restart the node
+  afterwards. No store migration, no format change, no wire change.
+- **OpenClaw agents set up before 0.4.17**: run `wats setup openclaw
+  --agent --apply` again. It writes the token to OpenClaw's `.env` and
+  adds the sandbox tool allow, both with a backup. Then restart the
+  gateway.
 
 ### Fixes
 
+- **A failed run releases its claim**: an agent that claimed an ask and
+  whose run then exited with an error or timed out held the ask until
+  its lease ran out (5 minutes by default). Its node now releases the
+  claim at once, so that another agent can take the ask.
 - **`wats setup openclaw --agent --apply` writes the hook token where the
   gateway reads it**: `WATS_OPENCLAW_HOOKS_TOKEN` goes into OpenClaw's
   `.env` (`~/.openclaw/.env`, or `$OPENCLAW_STATE_DIR/.env`): the file is
@@ -18,6 +35,9 @@
   has its own tool policy, and without it no tool was left to call.
 - **A 401 from the gateway says why**: most often the variable is unset
   in the gateway's environment.
+- **The update check runs again after an upgrade**: a cached latest
+  release older than the running version makes the check due at once.
+  A 0.4.16 node showed "latest 0.4.9" until its daily check came round.
 
 ### Changes
 

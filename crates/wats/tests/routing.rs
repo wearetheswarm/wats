@@ -560,6 +560,72 @@ async fn an_expired_lease_frees_the_task() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// The agent claims, then its run fails before it answers: its node
+/// releases the claim at once, so that the ask is free for others before
+/// the lease runs out.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_failed_run_releases_its_claim() -> anyhow::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir()?;
+    let hub = node(&dir.path().join("hub"), &[], |_| {}).await?;
+    let a = node(&dir.path().join("a"), &[&hub], |_| {}).await?;
+    a.wait_for_neighbor(PUBLIC_NET, Duration::from_secs(10))
+        .await?;
+    let ra = dir.path().join("ra");
+    let mut config = agent(&ra, &dir.path().join("a"), &[], Duration::from_millis(200));
+    // This agent's CLI keeps its prompt, waits for `go`, then fails.
+    let go = ra.join("go");
+    std::fs::write(
+        &config.command,
+        format!(
+            "#!/bin/sh\nn=$(ls {out} | grep -c prompt)\ncat > {out}/run-$n.tmp\nmv {out}/run-$n.tmp {out}/run-$n.prompt\nwhile [ ! -f {go} ]; do sleep 0.05; done\nexit 1\n",
+            out = ra.join("runs").display(),
+            go = go.display()
+        ),
+    )?;
+    std::fs::set_permissions(&config.command, std::fs::Permissions::from_mode(0o755))?;
+    config.run_timeout = Duration::from_secs(30);
+    let runner = start(&a, config);
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    let ask = hub
+        .publish(ask_with("Build the docs", json!({"mode": "one"}), &[]), &[])
+        .await?;
+    eventually("a woke", 10, || !runs_for(&ra, &ask).is_empty()).await;
+    let claim = a
+        .publish_as(
+            &a.author_key("agent")?,
+            reply(&ask, Kind::Claim, json!({})),
+            &[],
+        )
+        .await?;
+    std::fs::write(&go, "")?;
+    eventually("the failed run's release", 10, || {
+        in_thread(&hub, &ask, Kind::Release)
+            .iter()
+            .any(|r| r.parent.as_deref() == Some(claim.id.as_str()))
+    })
+    .await;
+    let releases = in_thread(&hub, &ask, Kind::Release);
+    assert_eq!(releases.len(), 1, "{releases:?}");
+    assert_eq!(releases[0].author, agent_id(&a));
+    assert!(
+        releases[0]
+            .text
+            .contains("its run exited with an error before it answered"),
+        "{}",
+        releases[0].text
+    );
+    let state = wats::delivery::state_on(&hub, &ask, wats::node::now_secs()).unwrap();
+    assert!(state.claims.is_empty(), "{:?}", state.claims);
+
+    runner.stop().await?;
+    for n in [a, hub] {
+        n.shutdown().await?;
+    }
+    Ok(())
+}
+
 /// The asker accepts an answer: the agent that held a claim gets it
 /// released by its node, and a runner that comes later is not woken.
 #[tokio::test(flavor = "multi_thread")]
