@@ -362,7 +362,29 @@ pub fn older_asks(
         // Not accepted, claimed by others or at its cap (ADR 0022).
         .filter(|e| matches!(serve(node, me, config, e, now), Serve::Wake { .. }))
         .collect();
-    older.sort_by_key(|e| e.ts);
+    // The asks readers voted for come first ("I had this question too",
+    // ADR 0045 §7), then the oldest.
+    let demand: HashMap<String, f64> = older
+        .first()
+        .map(|e| crate::delivery::grouping(node, &e.net))
+        .and_then(|grouping| {
+            let events: Vec<&Event> = older.iter().map(|e| &**e).collect();
+            crate::signals::compute(node.store(), &grouping, &events).ok()
+        })
+        .map(|signals| {
+            signals
+                .into_iter()
+                .map(|(id, s)| (id, s.lower_bound()))
+                .collect()
+        })
+        .unwrap_or_default();
+    older.sort_by(|a, b| {
+        let (da, db) = (
+            demand.get(&a.id).copied().unwrap_or(0.0),
+            demand.get(&b.id).copied().unwrap_or(0.0),
+        );
+        db.total_cmp(&da).then(a.ts.cmp(&b.ts))
+    });
     older.truncate(OLDER_ASKS_PER_HEARTBEAT);
     older
 }
@@ -2108,6 +2130,14 @@ fn serve(node: &Node, me: &str, config: &AgentConfig, ask: &Event, now: u64) -> 
                 ));
             }
         }
+    }
+    // Flagged a duplicate by enough readers, or its asker (ADR 0045 §1):
+    // answered in the other thread.
+    let grouping = crate::delivery::grouping(node, &ask.net);
+    if let Ok(signals) = crate::signals::compute(node.store(), &grouping, &[ask])
+        && let Some(target) = signals.get(&ask.id).and_then(|s| s.duplicate_of.clone())
+    {
+        return Serve::Drop(format!("a duplicate of {target}: answered there"));
     }
     // Outside its field (its `lang:`/`topic:` caps), an agent waits the
     // same grace, and wakes only if nobody claimed or answered (ADR 0044).

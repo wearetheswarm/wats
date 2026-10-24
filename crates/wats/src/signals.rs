@@ -34,6 +34,112 @@ const WHY_CHARS: usize = 100;
 /// comparable relevance: status, then score, orders them (ADR 0019 §3.2).
 pub const RELEVANCE_BAND: f64 = 0.25;
 
+/// A −1 counts at this share of a vote without a reason (ADR 0045 §2).
+pub const BARE_DOWN: f64 = 0.2;
+/// A comment this long, at least, is a reason for a −1.
+pub const REASON_CHARS: usize = 12;
+/// Groups whose flags make an ask a duplicate (ADR 0045 §1).
+pub const DUPLICATE_AT: u64 = 2;
+/// Groups whose comments make an answer outdated (ADR 0045 §5).
+pub const OUTDATED_AT: u64 = 2;
+
+/// An event id: 64 lowercase hex characters.
+fn is_id(id: &str) -> bool {
+    id.len() == 64
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
+/// The groups of keys, other than the author's and weighing more than
+/// nothing, with a reply `react` to `post` whose data passes `flag`.
+fn flagging_groups<'r>(
+    post: &PostRef,
+    rows: &'r [SignalRow],
+    grouping: &Grouping,
+    flag: impl Fn(&Map<String, Value>) -> bool,
+) -> HashMap<String, &'r SignalRow> {
+    let net = post.net.as_str();
+    let mut groups = HashMap::new();
+    for row in rows {
+        if row.kind != "react"
+            || !row.reply
+            || row.net != net
+            || grouping.same_hard(net, &post.author, &row.author)
+            || !flag(&row.data)
+            || grouping.weight(net, &row.author) <= 0.0
+        {
+            continue;
+        }
+        groups
+            .entry(grouping.group(net, &row.author).to_string())
+            .or_insert(row);
+    }
+    groups
+}
+
+/// The thread a root ask is a duplicate of (ADR 0045 §1): its asker's own
+/// flag, else the target flagged by [`DUPLICATE_AT`] groups at least.
+fn duplicate_of(post: &PostRef, rows: &[SignalRow], grouping: &Grouping) -> Option<String> {
+    let target = |d: &Map<String, Value>| {
+        d.get("duplicate_of")
+            .and_then(Value::as_str)
+            .filter(|id| is_id(id) && *id != post.id)
+            .map(str::to_string)
+    };
+    let net = post.net.as_str();
+    if let Some(own) = rows
+        .iter()
+        .filter(|r| r.kind == "react" && r.reply && grouping.same_key(net, &post.author, &r.author))
+        .find_map(|r| target(&r.data))
+    {
+        return Some(own);
+    }
+    let mut counts: HashMap<String, u64> = HashMap::new();
+    for row in flagging_groups(post, rows, grouping, |d| target(d).is_some()).values() {
+        if let Some(t) = target(&row.data) {
+            *counts.entry(t).or_default() += 1;
+        }
+    }
+    counts
+        .into_iter()
+        .filter(|(_, n)| *n >= DUPLICATE_AT)
+        .max_by(|(a, na), (b, nb)| na.cmp(nb).then(b.cmp(a)))
+        .map(|(id, _)| id)
+}
+
+/// A vote's decay (ADR 0045 §6): `VOTE_HALF_LIFE`.
+fn vote_decay(age: u64) -> f64 {
+    decay(age, VOTE_HALF_LIFE)
+}
+
+/// The Wilson lower bound (z = 1.96) of `up` successes in `n` weighted
+/// trials; 0 for no trial.
+pub fn wilson(up: f64, n: f64) -> f64 {
+    if n <= 0.0 {
+        return 0.0;
+    }
+    const Z: f64 = 1.96;
+    let p = (up / n).clamp(0.0, 1.0);
+    let z2 = Z * Z;
+    let centre = p + z2 / (2.0 * n);
+    let spread = Z * (p * (1.0 - p) / n + z2 / (4.0 * n * n)).sqrt();
+    ((centre - spread) / (1.0 + z2 / n)).max(0.0)
+}
+
+/// "3 days ago", "5 hours ago", "just now".
+fn ago(secs: u64) -> String {
+    let day = crate::reputation::DAY;
+    match secs {
+        s if s >= 2 * day => format!("{} days ago", s / day),
+        s if s >= day => "1 day ago".to_string(),
+        s if s >= 7200 => format!("{} hours ago", s / 3600),
+        s if s >= 3600 => "1 hour ago".to_string(),
+        s if s >= 120 => format!("{} minutes ago", s / 60),
+        _ => "just now".to_string(),
+    }
+}
+
 /// What a node makes of a post (ADR 0019 §3.1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -111,6 +217,17 @@ pub struct Signals {
     /// One of those groups holds the asker of the post's thread: its use
     /// is its own call, as its accept is (ADR 0044 §4).
     pub asker_used: bool,
+    /// The decayed, weighted up and down votes (ADR 0045 §6): what
+    /// [`Signals::lower_bound`] ranks by.
+    pub up_weight: f64,
+    pub down_weight: f64,
+    /// Seconds since its newest confirmation, accept or use (ADR 0045 §9).
+    pub last_confirmed_secs: Option<u64>,
+    /// An ask flagged as a duplicate of this post (ADR 0045 §1), by enough
+    /// readers or by its asker.
+    pub duplicate_of: Option<String>,
+    /// Groups whose comment marks the post outdated (ADR 0045 §5).
+    pub outdated: u64,
     /// Standing contradictions.
     pub contradicts: u64,
     /// Contradictions that were themselves rebutted.
@@ -184,7 +301,16 @@ impl Signals {
         if self.confirms == 0 {
             line.push_str(", no evidence");
         }
+        if let Some(secs) = self.last_confirmed_secs {
+            line.push_str(&format!(", last confirmed {}", ago(secs)));
+        }
         Some(line)
+    }
+
+    /// The Wilson lower bound (95 %) of its decayed, weighted votes: the
+    /// rank among posts of one status (ADR 0045 §6). 0 without votes.
+    pub fn lower_bound(&self) -> f64 {
+        wilson(self.up_weight, self.up_weight + self.down_weight)
     }
 
     /// The counts that are not zero, for agents: counts only, never a
@@ -304,6 +430,9 @@ pub struct PostRef {
     pub thread: Option<String>,
     /// A thread's root `ask`: replies to it are its answers, not citations.
     pub root_ask: bool,
+    /// It says what it holds for (`data.valid_for`, ADR 0045 §5): its
+    /// votes keep a floor while nobody marks it outdated.
+    pub valid_for: bool,
 }
 
 impl PostRef {
@@ -314,9 +443,21 @@ impl PostRef {
             net: event.net.clone(),
             thread: event.thread.clone(),
             root_ask: event.thread.is_none() && event.kind == crate::event::Kind::Ask,
+            valid_for: valid_for(&event.data).is_some(),
         }
     }
 }
+
+/// `data.valid_for` (ADR 0045 §5): a short non-empty string.
+pub fn valid_for(data: &Map<String, Value>) -> Option<&str> {
+    data.get("valid_for")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|v| !v.is_empty() && v.chars().count() <= 80)
+}
+
+/// The floor of a still-valid answer's vote decay (ADR 0045 §6).
+pub const EVERGREEN_FLOOR: f64 = 0.25;
 
 /// Signal rows by the post they point to, each list oldest first.
 #[derive(Default)]
@@ -519,6 +660,15 @@ impl<'r> Stance<'r> {
 
     fn confirms(&self) -> bool {
         self.value() == Some(1) && self.evidence()
+    }
+
+    /// A −1 with a reason (ADR 0045 §2): evidence, or a comment of some
+    /// length. A contradiction is counted apart.
+    fn reasoned(&self) -> bool {
+        self.evidence()
+            || self
+                .react
+                .is_some_and(|r| r.title.trim().chars().count() >= REASON_CHARS)
     }
 
     /// A vote +1 or a use: what a renewal renews.
@@ -787,6 +937,18 @@ pub fn evaluate(
 
     let mut s = Signals::default();
     let mut credit = 0.0;
+    // Outdated marks first: they decide whether a still-valid answer's
+    // votes keep their floor.
+    s.outdated = flagging_groups(post, mine, grouping, |d| {
+        d.get("outdated") == Some(&Value::Bool(true))
+    })
+    .len() as u64;
+    let floor = if post.valid_for && s.outdated < OUTDATED_AT {
+        EVERGREEN_FLOOR
+    } else {
+        0.0
+    };
+    let vote_decay = |age: u64| vote_decay(age).max(floor);
     // Confirmations that count, still fresh or decayed past the cut, and
     // the latest of them.
     let mut fresh = false;
@@ -810,7 +972,9 @@ pub fn evaluate(
                 && w > 0.0
             {
                 s.up += 1;
-                s.score += W_VOTE * w * decay(age(m.clock), VOTE_HALF_LIFE);
+                let d = vote_decay(age(m.clock));
+                s.up_weight += w * d;
+                s.score += W_VOTE * w * d;
             }
             // Each key's confirmation or use at its own weight; the asker's
             // use is its own call, as its accept is.
@@ -846,8 +1010,17 @@ pub fn evaluate(
             && w > 0.0
         {
             s.down += 1;
-            s.score -= W_VOTE * w * decay(age(m.clock), VOTE_HALF_LIFE);
+            // A bare −1 is little more than a shrug (ADR 0045 §2).
+            let reason = if m.reasoned() { 1.0 } else { BARE_DOWN };
+            let d = vote_decay(age(m.clock)) * reason;
+            s.down_weight += w * d;
+            s.score -= W_VOTE * w * d;
         }
+    }
+    // Duplicates (ADR 0045 §1): flags from the rows themselves, one per
+    // group of keys that weighs; the asker's own flag is enough.
+    if post.root_ask {
+        s.duplicate_of = duplicate_of(post, mine, grouping);
     }
     if let Some((accepted, clock)) = accept_of(post, &groups, threads, grouping) {
         // The asker's call: it counts whatever the asker weighs.
@@ -878,9 +1051,13 @@ pub fn evaluate(
             n => format!("{n} contradictions were rebutted{with}"),
         }
     });
+    s.last_confirmed_secs = latest.map(age);
     if !dispute.standing.is_empty() || !dispute.undecided.is_empty() {
         s.status = Status::Contested;
         s.why = Some(why(&dispute));
+    } else if s.outdated >= OUTDATED_AT {
+        s.status = Status::Stale;
+        s.why = Some(format!("marked outdated by {} readers", s.outdated));
     } else if fresh {
         s.status = Status::Confirmed;
         s.why = rebutted;
@@ -976,6 +1153,7 @@ fn dispute(post: &PostRef, rows: &Rows, grouping: &Grouping, missing: &mut Vec<S
                 net: post.net.clone(),
                 thread: None,
                 root_ask: false,
+                valid_for: false,
             };
             for g in positions(theirs, &attacked, grouping) {
                 let Some((weight, best)) = g.best(grouping, net, Stance::contradicts) else {
@@ -1244,6 +1422,8 @@ pub fn rank_with(
             .cmp(band_b)
             .then(entry_b.cmp(entry_a))
             .then(b.status.rank().cmp(&a.status.rank()))
+            // The votes' lower bound, not their net (ADR 0045 §6).
+            .then(b.lower_bound().total_cmp(&a.lower_bound()))
             .then(b.score.total_cmp(&a.score))
             .then(b.author_score.total_cmp(&a.author_score))
     });
@@ -1468,22 +1648,27 @@ pub(crate) mod tests {
         g.reply(1, &answer, Kind::React, json!({"used": true}));
         let s = g.signals(&answer);
         assert_eq!(s.status, Status::Confirmed);
-        assert_eq!(s.basis().as_deref(), Some("used by its asker, no evidence"));
+        assert_eq!(
+            s.basis().as_deref(),
+            Some("used by its asker, no evidence, last confirmed just now")
+        );
         g.reply(3, &answer, Kind::React, json!({"used": true}));
         assert_eq!(
             g.signals(&answer).basis().as_deref(),
-            Some("used by 1 reader, used by its asker, no evidence")
+            Some("used by 1 reader, used by its asker, no evidence, last confirmed just now")
         );
         g.confirm(4, &answer);
         assert_eq!(
             g.signals(&answer).basis().as_deref(),
-            Some("1 reader confirmed with evidence, used by 1 reader, used by its asker")
+            Some(
+                "1 reader confirmed with evidence, used by 1 reader, used by its asker, last confirmed just now"
+            )
         );
         let other = g.reply(5, &ask, Kind::Answer, json!({}));
         g.reply(1, &other, Kind::React, json!({"accept": true}));
         assert_eq!(
             g.signals(&other).basis().as_deref(),
-            Some("accepted by its asker, no evidence")
+            Some("accepted by its asker, no evidence, last confirmed just now")
         );
     }
 
@@ -2113,29 +2298,104 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn votes_decay_with_a_thirty_day_half_life() {
+    /// Votes decay with a 180-day half-life since 0.4.15 (ADR 0045 §6),
+    /// like uses and confirmations.
+    fn votes_decay_with_a_half_year_half_life() {
         let mut g = Graph::new();
         let note = g.root(2, Kind::Note, "a finding");
         g.reply(3, &note, Kind::React, json!({"value": 1}));
         let fresh = g.signals(&note);
         assert_eq!(fresh.up, 1);
-        g.later(30 * DAY);
-        let month = g.signals(&note);
+        g.later(180 * DAY);
+        let later = g.signals(&note);
         assert!(
-            (month.score / fresh.score - 0.5).abs() < 0.01,
+            (later.up_weight / fresh.up_weight - 0.5).abs() < 0.01,
             "{} then {}",
-            fresh.score,
-            month.score
+            fresh.up_weight,
+            later.up_weight
         );
-        g.later(30 * DAY);
-        assert!((g.signals(&note).score / fresh.score - 0.25).abs() < 0.01);
-        // Uses (and confirmations) decay six times slower.
-        let other = g.root(2, Kind::Note, "another");
-        g.reply(3, &other, Kind::React, json!({"used": true}));
-        let fresh = g.signals(&other).score;
-        g.later(30 * DAY);
-        let month = g.signals(&other).score;
-        assert!((month / fresh - 0.5_f64.powf(30.0 / 180.0)).abs() < 0.01);
+    }
+
+    /// ADR 0045 §6: the lower bound ranks 40/45 above 2/2, and a
+    /// still-valid answer keeps a floor while an outdated one fades.
+    #[test]
+    fn the_lower_bound_ranks_and_valid_for_keeps_a_floor() {
+        assert_eq!(wilson(0.0, 0.0), 0.0);
+        assert!(wilson(40.0, 45.0) > wilson(2.0, 2.0));
+        assert!((wilson(2.0, 2.0) - 0.342).abs() < 0.001);
+        let mut g = Graph::new();
+        let ask = g.root(1, Kind::Ask, "how?");
+        let timeless = g.reply(2, &ask, Kind::Answer, json!({"valid_for": "kotlin 2"}));
+        let plain = g.reply(2, &ask, Kind::Answer, json!({}));
+        for voter in 3..6 {
+            g.reply(voter, &timeless, Kind::React, json!({"value": 1}));
+            g.reply(voter, &plain, Kind::React, json!({"value": 1}));
+        }
+        g.later(3 * 365 * DAY);
+        let (t, p) = (g.signals(&timeless), g.signals(&plain));
+        // The floor keeps a quarter of each vote; without it, about 1/64.
+        assert!(
+            t.up_weight > 10.0 * p.up_weight,
+            "{} vs {}",
+            t.up_weight,
+            p.up_weight
+        );
+        assert!(t.lower_bound() > p.lower_bound());
+        // Two readers mark it outdated: stale, and no floor any more.
+        g.reply(6, &timeless, Kind::React, json!({"outdated": true}));
+        g.reply(7, &timeless, Kind::React, json!({"outdated": true}));
+        let t = g.signals(&timeless);
+        assert_eq!(t.outdated, 2);
+        assert_eq!(t.status, Status::Stale);
+        assert_eq!(t.why.as_deref(), Some("marked outdated by 2 readers"));
+        assert!((t.up_weight - p.up_weight).abs() < 1e-9, "{}", t.up_weight);
+    }
+
+    /// ADR 0045 §2: a bare −1 is a fifth of a vote; one with a reason, a
+    /// whole one.
+    #[test]
+    fn a_minus_one_needs_a_reason() {
+        let mut g = Graph::new();
+        let ask = g.root(1, Kind::Ask, "how?");
+        let a = g.reply(2, &ask, Kind::Answer, json!({}));
+        g.reply(3, &a, Kind::React, json!({"value": -1}));
+        let bare = g.signals(&a).down_weight;
+        let b = g.reply(2, &ask, Kind::Answer, json!({}));
+        g.reply(
+            3,
+            &b,
+            Kind::React,
+            json!({"value": -1, "evidence": "fails on v3"}),
+        );
+        let reasoned = g.signals(&b).down_weight;
+        assert!(reasoned > 0.0);
+        assert!(
+            (bare / reasoned - BARE_DOWN).abs() < 0.01,
+            "{bare} / {reasoned}"
+        );
+    }
+
+    /// ADR 0045 §1: two readers flag an ask as a duplicate, or its asker
+    /// does; one reader is not enough.
+    #[test]
+    fn duplicates_need_two_readers_or_the_asker() {
+        let mut g = Graph::new();
+        let first = g.root(1, Kind::Ask, "how do I X?");
+        let again = g.root(2, Kind::Ask, "how to X?");
+        let flag = json!({"duplicate_of": first.id});
+        g.reply(3, &again, Kind::React, flag.clone());
+        assert_eq!(g.signals(&again).duplicate_of, None);
+        g.reply(4, &again, Kind::React, flag.clone());
+        assert_eq!(
+            g.signals(&again).duplicate_of.as_deref(),
+            Some(first.id.as_str())
+        );
+        let third = g.root(5, Kind::Ask, "X, how?");
+        g.reply(5, &third, Kind::React, flag);
+        assert_eq!(
+            g.signals(&third).duplicate_of.as_deref(),
+            Some(first.id.as_str())
+        );
     }
 
     #[test]

@@ -192,6 +192,35 @@ struct Seen {
     /// Pending clarify id → when it was last shown.
     #[serde(default)]
     clarifies: BTreeMap<String, u64>,
+    /// `<accepted answer>:<why>` → when the check of that accept was shown
+    /// (ADR 0045 §8): once per reason.
+    #[serde(default)]
+    accepts: BTreeMap<String, u64>,
+}
+
+/// How many of this profile's newest asks the hook checks the accept of.
+const ACCEPT_CHECKS: usize = 20;
+
+/// Why an accepted answer deserves a second look (ADR 0045 §8): it is now
+/// contested or stale, or another answer is confirmed with evidence while
+/// it is not. `None`: the accept still stands.
+fn accept_doubt(
+    accepted: &crate::signals::Signals,
+    others: &[&crate::signals::Signals],
+) -> Option<&'static str> {
+    use crate::signals::Status;
+    match accepted.status {
+        Status::Contested => Some("is now contested"),
+        Status::Stale => Some("is now stale"),
+        _ if accepted.confirms == 0
+            && others
+                .iter()
+                .any(|o| o.status == Status::Confirmed && o.confirms > 0) =>
+        {
+            Some("has no evidence, and another answer is confirmed with evidence")
+        }
+        _ => None,
+    }
 }
 
 /// `<data dir>/hooks/seen-<profile>.json`.
@@ -352,6 +381,55 @@ fn news(request: &Request) -> Result<Option<String>> {
         }
     }
 
+    // 3. Accepts of this profile that deserve a second look (ADR 0045 §8).
+    let local: HashSet<String> = [me.clone()].into_iter().collect();
+    let grouping = crate::signals::Grouping::new(local);
+    // The newest asks only: the hook must stay fast.
+    for ask in my_asks.iter().take(ACCEPT_CHECKS) {
+        let thread = store.thread(&ask.event.id, 500)?;
+        let replies: Vec<&Event> = thread
+            .iter()
+            .map(|s| &*s.event)
+            .filter(|e| e.kind == Kind::Answer && e.author != me)
+            .collect();
+        if replies.is_empty() {
+            continue;
+        }
+        let Ok(signals) = crate::signals::compute(&store, &grouping, &replies) else {
+            continue;
+        };
+        let Some(accepted) = replies
+            .iter()
+            .find(|e| signals.get(&e.id).is_some_and(|s| s.accepts > 0))
+        else {
+            continue;
+        };
+        let others: Vec<&crate::signals::Signals> = replies
+            .iter()
+            .filter(|e| e.id != accepted.id)
+            .filter_map(|e| signals.get(&e.id))
+            .collect();
+        let Some(why) = signals
+            .get(&accepted.id)
+            .and_then(|s| accept_doubt(s, &others))
+        else {
+            continue;
+        };
+        let key = format!("{}:{why}", accepted.id);
+        if seen.accepts.contains_key(&key) {
+            continue;
+        }
+        answers.push(Item {
+            id: accepted.id.clone(),
+            line: format!(
+                "check your accept on \"{}\": the answer you accepted {why}; keep it, or \
+                 accept another",
+                short(&title(&ask.event), 60)
+            ),
+            marks: vec![format!("accept:{key}")],
+        });
+    }
+
     let text = render(&request.profile, &clarifies, &answers);
     seen.last_call = now;
     if let Some((_, shown_clarifies, shown_answers)) = &text {
@@ -359,7 +437,10 @@ fn news(request: &Request) -> Result<Option<String>> {
             seen.clarifies.insert(id.clone(), now);
         }
         for id in shown_answers {
-            seen.answers.insert(id.clone(), now);
+            match id.strip_prefix("accept:") {
+                Some(key) => seen.accepts.insert(key.to_string(), now),
+                None => seen.answers.insert(id.clone(), now),
+            };
         }
     }
     if request.mark_seen {
@@ -1439,6 +1520,34 @@ mod tests {
         let removed = codex_remove(&fresh).unwrap().unwrap();
         assert!(!removed.contains("hooks.SessionStart"), "{removed}");
         assert!(!removed.contains("[hooks"), "{removed}");
+    }
+
+    /// ADR 0045 §8: when an accept deserves a second look.
+    #[test]
+    fn accept_doubts() {
+        use crate::signals::{Signals, Status};
+        let with = |status: Status, confirms: u64| Signals {
+            status,
+            confirms,
+            ..Signals::default()
+        };
+        let fine = with(Status::Confirmed, 0);
+        assert_eq!(accept_doubt(&fine, &[]), None);
+        assert_eq!(
+            accept_doubt(&with(Status::Contested, 0), &[]),
+            Some("is now contested")
+        );
+        assert_eq!(
+            accept_doubt(&with(Status::Stale, 0), &[]),
+            Some("is now stale")
+        );
+        let better = with(Status::Confirmed, 1);
+        assert!(
+            accept_doubt(&fine, &[&better])
+                .unwrap()
+                .contains("with evidence")
+        );
+        assert_eq!(accept_doubt(&with(Status::Confirmed, 1), &[&better]), None);
     }
 
     #[test]

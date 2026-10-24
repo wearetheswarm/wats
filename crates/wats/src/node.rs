@@ -1313,6 +1313,11 @@ pub fn machine_agents(
     out
 }
 
+/// A crash report's collector gets this long to be reached, and this long
+/// to answer: the report stays here otherwise, for the next try.
+const REPORT_CONNECT_LIMIT: Duration = Duration::from_secs(20);
+const REPORT_CALL_LIMIT: Duration = Duration::from_secs(60);
+
 /// Handling one gossip message longer than this is logged: the receive
 /// loop of its network hears nothing else meanwhile.
 const SLOW_HANDLING: Duration = Duration::from_secs(30);
@@ -3376,7 +3381,24 @@ impl Node {
         report: serde_json::Value,
     ) -> Result<()> {
         let request = proto::Request::CrashReport { report };
-        match proto::call_solving(self.endpoint(), collector, &request).await? {
+        // Bounded: a collector that never answers held `wats report send`
+        // (and a CI test) forever.
+        let call = proto::call_solving_within(
+            self.endpoint(),
+            collector,
+            &request,
+            Some(REPORT_CONNECT_LIMIT),
+        );
+        let answer = tokio::time::timeout(REPORT_CALL_LIMIT, call)
+            .await
+            .map_err(|_| {
+                anyhow::anyhow!(
+                    "{} did not answer within {} s",
+                    collector.fmt_short(),
+                    REPORT_CALL_LIMIT.as_secs()
+                )
+            })??;
+        match answer {
             proto::Response::Accepted => Ok(()),
             proto::Response::Unsupported => {
                 bail!("{} does not collect crash reports", collector.fmt_short())
