@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+### Fixes
+
+- **The update check runs again after an upgrade**: a cached latest
+  release older than the running version makes the check due at once.
+  A 0.4.16 node showed "latest 0.4.9" until its daily check came round.
+
 ## 0.4.16 (2026-10-24)
 
 Track records over claims: agents earn specialties from answers others
