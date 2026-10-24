@@ -10,6 +10,12 @@
 //!   and that this node has not heard for [`SILENT_ROUNDS`] rounds gets a
 //!   fresh gossip connection. Nodes before 0.4.11 drop the ping as an
 //!   invalid envelope, and are never judged by it.
+//! - **One-sided links (0.4.14).** A neighbor still silent after its
+//!   fresh connection most likely does not count this node as its own
+//!   neighbor (its active view is full): it sends nothing, and a reset
+//!   every [`RESET_EVERY`] changes nothing. It is marked one-sided, logged
+//!   once and not reset again, until it is heard from. `status` lists the
+//!   neighbors with when each was last heard.
 //! - **A fresh connection** ([`Node::reset_link`]) becomes the active
 //!   one on both sides, as after a reconnect. At most every
 //!   [`RESET_EVERY`] per neighbor; anti-entropy uses it too, for a
@@ -28,7 +34,7 @@ use std::time::{Duration, Instant};
 use iroh::endpoint::TransportAddrUsage;
 use iroh::{EndpointId, TransportAddr};
 use serde::Deserialize;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use super::Node;
 use crate::proto;
@@ -62,6 +68,10 @@ pub struct Links {
     pings_sent: std::sync::atomic::AtomicU64,
     pings_failed: std::sync::atomic::AtomicU64,
     pings_heard: std::sync::atomic::AtomicU64,
+    /// Neighbors reset and not heard from since, per network.
+    awaiting: Mutex<std::collections::HashSet<(String, EndpointId)>>,
+    /// Neighbors silent even after their reset: one-sided links.
+    one_sided: Mutex<std::collections::HashSet<(String, EndpointId)>>,
 }
 
 /// The window of the `status` counters.
@@ -111,6 +121,23 @@ pub fn summary(gossip: &serde_json::Value) -> String {
             " · {} link reset(s): {}",
             resets.len(),
             peers.join(", ")
+        ));
+    }
+    let one_sided: Vec<String> = gossip
+        .get("neighbors")
+        .and_then(Value::as_object)
+        .into_iter()
+        .flat_map(|nets| nets.values())
+        .filter_map(Value::as_array)
+        .flatten()
+        .filter(|n| n.get("one_sided").and_then(Value::as_bool) == Some(true))
+        .filter_map(|n| str_of(n, "peer").and_then(|p| p.get(..10).map(str::to_string)))
+        .collect();
+    if !one_sided.is_empty() {
+        line.push_str(&format!(
+            " · {} one-sided link(s), not reset again: {}",
+            one_sided.len(),
+            one_sided.join(", ")
         ));
     }
     if let Some(pings) = gossip.get("pings") {
@@ -246,6 +273,14 @@ impl Node {
                 "failed": self.links.pings_failed.load(Relaxed),
                 "heard": self.links.pings_heard.load(Relaxed),
             },
+            "neighbors": self
+                .joined_nets()
+                .into_iter()
+                .map(|net| {
+                    let list = self.neighbors_json(&net);
+                    (net, list)
+                })
+                .collect::<serde_json::Map<String, serde_json::Value>>(),
         });
         if late > LATE_FLAG
             && let Some(map) = out.as_object_mut()
@@ -268,9 +303,40 @@ impl Node {
 
     /// `peer` delivered a gossip message on `net`.
     pub(super) fn heard(&self, net: &str, peer: EndpointId) {
+        let key = (net.to_string(), peer);
         if let Ok(mut heard) = self.links.heard.lock() {
-            heard.insert((net.to_string(), peer), Instant::now());
+            heard.insert(key.clone(), Instant::now());
         }
+        if let Ok(mut awaiting) = self.links.awaiting.lock() {
+            awaiting.remove(&key);
+        }
+        if let Ok(mut one_sided) = self.links.one_sided.lock()
+            && one_sided.remove(&key)
+        {
+            info!(%net, peer = %peer.fmt_short(), "gossip link heard from again: no longer one-sided");
+        }
+    }
+
+    /// The gossip neighbors of `net`, for `status` (0.4.14): each one's id,
+    /// seconds since it was last heard (`None`: never), whether it pings,
+    /// and whether its link looks one-sided.
+    pub fn neighbors_json(&self, net: &str) -> serde_json::Value {
+        let heard = self.links.heard.lock().ok();
+        let one_sided = self.links.one_sided.lock().ok();
+        let list: Vec<serde_json::Value> = self
+            .neighbors_of(net)
+            .into_iter()
+            .map(|peer| {
+                let key = (net.to_string(), peer);
+                serde_json::json!({
+                    "peer": peer.to_string(),
+                    "heard_secs_ago": heard.as_ref().and_then(|h| h.get(&key)).map(|t| t.elapsed().as_secs()),
+                    "pings": self.has_feature(&peer, proto::FEATURE_GOSSIP_PING),
+                    "one_sided": one_sided.as_ref().is_some_and(|o| o.contains(&key)),
+                })
+            })
+            .collect();
+        serde_json::Value::Array(list)
     }
 
     /// Give `peer` a fresh gossip connection, at most every
@@ -303,8 +369,15 @@ impl Node {
                     }
                 }
                 info!(%net, peer = %peer.fmt_short(), "gossip link looked dead ({why}): reconnected");
-                // A grace before it is judged again.
-                self.heard(net, peer);
+                // A grace before it is judged again; then, still silent, it
+                // is one-sided.
+                let key = (net.to_string(), peer);
+                if let Ok(mut heard) = self.links.heard.lock() {
+                    heard.insert(key.clone(), Instant::now());
+                }
+                if let Ok(mut awaiting) = self.links.awaiting.lock() {
+                    awaiting.insert(key);
+                }
                 true
             }
             Err(e) => {
@@ -371,6 +444,23 @@ impl Node {
             })
             .unwrap_or_default();
         for peer in silent {
+            let key = (net.to_string(), peer);
+            if self.links.one_sided.lock().is_ok_and(|o| o.contains(&key)) {
+                continue;
+            }
+            // Reset already, and silent since: a fresh link changes nothing.
+            if self.links.awaiting.lock().is_ok_and(|mut a| a.remove(&key)) {
+                if let Ok(mut one_sided) = self.links.one_sided.lock() {
+                    one_sided.insert(key);
+                }
+                warn!(
+                    %net,
+                    peer = %peer.fmt_short(),
+                    "gossip neighbor still silent after a fresh link: it likely does not count \
+                     this node as its neighbor (a one-sided link); not reset again until heard"
+                );
+                continue;
+            }
             let why = format!("nothing heard from it for {} s", silent_after.as_secs());
             self.reset_link(net, peer, &why).await;
         }
@@ -527,6 +617,20 @@ mod tests {
             "degraded: 9 events arrived late (anti-entropy brought what gossip had not) · 3 new \
              events by gossip, 9 late by anti-entropy (last hour) · 1 link reset(s): 9f5d9e24df \
              (nothing heard from it for 180 s)"
+        );
+        let one_sided = serde_json::json!({
+            "last_hour": {"by_gossip": 5, "by_anti_entropy": 0},
+            "resets": [],
+            "pings": {"sent": 30, "failed": 0, "heard": 100},
+            "neighbors": {"public": [
+                {"peer": "bf0910a6bbfc00", "heard_secs_ago": 900, "pings": true, "one_sided": true},
+                {"peer": "5962b85866aa00", "heard_secs_ago": 20, "pings": true, "one_sided": false},
+            ]},
+        });
+        assert_eq!(
+            summary(&one_sided),
+            "5 new events by gossip, 0 late by anti-entropy (last hour) · 1 one-sided link(s), \
+             not reset again: bf0910a6bb · pings: 30 sent, 0 failed, 100 heard (since start)"
         );
     }
 

@@ -130,6 +130,12 @@ answer's standing on other nodes. The options then: an owner name asked
 once by setup and declared by every profile (it can only lower weight),
 or an automatic owner per machine.
 
+**Preferred direction if reopened (Vincent):** an optional wats login
+before joining the network, through an existing identity such as
+Discord, which is then the owner every time. Always optional: the
+network works without it, and so without any service run by the
+project. Nothing to build now.
+
 ## Questions for Vincent (answered 2026-10-24: the recommendations)
 
 Implemented: Q1 as `basis` (`Signals::basis`) in `search`, `wait` and

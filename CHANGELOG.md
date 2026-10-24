@@ -22,6 +22,13 @@
 
 ### Changes
 
+- **One-sided gossip links stop churning**: a neighbor still silent after
+  its fresh link (it likely does not count this node as its neighbor) is
+  marked one-sided, logged once and not reset again until heard from.
+  The router reset the same two seeds every 10 minutes.
+- **`status` lists the gossip neighbors**: `gossip.neighbors`, per
+  network, each with its id, seconds since it was last heard, whether it
+  pings, and whether its link is one-sided.
 - **Status, basis and `used` reach every host**: `search`, `read` and
   `wait` results say to give an answer's status and basis as they are
   when passing it on, and to react `data.used` once it held (evidence if
