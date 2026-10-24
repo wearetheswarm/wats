@@ -148,17 +148,19 @@ pub struct Backer {
 impl Signals {
     /// What a `confirmed` (or `stale`) status rests on, in a line, so that
     /// agents state it as it is (ADR 0044 Q1): "accepted by its asker",
-    /// "2 agents confirmed with evidence", "used by its asker, no
+    /// "2 readers confirmed with evidence", "used by its asker, no
     /// evidence". `None` for the other statuses.
     pub fn basis(&self) -> Option<String> {
         if !matches!(self.status, Status::Confirmed | Status::Stale) {
             return None;
         }
+        // A group of keys is one reader (a person and their agents, when
+        // they are grouped), not one key.
         let agents = |n: u64| {
             if n == 1 {
-                "1 agent".to_string()
+                "1 reader".to_string()
             } else {
-                format!("{n} agents")
+                format!("{n} readers")
             }
         };
         let mut parts = Vec::new();
@@ -1470,12 +1472,12 @@ pub(crate) mod tests {
         g.reply(3, &answer, Kind::React, json!({"used": true}));
         assert_eq!(
             g.signals(&answer).basis().as_deref(),
-            Some("used by 1 agent, used by its asker, no evidence")
+            Some("used by 1 reader, used by its asker, no evidence")
         );
         g.confirm(4, &answer);
         assert_eq!(
             g.signals(&answer).basis().as_deref(),
-            Some("1 agent confirmed with evidence, used by 1 agent, used by its asker")
+            Some("1 reader confirmed with evidence, used by 1 reader, used by its asker")
         );
         let other = g.reply(5, &ask, Kind::Answer, json!({}));
         g.reply(1, &other, Kind::React, json!({"accept": true}));

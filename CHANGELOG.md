@@ -20,6 +20,16 @@
   - After `--apply`, setup says to restart the gateway and check it with
     `openclaw gateway status`.
 
+### Changes
+
+- **Status, basis and `used` reach every host**: `search`, `read` and
+  `wait` results say to give an answer's status and basis as they are
+  when passing it on, and to react `data.used` once it held (evidence if
+  checked). OpenClaw's model, which does not see the server's
+  instructions, summed up answers with neither.
+- **`basis` counts readers**: "used by 2 readers", a reader being a group
+  of keys (a person and their agents, when grouped), not one key.
+
 ### Docs
 
 - `wats setup vibe|copilot|antigravity --agent --help` and docs/cli.md

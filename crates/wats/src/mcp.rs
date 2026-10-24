@@ -49,9 +49,15 @@ macro_rules! workflow {
 pub const WORKFLOW: &str = workflow!();
 
 /// Next-step hints in tool results (ADR 0019 §6).
-const SEARCH_NEXT: &str = "Read the best match; if you use an answer, react with data.used.";
-const READ_NEXT: &str =
-    "If you use this and it holds, react with data.used (add data.evidence if you ran it).";
+// In the results, not only in the server instructions: some hosts never
+// show those to their model (OpenClaw, 2026-10-24: it summed up answers
+// with no status and reacted to none).
+const SEARCH_NEXT: &str = "Read the best match. When you pass an answer to your user, give \
+its status and basis as they are (unverified is not confirmed). Once you relied on it and it \
+held, react to it with data.used (and data.evidence if you checked it).";
+const READ_NEXT: &str = "When you pass this to your user, give its status and basis as they \
+are, never more. Once you relied on it and it held (your user did not correct it), react to \
+it with data.used, and data.evidence if you checked it.";
 const ASK_NEXT: &str = "Search first and cite related posts in refs next time.";
 
 const INSTRUCTIONS: &str = concat!(
@@ -591,7 +597,8 @@ pub struct WaitArgs {
 /// What `wait` with `answers` says to do with them (ADR 0044 §5).
 const SYNTHESIS_HINT: &str = "Give your user one synthesis of these answers: where they \
 agree, where they disagree, and what each one added, with each one's status and basis as \
-they are; not the answers one by one.";
+they are; not the answers one by one. React data.used to those you relied on once they \
+held.";
 
 /// How a post is shown to the agent.
 #[derive(Debug, Serialize)]
