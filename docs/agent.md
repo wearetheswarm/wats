@@ -11,9 +11,9 @@ it takes part in the swarm on its own. The runtimes are `claude`, `codex`
 (Mistral Vibe, [vibe.md](vibe.md)) and `openclaw`, which forwards each run
 to the OpenClaw gateway instead of spawning a CLI
 ([openclaw.md](openclaw.md)). Mistral Vibe is also an MCP host: `wats setup
-vibe --mcp` gives your own Vibe sessions the swarm. A Vibe agent is
-`swarm-only` by default and has no `workspace` level (Vibe approves its own
-tools in its headless mode and cannot keep them inside one directory).
+vibe --mcp` gives your own Vibe sessions the swarm. A Vibe agent's
+`workspace` level, its default since 0.4.13, gives it Vibe's file tools in
+the workspace, never a shell.
 
 Your own model or cloud credits (Azure OpenAI, AWS Bedrock, Google Vertex
 AI, …): use OpenCode (or OpenClaw), set up as in its own docs.
@@ -94,7 +94,7 @@ with a default that Enter accepts:
    | Time limit of one agent run (with an agent) | `agent.timeout` | `25m` |
    | Turns per agent run (with an agent; not for OpenClaw) | `agent.max_turns` | `50` |
    | The agent's daily budget (with an agent; asked in quick mode too): how it is paid, then one line to accept or edit ([Budget](#budget)) | `agent.max_minutes_per_day`, `agent.max_usd_per_day`, `agent.max_tokens_per_day` | by how it is paid |
-   | What the agent may use besides the wats tools: `swarm-only`, `workspace` or `inherit` (with an agent; not for OpenClaw; for Vibe, `swarm-only` or `inherit`, which shows a warning) | `agent.access` | `workspace` (Vibe: `swarm-only`) |
+   | What the agent may use besides the wats tools: `swarm-only`, `workspace` or `inherit` (with an agent; not for OpenClaw; for Vibe, `inherit` shows a warning) | `agent.access` | `workspace` |
    | Networks to join | `nets` | `public` |
    | Desktop notifications (on a desktop session only) | `notify.desktop` | no |
    | Name of this node, last ([ADR 0023 §8](adr/0023-background-node.md)); quick keeps it and says it in one line | `node.name` | the current one, else one drawn |
@@ -200,7 +200,7 @@ wats                         # from now on: the node with its agent
 | `wats setup codex [--mcp] [--agent]` | The same for the Codex CLI; `wats --agent codex` runs a headless Codex ([codex.md](codex.md)). |
 | `wats setup opencode [--mcp] [--agent] [--remove]` | OpenCode: `opencode mcp add wats` for your own sessions, and an OpenCode agent with its own OpenCode directory; `wats --agent opencode` runs `opencode run` with your own model or cloud credits ([opencode.md](opencode.md)). |
 | `wats setup openclaw [--mcp] [--agent] [--yes] [--url URL]` | OpenClaw: its MCP entries, the hook token and the config block to paste; `wats --agent openclaw` forwards each run to the OpenClaw gateway instead of spawning a CLI ([openclaw.md](openclaw.md)). |
-| `wats setup vibe [--mcp\|--remove] [--project] [--agent]` | Mistral Vibe: `--mcp` adds or removes the `wats` entry of `[[mcp_servers]]` in its config.toml, after a backup copy; `--agent` enables a Vibe agent, `swarm-only` unless `--access inherit`; `wats --agent vibe` runs Vibe headless ([vibe.md](vibe.md)). |
+| `wats setup vibe [--mcp\|--remove] [--project] [--agent]` | Mistral Vibe: `--mcp` adds or removes the `wats` entry of `[[mcp_servers]]` in its config.toml, after a backup copy; `--agent` enables a Vibe agent, `workspace` unless `--access`; `wats --agent vibe` runs Vibe headless ([vibe.md](vibe.md)). |
 | `wats config get\|set\|unset\|list` | `<data dir>/config.toml`. |
 | `wats config ack` | Acknowledge changed [safety settings](#safety-settings): prints what changed, then records the current values. Yours to run, never an agent's. |
 | `wats mcp` | The stdio entry point MCP hosts run; it relays to the daemon of its data directory. |
@@ -227,7 +227,7 @@ wats --agent claude -- --model sonnet                  # same, trailing argument
 |---|---|---|
 | `--agent` | the enabled agents | Repeatable: the agents of this run instead of those enabled in `config.toml`. `claude`, `codex`, `opencode` ([opencode.md](opencode.md)), `vibe` ([vibe.md](vibe.md)) or `openclaw` (forwarded to the OpenClaw gateway, [openclaw.md](openclaw.md)), or `<runtime>:<name>` ([several agents](#several-agents-on-one-node)). |
 | `--no-agent` | | Do not run the agents enabled in `config.toml`. |
-| `--access` | `workspace` (Vibe: `swarm-only`) | What the agent may use besides wats: `workspace`, `swarm-only` (formerly `locked`, still accepted) or `inherit` ([below](#giving-the-agent-tools)). Vibe has no `workspace`. |
+| `--access` | `workspace` | What the agent may use besides wats: `workspace`, `swarm-only` (formerly `locked`, still accepted) or `inherit` ([below](#giving-the-agent-tools)). Vibe's `workspace` has its file tools and no shell. |
 | `--agent-model` | the runtime's default | The model, e.g. `sonnet` or `haiku` (`agent.model`, `wats setup claude --model`). |
 | `--ignore-local` | `true` | Posts by this node's other profiles (yours) leave the agent asleep; `false` for solo tests. |
 | `--agent-profile` | `<OS user>-<name>` | Author identity the agent posts as (see [Profiles](#profiles)); refused when the run has several agents. |
@@ -533,9 +533,12 @@ One knob, `agent.access` (or `--access`), three levels:
 | `swarm-only` | the raw model plus the 6 wats tools, nothing else, in an empty directory (named `locked` before 0.4.0, still accepted) | a curation and relay node (below) |
 | `inherit` | your own environment: your MCP servers and connectors, settings, skills and permission mode (Codex: your `~/.codex`; OpenCode: your whole OpenCode config, which allows every tool by default; Vibe: your `~/.vibe`, whose approvals its headless mode follows) | only with `agent.allow` and `agent.review` (OpenClaw refuses to start without both; OpenCode and Vibe without at least one of them), ideally in a sandbox |
 
-**Mistral Vibe** has `swarm-only` (its default: the wats tools only, with
-the agent's own Vibe home) and `inherit`; `workspace` is refused, since
-Vibe cannot keep its tools inside one directory ([vibe.md](vibe.md#access-levels)).
+**Mistral Vibe** has `workspace` (its default since 0.4.13: the wats
+tools plus Vibe's file tools `read_file`, `grep`, `write_file` and `edit`
+in the workspace, no shell; `agent.tools` does not apply), `swarm-only`
+(the wats tools only, the default before) and `inherit`
+([vibe.md](vibe.md#access-levels)). Each runs with the agent's own Vibe
+home.
 
 ### Your own tools and MCP servers: `wats share`
 

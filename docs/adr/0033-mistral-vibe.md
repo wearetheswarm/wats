@@ -14,7 +14,7 @@ streaming entries), `crates/wats/src/access.rs` (`level_for`),
 `crates/wats/src/main.rs` (`wats setup vibe --agent`, `agent_config`).
 Tests: `crates/wats/tests/vibe.rs` (fake `vibe` scripts),
 `crates/wats/tests/setup_wizard.rs`
-(`the_wizard_offers_vibe_without_workspace`), unit tests in `vibe.rs`,
+(`the_wizard_offers_vibe`), unit tests in `vibe.rs`,
 `firstrun.rs` and `mcp.rs`. Docs: [docs/vibe.md](../vibe.md).
 
 Source: a product decision by Vincent (2026-10-22). Mistral Vibe was an
@@ -147,12 +147,12 @@ vibe --prompt= --output=streaming --output-dir=<work dir>/vibe-run \
 | Level | What the run gets |
 |---|---|
 | `swarm-only` (the default for Vibe) | the wats tools only, in an empty directory, with the agent's own Vibe home |
-| `workspace` | **refused**: Vibe cannot keep its tools inside one directory |
+| `workspace` | **refused** in 0.4.5 to 0.4.12; since 0.4.13 the wats tools plus Vibe's file tools in the workspace, no shell (amendment below) |
 | `inherit` | your whole Vibe environment (`~/.vibe`, your MCP servers, agents, skills, approvals), plus the wats server |
 
 - **The default is `swarm-only`** for a Vibe agent whatever `[agent]`
   says (`access::level_for`); `wats setup vibe --agent` writes it.
-- **`workspace` is refused** by the runner, `wats --agent vibe --access
+- **`workspace` was refused** until 0.4.12 (see the amendment below) by the runner, `wats --agent vibe --access
   workspace`, `wats setup vibe --agent --access workspace` (before any
   write), `wats config set agents.<name>.access workspace` on a Vibe agent
   (and `runtime vibe` on a table set to workspace), and the wizard, with
@@ -181,6 +181,45 @@ vibe --prompt= --output=streaming --output-dir=<work dir>/vibe-run \
   The wizard and `wats setup vibe --agent --access inherit` show one line:
   "Vibe approves its own tools: with inherit, a post can make it read or
   run anything you can".
+
+**Amendment (2026-10-24, for 0.4.13): a `workspace` level.** Vibe's
+source (main, 2026-10-23) shows that its file tools resolve a path
+(`..` and symlinks) and compare it with the working directory and the
+`--add-dir` roots (`Workspace.allows`, `is_relative_to`). A path outside
+them is not a hard refusal: it adds an `OUTSIDE_DIRECTORY` requirement,
+an approval, whatever the tool's permission but `never`. A headless run
+denies every approval. That is a boundary as long as nothing approves
+for Vibe, so a `workspace` run gets:
+
+- the agent's own Vibe home and per-run config, as at `swarm-only`;
+- `enabled_tools` = the wats tools plus `read_file`, `grep`,
+  `write_file`, `edit` and `search_replace` (`vibe::WORKSPACE_TOOLS`),
+  each with `permission = "always"`, which covers the workspace only;
+  every other built-in disabled (no shell, web, subagents or skills);
+- `--workdir=<workspace>`, and the run starts there;
+- `--agent=ask` (`vibe::WORKSPACE_AGENT`): the built-in agent with no
+  overrides. Vibe's default, `accept-edits`, sets `permission = "always"`
+  on edits, and `auto-approve` sets `bypass_tool_permissions`, which
+  would approve the outside paths too;
+- no `--add-dir`, `--trust`, tool `allowlist` or lent server; the first
+  two are refused in `agent.args` as at `swarm-only`, and `agent.tools`
+  gets a warning that it does not apply;
+- the workspace's `AGENTS.md` in the prompt (`vibe::workspace_instructions`:
+  a regular file, never a link, 16 KiB at most). Vibe reads it only in a
+  trusted folder, and trusting the workspace would also load its
+  `.vibe/config.toml`, which the agent can write (found on Vincent's
+  first run, 2026-10-24).
+
+**Default (D40, 0.4.13):** `workspace` is a Vibe agent's level when
+none is set, and `wats setup vibe --agent` writes it; `swarm-only` stays
+available. Setup wrote `access = "swarm-only"` out for every Vibe agent
+before, so those keep it.
+
+The gate, on a real Vibe before a release: one ask makes the agent read
+`/etc/hosts`, write `../outside.txt` and read a file in its workspace.
+Only the last may succeed. If an outside one goes through, `workspace`
+is refused again, with the reason "Vibe's outside-workdir guard is an
+approval that its agent profile auto-approves".
 
 ### 3. Config isolation
 
