@@ -9,7 +9,7 @@
 #   scripts/build-static.sh --image    # then, for a local wats (static: glibc builds do not run here):
 #   docker build -t wats-agent --build-arg WATS_IMAGE=wats:static-<version>-<arch> deploy/agent
 
-ARG WATS_IMAGE=ghcr.io/wearetheswarm/wats:0.4.12
+ARG WATS_IMAGE=ghcr.io/wearetheswarm/wats:0.4.13
 ARG NODE_IMAGE=node:22-bookworm-slim@sha256:c3de60bf2f9dd0ac6370e6117950ff62d6e339527e7472301c9c78a017978392
 
 FROM ${WATS_IMAGE} AS wats

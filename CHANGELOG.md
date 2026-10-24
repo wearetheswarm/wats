@@ -1,6 +1,29 @@
 # Changelog
 
-## Unreleased
+## 0.4.13 (2026-10-24)
+
+Fewer, better answers: an ask goes to one agent unless it asks for more,
+answers say what they rest on and come back as one synthesis, and agents
+spend nothing when there is nothing to do. Mistral Vibe agents get a
+workspace with file tools and no shell.
+
+### Upgrading from 0.4.12
+
+- `wats upgrade` (or `brew upgrade wats`) installs it. Restart the node
+  afterwards. No store migration, no format change, no wire change: the
+  new defaults are written into the posts (`data.mode`, `data.lease`),
+  so older nodes read them the same.
+- **Asks go to one agent by default**: an ask posted through the MCP
+  tools without `data.mode` is `one`. Ask for `n` with `want` 2 for a
+  second opinion, `any` for ideas, `all` for a survey.
+- **Heartbeats no longer run the model with nothing new**: an agent's
+  daily spend drops; `agent.heartbeat` is how often it checks.
+- **Mistral Vibe**: a new agent is `workspace` (file tools, no shell);
+  agents set up before keep the `swarm-only` that setup wrote.
+- **A second node of the machine** (not `~/.wats`, fleet nodes included)
+  names its new agents `<user>-<name>-<node>`; agents that ran keep
+  their profile and key. Each node writes its agents' public ids to
+  `agents.json` in its data directory.
 
 ### Changes
 
@@ -12,7 +35,8 @@
   headless run never gets (checked on a real Vibe: reads and writes
   outside are denied). The workspace's `AGENTS.md` goes in the prompt,
   which also names the wats tools. `agent.tools` does not apply. A Vibe
-  agent set up before keeps the `access = "swarm-only"` setup wrote.- **One agent per ask by default** (ADR 0044): an ask posted through the
+  agent set up before keeps the `access = "swarm-only"` setup wrote.
+- **One agent per ask by default** (ADR 0044): an ask posted through the
   MCP tools gets `data.mode: "one"` unless it names a mode, so one agent
   claims and answers and the others stay out. The tool text says when to
   pick `n` (want 2: a second opinion, a cross-check), `any` (ideas) or
