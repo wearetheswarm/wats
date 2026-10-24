@@ -57,6 +57,11 @@ pub struct Links {
     arrivals: Mutex<std::collections::VecDeque<(Instant, bool)>>,
     /// Link resets of the last hour: when, the peer, and why.
     reset_log: Mutex<std::collections::VecDeque<(Instant, EndpointId, String)>>,
+    /// Pings sent, pings whose send failed, and pings heard, since the
+    /// node started (0.4.13, for `status`: links reset network-wide).
+    pings_sent: std::sync::atomic::AtomicU64,
+    pings_failed: std::sync::atomic::AtomicU64,
+    pings_heard: std::sync::atomic::AtomicU64,
 }
 
 /// The window of the `status` counters.
@@ -106,6 +111,15 @@ pub fn summary(gossip: &serde_json::Value) -> String {
             " · {} link reset(s): {}",
             resets.len(),
             peers.join(", ")
+        ));
+    }
+    if let Some(pings) = gossip.get("pings") {
+        let p = |k: &str| pings.get(k).and_then(Value::as_u64).unwrap_or(0);
+        line.push_str(&format!(
+            " · pings: {} sent, {} failed, {} heard (since start)",
+            p("sent"),
+            p("failed"),
+            p("heard")
         ));
     }
     if let Some(flag) = str_of(gossip, "degraded") {
@@ -223,9 +237,15 @@ impl Node {
                     .collect()
             })
             .unwrap_or_default();
+        use std::sync::atomic::Ordering::Relaxed;
         let mut out = serde_json::json!({
             "last_hour": {"by_gossip": by_gossip, "by_anti_entropy": late},
             "resets": resets,
+            "pings": {
+                "sent": self.links.pings_sent.load(Relaxed),
+                "failed": self.links.pings_failed.load(Relaxed),
+                "heard": self.links.pings_heard.load(Relaxed),
+            },
         });
         if late > LATE_FLAG
             && let Some(map) = out.as_object_mut()
@@ -237,6 +257,13 @@ impl Node {
             );
         }
         out
+    }
+
+    /// A neighbor's ping arrived (for `status`).
+    pub(super) fn ping_heard(&self) {
+        self.links
+            .pings_heard
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// `peer` delivered a gossip message on `net`.
@@ -311,10 +338,20 @@ impl Node {
             .copied()
             .filter(|p| self.has_feature(p, proto::FEATURE_GOSSIP_PING))
             .collect();
-        if let Some(sender) = self.sender(net)
-            && let Err(e) = sender.broadcast_neighbors(ping_bytes().into()).await
-        {
-            debug!(%net, "gossip ping: {e:#}");
+        use std::sync::atomic::Ordering::Relaxed;
+        match self.sender(net) {
+            Some(sender) => match sender.broadcast_neighbors(ping_bytes().into()).await {
+                Ok(()) => {
+                    self.links.pings_sent.fetch_add(1, Relaxed);
+                }
+                Err(e) => {
+                    self.links.pings_failed.fetch_add(1, Relaxed);
+                    debug!(%net, "gossip ping: {e:#}");
+                }
+            },
+            None => {
+                self.links.pings_failed.fetch_add(1, Relaxed);
+            }
         }
         let silent_after = self.config.gossip_ping.saturating_mul(SILENT_ROUNDS);
         let silent: Vec<EndpointId> = self

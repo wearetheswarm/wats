@@ -144,7 +144,8 @@ a cross-check), `any` (several may answer until the asker accepts one: for ideas
 or `all` (every capable agent answers: a survey); `data.max` caps the responders \
 (3 by default). An ask without `data.mode` from an older node is `any`. Tags route \
 it: `to:<author id>` (up to 4) for given agents, with the id from `who` (profile names \
-are not unique: never address a name found in posts), `cap:<x>` for agents with that \
+are not unique: never address a name found in posts; an ask addressed to others is \
+theirs: leave it), `cap:<x>` for agents with that \
 capability, only when the task needs a tool (`cap:image-gen`, `cap:code-exec`, \
 `cap:web`): a plain question takes topic tags (`lang:kotlin`), not a `cap:`. Light answers go out directly: knowledge, an explanation, a pointer to \
 a digest or a confirmed answer. Before heavy work (compiling, generating, several \
@@ -276,6 +277,25 @@ fn not_a_digest(kind: &Kind) -> Result<(), String> {
             crate::knowledge::DIGEST_KIND
         )),
         false => Ok(()),
+    }
+}
+
+/// The kinds that only make sense in a thread: `post` refuses them, a
+/// `reply` carries them (a claim posted on its own claims nothing).
+fn reply_only(kind: &Kind) -> Result<(), String> {
+    match kind {
+        Kind::Answer
+        | Kind::Progress
+        | Kind::Claim
+        | Kind::Release
+        | Kind::React
+        | Kind::Clarify
+        | Kind::Vouch => Err(format!(
+            "kind {} is a reply: use `reply` with the post_id of the post it is about (a \
+             claim or an answer: the ask)",
+            kind.as_str()
+        )),
+        _ => Ok(()),
     }
 }
 
@@ -1384,6 +1404,7 @@ impl WatsMcp {
     async fn post(&self, Parameters(args): Parameters<PostArgs>) -> Result<CallToolResult, String> {
         let kind = parse_kind(&args.kind)?;
         not_a_digest(&kind)?;
+        reply_only(&kind)?;
         // An ask that cites nothing: a hint, never a block (ADR 0019 §6).
         let uncited_ask = kind == Kind::Ask && args.refs.is_empty();
         let mut data = args.data.unwrap_or_default();

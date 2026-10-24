@@ -1730,3 +1730,71 @@ async fn a_silent_gossip_neighbor_gets_a_fresh_link() -> anyhow::Result<()> {
     }
     Ok(())
 }
+
+/// Pings keep a quiet link alive (0.4.13 check): two nodes that both ping
+/// every 300 ms, with nothing else to say, never judge each other silent.
+#[tokio::test(flavor = "multi_thread")]
+async fn pings_keep_a_quiet_link_alive() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let mut b_config = config(&dir.path().join("b"), &[]);
+    b_config.gossip_ping = Duration::from_millis(300);
+    let b = Node::start(b_config).await?;
+    let mut a_config = config(&dir.path().join("a"), &[&b]);
+    a_config.gossip_ping = Duration::from_millis(300);
+    let a = Node::start(a_config).await?;
+    eventually("A and B are gossip neighbors", 30, || {
+        (a.neighbor_count(PUBLIC_NET) > 0 && b.neighbor_count(PUBLIC_NET) > 0).then_some(())
+    })
+    .await;
+    // Ten rounds; three silent ones reset a link.
+    tokio::time::sleep(Duration::from_secs(4)).await;
+    assert_eq!(a.link_resets(), 0, "A: {}", a.gossip_json());
+    assert_eq!(b.link_resets(), 0, "B: {}", b.gossip_json());
+    // `status` counts them (0.4.13).
+    for n in [&a, &b] {
+        let pings = &n.gossip_json()["pings"];
+        assert!(pings["sent"].as_u64() > Some(3), "{pings}");
+        assert!(pings["heard"].as_u64() > Some(3), "{pings}");
+        assert_eq!(pings["failed"], 0, "{pings}");
+    }
+    for node in [a, b] {
+        node.shutdown().await?;
+    }
+    Ok(())
+}
+
+/// Experiment: a quiet mesh like the seeds' (a hub at active view 8, ten
+/// nodes at 8 and two at 5), every node pinging every 300 ms.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "experiment"]
+async fn pings_keep_a_quiet_mesh_alive() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let mut hub_config = config(&dir.path().join("hub"), &[]);
+    hub_config.gossip_ping = Duration::from_millis(300);
+    hub_config.gossip_active_view = 8;
+    let hub = Node::start(hub_config).await?;
+    let mut nodes = vec![hub];
+    for i in 0..12 {
+        let peers: Vec<&Arc<Node>> = nodes.iter().take(3).collect();
+        let mut c = config(&dir.path().join(format!("n{i}")), &peers);
+        c.gossip_ping = Duration::from_millis(300);
+        c.gossip_active_view = if i < 10 { 8 } else { 5 };
+        nodes.push(Node::start(c).await?);
+    }
+    tokio::time::sleep(Duration::from_secs(8)).await;
+    let before: Vec<u64> = nodes.iter().map(|n| n.link_resets()).collect();
+    tokio::time::sleep(Duration::from_secs(8)).await;
+    let after: Vec<u64> = nodes.iter().map(|n| n.link_resets()).collect();
+    for (i, n) in nodes.iter().enumerate() {
+        eprintln!(
+            "node {i}: neighbors {} resets {} -> {}",
+            n.neighbor_count(PUBLIC_NET),
+            before[i],
+            after[i]
+        );
+    }
+    for n in nodes {
+        n.shutdown().await?;
+    }
+    Ok(())
+}

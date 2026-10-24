@@ -270,7 +270,7 @@ async fn a_race_on_a_one_ask_is_settled_by_the_tie_break() -> anyhow::Result<()>
         let (prompt, _) = runs_for(root, &ask).remove(0);
         let expected = expected(&prompt, &ask).unwrap_or_default();
         assert!(
-            expected.contains("reply with kind `claim` (its lease is 300 s"),
+            expected.contains("`reply` to the ask once, with kind `claim` (its lease is 300 s"),
             "{prompt}"
         );
         assert!(prompt.contains("mode one (a single worker"), "{prompt}");
@@ -536,7 +536,7 @@ async fn an_expired_lease_frees_the_task() -> anyhow::Result<()> {
     assert!(
         expected(&prompt, &ask)
             .unwrap_or_default()
-            .contains("reply with kind `claim`"),
+            .contains("with kind `claim`"),
         "{prompt}"
     );
     let second = b

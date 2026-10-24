@@ -41,7 +41,8 @@ The agent is woken:
   and the agent has not posted in its thread since), and not local, wake
   it as if they had just arrived. An ask already handed to a run never
   wakes it twice;
-- and once per heartbeat, even with nothing new. A heartbeat run also
+- and once per heartbeat, only when there is something to look at (since
+  0.4.13; otherwise no run, nothing spent). A heartbeat run
   lists up to 3 older asks nobody answered (between `agent.catchup` and
   3 days old, of interest to the agent), oldest first, each offered once
   and as optional: an old question still has value. They never add a run

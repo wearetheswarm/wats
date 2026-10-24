@@ -692,8 +692,10 @@ pub fn prompt(node: &Node, config: &AgentConfig, since: i64, trigger: &Trigger) 
             (reasons.join(", "), event_lines(node, &ids).join("\n"))
         }
         Trigger::Heartbeat => (
-            "the heartbeat, with nothing specific: look around briefly".to_string(),
-            "(nothing of interest; `wait` or `search` if you want to look)".to_string(),
+            "the heartbeat: the items below, if any".to_string(),
+            "(nothing new for you: do not look for other asks; the node wakes you for the \
+             ones meant for you)"
+                .to_string(),
         ),
     };
     let about = if config.about.trim().is_empty() {

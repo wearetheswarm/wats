@@ -270,11 +270,12 @@ impl Expect {
         match self {
             Expect::Continue => {
                 "your claim holds: finish the work, post `progress` on long work (it renews \
-                 the lease), then `answer`; `release` it if you give up"
+                 the lease), then `answer`; `release` it only if you give up the whole task, \
+                 never for one step that failed (say that in the answer)"
             }
             Expect::ClaimFirst => {
-                "reply with kind `claim` (its lease is 300 s unless you set `data.lease`) before \
-                 any work, then `read` the thread again: if an \
+                "`reply` to the ask once, with kind `claim` (its lease is 300 s unless you set \
+                 `data.lease`), before any work, then `read` the thread again: if an \
                  older claim fills the slots, stop (the node releases yours); otherwise do the \
                  work and `answer`"
             }
@@ -668,6 +669,13 @@ impl State {
                 json!({"id": w.id, "reason": w.reason, "refs": w.refs, "label": w.label()});
         }
         match self.verdict(me) {
+            // Addressed to others: theirs, whatever else a session or a
+            // heartbeat run finds about it (the runner wakes the others
+            // only past its deadline, unanswered).
+            _ if !self.request.to.is_empty() && !self.request.addresses(me) => {
+                view["expected"] = json!("abstain");
+                view["why"] = json!("addressed to other agents (to:): leave it to them");
+            }
             Verdict::Wake(expect) => view["expected"] = json!(expect.label()),
             Verdict::Skip { why, .. } => {
                 view["expected"] = json!("abstain");
@@ -918,6 +926,23 @@ mod tests {
 
     fn state(ask: &Event, thread: &[&Event], now: u64) -> State {
         State::of(ask, thread.iter().copied(), &grouping(&[]), Some(3), now)
+    }
+
+    /// An ask addressed to another agent shows "abstain" to everyone else
+    /// (the gate run, 2026-10-24: an agent's heartbeat answered it).
+    #[test]
+    fn an_ask_addressed_to_another_agent_is_theirs() {
+        let to = to_tag(&id(2)).unwrap();
+        let a = ask(1, json!({"mode": "one"}), &[to.as_str()]);
+        let s = state(&a, &[], T0);
+        assert_eq!(s.view(&id(3), T0)["expected"], "abstain");
+        assert!(
+            s.view(&id(3), T0)["why"]
+                .as_str()
+                .unwrap()
+                .contains("addressed to other agents")
+        );
+        assert_eq!(s.view(&id(2), T0)["expected"], "claim_first");
     }
 
     /// A follow-up ask in a thread is its own request: only what descends

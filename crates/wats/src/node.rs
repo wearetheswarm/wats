@@ -2050,12 +2050,17 @@ impl Node {
                     }
                     // The topic's receiver ended (a gossip error): the
                     // node would go on sending and never hear anything on
-                    // this network again. Subscribe anew.
-                    tokio::time::sleep(RESUBSCRIBE_AFTER).await;
-                    match loop_node.resubscribe(&loop_net).await {
-                        Some(fresh) => receiver = Arc::new(tokio::sync::Mutex::new(fresh)),
-                        None => continue,
-                    }
+                    // this network again. Subscribe anew, never polling
+                    // the ended receiver again.
+                    receiver = loop {
+                        tokio::time::sleep(RESUBSCRIBE_AFTER).await;
+                        if !loop_node.joined(&loop_net) {
+                            return;
+                        }
+                        if let Some(fresh) = loop_node.resubscribe(&loop_net).await {
+                            break Arc::new(tokio::sync::Mutex::new(fresh));
+                        }
+                    };
                 }
             });
             if let Ok(mut loops) = node.receive_loops.lock() {
@@ -3974,6 +3979,7 @@ impl Node {
                     self.sighted(&net, msg.delivered_from);
                     self.heard(&net, msg.delivered_from);
                     if links::is_ping(&msg.content) {
+                        self.ping_heard();
                         continue;
                     }
                     // Everything on this network waits on it: a handler that
@@ -5712,6 +5718,13 @@ impl Node {
     pub async fn shutdown(&self) -> Result<()> {
         self.save_peer_cache().await;
         self.save_swarm().await;
+        // The receive loops first: gossip's shutdown ends their streams,
+        // which they would take for a gossip failure.
+        if let Ok(mut loops) = self.receive_loops.lock() {
+            for (_, task) in loops.drain() {
+                task.abort();
+            }
+        }
         self.gossip.shutdown().await.ok();
         self.router.shutdown().await?;
         // The router shuts the blob protocol down, which also closes the store.
