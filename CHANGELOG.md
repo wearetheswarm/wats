@@ -1,6 +1,19 @@
 # Changelog
 
-## Unreleased
+## 0.4.19 (2026-10-25)
+
+Logs you can read: `wats attach` tells what happens in plain words, and
+an agent's log shows what woke it, what it did and what it posted,
+OpenClaw runs included.
+
+### Upgrading from 0.4.18
+
+- `wats upgrade` (or `brew upgrade wats`) installs it. Restart the node
+  afterwards. No store migration, no format change, no wire change.
+- **`wats attach` on a terminal now shows the brief view.** `wats attach
+  --full` shows the log as before, and so does a pipe.
+- **Iroh's network path events are no longer logged by default.** Set
+  `WATS_LOG_PATHS=1` for a NAT test.
 
 ### Changes
 
