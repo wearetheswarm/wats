@@ -11,6 +11,13 @@ use wats::inbox::{InboxKey, read_submissions};
 use wats::node::{NetworkMode, Node, NodeConfig, PUBLIC_NET};
 
 async fn collector(dir: &std::path::Path, accept: bool) -> anyhow::Result<std::sync::Arc<Node>> {
+    // Logs, shown when the test fails or times out (it hung 300 s once on
+    // Ubuntu CI after 0.4.13, with no trace).
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter("wats=debug,iroh_gossip=info")
+        .with_ansi(false)
+        .with_test_writer()
+        .try_init();
     let mut config = NodeConfig::new(dir);
     config.mode = NetworkMode::Loopback;
     config.report_accept = accept;
@@ -18,15 +25,41 @@ async fn collector(dir: &std::path::Path, accept: bool) -> anyhow::Result<std::s
 }
 
 fn wats(data: &std::path::Path, ticket: &str, args: &[&str]) -> std::process::Output {
-    std::process::Command::new(env!("CARGO_BIN_EXE_wats"))
-        .env("WATS_HERMETIC", "1")
-        .env_remove("WATS_CRASH_TEST")
-        .arg("--dir")
-        .arg(data)
-        .arg(format!("--peer={ticket}"))
-        .args(args)
-        .output()
-        .unwrap()
+    output_within(
+        std::process::Command::new(env!("CARGO_BIN_EXE_wats"))
+            .env("WATS_HERMETIC", "1")
+            .env_remove("WATS_CRASH_TEST")
+            .arg("--dir")
+            .arg(data)
+            .arg(format!("--peer={ticket}"))
+            .args(args),
+    )
+}
+
+/// The command's output, or a panic with what it printed when it has not
+/// exited within two minutes: a hang names its command and shows its
+/// logs, instead of the test's 300 s timeout with no trace.
+fn output_within(command: &mut std::process::Command) -> std::process::Output {
+    let mut child = command
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+    while child.try_wait().unwrap().is_none() {
+        if std::time::Instant::now() > deadline {
+            let _ = child.kill();
+            let out = child.wait_with_output().unwrap();
+            panic!(
+                "{command:?} did not exit within 120 s\nstdout: {}\nstderr: {}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    child.wait_with_output().unwrap()
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -38,14 +71,16 @@ async fn panic_report_show_and_send() -> anyhow::Result<()> {
     let data = dir.path().join("crasher");
 
     // The node panics after starting.
-    let out = std::process::Command::new(env!("CARGO_BIN_EXE_wats"))
-        .env("WATS_HERMETIC", "1")
-        .env("WATS_CRASH_TEST", "panic")
-        .arg("--dir")
-        .arg(&data)
-        .arg(format!("--peer={ticket}"))
-        .arg("node")
-        .output()?;
+    let out = output_within(
+        std::process::Command::new(env!("CARGO_BIN_EXE_wats"))
+            .env("WATS_HERMETIC", "1")
+            .env("WATS_CRASH_TEST", "panic")
+            .env("RUST_LOG", "wats=debug")
+            .arg("--dir")
+            .arg(&data)
+            .arg(format!("--peer={ticket}"))
+            .arg("node"),
+    );
     assert!(!out.status.success());
     let list = String::from_utf8(wats(&data, &ticket, &["report", "list"]).stdout)?;
     assert!(list.contains("panic") && list.contains("new"), "{list}");

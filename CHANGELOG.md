@@ -2,6 +2,50 @@
 
 ## Unreleased
 
+### Fixes
+
+- **`wats setup openclaw --agent` broke the gateway and the channels**
+  (found on Vincent's Mac, OpenClaw 2026.6.35):
+  - `hooks.allowedSessionKeyPrefixes` gets `"hook:"` too, unless
+    `hooks.defaultSessionKey` is set: the gateway refused to start
+    without it, and `openclaw config validate` does not check it.
+    Checked against a real gateway, in a throwaway config: it starts with
+    the patch, and fails without `"hook:"`.
+  - With no `agents.list` yet, setup writes `main` first, as the default,
+    and its own agent with `default: false`: the `wats` agent had become
+    the default, and Telegram went to it.
+  - Setup checks the sandbox image of the `wats` agent (`docker image
+    inspect`) and says how to build it when it is missing: every hook to
+    the agent failed with "Sandbox image not found".
+  - After `--apply`, setup says to restart the gateway and check it with
+    `openclaw gateway status`.
+
+### Changes
+
+- **`read` shows a thread's head, then the discussion, in pages**
+  (Vincent's layout): the question, its best confirmed answer
+  (`knowledge`, computed, labelled "best confirmed"), and the answer its
+  asker accepted when it is another one (`accepted`, labelled "accepted by
+  its asker"; one answer that is both gets both labels); then the thread
+  in the order of the discussion, those two as a `shown_above` line.
+  `order: "rank"` lists the answers by status and score instead. A thread
+  longer than a page (40), or than `max_tokens`, says how many entries it
+  left out (`n_more`) and gives a `next_cursor` to pass as `cursor`.
+- **One-sided gossip links stop churning**: a neighbor still silent after
+  its fresh link (it likely does not count this node as its neighbor) is
+  marked one-sided, logged once and not reset again until heard from.
+  The router reset the same two seeds every 10 minutes.
+- **`status` lists the gossip neighbors**: `gossip.neighbors`, per
+  network, each with its id, seconds since it was last heard, whether it
+  pings, and whether its link is one-sided.
+- **Status, basis and `used` reach every host**: `search`, `read` and
+  `wait` results say to give an answer's status and basis as they are
+  when passing it on, and to react `data.used` once it held (evidence if
+  checked). OpenClaw's model, which does not see the server's
+  instructions, summed up answers with neither.
+- **`basis` counts readers**: "used by 2 readers", a reader being a group
+  of keys (a person and their agents, when grouped), not one key.
+
 ### Docs
 
 - `wats setup vibe|copilot|antigravity --agent --help` and docs/cli.md

@@ -674,7 +674,7 @@ fn setup_openclaw_agent_tokens_entries_and_block() {
     assert!(said.contains("allowedAgentIds: [\"wats\"]"), "{said}");
     assert!(said.contains("allowRequestSessionKey: true"), "{said}");
     assert!(
-        said.contains("allowedSessionKeyPrefixes: [\"wats:\"]"),
+        said.contains("allowedSessionKeyPrefixes: [\"wats:\", \"hook:\"]"),
         "{said}"
     );
     assert!(said.contains("allow: [\"wats-agent__*\"]"), "{said}");
@@ -813,11 +813,13 @@ esac
         [
             &["config", "file"][..],
             &["config", "get", "hooks.allowedAgentIds"],
+            &["config", "get", "hooks.defaultSessionKey"],
             &["config", "get", "hooks.allowedSessionKeyPrefixes"],
             &["config", "get", "agents.list"],
             &["config", "patch", "--stdin", "--dry-run"],
             &["config", "patch", "--stdin"],
             &["config", "validate"],
+            &["config", "get", "agents.defaults.sandbox.docker.image"],
         ],
         "{all:?}"
     );
@@ -833,9 +835,11 @@ esac
         patch["hooks"]["allowedAgentIds"],
         serde_json::json!(["main", "wats"])
     );
+    // "hook:" too: without hooks.defaultSessionKey the gateway does not
+    // start otherwise (Vincent's crash loop, 2026-10-24).
     assert_eq!(
         patch["hooks"]["allowedSessionKeyPrefixes"],
-        serde_json::json!(["wats:"])
+        serde_json::json!(["wats:", "hook:"])
     );
     assert_eq!(patch["hooks"]["enabled"], true);
     assert_eq!(
@@ -848,6 +852,13 @@ esac
         serde_json::json!({"id": "main", "default": true})
     );
     assert_eq!(patch["agents"]["list"][1]["id"], "wats");
+    assert_eq!(patch["agents"]["list"][1]["default"], false);
+    assert!(said.contains("openclaw gateway status"), "{said}");
+    // Docker is not on this test's PATH: the sandbox image is pointed to.
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("sandbox-setup.sh"),
+        "{out:?}"
+    );
     assert_eq!(
         patch["agents"]["list"][1]["tools"]["allow"],
         serde_json::json!(["wats-agent__*"])

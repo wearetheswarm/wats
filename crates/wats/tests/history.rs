@@ -1716,6 +1716,30 @@ async fn a_silent_gossip_neighbor_gets_a_fresh_link() -> anyhow::Result<()> {
             .starts_with("nothing heard from it"),
         "{gossip}"
     );
+    // Still silent after its fresh link: one-sided, not reset again
+    // (0.4.14), and `status` lists it.
+    eventually("A marks the link one-sided", 30, || {
+        let gossip = a.gossip_json();
+        gossip["neighbors"][PUBLIC_NET]
+            .as_array()
+            .is_some_and(|n| n.iter().any(|x| x["one_sided"] == true))
+            .then_some(())
+    })
+    .await;
+    let resets = a.link_resets();
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert_eq!(
+        a.link_resets(),
+        resets,
+        "a one-sided link is not reset again"
+    );
+    let neighbor = &a.gossip_json()["neighbors"][PUBLIC_NET][0];
+    assert_eq!(
+        neighbor["peer"],
+        b.endpoint().id().to_string(),
+        "{neighbor}"
+    );
+    assert_eq!(neighbor["pings"], true, "{neighbor}");
     let posted = a
         .publish(
             Draft {
