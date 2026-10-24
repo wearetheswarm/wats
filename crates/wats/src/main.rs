@@ -1113,6 +1113,11 @@ enum SetupTool {
         /// openclaw]. A node runs one OpenClaw agent.
         #[arg(long, value_parser = parse_agent_name, conflicts_with = "remove")]
         name: Option<String>,
+        /// Only check the set-up agent: one hook to the gateway (one short
+        /// model turn), then its outcome from the gateway's log (ADR
+        /// 0050 §3).
+        #[arg(long, conflicts_with_all = ["remove", "apply", "print", "mcp"])]
+        self_test: bool,
         /// The OpenClaw CLI.
         #[arg(long, env = "WATS_OPENCLAW", default_value = "openclaw")]
         openclaw: PathBuf,
@@ -1574,6 +1579,7 @@ struct OpenclawSetup {
     url: Option<String>,
     /// The agent's name in config.toml.
     name: Option<String>,
+    self_test: bool,
 }
 
 /// `openclaw mcp set <name> <entry>`, then `openclaw mcp show <name>` to
@@ -1613,6 +1619,119 @@ fn openclaw_mcp_set(
 ///    `openclaw config patch --stdin` and `openclaw config validate`.
 ///
 /// Any failure from the first write on restores the backup and fails.
+/// `wats setup openclaw --self-test` (ADR 0050 §3): one hook to the
+/// gateway as the runner sends it, then its outcome from the gateway's log.
+fn openclaw_self_test(data_dir: &std::path::Path, name: &str) -> Result<()> {
+    use wats::openclaw as oc;
+    let file = ConfigFile::open(data_dir)?;
+    let member = member_in(&file, data_dir, name, "openclaw")?;
+    let own = &member.settings;
+    anyhow::ensure!(
+        member.runtime.as_deref() == Some("openclaw"),
+        "agent {name} is not an OpenClaw agent: run `wats setup openclaw --agent` first"
+    );
+    let target = oc::Target {
+        url: own
+            .openclaw_url
+            .clone()
+            .unwrap_or_else(|| oc::DEFAULT_URL.to_string()),
+        agent: own
+            .openclaw_agent
+            .clone()
+            .filter(|a| !a.trim().is_empty())
+            .unwrap_or_else(|| oc::DEFAULT_AGENT.to_string()),
+        token_file: oc::hooks_token_path(data_dir),
+        ..oc::Target::default()
+    };
+    let token = oc::read_token(&target.token_file)
+        .context("no hook token: run `wats setup openclaw --agent` first")?;
+    anyhow::ensure!(
+        !wats::update::hermetic_env(),
+        "the self-test reaches a real gateway: not in hermetic tests"
+    );
+    println!(
+        "Self-test: one hook to {} (agent {}), which costs one short model turn; then up to 90 \
+         s for its outcome in the gateway's log ({}).",
+        oc::redacted_url(&target.url),
+        target.agent,
+        target.log_dir.display()
+    );
+    let request = oc::Request {
+        endpoint: target.endpoint(),
+        token,
+        run_id: format!("selftest-{}", wats::node::now_secs()),
+        agent: target.agent.clone(),
+        message: oc::SELF_TEST_MESSAGE.to_string(),
+        session_key: oc::SELF_TEST_SESSION.to_string(),
+        model: own.model.clone(),
+        timeout: Duration::from_secs(60),
+    };
+    let log_dir = target.log_dir.clone();
+    let outcome = std::thread::spawn(move || {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map(|rt| {
+                rt.block_on(async move {
+                    let mut log = oc::LogWatch::new(&log_dir);
+                    let isolated = std::sync::atomic::AtomicBool::new(false);
+                    let reply = oc::forward(request, &isolated).await;
+                    let oc::Reply::Dispatched { run_id, .. } = reply else {
+                        return Err(reply);
+                    };
+                    let until = tokio::time::Instant::now() + Duration::from_secs(90);
+                    while tokio::time::Instant::now() < until {
+                        if let Some(end) = log.poll(&run_id) {
+                            return Ok(Some((run_id, end)));
+                        }
+                        tokio::time::sleep(Duration::from_secs(2)).await;
+                    }
+                    Ok(None)
+                })
+            })
+    })
+    .join()
+    .map_err(|_| anyhow::anyhow!("the self-test panicked"))??;
+    match outcome {
+        Ok(Some((run_id, oc::HookEnd::Completed))) => {
+            println!("Self-test: the gateway ran the wats agent (run {run_id}): completed.");
+            Ok(())
+        }
+        Ok(Some((run_id, oc::HookEnd::Error(summary)))) => {
+            println!("Self-test: the wats agent's run {run_id} failed: {summary}");
+            if let Some(hint) = oc::self_test_hint(&summary) {
+                println!("  To fix it: {hint}.");
+            }
+            anyhow::bail!("the OpenClaw self-test failed")
+        }
+        Ok(None) => {
+            println!(
+                "Self-test: the gateway took the hook, but its log ({}) gave no outcome within \
+                 90 s: it cannot be read here (a container?), or the run is slow. Check \
+                 `openclaw logs`.",
+                target.log_dir.display()
+            );
+            Ok(())
+        }
+        Err(oc::Reply::Done { .. }) => {
+            println!("Self-test: the gateway ran the wats agent: completed.");
+            Ok(())
+        }
+        Err(oc::Reply::Failed { error, .. }) => {
+            println!("Self-test: {error}");
+            anyhow::bail!("the OpenClaw self-test failed")
+        }
+        Err(oc::Reply::Deferred(why)) => {
+            println!("Self-test: {why}");
+            anyhow::bail!("the OpenClaw self-test failed")
+        }
+        Err(_) => {
+            println!("Self-test: no answer from the gateway within the timeout.");
+            anyhow::bail!("the OpenClaw self-test failed")
+        }
+    }
+}
+
 /// Say whether the gateway at `url` takes the hook token now (an
 /// authenticated probe: 400, not 401).
 fn report_token_probe(url: &str, token: &str) {
@@ -1682,6 +1801,7 @@ fn apply_openclaw_config(
     openclaw: &std::path::Path,
     agent_id: &str,
     hooks_token: &str,
+    tools: &[String],
 ) -> Result<()> {
     use wats::openclaw as oc;
     let output = run_openclaw(openclaw, &["config", "file"])?;
@@ -1733,8 +1853,9 @@ fn apply_openclaw_config(
         }
         _ => Vec::new(),
     };
-    let patch =
-        serde_json::to_string_pretty(&oc::config_patch(agent_id, &agent_ids, &prefixes, &agents))?;
+    let patch = serde_json::to_string_pretty(&oc::config_patch(
+        agent_id, &agent_ids, &prefixes, &agents, tools,
+    ))?;
     println!("The patch for `openclaw config patch` (objects merge, lists replace):\n\n{patch}\n");
 
     let applied = (|| -> Result<()> {
@@ -2046,6 +2167,9 @@ fn setup_openclaw(
         println!("OpenClaw: wats MCP server removed");
         return Ok(());
     }
+    if asked.self_test {
+        return openclaw_self_test(data_dir, asked.name.as_deref().unwrap_or("openclaw"));
+    }
     // The `wats` entry is always set; neither flag means both.
     let agent = asked.agent || !asked.mcp;
     anyhow::ensure!(
@@ -2076,6 +2200,14 @@ fn setup_openclaw(
     }
     let member = member_in(&file, data_dir, &name, "openclaw")?;
     let own = &member.settings;
+    // Its OpenClaw tools (ADR 0050): what `wats share` chose, else the
+    // defaults on a first setup.
+    let first_tools = own.tools.is_empty() && wats::share::offered(data_dir, "openclaw").is_none();
+    let tools: Vec<String> = if first_tools {
+        oc::DEFAULT_TOOLS.iter().map(|t| t.to_string()).collect()
+    } else {
+        own.tools.clone()
+    };
     // The agent half: everything is checked and confirmed before anything
     // is written.
     let gateway = if agent {
@@ -2208,8 +2340,13 @@ fn setup_openclaw(
             oc::hooks_token_path(data_dir).display(),
         )
     };
+    println!(
+        "The wats agent's tools in OpenClaw: {} (`wats share` adds web_search, which needs a \
+         search provider in OpenClaw, or removes web_fetch).",
+        oc::agent_allow(&tools).join(", ")
+    );
     if automatic {
-        apply_openclaw_config(openclaw, &agent_id, &hooks_token)?;
+        apply_openclaw_config(openclaw, &agent_id, &hooks_token, &tools)?;
         // The gateway resolves ${WATS_OPENCLAW_HOOKS_TOKEN} from its own
         // .env: written here, not left to a line the user may lose (the
         // first [A] run on Vincent's Mac got 401s).
@@ -2242,7 +2379,7 @@ fn setup_openclaw(
         println!(
             "\nPaste this into OpenClaw's config (openclaw.json, JSON5; wats never edits it), \
              then restart the gateway:\n\n{}",
-            oc::config_block(&agent_id)
+            oc::config_block(&agent_id, &tools)
         );
         token_line("");
         println!(
@@ -2273,6 +2410,16 @@ fn setup_openclaw(
         }
     }
     file.set(&format!("agents.{name}.openclaw_url"), &gateway)?;
+    if first_tools {
+        use wats::share;
+        let natives = share::natives("openclaw");
+        let defaults: Vec<usize> = (0..natives.len()).filter(|i| natives[*i].default).collect();
+        let caps = share::choose(&share::Lending::default(), "openclaw", &defaults, &[], &[]).caps;
+        file.set(&format!("agents.{name}.tools"), &tools.join(","))?;
+        if !caps.is_empty() && own.caps.is_empty() {
+            file.set(&format!("agents.{name}.caps"), &caps.join(","))?;
+        }
+    }
     file.save()?;
     println!(
         "{}: agents.{name}.runtime = \"openclaw\", agents.{name}.openclaw_url = \"{gateway}\"; \
@@ -3148,6 +3295,7 @@ fn setup_tool_command(
             yes,
             url,
             name,
+            self_test,
             openclaw,
         } => setup_openclaw(
             node,
@@ -3161,6 +3309,7 @@ fn setup_tool_command(
                 yes,
                 url,
                 name,
+                self_test,
             },
             &openclaw,
         ),
@@ -3521,6 +3670,7 @@ fn offer_integrations(
                     yes: false,
                     url: None,
                     name: None,
+                    self_test: false,
                 },
                 path,
             ),
@@ -3852,6 +4002,9 @@ fn share_command(node: &NodeArgs, data_dir: &std::path::Path, args: &ShareArgs) 
         }
     };
     let runtime = member.runtime.clone().unwrap_or_default();
+    if runtime == "openclaw" {
+        return share_openclaw(node, data_dir, args, &member);
+    }
     anyhow::ensure!(
         share::supports(&runtime),
         "{runtime} agents cannot use your MCP servers yet: Claude Code, Codex, OpenCode, \
@@ -4065,6 +4218,154 @@ fn share_command(node: &NodeArgs, data_dir: &std::path::Path, args: &ShareArgs) 
         "{}: saved. A running node applies it at its next start (`wats stop`, then `wats`).",
         file.path().display()
     );
+    Ok(())
+}
+
+/// `wats share` for an OpenClaw agent (ADR 0050): its OpenClaw tools
+/// (`web_fetch`, `web_search`), saved in config.toml, then written to both
+/// allow lists of the `wats` agent through `openclaw config patch`.
+fn share_openclaw(
+    node: &NodeArgs,
+    data_dir: &std::path::Path,
+    args: &ShareArgs,
+    member: &wats::roster::Member,
+) -> Result<()> {
+    use wats::openclaw as oc;
+    use wats::share;
+    let natives = share::natives("openclaw");
+    let first = member.settings.tools.is_empty() && share::offered(data_dir, "openclaw").is_none();
+    let current_tools: Vec<String> = if first {
+        oc::DEFAULT_TOOLS.iter().map(|t| t.to_string()).collect()
+    } else {
+        member.settings.tools.clone()
+    };
+    let mut checked: Vec<bool> = natives
+        .iter()
+        .map(|n| share::native_on(n, &current_tools))
+        .collect();
+    for (names, on) in [(&args.add, true), (&args.remove, false)] {
+        for name in names {
+            let i = natives
+                .iter()
+                .position(|n| n.tools.contains(&name.trim()))
+                .with_context(|| {
+                    format!(
+                        "{name:?}: an OpenClaw agent may be given {}",
+                        oc::AGENT_TOOLS.join(" or ")
+                    )
+                })?;
+            checked[i] = on;
+        }
+    }
+    let show = |checked: &[bool]| {
+        println!(
+            "What agent {} (OpenClaw) may use when it answers the swarm, besides the wats tools \
+             (in OpenClaw's sandbox):",
+            member.name
+        );
+        for (i, native) in natives.iter().enumerate() {
+            let caps: Vec<String> = native.caps.iter().map(|c| format!("cap:{c}")).collect();
+            println!(
+                "  {:>3} [{}] {}  (announced as {})",
+                i + 1,
+                if checked[i] { "x" } else { " " },
+                native.label,
+                caps.join(", ")
+            );
+        }
+    };
+    show(&checked);
+    if args.list {
+        return Ok(());
+    }
+    if !args.yes && args.add.is_empty() && args.remove.is_empty() {
+        anyhow::ensure!(
+            interactive(node),
+            "no terminal to ask: pass --yes to keep this checklist, or --add/--remove \
+             web_fetch|web_search"
+        );
+        loop {
+            let line = ask_line("Numbers to switch (e.g. \"2\"), Enter when done: ")?;
+            if line.is_empty() {
+                break;
+            }
+            for word in line
+                .split(|c: char| c == ',' || c.is_whitespace())
+                .filter(|w| !w.is_empty())
+            {
+                match word.parse::<usize>() {
+                    Ok(n) if (1..=checked.len()).contains(&n) => checked[n - 1] = !checked[n - 1],
+                    _ => eprintln!("{word:?}: not a number of the list"),
+                }
+            }
+            show(&checked);
+        }
+    }
+    let chosen: Vec<usize> = (0..natives.len()).filter(|i| checked[*i]).collect();
+    let current = share::Lending {
+        tools: member.settings.tools.clone(),
+        lend: Vec::new(),
+        caps: member.settings.caps.clone(),
+    };
+    let next = share::choose(&current, "openclaw", &chosen, &[], &[]);
+    let mut file = ConfigFile::open(data_dir)?;
+    for (leaf, values) in [("tools", &next.tools), ("caps", &next.caps)] {
+        let key = member_key(member, leaf);
+        if values.is_empty() {
+            file.unset(&key)?;
+        } else {
+            file.set(&key, &values.join(","))?;
+        }
+    }
+    file.save()?;
+    share::remember(data_dir, "openclaw", &[])?;
+    println!(
+        "{}: saved. A running node applies it at its next start (`wats stop`, then `wats`).",
+        file.path().display()
+    );
+    if next.tools.iter().any(|t| t == "web_search") {
+        println!(
+            "web_search needs a search provider in OpenClaw: a provider key in the gateway's \
+             environment (BRAVE_API_KEY, GEMINI_API_KEY, PERPLEXITY_API_KEY, TAVILY_API_KEY…), \
+             or tools.web.search.provider set to a key-free one (duckduckgo). wats does not set \
+             it."
+        );
+    }
+    // OpenClaw's side: the dedicated agent's two allow lists.
+    let agent_id = member
+        .settings
+        .openclaw_agent
+        .clone()
+        .filter(|a| !a.trim().is_empty())
+        .unwrap_or_else(|| oc::DEFAULT_AGENT.to_string());
+    if agent_id != oc::DEFAULT_AGENT {
+        println!(
+            "OpenClaw's agent {agent_id} is your own: its tool policy is yours to set (allow \
+             {} there).",
+            next.tools.join(", ")
+        );
+        return Ok(());
+    }
+    let openclaw = std::env::var_os("WATS_OPENCLAW")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("openclaw"));
+    let hooks_token = oc::read_token(&oc::hooks_token_path(data_dir))
+        .context("no hook token: run `wats setup openclaw --agent` first")?;
+    match apply_openclaw_config(&openclaw, &agent_id, &hooks_token, &next.tools) {
+        Ok(()) => println!(
+            "OpenClaw: the wats agent may use {}. Restart the gateway (`openclaw gateway \
+             restart`).",
+            oc::agent_allow(&next.tools).join(", ")
+        ),
+        Err(e) => {
+            eprintln!("warning: OpenClaw's config not changed: {e:#}");
+            println!(
+                "Paste this into OpenClaw's config instead (openclaw.json), then restart the \
+                 gateway:\n\n{}",
+                oc::config_block(&agent_id, &next.tools)
+            );
+        }
+    }
     Ok(())
 }
 

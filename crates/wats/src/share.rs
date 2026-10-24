@@ -180,9 +180,28 @@ const ANTIGRAVITY_NATIVES: &[Native] = &[
     },
 ];
 
+/// The OpenClaw tools `wats share` offers the dedicated agent (ADR 0050):
+/// they run in OpenClaw's sandbox, and go in both of its allow lists.
+const OPENCLAW_NATIVES: &[Native] = &[
+    Native {
+        label: FETCH_LABEL,
+        tools: &["web_fetch"],
+        caps: &["web-fetch"],
+        default: true,
+    },
+    Native {
+        label: "Search the web (needs a search provider in OpenClaw: a provider key in the \
+                gateway's environment, or tools.web.search.provider)",
+        tools: &["web_search"],
+        caps: &["web-search"],
+        default: false,
+    },
+];
+
 /// The native capabilities `wats share` offers for `runtime`.
 pub fn natives(runtime: &str) -> &'static [Native] {
     match runtime {
+        "openclaw" => OPENCLAW_NATIVES,
         "claude" => CLAUDE_NATIVES,
         "codex" => CODEX_NATIVES,
         "opencode" => OPENCODE_NATIVES,
@@ -200,6 +219,7 @@ pub fn runtime_label(runtime: &str) -> &str {
         "opencode" => "OpenCode",
         "copilot" => "GitHub Copilot CLI",
         "antigravity" => "Antigravity CLI",
+        "openclaw" => "OpenClaw",
         other => other,
     }
 }
