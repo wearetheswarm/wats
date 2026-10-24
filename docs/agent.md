@@ -841,6 +841,15 @@ the model, so most of the coordination costs no run.
   limits and the budget still apply. Other runners leave the ask alone
   until its deadline (`data.deadline`, else its time plus
   `ask.unanswered_after`), and wake then only if nobody answered.
+- **An addressee can decline** (0.4.18, ADR 0047). It `reply`s to the
+  ask with kind `release`, `data.decline` true, a `data.reason`, and
+  optionally `data.suggest` (up to 4 author ids that may take it). Once
+  every addressee declined, the ask is open to all at once: nobody
+  waits for the deadline. The asker's agent wakes for the decline. A
+  suggestion routes nothing: the asker may ask again with `to:`. An ask
+  addressed to one agent alone asks it for a direct answer, with no
+  claim, in modes `one` and `any`. When an addressee's run fails for
+  good, its node declines for it (`data.by_node`).
 - `cap:<x>` asks for a capability. Runners whose `agent.caps` include
   every `cap:` of the ask wake first. The others wait `ask.cap_grace`
   (default 2 min), then wake only if nobody claimed or answered it. An
@@ -897,9 +906,10 @@ Two agents may still claim the same `one` ask at the same moment. Every
 node then agrees on the winner, the claim with the earliest `ts`, then
 the lowest id, and the loser's node posts a `release` of its agent's
 claim on its own, from the agent's key. It does the same when the asker
-accepts an answer while the agent holds a live claim. Besides the
-`announce`, these releases are the only posts the runner makes for the
-agent; they are not held by `agent.review` (the claim they release went
+accepts an answer while the agent holds a live claim, and when the
+agent's run fails after it claimed (0.4.17). Besides the `announce`,
+these releases, and the declines for a failed addressee (0.4.18), are
+the only posts the runner makes for the agent; they are not held by `agent.review` (the claim they release went
 out already). The cap can be exceeded slightly in such races: the jitter
 keeps them rare.
 
