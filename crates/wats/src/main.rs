@@ -965,8 +965,7 @@ struct SetupKeys {
     #[arg(long)]
     about: Option<String>,
     /// What the agent may use besides the wats tools (agent.access):
-    /// workspace (the default), swarm-only or inherit. Mistral Vibe:
-    /// swarm-only (its default) or inherit.
+    /// workspace (the default), swarm-only or inherit.
     #[arg(long, value_parser = wats::access::value_parser())]
     access: Option<String>,
     /// The agent's directory with workspace access (agent.workdir).
@@ -2531,12 +2530,13 @@ fn setup_tool(
         wats::antigravity::access(keys.access.as_deref())?;
     }
     if runtime == "vibe" {
-        // Checked before anything is written: no workspace for Vibe.
+        // Checked before anything is written.
         wats::vibe::access(keys.access.as_deref())?;
         anyhow::ensure!(
-            keys.workdir.is_none() && keys.tools.is_none(),
-            "--workdir and --tools are for the workspace level, which Mistral Vibe does not \
-             have"
+            keys.tools.is_none(),
+            "--tools does not apply to Mistral Vibe: at workspace, its runs get {} and the wats \
+             tools, never a shell",
+            wats::vibe::workspace_tools().join(", ")
         );
         if let Some(model) = &keys.model {
             wats::vibe::check_model(model.trim())?;
@@ -2610,10 +2610,11 @@ fn setup_tool(
         for (leaf, value) in &pairs {
             file.set(&key(leaf), value)?;
         }
-        // Said in the file, not only by default: Vibe's level is never
-        // `workspace`, whatever a shared `[agent]` table says.
+        // Said in the file, not only by default: Vibe's level is its own
+        // (workspace since 0.4.13, D40), whatever a shared `[agent]` table
+        // says.
         if runtime == "vibe" && agent && file.get(&key("access")).is_none() {
-            file.set(&key("access"), "swarm-only")?;
+            file.set(&key("access"), "workspace")?;
         }
         // What `wats share` would check: the runtime's own tools, the web
         // included, no shell (0.4.11).
@@ -2665,15 +2666,25 @@ fn setup_tool(
         {
             let dir = member.workspace();
             wats::access::ensure_workspace(&dir)?;
-            println!(
-                "agent workspace: {}\n  instructions: CLAUDE.md / AGENTS.md\n  skills: .claude/skills/\n  \
+            if runtime == "vibe" {
+                println!(
+                    "agent workspace: {}\n  instructions: AGENTS.md (wats puts it in each run's \
+                     prompt: Vibe does not load it from a folder it does not trust)\n  tools: \
+                     {} and the wats tools, never a shell (agent.tools does not apply)",
+                    dir.display(),
+                    wats::vibe::workspace_tools().join(", ")
+                );
+            } else {
+                println!(
+                    "agent workspace: {}\n  instructions: CLAUDE.md / AGENTS.md\n  skills: .claude/skills/\n  \
                  MCP servers: .mcp.json (Claude), .codex/config.toml (Codex), opencode.json \
                  (OpenCode)\n  \
                  tools: wats config set {} Read,Grep (Codex: image_generation; OpenCode: \
                  read,grep)",
-                dir.display(),
-                key("tools")
-            );
+                    dir.display(),
+                    key("tools")
+                );
+            }
             if wats::share::supports(runtime) {
                 println!(
                     "  `wats share`: choose what it may use when it answers the swarm, your own \
@@ -2751,11 +2762,19 @@ fn setup_tool(
                     eprintln!("warning: {e:#}");
                 }
             } else {
+                let level = if access == wats::access::Access::Workspace {
+                    format!(
+                        "workspace, the wats tools plus {} (no shell)",
+                        wats::vibe::workspace_tools().join(", ")
+                    )
+                } else {
+                    "swarm-only, the wats tools only".to_string()
+                };
                 println!(
-                    "Mistral Vibe agent: swarm-only, the wats tools only. Its runs use their own \
-                     Vibe home, {}, not ~/.vibe; your API key is found in your OS keyring \
-                     (`vibe --setup`) or in MISTRAL_API_KEY in the node's environment (a key \
-                     kept only in ~/.vibe/.env is not read).",
+                    "Mistral Vibe agent: {level}. Its runs use their own Vibe home, {}, not \
+                     ~/.vibe; your API key is found in your OS keyring (`vibe --setup`) or in \
+                     MISTRAL_API_KEY in the node's environment (a key kept only in \
+                     ~/.vibe/.env is not read).",
                     wats::vibe::agent_home(&member.work_dir).display()
                 );
             }
@@ -4335,8 +4354,8 @@ fn config_command(node: &NodeArgs, data_dir: &std::path::Path, action: ConfigAct
             {
                 wats::access::check_workdir(&data_dir.join(&value), data_dir)?;
             }
-            // A Vibe agent has no workspace level (ADR 0033): refused here
-            // too, whichever of the two keys is set last.
+            // A Vibe agent's level is checked (ADR 0033), whichever of the
+            // two keys is set last.
             if let Some((table, leaf @ ("access" | "runtime"))) = key.rsplit_once('.')
                 && (table == "agent" || table.starts_with("agents."))
             {

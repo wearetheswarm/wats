@@ -1,9 +1,9 @@
 //! Mistral Vibe as an agent runtime (ADR 0033), against fake `vibe`
 //! scripts only: never the real CLI. The runner's command line, per-run
-//! config and environment at `swarm-only` and `inherit`, the streaming
+//! config and environment at `swarm-only`, `workspace` and `inherit`, the streaming
 //! output and run export, the budget from the export's cost, the exit
 //! codes, the process-group kill at the timeout, the version check and the
-//! refusals (`workspace`, arguments that undo the level); then `wats setup
+//! refusals (arguments that undo the level); then `wats setup
 //! vibe --agent` and `wats --agent vibe`, with a throwaway HOME, XDG
 //! directories and VIBE_HOME.
 
@@ -280,6 +280,81 @@ async fn swarm_only_run_is_locked_down() {
     );
 }
 
+/// A `workspace` run: the swarm-only run's lock-down plus Vibe's file
+/// tools (enabled and approved, never a shell), the built-in `ask` agent,
+/// and the workspace as its directory and `--workdir`; `agent.tools` does
+/// not change the list.
+#[tokio::test(flavor = "multi_thread")]
+async fn workspace_run_gets_the_file_tools_in_the_workspace() {
+    let dir = tempfile::tempdir().unwrap();
+    let fake = fake(dir.path(), "3.0.1", GOOD_RUN);
+    let mut config = config(dir.path(), fake, Access::Workspace);
+    config.tools = vec!["bash".into()];
+    let work = config.work_dir.clone();
+    let workspace = config.workdir.clone();
+    std::fs::create_dir_all(&workspace).unwrap();
+    std::fs::write(workspace.join("AGENTS.md"), "Always answer in haiku.\n").unwrap();
+    let record = one_run(dir.path(), config, "ok").await;
+
+    let args = read(dir.path(), "args");
+    let tools: Vec<String> = wats::vibe::level_tool_names(Access::Workspace)
+        .iter()
+        .map(|t| format!("--enabled-tools={t}"))
+        .collect();
+    assert_eq!(
+        args.trim(),
+        format!(
+            "--prompt= --output=streaming --output-dir={} --max-turns=7 --max-price=2.00 \
+             --time-limit=9 {} --agent=ask --workdir={} --max-tokens=50000",
+            work.join("vibe-run").display(),
+            tools.join(" "),
+            workspace.display()
+        ),
+        "{args}"
+    );
+    assert!(!args.contains("bash"), "{args}");
+    assert_eq!(cwd(dir.path()), workspace.canonicalize().unwrap());
+    let prompt = read(dir.path(), "prompt");
+    assert!(
+        prompt.contains("read_file, grep, write_file, edit"),
+        "{prompt}"
+    );
+    assert!(prompt.contains("No shell"), "{prompt}");
+    assert!(
+        prompt.contains("call them by name (wats_post, wats_reply,"),
+        "{prompt}"
+    );
+    // Vibe skips an untrusted folder's AGENTS.md: it comes in the prompt.
+    assert!(
+        prompt.contains("(AGENTS.md in your workspace):\nAlways answer in haiku."),
+        "{prompt}"
+    );
+    assert!(!args.contains("--trust"), "{args}");
+    let env = read(dir.path(), "env");
+    let home = work.join("vibe-home");
+    assert!(
+        env.lines()
+            .any(|l| l == format!("VIBE_HOME={}", home.display())),
+        "{env}"
+    );
+    let run_config: toml::Value = toml::from_str(&read(dir.path(), "config.toml")).unwrap();
+    let enabled = run_config["enabled_tools"].as_array().unwrap();
+    let disabled = run_config["disabled_tools"].as_array().unwrap();
+    for tool in wats::vibe::WORKSPACE_TOOLS {
+        assert!(enabled.contains(&tool.into()), "{tool}: {run_config}");
+        assert!(!disabled.contains(&tool.into()), "{tool}: {run_config}");
+        assert_eq!(
+            run_config["tools"][tool]["permission"].as_str(),
+            Some("always"),
+            "{tool}"
+        );
+    }
+    for tool in ["bash", "web_fetch", "task"] {
+        assert!(disabled.contains(&tool.into()), "{tool}: {run_config}");
+    }
+    assert_eq!(record.access, "workspace");
+}
+
 /// `inherit`: the user's own Vibe (no VIBE_HOME of the runner's, no
 /// `--enabled-tools`), in the directory `wats` started in, with the wats
 /// server and the wats tools' approvals added through VIBE_MCP_SERVERS
@@ -439,10 +514,10 @@ wait $!"#,
     assert!(still, "the group was killed after its leader was reaped");
 }
 
-/// Below Vibe 3.0.0, at `workspace`, or with arguments that undo the
-/// level, the runner does not start.
+/// Below Vibe 3.0.0, or with arguments that undo the level, the runner
+/// does not start.
 #[tokio::test(flavor = "multi_thread")]
-async fn old_versions_workspace_and_undoing_arguments_are_refused() {
+async fn old_versions_and_undoing_arguments_are_refused() {
     let dir = tempfile::tempdir().unwrap();
     let a = node(&dir.path().join("node")).await.unwrap();
     let old = fake(dir.path(), "2.26.1", "exit 0");
@@ -456,14 +531,6 @@ async fn old_versions_workspace_and_undoing_arguments_are_refused() {
     assert!(format!("{e:#}").contains("2.26.1"), "{e:#}");
 
     let current = fake(dir.path(), "3.0.1", "exit 0");
-    let e = wats::agent::run(
-        Arc::clone(&a),
-        config(dir.path(), current.clone(), Access::Workspace),
-        async {},
-    )
-    .await
-    .unwrap_err();
-    assert!(format!("{e:#}").contains("cannot keep its tools"), "{e:#}");
 
     for extra in [
         ["--auto-approve"],
@@ -556,13 +623,13 @@ fn text(bytes: &[u8]) -> String {
     String::from_utf8_lossy(bytes).into_owned()
 }
 
-/// `wats setup vibe --agent` enables a swarm-only Vibe agent and writes
-/// nothing in HOME, the XDG directories or VIBE_HOME; `--access
-/// workspace` is refused before anything is written; `--access inherit`
+/// `wats setup vibe --agent` enables a workspace Vibe agent (D40) and writes
+/// nothing in HOME, the XDG directories or VIBE_HOME; `--tools` is
+/// refused before anything is written; `--access inherit`
 /// says the warning, and that the runner needs agent.allow and
 /// agent.review; with no flag, setup only says what each does.
 #[test]
-fn setup_enables_a_swarm_only_agent() {
+fn setup_enables_a_workspace_agent() {
     let m = Machine::new();
     let out = m.setup(&[]);
     assert!(out.status.success(), "{out:?}");
@@ -571,10 +638,10 @@ fn setup_enables_a_swarm_only_agent() {
     assert!(said.contains("wats setup vibe --agent"), "{said}");
     assert!(!m.path("data/config.toml").exists());
 
-    let out = m.setup(&["--agent", "--access", "workspace"]);
+    let out = m.setup(&["--agent", "--access", "workspace", "--tools", "bash"]);
     assert!(!out.status.success(), "{out:?}");
     assert!(
-        text(&out.stderr).contains("cannot keep its tools"),
+        text(&out.stderr).contains("--tools does not apply"),
         "{out:?}"
     );
     assert!(!m.path("data/config.toml").exists());
@@ -585,37 +652,41 @@ fn setup_enables_a_swarm_only_agent() {
     let config = std::fs::read_to_string(m.path("data/config.toml")).unwrap();
     assert!(config.contains("[agents.vibe]"), "{config}");
     assert!(config.contains("runtime = \"vibe\""), "{config}");
-    assert!(config.contains("access = \"swarm-only\""), "{config}");
-    assert!(said.contains("Mistral Vibe agent: swarm-only"), "{said}");
+    assert!(config.contains("access = \"workspace\""), "{config}");
+    assert!(said.contains("Mistral Vibe agent: workspace"), "{said}");
     assert!(said.contains("MISTRAL_API_KEY"), "{said}");
     for dir in ["home", "xdg-config", "xdg-data", "vibe"] {
         assert!(m.files(dir).is_empty(), "{dir}: {:?}", m.files(dir));
     }
-    // `wats config set` refuses workspace for a Vibe agent too, and says
-    // agent.tools does not apply to it.
+    // `wats config set` takes workspace for a Vibe agent, refuses an
+    // unknown level, and says agent.tools does not apply to it.
     let set = |key: &str, value: &str| m.wats(&["config", "set", key, value]).output().unwrap();
-    let out = set("agents.vibe.access", "workspace");
+    let out = set("agents.vibe.access", "everything");
     assert!(!out.status.success(), "{out:?}");
-    assert!(
-        text(&out.stderr).contains("cannot keep its tools"),
-        "{out:?}"
-    );
     let out = set("agents.vibe.tools", "read_file");
     assert!(out.status.success(), "{out:?}");
     assert!(
-        text(&out.stderr).contains("Mistral Vibe has no workspace level"),
+        text(&out.stderr).contains("does not apply to a Mistral Vibe agent"),
         "{out:?}"
     );
-    let out = set("agents.other.access", "workspace");
+    let out = set("agents.vibe.access", "swarm-only");
     assert!(out.status.success(), "{out:?}");
-    let out = set("agents.other.runtime", "vibe");
-    assert!(!out.status.success(), "{out:?}");
-    let config = std::fs::read_to_string(m.path("data/config.toml")).unwrap();
-    assert!(config.contains("access = \"swarm-only\""), "{config}");
+    let out = m.setup(&["--agent"]);
     assert!(
-        !config.contains("access = \"workspace\"\nruntime"),
-        "{config}"
+        text(&out.stdout).contains("Mistral Vibe agent: swarm-only"),
+        "an explicit level stays: {out:?}"
     );
+    let out = m.setup(&["--agent", "--access", "workspace"]);
+    assert!(out.status.success(), "{out:?}");
+    assert!(
+        text(&out.stdout).contains("Mistral Vibe agent: workspace"),
+        "{out:?}"
+    );
+    assert!(
+        text(&out.stdout).contains("instructions: AGENTS.md (wats puts it"),
+        "{out:?}"
+    );
+    assert!(!text(&out.stdout).contains(".mcp.json"), "{out:?}");
 
     let out = m.setup(&["--agent", "--access", "inherit"]);
     assert!(out.status.success(), "{out:?}");
@@ -642,8 +713,8 @@ fn setup_enables_a_swarm_only_agent() {
 
 /// `wats --agent vibe`: the node starts the runner with the agent's
 /// settings (here swarm-only by default), and a heartbeat run reaches the
-/// fake `vibe`; `--access workspace`, and `inherit` without agent.allow and
-/// agent.review, stop it at start.
+/// fake `vibe`; `inherit` without agent.allow and agent.review stops it at
+/// start.
 #[test]
 fn the_node_runs_a_vibe_agent() {
     let m = Machine::new();
@@ -666,7 +737,6 @@ fn the_node_runs_a_vibe_agent() {
         assert!(!out.status.success(), "{access}: {out:?}");
         assert!(text(&out.stderr).contains(why), "{access}: {out:?}");
     };
-    refused("workspace", "cannot keep its tools");
     refused("inherit", "agent.review = true");
 
     let mut node = m

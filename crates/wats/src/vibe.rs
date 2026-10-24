@@ -175,15 +175,18 @@ pub fn write_with_backup(path: &Path, text: &str, now: u64) -> Result<Option<Pat
 // Each run spawns, from the run directory:
 //
 //     vibe --prompt= --output=streaming --output-dir=<dir> --max-turns=<n>
-//          [--max-price=<usd>] [--enabled-tools=wats_*] [extra args]   < prompt
+//          [--max-price=<usd>] [--enabled-tools=wats_*] [--agent=ask
+//          --workdir=<workspace>] [extra args]   < prompt
 //
 // The prompt goes on stdin (an empty `--prompt` reads it there). At
 // `swarm-only`, Vibe's home is the agent's own (`VIBE_HOME`), with a
 // per-run `config.toml` that holds the wats MCP server only and enables
-// its tools only; at `inherit`, the user's own Vibe runs, with the wats
-// server and its tool approvals added through Vibe's `VIBE_*` environment
-// layer. There is no `workspace` level: Vibe cannot keep its tools inside
-// one directory.
+// its tools only; at `workspace`, the same plus Vibe's file tools
+// ([`WORKSPACE_TOOLS`]), no shell, in the workspace (`--workdir`) with the
+// built-in `ask` agent, so that a path outside it needs an approval that
+// a headless run never gets; at `inherit`, the user's own Vibe runs, with
+// the wats server and its tool approvals added through Vibe's `VIBE_*`
+// environment layer.
 
 /// The first Vibe whose headless mode wats was checked against (3.0.1's
 /// source): the Rust CLI's run contract (`--output-dir` and its
@@ -219,11 +222,21 @@ pub fn run_tool_names() -> Vec<String> {
     RUN_TOOLS.iter().map(|t| format!("{SERVER}_{t}")).collect()
 }
 
+/// The tools of a run at `access` (not `inherit`), by their exact names:
+/// the wats tools, plus [`WORKSPACE_TOOLS`] at `workspace`.
+pub fn level_tool_names(access: Access) -> Vec<String> {
+    let mut names = run_tool_names();
+    if access == Access::Workspace {
+        names.extend(WORKSPACE_TOOLS.iter().map(|t| (*t).to_string()));
+    }
+    names
+}
+
 /// A Vibe `re:` pattern (case-insensitive, full match) for every tool name
-/// but the exact wats tools: the last lock of `disabled_tools`, whatever
-/// new tool a later Vibe adds.
-pub fn others_pattern() -> String {
-    format!("re:(?!(?:{})$).*", run_tool_names().join("|"))
+/// but `names`: the last lock of `disabled_tools`, whatever new tool a
+/// later Vibe adds.
+pub fn others_pattern(names: &[String]) -> String {
+    format!("re:(?!(?:{})$).*", names.join("|"))
 }
 
 /// Vibe's built-in and provided tools (3.0.1: `vibe/core/tools/builtins/`,
@@ -264,6 +277,10 @@ pub const BUILTIN_TOOLS: [&str; 30] = [
     "unified_harness_scratchpad",
 ];
 
+/// Globs that disable a shell tool under any toolset prefix, at
+/// `swarm-only` and `workspace`.
+pub const SHELL_GLOBS: [&str; 3] = ["*bash*", "*shell*", "*powershell*"];
+
 /// Vibe's own cap on a prompt read from stdin (`MAX_STDIN_PROMPT_BYTES`):
 /// a longer prompt is cut to fit, with a note ([`fit_prompt`]).
 pub const MAX_PROMPT_BYTES: usize = 1024 * 1024;
@@ -282,13 +299,77 @@ pub const STOP_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
 pub const INHERIT_WARNING: &str =
     "Vibe approves its own tools: with inherit, a post can make it read or run anything you can";
 
-/// Why `workspace` is refused for Vibe.
-pub const WORKSPACE_REFUSED: &str = "agent.access = workspace is not available with Mistral \
-     Vibe: Vibe cannot keep its tools inside one directory. Use swarm-only (the default: the \
-     wats tools only) or inherit (your whole Vibe environment)";
+/// Vibe's own tools of a `workspace` run, on top of the wats tools: read,
+/// search and edit files (`edit` is `search_replace`'s new name), never a
+/// shell, the web or subagents. Each gets `permission = "always"` in the
+/// run's config, which covers the workspace only: Vibe asks before a path
+/// outside its working directory whatever the tool's permission (an
+/// `OUTSIDE_DIRECTORY` requirement), and a headless run denies every
+/// question. `agent.tools` does not change this list.
+pub const WORKSPACE_TOOLS: [&str; 5] =
+    ["read_file", "grep", "write_file", "edit", "search_replace"];
 
-/// Extra arguments refused at `swarm-only`: they would bring back Vibe's
-/// own tools or approvals, another directory, or an old session.
+/// [`WORKSPACE_TOOLS`] as said to the user and in the prompt: without
+/// `search_replace`, `edit`'s old name.
+pub fn workspace_tools() -> Vec<String> {
+    WORKSPACE_TOOLS
+        .iter()
+        .filter(|t| **t != "search_replace")
+        .map(|t| (*t).to_string())
+        .collect()
+}
+
+/// Said in a swarm-only or workspace run's prompt: two runs on Vincent's
+/// Mac (2026-10-24) stopped after one turn with "I cannot use wats tools
+/// in this run" and no tool call, while the tools were there.
+pub fn tool_names_line() -> String {
+    format!(
+        " Your wats tools are MCP tools of this run: call them by name ({}). If they are \
+         not in your tool list yet, search your tools once for \"wats\", then call them. \
+         Posts are not files: open them with wats_read, never in your workspace, and read \
+         each one once.",
+        run_tool_names().join(", ")
+    )
+}
+
+/// The most of the workspace's `AGENTS.md` a `workspace` run's prompt
+/// carries.
+pub const MAX_INSTRUCTIONS_BYTES: usize = 16 * 1024;
+
+/// The workspace's `AGENTS.md`, for a `workspace` run's prompt: Vibe loads
+/// a project's `AGENTS.md` only in a trusted folder, and wats never
+/// trusts the workspace (a trusted folder's `.vibe/config.toml`, which
+/// the agent can write, would load too). A regular file only, never a
+/// link (it could point outside the workspace), cut to
+/// [`MAX_INSTRUCTIONS_BYTES`]. `None` without one, or when it is empty.
+pub fn workspace_instructions(workdir: &Path) -> Option<String> {
+    let path = workdir.join("AGENTS.md");
+    let meta = std::fs::symlink_metadata(&path).ok()?;
+    if !meta.file_type().is_file() {
+        return None;
+    }
+    let bytes = std::fs::read(&path).ok()?;
+    let mut text = String::from_utf8_lossy(&bytes).into_owned();
+    if text.len() > MAX_INSTRUCTIONS_BYTES {
+        let mut end = MAX_INSTRUCTIONS_BYTES;
+        while !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        text.truncate(end);
+        text.push_str("\n[wats: AGENTS.md was cut to 16 KiB]");
+    }
+    let text = text.trim();
+    (!text.is_empty()).then(|| text.to_string())
+}
+
+/// The Vibe agent of a `workspace` run (`--agent`): the built-in `ask`,
+/// which approves nothing itself. Vibe's default, `accept-edits`, approves
+/// file edits, and `auto-approve` bypasses every permission.
+pub const WORKSPACE_AGENT: &str = "ask";
+
+/// Extra arguments refused at `swarm-only` and `workspace`: they would
+/// bring back Vibe's own tools or approvals, another directory, or an old
+/// session.
 pub const REFUSED_ARGS: [&str; 13] = [
     "--enabled-tools",
     "--agent",
@@ -320,27 +401,20 @@ pub const RUNNER_ARGS: [&str; 4] = ["--prompt", "--prompt-file", "--output", "--
 /// `VIBE_MCP_SERVERS`, `VIBE_HOME`, `VIBE_CWD`…).
 pub const KEPT_ENV: [&str; 3] = ["VIBE_APP_SERVER_BIN", "VIBE_APP_SERVER_CMD", "VIBE_THEME"];
 
-/// The access level of a Vibe agent: `swarm-only` when unset, `workspace`
-/// refused.
+/// The access level of a Vibe agent: `workspace` when unset (D40,
+/// 0.4.13; `swarm-only` before).
 pub fn access(value: Option<&str>) -> Result<Access> {
     let Some(value) = value else {
-        return Ok(Access::SwarmOnly);
+        return Ok(Access::Workspace);
     };
-    let access: Access = value.trim().parse()?;
-    if access == Access::Workspace {
-        bail!("{WORKSPACE_REFUSED}");
-    }
-    Ok(access)
+    value.trim().parse()
 }
 
 /// `inherit` hands swarm posts to the user's whole Vibe environment, whose
 /// tools Vibe runs itself: refused without `agent.review` or an explicit
 /// `agent.allow` ([`INHERIT_NEEDS_GUARDRAILS`], the same rule as
-/// OpenCode's). `workspace` is refused.
+/// OpenCode's).
 pub fn check_access(access: Access, allow: &[String], review: bool) -> Result<()> {
-    if access == Access::Workspace {
-        bail!("{WORKSPACE_REFUSED}");
-    }
     if INHERIT_NEEDS_GUARDRAILS && access == Access::Inherit && allow.is_empty() && !review {
         bail!(
             "agent.access = inherit with Mistral Vibe hands swarm posts to your own Vibe \
@@ -364,7 +438,7 @@ fn flag_of(arg: &str) -> &str {
 }
 
 /// Refuse extra arguments the runner sets ([`RUNNER_ARGS`], `-p`) and, at
-/// `swarm-only`, those that would undo the level ([`REFUSED_ARGS`], `-c`).
+/// `swarm-only` and `workspace`, those that would undo the level ([`REFUSED_ARGS`], `-c`).
 pub fn check_extra_args(access: Access, extra: &[String]) -> Result<()> {
     for arg in extra {
         let flag = flag_of(arg);
@@ -493,24 +567,33 @@ fn tool_permissions() -> serde_json::Map<String, serde_json::Value> {
         .collect()
 }
 
-/// The per-run `config.toml` of a `swarm-only` run, in the agent's own
-/// Vibe home: the exact wats tools only (allowed; every built-in tool and
-/// any other name disabled), no skills (not even through `/<name>` in a
-/// prompt), no connectors, subagents or background processes, no session
-/// log, no update check or telemetry, and the wats MCP server with the
-/// run's runner token.
-pub fn run_config(server: &Server) -> String {
+/// The per-run `config.toml` of a `swarm-only` or `workspace` run, in the
+/// agent's own Vibe home: the exact wats tools only (allowed; every
+/// built-in tool and any other name disabled), plus [`WORKSPACE_TOOLS`] at
+/// `workspace`, no skills (not even through `/<name>` in a prompt), no
+/// connectors, subagents or background processes, no session log, no
+/// update check or telemetry, and the wats MCP server with the run's
+/// runner token.
+pub fn run_config(server: &Server, access: Access) -> String {
     let strings = |items: &[&str]| -> toml_edit::Array { items.iter().copied().collect() };
     let mut doc = DocumentMut::new();
     doc.decor_mut().set_prefix(
         "# This node's Mistral Vibe agent (wats, ADR 0033): written before every run, \
          do not edit.\n",
     );
-    let names = run_tool_names();
-    let names: Vec<&str> = names.iter().map(String::as_str).collect();
+    let owned = level_tool_names(access);
+    let names: Vec<&str> = owned.iter().map(String::as_str).collect();
     doc.insert("enabled_tools", value(strings(&names)));
-    let others = others_pattern();
-    let mut disabled: Vec<&str> = BUILTIN_TOOLS.to_vec();
+    let others = others_pattern(&owned);
+    let mut disabled: Vec<&str> = BUILTIN_TOOLS
+        .iter()
+        .copied()
+        .filter(|t| !names.contains(t))
+        .collect();
+    // Vibe 3 shows its built-ins by toolset (`file_system.bash`): the
+    // shells by any name, on top of the exact names (the gate run,
+    // 2026-10-24, saw `file_system.bash`). No wats tool name has these.
+    disabled.extend(SHELL_GLOBS);
     disabled.push(&others);
     doc.insert("disabled_tools", value(strings(&disabled)));
     // Skills: `enabled_skills` that matches nothing, and every skill
@@ -536,10 +619,10 @@ pub fn run_config(server: &Server) -> String {
     doc.insert("session_logging", Item::Table(logging));
     let mut tools = Table::new();
     tools.set_implicit(true);
-    for (name, _) in tool_permissions() {
+    for name in &owned {
         let mut tool = Table::new();
         tool.insert("permission", value("always"));
-        tools.insert(&name, Item::Table(tool));
+        tools.insert(name, Item::Table(tool));
     }
     doc.insert("tools", Item::Table(tools));
     let mut entry = Table::new();
@@ -766,6 +849,8 @@ pub struct Run<'a> {
     /// 0034).
     pub max_tokens: Option<u64>,
     pub export_dir: &'a Path,
+    /// The workspace (`--workdir`), at `workspace`.
+    pub workdir: &'a Path,
     /// `agent.timeout`: `--time-limit` a little under it.
     pub timeout: std::time::Duration,
     pub extra: &'a [String],
@@ -773,8 +858,9 @@ pub struct Run<'a> {
 
 /// The arguments of one run, before the extra arguments: headless with
 /// the prompt on stdin, NDJSON on stdout, the run export, the limits
-/// (unless the extra arguments set them), and at `swarm-only` the exact
-/// wats tools only.
+/// (unless the extra arguments set them), at `swarm-only` the exact wats
+/// tools only, and at `workspace` those plus [`WORKSPACE_TOOLS`], the
+/// [`WORKSPACE_AGENT`] and the workspace as the working directory.
 pub fn run_args(r: &Run) -> Vec<String> {
     let given = |flag: &str| r.extra.iter().any(|a| flag_of(a) == flag);
     let mut args = vec![
@@ -800,10 +886,14 @@ pub fn run_args(r: &Run) -> Vec<String> {
     }
     if r.access != Access::Inherit {
         args.extend(
-            run_tool_names()
+            level_tool_names(r.access)
                 .into_iter()
                 .map(|t| format!("--enabled-tools={t}")),
         );
+    }
+    if r.access == Access::Workspace {
+        args.push(format!("--agent={WORKSPACE_AGENT}"));
+        args.push(format!("--workdir={}", r.workdir.display()));
     }
     args
 }
@@ -991,19 +1081,18 @@ mod tests {
         }
     }
 
-    /// Unset is swarm-only; `workspace` is refused; `inherit` and the old
+    /// Unset is workspace (D40); `swarm-only`, `inherit` and the old
     /// `locked` parse.
     #[test]
-    fn levels_default_to_swarm_only_without_workspace() {
-        assert_eq!(access(None).unwrap(), Access::SwarmOnly);
+    fn levels_default_to_workspace() {
+        assert_eq!(access(None).unwrap(), Access::Workspace);
         assert_eq!(access(Some("locked")).unwrap(), Access::SwarmOnly);
         assert_eq!(access(Some("inherit")).unwrap(), Access::Inherit);
-        let e = access(Some("workspace")).unwrap_err();
-        assert!(format!("{e:#}").contains("cannot keep its tools"), "{e:#}");
+        assert_eq!(access(Some("workspace")).unwrap(), Access::Workspace);
         assert!(access(Some("everything")).is_err());
         assert_eq!(
             crate::access::level_for("vibe", None).unwrap(),
-            Access::SwarmOnly
+            Access::Workspace
         );
         assert_eq!(
             crate::access::level_for("claude", None).unwrap(),
@@ -1017,7 +1106,7 @@ mod tests {
     fn inherit_needs_review_or_allow() {
         let allow = s(&["ab"]);
         assert!(check_access(Access::SwarmOnly, &[], false).is_ok());
-        assert!(check_access(Access::Workspace, &allow, true).is_err());
+        assert!(check_access(Access::Workspace, &[], false).is_ok());
         assert!(check_access(Access::Inherit, &[], true).is_ok());
         assert!(check_access(Access::Inherit, &allow, false).is_ok());
         assert!(check_access(Access::Inherit, &allow, true).is_ok());
@@ -1040,8 +1129,10 @@ mod tests {
             "--continue",
             "--resume=abc",
         ] {
-            let e = check_extra_args(Access::SwarmOnly, &s(&[arg])).unwrap_err();
-            assert!(format!("{e:#}").contains("would undo"), "{arg}: {e:#}");
+            for level in [Access::SwarmOnly, Access::Workspace] {
+                let e = check_extra_args(level, &s(&[arg])).unwrap_err();
+                assert!(format!("{e:#}").contains("would undo"), "{arg}: {e:#}");
+            }
             assert!(
                 check_extra_args(Access::Inherit, &s(&[arg])).is_ok(),
                 "{arg}"
@@ -1116,7 +1207,7 @@ mod tests {
     #[test]
     fn the_run_config_holds_the_wats_server_only() {
         let args = s(&["--dir", "/d", "mcp", "--profile", "alice-vibe"]);
-        let text = run_config(&server(&args));
+        let text = run_config(&server(&args), Access::SwarmOnly);
         let doc: toml::Value = toml::from_str(&text).unwrap();
         let names: Vec<toml::Value> = RUN_TOOLS
             .iter()
@@ -1139,7 +1230,7 @@ mod tests {
         }
         // Last: every name but the exact wats tools.
         let others = disabled.last().unwrap().as_str().unwrap();
-        assert_eq!(others, others_pattern());
+        assert_eq!(others, others_pattern(&run_tool_names()));
         assert!(
             others.starts_with("re:(?!(?:wats_post|wats_reply|") && others.ends_with(")$).*"),
             "{others}"
@@ -1200,6 +1291,97 @@ mod tests {
         }
     }
 
+    /// The workspace's AGENTS.md for the prompt: a regular file only (a
+    /// link could point outside the workspace), cut to 16 KiB.
+    #[test]
+    fn workspace_instructions_are_a_regular_file_cut_to_fit() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(workspace_instructions(dir.path()), None);
+        std::fs::write(dir.path().join("AGENTS.md"), "  Be brief.\n").unwrap();
+        assert_eq!(
+            workspace_instructions(dir.path()).as_deref(),
+            Some("Be brief.")
+        );
+        std::fs::write(
+            dir.path().join("AGENTS.md"),
+            "é".repeat(MAX_INSTRUCTIONS_BYTES),
+        )
+        .unwrap();
+        let cut = workspace_instructions(dir.path()).unwrap();
+        assert!(cut.len() <= MAX_INSTRUCTIONS_BYTES + 64, "{}", cut.len());
+        assert!(cut.ends_with("[wats: AGENTS.md was cut to 16 KiB]"));
+        #[cfg(unix)]
+        {
+            let secret = dir.path().join("secret");
+            std::fs::write(&secret, "key").unwrap();
+            std::fs::remove_file(dir.path().join("AGENTS.md")).unwrap();
+            std::os::unix::fs::symlink(&secret, dir.path().join("AGENTS.md")).unwrap();
+            assert_eq!(workspace_instructions(dir.path()), None);
+        }
+    }
+
+    /// The per-run config of a `workspace` run: the wats tools plus Vibe's
+    /// file tools, each approved (Vibe still asks for a path outside the
+    /// working directory), never a shell, the web or subagents.
+    #[test]
+    fn the_workspace_config_adds_the_file_tools_only() {
+        let args = s(&["mcp"]);
+        let text = run_config(&server(&args), Access::Workspace);
+        let doc: toml::Value = toml::from_str(&text).unwrap();
+        let enabled: Vec<&str> = doc["enabled_tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(toml::Value::as_str)
+            .collect();
+        assert_eq!(enabled.len(), RUN_TOOLS.len() + WORKSPACE_TOOLS.len());
+        for tool in WORKSPACE_TOOLS {
+            assert!(enabled.contains(&tool), "{tool}: {text}");
+            assert_eq!(
+                doc["tools"][tool]["permission"].as_str(),
+                Some("always"),
+                "{tool}"
+            );
+        }
+        let disabled: Vec<&str> = doc["disabled_tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(toml::Value::as_str)
+            .collect();
+        for tool in WORKSPACE_TOOLS {
+            assert!(!disabled.contains(&tool), "{tool}: {text}");
+        }
+        for tool in [
+            "bash",
+            "git_bash",
+            "powershell",
+            "shell",
+            "web_fetch",
+            "task",
+            "skill",
+        ] {
+            assert!(disabled.contains(&tool), "{tool}: {text}");
+            assert!(!enabled.contains(&tool), "{tool}: {text}");
+        }
+        assert_eq!(
+            disabled.last().copied(),
+            Some(others_pattern(&level_tool_names(Access::Workspace)).as_str())
+        );
+        assert!(!text.contains("allowlist"), "{text}");
+        for glob in SHELL_GLOBS {
+            assert!(disabled.contains(&glob), "{glob}: {text}");
+        }
+        for name in level_tool_names(Access::Workspace) {
+            let n = name.to_ascii_lowercase();
+            assert!(
+                !n.contains("bash") && !n.contains("shell"),
+                "{name} would be disabled"
+            );
+        }
+        assert_eq!(doc["enable_subagents"], toml::Value::Boolean(false));
+    }
+
     /// The LLM tokens left in the budget (ADR 0034) cap the run, unless the
     /// extra arguments set `--max-tokens`.
     #[test]
@@ -1212,6 +1394,7 @@ mod tests {
                 max_price: None,
                 max_tokens,
                 export_dir: dir,
+                workdir: Path::new("/w/workspace"),
                 timeout: std::time::Duration::from_secs(600),
                 extra,
             })
@@ -1236,6 +1419,7 @@ mod tests {
                 max_price,
                 max_tokens: None,
                 export_dir: dir,
+                workdir: Path::new("/w/workspace"),
                 timeout: std::time::Duration::from_secs(600),
                 extra,
             })
@@ -1254,6 +1438,23 @@ mod tests {
                 .map(|t| format!("--enabled-tools=wats_{t}")),
         );
         assert_eq!(run(Access::SwarmOnly, Some(1.234), &[]), expected);
+        // workspace: the file tools too, the `ask` agent, the workspace.
+        let workspace = run(Access::Workspace, Some(1.234), &[]);
+        let mut more: Vec<String> = WORKSPACE_TOOLS
+            .iter()
+            .map(|t| format!("--enabled-tools={t}"))
+            .collect();
+        more.extend(s(&["--agent=ask", "--workdir=/w/workspace"]));
+        assert_eq!(workspace, [expected.clone(), more].concat());
+        assert!(
+            !workspace.iter().any(|a| a.contains("bash")),
+            "{workspace:?}"
+        );
+        assert!(
+            !run(Access::SwarmOnly, None, &[])
+                .iter()
+                .any(|a| a.starts_with("--agent") || a.starts_with("--workdir"))
+        );
         let inherit = run(Access::Inherit, Some(0.0), &[]);
         assert!(
             inherit.contains(&"--max-price=0.01".to_string()),
