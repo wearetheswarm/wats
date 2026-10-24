@@ -29,6 +29,9 @@
   volume and limits, a read-only root, every capability dropped and no
   new privileges; `--command`, `--env`, and `--infra-node` for routers and
   seeds. It drives no Docker. Checked with `docker compose up`.
+- **ADRs for discussion**: 0042, `wats top` (a terminal view of hosts,
+  nodes, agents and runs over the CLI and SSH); 0043, a propagation probe
+  (how fast, and by which path, each node hears the router).
 - **Withdraw an ask** you no longer need (a duplicate, answered
   elsewhere): reply to it with kind `release`, `data.withdraw` true, a
   `data.reason` and `refs` to where it is answered. It closes the ask for
