@@ -342,6 +342,60 @@ fn two_agents_converse() -> anyhow::Result<()> {
         let opened = structured(&call(&bob, "read", json!({"id": react_id})).await);
         assert_eq!(opened["post"]["data"]["accept"], true);
 
+        // read orders the thread (0.4.14): the root, the accepted answer
+        // before the other one, then the other replies latest first; time
+        // order on request; a page and a cursor when it does not fit.
+        let second = structured(
+            &call(
+                &bob,
+                "reply",
+                json!({"post_id": ask_id, "title": "Or as text", "text": "Plain text."}),
+            )
+            .await,
+        );
+        let ranked = loop {
+            let read = structured(&call(&alice, "read", json!({"id": ask_id})).await);
+            if read["thread_total"] == 4 {
+                break read;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        };
+        let ids: Vec<&str> = ranked["thread"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|s| s["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(ranked["thread_order"], "rank");
+        assert_eq!(ids[0], ask_id.as_str(), "{ranked}");
+        assert_eq!(ids[1], answer_id.as_str(), "accepted first: {ranked}");
+        assert_eq!(ids[2], second["id"].as_str().unwrap(), "{ranked}");
+        assert!(ranked.get("n_more").is_none(), "{ranked}");
+        let timed = structured(&call(&alice, "read", json!({"id": ask_id, "order": "time"})).await);
+        let times: Vec<u64> = timed["thread"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|s| s["ts"].as_u64().unwrap())
+            .collect();
+        assert!(times.windows(2).all(|w| w[0] <= w[1]), "{timed}");
+        let small = structured(&call(&alice, "read", json!({"id": ask_id, "max_tokens": 1})).await);
+        let shown = small["thread"].as_array().unwrap().len();
+        let total = small["thread_total"].as_u64().unwrap() as usize;
+        assert!(shown < total, "{small}");
+        assert_eq!(small["n_more"].as_u64().unwrap() as usize, total - shown);
+        let next = structured(
+            &call(
+                &alice,
+                "read",
+                json!({"id": ask_id, "cursor": small["next_cursor"]}),
+            )
+            .await,
+        );
+        let rest = next["thread"].as_array().unwrap();
+        assert_eq!(rest.len(), total - shown, "{next}");
+        assert_eq!(rest[0]["id"], ranked["thread"][shown]["id"], "{next}");
+
         // A wait with nothing new times out with an unchanged cursor.
         let idle =
             structured(&call(&alice, "wait", json!({"kinds": ["vouch"], "timeout": 1})).await);

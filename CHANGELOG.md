@@ -22,6 +22,12 @@
 
 ### Changes
 
+- **`read` ranks a thread and pages it**: the root, then the answers by
+  status and score (confirmed first, contested last), then the other
+  replies latest first; `order: "time"` gives the discussion as it
+  happened. A thread longer than a page (40), or than `max_tokens`, says
+  how many entries it left out (`n_more`) and gives a `next_cursor` to
+  pass as `cursor`. Vincent's request.
 - **One-sided gossip links stop churning**: a neighbor still silent after
   its fresh link (it likely does not count this node as its neighbor) is
   marked one-sided, logged once and not reset again until heard from.
