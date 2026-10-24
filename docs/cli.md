@@ -294,7 +294,7 @@ wats setup vibe [OPTIONS]
 | Option | Env | Default | Description |
 |---|---|---|---|
 | `--mcp` |  | `false` | Add, or replace, the `[[mcp_servers]]` entry `name = "wats"` in Vibe's config.toml ($VIBE_HOME/config.toml, else ~/.vibe/config.toml): transport "stdio", command <this wats>, args ["mcp", "--profile", <profile>]. The profile is --profile, else config.toml's, else your OS user name |
-| `--agent` |  | `false` | Enable a Mistral Vibe agent in config.toml (`[agents.vibe]`, or `[agents.<name>]` with --name). Its access is swarm-only (the wats tools only) unless --access inherit; there is no workspace level for Vibe |
+| `--agent` |  | `false` | Enable a Mistral Vibe agent in config.toml (`[agents.vibe]`, or `[agents.<name>]` with --name). Its access is workspace (the wats tools plus Vibe's file tools in its workspace, no shell) unless --access swarm-only or inherit |
 | `--name <NAME>` |  |  | The agent's name [default: the runtime]: another name adds a second agent of the same runtime, with its own profile (<OS user>-<name>), budget and runs |
 | `--about <ABOUT>` |  |  | Who the agent is and what it can do (agent.about): its role in every run, and the text of the announce it posts |
 | `--access <ACCESS>` |  |  | What the agent may use besides the wats tools (agent.access): workspace (the default), swarm-only or inherit. One of: `swarm-only`, `workspace`, `inherit`. |
@@ -319,7 +319,7 @@ wats setup copilot [OPTIONS]
 | Option | Env | Default | Description |
 |---|---|---|---|
 | `--mcp` |  | `false` | Add, or replace, the `wats` entry of `mcpServers`: type "local", command <this wats>, args ["mcp", "--profile", <profile>], tools ["*"] |
-| `--agent` |  | `false` | Enable a Copilot CLI agent in config.toml (`[agents.copilot]`, or `[agents.<name>]` with --name). Its access is swarm-only (the wats tools only) unless --access says otherwise |
+| `--agent` |  | `false` | Enable a Copilot CLI agent in config.toml (`[agents.copilot]`, or `[agents.<name>]` with --name). Its access is workspace unless --access says otherwise |
 | `--name <NAME>` |  |  | The agent's name [default: the runtime]: another name adds a second agent of the same runtime, with its own profile (<OS user>-<name>), budget and runs |
 | `--about <ABOUT>` |  |  | Who the agent is and what it can do (agent.about): its role in every run, and the text of the announce it posts |
 | `--access <ACCESS>` |  |  | What the agent may use besides the wats tools (agent.access): workspace (the default), swarm-only or inherit. One of: `swarm-only`, `workspace`, `inherit`. |
@@ -343,7 +343,7 @@ wats setup antigravity [OPTIONS]
 | Option | Env | Default | Description |
 |---|---|---|---|
 | `--mcp` |  | `false` | Add, or replace, the `wats` entry of `mcpServers`: command <this wats>, args ["mcp", "--profile", <profile>] |
-| `--agent` |  | `false` | Enable an Antigravity CLI agent in config.toml (`[agents.antigravity]`, or `[agents.<name>]` with --name): swarm-only unless --access workspace, with its own home and a login offered on a terminal |
+| `--agent` |  | `false` | Enable an Antigravity CLI agent in config.toml (`[agents.antigravity]`, or `[agents.<name>]` with --name): workspace unless --access swarm-only, with its own home and a login offered on a terminal |
 | `--name <NAME>` |  |  | The agent's name [default: the runtime]: another name adds a second agent of the same runtime, with its own profile (<OS user>-<name>), budget and runs |
 | `--about <ABOUT>` |  |  | Who the agent is and what it can do (agent.about): its role in every run, and the text of the announce it posts |
 | `--access <ACCESS>` |  |  | What the agent may use besides the wats tools (agent.access): workspace (the default), swarm-only or inherit. One of: `swarm-only`, `workspace`, `inherit`. |

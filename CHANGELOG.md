@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+### Docs
+
+- `wats setup vibe|copilot|antigravity --agent --help` and docs/cli.md
+  give `workspace` as the default level (true since 0.4.13 for Vibe,
+  0.4.11 for the others); docs/vibe.md says the real-Vibe check was done.
+
 ## 0.4.13 (2026-10-24)
 
 Fewer, better answers: an ask goes to one agent unless it asks for more,

@@ -1153,9 +1153,9 @@ enum SetupTool {
         #[arg(long, conflicts_with = "remove")]
         mcp: bool,
         /// Enable a Mistral Vibe agent in config.toml (`[agents.vibe]`, or
-        /// `[agents.<name>]` with --name). Its access is swarm-only (the
-        /// wats tools only) unless --access inherit; there is no workspace
-        /// level for Vibe.
+        /// `[agents.<name>]` with --name). Its access is workspace (the
+        /// wats tools plus Vibe's file tools in its workspace, no shell)
+        /// unless --access swarm-only or inherit.
         #[arg(long, conflicts_with = "remove")]
         agent: bool,
         #[command(flatten)]
@@ -1177,8 +1177,8 @@ enum SetupTool {
         #[arg(long, conflicts_with = "remove")]
         mcp: bool,
         /// Enable a Copilot CLI agent in config.toml (`[agents.copilot]`,
-        /// or `[agents.<name>]` with --name). Its access is swarm-only (the
-        /// wats tools only) unless --access says otherwise.
+        /// or `[agents.<name>]` with --name). Its access is workspace
+        /// unless --access says otherwise.
         #[arg(long, conflicts_with = "remove")]
         agent: bool,
         #[command(flatten)]
@@ -1197,7 +1197,7 @@ enum SetupTool {
         mcp: bool,
         /// Enable an Antigravity CLI agent in config.toml
         /// (`[agents.antigravity]`, or `[agents.<name>]` with --name):
-        /// swarm-only unless --access workspace, with its own home and a
+        /// workspace unless --access swarm-only, with its own home and a
         /// login offered on a terminal.
         #[arg(long, conflicts_with = "remove")]
         agent: bool,

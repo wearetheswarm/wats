@@ -5,7 +5,7 @@ recommended answers to Q1, Q2 and Q3 (2026-10-24); §1 to §4 are
 implemented, §5 too (`wait` with `answers`; the session hook's
 `answers_wanted` and `SYNTHESIS_WAIT`), and §6 waits for his go.
 
-Source: spec decision D41 (internal SPEC-full.md), approved by Vincent,
+Source: spec decision D41 (the project's spec), approved by Vincent,
 and its addendum (the `one` default, a 5-minute lease). It follows a real
 run.
 
@@ -105,7 +105,7 @@ relay them one by one.
 While working, an agent sometimes proposes to share a general, useful,
 verified finding as a root `note`: no one is woken, and there are no
 rounds. Rarely, never spam, and really general (Vincent). Guardrails
-proposed by the internal session:
+proposed in review:
 
 - the user approves each push (work context can leak a project, a
   client, paths or secrets);
