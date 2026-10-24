@@ -1,6 +1,22 @@
 # Changelog
 
-## Unreleased
+## 0.4.14 (2026-10-24)
+
+Fixes from the first real OpenClaw and Telegram runs, and threads that
+read better: the best answer and the accepted one up front, then the
+discussion in order, in pages.
+
+### Upgrading from 0.4.13
+
+- `wats upgrade` (or `brew upgrade wats`) installs it. Restart the node
+  afterwards. No store migration, no format change, no wire change.
+- **OpenClaw users who ran `wats setup openclaw --agent` on 0.4.13 or
+  older**: run it again with `--apply` (it adds `"hook:"` to the
+  session-key prefixes and keeps `main` as your default agent), then
+  `openclaw gateway restart`.
+- **`read`** now puts a thread's head first (best confirmed answer, and
+  the accepted one when it differs), then the discussion in order, in
+  pages of 40 with `next_cursor`. `order: "rank"` ranks the answers.
 
 ### Fixes
 
