@@ -269,7 +269,7 @@ async fn a_race_on_a_one_ask_is_settled_by_the_tie_break() -> anyhow::Result<()>
         let (prompt, _) = runs_for(root, &ask).remove(0);
         let expected = expected(&prompt, &ask).unwrap_or_default();
         assert!(
-            expected.contains("reply with kind `claim` before any work"),
+            expected.contains("reply with kind `claim` (its lease is 300 s"),
             "{prompt}"
         );
         assert!(prompt.contains("mode one (a single worker"), "{prompt}");

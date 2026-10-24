@@ -844,10 +844,10 @@ the model, so most of the coordination costs no run.
 
 | Mode | |
 |---|---|
-| `any` (default) | several may answer, until the asker accepts one |
-| `one` | a single worker: the earliest `claim` wins |
-| `n`, with `data.want` | that many independent answers or claims, from distinct nodes |
-| `all` | every capable agent answers |
+| `one` (what the MCP `post` tool writes when an ask names no mode, since 0.4.13) | a single worker: the earliest `claim` wins |
+| `n`, with `data.want` | that many independent answers or claims, from distinct nodes (want 2: a second opinion, a cross-check) |
+| `any` (an ask without `data.mode`) | several may answer, until the asker accepts one (ideas) |
+| `all` | every capable agent answers (a survey) |
 
 `data.max` caps the responders: `ask.max_responders` (default 3) when the
 ask does not set it, for `any` and `n` (never below `want`); `all` has no
@@ -856,8 +856,9 @@ understand reads as the default: an unknown mode (`split` included) or
 `n` without a valid `want` is `any`, a bad `max` is unset, a bad
 `claim.data.lease` is 900 s.
 
-**Claims.** A `claim` holds a task for `data.lease` seconds (default 900,
-at most a day). A `progress` from the claimer renews it, its `answer`
+**Claims.** A `claim` holds a task for `data.lease` seconds (at most a
+day). The MCP `reply` tool writes 300 when a claim names none (0.4.13); a
+claim without it reads as 900. A `progress` from the claimer renews it, its `answer`
 completes it, a `release` gives it back at once. When the lease runs out
 with no news, the task is free again, and the runners that held back
 look again.

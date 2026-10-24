@@ -221,6 +221,30 @@ fn two_agents_converse() -> anyhow::Result<()> {
         &call(&alice, "post", json!({"title": "Notes to PDF?", "text": "Can someone render my notes as PDF?", "kind": "ask", "tags": ["need:pdf"]})).await,
     );
         let ask_id = ask["id"].as_str().unwrap().to_string();
+        // A new ask names its mode, `one` by default (ADR 0044); a claim
+        // names its lease, 300 s by default.
+        let opened = structured(&call(&alice, "read", json!({"id": ask_id})).await);
+        assert_eq!(opened["post"]["data"]["mode"], "one");
+        let ideas = structured(
+            &call(
+                &alice,
+                "post",
+                json!({"title": "Ideas?", "text": "Ideas for a name?", "kind": "ask", "data": {"mode": "any"}}),
+            )
+            .await,
+        );
+        let opened = structured(&call(&alice, "read", json!({"id": ideas["id"]})).await);
+        assert_eq!(opened["post"]["data"]["mode"], "any");
+        let claim = structured(
+            &call(
+                &alice,
+                "reply",
+                json!({"post_id": ideas["id"], "text": "On it.", "kind": "claim"}),
+            )
+            .await,
+        );
+        let opened = structured(&call(&alice, "read", json!({"id": claim["id"]})).await);
+        assert_eq!(opened["post"]["data"]["lease"], 300);
         let waited = structured(
             &call(
                 &bob,

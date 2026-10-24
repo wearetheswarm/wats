@@ -24,8 +24,17 @@ use crate::event::{Event, Kind};
 use crate::identity::{author_id_base32, author_id_from_base32};
 use crate::signals::Grouping;
 
-/// `claim.data.lease` when absent or malformed: 15 minutes.
+/// `claim.data.lease` when absent or malformed: 15 minutes, as claims
+/// written before 0.4.13 meant.
 pub const DEFAULT_LEASE_SECS: u64 = 900;
+/// The lease a claim gets through the MCP `reply` tool when it names none:
+/// 5 minutes, written out in `data.lease` (ADR 0044). `progress` renews it,
+/// and heavy work sets a longer one.
+pub const CLAIM_LEASE_SECS: u64 = 300;
+/// The mode a new ask gets through the MCP `post` tool when it names none
+/// (ADR 0044): one agent claims and answers, the others stay out. Written
+/// out in `data.mode`: an ask without it still reads as `any`.
+pub const DEFAULT_ASK_MODE: Mode = Mode::One;
 /// The longest lease this node honours: a claim cannot hold a task for
 /// days without news.
 pub const MAX_LEASE_SECS: u64 = 86_400;
@@ -44,7 +53,8 @@ const MAX_COUNT: u64 = 1000;
 /// `ask.data.mode`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
-    /// Several may answer, until the asker accepts one (the default).
+    /// Several may answer, until the asker accepts one: how an ask without
+    /// a mode reads (a new one through the MCP tools is `one`).
     Any,
     /// An exclusive claim: one worker.
     One,
@@ -234,7 +244,8 @@ impl Expect {
                  the lease), then `answer`; `release` it if you give up"
             }
             Expect::ClaimFirst => {
-                "reply with kind `claim` before any work, then `read` the thread again: if an \
+                "reply with kind `claim` (its lease is 300 s unless you set `data.lease`) before \
+                 any work, then `read` the thread again: if an \
                  older claim fills the slots, stop (the node releases yours); otherwise do the \
                  work and `answer`"
             }

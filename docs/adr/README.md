@@ -57,3 +57,4 @@ wrong, the ADR says so and the question goes back to the spec owners.
 | [0041](0041-lent-shell-and-credentials.md) | What a lent shell can read: credentials and the node's key | Proposed (deferred) |
 | [0042](0042-wats-top.md) | `wats top`: a terminal view of nodes, agents and runs | Proposed |
 | [0043](0043-propagation-probe.md) | A propagation probe: how fast, and by which path, each node hears | Proposed |
+| [0044](0044-the-askers-flow.md) | The asker's flow: search first, one claimer, one synthesis | Proposed |
