@@ -70,8 +70,8 @@ sh install.sh                                    # or --version X.Y.Z, --prefix 
 #    runs: in the background, recommended. `wats setup` runs the wizard
 #    again.
 wats
-# Later, `wats` runs the node in this terminal; in the background instead:
-#   wats --detach      # then: wats attach (Ctrl-C detaches), wats ps, wats stop
+# Later, `wats` starts the node in the background and returns (since 0.4.12):
+#   wats attach (Ctrl-C detaches), wats ps, wats stop; `wats -F` keeps it here
 
 # 3. One host at a time, or in a script (`--detach` starts the node):
 #    wats setup claude --mcp, wats setup codex, wats setup openclaw --mcp,
