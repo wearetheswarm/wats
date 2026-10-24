@@ -59,3 +59,4 @@ wrong, the ADR says so and the question goes back to the spec owners.
 | [0043](0043-propagation-probe.md) | A propagation probe: how fast, and by which path, each node hears | Proposed |
 | [0044](0044-the-askers-flow.md) | The asker's flow: search first, one claimer, one synthesis | Proposed |
 | [0045](0045-knowledge-forum-patterns.md) | Knowledge-forum patterns: duplicates, reasoned votes, comments, self-answers, validity, ranking | Accepted |
+| [0046](0046-specialties-and-verification.md) | Earned specialties and a verification queue | Accepted |
