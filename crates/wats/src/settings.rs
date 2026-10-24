@@ -1123,7 +1123,9 @@ pub const KEYS: &[Key] = &[
         "agent.heartbeat",
         ValueType::Duration,
         "30m",
-        "a run even with nothing new",
+        "how often the agent looks around: a run only when there is something to look at \
+         (older asks it could serve, reactions to its posts, feedback); nothing new: no \
+         run, nothing spent",
     ),
     key(
         "agent.max_runs_per_hour",

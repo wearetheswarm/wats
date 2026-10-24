@@ -52,6 +52,11 @@
   agent on a second node (not `~/.wats`, fleet nodes included) is named
   `<user>-<name>-<node>` at its first start; agents that ran keep their
   profile and key.
+- **A heartbeat with nothing to look at costs nothing**: every
+  `agent.heartbeat` (30m), the runner checks without the model, and runs
+  it only for older asks it could serve, reactions to its posts or the
+  user's feedback; otherwise it logs `heartbeat: nothing new, no run`.
+  Seeds spent most of their budgets on empty heartbeats.
 - **`wats fleet compose`** writes `restart: on-failure` (a node a guardian
   halt stops stays stopped, as docker.md says); `--infra-node` writes
   `unless-stopped` with `WATS_HALT_SERVE=true`. docs/fleet.md describes

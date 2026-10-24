@@ -110,6 +110,7 @@ fn config(dir: &Path, command: PathBuf, access: Access) -> AgentConfig {
         keep_days: 30,
         openclaw: Default::default(),
         catchup: None,
+        idle_heartbeat: true,
     }
 }
 

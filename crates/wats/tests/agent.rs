@@ -88,7 +88,7 @@ fn ask(text: &str) -> Draft {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn agent_wakes_on_asks_and_heartbeats() -> anyhow::Result<()> {
+async fn agent_wakes_on_asks_not_on_empty_heartbeats() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     let a = node(&dir.path().join("a"), &[]).await?;
     let b = node(&dir.path().join("b"), &[&a]).await?;
@@ -134,6 +134,7 @@ async fn agent_wakes_on_asks_and_heartbeats() -> anyhow::Result<()> {
         keep_days: 30,
         openclaw: Default::default(),
         catchup: None,
+        idle_heartbeat: false,
     };
     let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
     let runner = tokio::spawn(wats::agent::run(Arc::clone(&a), config.clone(), async {
@@ -213,11 +214,18 @@ async fn agent_wakes_on_asks_and_heartbeats() -> anyhow::Result<()> {
         serde_json::from_slice(&std::fs::read(dir.path().join("work/mcp-agent.json"))?)?;
     assert_eq!(mcp_config["mcpServers"]["wats"]["args"][2], "agent");
 
-    // With nothing new, the heartbeat still wakes it.
-    eventually("a heartbeat run", || {
-        runs(dir.path())
+    // With nothing new, the heartbeat (every 4 s here) spends no run.
+    tokio::time::sleep(Duration::from_secs(6)).await;
+    assert!(
+        !runs(dir.path())
             .iter()
-            .any(|(p, _)| p.contains("woken because: the heartbeat"))
+            .any(|(p, _)| p.contains("woken because: the heartbeat")),
+        "a heartbeat with nothing to look at ran"
+    );
+    // Another ask: a second run.
+    let again = b.publish(ask("And this TSV?"), &[]).await?;
+    eventually("a second run", || {
+        runs(dir.path()).iter().any(|(p, _)| p.contains(&again.id))
     })
     .await;
 
@@ -342,6 +350,7 @@ async fn history_older_than_a_day_wakes_no_runner() -> anyhow::Result<()> {
         keep_days: 30,
         openclaw: Default::default(),
         catchup: None,
+        idle_heartbeat: true,
     };
     let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
     let runner = tokio::spawn(wats::agent::run(Arc::clone(&b), config, async {
@@ -838,6 +847,7 @@ async fn access_defaults_to_workspace_and_caps_without_tools_warn() {
 fn wats_out(data: &Path, args: &[&str]) -> (bool, String, String) {
     let out = std::process::Command::new(env!("CARGO_BIN_EXE_wats"))
         .env("USER", "tester")
+        .env("WATS_TEST_IDLE_HEARTBEAT", "1")
         .env_remove("WATS_PROFILE")
         .arg("--dir")
         .arg(data)
@@ -894,6 +904,7 @@ async fn two_agents_from_config_both_run() {
     let mut node = tokio::process::Command::new(env!("CARGO_BIN_EXE_wats"))
         .clear_tool_env()
         .env("USER", "tester")
+        .env("WATS_TEST_IDLE_HEARTBEAT", "1")
         .env_remove("WATS_PROFILE")
         .args(["--loopback", "--pow-bits=0", "--min-pow-bits=0", "--dir"])
         .arg(&data)
@@ -1129,6 +1140,7 @@ async fn budget_pauses_the_agent() -> anyhow::Result<()> {
         keep_days: 30,
         openclaw: Default::default(),
         catchup: None,
+        idle_heartbeat: true,
     };
     let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
     let runner = tokio::spawn(wats::agent::run(Arc::clone(&a), config, async {
@@ -1303,6 +1315,7 @@ echo '{{"type":"turn.completed","usage":{{"input_tokens":10,"output_tokens":2}}}
         keep_days: 30,
         openclaw: Default::default(),
         catchup: None,
+        idle_heartbeat: true,
     };
     let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
     let runner = tokio::spawn(wats::agent::run(Arc::clone(&a), config, async {
@@ -1462,6 +1475,7 @@ echo '{{"type":"turn.completed","usage":{{"input_tokens":10,"output_tokens":2}}}
         .env("HOME", &home)
         .env("CODEX_HOME", &codex_home)
         .env("USER", "tester")
+        .env("WATS_TEST_IDLE_HEARTBEAT", "1")
         .env_remove("WATS_PROFILE")
         .args(["--loopback", "--pow-bits=0", "--min-pow-bits=0", "--dir"])
         .arg(&data)
@@ -1661,6 +1675,7 @@ async fn swarm_only_agent_with_tools_warns_and_starts() -> anyhow::Result<()> {
         keep_days: 30,
         openclaw: Default::default(),
         catchup: None,
+        idle_heartbeat: true,
     };
     let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
     let runner = tokio::spawn(wats::agent::run(Arc::clone(&a), config, async {
@@ -1731,6 +1746,7 @@ async fn workspace_access_opens_the_workspace() -> anyhow::Result<()> {
         keep_days: 30,
         openclaw: Default::default(),
         catchup: None,
+        idle_heartbeat: true,
     };
     let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
     let runner = tokio::spawn(wats::agent::run(Arc::clone(&a), config, async {
@@ -2245,6 +2261,7 @@ async fn wakes_only_on_what_is_addressed_to_it() -> anyhow::Result<()> {
         keep_days: 30,
         openclaw: Default::default(),
         catchup: None,
+        idle_heartbeat: true,
     };
     let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
     let runner = tokio::spawn(wats::agent::run(Arc::clone(&a), config, async {
@@ -2357,6 +2374,7 @@ async fn wake_limits_defer_and_survive_a_restart() -> anyhow::Result<()> {
         keep_days: 30,
         openclaw: Default::default(),
         catchup: None,
+        idle_heartbeat: true,
     };
     let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
     let runner = tokio::spawn(wats::agent::run(Arc::clone(&a), config.clone(), async {
@@ -2474,6 +2492,7 @@ async fn loop_detector_pauses_a_thread_until_a_third_party_posts() -> anyhow::Re
         keep_days: 30,
         openclaw: Default::default(),
         catchup: None,
+        idle_heartbeat: true,
     };
     let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
     let runner = tokio::spawn(wats::agent::run(Arc::clone(&a), config, async {
@@ -2775,6 +2794,7 @@ async fn openclaw_forwards_wakes_to_the_gateway() -> anyhow::Result<()> {
             token_file,
         },
         catchup: None,
+        idle_heartbeat: true,
     };
     let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
     let runner = tokio::spawn(wats::agent::run(Arc::clone(&a), config, async {
@@ -2973,6 +2993,7 @@ async fn asks_stored_before_the_runner_started_still_wake_it() -> anyhow::Result
         keep_days: 30,
         openclaw: Default::default(),
         catchup: Some(wats::agent::DEFAULT_CATCHUP),
+        idle_heartbeat: true,
     };
     let start = |config: AgentConfig| {
         let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
@@ -3085,6 +3106,7 @@ async fn heartbeats_offer_older_unanswered_asks() -> anyhow::Result<()> {
         keep_days: 30,
         openclaw: Default::default(),
         catchup: Some(wats::agent::DEFAULT_CATCHUP),
+        idle_heartbeat: true,
     };
     let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
     let runner = tokio::spawn(wats::agent::run(Arc::clone(&a), config, async {
@@ -3206,6 +3228,7 @@ async fn a_clarify_past_its_deadline_wakes_the_agent_for_its_default() -> anyhow
         keep_days: 30,
         openclaw: Default::default(),
         catchup: None,
+        idle_heartbeat: true,
     };
     {
         let a = Arc::clone(&a);
@@ -3403,6 +3426,7 @@ async fn local_agents_wake_each_other_but_not_on_the_humans_posts() -> anyhow::R
             keep_days: 30,
             openclaw: Default::default(),
             catchup: None,
+            idle_heartbeat: true,
         }
     };
     let mut stops = Vec::new();
@@ -3524,6 +3548,7 @@ fn budget_config(
         keep_days: 30,
         openclaw: Default::default(),
         catchup: None,
+        idle_heartbeat: true,
     }
 }
 
@@ -3886,6 +3911,7 @@ async fn a_follow_up_ask_to_an_answer_wakes_its_author() -> anyhow::Result<()> {
         keep_days: 30,
         openclaw: Default::default(),
         catchup: Some(wats::agent::DEFAULT_CATCHUP),
+        idle_heartbeat: true,
     };
     let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
     let runner = tokio::spawn(wats::agent::run(Arc::clone(&a), config, async {

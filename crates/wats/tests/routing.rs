@@ -136,6 +136,7 @@ fn agent(root: &Path, data: &Path, caps: &[&str], every: Duration) -> AgentConfi
         keep_days: 30,
         openclaw: Default::default(),
         catchup: None,
+        idle_heartbeat: true,
     }
 }
 

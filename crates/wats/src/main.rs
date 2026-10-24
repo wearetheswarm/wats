@@ -7511,6 +7511,10 @@ fn agent_config(
     };
     Ok(wats::agent::AgentConfig {
         catchup,
+        // For tests that count heartbeat runs of a whole node (hermetic,
+        // or WATS_TEST_IDLE_HEARTBEAT).
+        idle_heartbeat: wats::update::hermetic_env()
+            || std::env::var_os("WATS_TEST_IDLE_HEARTBEAT").is_some(),
         openclaw,
         runtime,
         ignore_local: args.ignore_local.or(file.ignore_local).unwrap_or(true),

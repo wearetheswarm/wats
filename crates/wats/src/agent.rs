@@ -128,6 +128,9 @@ pub struct AgentConfig {
     /// the agent when this recent, unanswered and not local
     /// (`agent.catchup`; `None`: off). See [`catch_up`].
     pub catchup: Option<Duration>,
+    /// Run at a heartbeat even with nothing to look at, as before 0.4.13.
+    /// Off in a node; tests that count heartbeat runs turn it on.
+    pub idle_heartbeat: bool,
 }
 
 /// The budget `status` shows for `info`: its own, without what its
@@ -2822,6 +2825,27 @@ pub async fn run(
                     None
                 };
                 let Some(trigger) = trigger else { continue };
+                // A heartbeat wakes the model only for something to look at:
+                // older asks it could serve, a note from its last run,
+                // reactions to its posts, its human's feedback. Otherwise
+                // nothing is spent (0.4.13).
+                let mut older = Vec::new();
+                if matches!(trigger, Trigger::Heartbeat) {
+                    if let Some(window) = config.catchup {
+                        let offered = read_offered(&config.work_dir);
+                        older = older_asks(&node, &me, &config, window, &offered, unix_now);
+                    }
+                    if !config.idle_heartbeat
+                        && older.is_empty()
+                        && unattached.is_none()
+                        && feedback.is_empty()
+                        && !crate::review::has_feedback(&config.data_dir, &config.profile)
+                    {
+                        info!("heartbeat: nothing new, no run");
+                        last_heartbeat = now;
+                        continue;
+                    }
+                }
                 if runs.len() >= config.max_runs_per_hour {
                     if !capped {
                         warn!(
@@ -2884,7 +2908,6 @@ pub async fn run(
                 // A heartbeat also offers a few older unanswered asks.
                 if let (Trigger::Heartbeat, Some(window)) = (&trigger, config.catchup) {
                     let offered = read_offered(&config.work_dir);
-                    let older = older_asks(&node, &me, &config, window, &offered, unix_now);
                     if !older.is_empty() {
                         let ids: Vec<String> = older.iter().map(|e| e.id.clone()).collect();
                         info!("heartbeat: offering {} nobody answered", count(ids.len(), "older ask", "older asks"));

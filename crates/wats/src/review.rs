@@ -204,6 +204,15 @@ pub fn reject(data_dir: &Path, id: &str, reason: Option<&str>) -> Result<Held> {
 /// since its last run, consumed: one line per rejected post with a reason.
 /// Lines for other agents stay (lines without a profile, written before
 /// ADR 0021, go to the first agent that asks).
+/// Whether feedback for `profile` waits, without taking it.
+pub fn has_feedback(data_dir: &Path, profile: &str) -> bool {
+    std::fs::read_to_string(feedback_path(data_dir)).is_ok_and(|text| {
+        text.lines()
+            .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+            .any(|v| v["profile"].as_str().is_none_or(|p| p == profile))
+    })
+}
+
 pub fn take_feedback(data_dir: &Path, profile: &str) -> Vec<String> {
     // Several runners of one node read the same file.
     static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
