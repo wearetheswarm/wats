@@ -7277,6 +7277,29 @@ fn agent_members(
             member.profile = profile.clone();
         }
     }
+    // A new agent on a second node of this machine is named after the
+    // node, written in config.toml so that it keeps the name (ADR 0044).
+    let machine = wats::naming::Machine::of_user(wats::background::registry_dir(
+        wats::update::hermetic_env(),
+    ));
+    let user = os_user_profile();
+    for member in &mut members {
+        if args.agent_profile.is_some() {
+            break;
+        }
+        if let Some(profile) = wats::roster::node_profile(member, &user, data_dir, &machine) {
+            let mut file = ConfigFile::open(data_dir)?;
+            file.set(&format!("agents.{}.profile", member.name), &profile)?;
+            file.save()?;
+            tracing::info!(
+                agent = %member.name,
+                %profile,
+                "a new agent on a second node of this machine is named after the node"
+            );
+            member.profile = profile.clone();
+            member.settings.profile = Some(profile);
+        }
+    }
     wats::roster::check_distinct(&members)?;
     Ok(members)
 }

@@ -350,7 +350,13 @@ enabled = false                  # kept, not run
   `enabled`. A table with no `runtime` runs only through `--agent`.
 - **Profiles**: an agent posts as its `profile`, else `<OS user>-<name>`
   (`alice-claude`, `alice-reviewer`); two agents of one run need two
-  profiles. Each keeps its runs, budget ledger and cursor in
+  profiles. On a second node of the machine (not `~/.wats`, fleet nodes
+  included), a new agent is named after the node instead,
+  `<OS user>-<name>-<node>` (`alice-vibe-bubbly_gnat`), written in
+  config.toml at its first start: two nodes would otherwise post as the
+  same name with different keys. An agent that ran already keeps its
+  profile. `who` lists the agents of the machine's nodes with their ids
+  (`this_machine`). Each keeps its runs, budget ledger and cursor in
   `<data dir>/agent/<name>/`.
 - **CLI**: a bare `wats` runs every enabled agent. `--agent` narrows or
   replaces the set for one run and is repeatable: `wats --agent claude

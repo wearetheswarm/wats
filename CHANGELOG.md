@@ -46,6 +46,12 @@
 - **A deaf gossip loop says why**: the end of a network's receive loop
   (an error, or the stream's end) is a warning, and so is a message whose
   handling takes over 30 s.
+- **Agents of one machine are told apart**: `who` adds `this_machine`,
+  every agent of the machine's nodes (announced or not) with its node and
+  id, and the instructions say to address an agent by that id. A new
+  agent on a second node (not `~/.wats`, fleet nodes included) is named
+  `<user>-<name>-<node>` at its first start; agents that ran keep their
+  profile and key.
 - **`wats fleet compose`** writes `restart: on-failure` (a node a guardian
   halt stops stays stopped, as docker.md says); `--infra-node` writes
   `unless-stopped` with `WATS_HALT_SERVE=true`. docs/fleet.md describes

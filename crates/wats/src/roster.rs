@@ -129,6 +129,37 @@ pub fn default_profile(user: &str, name: &str) -> String {
     format!("{user}-{name}")
 }
 
+/// The profile of a new agent `name` on a node that is not this
+/// machine's default one (`~/.wats`): `<user>-<name>-<node name>`, the
+/// user part shortened to fit 64 chars, so that two nodes of one machine
+/// do not both post as `<user>-<name>` with different keys (ADR 0044).
+/// `None` on the default node, without a machine (hermetic), or for an
+/// agent that has run already (its directory exists: its profile, and so
+/// its key, stay).
+pub fn node_profile(
+    member: &Member,
+    user: &str,
+    data_dir: &Path,
+    machine: &crate::naming::Machine,
+) -> Option<String> {
+    if member.settings.profile.is_some() || member.legacy || member.work_dir.exists() {
+        return None;
+    }
+    let default_dir = machine.default_dir.as_deref()?;
+    if crate::naming::same_dir(data_dir, default_dir) {
+        return None;
+    }
+    let node = crate::naming::stored(data_dir)?;
+    let tail = format!("-{}-{node}", member.name);
+    let room = 64usize.saturating_sub(tail.len());
+    if room == 0 {
+        return None;
+    }
+    let user = &user[..user.len().min(room)];
+    let profile = format!("{user}{tail}");
+    crate::node::is_valid_profile(&profile).then_some(profile)
+}
+
 /// One agent of the node.
 #[derive(Debug, Clone)]
 pub struct Member {
@@ -353,6 +384,38 @@ pub fn check_distinct(members: &[Member]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// ADR 0044: a new agent on a second node of the machine is named
+    /// after the node; on the default node, once it ran, or with its own
+    /// profile, it keeps `<user>-<name>`.
+    #[test]
+    fn a_new_agent_on_a_second_node_is_named_after_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let (home, second) = (dir.path().join("home"), dir.path().join("second"));
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(&second).unwrap();
+        crate::naming::write(&second, "bubbly_gnat").unwrap();
+        let machine = crate::naming::Machine {
+            registry: None,
+            default_dir: Some(home.clone()),
+        };
+        let vibe = unnamed("vibe", &second, "alice");
+        assert_eq!(
+            node_profile(&vibe, "alice", &second, &machine).as_deref(),
+            Some("alice-vibe-bubbly_gnat")
+        );
+        let on_home = unnamed("vibe", &home, "alice");
+        assert_eq!(node_profile(&on_home, "alice", &home, &machine), None);
+        assert_eq!(
+            node_profile(&vibe, "alice", &second, &crate::naming::Machine::default()),
+            None
+        );
+        let mut named = vibe.clone();
+        named.settings.profile = Some("alice-vibe".into());
+        assert_eq!(node_profile(&named, "alice", &second, &machine), None);
+        std::fs::create_dir_all(&vibe.work_dir).unwrap();
+        assert_eq!(node_profile(&vibe, "alice", &second, &machine), None);
+    }
 
     fn settings(text: &str) -> Settings {
         let dir = tempfile::tempdir().unwrap();
