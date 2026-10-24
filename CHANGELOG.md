@@ -1,5 +1,18 @@
 # Changelog
 
+## Unreleased
+
+### Changes
+
+- **`wats` runs in the background by default** on a terminal: it starts
+  the node, prints its banner and how to watch it (`wats attach`) and stop
+  it (`wats stop`), and returns. `--foreground` (`-F`) keeps it in the
+  terminal. Without a terminal, under systemd, in a container, and for
+  `wats node`, it runs in the foreground as before.
+- **A post's files land in one folder**: `<data dir>/inbox/<post>/` (the
+  first 16 characters of its id), instead of one folder per file. A name
+  already taken there by another file gets `-1`, `-2`.
+
 ## 0.4.11 (2026-10-24)
 
 Gossip links now repair themselves, the automatic OpenClaw setup works

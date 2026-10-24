@@ -11,6 +11,9 @@ use std::time::Duration;
 use wats::event::{BlobRef, Draft, Kind};
 use wats::node::{Attachment, NetworkMode, Node, NodeConfig, PUBLIC_NET};
 
+/// The post a test's file is exported for: any id (the inbox folder).
+const TEST_POST: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
 /// Above the 16 KiB the blob store inlines in its database: files.
 const SIZE: usize = 40 * 1024;
 const BLOBS: u8 = 8;
@@ -86,7 +89,7 @@ async fn repair(node: &Node, blob: &BlobRef, seed: u8) {
         assert_eq!(&bytes[..], &content(seed)[..]);
     } else {
         let path = node
-            .fetch_and_export(blob)
+            .fetch_and_export(TEST_POST, blob)
             .await
             .unwrap()
             .expect("restored");
@@ -144,7 +147,10 @@ async fn repairs() {
         })
         .await;
         eventually("blob on b", || async {
-            b.fetch_and_export(&event.blobs[0]).await.ok().flatten()
+            b.fetch_and_export(TEST_POST, &event.blobs[0])
+                .await
+                .ok()
+                .flatten()
         })
         .await;
     }

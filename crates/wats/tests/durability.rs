@@ -15,6 +15,9 @@ use wats::node::{Attachment, NetworkMode, Node, NodeConfig, PUBLIC_NET};
 use wats::proto::closest;
 use wats::store::DropReason;
 
+/// The post a test's file is exported for: any id (the inbox folder).
+const TEST_POST: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
 /// Repair every few hundred milliseconds, every blob checked again each
 /// second, a peer replaced after two misses a second apart.
 fn fast() -> Tuning {
@@ -427,7 +430,10 @@ async fn the_last_copy_is_handed_off_before_it_is_deleted() -> anyhow::Result<()
         reader.store().get(&event.id).ok().flatten().is_some()
     })
     .await;
-    reader.fetch_and_export(&blob).await?.expect("fetched");
+    reader
+        .fetch_and_export(TEST_POST, &blob)
+        .await?
+        .expect("fetched");
     assert!(!reader.has_replica_intent(&hash.parse()?).await);
     publisher.shutdown().await?;
     holder.shutdown().await?;
@@ -856,7 +862,7 @@ async fn a_proof_refuses_the_blob_to_every_requester() -> anyhow::Result<()> {
     }
     let proof = holder.block_blob_requests_for_tests(blob.hash.parse()?);
     for n in [&proved, &second] {
-        let fetched = n.fetch_and_export(&blob).await;
+        let fetched = n.fetch_and_export(TEST_POST, &blob).await;
         assert!(
             !matches!(fetched, Ok(Some(_))),
             "refused during the proof: {fetched:?}"
@@ -873,7 +879,7 @@ async fn a_proof_refuses_the_blob_to_every_requester() -> anyhow::Result<()> {
     })
     .await;
     assert!(
-        reader.fetch_and_export(&blob).await?.is_some(),
+        reader.fetch_and_export(TEST_POST, &blob).await?.is_some(),
         "served again"
     );
     for n in [holder, proved, second, reader] {
@@ -1241,7 +1247,7 @@ async fn an_evicted_replica_is_released_once_others_are_closer() -> anyhow::Resu
     )
     .clone();
     eventually("the reader fetches it", async || {
-        matches!(reader.fetch_and_export(&blob).await, Ok(Some(_)))
+        matches!(reader.fetch_and_export(TEST_POST, &blob).await, Ok(Some(_)))
     })
     .await;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(60);

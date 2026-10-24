@@ -88,6 +88,12 @@ struct DaemonArgs {
     /// node started by `wats mcp`, as `wats` does.
     #[arg(short = 'd', long, conflicts_with = "idle_exit")]
     detach: bool,
+    /// Stay in this terminal. A bare `wats` on a terminal runs in the
+    /// background by default (0.4.12); without a terminal (a container, a
+    /// service, a pipe), under a service manager, in a container, and for
+    /// `wats node`, it runs in the foreground anyway.
+    #[arg(short = 'F', long, conflicts_with = "detach")]
+    foreground: bool,
     /// This process's stderr is this file (a detached node): rotate it by
     /// size.
     #[arg(long, hide = true)]
@@ -3382,6 +3388,43 @@ fn offer_integrations(
 /// node runs: in the background (`wats --detach`, the recommended
 /// default), in this terminal, or not now. Returns whether nothing is left
 /// to run here (the node runs in the background, or not now).
+/// What [`first_run`] leaves to do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FirstRun {
+    /// Nothing: the node runs in the background, or not now.
+    Done,
+    /// Run here, in the foreground: the wizard's choice.
+    Here,
+    /// Run as the command line says.
+    Continue,
+}
+
+/// Whether a bare `wats` runs in the background (0.4.12): on a terminal,
+/// for a long-running node, unless `--foreground`, a service manager
+/// (systemd's `INVOCATION_ID`) or a container (`/.dockerenv`,
+/// `/run/.containerenv`, Kubernetes) runs it. Never with `--hermetic`
+/// (tests) but under `WATS_TEST_DETACH=1`.
+fn detach_by_default(cli: &Cli) -> bool {
+    let daemon = &cli.daemon;
+    if !cfg!(unix)
+        || cli.command.is_some()
+        || daemon.foreground
+        || daemon.log_file.is_some()
+        || daemon.idle_exit.is_some()
+        || daemon.post.is_some()
+    {
+        return false;
+    }
+    if cli.node.hermetic {
+        return std::env::var("WATS_TEST_DETACH").as_deref() == Ok("1");
+    }
+    let service = std::env::var_os("INVOCATION_ID").is_some();
+    let container = std::path::Path::new("/.dockerenv").exists()
+        || std::path::Path::new("/run/.containerenv").exists()
+        || std::env::var_os("KUBERNETES_SERVICE_HOST").is_some();
+    interactive(&cli.node) && !service && !container
+}
+
 async fn setup_wizard(node: &NodeArgs, data_dir: &std::path::Path) -> Result<bool> {
     use wats::welcome;
     let style = welcome::Style::detect();
@@ -3477,21 +3520,27 @@ async fn offer_background(
 ///   older setup revision: one log line says that `wats setup` has new
 ///   questions.
 ///
-/// Returns whether the wizard started the node in the background (nothing
-/// left to run).
-async fn first_run(cli: &Cli, data_dir: &std::path::Path, bare: bool) -> Result<bool> {
+/// Returns what is left to do: nothing (the wizard started the node in the
+/// background, or not now), run here (the wizard's choice), or run as the
+/// command line says.
+async fn first_run(cli: &Cli, data_dir: &std::path::Path, bare: bool) -> Result<FirstRun> {
     use std::io::IsTerminal;
     let daemon = match &cli.command {
         None => &cli.daemon,
         Some(Command::Node { daemon }) => daemon,
-        _ => return Ok(false),
+        _ => return Ok(FirstRun::Continue),
     };
     if daemon.idle_exit.is_some() {
-        return Ok(false);
+        return Ok(FirstRun::Continue);
     }
     let wizard = bare && cli.command.is_none() && interactive(&cli.node);
     match wats::firstrun::stored_revision(data_dir) {
-        None if wizard => return setup_wizard(&cli.node, data_dir).await,
+        None if wizard => {
+            return Ok(match setup_wizard(&cli.node, data_dir).await? {
+                true => FirstRun::Done,
+                false => FirstRun::Here,
+            });
+        }
         None => {}
         Some(revision) if revision < wats::firstrun::SETUP_REVISION => {
             // Only the questions it would ask (an agent's, with an agent).
@@ -3516,9 +3565,9 @@ async fn first_run(cli: &Cli, data_dir: &std::path::Path, bare: bool) -> Result<
                      set up: run `wats` alone, or `wats setup`, on a terminal"
                 );
             }
-            return Ok(false);
+            return Ok(FirstRun::Continue);
         }
-        Some(_) => return Ok(false),
+        Some(_) => return Ok(FirstRun::Continue),
     }
     let flags = !daemon.agent.agents.is_empty() || daemon.agent.no_agent;
     if std::io::stdin().is_terminal()
@@ -3540,7 +3589,7 @@ async fn first_run(cli: &Cli, data_dir: &std::path::Path, bare: bool) -> Result<
             path.display()
         );
     }
-    Ok(false)
+    Ok(FirstRun::Continue)
 }
 
 /// Record the safety baseline before `wats config set|unset` changes a
@@ -8244,9 +8293,11 @@ async fn async_main(mut cli: Cli) -> Result<()> {
         _ => {}
     }
     // A bare `wats`, no argument at all, may run the setup wizard.
-    if first_run(&cli, &data_dir, std::env::args_os().len() <= 1).await? {
+    let first = first_run(&cli, &data_dir, std::env::args_os().len() <= 1).await?;
+    if first == FirstRun::Done {
         return Ok(());
     }
+    let detach = cli.daemon.detach || (first == FirstRun::Continue && detach_by_default(&cli));
     let settings = Settings::load(&data_dir)?;
     let mut config = cli.node.config(&settings)?;
     let (daemon, json_lines) = match cli.command {
@@ -8382,7 +8433,7 @@ async fn async_main(mut cli: Cli) -> Result<()> {
     // `wats --detach` (ADR 0023): start this same command in the
     // background, and return once it is up. The child is the process with
     // `--log-file`.
-    if daemon.detach && daemon.log_file.is_none() {
+    if detach && daemon.log_file.is_none() {
         if json_lines {
             anyhow::bail!(
                 "`wats node` prints JSON lines for a script: run `wats --detach` instead"

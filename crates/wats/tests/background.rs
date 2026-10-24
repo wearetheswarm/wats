@@ -815,3 +815,34 @@ async fn setup_detach_brings_back_a_stopped_session() -> anyhow::Result<()> {
     client.cancel().await?;
     Ok(())
 }
+
+/// A bare `wats` on a terminal runs in the background by default (0.4.12):
+/// no `--detach`, and it returns once the node is up, saying how to watch
+/// and stop it.
+#[test]
+fn a_bare_wats_on_a_terminal_detaches_by_default() {
+    let machine = Machine::new();
+    let dir = machine.dir("node");
+    let out = machine
+        .wats()
+        .env("WATS_TEST_INTERACTIVE", "1")
+        .env("WATS_TEST_DETACH", "1")
+        .args([
+            "--infra",
+            "none",
+            "--pow-bits=0",
+            "--min-pow-bits=0",
+            "--dir",
+        ])
+        .arg(&dir)
+        .arg("--no-agent")
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{out:?}");
+    let said = text(&out.stderr);
+    assert!(said.contains("running in the background"), "{said}");
+    assert!(said.contains("stop it: wats stop"), "{said}");
+    assert!(machine.running(&dir).is_some(), "it runs on");
+    let stopped = machine.stop(&["--all", "--timeout", "5s"]);
+    assert!(stopped.status.success(), "{stopped:?}");
+}

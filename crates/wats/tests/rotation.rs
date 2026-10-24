@@ -20,6 +20,9 @@ use wats::node::{Attachment, NetworkMode, Node, NodeConfig, PUBLIC_NET, now_secs
 use wats::proto::{Request, Response};
 use wats::store::{DropReason, RangeState, Store};
 
+/// The post a test's file is exported for: any id (the inbox folder).
+const TEST_POST: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
 const DAY: u64 = 86_400;
 const MIB: u64 = 1 << 20;
 
@@ -781,7 +784,7 @@ async fn rotation_evicts_files_by_the_last_copy_rule() -> anyhow::Result<()> {
     assert!(replica, "b holds a replica");
     for node in [&c, &d] {
         assert!(
-            within("a read", node.fetch_and_export(&blob))
+            within("a read", node.fetch_and_export(TEST_POST, &blob))
                 .await?
                 .is_some(),
             "cached on a read"

@@ -57,6 +57,7 @@ wats [OPTIONS] [COMMAND]
 | `--quiet` |  | `false` | Print nothing on stdout, and no banner (background use) |
 | `--idle-exit <IDLE_EXIT>` |  |  | Exit after this many seconds without attached MCP sessions |
 | `-d, --detach` |  | `false` | Run in the background, detached from this terminal (like `wats &`, but it survives closing it): returns once the node is up, its output going to `<data dir>/logs/node.log`. Watch it with `wats attach`, list with `wats ps`, stop with `wats stop`. Takes over a background node started by `wats mcp`, as `wats` does |
+| `-F, --foreground` |  | `false` | Stay in this terminal. A bare `wats` on a terminal runs in the background by default (0.4.12); without a terminal (a container, a service, a pipe), under a service manager, in a container, and for `wats node`, it runs in the foreground anyway |
 
 **Agent runner**
 
@@ -129,6 +130,7 @@ wats node [OPTIONS]
 | `--quiet` |  | `false` | Print nothing on stdout, and no banner (background use) |
 | `--idle-exit <IDLE_EXIT>` |  |  | Exit after this many seconds without attached MCP sessions |
 | `-d, --detach` |  | `false` | Run in the background, detached from this terminal (like `wats &`, but it survives closing it): returns once the node is up, its output going to `<data dir>/logs/node.log`. Watch it with `wats attach`, list with `wats ps`, stop with `wats stop`. Takes over a background node started by `wats mcp`, as `wats` does |
+| `-F, --foreground` |  | `false` | Stay in this terminal. A bare `wats` on a terminal runs in the background by default (0.4.12); without a terminal (a container, a service, a pipe), under a service manager, in a container, and for `wats node`, it runs in the foreground anyway |
 
 **Agent runner**
 

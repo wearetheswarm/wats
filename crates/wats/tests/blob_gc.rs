@@ -12,6 +12,9 @@ use iroh_blobs::store::fs::FsStore;
 use wats::event::{Draft, Kind};
 use wats::node::{Attachment, NetworkMode, Node, NodeConfig, PUBLIC_NET};
 
+/// The post a test's file is exported for: any id (the inbox folder).
+const TEST_POST: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
 /// Above the 16 KiB the blob store inlines in its database: files.
 const SIZE: usize = 40 * 1024;
 const KEPT: u8 = 6;
@@ -229,7 +232,7 @@ async fn a_kept_blob_with_its_file_gone_and_no_peer_is_reported() {
     assert_eq!(node.unreadable_blobs(), 1, "found at start");
     let read = node.blob_bytes(&blob.hash).await;
     assert!(!matches!(read, Ok(Some(_))), "{read:?}");
-    let export = node.fetch_and_export(&blob).await;
+    let export = node.fetch_and_export(TEST_POST, &blob).await;
     assert!(!matches!(export, Ok(Some(_))), "{export:?}");
     // Collections go on, and the post is still there.
     let from = node.blob_collections();
@@ -284,7 +287,7 @@ async fn a_kept_blob_with_its_file_gone_comes_back_from_a_peer() {
     })
     .await;
     eventually("blob on b", || async {
-        b.fetch_and_export(&blob).await.ok().flatten()
+        b.fetch_and_export(TEST_POST, &blob).await.ok().flatten()
     })
     .await;
     b.shutdown().await.unwrap();
@@ -303,7 +306,12 @@ async fn a_kept_blob_with_its_file_gone_comes_back_from_a_peer() {
     c.wait_for_neighbor(PUBLIC_NET, Duration::from_secs(10))
         .await
         .unwrap();
-    assert!(c.fetch_and_export(&blob).await.unwrap().is_none());
+    assert!(
+        c.fetch_and_export(TEST_POST, &blob)
+            .await
+            .unwrap()
+            .is_none()
+    );
     c.shutdown().await.unwrap();
 
     // B, which holds it, comes back: a read on A restores it from B.
@@ -323,7 +331,11 @@ async fn a_kept_blob_with_its_file_gone_comes_back_from_a_peer() {
     d_config.peers.push(a.endpoint().addr());
     let d = Node::start(d_config).await.unwrap();
     neighbors(&a, &d).await;
-    let exported = d.fetch_and_export(&blob).await.unwrap().expect("served");
+    let exported = d
+        .fetch_and_export(TEST_POST, &blob)
+        .await
+        .unwrap()
+        .expect("served");
     assert_eq!(std::fs::read(exported).unwrap(), content(2));
     d.shutdown().await.unwrap();
     a.shutdown().await.unwrap();

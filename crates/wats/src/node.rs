@@ -366,6 +366,15 @@ impl NodeConfig {
 /// keep their meaning in every version.
 pub const ENVELOPE_VERSION: u32 = 1;
 
+/// `name` with `-n` before its extension: `chart.png` → `chart-1.png`,
+/// `notes` → `notes-1`.
+fn numbered(name: &str, n: u32) -> String {
+    match name.rsplit_once('.') {
+        Some((stem, ext)) if !stem.is_empty() => format!("{stem}-{n}.{ext}"),
+        _ => format!("{name}-{n}"),
+    }
+}
+
 /// What travels over gossip.
 #[derive(Debug, Serialize, Deserialize)]
 struct Envelope {
@@ -3705,7 +3714,7 @@ impl Node {
 
     /// Make a blob local (downloading it from known peers if needed), then
     /// export it with [`Node::export_blob`].
-    pub async fn fetch_and_export(&self, blob: &BlobRef) -> Result<Option<PathBuf>> {
+    pub async fn fetch_and_export(&self, post: &str, blob: &BlobRef) -> Result<Option<PathBuf>> {
         if blob.size > self.config.max_blob_bytes {
             bail!(
                 "blob is larger than this node's {} byte limit",
@@ -3738,13 +3747,18 @@ impl Node {
                 return Ok(None);
             }
         }
-        self.export_blob(blob).await
+        self.export_blob(post, blob).await
     }
 
-    /// Copy a complete local blob to `<data dir>/inbox/<hash>/<name>`,
-    /// read-only, and return the path. Received files are untrusted data:
-    /// they are exported for reading, never executed (SPEC §2.11, §2.15).
-    pub async fn export_blob(&self, blob: &BlobRef) -> Result<Option<PathBuf>> {
+    /// Copy a complete local blob to `<data dir>/inbox/<post>/<name>`
+    /// (`post`: the id of the post that lists it, its first 16 characters),
+    /// read-only, and return the path: a post's files sit together (0.4.12;
+    /// one directory per blob hash before). A name the post's directory
+    /// already holds with other content gets `-1`, `-2`… before its
+    /// extension; the same content is found again. Received files are
+    /// untrusted data: they are exported for reading, never executed (SPEC
+    /// §2.11, §2.15).
+    pub async fn export_blob(&self, post: &str, blob: &BlobRef) -> Result<Option<PathBuf>> {
         if !is_safe_blob_name(&blob.name) {
             bail!("unsafe blob name {:?}", blob.name);
         }
@@ -3755,16 +3769,38 @@ impl Node {
         // Never follow a symlink on the way (security review D): the inbox
         // and its per-hash directory must be real directories, and the file
         // is written through a fresh, exclusively created temporary file.
+        anyhow::ensure!(
+            post.len() >= 16 && post.bytes().all(|b| b.is_ascii_hexdigit()),
+            "not a post id: {post:?}"
+        );
         let inbox = std::path::absolute(self.config.data_dir.join("inbox"))?;
-        let dir = inbox.join(hash.to_hex());
+        let dir = inbox.join(&post[..16]);
         real_dir(&inbox).await?;
         real_dir(&dir).await?;
-        let path = dir.join(&blob.name);
-        match tokio::fs::symlink_metadata(&path).await {
-            Ok(meta) if meta.file_type().is_file() => return Ok(Some(path)),
-            Ok(_) => bail!("{} exists and is not a regular file", path.display()),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => return Err(e.into()),
+        let mut path = dir.join(&blob.name);
+        for n in 1.. {
+            match tokio::fs::symlink_metadata(&path).await {
+                Ok(meta) if meta.file_type().is_file() => {
+                    // The same file again, or another one under that name.
+                    if meta.len() == blob.size
+                        && tokio::fs::read(&path)
+                            .await
+                            .is_ok_and(|bytes| Hash::new(&bytes) == hash)
+                    {
+                        return Ok(Some(path));
+                    }
+                    path = dir.join(numbered(&blob.name, n));
+                }
+                Ok(_) => bail!("{} exists and is not a regular file", path.display()),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => break,
+                Err(e) => return Err(e.into()),
+            }
+            anyhow::ensure!(
+                n < 1000,
+                "too many files named {} in {}",
+                blob.name,
+                dir.display()
+            );
         }
         static EXPORTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let n = EXPORTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -5637,6 +5673,13 @@ mod storage_tests {
     clippy::arithmetic_side_effects
 )]
 mod tests {
+    #[test]
+    fn numbered_names_keep_their_extension() {
+        assert_eq!(super::numbered("chart.png", 1), "chart-1.png");
+        assert_eq!(super::numbered("a.tar.gz", 2), "a.tar-2.gz");
+        assert_eq!(super::numbered("notes", 3), "notes-3");
+    }
+
     use super::*;
 
     #[test]
@@ -6162,7 +6205,10 @@ mod blob_gc_tests {
                 .set_len(SIZE as u64 / 2)
                 .unwrap();
             until_the_store_fails(&b, hash).await;
-            let exported = b.fetch_and_export(&event.blobs[0]).await.unwrap();
+            let exported = b
+                .fetch_and_export(&event.id, &event.blobs[0])
+                .await
+                .unwrap();
             let exported = exported.expect("exported");
             assert_eq!(std::fs::read(exported).unwrap(), content(7));
             assert_eq!(std::fs::read(&file).unwrap(), content(7));

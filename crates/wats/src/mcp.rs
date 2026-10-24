@@ -1702,7 +1702,7 @@ impl WatsMcp {
             });
         if args.fetch_blobs {
             for (i, blob) in post.event.blobs.iter().enumerate() {
-                let status = match self.node.fetch_and_export(blob).await {
+                let status = match self.node.fetch_and_export(&post.event.id, blob).await {
                     Ok(Some(path)) => json!({"local_path": path}),
                     Ok(None) => {
                         json!({"local_path": null, "status": "not available from known peers"})

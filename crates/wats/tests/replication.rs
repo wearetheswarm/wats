@@ -121,7 +121,10 @@ async fn late_joiner_catches_up_and_fetches_blobs_on_demand() -> anyhow::Result<
     // The blob was not replicated (nobody was there); B fetches it on read.
     let blob = &with_blob.blobs[0];
     assert!(b.blob_bytes(&blob.hash).await?.is_none());
-    let path = b.fetch_and_export(blob).await?.expect("fetched from a");
+    let path = b
+        .fetch_and_export(&with_blob.id, blob)
+        .await?
+        .expect("fetched from a");
     assert_eq!(std::fs::read(path)?, b"published before you arrived");
 
     // A restart syncs only what is new since the watermark.
@@ -318,19 +321,22 @@ async fn blobs_must_match_their_declared_size() -> anyhow::Result<()> {
         size: 1000,
         ..blob.clone()
     };
-    assert!(b.fetch_and_export(&smaller).await?.is_none());
+    assert!(b.fetch_and_export(&event.id, &smaller).await?.is_none());
     assert!(b.blob_bytes(&blob.hash).await?.is_none(), "not complete");
     // Declared larger than it is: complete, but not what was declared.
     let larger = wats::event::BlobRef {
         size: 9000,
         ..blob.clone()
     };
-    assert!(b.fetch_and_export(&larger).await?.is_none());
+    assert!(b.fetch_and_export(&event.id, &larger).await?.is_none());
     // The true size works.
-    let path = b.fetch_and_export(&blob).await?.expect("fetched from a");
+    let path = b
+        .fetch_and_export(&event.id, &blob)
+        .await?
+        .expect("fetched from a");
     assert_eq!(std::fs::read(path)?, content);
     assert!(
-        b.export_blob(&larger).await?.is_none(),
+        b.export_blob(&event.id, &larger).await?.is_none(),
         "export checks the size too"
     );
 
@@ -361,12 +367,12 @@ async fn blob_export_never_follows_symlinks() -> anyhow::Result<()> {
     let blob = &event.blobs[0];
     let elsewhere = dir.path().join("elsewhere");
     std::fs::create_dir_all(&elsewhere)?;
-    let hash_dir = data.join("inbox").join(&blob.hash);
+    let hash_dir = data.join("inbox").join(&event.id[..16]);
 
-    // The per-hash directory is a symlink: refused, nothing written there.
+    // The post's directory is a symlink: refused, nothing written there.
     std::fs::create_dir_all(data.join("inbox"))?;
     std::os::unix::fs::symlink(&elsewhere, &hash_dir)?;
-    assert!(a.export_blob(blob).await.is_err());
+    assert!(a.export_blob(&event.id, blob).await.is_err());
     assert_eq!(std::fs::read_dir(&elsewhere)?.count(), 0);
     std::fs::remove_file(&hash_dir)?;
 
@@ -375,14 +381,30 @@ async fn blob_export_never_follows_symlinks() -> anyhow::Result<()> {
     let victim = elsewhere.join("victim");
     std::fs::write(&victim, b"keep me")?;
     std::os::unix::fs::symlink(&victim, hash_dir.join(&blob.name))?;
-    assert!(a.export_blob(blob).await.is_err());
+    assert!(a.export_blob(&event.id, blob).await.is_err());
     assert_eq!(std::fs::read(&victim)?, b"keep me");
     std::fs::remove_file(hash_dir.join(&blob.name))?;
 
     // A clean inbox works, read-only.
-    let path = a.export_blob(blob).await?.expect("exported");
+    let path = a.export_blob(&event.id, blob).await?.expect("exported");
     assert_eq!(std::fs::read(&path)?, b"exported safely");
     assert!(std::fs::metadata(&path)?.permissions().readonly());
+    assert_eq!(
+        path.parent(),
+        Some(hash_dir.as_path()),
+        "one folder per post"
+    );
+    // Again: the same file, not a copy.
+    assert_eq!(a.export_blob(&event.id, blob).await?.expect("again"), path);
+    // Another file under that name in the post's folder: a numbered one.
+    let mut perms = std::fs::metadata(&path)?.permissions();
+    #[allow(clippy::permissions_set_readonly_false)]
+    perms.set_readonly(false);
+    std::fs::set_permissions(&path, perms)?;
+    std::fs::write(&path, b"something else")?;
+    let other = a.export_blob(&event.id, blob).await?.expect("numbered");
+    assert_ne!(other, path);
+    assert_eq!(std::fs::read(&other)?, b"exported safely");
     a.shutdown().await?;
     Ok(())
 }
