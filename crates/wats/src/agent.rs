@@ -1170,6 +1170,10 @@ fn start_forward(
         since: record.started,
         log: openclaw::LogWatch::new(&config.openclaw.log_dir),
         until: tokio::time::Instant::now() + config.run_timeout + WATCH_GRACE,
+        session: config.openclaw.state_dir.as_ref().map(|dir| {
+            openclaw::SessionTail::new(dir, &config.openclaw.agent, &request.session_key)
+        }),
+        transcript: transcript.clone(),
     };
     let task = tokio::spawn(async move {
         match openclaw::forward(request, &isolated).await {
@@ -1198,6 +1202,68 @@ fn start_forward(
     })
 }
 
+/// The agent's posts since `since` (unix seconds), oldest first.
+fn agent_posts(node: &Node, me: &str, since: u64) -> Vec<Arc<Event>> {
+    let mine = Filter {
+        author: Some(me.to_string()),
+        ..Filter::default()
+    };
+    let mut posts: Vec<Arc<Event>> = node
+        .store()
+        .search(None, &mine, 50)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|s| s.event)
+        .filter(|e| e.ts >= since && e.kind != Kind::Announce)
+        .collect();
+    posts.sort_by_key(|e| e.ts);
+    posts
+}
+
+/// Why a queued event woke the agent, for people.
+fn why_woke(queued: &Queued) -> &'static str {
+    match queued.why {
+        _ if queued.urgent => "addressed to it",
+        WHY_ASK => "an ask",
+        WHY_REPLY => "a reply to its post",
+        WHY_DEADLINE => "its clarify's deadline passed",
+        _ => "of interest",
+    }
+}
+
+/// What woke a run (ADR 0051 §5): a `wats_woke` line in its transcript,
+/// and a brief line.
+fn note_woke(node: &Node, config: &AgentConfig, transcript: &std::path::Path, woke: &[Queued]) {
+    let mut listed = Vec::new();
+    let mut said = Vec::new();
+    for queued in woke {
+        let Some(event) = node.store().get(&queued.id).ok().flatten().map(|s| s.event) else {
+            continue;
+        };
+        let (kind, title, from) = (
+            event.kind.as_str(),
+            crate::brief::title(&event),
+            crate::brief::name(node, &event.author),
+        );
+        listed.push(json!({
+            "id": event.id, "kind": kind, "title": title, "author": from, "why": why_woke(queued),
+        }));
+        said.push(format!(
+            "{kind} \"{title}\" from {from} ({})",
+            why_woke(queued)
+        ));
+    }
+    if let Ok(mut f) = std::fs::OpenOptions::new().append(true).open(transcript) {
+        let _ = runs::write_line(&mut f, &json!({"type": "wats_woke", "events": listed}));
+    }
+    let what = match said.len() {
+        0 => "its heartbeat".to_string(),
+        1 => said.remove(0),
+        n => format!("{} and {} more", said.remove(0), n - 1),
+    };
+    info!(target: crate::brief::TARGET, "{} woke for {what}", config.profile);
+}
+
 /// How long past `timeoutSeconds` a dispatched OpenClaw run is watched
 /// (ADR 0048 §1).
 const WATCH_GRACE: Duration = Duration::from_secs(30);
@@ -1215,6 +1281,9 @@ struct Watch {
     since: u64,
     log: crate::openclaw::LogWatch,
     until: tokio::time::Instant,
+    /// The run's OpenClaw session, followed into `transcript` (ADR 0051 §4).
+    session: Option<crate::openclaw::SessionTail>,
+    transcript: PathBuf,
 }
 
 impl Watch {
@@ -1233,6 +1302,26 @@ impl Watch {
             .any(|s| s.event.ts >= self.since)
     }
 
+    /// Copy what the session's transcript gained into the run's.
+    fn follow_session(&mut self) {
+        let Some(session) = self.session.as_mut() else {
+            return;
+        };
+        let entries = session.read_new();
+        if entries.is_empty() {
+            return;
+        }
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&self.transcript)
+        {
+            for entry in entries {
+                let _ =
+                    runs::write_line(&mut f, &json!({"type": "openclaw_entry", "entry": entry}));
+            }
+        }
+    }
+
     async fn outcome(mut self, run_id: String, isolated: bool) -> crate::openclaw::Reply {
         use crate::openclaw::{HookEnd, Reply};
         let watched = |status, detail: Option<&str>| Reply::Watched {
@@ -1242,13 +1331,23 @@ impl Watch {
             isolated,
         };
         loop {
+            self.follow_session();
             if self.posted() {
+                // The rest of the turn, briefly.
+                tokio::time::sleep(WATCH_EVERY).await;
+                self.follow_session();
                 return watched("ok", None);
             }
             match self.log.poll(&run_id) {
-                Some(HookEnd::Error(error)) => return watched("failed", Some(&error)),
-                Some(HookEnd::Completed) if self.posted() => return watched("ok", None),
+                Some(HookEnd::Error(error)) => {
+                    self.follow_session();
+                    return watched("failed", Some(&error));
+                }
                 Some(HookEnd::Completed) => {
+                    self.follow_session();
+                    if self.posted() {
+                        return watched("ok", None);
+                    }
                     return watched("abstained", Some("completed without a post"));
                 }
                 None => {}
@@ -2210,6 +2309,45 @@ async fn finish_run(
     if let Err(e) = ledger {
         warn!("agent spend ledger: {e}");
     }
+    // What the run posted (ADR 0051 §5), for its transcript and the brief
+    // line.
+    let posts = node
+        .author_key(&config.profile)
+        .map(|key| agent_posts(node, &crate::identity::author_id(&key), record.started))
+        .unwrap_or_default();
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .append(true)
+        .open(&running.transcript)
+    {
+        let listed: Vec<serde_json::Value> = posts
+            .iter()
+            .map(|e| json!({"id": e.id, "kind": e.kind.as_str(), "title": crate::brief::title(e)}))
+            .collect();
+        let _ = runs::write_line(&mut f, &json!({"type": "wats_outcome", "posts": listed}));
+    }
+    let secs = record.seconds.unwrap_or(0.0);
+    let posted: Vec<String> = posts
+        .iter()
+        .filter(|e| e.kind != Kind::React)
+        .map(|e| e.kind.as_str().to_string())
+        .collect();
+    info!(
+        target: crate::brief::TARGET,
+        "{} run {}{} · {secs:.0} s{}",
+        config.profile,
+        record.status,
+        record
+            .error
+            .as_deref()
+            .filter(|_| record.status != "ok")
+            .map(|e| format!(": {}", crate::brief::cut(e, 80)))
+            .unwrap_or_default(),
+        if posted.is_empty() {
+            " · no post".to_string()
+        } else {
+            format!(" · posted {}", posted.join(", "))
+        }
+    );
     let footer = record.footer();
     let written = std::fs::OpenOptions::new()
         .append(true)
@@ -3306,6 +3444,17 @@ pub async fn run(
                                 attempt + 2,
                                 retries.len() + 1
                             );
+                            info!(
+                                target: crate::brief::TARGET,
+                                "{} retries in {}: {}",
+                                config.profile,
+                                if after.as_secs() >= 60 {
+                                    format!("{} min", after.as_secs() / 60)
+                                } else {
+                                    format!("{} s", after.as_secs())
+                                },
+                                crate::brief::cut(error.as_deref().unwrap_or_default(), 80)
+                            );
                             let at = Instant::now() + after;
                             for q in &woke {
                                 attempts.insert(q.id.clone(), attempt + 1);
@@ -3504,7 +3653,7 @@ pub async fn run(
                         && feedback.is_empty()
                         && !crate::review::has_feedback(&config.data_dir, &config.profile)
                     {
-                        info!("heartbeat: nothing new, no run");
+                        debug!("heartbeat: nothing new, no run");
                         last_heartbeat = now;
                         continue;
                     }
@@ -3682,6 +3831,7 @@ pub async fn run(
                         {
                             warn!("agent spend ledger: {e}");
                         }
+                        note_woke(&node, &config, &run.transcript, &woke);
                         run.woke = woke;
                         run.feedback = taken;
                         running = Some(run);

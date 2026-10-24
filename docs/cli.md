@@ -526,6 +526,7 @@ wats attach [OPTIONS]
 | Option | Env | Default | Description |
 |---|---|---|---|
 | `--lines <LINES>` |  | `20` | How many of the last log lines to show first |
+| `--full` |  | `false` | The log as it is. On a terminal, `wats attach` shows only the brief lines (asks, the agents' work, answers, votes) and the warnings, as hh:mm:ss; without one, the full log is the default |
 | `-n, --node <NAME>` |  |  | The node of this machine named NAME (`wats ps`) [default: --dir, else ~/.wats] |
 
 <a id="wats-ps"></a>

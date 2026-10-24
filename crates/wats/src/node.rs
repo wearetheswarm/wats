@@ -1884,6 +1884,8 @@ impl Node {
             proof_guard,
         });
         node.measure_storage().await;
+        // Brief lines for `wats attach` (ADR 0051).
+        tokio::spawn(crate::brief::watch(Arc::downgrade(&node)));
         if node.events_share().is_some() {
             // Rotation at the cap (ADR 0025 §7): checked at start, then
             // every 30 s, in the background.

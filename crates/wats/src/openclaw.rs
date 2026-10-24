@@ -320,6 +320,9 @@ pub struct Target {
     /// Where the gateway writes its file log ([`LOG_DIR`]): a hook run's
     /// outcome, by its `runId` (ADR 0048 §1).
     pub log_dir: PathBuf,
+    /// The gateway's state directory, whose session transcripts a run's
+    /// transcript follows (ADR 0051 §4); `None`: not followed.
+    pub state_dir: Option<PathBuf>,
 }
 
 impl Default for Target {
@@ -329,6 +332,7 @@ impl Default for Target {
             agent: DEFAULT_AGENT.into(),
             token_file: PathBuf::new(),
             log_dir: PathBuf::from(LOG_DIR),
+            state_dir: None,
         }
     }
 }
@@ -336,6 +340,87 @@ impl Default for Target {
 /// The gateway's file log directory (OpenClaw 2026.6.35):
 /// `openclaw-<date>.log`, one JSON object per line.
 pub const LOG_DIR: &str = "/tmp/openclaw";
+
+/// The gateway's state directory: `$OPENCLAW_STATE_DIR`, else
+/// `~/.openclaw` (the lookup of [`env_file`]).
+pub fn state_dir(state_dir: Option<PathBuf>, home: Option<PathBuf>) -> Option<PathBuf> {
+    env_file(state_dir, home).and_then(|f| f.parent().map(Path::to_path_buf))
+}
+
+/// Follows one OpenClaw session's transcript (ADR 0051 §4):
+/// `agents/<agent>/sessions/sessions.json` maps `agent:<agent>:<session
+/// key>` to its `sessionFile`; only the lines written after [`Self::new`]
+/// are read.
+pub struct SessionTail {
+    index: PathBuf,
+    key: String,
+    file: Option<PathBuf>,
+    offset: u64,
+}
+
+impl SessionTail {
+    pub fn new(state_dir: &Path, agent: &str, session_key: &str) -> Self {
+        let mut tail = SessionTail {
+            index: state_dir
+                .join("agents")
+                .join(agent)
+                .join("sessions")
+                .join("sessions.json"),
+            key: format!("agent:{agent}:{session_key}"),
+            file: None,
+            offset: 0,
+        };
+        if let Some(file) = tail.resolve() {
+            tail.offset = std::fs::metadata(&file).map_or(0, |m| m.len());
+            tail.file = Some(file);
+        }
+        tail
+    }
+
+    /// The session's transcript, as the index names it now.
+    fn resolve(&self) -> Option<PathBuf> {
+        let index: Value = serde_json::from_slice(&std::fs::read(&self.index).ok()?).ok()?;
+        let entry = &index[&self.key];
+        let dir = self.index.parent()?;
+        match entry["sessionFile"].as_str() {
+            Some(file) => Some(PathBuf::from(file)),
+            None => entry["sessionId"]
+                .as_str()
+                .map(|id| dir.join(format!("{id}.jsonl"))),
+        }
+    }
+
+    /// The transcript's entries written since the last look, complete
+    /// lines only.
+    pub fn read_new(&mut self) -> Vec<Value> {
+        use std::io::{Read, Seek};
+        if self.file.is_none() {
+            // A new session: read from its start.
+            self.file = self.resolve();
+            self.offset = 0;
+        }
+        let Some(path) = &self.file else {
+            return Vec::new();
+        };
+        let Ok(mut file) = std::fs::File::open(path) else {
+            return Vec::new();
+        };
+        if file.seek(std::io::SeekFrom::Start(self.offset)).is_err() {
+            return Vec::new();
+        }
+        let mut buf = Vec::new();
+        if file.take(4 << 20).read_to_end(&mut buf).is_err() {
+            return Vec::new();
+        }
+        let complete = buf.iter().rposition(|&b| b == b'\n').map_or(0, |i| i + 1);
+        self.offset += complete as u64;
+        buf[..complete]
+            .split(|&b| b == b'\n')
+            .filter_map(|line| serde_json::from_slice::<Value>(line).ok())
+            .filter(|entry| entry["type"] == "message")
+            .collect()
+    }
+}
 
 /// A hook run's end, as the gateway's log says it (ADR 0048 §1).
 #[derive(Debug, Clone, PartialEq, Eq)]
