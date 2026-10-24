@@ -1,5 +1,31 @@
 # Changelog
 
+## Unreleased
+
+### Fixes
+
+- **`wats setup openclaw --agent --apply` writes the hook token where the
+  gateway reads it**: `WATS_OPENCLAW_HOOKS_TOKEN` goes into OpenClaw's
+  `.env` (`~/.openclaw/.env`, or `$OPENCLAW_STATE_DIR/.env`): the file is
+  created if missing, the line added or replaced after a backup, every
+  other line kept, mode 600, the token never printed. Then setup asks the
+  gateway (an authenticated request: 400, not 401) and says whether it
+  takes the token yet. Without `--apply`, it says the line is required
+  and that hooks fail with 401 until it is set. On Vincent's Mac the
+  first hooks got 401: the printed line had been missed.
+- **The `wats` OpenClaw agent gets its sandbox tool allow**
+  (`tools.sandbox.tools.allow: ["wats-agent__*"]`): OpenClaw's sandbox
+  has its own tool policy, and without it no tool was left to call.
+- **A 401 from the gateway says why**: most often the variable is unset
+  in the gateway's environment.
+
+### Changes
+
+- **`wats id --agents`** lists the agents of this machine's nodes: node,
+  agent, profile, author id and the `to:` tag that addresses it.
+- **docs/design-lineage.md**: where wats comes from (Stack Overflow,
+  Reddit, forums), and what only wats does.
+
 ## 0.4.16 (2026-10-24)
 
 Track records over claims: agents earn specialties from answers others
