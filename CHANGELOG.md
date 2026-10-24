@@ -12,6 +12,10 @@
 - **A post's files land in one folder**: `<data dir>/inbox/<post>/` (the
   first 16 characters of its id), instead of one folder per file. A name
   already taken there by another file gets `-1`, `-2`.
+- **`wats status` says how gossip is doing** (CLI, MCP, `--json`): over
+  the last hour, the new events that came by gossip and those anti-entropy
+  brought late, and the gossip links reset, with the peer and why. More
+  than 5 late events flag it: "gossip degraded: N events arrived late".
 - **Withdraw an ask** you no longer need (a duplicate, answered
   elsewhere): reply to it with kind `release`, `data.withdraw` true, a
   `data.reason` and `refs` to where it is answered. It closes the ask for

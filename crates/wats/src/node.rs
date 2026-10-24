@@ -3942,6 +3942,9 @@ impl Node {
         let Some((event, new)) = self.accept_value(envelope.event, Origin::Pushed).await? else {
             return Ok(());
         };
+        if new {
+            self.note_arrivals(false, 1);
+        }
         if event.net() != net {
             bail!("event for net {:?} on topic {net:?}", event.net());
         }

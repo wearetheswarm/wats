@@ -697,6 +697,9 @@ fn unanswered_asks_surface_for_their_author() -> anyhow::Result<()> {
         assert_eq!(waited["unanswered"][0]["clarifies"][0]["id"], clarify["id"]);
         let status = structured(&call(&asker, "status", json!({})).await);
         assert_eq!(status["unanswered"][0]["id"], ask_id, "{status}");
+        // How events arrived in the last hour (0.4.12).
+        assert_eq!(status["gossip"]["last_hour"]["by_anti_entropy"], 0, "{status}");
+        assert!(status["gossip"]["resets"].as_array().is_some(), "{status}");
         // Not the helper's ask.
         let theirs = structured(&call(&helper, "status", json!({})).await);
         assert!(theirs.get("unanswered").is_none(), "{theirs}");

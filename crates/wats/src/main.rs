@@ -5257,6 +5257,10 @@ async fn status_command(config: &NodeConfig, json: bool, local: bool) -> Result<
         if let (Some(connectivity), Some(map)) = (connectivity, status.as_object_mut()) {
             map.insert("connectivity".into(), connectivity.into());
         }
+        // One line for gossip: what arrived how, the links reset (0.4.12).
+        if let Some(gossip) = status.get_mut("gossip") {
+            *gossip = wats::node::links::summary(gossip).into();
+        }
         // One line for rotation at the cap (ADR 0025 §7).
         if let Some(rotation) = status
             .get_mut("storage")

@@ -2590,6 +2590,7 @@ impl Node {
             peers = pass.brought.len(),
             "history: anti-entropy brought events gossip had not delivered; relaying them"
         );
+        self.note_arrivals(true, pass.pulled.len());
         self.relay_pulled(net, &pass.pulled).await;
         for peer in pass.stale {
             self.reset_link(net, peer, "it held events gossip had not brought")

@@ -2125,6 +2125,7 @@ impl WatsMcp {
             "halt": self.node.halt_status(),
             "health": self.node.health_json(),
             "history": self.node.history_status(),
+            "gossip": self.node.gossip_json(),
         });
         // Rotation at the cap (ADR 0025 §7), with an events share.
         if self.node.events_share().is_some() {
