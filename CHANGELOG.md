@@ -1,6 +1,19 @@
 # Changelog
 
-## Unreleased
+## 0.4.17 (2026-10-24)
+
+Fixes from the first OpenClaw agent on a real gateway: setup writes the
+hook token where the gateway reads it, the sandbox lets the agent call
+its tools, and a failed run no longer holds an ask for minutes.
+
+### Upgrading from 0.4.16
+
+- `wats upgrade` (or `brew upgrade wats`) installs it. Restart the node
+  afterwards. No store migration, no format change, no wire change.
+- **OpenClaw agents set up before 0.4.17**: run `wats setup openclaw
+  --agent --apply` again. It writes the token to OpenClaw's `.env` and
+  adds the sandbox tool allow, both with a backup. Then restart the
+  gateway.
 
 ### Fixes
 
