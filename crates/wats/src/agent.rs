@@ -1852,13 +1852,14 @@ fn completion_status(completion: Option<&str>) -> &'static str {
 
 /// Close a run: kill it if needed, write the transcript footer and the
 /// index record, prune old transcripts. A deferred OpenClaw run leaves no
-/// record: it is retried.
+/// record: it is retried. With what it finished as, its recorded status
+/// (empty when deferred).
 async fn finish_run(
     node: &Node,
     config: &AgentConfig,
     mut running: Running,
     outcome: Outcome,
-) -> Finished {
+) -> (Finished, String) {
     use crate::openclaw::Reply;
     if let Some(token) = &running.token {
         node.end_runner_token(token);
@@ -1962,7 +1963,7 @@ async fn finish_run(
         }
         let _ = std::fs::remove_file(&running.transcript);
         let _ = std::fs::remove_file(runs::current_path(&config.work_dir));
-        return finished;
+        return (finished, String::new());
     }
     if record.status.is_empty() {
         record.status = if record.exit == Some(0) {
@@ -2078,7 +2079,7 @@ async fn finish_run(
     if let Err(e) = runs::prune(&config.work_dir, config.keep_runs, config.keep_days) {
         warn!("agent runs retention: {e}");
     }
-    finished
+    (finished, record.status)
 }
 
 async fn wait_running(running: &mut Option<Running>) -> Outcome {
@@ -2430,8 +2431,9 @@ fn delivery_section(node: &Node, me: &str, ids: &[(String, &'static str)], now: 
 /// After a claim or an accept in the thread of an ask: the node releases
 /// the agent's live claim on it when that claim lost the tie-break of
 /// `one` or `n`, or when the asker accepted an answer (ADR 0022 §2.1,
-/// §2.3). Once per claim (`released`). Besides its `announce`, the only
-/// posts the runner makes for the agent.
+/// §2.3). Once per claim (`released`). Besides its `announce` and
+/// [`release_failed_claims`], the only posts the runner makes for the
+/// agent.
 async fn settle_claims(
     node: &Arc<Node>,
     me: &str,
@@ -2463,10 +2465,73 @@ async fn settle_claims(
     if !released.insert(mine.id.clone()) {
         return;
     }
+    publish_release(node, config, &ask.event, &mine.id, &why).await;
+}
+
+/// Whether a run's recorded status says it ended without finishing its
+/// work: it exited non-zero, failed or ran out of time. A stopped run
+/// (the node shutting down) is not one: nothing is posted on the way out.
+fn run_failed(status: &str) -> bool {
+    matches!(status, "error" | "failed" | "timeout")
+}
+
+/// After a run that failed: the node releases each live claim the agent
+/// made during it, so that the ask goes to others now, not when the lease
+/// runs out. A claim the agent answered is no longer live.
+async fn release_failed_claims(
+    node: &Arc<Node>,
+    me: &str,
+    config: &AgentConfig,
+    started: u64,
+    status: &str,
+    released: &mut std::collections::HashSet<String>,
+) {
+    let mine = Filter {
+        kinds: vec![Kind::Claim],
+        author: Some(me.to_string()),
+        ..Filter::default()
+    };
+    let Ok(claims) = node.store().search(None, &mine, 20) else {
+        return;
+    };
+    let now = unix_now();
+    for claim in claims
+        .into_iter()
+        .map(|s| s.event)
+        .filter(|e| e.ts >= started)
+    {
+        let Some(ask) = node.store().get(claim.thread_root()).ok().flatten() else {
+            continue;
+        };
+        let Some(state) = crate::delivery::state_on(node, &ask.event, now) else {
+            continue;
+        };
+        if state.claim_of(me).is_none_or(|c| c.id != claim.id) || !released.insert(claim.id.clone())
+        {
+            continue;
+        }
+        let ended = match status {
+            "error" => "exited with an error",
+            "timeout" => "timed out",
+            _ => "failed",
+        };
+        let why = format!("its run {ended} before it answered");
+        publish_release(node, config, &ask.event, &claim.id, &why).await;
+    }
+}
+
+/// Post the release of the agent's claim `claim` on `ask`, as the agent.
+async fn publish_release(
+    node: &Arc<Node>,
+    config: &AgentConfig,
+    ask: &Event,
+    claim: &str,
+    why: &str,
+) {
     let draft = Draft {
-        net: ask.event.net.clone(),
-        thread: Some(root.to_string()),
-        parent: Some(mine.id.clone()),
+        net: ask.net.clone(),
+        thread: Some(ask.thread_root().to_string()),
+        parent: Some(claim.to_string()),
         kind: Some(Kind::Release),
         title: Some("Released".into()),
         text: format!("Released by this agent's node: {why}."),
@@ -2478,12 +2543,12 @@ async fn settle_claims(
     };
     match published {
         Ok(event) => info!(
-            claim = short(&mine.id),
+            claim = short(claim),
             release = short(&event.id),
             "released the agent's claim: {why}"
         ),
         Err(e) => warn!(
-            claim = short(&mine.id),
+            claim = short(claim),
             "could not release the agent's claim: {e:#}"
         ),
     }
@@ -2874,7 +2939,10 @@ pub async fn run(
                     let woke = std::mem::take(&mut run.woke);
                     let taken = std::mem::take(&mut run.feedback);
                     let run_started = run.record.started;
-                    let finished = finish_run(&node, &config, run, outcome).await;
+                    let (finished, status) = finish_run(&node, &config, run, outcome).await;
+                    if run_failed(&status) {
+                        release_failed_claims(&node, &me, &config, run_started, &status, &mut released).await;
+                    }
                     if let Some(note) = unattached_note(&node, &me, &config, run_started) {
                         warn!("agent {}: {note}", config.profile);
                         unattached = Some(note);
