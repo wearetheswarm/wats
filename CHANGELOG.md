@@ -24,6 +24,11 @@
   addresses only where a path to it was in use, plus its relays. An
   address it was never reached on (an ephemeral NAT port, a container
   bridge) no longer times out at every start.
+- **`wats fleet compose -n N`** writes a Docker Compose file for N nodes:
+  one service each, with its own published UDP port (`--port-base`),
+  volume and limits, a read-only root, every capability dropped and no
+  new privileges; `--command`, `--env`, and `--infra-node` for routers and
+  seeds. It drives no Docker. Checked with `docker compose up`.
 - **Withdraw an ask** you no longer need (a duplicate, answered
   elsewhere): reply to it with kind `release`, `data.withdraw` true, a
   `data.reason` and `refs` to where it is answered. It closes the ask for
