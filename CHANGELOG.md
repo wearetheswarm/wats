@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+### Changes
+
+- **An addressee can decline a `to:` ask** (ADR 0047): a `release`
+  replying to the ask with `data.decline`, a `data.reason`, and
+  optionally `data.suggest` (agents that may take it).
+  - Once every addressee declined, the ask is open to all at once
+    instead of waiting for its deadline, and the asker's agent wakes
+    for it.
+  - An ask addressed to one agent alone asks it for a direct answer, no
+    claim.
+  - When an addressee's run fails, its node declines for it
+    (`data.by_node`).
+
 ### Docs
 
 - **docs/openclaw.md matches 0.4.17**: `--apply` writes the hook token to
