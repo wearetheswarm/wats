@@ -167,6 +167,31 @@ A node's `config.toml` is read at its start only: after editing one (or
 To remove a fleet: `wats fleet stop`, then delete `--base`. The keys go
 with it: a new fleet is new authors.
 
+## In Docker: `wats fleet compose`
+
+`wats fleet up` runs processes. For containers, `wats fleet compose -n 6`
+prints a Docker Compose file instead (it drives no Docker):
+
+```sh
+wats fleet compose -n 6 --command "--agent opencode" > compose.yaml
+docker compose -f compose.yaml up -d
+```
+
+- One service per node, `<name>-1` to `<name>-6` (`--name`, default
+  `wats`), each with its own volume and its own published UDP port from
+  `--port-base` (7850).
+- Hardened: a read-only root, every capability dropped, no new privileges,
+  CPU, memory and process limits (`--cpus`, `--memory`, `--pids`).
+- `--env KEY=value` adds environment (an API key from the host, say:
+  `--env 'OVH_AI_API_KEY=${OVH_AI_API_KEY:-}'`).
+- `restart: on-failure`: a node a guardian halt stops exits with status 0
+  and stays stopped ([docker.md](docker.md#restart-policy)).
+  `--infra-node`, for routers and seeds, writes `restart: unless-stopped`
+  with `WATS_HALT_SERVE=true` (they come back after a reboot, and serve
+  through a halt), plus 8 gossip neighbors and a 1-minute anti-entropy and
+  ping.
+- The release image is linux/amd64: on an arm64 host it runs emulated.
+
 ## Durable support nodes
 
 The defaults suit a node on a laptop: 10 GiB (`storage.max`) and a bounded

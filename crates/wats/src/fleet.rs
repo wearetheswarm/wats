@@ -127,7 +127,10 @@ pub struct ComposeArgs {
     #[arg(long, default_value_t = 512)]
     pub pids: u32,
     /// Infrastructure nodes (routers, seeds): 8 gossip neighbors, a
-    /// 1-minute anti-entropy and ping.
+    /// 1-minute anti-entropy and ping, and `restart: unless-stopped` with
+    /// `WATS_HALT_SERVE=true` (they survive a host reboot, and a guardian
+    /// halt keeps them serving instead of stopping). Otherwise `restart:
+    /// on-failure`: a node a halt stops exits 0 and stays stopped.
     #[arg(long)]
     pub infra_node: bool,
     /// More environment for every node (`KEY=value`, repeatable).
@@ -164,6 +167,7 @@ pub fn compose_file(args: &ComposeArgs) -> Result<String> {
             ("WATS_GOSSIP_ACTIVE_VIEW", "8"),
             ("WATS_SYNC_ANTI_ENTROPY", "1m"),
             ("WATS_GOSSIP_PING", "1m"),
+            ("WATS_HALT_SERVE", "true"),
         ] {
             env.push((k.into(), v.into()));
         }
@@ -203,7 +207,14 @@ pub fn compose_file(args: &ComposeArgs) -> Result<String> {
         let _ = writeln!(out, "  platform: linux/amd64");
     }
     let _ = writeln!(out, "  command: [{}]", command.join(", "));
-    let _ = writeln!(out, "  restart: unless-stopped");
+    // A halt stops a node with status 0 (ADR 0016): on-failure leaves it
+    // stopped. Infrastructure nodes serve through a halt instead, and
+    // must come back after a reboot.
+    let restart = match args.infra_node {
+        true => "unless-stopped",
+        false => "on-failure",
+    };
+    let _ = writeln!(out, "  restart: {restart}");
     let _ = writeln!(out, "  read_only: true");
     let _ = writeln!(out, "  tmpfs: [\"/tmp:size=256m\"]");
     let _ = writeln!(out, "  cap_drop: [ALL]");
@@ -1594,6 +1605,8 @@ mod tests {
             "pids: 512",
             "WATS_GOSSIP_ACTIVE_VIEW: \"8\"",
             "WATS_SYNC_ANTI_ENTROPY: \"1m\"",
+            "WATS_HALT_SERVE: \"true\"",
+            "restart: unless-stopped",
             "KEY: \"a b\"",
         ] {
             assert!(file.contains(line), "{line}: {file}");
@@ -1601,6 +1614,9 @@ mod tests {
         // Another image: no platform forced.
         let own = compose_file(&compose_args(&["-n", "1", "--image", "me/wats:dev"])).unwrap();
         assert!(!own.contains("platform:"), "{own}");
+        // Not infrastructure: on-failure, and no halt.serve.
+        assert!(own.contains("restart: on-failure"), "{own}");
+        assert!(!own.contains("WATS_HALT_SERVE"), "{own}");
         // Refused: a bad name, a port overflow, WATS_PORT in --env.
         assert!(compose_file(&compose_args(&["-n", "1", "--name", "Bad_Name"])).is_err());
         assert!(compose_file(&compose_args(&["-n", "10", "--port-base", "65530"])).is_err());

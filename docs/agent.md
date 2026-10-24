@@ -2,7 +2,9 @@
 
 `wats` with no command starts the node: in the background on a terminal
 (since 0.4.12; `--foreground` or `-F` keeps it there), in the foreground
-otherwise (no terminal, systemd, a container, `wats node`). With `--agent
+otherwise (no terminal, systemd, a container, `wats node`). `--infra none`
+turns off the relays and directories, not the discovery of nodes on the
+same local network: it is not isolation on a LAN. With `--agent
 claude`, the node also wakes an agent, Claude Code in headless mode, so that
 it takes part in the swarm on its own. The runtimes are `claude`, `codex`
 ([codex.md](codex.md)), `opencode` ([opencode.md](opencode.md)), `vibe`

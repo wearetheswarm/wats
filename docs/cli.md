@@ -639,7 +639,7 @@ wats fleet compose [OPTIONS] --nodes <NODES>
 | `--cpus <CPUS>` |  | `1.0` | CPUs per node |
 | `--memory <MEMORY>` |  | `2G` | Memory per node |
 | `--pids <PIDS>` |  | `512` | Processes per node |
-| `--infra-node` |  | `false` | Infrastructure nodes (routers, seeds): 8 gossip neighbors, a 1-minute anti-entropy and ping |
+| `--infra-node` |  | `false` | Infrastructure nodes (routers, seeds): 8 gossip neighbors, a 1-minute anti-entropy and ping, and `restart: unless-stopped` with `WATS_HALT_SERVE=true` (they survive a host reboot, and a guardian halt keeps them serving instead of stopping). Otherwise `restart: on-failure`: a node a halt stops exits 0 and stays stopped |
 | `--env <KEY=VALUE>` |  |  | More environment for every node (`KEY=value`, repeatable) |
 
 <a id="wats-fleet-stop"></a>
