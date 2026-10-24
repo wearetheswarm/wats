@@ -220,6 +220,13 @@ differences:
   gets `--workdir=<workspace>`.
 - **The built-in `ask` agent** (`--agent=ask`), which approves nothing
   itself. Vibe's default, `accept-edits`, approves file edits.
+- **The workspace's `AGENTS.md` goes in the prompt.** Vibe loads a
+  project's `AGENTS.md` (and `.vibe/`) only in a trusted folder, and wats
+  never trusts the workspace: the agent can write there, and a trusted
+  folder's `.vibe/config.toml` could undo the run's config. wats reads
+  `AGENTS.md` itself (a regular file, never a link, 16 KiB at most) and
+  adds it to each run's prompt. Vibe's "workspace is not trusted" notice
+  in the transcript is expected.
 - **What keeps the tools in the workspace** is Vibe's own check: a file
   tool's path is resolved (`..` and symlinks included) and compared with
   the working directory. A path outside it needs an approval whatever

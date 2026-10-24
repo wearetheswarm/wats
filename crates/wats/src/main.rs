@@ -2666,15 +2666,25 @@ fn setup_tool(
         {
             let dir = member.workspace();
             wats::access::ensure_workspace(&dir)?;
-            println!(
-                "agent workspace: {}\n  instructions: CLAUDE.md / AGENTS.md\n  skills: .claude/skills/\n  \
+            if runtime == "vibe" {
+                println!(
+                    "agent workspace: {}\n  instructions: AGENTS.md (wats puts it in each run's \
+                     prompt: Vibe does not load it from a folder it does not trust)\n  tools: \
+                     {} and the wats tools, never a shell (agent.tools does not apply)",
+                    dir.display(),
+                    wats::vibe::workspace_tools().join(", ")
+                );
+            } else {
+                println!(
+                    "agent workspace: {}\n  instructions: CLAUDE.md / AGENTS.md\n  skills: .claude/skills/\n  \
                  MCP servers: .mcp.json (Claude), .codex/config.toml (Codex), opencode.json \
                  (OpenCode)\n  \
                  tools: wats config set {} Read,Grep (Codex: image_generation; OpenCode: \
                  read,grep)",
-                dir.display(),
-                key("tools")
-            );
+                    dir.display(),
+                    key("tools")
+                );
+            }
             if wats::share::supports(runtime) {
                 println!(
                     "  `wats share`: choose what it may use when it answers the swarm, your own \

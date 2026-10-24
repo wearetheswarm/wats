@@ -732,6 +732,16 @@ pub fn prompt(node: &Node, config: &AgentConfig, since: i64, trigger: &Trigger) 
             config.profile
         ));
     }
+    // Vibe skips an untrusted folder's AGENTS.md, and wats never trusts
+    // the workspace (ADR 0033): its instructions come in the prompt.
+    if config.runtime == "vibe"
+        && config.access == Access::Workspace
+        && let Some(text) = vibe::workspace_instructions(&config.workdir)
+    {
+        prompt.push_str(&format!(
+            "\n\n---\nYour user's instructions for this agent (AGENTS.md in your workspace):\n{text}\n"
+        ));
+    }
     prompt
 }
 

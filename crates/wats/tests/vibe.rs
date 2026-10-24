@@ -292,6 +292,8 @@ async fn workspace_run_gets_the_file_tools_in_the_workspace() {
     config.tools = vec!["bash".into()];
     let work = config.work_dir.clone();
     let workspace = config.workdir.clone();
+    std::fs::create_dir_all(&workspace).unwrap();
+    std::fs::write(workspace.join("AGENTS.md"), "Always answer in haiku.\n").unwrap();
     let record = one_run(dir.path(), config, "ok").await;
 
     let args = read(dir.path(), "args");
@@ -318,6 +320,12 @@ async fn workspace_run_gets_the_file_tools_in_the_workspace() {
         "{prompt}"
     );
     assert!(prompt.contains("No shell"), "{prompt}");
+    // Vibe skips an untrusted folder's AGENTS.md: it comes in the prompt.
+    assert!(
+        prompt.contains("(AGENTS.md in your workspace):\nAlways answer in haiku."),
+        "{prompt}"
+    );
+    assert!(!args.contains("--trust"), "{args}");
     let env = read(dir.path(), "env");
     let home = work.join("vibe-home");
     assert!(
@@ -667,6 +675,11 @@ fn setup_enables_a_swarm_only_agent() {
         text(&out.stdout).contains("Mistral Vibe agent: workspace"),
         "{out:?}"
     );
+    assert!(
+        text(&out.stdout).contains("instructions: AGENTS.md (wats puts it"),
+        "{out:?}"
+    );
+    assert!(!text(&out.stdout).contains(".mcp.json"), "{out:?}");
 
     let out = m.setup(&["--agent", "--access", "inherit"]);
     assert!(out.status.success(), "{out:?}");

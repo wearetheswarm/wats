@@ -203,7 +203,12 @@ for Vibe, so a `workspace` run gets:
   would approve the outside paths too;
 - no `--add-dir`, `--trust`, tool `allowlist` or lent server; the first
   two are refused in `agent.args` as at `swarm-only`, and `agent.tools`
-  gets a warning that it does not apply.
+  gets a warning that it does not apply;
+- the workspace's `AGENTS.md` in the prompt (`vibe::workspace_instructions`:
+  a regular file, never a link, 16 KiB at most). Vibe reads it only in a
+  trusted folder, and trusting the workspace would also load its
+  `.vibe/config.toml`, which the agent can write (found on Vincent's
+  first run, 2026-10-24).
 
 The gate, on a real Vibe before a release: one ask makes the agent read
 `/etc/hosts`, write `../outside.txt` and read a file in its workspace.

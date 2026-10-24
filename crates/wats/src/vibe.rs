@@ -315,6 +315,36 @@ pub fn workspace_tools() -> Vec<String> {
         .collect()
 }
 
+/// The most of the workspace's `AGENTS.md` a `workspace` run's prompt
+/// carries.
+pub const MAX_INSTRUCTIONS_BYTES: usize = 16 * 1024;
+
+/// The workspace's `AGENTS.md`, for a `workspace` run's prompt: Vibe loads
+/// a project's `AGENTS.md` only in a trusted folder, and wats never
+/// trusts the workspace (a trusted folder's `.vibe/config.toml`, which
+/// the agent can write, would load too). A regular file only, never a
+/// link (it could point outside the workspace), cut to
+/// [`MAX_INSTRUCTIONS_BYTES`]. `None` without one, or when it is empty.
+pub fn workspace_instructions(workdir: &Path) -> Option<String> {
+    let path = workdir.join("AGENTS.md");
+    let meta = std::fs::symlink_metadata(&path).ok()?;
+    if !meta.file_type().is_file() {
+        return None;
+    }
+    let bytes = std::fs::read(&path).ok()?;
+    let mut text = String::from_utf8_lossy(&bytes).into_owned();
+    if text.len() > MAX_INSTRUCTIONS_BYTES {
+        let mut end = MAX_INSTRUCTIONS_BYTES;
+        while !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        text.truncate(end);
+        text.push_str("\n[wats: AGENTS.md was cut to 16 KiB]");
+    }
+    let text = text.trim();
+    (!text.is_empty()).then(|| text.to_string())
+}
+
 /// The Vibe agent of a `workspace` run (`--agent`): the built-in `ask`,
 /// which approves nothing itself. Vibe's default, `accept-edits`, approves
 /// file edits, and `auto-approve` bypasses every permission.
@@ -1236,6 +1266,35 @@ mod tests {
             use std::os::unix::fs::PermissionsExt;
             let mode = std::fs::metadata(&path).unwrap().permissions().mode();
             assert_eq!(mode & 0o777, 0o600);
+        }
+    }
+
+    /// The workspace's AGENTS.md for the prompt: a regular file only (a
+    /// link could point outside the workspace), cut to 16 KiB.
+    #[test]
+    fn workspace_instructions_are_a_regular_file_cut_to_fit() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(workspace_instructions(dir.path()), None);
+        std::fs::write(dir.path().join("AGENTS.md"), "  Be brief.\n").unwrap();
+        assert_eq!(
+            workspace_instructions(dir.path()).as_deref(),
+            Some("Be brief.")
+        );
+        std::fs::write(
+            dir.path().join("AGENTS.md"),
+            "é".repeat(MAX_INSTRUCTIONS_BYTES),
+        )
+        .unwrap();
+        let cut = workspace_instructions(dir.path()).unwrap();
+        assert!(cut.len() <= MAX_INSTRUCTIONS_BYTES + 64, "{}", cut.len());
+        assert!(cut.ends_with("[wats: AGENTS.md was cut to 16 KiB]"));
+        #[cfg(unix)]
+        {
+            let secret = dir.path().join("secret");
+            std::fs::write(&secret, "key").unwrap();
+            std::fs::remove_file(dir.path().join("AGENTS.md")).unwrap();
+            std::os::unix::fs::symlink(&secret, dir.path().join("AGENTS.md")).unwrap();
+            assert_eq!(workspace_instructions(dir.path()), None);
         }
     }
 
