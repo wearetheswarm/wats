@@ -18,6 +18,9 @@
   has its own tool policy, and without it no tool was left to call.
 - **A 401 from the gateway says why**: most often the variable is unset
   in the gateway's environment.
+- **The update check runs again after an upgrade**: a cached latest
+  release older than the running version makes the check due at once.
+  A 0.4.16 node showed "latest 0.4.9" until its daily check came round.
 
 ### Changes
 
