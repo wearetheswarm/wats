@@ -277,6 +277,10 @@ pub const BUILTIN_TOOLS: [&str; 30] = [
     "unified_harness_scratchpad",
 ];
 
+/// Globs that disable a shell tool under any toolset prefix, at
+/// `swarm-only` and `workspace`.
+pub const SHELL_GLOBS: [&str; 3] = ["*bash*", "*shell*", "*powershell*"];
+
 /// Vibe's own cap on a prompt read from stdin (`MAX_STDIN_PROMPT_BYTES`):
 /// a longer prompt is cut to fit, with a note ([`fit_prompt`]).
 pub const MAX_PROMPT_BYTES: usize = 1024 * 1024;
@@ -320,8 +324,10 @@ pub fn workspace_tools() -> Vec<String> {
 /// in this run" and no tool call, while the tools were there.
 pub fn tool_names_line() -> String {
     format!(
-        " Your wats tools are MCP tools of this run, already available: call them by name \
-         ({}); there is nothing to search for or install first.",
+        " Your wats tools are MCP tools of this run: call them by name ({}). If they are \
+         not in your tool list yet, search your tools once for \"wats\", then call them. \
+         Posts are not files: open them with wats_read, never in your workspace, and read \
+         each one once.",
         run_tool_names().join(", ")
     )
 }
@@ -395,10 +401,11 @@ pub const RUNNER_ARGS: [&str; 4] = ["--prompt", "--prompt-file", "--output", "--
 /// `VIBE_MCP_SERVERS`, `VIBE_HOME`, `VIBE_CWD`…).
 pub const KEPT_ENV: [&str; 3] = ["VIBE_APP_SERVER_BIN", "VIBE_APP_SERVER_CMD", "VIBE_THEME"];
 
-/// The access level of a Vibe agent: `swarm-only` when unset.
+/// The access level of a Vibe agent: `workspace` when unset (D40,
+/// 0.4.13; `swarm-only` before).
 pub fn access(value: Option<&str>) -> Result<Access> {
     let Some(value) = value else {
-        return Ok(Access::SwarmOnly);
+        return Ok(Access::Workspace);
     };
     value.trim().parse()
 }
@@ -583,6 +590,10 @@ pub fn run_config(server: &Server, access: Access) -> String {
         .copied()
         .filter(|t| !names.contains(t))
         .collect();
+    // Vibe 3 shows its built-ins by toolset (`file_system.bash`): the
+    // shells by any name, on top of the exact names (the gate run,
+    // 2026-10-24, saw `file_system.bash`). No wats tool name has these.
+    disabled.extend(SHELL_GLOBS);
     disabled.push(&others);
     doc.insert("disabled_tools", value(strings(&disabled)));
     // Skills: `enabled_skills` that matches nothing, and every skill
@@ -1070,18 +1081,18 @@ mod tests {
         }
     }
 
-    /// Unset is swarm-only; `workspace`, `inherit` and the old `locked`
-    /// parse.
+    /// Unset is workspace (D40); `swarm-only`, `inherit` and the old
+    /// `locked` parse.
     #[test]
-    fn levels_default_to_swarm_only() {
-        assert_eq!(access(None).unwrap(), Access::SwarmOnly);
+    fn levels_default_to_workspace() {
+        assert_eq!(access(None).unwrap(), Access::Workspace);
         assert_eq!(access(Some("locked")).unwrap(), Access::SwarmOnly);
         assert_eq!(access(Some("inherit")).unwrap(), Access::Inherit);
         assert_eq!(access(Some("workspace")).unwrap(), Access::Workspace);
         assert!(access(Some("everything")).is_err());
         assert_eq!(
             crate::access::level_for("vibe", None).unwrap(),
-            Access::SwarmOnly
+            Access::Workspace
         );
         assert_eq!(
             crate::access::level_for("claude", None).unwrap(),
@@ -1358,6 +1369,16 @@ mod tests {
             Some(others_pattern(&level_tool_names(Access::Workspace)).as_str())
         );
         assert!(!text.contains("allowlist"), "{text}");
+        for glob in SHELL_GLOBS {
+            assert!(disabled.contains(&glob), "{glob}: {text}");
+        }
+        for name in level_tool_names(Access::Workspace) {
+            let n = name.to_ascii_lowercase();
+            assert!(
+                !n.contains("bash") && !n.contains("shell"),
+                "{name} would be disabled"
+            );
+        }
         assert_eq!(doc["enable_subagents"], toml::Value::Boolean(false));
     }
 

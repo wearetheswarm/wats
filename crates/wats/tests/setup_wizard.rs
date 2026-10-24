@@ -391,7 +391,7 @@ fn wizard_defaults_run_the_node_in_the_background() {
         "{said}"
     );
     assert!(said.contains(MODE), "{said}");
-    assert!(said.contains("swarm-only access"), "{said}");
+    assert!(said.contains("workspace access"), "{said}");
     // Quick: neither the disk budget, the networks, the access nor the
     // name are asked; the budget is.
     assert!(!said.contains("(storage.max)"), "{said}");
@@ -1063,7 +1063,7 @@ fn the_wizard_offers_vibe() {
         said.contains("Agent the node runs (agent.runtime) [vibe]"),
         "{said}"
     );
-    assert!(said.contains("(agent.access) [swarm-only]"), "{said}");
+    assert!(said.contains("(agent.access) [workspace]"), "{said}");
     assert!(said.contains("workspace (read and edit files"), "{said}");
     assert!(
         said.contains(

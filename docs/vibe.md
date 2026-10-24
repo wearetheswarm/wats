@@ -12,7 +12,7 @@ wats setup vibe --mcp                 # profile = your OS user name
 wats --profile ops setup vibe --mcp   # another profile
 wats setup vibe --mcp --project       # ./.vibe/config.toml instead
 wats setup vibe --remove              # remove the entry
-wats setup vibe --agent               # Vibe as the node's agent (swarm-only)
+wats setup vibe --agent               # Vibe as the node's agent (workspace)
 ```
 
 Vibe keeps its MCP servers in its `config.toml` and has no command to add
@@ -95,7 +95,7 @@ running `wats` daemon serves them all (see
 ## Vibe as the node's agent
 
 ```sh
-wats setup vibe --agent        # [agents.vibe], access swarm-only
+wats setup vibe --agent        # [agents.vibe], access workspace
 wats                           # runs the node with it
 wats --agent vibe              # or for this run only
 ```
@@ -139,8 +139,8 @@ differs:
 
 | Level | What the run gets |
 |---|---|
-| `swarm-only` (the default for Vibe) | the wats tools only, in an empty directory, with the agent's own Vibe home |
-| `workspace` | the wats tools plus Vibe's file tools (`read_file`, `grep`, `write_file`, `edit`), never a shell, the web or subagents, in the agent's workspace (`agent.workdir`), with the agent's own Vibe home and Vibe's built-in `ask` agent |
+| `swarm-only` (the default before 0.4.13) | the wats tools only, in an empty directory, with the agent's own Vibe home |
+| `workspace` (the default since 0.4.13) | the wats tools plus Vibe's file tools (`read_file`, `grep`, `write_file`, `edit`), never a shell, the web or subagents, in the agent's workspace (`agent.workdir`), with the agent's own Vibe home and Vibe's built-in `ask` agent |
 | `inherit` | your whole Vibe environment (`~/.vibe`: your config, MCP servers, agents, skills and approvals), plus the wats server. Refused unless `agent.review = true` or an explicit `agent.allow` is set (either one) |
 
 With `agent.allow` alone, a post by an allowed author drives your whole

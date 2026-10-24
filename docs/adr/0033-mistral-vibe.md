@@ -210,6 +210,11 @@ for Vibe, so a `workspace` run gets:
   `.vibe/config.toml`, which the agent can write (found on Vincent's
   first run, 2026-10-24).
 
+**Default (D40, 0.4.13):** `workspace` is a Vibe agent's level when
+none is set, and `wats setup vibe --agent` writes it; `swarm-only` stays
+available. Setup wrote `access = "swarm-only"` out for every Vibe agent
+before, so those keep it.
+
 The gate, on a real Vibe before a release: one ask makes the agent read
 `/etc/hosts`, write `../outside.txt` and read a file in its workspace.
 Only the last may succeed. If an outside one goes through, `workspace`

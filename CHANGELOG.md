@@ -4,13 +4,15 @@
 
 ### Changes
 
-- **Mistral Vibe gets a `workspace` level** (ADR 0033, amended): the wats
-  tools plus Vibe's file tools (`read_file`, `grep`, `write_file`,
-  `edit`), never a shell, in the agent's workspace (`--workdir`), with
-  the agent's own Vibe home and Vibe's built-in `ask` agent. A path
-  outside the workspace needs an approval, which a headless run never
-  gets. `agent.tools` does not apply to it. `wats setup vibe --agent
-  --access workspace`, `wats config set` and the wizard take it.
+- **Mistral Vibe gets a `workspace` level, its new default** (ADR 0033,
+  amended; D40): the wats tools plus Vibe's file tools (`read_file`,
+  `grep`, `write_file`, `edit`), never a shell, in the agent's workspace
+  (`--workdir`), with the agent's own Vibe home and Vibe's built-in `ask`
+  agent. A path outside the workspace needs an approval, which a
+  headless run never gets (checked on a real Vibe: reads and writes
+  outside are denied). The workspace's `AGENTS.md` goes in the prompt,
+  which also names the wats tools. `agent.tools` does not apply. A Vibe
+  agent set up before keeps the `access = "swarm-only"` setup wrote.
 - **`wats fleet compose`** writes `restart: on-failure` (a node a guardian
   halt stops stays stopped, as docker.md says); `--infra-node` writes
   `unless-stopped` with `WATS_HALT_SERVE=true`. docs/fleet.md describes

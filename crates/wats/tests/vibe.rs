@@ -623,13 +623,13 @@ fn text(bytes: &[u8]) -> String {
     String::from_utf8_lossy(bytes).into_owned()
 }
 
-/// `wats setup vibe --agent` enables a swarm-only Vibe agent and writes
+/// `wats setup vibe --agent` enables a workspace Vibe agent (D40) and writes
 /// nothing in HOME, the XDG directories or VIBE_HOME; `--tools` is
 /// refused before anything is written; `--access inherit`
 /// says the warning, and that the runner needs agent.allow and
 /// agent.review; with no flag, setup only says what each does.
 #[test]
-fn setup_enables_a_swarm_only_agent() {
+fn setup_enables_a_workspace_agent() {
     let m = Machine::new();
     let out = m.setup(&[]);
     assert!(out.status.success(), "{out:?}");
@@ -652,8 +652,8 @@ fn setup_enables_a_swarm_only_agent() {
     let config = std::fs::read_to_string(m.path("data/config.toml")).unwrap();
     assert!(config.contains("[agents.vibe]"), "{config}");
     assert!(config.contains("runtime = \"vibe\""), "{config}");
-    assert!(config.contains("access = \"swarm-only\""), "{config}");
-    assert!(said.contains("Mistral Vibe agent: swarm-only"), "{said}");
+    assert!(config.contains("access = \"workspace\""), "{config}");
+    assert!(said.contains("Mistral Vibe agent: workspace"), "{said}");
     assert!(said.contains("MISTRAL_API_KEY"), "{said}");
     for dir in ["home", "xdg-config", "xdg-data", "vibe"] {
         assert!(m.files(dir).is_empty(), "{dir}: {:?}", m.files(dir));
@@ -669,10 +669,13 @@ fn setup_enables_a_swarm_only_agent() {
         text(&out.stderr).contains("does not apply to a Mistral Vibe agent"),
         "{out:?}"
     );
-    let out = set("agents.vibe.access", "workspace");
+    let out = set("agents.vibe.access", "swarm-only");
     assert!(out.status.success(), "{out:?}");
-    let config = std::fs::read_to_string(m.path("data/config.toml")).unwrap();
-    assert!(config.contains("access = \"workspace\""), "{config}");
+    let out = m.setup(&["--agent"]);
+    assert!(
+        text(&out.stdout).contains("Mistral Vibe agent: swarm-only"),
+        "an explicit level stays: {out:?}"
+    );
     let out = m.setup(&["--agent", "--access", "workspace"]);
     assert!(out.status.success(), "{out:?}");
     assert!(

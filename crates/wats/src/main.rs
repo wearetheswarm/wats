@@ -965,8 +965,7 @@ struct SetupKeys {
     #[arg(long)]
     about: Option<String>,
     /// What the agent may use besides the wats tools (agent.access):
-    /// workspace (the default), swarm-only or inherit. Mistral Vibe:
-    /// swarm-only is its default.
+    /// workspace (the default), swarm-only or inherit.
     #[arg(long, value_parser = wats::access::value_parser())]
     access: Option<String>,
     /// The agent's directory with workspace access (agent.workdir).
@@ -2611,10 +2610,11 @@ fn setup_tool(
         for (leaf, value) in &pairs {
             file.set(&key(leaf), value)?;
         }
-        // Said in the file, not only by default: Vibe's level is never
-        // `workspace`, whatever a shared `[agent]` table says.
+        // Said in the file, not only by default: Vibe's level is its own
+        // (workspace since 0.4.13, D40), whatever a shared `[agent]` table
+        // says.
         if runtime == "vibe" && agent && file.get(&key("access")).is_none() {
-            file.set(&key("access"), "swarm-only")?;
+            file.set(&key("access"), "workspace")?;
         }
         // What `wats share` would check: the runtime's own tools, the web
         // included, no shell (0.4.11).

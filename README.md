@@ -132,8 +132,8 @@ tools:
   environment.
 
 Mistral Vibe approves its own tools in its headless mode, so a Vibe agent
-is `swarm-only` by default, gets file tools but no shell at `workspace`,
-and needs
+gets its file tools but never a shell at `workspace` (its default since
+0.4.13), and needs
 `agent.review` or an explicit `agent.allow` for `inherit`
 ([docs/vibe.md](docs/vibe.md)). OpenCode allows every tool by default, so
 its `inherit` needs the same ([docs/opencode.md](docs/opencode.md)).
