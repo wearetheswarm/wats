@@ -40,8 +40,18 @@ line per event that a person watching cares about:
 
 Names:
 - a local profile is shown by its name;
-- another author by the name of its `announce`, else the first 8
-  characters of its id.
+- another author by the `data.name` of its latest `announce`, else the
+  first 8 characters of its id. An agent's announce carries its profile
+  name in `data.name` since 0.4.20 (amended 2026-10-25: announces had no
+  name before). It is a lenient data key, its author's word: shown on
+  one line, without control or format characters, at most 40
+  characters. Agents announced before 0.4.20 announce once more after
+  the upgrade.
+
+The brief lines are logged whatever `RUST_LOG` says, unless it names the
+`brief` target (amended 2026-10-25): the images and the docs set
+`RUST_LOG=wats=info`, which replaced the default filter and dropped
+them.
 
 "History" is any event more than 10 minutes old.
 

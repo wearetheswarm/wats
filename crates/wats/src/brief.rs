@@ -22,9 +22,40 @@ const HISTORY_SECS: u64 = 600;
 /// How long a title is shown.
 const TITLE_CHARS: usize = 70;
 
-/// A name for `author`: a local profile's name, else the start of its id.
+/// Longest name shown.
+const NAME_CHARS: usize = 40;
+
+/// A name for `author`: a local profile's name, else the `data.name` of
+/// its latest `announce` (agents since 0.4.20), else the start of its id.
 pub fn name(node: &Node, author: &str) -> String {
-    node.local_profile(author)
+    if let Some(profile) = node.local_profile(author) {
+        return profile;
+    }
+    let filter = crate::store::Filter {
+        author: Some(author.to_string()),
+        ..Default::default()
+    };
+    node.store()
+        .latest_announces(&filter, 1)
+        .ok()
+        .and_then(|found| found.into_iter().next())
+        .and_then(|s| {
+            s.event
+                .data
+                .get("name")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+        // A name is the author's word: shown on one line, no control or
+        // format characters.
+        .map(|n| {
+            let n: String = cut(&n, NAME_CHARS)
+                .chars()
+                .filter(|c| !c.is_control())
+                .collect();
+            crate::unicode::escape_format(&n).into_owned()
+        })
+        .filter(|n| !n.is_empty())
         .unwrap_or_else(|| author.chars().take(8).collect())
 }
 

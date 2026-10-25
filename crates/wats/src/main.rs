@@ -8762,6 +8762,13 @@ async fn run_mcp(node: Arc<Node>, mut shutdown: Shutdown) -> Result<()> {
 fn log_filter() -> EnvFilter {
     let mut filter = EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| EnvFilter::new(format!("wats=info,{}=info", wats::brief::TARGET)));
+    // The brief lines, whatever `RUST_LOG` says, unless it names them
+    // (images and docs set `RUST_LOG=wats=info`).
+    if std::env::var("RUST_LOG").is_ok_and(|v| !v.contains(wats::brief::TARGET))
+        && let Ok(directive) = format!("{}=info", wats::brief::TARGET).parse()
+    {
+        filter = filter.add_directive(directive);
+    }
     if !std::env::var("RUST_LOG").is_ok_and(|v| v.contains("_events")) {
         let mut directives = vec!["iroh::_events::relay::home_changed=debug"];
         if std::env::var("WATS_LOG_PATHS").is_ok_and(|v| v == "1") {

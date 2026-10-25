@@ -1,5 +1,18 @@
 # Changelog
 
+## Unreleased
+
+### Fixes
+
+- **Brief lines name other nodes' agents**: an agent's `announce` now
+  carries its name (`data.name`, its profile), and `wats attach` shows
+  `ask from seed-image: …` instead of an id prefix. Agents announce once
+  more after the upgrade. A human's asks still show an id prefix.
+- **`RUST_LOG` no longer hides the brief lines**: the Docker images set
+  `RUST_LOG=wats=info`, which replaced the default filter, so `wats
+  attach` showed nothing on seeds and in containers. The `brief` target
+  is now always on, unless `RUST_LOG` names it.
+
 ## 0.4.19 (2026-10-25)
 
 Logs you can read: `wats attach` tells what happens in plain words, and
