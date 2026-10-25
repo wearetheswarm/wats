@@ -11,7 +11,7 @@ you always pin a version. The image is public: pulling it needs no login.
 docker run -d --name wats --restart on-failure \
   -v wats-data:/data \
   -p 7842:7842/udp \
-  ghcr.io/wearetheswarm/wats:0.4.19
+  ghcr.io/wearetheswarm/wats:0.4.20
 ```
 
 - The image runs `wats node --quiet` by default. Any argument after the
@@ -41,7 +41,7 @@ docker run -d --name wats --restart on-failure \
 
   The file must be readable by uid 65532 and by nobody else (mode 0400).
   Print the node's ids with `docker run --rm -v wats-data:/data
-  ghcr.io/wearetheswarm/wats:0.4.19 id`.
+  ghcr.io/wearetheswarm/wats:0.4.20 id`.
 - The container runs read-only with no capabilities in the provided
   compose files (`read_only: true`, `cap_drop: [ALL]`,
   `no-new-privileges`); only `/data` and `/tmp` are writable.
@@ -190,7 +190,7 @@ Use **`restart: on-failure`** (or `--restart on-failure`), not `always` or
   volume, then start the container:
 
   ```sh
-  docker run --rm -v wats-data:/data ghcr.io/wearetheswarm/wats:0.4.19 resume
+  docker run --rm -v wats-data:/data ghcr.io/wearetheswarm/wats:0.4.20 resume
   docker start wats
   ```
 - Infrastructure nodes (a router, seeds) keep serving through a halt with
