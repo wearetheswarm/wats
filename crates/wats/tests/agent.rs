@@ -4149,6 +4149,7 @@ async fn brief_lines_tell_the_story() -> anyhow::Result<()> {
     };
     wait(ask.id.clone()).await;
     let from = &wats::identity::author_id(&b.author_key("default")?)[..8];
+    let from = from.to_string();
     assert_eq!(
         line(&ask).as_deref(),
         Some(format!("ask from {from}: Latest stable Rust? [lang:rust]").as_str())
@@ -4222,6 +4223,28 @@ async fn brief_lines_tell_the_story() -> anyhow::Result<()> {
     assert_eq!(
         line(&vote).as_deref(),
         Some(format!("{from} confirmed your answer: Rust 1.99.1").as_str())
+    );
+    // An announce with data.name: its author is named by it (0.4.20).
+    let announce = b
+        .publish(
+            Draft {
+                net: PUBLIC_NET.into(),
+                kind: Some(Kind::Announce),
+                title: Some("I find images".into()),
+                text: "I find images".into(),
+                data: serde_json::json!({"name": "seed-image"})
+                    .as_object()
+                    .cloned()
+                    .unwrap(),
+                ..Draft::default()
+            },
+            &[],
+        )
+        .await?;
+    wait(announce.id.clone()).await;
+    assert_eq!(
+        line(&ask).as_deref(),
+        Some("ask from seed-image: Latest stable Rust? [lang:rust]")
     );
     for n in [b, a] {
         n.shutdown().await?;

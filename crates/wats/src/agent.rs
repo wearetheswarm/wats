@@ -963,9 +963,15 @@ async fn announce_if_changed(node: &Arc<Node>, config: &AgentConfig) {
         return;
     }
     let tags: Vec<String> = config.caps.iter().map(|c| cap_tag(c)).collect();
-    let fingerprint = blake3::hash(json!([config.profile, about, tags]).to_string().as_bytes())
-        .to_hex()
-        .to_string();
+    // `name` in it: agents announced before 0.4.20 announce once more,
+    // with their name.
+    let fingerprint = blake3::hash(
+        json!([config.profile, about, tags, "name"])
+            .to_string()
+            .as_bytes(),
+    )
+    .to_hex()
+    .to_string();
     let marker = config
         .work_dir
         .join(format!("announced-{}", config.profile));
@@ -978,6 +984,12 @@ async fn announce_if_changed(node: &Arc<Node>, config: &AgentConfig) {
         title: Some(title_from_text(about)),
         text: about.to_string(),
         tags,
+        // The agent's name for people (`data.name`, 0.4.20): brief lines
+        // show it instead of an id (ADR 0051 §1).
+        data: json!({"name": config.profile})
+            .as_object()
+            .cloned()
+            .unwrap_or_default(),
         ..Draft::default()
     };
     let published = match node.author_key(&config.profile) {
