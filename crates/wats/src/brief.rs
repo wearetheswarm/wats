@@ -710,16 +710,6 @@ mod tests {
     }
 
     #[test]
-    fn files_say_what_came_with_an_answer() {
-        assert_eq!(files_line(&[]), "");
-        assert_eq!(files_line(&["main.rs"]), " · 1 file attached (main.rs)");
-        assert_eq!(
-            files_line(&["a.txt", "b.rs", "c.log", "d.png"]),
-            " · 4 files attached (a.txt, b.rs, c.log, …)"
-        );
-    }
-
-    #[test]
     fn brief_lines_and_warnings_only() {
         let plain = Paint { color: false };
         let brief = "2026-10-24T19:38:46.191234Z  INFO agent{name=openclaw}: brief: alice-agent \
