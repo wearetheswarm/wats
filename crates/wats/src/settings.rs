@@ -931,7 +931,7 @@ pub const KEYS: &[Key] = &[
         "semantic.enabled",
         ValueType::Bool,
         "true",
-        "semantic search: search also matches by meaning, with a model (67 MB, downloaded once \
+        "semantic search: search also matches by meaning, with a model (34 MB, downloaded once \
          from wats's releases) that embeds posts on this machine, in the background; nothing \
          leaves it (false: full-text search only)",
     ),

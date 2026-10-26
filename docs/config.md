@@ -82,7 +82,7 @@ Command-line flags and `WATS_*` variables, where they exist (`wats --help`), tak
 
 | Key | Default | |
 |---|---|---|
-| `semantic.enabled` | true | semantic search: search also matches by meaning, with a model (67 MB, downloaded once from wats's releases) that embeds posts on this machine, in the background; nothing leaves it (false: full-text search only) |
+| `semantic.enabled` | true | semantic search: search also matches by meaning, with a model (34 MB, downloaded once from wats's releases) that embeds posts on this machine, in the background; nothing leaves it (false: full-text search only) |
 | `semantic.model_dir` | &lt;data dir&gt;/models | where semantic search's model file is, or goes; several nodes of a machine can share one |
 
 ## `[health]`

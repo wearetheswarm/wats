@@ -331,8 +331,10 @@ laptops.
   not match is deleted and never loaded.
 - **Download.** It happens once, in the background, at the first start
   with semantic search on. Startup never waits for it.
-  - Destination: `<data dir>/models/<sha256>/`. `semantic.model_dir`
-    lets several nodes share one copy.
+  - Destination: `<data dir>/models/<file>.safetensors` (by default
+    `~/.wats/models/bge-small-en-v1.5-int8.safetensors` since 0.5.1).
+    `semantic.model_dir` sets the directory, so several nodes can share
+    one copy.
   - Hermetic mode and `--infra none` never download. A test sets
     `semantic.model_dir` to a fixture.
 - **Offline, or a failed download.** Search is FTS only, exactly as
@@ -388,9 +390,10 @@ laptops.
 - **Partial results are fine.** Search uses vectors where they exist and
   FTS everywhere. There is no "index not ready" error.
 - **Laptop manners:**
-  - **Battery.** The backfill pauses on battery, read from IOKit's
-    power source on macOS and `/sys/class/power_supply` on Linux; both
-    reads are cheap. New posts are still embedded.
+  - **Battery.** The backfill pauses on battery, read from `pmset -g
+    batt` on macOS (no IOKit binding needed) and from
+    `/sys/class/power_supply` on Linux; both reads are cheap. New posts
+    are still embedded.
   - **Load.** It also pauses while the load average exceeds twice the
     number of cores. At background priority and half the time, only a
     really busy machine needs it to stop. Once the number of cores was
@@ -405,7 +408,7 @@ laptops.
     …`, or `ready`); `status --json` has `semantic: {state, embedded,
     total, model}`.
   - When the backfill finishes, the brief view logs one line:
-    `semantic index ready: 15,000 posts (12 min)`.
+    `semantic index ready: 15000 posts (12m)`.
 
 **Numbers:**
 - **Today's store:** 69 posts, a few seconds anywhere.
@@ -431,9 +434,9 @@ laptops.
 
 ### 7. Default on
 
-On by default for every node, laptops included. `semantic = false` in
-`config.toml` (or `--no-semantic`) turns it off. Why:
-- The model is 67 MB, downloaded once.
+On by default for every node, laptops included. `semantic.enabled =
+false` in `config.toml` (or `--no-semantic`) turns it off. Why:
+- The model is 66.4 MB (33.8 MB since 0.5.1, int8), downloaded once.
 - The ~240 MB of RAM is held only while the model works, then released.
 - The backfill runs at background priority, under a cap, paused on
   battery.
@@ -492,8 +495,9 @@ see the same posts, and only the local ranking differs.
   so, rather than being handed noise.
 - `browse` becomes a step of the flow, pointed to by every search.
 - **0.5.0:**
-  - a local schema bump;
-  - a 67 MB download on first start;
+  - three local tables, with no schema bump (0.4.21 still opens the
+    store);
+  - a 66.4 MB download on first start (33.8 MB since 0.5.1);
   - about 240 MB of RAM while the model works;
   - about 20 pure-Rust crates (`gemm`), and the vocabulary in the binary.
 - No wire change.
