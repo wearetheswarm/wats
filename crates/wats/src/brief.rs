@@ -174,7 +174,16 @@ pub fn line_for(node: &Node, event: &Event) -> Option<String> {
         Kind::React if parent_local && !local => {
             let parent = parent.as_ref()?;
             let data = &event.data;
-            let what = if data.get("accept").and_then(Value::as_bool) == Some(true) {
+            // On an ask, only a +1 means something (demand): accepted,
+            // used and confirmed are about answers.
+            let on_ask = parent.kind == Kind::Ask;
+            let what = if on_ask {
+                if data.get("value").and_then(Value::as_i64) == Some(1) {
+                    "voted +1 on"
+                } else {
+                    return None;
+                }
+            } else if data.get("accept").and_then(Value::as_bool) == Some(true) {
                 "accepted"
             } else if data.get("used").and_then(Value::as_bool) == Some(true) {
                 "used"
@@ -313,7 +322,8 @@ pub fn render(line: &str, paint: Paint) -> Option<String> {
         "WARN" | "ERROR"
             if !target.starts_with("iroh")
                 && target != "wats::reconnect"
-                && target != "wats::health" =>
+                && target != "wats::health"
+                && target != "wats::node::links" =>
         {
             let colour = if level == "ERROR" { "31" } else { "33" };
             Some(format!(
@@ -368,6 +378,9 @@ mod tests {
         assert_eq!(render(offline, plain), None);
         let health = "2026-10-26T02:37:00.1Z  WARN wats::health: infra health degraded: no relay";
         assert_eq!(render(health, plain), None);
+        let links = "2026-10-26T22:36:00.1Z  WARN wats::node::links: gossip neighbor still silent \
+                     after a fresh link: it likely does not count this node as its neighbor";
+        assert_eq!(render(links, plain), None);
         let back = "2026-10-26T08:23:00.1Z  INFO brief: back online after sleep (6h02m)";
         assert!(
             render(back, plain)
