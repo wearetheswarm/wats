@@ -1,5 +1,19 @@
 # Changelog
 
+## Unreleased (0.5.1)
+
+### Changes
+
+- **A new semantic search model reindexes by itself** (ADR 0053 §6): the
+  node drops the previous model's vectors and embeds the history again,
+  newest first. Search keeps working meanwhile. 0.5.0 did this only on a
+  node's first run.
+- **`wats status` shows the model download**:
+  `semantic: downloading model (12 MB of 66)`, instead of `off: model not
+  downloaded` while it comes.
+- **AVX-512** on x86 CPUs that have it: semantic search embeds about 22%
+  faster there (measured on AMD Zen 5), and nothing changes elsewhere.
+
 ## 0.5.0 (2026-10-26)
 
 Semantic search: `search` finds an answer even when the question is

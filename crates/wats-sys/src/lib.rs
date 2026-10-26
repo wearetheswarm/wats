@@ -275,6 +275,58 @@ mod tests {
         assert_eq!(c, [0.0, 58.0, 0.0, 0.0, 139.0, 0.0]);
     }
 
+    /// Against a naive product, over many shapes (those of BERT's layers,
+    /// odd ones, a single row or column) and strides, both ways round:
+    /// whichever kernels the CPU gets (AVX-512, AVX2, NEON, Accelerate).
+    #[test]
+    fn sgemm_matches_a_naive_product() {
+        let mut seed = 0x2545_f491_4f6c_dd1du64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed >> 40) as f32 / (1u64 << 24) as f32 - 0.5
+        };
+        let dims = [1usize, 2, 3, 7, 16, 17, 32, 33, 64, 130];
+        let mut checked = 0;
+        for &m in &dims {
+            for &n in &[1usize, 5, 16, 31, 64, 384] {
+                for &k in &[1usize, 8, 15, 32, 384] {
+                    for bt in [false, true] {
+                        let (lda, ldc) = (k + m % 3, n + 2);
+                        let ldb = if bt { k + 1 } else { n + 3 };
+                        let a: Vec<f32> = (0..(m - 1) * lda + k).map(|_| next()).collect();
+                        let b_len = if bt {
+                            (n - 1) * ldb + k
+                        } else {
+                            (k - 1) * ldb + n
+                        };
+                        let b: Vec<f32> = (0..b_len).map(|_| next()).collect();
+                        let mut c = vec![f32::NAN; (m - 1) * ldc + n];
+                        super::sgemm(m, n, k, &a, lda, &b, ldb, bt, &mut c, ldc);
+                        for i in 0..m {
+                            for j in 0..n {
+                                let want: f64 = (0..k)
+                                    .map(|p| {
+                                        let bv = if bt { b[j * ldb + p] } else { b[p * ldb + j] };
+                                        f64::from(a[i * lda + p]) * f64::from(bv)
+                                    })
+                                    .sum();
+                                let got = f64::from(c[i * ldc + j]);
+                                assert!(
+                                    (got - want).abs() <= 1e-4 * (1.0 + want.abs()),
+                                    "m={m} n={n} k={k} bt={bt} ({i},{j}): {got} vs {want}"
+                                );
+                            }
+                        }
+                        checked += 1;
+                    }
+                }
+            }
+        }
+        assert_eq!(checked, dims.len() * 6 * 5 * 2);
+    }
+
     #[test]
     #[should_panic(expected = "a is too short")]
     fn sgemm_refuses_short_slices() {

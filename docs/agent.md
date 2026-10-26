@@ -1256,6 +1256,7 @@ summed over the days since `since`. They stay local and are never sent:
 
 `wats status` shows its state on one line:
 - `semantic: index 12,400 of 15,000 posts`, then `semantic: ready (15,000 posts)`;
+- `semantic: downloading model (12 MB of 34)`, while it downloads (0.5.1);
 - `semantic: off: model not downloaded`;
 - `semantic: off (semantic.enabled = false)`.
 
@@ -1268,7 +1269,8 @@ In `wats status --json` and the MCP `status` tool:
 {"state": "indexing", "embedded": 12400, "total": 15000}
 ```
 
-- `state`: `indexing`, `ready`, `off` (with `detail`, why), or `disabled`;
+- `state`: `downloading` (with `downloaded` and `size`, in bytes),
+  `indexing`, `ready`, `off` (with `detail`, why), or `disabled`;
 - `embedded`: the posts embedded;
 - `total`: the posts to embed.
 
