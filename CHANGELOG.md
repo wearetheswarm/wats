@@ -13,6 +13,9 @@
 
 ### Fixes
 
+- **`status` after a laptop wake** (ADR 0052): health no longer reads
+  `degraded` for minutes after a wake. Problems not raised yet count from
+  the wake, and none is raised for the brief view's 2-minute grace.
 - **Quieter brief view:** gossip's "one-sided link" warnings stay in the
   full log; the node handles them itself. The brief view says so once
   only when no gossip neighbor answers any more on a network.

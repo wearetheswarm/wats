@@ -69,4 +69,9 @@ new lines are brief lines (INFO, target `brief`), like those of ADR
   issues 2 min later than in the full log.
 - The `health` and `connectivity` values of `status` do not change: they
   can still read `degraded` for a few minutes after a wake.
+  - **Amended 2026-10-26 (0.5.2):** they no longer do. When the clocks
+    show a sleep, the health checks restart the debounce of problems not
+    yet raised, from the wake. They raise nothing for the same 2 minutes
+    as the brief view (`Health::woke`). A problem that outlasts the grace
+    is raised after its usual debounce.
 - No wire change.
