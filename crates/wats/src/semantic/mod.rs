@@ -22,13 +22,17 @@ pub use bert::DIM;
 
 /// SHA-256 of the model file, built from upstream by
 /// `examples/semantic_model.rs`, and published as a release asset.
-pub const MODEL_SHA256: &str = "2e8ce3355bf8da29cfddf974901b6492e68fc540335047d87aee53cbb422fadc";
+pub const MODEL_SHA256: &str = "2d3e18fede3cfbf614b9ec4de9c3a933c0fd94e481f6a3c936c51d49d0e094c0";
 /// Its size in bytes.
-pub const MODEL_BYTES: u64 = 66_446_096;
+pub const MODEL_BYTES: u64 = 33_788_328;
 /// Its file name, locally and as a release asset.
-pub const MODEL_FILE: &str = "bge-small-en-v1.5-f16.safetensors";
+pub const MODEL_FILE: &str = "bge-small-en-v1.5-int8.safetensors";
 /// A post is embedded from its first tokens: title, then body.
 pub const MAX_TOKENS: usize = 256;
+/// Posts embedded in one pass: each int8 layer is dequantized once per
+/// pass. 8 is as fast as 16 (23 ms/post on an M4 Pro), with 70 MB less
+/// RAM for the activations.
+pub const EMBED_BATCH: usize = 8;
 /// bge's instruction for queries; never for passages.
 pub const QUERY_PREFIX: &str = "Represent this sentence for searching relevant passages: ";
 
@@ -53,12 +57,29 @@ impl Model {
 
     /// The embedding of a post: its title, then its body.
     pub fn passage(&self, title: &str, text: &str) -> Vec<f32> {
-        let input = if title.trim().is_empty() {
-            text.to_string()
-        } else {
-            format!("{title}\n{text}")
-        };
-        self.bert.embed(&tokenizer::encode(&input, MAX_TOKENS))
+        self.passages(&[(title, text)]).pop().unwrap_or_default()
+    }
+
+    /// The embeddings of several posts in one pass (the backfill's
+    /// batches): each int8 layer is dequantized once for all of them.
+    pub fn passages(&self, posts: &[(&str, &str)]) -> Vec<Vec<f32>> {
+        let ids: Vec<Vec<u32>> = posts
+            .iter()
+            .map(|(title, text)| {
+                let input = if title.trim().is_empty() {
+                    (*text).to_string()
+                } else {
+                    format!("{title}\n{text}")
+                };
+                tokenizer::encode(&input, MAX_TOKENS)
+            })
+            .collect();
+        ids.chunks(EMBED_BATCH)
+            .flat_map(|chunk| {
+                let refs: Vec<&[u32]> = chunk.iter().map(Vec::as_slice).collect();
+                self.bert.embed_batch(&refs)
+            })
+            .collect()
     }
 
     /// The embedding of a search query.
@@ -194,6 +215,6 @@ mod tests {
     #[test]
     fn a_wrong_model_file_is_refused() {
         let err = Model::load(b"not the model").err().unwrap();
-        assert!(err.to_string().contains("not 2e8ce335"), "{err}");
+        assert!(err.to_string().contains("not 2d3e18fe"), "{err}");
     }
 }

@@ -217,33 +217,38 @@ back, so the backup is the only way to keep the same key when moving CI.
 
 ## The semantic search model
 
-Semantic search (0.5.0, [ADR 0053](adr/0053-semantic-search.md))
-downloads one more file, once: `bge-small-en-v1.5-f16.safetensors`,
-from the release `model-bge-small-en-v1.5-f16`.
+Semantic search ([ADR 0053](adr/0053-semantic-search.md)) downloads one
+more file, once:
 
-The file is built reproducibly from the upstream weights by
-`crates/wats/examples/semantic_model.rs`:
-- upstream: `BAAI/bge-small-en-v1.5` at revision `5c38ec7`, SHA-256
-  `3c9f3166…`;
-- the result: SHA-256 `2e8ce335…`, which the binary pins
-  (`semantic::MODEL_SHA256`).
+| wats | File | Release | SHA-256 |
+|---|---|---|---|
+| 0.5.1 and later | `bge-small-en-v1.5-int8.safetensors`, 33,788,328 bytes | `model-bge-small-en-v1.5-int8` | `2d3e18fe…` |
+| 0.5.0 | `bge-small-en-v1.5-f16.safetensors`, 66,446,096 bytes | `model-bge-small-en-v1.5-f16` (left in place) | `2e8ce335…` |
 
-A node loads the file only if it matches that hash and its `.minisig`
-verifies with the release key.
+- **The int8 file:** the linear layers' matrices and the word embeddings
+  in int8, each row with its scale; the rest in fp16.
+- **Built reproducibly** by `crates/wats/examples/semantic_model.rs`,
+  from the upstream weights: `BAAI/bge-small-en-v1.5` at revision
+  `5c38ec7`, SHA-256 `3c9f3166…`.
+- **Checked on every node:** a node loads the file only if it matches
+  the hash its binary pins (`semantic::MODEL_SHA256`), and if its
+  `.minisig` verifies with the release key.
 
-The `model` workflow (`.github/workflows/model.yml`), run by hand once
-per model, does the rest:
-- it downloads upstream, rebuilds the file, and fails unless the hash is
-  the pinned one;
+**The `model` workflow** (`.github/workflows/model.yml`) is run by hand,
+once per model:
+- it downloads the upstream weights, rebuilds the file, and fails unless
+  the hash is the pinned one;
 - it signs the file and its `.sha256` with the release key;
 - it publishes them.
 
-`release.yml` skips `model-*` tags. To check the file yourself:
+`release.yml` skips `model-*` tags.
+
+To check the file yourself:
 
 ```sh
-gh release download model-bge-small-en-v1.5-f16 -R wearetheswarm/wats
-minisign -Vm bge-small-en-v1.5-f16.safetensors -P <public key above>
-shasum -a 256 bge-small-en-v1.5-f16.safetensors
+gh release download model-bge-small-en-v1.5-int8 -R wearetheswarm/wats
+minisign -Vm bge-small-en-v1.5-int8.safetensors -P <public key above>
+shasum -a 256 bge-small-en-v1.5-int8.safetensors
 ```
 
 ## Rotating the key
