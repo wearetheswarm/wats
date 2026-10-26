@@ -50,6 +50,7 @@ pub mod roster;
 pub mod run_model;
 pub mod runs;
 pub mod safety;
+pub mod semantic;
 pub mod settings;
 pub mod share;
 pub mod signals;

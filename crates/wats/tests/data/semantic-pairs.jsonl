@@ -1,0 +1,54 @@
+{"q": "Need a tested, compiled Rust program that prints prime numbers on Linux", "target": ["0000006393"]}
+{"q": "Rust binary to generate primes, built and verified on x86_64", "target": ["0000006393"]}
+{"q": "What day is it today?", "target": ["0000002e44"]}
+{"q": "Tell me the current date", "target": ["0000002e44"]}
+{"q": "Render a three-dimensional WeAreTheSwarm logo", "target": ["0000000fef"]}
+{"q": "Make a 3D emblem for the WeAreTheSwarm project", "target": ["0000000fef"]}
+{"q": "Why would a team pick Kotlin over Java?", "target": ["000003e31d", "0000021bd6"]}
+{"q": "Kotlin pros and cons", "target": ["000003e31d", "0000021bd6"]}
+{"q": "Create a hero illustration for the wearetheswarm.ai homepage", "target": ["0000027554"]}
+{"q": "I need artwork for our website banner", "target": ["0000027554"]}
+{"q": "What does 'logiciel libre' mean exactly?", "target": ["0000048ac5"]}
+{"q": "Define free software as the FSF does", "target": ["0000048ac5"]}
+{"q": "Origins of Usenet: when and why it started", "target": ["000007c400"]}
+{"q": "Who invented Usenet and for what purpose?", "target": ["000007c400"]}
+{"q": "History of Internet Relay Chat and its first users", "target": ["00000150ed"]}
+{"q": "Where did IRC come from?", "target": ["00000150ed"]}
+{"q": "Who are the authors of the iroh networking library?", "target": ["000000f12f"]}
+{"q": "Origin story of n0's iroh", "target": ["000000f12f"]}
+{"q": "What's the forecast for Villeurbanne today?", "target": ["000002ce2f"]}
+{"q": "Is it raining in Villeurbanne right now?", "target": ["000002ce2f"]}
+{"q": "Get the raw Open-Meteo API response for Villeurbanne", "target": ["000002ca8c"]}
+{"q": "Paste the JSON forecast from open-meteo.com for Villeurbanne", "target": ["000002ca8c"]}
+{"q": "Draw a smiley celebrating the end of the 2026 test", "target": ["0000009841"]}
+{"q": "Make a happy face image saying the test is over", "target": ["0000009841"]}
+{"q": "Summarize the wearetheswarm.ai manifesto page", "target": ["000004649d"]}
+{"q": "What does the WeAreTheSwarm manifesto say?", "target": ["000004649d"]}
+{"q": "Illustration of AI agents connected in a peer-to-peer mesh sharing knowledge", "target": ["000001b3a4", "000000f3df", "00000735e2", "0000010f2b", "000005b0e9"]}
+{"q": "Picture of glowing orb agents around a golden core", "target": ["000001b3a4", "000000f3df", "00000735e2", "0000010f2b", "000005b0e9"]}
+{"q": "Python module and command line tool for prime numbers, with unit tests", "target": ["000003f1e0"]}
+{"q": "Write primes in Python with a CLI", "target": ["000003f1e0"]}
+{"q": "Send the primes.py file as an attachment", "target": ["0000006448", "000003f1e0"]}
+{"q": "Can you attach the Python prime source files?", "target": ["0000006448", "000003f1e0"]}
+{"q": "Test whether the agent can read files outside its workspace", "target": ["0000002081", "000007f7d2", "0000020d4d"]}
+{"q": "Sandbox check: can you read /etc/hosts?", "target": ["0000002081", "000007f7d2", "0000020d4d"]}
+{"q": "Which Rust release is current?", "target": ["000002c860", "000002de4c", "0000060f8b", "000004e95d"]}
+{"q": "Newest stable rustc version number", "target": ["000002c860", "000002de4c", "0000060f8b", "000004e95d"]}
+{"q": "What is the latest stable Go version?", "target": null}
+{"q": "What is today's weather in Paris?", "target": null}
+{"q": "When was the World Wide Web invented?", "target": null}
+{"q": "Who created the BitTorrent protocol?", "target": null}
+{"q": "Generate a logo for a coffee shop", "target": null}
+{"q": "What are the main advantages of Scala?", "target": null}
+{"q": "Write a Go function that sorts a slice", "target": null}
+{"q": "How do I configure a PostgreSQL connection pool?", "target": null}
+{"q": "What is the definition of open data?", "target": null}
+{"q": "What time zone is Lyon in?", "target": null}
+{"q": "Compute the Fibonacci sequence in Python with tests", "target": null}
+{"q": "What was Gopher used for?", "target": null}
+{"q": "Who created libp2p?", "target": null}
+{"q": "Fetch the current Bitcoin price as raw JSON", "target": null}
+{"q": "Explain Rust borrow checker error E0502", "target": null}
+{"q": "Summarize the GNU manifesto", "target": null}
+{"q": "Generate a video of a swarm of bees", "target": null}
+{"q": "Check whether the agent can open a network socket", "target": null}

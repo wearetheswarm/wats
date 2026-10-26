@@ -1,7 +1,12 @@
 //! The few operating-system calls wats makes that need `unsafe`. The
 //! `wats` crate is `#![forbid(unsafe_code)]`; what it cannot do safely
 //! lives here, one small audited function each, with its safety
-//! argument. Nothing here changes the process's state.
+//! argument. Nothing here changes the process's state, except
+//! [`background_priority`], which lowers the calling thread's priority.
+//!
+//! [`sgemm`] is the matrix product of semantic search (ADR 0053): Apple's
+//! Accelerate on macOS, the pure-Rust `gemm` crate elsewhere, both behind
+//! one bounds-checked safe function.
 
 #![deny(unsafe_op_in_unsafe_fn)]
 #![warn(missing_docs)]
@@ -59,8 +64,230 @@ pub fn utc_offset(ts: i64) -> Option<i64> {
     }
 }
 
+/// `c = a × b`, in f32, row-major: `a` is m×k (row stride `lda`); `b` is
+/// k×n (row stride `ldb`), or, when `bt`, given transposed as n×k rows
+/// (row stride `ldb`); `c` is m×n (row stride `ldc`), overwritten. One
+/// thread. Panics when a slice is too short for its dimensions and stride:
+/// a caller's bug, never undefined behaviour.
+#[allow(clippy::too_many_arguments)]
+pub fn sgemm(
+    m: usize,
+    n: usize,
+    k: usize,
+    a: &[f32],
+    lda: usize,
+    b: &[f32],
+    ldb: usize,
+    bt: bool,
+    c: &mut [f32],
+    ldc: usize,
+) {
+    if m == 0 || n == 0 {
+        return;
+    }
+    if k == 0 {
+        for row in c.chunks_mut(ldc).take(m) {
+            row.iter_mut().take(n).for_each(|v| *v = 0.0);
+        }
+        return;
+    }
+    // The last element each operand is read or written at, so every
+    // access below is in bounds.
+    let fits = |rows: usize, cols: usize, stride: usize, len: usize| {
+        stride >= cols
+            && (rows - 1)
+                .checked_mul(stride)
+                .and_then(|x| x.checked_add(cols))
+                .is_some_and(|end| end <= len)
+    };
+    assert!(fits(m, k, lda, a.len()), "sgemm: a is too short");
+    if bt {
+        assert!(fits(n, k, ldb, b.len()), "sgemm: b is too short");
+    } else {
+        assert!(fits(k, n, ldb, b.len()), "sgemm: b is too short");
+    }
+    assert!(fits(m, n, ldc, c.len()), "sgemm: c is too short");
+    #[cfg(target_os = "macos")]
+    {
+        let int = |v: usize| i32::try_from(v).expect("sgemm: dimension over i32");
+        // SAFETY: the asserts above check that `a`, `b` and `c` cover
+        // every element cblas_sgemm reads or writes for these dimensions
+        // and leading dimensions (row-major: element (i, j) of a matrix
+        // with leading dimension ld is at i * ld + j). `c` is a unique
+        // borrow, so it aliases neither input. beta = 0: `c` is only
+        // written.
+        unsafe {
+            cblas_sgemm(
+                CBLAS_ROW_MAJOR,
+                CBLAS_NO_TRANS,
+                if bt { CBLAS_TRANS } else { CBLAS_NO_TRANS },
+                int(m),
+                int(n),
+                int(k),
+                1.0,
+                a.as_ptr(),
+                int(lda),
+                b.as_ptr(),
+                int(ldb),
+                0.0,
+                c.as_mut_ptr(),
+                int(ldc),
+            );
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let stride = |v: usize| isize::try_from(v).expect("sgemm: stride over isize");
+        // b's column and row strides: element (kk, j) of the k×n operand.
+        let (rhs_cs, rhs_rs) = if bt {
+            (stride(ldb), 1)
+        } else {
+            (1, stride(ldb))
+        };
+        // SAFETY: as above, the asserts check that every element gemm
+        // reads (a, b) or writes (c) is inside its slice, with these
+        // strides: element (i, j) of `a` at i * lda + j, of `c` at
+        // i * ldc + j, of `b` at kk * rhs_rs + j * rhs_cs. `c` is a unique
+        // borrow. read_dst = false: `c` is only written.
+        unsafe {
+            gemm::gemm(
+                m,
+                n,
+                k,
+                c.as_mut_ptr(),
+                1,
+                stride(ldc),
+                false,
+                a.as_ptr(),
+                1,
+                stride(lda),
+                b.as_ptr(),
+                rhs_cs,
+                rhs_rs,
+                0.0,
+                1.0,
+                false,
+                false,
+                false,
+                gemm::Parallelism::None,
+            );
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+const CBLAS_ROW_MAJOR: i32 = 101;
+#[cfg(target_os = "macos")]
+const CBLAS_NO_TRANS: i32 = 111;
+#[cfg(target_os = "macos")]
+const CBLAS_TRANS: i32 = 112;
+
+#[cfg(target_os = "macos")]
+#[link(name = "Accelerate", kind = "framework")]
+unsafe extern "C" {
+    fn cblas_sgemm(
+        order: i32,
+        trans_a: i32,
+        trans_b: i32,
+        m: i32,
+        n: i32,
+        k: i32,
+        alpha: f32,
+        a: *const f32,
+        lda: i32,
+        b: *const f32,
+        ldb: i32,
+        beta: f32,
+        c: *mut f32,
+        ldc: i32,
+    );
+}
+
+/// Lowers the calling thread's priority for background work (semantic
+/// search's backfill, ADR 0053 §6): the background QoS class on macOS,
+/// which also keeps it on the efficiency cores, and a nice value of 19 on
+/// Linux. Only this thread changes. Returns whether it worked.
+pub fn background_priority() -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        // SAFETY: pthread_set_qos_class_self_np only changes the QoS class
+        // of the calling thread; it takes two plain values.
+        unsafe {
+            libc::pthread_set_qos_class_self_np(libc::qos_class_t::QOS_CLASS_BACKGROUND, 0) == 0
+        }
+    }
+    #[cfg(target_os = "linux")]
+    {
+        // SAFETY: gettid takes nothing; setpriority with PRIO_PROCESS and
+        // a thread id changes that thread's nice value only (Linux
+        // threads are scheduled entities of their own).
+        unsafe {
+            let tid = libc::gettid();
+            #[allow(clippy::useless_conversion)]
+            let who: libc::id_t = match tid.try_into() {
+                Ok(who) => who,
+                Err(_) => return false,
+            };
+            libc::setpriority(libc::PRIO_PROCESS, who, 19) == 0
+        }
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        false
+    }
+}
+
+/// The 1-minute load average, read with getloadavg(3). `None`: the call
+/// failed, or not on Unix.
+pub fn load_average() -> Option<f64> {
+    #[cfg(unix)]
+    {
+        let mut load = [0f64; 1];
+        // SAFETY: getloadavg writes at most `nelem` (1) doubles into the
+        // buffer, which holds 1.
+        let n = unsafe { libc::getloadavg(load.as_mut_ptr(), 1) };
+        (n == 1).then_some(load[0])
+    }
+    #[cfg(not(unix))]
+    {
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    /// 2×3 times 3×2, plainly and transposed, with strides.
+    #[test]
+    fn sgemm_multiplies() {
+        let a = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
+        let b = [7.0, 8.0, 9.0, 10.0, 11.0, 12.0];
+        let mut c = [0.0; 4];
+        super::sgemm(2, 2, 3, &a, 3, &b, 2, false, &mut c, 2);
+        assert_eq!(c, [58.0, 64.0, 139.0, 154.0]);
+        // b given transposed: rows (7, 9, 11) and (8, 10, 12).
+        let bt = [7.0, 9.0, 11.0, 8.0, 10.0, 12.0];
+        let mut c = [0.0; 4];
+        super::sgemm(2, 2, 3, &a, 3, &bt, 3, true, &mut c, 2);
+        assert_eq!(c, [58.0, 64.0, 139.0, 154.0]);
+        // Into a wider matrix: column 1 of a 2×3 row-major c.
+        let mut c = [0.0; 6];
+        super::sgemm(2, 1, 3, &a, 3, &bt, 3, true, &mut c[1..], 3);
+        assert_eq!(c, [0.0, 58.0, 0.0, 0.0, 139.0, 0.0]);
+    }
+
+    #[test]
+    #[should_panic(expected = "a is too short")]
+    fn sgemm_refuses_short_slices() {
+        let mut c = [0.0; 4];
+        super::sgemm(2, 2, 3, &[1.0; 5], 3, &[1.0; 6], 2, false, &mut c, 2);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_load_average_reads() {
+        assert!(super::load_average().is_some_and(|l| l >= 0.0));
+    }
+
     #[cfg(unix)]
     #[test]
     fn the_disposition_reads() {

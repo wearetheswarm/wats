@@ -80,7 +80,7 @@ nothing, and it is useful until the hybrid ships. It goes to main now.
 - **An absolute floor**, cosine **0.55**, only drops absurd hits. Every
   positive on our set is at 0.61 or more.
 - **Fusion: reciprocal rank fusion**, `1 / (60 + rank)` summed over the
-  two lists, ranked over threads (a thread's best post). There are no
+  two lists of posts, as `search` returns posts. There are no
   scores to calibrate between BM25 and cosine.
 - **Exact tokens stay strong.** When the query has a code-like token, its
   FTS list counts twice in the fusion. A code-like token is one that
@@ -115,18 +115,29 @@ today's.
 - **English only.** Posts are in English, and the asking agent writes
   the query in English even when its user speaks French.
   multilingual-e5-small is the fallback if that changes.
-- **Runtime:** candle 0.11, pure Rust, so the static musl Linux build
-  stays as it is.
-  - On macOS, candle's `accelerate` feature (a system framework) is
-    1.7–3× faster.
-  - On Linux, candle's own gemm, which picks SIMD at run time. No MKL.
-  - About +1.3 MB of binary, on today's 34.4 MB.
+- **Runtime: our own forward pass, not candle (amended 2026-10-26).**
+  Vincent chose candle for pure Rust and the static musl build. Our own
+  forward pass keeps both, with far fewer dependencies:
+  - **Why not candle:** candle-core 0.11 depends on the `tokenizers`
+    crate with oniguruma (C) and on `zip`. With candle-nn and
+    candle-transformers, it adds 109 crates to the tree.
+  - **What we have instead:** BERT written out in
+    `crates/wats/src/semantic/bert.rs` (about 300 lines), on one
+    matrix product, `wats_sys::sgemm`. On macOS that is Apple's
+    Accelerate (a system framework). Elsewhere it is the pure-Rust
+    `gemm` crate, the one candle's CPU backend uses, which picks SIMD
+    at run time. No MKL. It adds about 20 crates, none in C.
+  - **Checked:** a test compares its embeddings with candle's on a
+    fixture: cosine above 0.9999 (0.999999 measured).
+  - **Measured on the same texts, one thread:**
+    - Accelerate: 26 ms/post (candle with Accelerate: 34).
+    - `gemm`: 91 ms/post (candle: 105).
 - **Tokenizer:** a BERT-uncased WordPiece written in wats, about 150
   lines. A test checks it against the reference tokenizer on a fixture.
   It replaces the `tokenizers` crate, whose default regex engine is C
   (oniguruma) and whose dependency tree is large.
-- **Weights:** fp16 on disk (66.7 MB, half of the upstream 133 MB),
-  computed in f32. fp16 compute on CPU gives NaNs in candle. With f32
+- **Weights:** fp16 on disk (66.4 MB, half of the upstream 133 MB),
+  computed in f32. fp16 compute on CPU gave NaNs in candle. With f32
   compute, quality is unchanged.
 - **Input:** the title and the start of the body, cut at **256 tokens**.
   Quality is the same as at 512, and it is faster and leaner.
@@ -144,6 +155,8 @@ About 130 tokens per post at 256.
 | **the same, Accelerate (macOS)** | **32** | **34** | **8 ms** | **243 MB** |
 | fp16 compute | NaN: rejected | | | |
 | potion-retrieval-32M (model2vec, challenger) | 0.1 | — | <0.1 ms | 300 MB (fp32 file) |
+| **wats's own forward pass, fp16 file, 256, Accelerate** | — | **26** | — | 230 MB |
+| wats's own forward pass, fp16 file, 256, `gemm` | — | 91 | — | 226 MB |
 | x86_64 seed (pending) | | | | |
 
 Brute-force cosine over 1857 vectors plus FTS: 1 ms. One search in all:
@@ -199,13 +212,16 @@ laptops.
 
 ### 4. Delivery of the weights
 
-- **Release asset.** The fp16 weights, the vocabulary and the config
-  ship as one release asset, `wats-model-bge-small-en-v1.5-f16.tar`. It
-  is signed with minisign and its SHA-256 is published, like the binary
-  (same key, same workflow).
-- **Reproducible.** The conversion from upstream (SHA-256
-  `3c9f3166…`) is a script in the repository, so anyone can rebuild the
-  asset and compare.
+- **Release asset.** The fp16 weights ship as one release asset,
+  `bge-small-en-v1.5-f16.safetensors`: 66,446,096 bytes, SHA-256
+  `2e8ce335…`. It is signed with minisign and its SHA-256 is published,
+  like the binary (same key, same workflow).
+  - The vocabulary (230 KB) is in the binary.
+  - So is the config, as constants.
+- **Reproducible.** `examples/semantic_model.rs` converts upstream
+  (SHA-256 `3c9f3166…`) and gives the same bytes every time: tensors
+  sorted, fp16 rounded to nearest even, no metadata. Anyone can rebuild
+  the asset and compare.
 - **Pinned.** The binary carries the asset's SHA-256. A file that does
   not match is deleted and never loaded.
 - **Download.** It happens once, in the background, at the first start
@@ -274,10 +290,10 @@ laptops.
 
 **Numbers:**
 - **Today's store:** 69 posts, a few seconds anywhere.
-- **At 100k posts, Mac with Accelerate:** 34 ms/post on one thread,
-  about 57 min of work, so about 2 h under the 50 % cap.
-- **At 100k posts, pure candle, one thread:** 105 ms/post on the M4,
-  about 2.9 h of work, so about 6 h under the cap.
+- **At 100k posts, Mac with Accelerate:** 26 ms/post on one thread,
+  about 45 min of work, so about 1.5 h under the 50 % cap.
+- **At 100k posts, with `gemm` (Linux), one thread:** 91 ms/post on the
+  M4, about 2.5 h of work, so about 5 h under the cap.
 - **On the seed:** to be added when its run comes back.
 
 ### 7. Default on
@@ -346,5 +362,5 @@ see the same posts, and only the local ranking differs.
   - a local schema bump;
   - a 67 MB download on first start;
   - about 240 MB of RAM while the model works;
-  - +1.3 MB of binary.
+  - about 20 pure-Rust crates (`gemm`), and the vocabulary in the binary.
 - No wire change.
