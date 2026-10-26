@@ -118,6 +118,8 @@ pub struct Semantic {
     stop: AtomicBool,
     /// When the backfill started, for its "ready" line.
     started: Mutex<Option<Instant>>,
+    /// A download in progress: bytes so far, and the file's size.
+    downloading: Mutex<Option<(u64, u64)>>,
 }
 
 /// What one batch did.
@@ -138,6 +140,7 @@ impl Semantic {
             off: Mutex::new(None),
             stop: AtomicBool::new(false),
             started: Mutex::new(None),
+            downloading: Mutex::new(None),
         }
     }
 
@@ -252,17 +255,28 @@ impl Semantic {
     /// One batch: new posts first, then the history (unless `pause`).
     pub fn step(&self, store: &Store, pause: bool) -> Result<Step> {
         let model_id = &self.config.model_id;
-        let top = match store.semantic_state("top")? {
-            Some(top) => top,
-            None => {
-                // First run: what is stored now is the history.
-                let max = store.max_seq()?;
-                store.set_semantic_state("top", max)?;
-                store.set_semantic_state("below", max.saturating_add(1))?;
-                store.drop_other_embeddings(model_id)?;
-                max
+        // The state is this model's (ADR 0053 §6): on a first run, or with
+        // another model than the one that built the index, what is stored
+        // is history to embed again, newest first, and the other model's
+        // vectors go.
+        let this_model = format!("model:{model_id}");
+        if store.semantic_state(&this_model)?.is_none() {
+            let dropped = store.drop_other_embeddings(model_id)?;
+            if dropped > 0 {
+                info!(
+                    "semantic: a new model; {dropped} vectors of the previous one dropped, reindexing"
+                );
             }
-        };
+            store.clear_semantic_state()?;
+            let max = store.max_seq()?;
+            store.set_semantic_state("top", max)?;
+            store.set_semantic_state("below", max.saturating_add(1))?;
+            store.set_semantic_state(&this_model, 1)?;
+            if let Ok(mut started) = self.started.lock() {
+                *started = None;
+            }
+        }
+        let top = store.semantic_state("top")?.unwrap_or(0);
         let mut todo = store.embedding_todo(model_id, Some(top), None, BATCH)?;
         let new = !todo.is_empty();
         let below = store.semantic_state("below")?.unwrap_or(0);
@@ -319,6 +333,13 @@ impl Semantic {
             .unwrap_or((0, 0));
         let off = self.off.lock().ok().and_then(|o| o.clone());
         let have_file = self.config.model_file.exists();
+        let downloading = self.downloading.lock().ok().and_then(|d| *d);
+        if let (false, Some((got, size))) = (have_file, downloading) {
+            return json!({"state": "downloading", "embedded": embedded, "total": total,
+                          "downloaded": got, "size": size,
+                          "detail": format!("downloading model ({} MB of {})", got / 1_000_000,
+                                            size.div_ceil(1_000_000))});
+        }
         if !have_file || off.is_some() {
             let detail = off.unwrap_or_else(|| "model not downloaded".into());
             return json!({"state": "off", "embedded": embedded, "total": total,
@@ -403,7 +424,17 @@ impl Semantic {
         };
         let mut failures = 0usize;
         while !self.config.model_file.exists() && !self.stop.load(Ordering::SeqCst) {
-            match download(&base, &self.config.model_file).await {
+            let progress = |got: u64| {
+                if let Ok(mut d) = self.downloading.lock() {
+                    *d = Some((got, MODEL_BYTES));
+                }
+            };
+            progress(0);
+            let outcome = download(&base, &self.config.model_file, &progress).await;
+            if let Ok(mut d) = self.downloading.lock() {
+                *d = None;
+            }
+            match outcome {
                 Ok(()) => {
                     info!("semantic: model downloaded ({MODEL_FILE})");
                     self.set_off(None);
@@ -431,6 +462,10 @@ pub fn summary(semantic: &Value) -> String {
     match semantic["state"].as_str() {
         Some("ready") => format!("ready ({} posts)", n("embedded")),
         Some("indexing") => format!("index {} of {} posts", n("embedded"), n("total")),
+        Some("downloading") => semantic["detail"]
+            .as_str()
+            .unwrap_or("downloading model")
+            .to_string(),
         Some("disabled") => "off (semantic.enabled = false)".into(),
         _ => format!(
             "off: {}",
@@ -498,9 +533,13 @@ fn on_battery() -> bool {
 /// Downloads the model file from `base` (a directory URL) to `dest`,
 /// checked against the pinned SHA-256 and its minisign signature by the
 /// release key, then moved into place.
-pub async fn download(base: &str, dest: &std::path::Path) -> Result<()> {
+pub async fn download(
+    base: &str,
+    dest: &std::path::Path,
+    progress: &(dyn Fn(u64) + Sync),
+) -> Result<()> {
     let client = crate::update::https_client()?;
-    let get = |url: String, limit: u64| {
+    let get = |url: String, limit: u64, report: bool| {
         let client = client.clone();
         async move {
             let mut response = client
@@ -524,18 +563,21 @@ pub async fn download(base: &str, dest: &std::path::Path) -> Result<()> {
                     "{url} is larger than expected"
                 );
                 body.extend_from_slice(&chunk);
+                if report {
+                    progress(body.len() as u64);
+                }
             }
             Ok::<_, anyhow::Error>(body)
         }
     };
     let base = base.trim_end_matches('/');
-    let data = get(format!("{base}/{MODEL_FILE}"), MODEL_BYTES).await?;
+    let data = get(format!("{base}/{MODEL_FILE}"), MODEL_BYTES, true).await?;
     let sha = hex::encode(Sha256::digest(&data));
     ensure!(
         sha == MODEL_SHA256,
         "{MODEL_FILE}: SHA-256 {sha}, not the pinned one"
     );
-    let signature = get(format!("{base}/{MODEL_FILE}.minisig"), 4096).await?;
+    let signature = get(format!("{base}/{MODEL_FILE}.minisig"), 4096, false).await?;
     crate::update::verify_signature(
         crate::update::RELEASE_PUBLIC_KEY,
         &data,
@@ -663,7 +705,7 @@ mod tests {
         let dest = dir.path().join(MODEL_FILE);
         tokio::runtime::Runtime::new()
             .unwrap()
-            .block_on(download(MODEL_URL, &dest))
+            .block_on(download(MODEL_URL, &dest, &|_| {}))
             .unwrap();
         let model = model_loader()(&dest).unwrap();
         assert_eq!(model.query("hello").len(), super::super::DIM);
@@ -684,6 +726,59 @@ mod tests {
             "off: model not downloaded"
         );
         assert_eq!(thousands(1_234_567), "1,234,567");
+    }
+
+    /// A finished index, then another model: its vectors go, and the
+    /// history is embedded again, newest first.
+    #[test]
+    fn a_new_model_reindexes() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open_in_memory().unwrap();
+        let seqs: Vec<i64> = (0..20)
+            .map(|i| ask(&store, 1, 100 + i, &format!("post number {i}")))
+            .collect();
+        let old = semantic(dir.path());
+        while !old.step(&store, false).unwrap().finished {}
+        assert_eq!(store.embedding_counts(MODEL_SHA256).unwrap(), (20, 20));
+        let mut config = old.config().clone();
+        config.model_id = "another-model".into();
+        let new = Semantic::new(config, Box::new(|_| Ok(Arc::new(Fake) as Arc<dyn Embed>)));
+        assert_eq!(new.status(&store)["state"], "indexing");
+        let step = new.step(&store, false).unwrap();
+        assert_eq!(step.embedded, BATCH);
+        // The previous model's vectors are gone.
+        assert_eq!(store.embedding_counts(MODEL_SHA256).unwrap().0, 0);
+        // Newest first.
+        let left = store
+            .embedding_todo("another-model", None, Some(i64::MAX), 100)
+            .unwrap();
+        assert!(left.iter().all(|t| t.0 <= seqs[3]), "{left:?}");
+        while !new.step(&store, false).unwrap().finished {}
+        assert_eq!(store.embedding_counts("another-model").unwrap(), (20, 20));
+        assert_eq!(new.status(&store)["state"], "ready");
+        // Back on the same model: nothing to do again.
+        let again = Semantic::new(
+            new.config().clone(),
+            Box::new(|_| Ok(Arc::new(Fake) as Arc<dyn Embed>)),
+        );
+        assert_eq!(again.step(&store, false).unwrap(), Step::default());
+    }
+
+    #[test]
+    fn a_download_in_progress_shows() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = Semantic::new(Config::new(dir.path().to_path_buf(), false), model_loader());
+        let store = Store::open_in_memory().unwrap();
+        *s.downloading.lock().unwrap() = Some((12_400_000, MODEL_BYTES));
+        let status = s.status(&store);
+        assert_eq!(status["state"], "downloading");
+        assert_eq!(
+            summary(&status),
+            format!(
+                "downloading model (12 MB of {})",
+                MODEL_BYTES.div_ceil(1_000_000)
+            )
+        );
     }
 
     #[test]

@@ -2629,6 +2629,12 @@ impl Store {
             .optional()?)
     }
 
+    /// Forgets where semantic search stood (a new model starts over).
+    pub fn clear_semantic_state(&self) -> Result<()> {
+        self.conn().execute("DELETE FROM semantic_state", [])?;
+        Ok(())
+    }
+
     pub fn set_semantic_state(&self, key: &str, value: i64) -> Result<()> {
         self.conn().execute(
             "INSERT INTO semantic_state (key, value) VALUES (?1, ?2)

@@ -190,9 +190,21 @@ AVX-512, 4 vCPU.
 - **Conditions:** the bench ran in a container capped at 2 CPUs, beside
   the 11 seeds and the archive, so the numbers include contention.
 - **These are candle numbers.** Our forward pass uses the same `gemm`
-  kernels: `gemm` picks AVX2/FMA at run time on this CPU (its
-  `x86-v4`/AVX-512 path is a build feature we leave off). It was
+  kernels: `gemm` picks AVX2/FMA at run time on this CPU. It was
   slightly faster than candle on the M4.
+- **AVX-512 (amended 2026-10-26, 0.5.1).** Since 0.5.1, `gemm` is built
+  with `x86-v4`. That is stable Rust, not nightly, and the AVX-512
+  kernels are picked at run time only on a CPU that has them.
+  - **Measured on GitHub's ubuntu-latest,** one thread, 256 tokens:
+    - AMD EPYC 9V45 (Zen 5): 96.1 → 75.0 ms/post, −22 %;
+    - EPYC 7763 (Zen 3, no AVX-512): 136 ms either way.
+  - **The runners are mixed.** In 10 runs: EPYC 7763; EPYC 9V74 and 9V45
+    (AVX-512); Xeon Platinum 8573C (AVX-512). CI therefore exercises the
+    AVX-512 path in about a third of runs, against a naive product over
+    many shapes and strides (`wats-sys`, `sgemm_matches_a_naive_product`).
+  - **Downclocking** mattered on Skylake-SP. Zen 4/5 and Ice Lake or
+    later barely downclock.
+  - The seeds (Haswell) have no AVX-512.
 - **Threads:** "all cores" was slower than one thread, because the
   threads fought the cap and the neighbours. One thread at nice 19 is
   right for servers too.
@@ -309,6 +321,17 @@ laptops.
   - **CPU cap:** at most 50 % of one core on average. The thread sleeps
     as long as it worked.
 - **Resumable.** A watermark, the lowest `seq` done, survives a restart.
+- **A new model reindexes (amended 2026-10-26, 0.5.1).** The state
+  records the model's hash (`model:<sha256>` in `semantic_state`). When
+  a node starts with another model, it does three things:
+  - it drops the previous model's vectors;
+  - it forgets where the backfill stood;
+  - it embeds the history again, newest first, and new posts first as
+    always.
+
+  Until it catches up, search uses vectors where they exist and words
+  everywhere. 0.5.0 only did this on a node's first run, so a model
+  change would have left the old history without vectors.
 - **Partial results are fine.** Search uses vectors where they exist and
   FTS everywhere. There is no "index not ready" error.
 - **Laptop manners:**
