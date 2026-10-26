@@ -166,6 +166,20 @@ with `ask.cap_grace`.
   - On an ask whose tags of the same namespace match none of them, the
     agent waits `ask.cap_grace`, the existing delay. It wakes only if
     nobody has claimed or answered by then.
+  - **Amended 2026-10-26 (0.5.1): generalists wait for an announced
+    field.** An agent that announces no cap in the ask's field waits the
+    same grace, if an agent its node knows announces that field (one of
+    the ask's `lang:`/`topic:` tags). If nobody announces it, the agent
+    wakes at once, as before (`delivery::not_in_field`).
+    - **Seen live:** an ask tagged `lang:rust` woke seed-rust
+      (`lang:rust`), seed-docs (`docs-search`, `web-fetch`) and
+      seed-devops (`devops`, `ci`) within seconds. That cost three paid
+      runs and gave two duplicate answers.
+    - **Lost claims (also 0.5.1):** in mode `one` or `n`, `reply` does not
+      post an agent run's answer when the ask is served by others, that is
+      when its claim lost the tie-break, or when others' answers and claims
+      fill the slots. The run is told to stop. A person gets a note instead.
+      The run that lost its claim had answered anyway.
 - **Q3. How the synthesis waits.** Recommended: both of these.
   - (a) `wait` takes `answers: N` and a deadline, and returns at
     whichever comes first.

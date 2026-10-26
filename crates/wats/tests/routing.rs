@@ -1062,6 +1062,77 @@ async fn an_agent_outside_its_field_waits_the_grace() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// 0.5.1: an agent with no cap in the ask's field (seed-docs: docs-search,
+/// web-fetch) waits the grace on a `lang:rust` ask while an agent this node
+/// knows announces `lang:rust`; on a `lang:kotlin` ask nobody announces, it
+/// wakes at once (seen live: three agents woke for a Rust ask).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_generalist_lets_the_field_go_first() -> anyhow::Result<()> {
+    const GRACE: u64 = 3;
+    let dir = tempfile::tempdir()?;
+    let hub = node(&dir.path().join("hub"), &[], |_| {}).await?;
+    let grace = |c: &mut NodeConfig| c.cap_grace = Duration::from_secs(GRACE);
+    let a = node(&dir.path().join("a"), &[&hub], grace).await?;
+    a.wait_for_neighbor(PUBLIC_NET, Duration::from_secs(10))
+        .await?;
+    // A Rust agent somewhere in the swarm.
+    hub.publish(
+        Draft {
+            net: PUBLIC_NET.into(),
+            kind: Some(Kind::Announce),
+            title: Some("rust-agent".into()),
+            text: "I answer Rust questions.".into(),
+            tags: vec!["lang:rust".into()],
+            ..Draft::default()
+        },
+        &[],
+    )
+    .await?;
+    let every = Duration::from_millis(200);
+    let ra = dir.path().join("ra");
+    let runner = start(
+        &a,
+        agent(
+            &ra,
+            &dir.path().join("a"),
+            &["docs-search", "web-fetch"],
+            every,
+        ),
+    );
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let rust = hub
+        .publish(
+            ask_with("Is this borrow sound?", json!({}), &["lang:rust".into()]),
+            &[],
+        )
+        .await?;
+    let kotlin = hub
+        .publish(
+            ask_with(
+                "What is Kotlin worth today?",
+                json!({}),
+                &["lang:kotlin".into()],
+            ),
+            &[],
+        )
+        .await?;
+    eventually("the Kotlin ask woke it at once", 5, || {
+        !runs_for(&ra, &kotlin).is_empty()
+    })
+    .await;
+    eventually("the Rust ask woke it after the grace", 15, || {
+        !runs_for(&ra, &rust).is_empty()
+    })
+    .await;
+    let (_, at) = runs_for(&ra, &rust).remove(0);
+    assert!(at.duration_since(SystemTime::UNIX_EPOCH)?.as_secs() >= rust.ts + GRACE);
+    runner.stop().await?;
+    for n in [a, hub] {
+        n.shutdown().await?;
+    }
+    Ok(())
+}
+
 /// ADR 0048 §3, §4: a run that fails on an overloaded API is tried again,
 /// and declines nothing when the retry works; a run that keeps failing is
 /// final after two retries, and the next heartbeat offers what it missed.

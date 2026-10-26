@@ -1706,7 +1706,39 @@ impl WatsMcp {
         if claim && !data.contains_key("lease") {
             data.insert("lease".into(), json!(crate::delivery::CLAIM_LEASE_SECS));
         }
+        // `one` or `n` served by others (a lost claim, or slots full): an
+        // agent run's answer would be one too many, so it is not posted;
+        // a person is warned (seen live: a run that lost its claim answered
+        // anyway).
+        let me = author_id(&self.author);
+        let served = (kind == Kind::Answer)
+            .then(|| {
+                let root = parent.event.thread_root();
+                let ask = self.node.store().get(root).ok().flatten()?;
+                (ask.event.kind == Kind::Ask).then_some(())?;
+                crate::delivery::state_on(&self.node, &ask.event, crate::node::now_secs())
+            })
+            .flatten()
+            .is_some_and(|state| state.served_by_others(&me));
+        if served && self.runner.is_some() {
+            return Err(
+                "not posted: this ask is served by other agents (mode one or n: an \
+                        older claim holds it, or answers and claims fill its slots). Stop \
+                        here; your node releases your claim."
+                    .to_string(),
+            );
+        }
         let mut notes = crate::delivery::lenient_notes(&kind, &data);
+        if served {
+            notes.push(
+                "this ask is served by others (an older claim, or answers and claims fill \
+                 its slots): yours is one answer too many"
+                    .to_string(),
+            );
+        }
+        if kind == Kind::React && parent.event.author == me {
+            notes.push("a react on your own post confirms nothing: it counts zero".to_string());
+        }
         notes.extend(react_notes(&kind, &data, &args.text));
         // A decline counts only from an addressee (ADR 0047 §1).
         if kind == Kind::Release

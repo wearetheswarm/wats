@@ -941,6 +941,52 @@ pub fn cap_tag(cap: &str) -> String {
     }
 }
 
+/// Programming languages, as a cap without a namespace would name them.
+const LANGUAGES: &[&str] = &[
+    "rust",
+    "python",
+    "kotlin",
+    "java",
+    "go",
+    "golang",
+    "javascript",
+    "typescript",
+    "cpp",
+    "c++",
+    "csharp",
+    "c#",
+    "ruby",
+    "php",
+    "swift",
+    "scala",
+    "elixir",
+    "haskell",
+    "ocaml",
+    "zig",
+    "dart",
+    "lua",
+    "julia",
+    "perl",
+    "sql",
+];
+
+/// A warning for each cap of `agent.caps` that names a programming
+/// language without a namespace: `rust` announces `cap:rust`, a
+/// capability, where a language is a field, `lang:rust` (ADR 0044). Seen
+/// live: askers copy what agents announce.
+pub fn language_cap_warnings(profile: &str, caps: &[String]) -> Vec<String> {
+    caps.iter()
+        .filter(|c| !c.contains(':') && LANGUAGES.contains(&c.trim().to_ascii_lowercase().as_str()))
+        .map(|c| {
+            let lang = c.trim().to_ascii_lowercase();
+            format!(
+                "agent {profile}: agent.caps {c:?} announces cap:{lang}, a capability (a tool, \
+                 like image-gen); a language is a field: write lang:{lang}"
+            )
+        })
+        .collect()
+}
+
 /// Check a capability of `agent.caps`: its tag must be a valid v1 tag.
 pub fn check_cap(cap: &str) -> Result<(), String> {
     match crate::event::tag_error(&cap_tag(cap)) {
@@ -2599,7 +2645,16 @@ fn serve(node: &Node, me: &str, config: &AgentConfig, ask: &Event, now: u64) -> 
     // Outside its field (its `lang:`/`topic:` caps), an agent waits the
     // same grace, and wakes only if nobody claimed or answered (ADR 0044).
     if request.to.is_empty() {
-        let outside = crate::delivery::outside_field(&config.caps, &ask.tags);
+        let mut outside = crate::delivery::outside_field(&config.caps, &ask.tags);
+        // An agent with no cap in the ask's field (seed-docs on lang:rust)
+        // waits too while an agent this node knows announces that field
+        // (0.5.1; seen live: three agents woke and two answered).
+        if outside.is_empty() {
+            outside = crate::delivery::not_in_field(&config.caps, &ask.tags)
+                .into_iter()
+                .filter(|t| someone_announces(node, &ask.net, std::slice::from_ref(t)))
+                .collect();
+        }
         if !outside.is_empty() {
             let grace = ask.ts.saturating_add(node.config().cap_grace.as_secs());
             if now < grace {
@@ -3313,6 +3368,9 @@ pub async fn run(
             budget::UNLIMITED
         );
     }
+    for warning in language_cap_warnings(&config.profile, &config.caps) {
+        warn!("{warning}");
+    }
     for warning in access::cap_warnings(&access::CapCheck {
         agent: &config.profile,
         runtime: &config.runtime,
@@ -3858,6 +3916,18 @@ pub async fn run(
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn a_language_as_a_cap_warns() {
+        let caps: Vec<String> = ["rust", "lang:kotlin", "image-gen", "Python"]
+            .iter()
+            .map(|c| c.to_string())
+            .collect();
+        let warnings = super::language_cap_warnings("seed", &caps);
+        assert_eq!(warnings.len(), 2, "{warnings:?}");
+        assert!(warnings[0].contains("write lang:rust"));
+        assert!(warnings[1].contains("write lang:python"));
+    }
 
     /// ADR 0048 §3: an overloaded API, a rate limit, a 5xx or the network
     /// are infra; an auth error, a missing model or no text are not.
