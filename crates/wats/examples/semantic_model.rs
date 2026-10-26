@@ -5,7 +5,7 @@
 //! the one the binary pins (`semantic::MODEL_SHA256`).
 //!
 //! ```sh
-//! curl -LO https://huggingface.co/BAAI/bge-small-en-v1.5/resolve/main/model.safetensors
+//! curl -LO https://huggingface.co/BAAI/bge-small-en-v1.5/resolve/5c38ec7c405ec4b44b94cc5a9bb96e735b38267a/model.safetensors
 //! cargo run --release -p wats --example semantic_model -- model.safetensors bge-small-en-v1.5-f16.safetensors
 //! shasum -a 256 bge-small-en-v1.5-f16.safetensors
 //! ```

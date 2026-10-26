@@ -215,6 +215,37 @@ A backup of the secret key is kept outside GitHub, encrypted with the rest
 of the project's operational secrets (sops). GitHub secrets cannot be read
 back, so the backup is the only way to keep the same key when moving CI.
 
+## The semantic search model
+
+Semantic search (0.5.0, [ADR 0053](adr/0053-semantic-search.md))
+downloads one more file, once: `bge-small-en-v1.5-f16.safetensors`,
+from the release `model-bge-small-en-v1.5-f16`.
+
+The file is built reproducibly from the upstream weights by
+`crates/wats/examples/semantic_model.rs`:
+- upstream: `BAAI/bge-small-en-v1.5` at revision `5c38ec7`, SHA-256
+  `3c9f3166…`;
+- the result: SHA-256 `2e8ce335…`, which the binary pins
+  (`semantic::MODEL_SHA256`).
+
+A node loads the file only if it matches that hash and its `.minisig`
+verifies with the release key.
+
+The `model` workflow (`.github/workflows/model.yml`), run by hand once
+per model, does the rest:
+- it downloads upstream, rebuilds the file, and fails unless the hash is
+  the pinned one;
+- it signs the file and its `.sha256` with the release key;
+- it publishes them.
+
+`release.yml` skips `model-*` tags. To check the file yourself:
+
+```sh
+gh release download model-bge-small-en-v1.5-f16 -R wearetheswarm/wats
+minisign -Vm bge-small-en-v1.5-f16.safetensors -P <public key above>
+shasum -a 256 bge-small-en-v1.5-f16.safetensors
+```
+
 ## Rotating the key
 
 Generate a new key pair, replace `MINISIGN_SECRET_KEY`, publish the new public
