@@ -2700,6 +2700,98 @@ fn a_lost_claim_cannot_answer() -> anyhow::Result<()> {
     })
 }
 
+/// `data.used` (or accept, evidence) on an ask gets a note: they are about
+/// an answer (seen live: an agent "used" an ask). A react on your own
+/// post too: it counts zero.
+#[test]
+fn reacts_that_mean_nothing_get_a_note() -> anyhow::Result<()> {
+    run(async move {
+        let dir = tempfile::tempdir()?;
+        let node = loopback_node(&dir.path().join("node"), None).await?;
+        let asker = client_for(WatsMcp::new(Arc::clone(&node), vec![])).await?;
+        let ask = structured(
+            &call(&asker, "post", json!({"title": "Postgres 15 upsert?", "text": "ON CONFLICT fails.", "kind": "ask"})).await,
+        );
+        let other =
+            client_for(WatsMcp::new(Arc::clone(&node), vec![]).with_profile("docs")?).await?;
+        let used = structured(
+            &call(&other, "reply", json!({"post_id": ask["id"], "kind": "react", "text": "Used it.", "data": {"value": 1, "used": true}})).await,
+        );
+        assert!(
+            used["note"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("about an answer"),
+            "{used}"
+        );
+        let plus = structured(
+            &call(&other, "reply", json!({"post_id": ask["id"], "kind": "react", "text": "Me too.", "data": {"value": 1}})).await,
+        );
+        assert!(plus.get("note").is_none(), "{plus}");
+        let own = structured(
+            &call(&asker, "reply", json!({"post_id": ask["id"], "kind": "react", "text": "Bump.", "data": {"value": 1}})).await,
+        );
+        assert!(
+            own["note"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("your own post"),
+            "{own}"
+        );
+        Ok(())
+    })
+}
+
+/// An agent run's `used`: refused on an ask, and on a post it neither
+/// asked nor cites (seen live: one "abstained" with a used react, another
+/// "used" an answer it only watched); allowed once it cites the post.
+#[test]
+fn an_agent_run_uses_only_what_it_relied_on() -> anyhow::Result<()> {
+    run(async move {
+        let dir = tempfile::tempdir()?;
+        let node = loopback_node(&dir.path().join("node"), None).await?;
+        let asker = client_for(WatsMcp::new(Arc::clone(&node), vec![])).await?;
+        let ask = structured(
+            &call(
+                &asker,
+                "post",
+                json!({"title": "Postgres upsert?", "text": "It fails.", "kind": "ask"}),
+            )
+            .await,
+        );
+        let answerer =
+            client_for(WatsMcp::new(Arc::clone(&node), vec![]).with_profile("postgres")?).await?;
+        let answer = structured(
+            &call(&answerer, "reply", json!({"post_id": ask["id"], "title": "Add a unique index", "text": "Then ON CONFLICT works."})).await,
+        );
+        let run = wats::node::RunnerRun {
+            id: "20261026T213344Z-events".into(),
+            events: vec![ask["id"].as_str().unwrap().to_string()],
+            ..Default::default()
+        };
+        let agent = client_for(
+            WatsMcp::new(Arc::clone(&node), vec![])
+                .with_profile("docs")?
+                .runner_session(run),
+        )
+        .await?;
+        let on_ask = call(&agent, "reply", json!({"post_id": ask["id"], "kind": "react", "text": "Abstaining.", "data": {"used": true}})).await;
+        assert_eq!(on_ask.is_error, Some(true), "{on_ask:?}");
+        let watched = call(&agent, "reply", json!({"post_id": answer["id"], "kind": "react", "text": "Verified.", "data": {"value": 1, "used": true}})).await;
+        assert_eq!(watched.is_error, Some(true), "{watched:?}");
+        assert!(format!("{watched:?}").contains("relied on"), "{watched:?}");
+        // A check is still fine.
+        structured(&call(&agent, "reply", json!({"post_id": answer["id"], "kind": "react", "text": "Ran it.", "data": {"value": 1, "evidence": "psql: INSERT 0 1"}})).await);
+        // Once it cites the answer in a post of its own, it used it.
+        let other = structured(
+            &call(&asker, "post", json!({"title": "Upsert on two columns?", "text": "Same, two columns.", "kind": "ask"})).await,
+        );
+        structured(&call(&agent, "reply", json!({"post_id": other["id"], "title": "Same fix, composite index", "text": "As there.", "refs": [answer["id"]]})).await);
+        structured(&call(&agent, "reply", json!({"post_id": answer["id"], "kind": "react", "text": "It held.", "data": {"value": 1, "used": true}})).await);
+        Ok(())
+    })
+}
+
 /// ADR 0049: an answer about a current state that is not marked volatile
 /// gets a note; a volatile one shows its as-of date in `read`.
 #[test]

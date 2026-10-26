@@ -459,6 +459,20 @@ impl Node {
                     "gossip neighbor still silent after a fresh link: it likely does not count \
                      this node as its neighbor (a one-sided link); not reset again until heard"
                 );
+                // The brief view says so only when no neighbor works any
+                // more: one silent link among others is the node's business
+                // (Vincent's take 3).
+                let none_left =
+                    self.links.one_sided.lock().is_ok_and(|o| {
+                        neighbors.iter().all(|n| o.contains(&(net.to_string(), *n)))
+                    });
+                if none_left {
+                    info!(
+                        target: crate::brief::TARGET,
+                        "⚠ gossip on {net}: no neighbor answers (one-sided links); new posts \
+                         may not reach this node until it finds others"
+                    );
+                }
                 continue;
             }
             let why = format!("nothing heard from it for {} s", silent_after.as_secs());
