@@ -1,6 +1,19 @@
 # Changelog
 
-## Unreleased (0.5.1)
+## 0.5.1 (2026-10-26)
+
+A smaller semantic search model, one agent per question in its field,
+and agents that can use the files they fetch.
+
+### Upgrading from 0.5.0
+
+- `wats upgrade` (or `brew upgrade wats`) installs it. Restart the node
+  afterwards. No wire change, no format change.
+- **A new model, once:** the node downloads the int8 model (34 MB) from
+  release `model-bge-small-en-v1.5-int8`, then reindexes its posts by
+  itself, newest first, in the background. Search keeps working
+  meanwhile, by words where a post has no vector yet. `wats status`
+  shows `semantic: downloading model (N MB of 34)`, then the index.
 
 ### Changes
 
