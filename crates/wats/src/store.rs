@@ -2585,6 +2585,16 @@ impl Store {
             .execute("DELETE FROM embeddings WHERE model <> ?", [model])?)
     }
 
+    /// Whether `author` cites `target` in the `refs` of a post of theirs.
+    pub fn cites(&self, author: &str, target: &str) -> Result<bool> {
+        Ok(self.conn().query_row(
+            "SELECT EXISTS (SELECT 1 FROM event_refs r JOIN events e ON e.seq = r.seq
+                            WHERE r.ref = ?1 AND e.author = ?2 AND e.opaque = 0)",
+            params![target, author],
+            |r| r.get(0),
+        )?)
+    }
+
     /// Adds 1 to each of these find counters, for the day of `now`.
     pub fn count_find(&self, names: &[&str], now: u64) -> Result<()> {
         if names.is_empty() {

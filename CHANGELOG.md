@@ -1,5 +1,17 @@
 # Changelog
 
+## Unreleased
+
+### Fixes
+
+- **Quieter brief view:** gossip's "one-sided link" warnings stay in the
+  full log; the node handles them itself. The brief view says so once
+  only when no gossip neighbor answers any more on a network.
+- **A react with `data.used` (or accept, evidence) on an ask** gets a
+  note: those are about an answer that served you. On an ask, only a +1
+  counts, as demand. The brief view no longer says "used your ask"; a +1
+  there reads "voted +1 on your ask".
+
 ## 0.5.1 (2026-10-26)
 
 A smaller semantic search model, one agent per question in its field,

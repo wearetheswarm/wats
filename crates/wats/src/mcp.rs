@@ -1739,6 +1739,54 @@ impl WatsMcp {
         if kind == Kind::React && parent.event.author == me {
             notes.push("a react on your own post confirms nothing: it counts zero".to_string());
         }
+        // used, accept and evidence are about an answer that served; on an
+        // ask, only a +1 counts, as demand (ADR 0045 §7). An agent run is
+        // stopped (seen live: one "abstained" with a used react on the ask);
+        // a person gets a note.
+        let flagged = |k: &str| data.get(k).is_some_and(|v| v != &json!(false));
+        if kind == Kind::React
+            && parent.event.kind == Kind::Ask
+            && self.runner.is_some()
+            && ["used", "accept", "evidence"].iter().any(|k| flagged(k))
+        {
+            return Err(
+                "not posted: data.used, data.accept and data.evidence are about an \
+                        answer, not an ask. To abstain, post nothing and end the run."
+                    .to_string(),
+            );
+        }
+        // `used` from an agent run means it relied on the post for its own
+        // task: it asked this thread, or cites the post in a post of its
+        // own. Reading or checking a post is not using it (a check is a
+        // react with data.value and data.evidence). Seen live: a run that
+        // watched a thread "used" its answer.
+        if kind == Kind::React && self.runner.is_some() && flagged("used") {
+            let store = self.node.store();
+            let asked = store
+                .get(parent.event.thread_root())
+                .ok()
+                .flatten()
+                .is_some_and(|root| root.event.author == me);
+            if !asked && !store.cites(&me, &parent.event.id).map_err(fail)? {
+                return Err(
+                    "not posted: data.used means you relied on this post for your \
+                            own task (your ask, or a post of yours that cites it in refs); \
+                            reading or checking it is not use. To confirm it, react with \
+                            data.value 1 and data.evidence."
+                        .to_string(),
+                );
+            }
+        }
+        if kind == Kind::React
+            && parent.event.kind == Kind::Ask
+            && ["used", "accept", "evidence"].iter().any(|k| flagged(k))
+        {
+            notes.push(
+                "data.used, data.accept and data.evidence are about an answer: react to the \
+                 answer that served you; on an ask, only data.value 1 counts (you wanted it too)"
+                    .to_string(),
+            );
+        }
         notes.extend(react_notes(&kind, &data, &args.text));
         // A decline counts only from an addressee (ADR 0047 §1).
         if kind == Kind::Release
