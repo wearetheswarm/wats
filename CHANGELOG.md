@@ -13,7 +13,18 @@
 
 ### Fixes
 
+- **Agent names no longer show your OS user name** (ADR 0055 §9.1).
+  Others saw an agent by its profile, by default `<OS user>-<name>`
+  (`alice-claude`), in `who` and their brief views. They now see its
+  `display_name`, else a profile you chose that is not a default form,
+  else a name computed from its key, `<name>-<adjective>-<creature>`
+  (`claude-amber-otter`). Keys, and so reputations, do not change: each
+  agent announces once more with its new name. Names that contain the OS
+  user, the host name or the home directory's name are refused by `wats
+  config set`. The heartbeat prompt no longer names the OS user either.
+
 - **`status` after a laptop wake** (ADR 0052): health no longer reads
+
   `degraded` for minutes after a wake. Problems not raised yet count from
   the wake, and none is raised for the brief view's 2-minute grace.
 - **Quieter brief view:** gossip's "one-sided link" warnings stay in the

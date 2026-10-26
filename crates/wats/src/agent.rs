@@ -46,8 +46,11 @@ const MAX_IDS_IN_PROMPT: usize = 50;
 pub struct AgentConfig {
     /// The agent runtime (`claude`).
     pub runtime: String,
-    /// Author profile the agent posts as.
+    /// Author profile the agent posts as: its key derives from it.
     pub profile: String,
+    /// Its name for others (ADR 0055 §9.1); resolved at start, when its
+    /// key is known ([`AgentConfig::display_name`]).
+    pub public_name: crate::roster::PublicName,
     /// Whose node this is (the OS user), for the prompt.
     pub user: String,
     /// Who the agent is and what it can do (`agent.about`): its role in the
@@ -131,6 +134,14 @@ pub struct AgentConfig {
     /// Run at a heartbeat even with nothing to look at, as before 0.4.13.
     /// Off in a node; tests that count heartbeat runs turn it on.
     pub idle_heartbeat: bool,
+}
+
+impl AgentConfig {
+    /// Its name for others: announced as `data.name`, and the name the
+    /// prompt gives it. The profile until [`run`] resolves it.
+    pub fn display_name(&self) -> &str {
+        self.public_name.chosen.as_deref().unwrap_or(&self.profile)
+    }
 }
 
 /// The budget `status` shows for `info`: its own, without what its
@@ -794,7 +805,8 @@ fn count(n: usize, one: &str, many: &str) -> String {
 }
 
 /// The prompt of one run: the heartbeat template (HEARTBEAT.md) with its
-/// variables filled: `{agent_profile}`, `{user}`, `{agent.about}`,
+/// variables filled: `{agent_profile}` (its name for others, ADR 0055
+/// §9.1, not its profile), `{user}`, `{agent.about}`,
 /// `{reasons}`, `{cursor}`, `{access}` (what the run can use, see
 /// [`access::prompt_line`]) and `{events}` (one line per event: id · kind ·
 /// author · title). A template without `{access}` or `{events}` gets
@@ -899,7 +911,7 @@ pub fn prompt(node: &Node, config: &AgentConfig, since: i64, trigger: &Trigger) 
     }
     let template = config.heartbeat_text.trim_end();
     let mut prompt = template
-        .replace("{agent_profile}", &config.profile)
+        .replace("{agent_profile}", config.display_name())
         .replace("{user}", &config.user)
         .replace("{agent.about}", about)
         .replace("{reasons}", &reasons)
@@ -912,7 +924,7 @@ pub fn prompt(node: &Node, config: &AgentConfig, since: i64, trigger: &Trigger) 
     if !template.contains("{events}") {
         prompt.push_str(&format!(
             "\n\n---\nYou are {}. You were woken because: {reasons}.\nNew since your last run ({cursor}):\n{events}\n",
-            config.profile
+            config.display_name()
         ));
     }
     // Vibe skips an untrusted folder's AGENTS.md, and wats never trusts
@@ -1012,7 +1024,7 @@ async fn announce_if_changed(node: &Arc<Node>, config: &AgentConfig) {
     // `name` in it: agents announced before 0.4.20 announce once more,
     // with their name.
     let fingerprint = blake3::hash(
-        json!([config.profile, about, tags, "name"])
+        json!([config.profile, about, tags, "name", config.display_name()])
             .to_string()
             .as_bytes(),
     )
@@ -1031,8 +1043,9 @@ async fn announce_if_changed(node: &Arc<Node>, config: &AgentConfig) {
         text: about.to_string(),
         tags,
         // The agent's name for people (`data.name`, 0.4.20): brief lines
-        // show it instead of an id (ADR 0051 §1).
-        data: json!({"name": config.profile})
+        // show it instead of an id (ADR 0051 §1). Not the profile, which
+        // can hold the OS user (ADR 0055 §9.1).
+        data: json!({"name": config.display_name()})
             .as_object()
             .cloned()
             .unwrap_or_default(),
@@ -1319,7 +1332,7 @@ fn note_woke(node: &Node, config: &AgentConfig, transcript: &std::path::Path, wo
         1 => said.remove(0),
         n => format!("{} and {} more", said.remove(0), n - 1),
     };
-    info!(target: crate::brief::TARGET, "{} woke for {what}", config.profile);
+    info!(target: crate::brief::TARGET, "{} woke for {what}", config.display_name());
 }
 
 /// How long past `timeoutSeconds` a dispatched OpenClaw run is watched
@@ -2395,7 +2408,7 @@ async fn finish_run(
     info!(
         target: crate::brief::TARGET,
         "{} run {}{} · {secs:.0} s{}",
-        config.profile,
+        config.display_name(),
         record.status,
         record
             .error
@@ -3375,6 +3388,8 @@ pub async fn run(
     shutdown: impl std::future::Future<Output = ()>,
 ) -> Result<()> {
     let me = author_id(&node.author_key(&config.profile)?);
+    let mut config = config;
+    config.public_name.chosen = Some(config.public_name.resolve(&config.runtime, &me));
     std::fs::create_dir_all(&config.work_dir)?;
     // Runs that never ended (the node crashed or was killed): charged their
     // caps, the dollars they were allowed and their timeout (ADR 0034 §6).
@@ -3386,7 +3401,6 @@ pub async fn run(
         ),
         Err(e) => warn!("agent spend ledger: {e}"),
     }
-    let mut config = config;
     if config.access == Access::SwarmOnly
         && !config.tools.is_empty()
         && config.runtime != "openclaw"
@@ -3552,7 +3566,7 @@ pub async fn run(
                             info!(
                                 target: crate::brief::TARGET,
                                 "{} retries in {}: {}",
-                                config.profile,
+                                config.display_name(),
                                 if after.as_secs() >= 60 {
                                     format!("{} min", after.as_secs() / 60)
                                 } else {
