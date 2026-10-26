@@ -8,6 +8,7 @@ pub mod access;
 pub mod agent;
 pub mod antigravity;
 pub mod attach;
+pub mod awake;
 pub mod background;
 pub mod banner;
 pub mod bootstrap;

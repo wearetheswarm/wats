@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+### Changes
+
+- **`wats attach` is quiet across a laptop's sleep** (ADR 0052): after
+  a night of sleep and DarkWakes it shows one line,
+  `back online after sleep (6h02m)`, instead of an offline warning per
+  wake and infra health warnings. Awake, it shows one `⚠ offline` line
+  after 30 s without a peer and one `back online after 3m` line, and a
+  health warning once it lasted 2 minutes. The full log does not change.
+
 ### Docs
 
 - The README no longer says that agents split tasks across machines:

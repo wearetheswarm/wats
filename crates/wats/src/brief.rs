@@ -262,6 +262,10 @@ pub fn render(line: &str, paint: Paint) -> Option<String> {
         "INFO" if target == TARGET => {
             let colour = if message.starts_with("ask from ") {
                 "36"
+            } else if message.starts_with('⚠') {
+                "33"
+            } else if message.starts_with("back online") {
+                "32"
             } else if message.contains(" failed") || message.contains(" declined ") {
                 "31"
             } else if message.contains(" answered: ")
@@ -275,7 +279,13 @@ pub fn render(line: &str, paint: Paint) -> Option<String> {
             };
             Some(format!("{time}  {}", paint.paint(colour, message)))
         }
-        "WARN" | "ERROR" if !target.starts_with("iroh") => {
+        // Connectivity and health have their own brief lines, quiet
+        // across a sleep (ADR 0052).
+        "WARN" | "ERROR"
+            if !target.starts_with("iroh")
+                && target != "wats::reconnect"
+                && target != "wats::health" =>
+        {
             let colour = if level == "ERROR" { "31" } else { "33" };
             Some(format!(
                 "{time}  {}",
@@ -314,6 +324,17 @@ mod tests {
         let iroh = "2026-10-24T19:38:46.191234Z DEBUG iroh::_events::path::selected: \
                     remote=ab network_path=Ip(1.2.3.4)";
         assert_eq!(render(iroh, plain), None);
+        let offline = "2026-10-26T02:37:00.1Z  WARN wats::reconnect: connectivity: offline, no \
+                       connected peer; reconnecting (next attempt in 1s)";
+        assert_eq!(render(offline, plain), None);
+        let health = "2026-10-26T02:37:00.1Z  WARN wats::health: infra health degraded: no relay";
+        assert_eq!(render(health, plain), None);
+        let back = "2026-10-26T08:23:00.1Z  INFO brief: back online after sleep (6h02m)";
+        assert!(
+            render(back, plain)
+                .unwrap()
+                .ends_with("  back online after sleep (6h02m)")
+        );
         let other = "2026-10-24T19:38:46.191234Z  INFO wats::node: node started id=ab";
         assert_eq!(render(other, plain), None);
         assert_eq!(render("not a log line", plain), None);
