@@ -276,8 +276,13 @@ pub async fn watch(node: Weak<Node>) {
         let mono_took = mono_now.saturating_duration_since(mono);
         (wall, mono) = (wall_now, mono_now);
         let now = crate::node::now_secs();
+        let woke = slept(wall_took, mono_took, TICK);
+        if woke.is_some() {
+            // `status` too: no "degraded" for what a wake brings back.
+            node.health_woke(now);
+        }
         let lines = node.notices(|n| {
-            if let Some(secs) = slept(wall_took, mono_took, TICK) {
+            if let Some(secs) = woke {
                 n.slept(secs.as_secs(), now, mono_now);
             }
             n.tick(now, mono_now)
