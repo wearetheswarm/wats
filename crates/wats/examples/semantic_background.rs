@@ -6,7 +6,7 @@
 //!
 //! ```sh
 //! cargo run --release -p wats --example semantic_background -- \
-//!     <models dir>/bge-small-en-v1.5-f16.safetensors \
+//!     <models dir>/bge-small-en-v1.5-int8.safetensors \
 //!     crates/wats/tests/data/semantic-background.jsonl \
 //!     crates/wats/src/semantic/background.bin
 //! ```

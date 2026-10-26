@@ -37,7 +37,7 @@ pub const IDLE_UNLOAD: Duration = Duration::from_secs(10 * 60);
 pub const POLL: Duration = Duration::from_secs(2);
 /// The release the model file is published in.
 pub const MODEL_URL: &str =
-    "https://github.com/wearetheswarm/wats/releases/download/model-bge-small-en-v1.5-f16/";
+    "https://github.com/wearetheswarm/wats/releases/download/model-bge-small-en-v1.5-int8/";
 /// After a failed download: 1 h, 6 h, then daily.
 pub const DOWNLOAD_RETRY: [Duration; 3] = [
     Duration::from_secs(3600),
@@ -49,11 +49,20 @@ pub const DOWNLOAD_RETRY: [Duration; 3] = [
 pub trait Embed: Send + Sync {
     fn passage(&self, title: &str, text: &str) -> Vec<f32>;
     fn query(&self, query: &str) -> Vec<f32>;
+
+    /// Several posts at once (a batch of the backfill).
+    fn passages(&self, posts: &[(&str, &str)]) -> Vec<Vec<f32>> {
+        posts.iter().map(|(t, x)| self.passage(t, x)).collect()
+    }
 }
 
 impl Embed for Model {
     fn passage(&self, title: &str, text: &str) -> Vec<f32> {
         Model::passage(self, title, text)
+    }
+
+    fn passages(&self, posts: &[(&str, &str)]) -> Vec<Vec<f32>> {
+        Model::passages(self, posts)
     }
 
     fn query(&self, query: &str) -> Vec<f32> {
@@ -306,8 +315,11 @@ impl Semantic {
             started.get_or_insert_with(Instant::now);
         }
         let mut embedded = 0;
-        for (seq, title, text) in &todo {
-            let vector = model.passage(title, text);
+        let posts: Vec<(&str, &str)> = todo
+            .iter()
+            .map(|(_, title, text)| (title.as_str(), text.as_str()))
+            .collect();
+        for ((seq, _, _), vector) in todo.iter().zip(model.passages(&posts)) {
             if store.put_embedding(*seq, model_id, &super::to_blob(&vector))? {
                 embedded += 1;
             }
@@ -699,7 +711,7 @@ mod tests {
     /// The published release (network): downloaded, checked against the
     /// pinned SHA-256 and the release key's signature, and it loads.
     #[test]
-    #[ignore = "downloads 66 MB from the model release"]
+    #[ignore = "downloads 34 MB from the model release"]
     fn downloads_the_published_model() {
         let dir = tempfile::tempdir().unwrap();
         let dest = dir.path().join(MODEL_FILE);

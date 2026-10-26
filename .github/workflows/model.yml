@@ -4,12 +4,14 @@ name: model
 # by hand, once per model:
 #   - downloads the upstream bge-small-en-v1.5 weights at a pinned revision
 #     and checks their SHA-256 (examples/semantic_model.rs checks it too);
-#   - converts them reproducibly to bge-small-en-v1.5-f16.safetensors, and
+#   - converts them reproducibly to bge-small-en-v1.5-int8.safetensors (0.5.1:
+#     int8 matrices with per-row scales, the rest fp16; 0.5.0 nodes keep the
+#     fp16 file of release model-bge-small-en-v1.5-f16, left in place), and
 #     fails unless the result is the file the binary pins
 #     (semantic::MODEL_SHA256 in crates/wats/src/semantic/mod.rs);
 #   - signs the file and its .sha256 with minisign, with the release key
 #     (MINISIGN_SECRET_KEY, as release.yml; docs/release-signing.md);
-#   - publishes them as release model-bge-small-en-v1.5-f16, which nodes
+#   - publishes them as release model-bge-small-en-v1.5-int8, which nodes
 #     download from (semantic::engine::MODEL_URL).
 # The release is created with the workflow's token, so release.yml does
 # not run for it (and skips model-* tags anyway).
@@ -28,8 +30,8 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     env:
-      TAG: model-bge-small-en-v1.5-f16
-      FILE: bge-small-en-v1.5-f16.safetensors
+      TAG: model-bge-small-en-v1.5-int8
+      FILE: bge-small-en-v1.5-int8.safetensors
       UPSTREAM_URL: https://huggingface.co/BAAI/bge-small-en-v1.5/resolve/5c38ec7c405ec4b44b94cc5a9bb96e735b38267a/model.safetensors
       UPSTREAM_SHA256: 3c9f31665447c8911517620762200d2245a2518d6e7208acc78cd9db317e21ad
     steps:
@@ -99,6 +101,6 @@ jobs:
             gh release upload "$TAG" "${files[@]}" --clobber
           else
             gh release create "$TAG" "${files[@]}" --latest=false \
-              --title "Semantic search model: bge-small-en-v1.5 (fp16)" \
+              --title "Semantic search model: bge-small-en-v1.5 (int8)" \
               --notes "The model file of semantic search (ADR 0053), built reproducibly from BAAI/bge-small-en-v1.5 (MIT) at revision 5c38ec7 by examples/semantic_model.rs, and signed with the release key. Nodes download it once and check its pinned SHA-256 and signature. Not a wats release."
           fi

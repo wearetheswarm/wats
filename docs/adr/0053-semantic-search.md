@@ -162,6 +162,55 @@ today's.
 - **Weights:** fp16 on disk (66.4 MB, half of the upstream 133 MB),
   computed in f32. fp16 compute on CPU gave NaNs in candle. With f32
   compute, quality is unchanged.
+- **int8 weights (amended 2026-10-26, 0.5.1; Vincent agreed).**
+  - **The format:**
+    - The matrices of the linear layers and the word embeddings are int8,
+      per-row symmetric: each row's largest magnitude maps to 127,
+      rounded half away from zero (`bert::quantize_rows`).
+    - Each matrix has a `<name>_scale` tensor beside it, one f32 per row.
+    - Everything else is fp16.
+    - Inputs stay at 256 tokens. 128 would drop what long answers with
+      code carry late.
+  - **The file:** `bge-small-en-v1.5-int8.safetensors`, 33,788,328 bytes,
+    SHA-256 `2d3e18fe…`, built reproducibly from upstream by
+    `examples/semantic_model.rs`.
+  - **In memory,** the weights stay int8 (about 34 MB instead of 133 MB of
+    f32). A layer is dequantized when used.
+  - **The backfill embeds its posts in passes of 8** (`EMBED_BATCH`,
+    `Bert::embed_batch`). Their tokens go through each linear layer
+    together, so a layer is dequantized once per 8 posts, while attention
+    stays within each post. 8 is as fast as 16, with 70 MB less of
+    activations.
+  - **Quality** on the calibration set, as production runs it (the store's
+    69 posts, the background re-embedded with each model, full-text over
+    the store, wats's gate and fusion):
+
+    | | hybrid hit@1 | hit@5 | MRR | negatives with nothing by meaning |
+    |---|---|---|---|---|
+    | fp16 (0.5.0) | 36/36 | 36/36 | 1.00 | 12/18 |
+    | int8 (0.5.1) | 36/36 | 36/36 | 1.00 | 12/18 |
+
+    fp16 against int8 vectors: cosine min 0.99946, median 0.99981. Against
+    candle's f32: above 0.999. Z_MIN, Z_WEAK and the floor are unchanged.
+    The background is rebuilt with the int8 model.
+  - **Speed and memory,** one thread, 256 tokens, 300 posts
+    (`examples/semantic_bench.rs`):
+
+    | | one at a time (0.5.0's backfill, and queries) | in passes of 8 (0.5.1's backfill) | a query | RSS after |
+    |---|---|---|---|---|
+    | M4 Pro, Accelerate, fp16 | 24.6 ms/post | 21.6 ms/post | 4 ms | 216 MB |
+    | M4 Pro, Accelerate, int8 | 36.5 ms/post | **23.4 ms/post** | 16 ms | **140 MB** |
+    | ubuntu-latest (EPYC), gemm, fp16 | 140 ms/post | 128 ms/post | 26 ms | 157 MB |
+    | ubuntu-latest (EPYC), gemm, int8 | 166 ms/post | **132 ms/post** | 50 ms | **59 MB** |
+
+    - **The backfill:** 0.5.0 embedded its posts one at a time, so 0.5.1's
+      int8 passes are as fast on the Mac (23.4 against 24.6 ms/post) and
+      faster on x86 (132 against 140), with 75–100 MB less RAM.
+    - **A query** dequantizes the whole model once: about 12 ms more on the
+      Mac and 24 ms more on x86. That is still well under the search's own
+      cost.
+    - True int8 matrix products (VNNI) would need a backend that neither
+      Accelerate's sgemm nor `gemm` provides.
 - **Input:** the title and the start of the body, cut at **256 tokens**.
   Quality is the same as at 512, and it is faster and leaner.
 
@@ -264,10 +313,14 @@ laptops.
 
 ### 4. Delivery of the weights
 
-- **Release asset.** The fp16 weights ship as one release asset,
-  `bge-small-en-v1.5-f16.safetensors`: 66,446,096 bytes, SHA-256
-  `2e8ce335…`. It is signed with minisign and its SHA-256 is published,
-  like the binary (same key, same workflow).
+- **Release asset.** The weights ship as one release asset, signed with
+  minisign and with their SHA-256 published, like the binary (same key,
+  same workflow).
+  - Since 0.5.1: `bge-small-en-v1.5-int8.safetensors` (33,788,328 bytes,
+    SHA-256 `2d3e18fe…`), release `model-bge-small-en-v1.5-int8`.
+  - 0.5.0: `bge-small-en-v1.5-f16.safetensors` (66,446,096 bytes, SHA-256
+    `2e8ce335…`), release `model-bge-small-en-v1.5-f16`, left in place for
+    0.5.0 nodes.
   - The vocabulary (230 KB) is in the binary.
   - So is the config, as constants.
 - **Reproducible.** `examples/semantic_model.rs` converts upstream

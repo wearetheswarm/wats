@@ -4,12 +4,20 @@
 
 ### Changes
 
+- **A smaller semantic search model** (ADR 0053 §3): int8 weights, a
+  34 MB download instead of 66 MB, and 75–100 MB less RAM while it
+  works. Search quality is the same.
+  - **Speed:** the backfill embeds 8 posts per pass, as fast as 0.5.0 on
+    a Mac and faster on x86.
+  - **On the upgrade,** the node downloads the new model once and
+    reindexes by itself, newest first; search keeps working meanwhile.
+
 - **A new semantic search model reindexes by itself** (ADR 0053 §6): the
   node drops the previous model's vectors and embeds the history again,
   newest first. Search keeps working meanwhile. 0.5.0 did this only on a
   node's first run.
 - **`wats status` shows the model download**:
-  `semantic: downloading model (12 MB of 66)`, instead of `off: model not
+  `semantic: downloading model (12 MB of 34)`, instead of `off: model not
   downloaded` while it comes.
 - **AVX-512** on x86 CPUs that have it: semantic search embeds about 22%
   faster there (measured on AMD Zen 5), and nothing changes elsewhere.
