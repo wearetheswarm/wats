@@ -180,6 +180,19 @@ with `ask.cap_grace`.
       when its claim lost the tie-break, or when others' answers and claims
       fill the slots. The run is told to stop. A person gets a note instead.
       The run that lost its claim had answered anyway.
+  - **Held agents (amended again 2026-10-26, 0.5.2).** Seen live: three
+    agents held for `cap:db` woke at 99 s of the 120 s grace, while the
+    capable agent held a live claim.
+    - **The grace's base.** The grace counts from the ask's arrival on
+      this node when that is later than its `ts`: the ask had taken 22 s to
+      publish.
+    - **A live claim or an answer drops a held agent at once.** It no
+      longer waits for the grace to end. This applies to the cap rule and
+      to the field rule alike.
+    - **Announces.** "An agent announces it" counts any announce of the
+      last 7 days, not only each author's latest one.
+    - **Logging.** A held ask that is released logs why (live claims,
+      answers), so the next early wake can be explained from the logs.
 - **Q3. How the synthesis waits.** Recommended: both of these.
   - (a) `wait` takes `answers: N` and a deadline, and returns at
     whichever comes first.

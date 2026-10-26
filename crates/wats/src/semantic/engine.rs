@@ -70,24 +70,34 @@ impl Embed for Model {
     }
 }
 
-/// Loads the model from its file.
-pub type Loader = Box<dyn Fn(&std::path::Path) -> Result<Arc<dyn Embed>> + Send + Sync>;
+/// Loads a model from its file, checked against an expected SHA-256.
+pub type Loader = Box<dyn Fn(&std::path::Path, &str) -> Result<Arc<dyn Embed>> + Send + Sync>;
 
-/// The real loader: the pinned file.
+/// The real loader.
 pub fn model_loader() -> Loader {
-    Box::new(|path| {
+    Box::new(|path, sha| {
         let bytes = std::fs::read(path).with_context(|| format!("read {}", path.display()))?;
-        Ok(Arc::new(Model::load(&bytes)?) as Arc<dyn Embed>)
+        Ok(Arc::new(Model::load_verified(&bytes, sha)?) as Arc<dyn Embed>)
     })
+}
+
+/// A model of an earlier release, and where its file would be.
+#[derive(Debug, Clone)]
+pub struct Previous {
+    pub id: String,
+    pub file: PathBuf,
 }
 
 /// How a node runs semantic search.
 #[derive(Debug, Clone)]
 pub struct Config {
-    /// The model file.
+    /// The pinned model's file.
     pub model_file: PathBuf,
-    /// The model's identity in the store: its file's SHA-256.
+    /// The pinned model's identity in the store: its file's SHA-256.
     pub model_id: String,
+    /// Earlier models that may serve while the pinned one builds its
+    /// index ([`super::PREVIOUS_MODELS`], in the same directory).
+    pub previous: Vec<Previous>,
     /// Where to download the file from (a directory URL), or `None`
     /// (hermetic, no infrastructure): it must be there already.
     pub download: Option<String>,
@@ -96,31 +106,59 @@ pub struct Config {
 }
 
 impl Config {
-    /// The model file in `dir` (`<data dir>/models`, or
+    /// The model files in `dir` (`<data dir>/models`, or
     /// `semantic.model_dir`).
     pub fn new(dir: PathBuf, download: bool) -> Self {
         Config {
             model_file: dir.join(MODEL_FILE),
             model_id: MODEL_SHA256.to_string(),
+            previous: super::PREVIOUS_MODELS
+                .iter()
+                .map(|(id, file)| Previous {
+                    id: (*id).to_string(),
+                    file: dir.join(file),
+                })
+                .collect(),
             download: download.then(|| MODEL_URL.to_string()),
             laptop_manners: true,
         }
+    }
+
+    /// The file of model `id`: the pinned one's, or a previous one's.
+    fn file_of(&self, id: &str) -> Option<&PathBuf> {
+        if id == self.model_id {
+            return Some(&self.model_file);
+        }
+        self.previous.iter().find(|p| p.id == id).map(|p| &p.file)
     }
 }
 
 #[derive(Default)]
 struct Vectors {
+    /// The model these vectors are of.
+    model: String,
     index: Index,
     /// The table's count and highest `seq` when loaded.
     count: usize,
     max: i64,
 }
 
+/// The loaded models by id, each with when it was last used.
+type Loaded = std::collections::HashMap<String, (Arc<dyn Embed>, Instant)>;
+
+/// Free bytes under `storage.max` (`None`: no limit known).
+pub type FreeBytes = Box<dyn Fn() -> Option<u64> + Send + Sync>;
+
+/// Bytes a vector takes on disk, with its row.
+const VECTOR_BYTES: u64 = (super::DIM as u64) * 2 + 64;
+
 /// Semantic search's state on a node.
 pub struct Semantic {
     config: Config,
     loader: Loader,
-    model: Mutex<Option<(Arc<dyn Embed>, Instant)>>,
+    /// Loaded models by id: the serving one and, while a new model builds
+    /// its index, the pinned one too.
+    models: Mutex<Loaded>,
     vectors: Mutex<Vectors>,
     /// Why there are no vectors (e.g. the model is not downloaded).
     off: Mutex<Option<String>>,
@@ -129,6 +167,9 @@ pub struct Semantic {
     started: Mutex<Option<Instant>>,
     /// A download in progress: bytes so far, and the file's size.
     downloading: Mutex<Option<(u64, u64)>>,
+    /// Free bytes under `storage.max`: whether two indexes fit while a new
+    /// model builds its own.
+    free_bytes: Mutex<FreeBytes>,
 }
 
 /// What one batch did.
@@ -144,12 +185,13 @@ impl Semantic {
         Semantic {
             config,
             loader,
-            model: Mutex::new(None),
+            models: Mutex::default(),
             vectors: Mutex::default(),
             off: Mutex::new(None),
             stop: AtomicBool::new(false),
             started: Mutex::new(None),
             downloading: Mutex::new(None),
+            free_bytes: Mutex::new(Box::new(|| None)),
         }
     }
 
@@ -161,75 +203,130 @@ impl Semantic {
         self.stop.store(true, Ordering::SeqCst);
     }
 
+    /// How to read the free bytes under `storage.max` (the node, once it
+    /// is up).
+    pub fn set_free_bytes(&self, free: FreeBytes) {
+        if let Ok(mut f) = self.free_bytes.lock() {
+            *f = free;
+        }
+    }
+
     fn set_off(&self, why: Option<String>) {
         if let Ok(mut off) = self.off.lock() {
             *off = why;
         }
     }
 
-    /// The model, loaded if its file is there.
+    /// The pinned model, loaded if its file is there.
     pub fn model(&self) -> Option<Arc<dyn Embed>> {
-        let mut slot = self.model.lock().ok()?;
-        if let Some((model, used)) = slot.as_mut() {
+        self.load(&self.config.model_id.clone())
+    }
+
+    /// Model `id` (pinned or previous), loaded if its file is there and
+    /// is that model. A pinned file that does not load is removed, to be
+    /// downloaded again.
+    fn load(&self, id: &str) -> Option<Arc<dyn Embed>> {
+        let mut models = self.models.lock().ok()?;
+        if let Some((model, used)) = models.get_mut(id) {
             *used = Instant::now();
             return Some(Arc::clone(model));
         }
-        if !self.config.model_file.exists() {
+        let file = self.config.file_of(id)?.clone();
+        if !file.exists() {
             return None;
         }
         let started = Instant::now();
-        match (self.loader)(&self.config.model_file) {
+        match (self.loader)(&file, id) {
             Ok(model) => {
-                debug!("semantic: model loaded in {:?}", started.elapsed());
-                *slot = Some((Arc::clone(&model), Instant::now()));
-                self.set_off(None);
+                debug!(
+                    "semantic: model {} loaded in {:?}",
+                    short(id),
+                    started.elapsed()
+                );
+                models.insert(id.to_string(), (Arc::clone(&model), Instant::now()));
+                if id == self.config.model_id {
+                    self.set_off(None);
+                }
                 Some(model)
             }
             Err(e) => {
-                warn!("semantic: the model file does not load: {e:#}");
-                // A bad file is removed: it is downloaded again.
-                let _ = std::fs::remove_file(&self.config.model_file);
-                self.set_off(Some(format!("model file refused ({e})")));
+                warn!(
+                    "semantic: the model file {} does not load: {e:#}",
+                    file.display()
+                );
+                if id == self.config.model_id {
+                    let _ = std::fs::remove_file(&file);
+                    self.set_off(Some(format!("model file refused ({e})")));
+                }
                 None
             }
         }
     }
 
-    /// Unloads the model when unused for [`IDLE_UNLOAD`]; the vectors in
-    /// memory go with it.
+    /// Unloads the models unused for [`IDLE_UNLOAD`]; the vectors in memory
+    /// go with the one they are of.
     pub fn unload_if_idle(&self) {
-        let Ok(mut slot) = self.model.lock() else {
+        let Ok(mut models) = self.models.lock() else {
             return;
         };
-        if slot
-            .as_ref()
-            .is_some_and(|(_, used)| used.elapsed() >= IDLE_UNLOAD)
-        {
-            *slot = None;
-            if let Ok(mut v) = self.vectors.lock() {
+        let idle: Vec<String> = models
+            .iter()
+            .filter(|(_, (_, used))| used.elapsed() >= IDLE_UNLOAD)
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in idle {
+            models.remove(&id);
+            if let Ok(mut v) = self.vectors.lock()
+                && v.model == id
+            {
                 *v = Vectors::default();
             }
-            debug!("semantic: model unloaded (idle)");
+            debug!("semantic: model {} unloaded (idle)", short(&id));
         }
     }
 
-    /// Brings the vectors in memory up to the table: the new rows, or all
-    /// of them again when some were deleted.
-    fn refresh(&self, store: &Store, vectors: &mut Vectors) -> Result<()> {
-        let model = &self.config.model_id;
+    /// The model whose vectors answer queries: the pinned one, or a
+    /// previous one while the pinned one builds its index.
+    pub fn serving(&self, store: &Store) -> String {
+        self.config
+            .previous
+            .iter()
+            .find(|p| {
+                store
+                    .semantic_state(&format!("serving:{}", p.id))
+                    .ok()
+                    .flatten()
+                    .is_some()
+            })
+            .map_or_else(|| self.config.model_id.clone(), |p| p.id.clone())
+    }
+
+    /// Brings the vectors in memory up to the table for `model`: the new
+    /// rows, or all of them again when some were deleted.
+    fn refresh(&self, store: &Store, model: &str, vectors: &mut Vectors) -> Result<()> {
+        if vectors.model != model {
+            *vectors = Vectors {
+                model: model.to_string(),
+                ..Vectors::default()
+            };
+        }
         let (count, max) = store.embeddings_extent(model)?;
         if (count, max) == (vectors.count, vectors.max) {
             return Ok(());
         }
+        let fresh = || Vectors {
+            model: model.to_string(),
+            ..Vectors::default()
+        };
         if count < vectors.count || max < vectors.max {
-            *vectors = Vectors::default();
+            *vectors = fresh();
         }
         for (seq, blob) in store.embeddings_after(model, vectors.max)? {
             vectors.index.push(seq, &blob);
         }
         if vectors.index.len() != count {
             // Rows deleted and others added: load them all again.
-            *vectors = Vectors::default();
+            *vectors = fresh();
             for (seq, blob) in store.embeddings_after(model, 0)? {
                 vectors.index.push(seq, &blob);
             }
@@ -240,20 +337,37 @@ impl Semantic {
 
     /// The posts that match `query` by meaning, gated (ADR 0053 §2), at
     /// most `k`: `None` when semantic search cannot run (no model, no
-    /// vector), and full-text search alone applies.
+    /// vector), and full-text search alone applies. With the serving
+    /// model and its vectors: during a model change, the previous model's
+    /// complete index, then the new one's.
     pub fn hits(&self, store: &Store, query: &str, k: usize) -> Option<Vec<VectorHit>> {
-        let model = self.model()?;
+        let serving = self.serving(store);
+        let (id, model) = match self.load(&serving) {
+            Some(model) => (serving, model),
+            // The previous model's file is gone: the new index, as far as
+            // it goes.
+            None => (self.config.model_id.clone(), self.model()?),
+        };
         let embedding = model.query(query);
         let mut vectors = self.vectors.lock().ok()?;
-        if let Err(e) = self.refresh(store, &mut vectors) {
+        if let Err(e) = self.refresh(store, &id, &mut vectors) {
             warn!("semantic: reading the vectors: {e:#}");
             return None;
         }
         if vectors.index.is_empty() {
             return None;
         }
-        let background = super::background().scores(&embedding);
-        let background: Vec<f32> = background.into_iter().map(|(_, c)| c).collect();
+        // The background is the pinned model's: a previous model gates
+        // against its own posts only.
+        let background: Vec<f32> = if id == self.config.model_id {
+            super::background()
+                .scores(&embedding)
+                .into_iter()
+                .map(|(_, c)| c)
+                .collect()
+        } else {
+            Vec::new()
+        };
         Some(rank::gate(
             &vectors.index.scores(&embedding),
             &background,
@@ -261,47 +375,138 @@ impl Semantic {
         ))
     }
 
+    /// A state key of the pinned model: `<name>:<model sha256>`. An older
+    /// wats (0.5.0, which reads `top`) finds none of them after a rollback,
+    /// and reindexes with its own model.
+    fn key(&self, name: &str) -> String {
+        format!("{name}:{}", self.config.model_id)
+    }
+
+    /// Whether a second index fits under `storage.max`, beside the one
+    /// serving.
+    fn room_for_two(&self, store: &Store) -> bool {
+        let (_, total) = store
+            .embedding_counts(&self.config.model_id)
+            .unwrap_or((0, 0));
+        let need = total.saturating_mul(VECTOR_BYTES);
+        let free = self.free_bytes.lock().ok().and_then(|f| f());
+        free.is_none_or(|free| free >= need)
+    }
+
+    /// Removes, from the model directory, every other `*.safetensors` file
+    /// whose SHA-256 is not the pinned one's: once the pinned file is
+    /// there and verified, the index is the pinned model's, and no
+    /// download runs. A shared `semantic.model_dir` too (Vincent,
+    /// 2026-10-26). Never the pinned file, never a `.part`.
+    pub fn remove_stale_models(&self, store: &Store) {
+        if self.serving(store) != self.config.model_id
+            || self.downloading.lock().ok().and_then(|d| *d).is_some()
+        {
+            return;
+        }
+        let pinned = &self.config.model_file;
+        let verified = std::fs::read(pinned)
+            .ok()
+            .is_some_and(|bytes| hex::encode(Sha256::digest(&bytes)) == self.config.model_id);
+        let Some(dir) = pinned.parent().filter(|_| verified) else {
+            return;
+        };
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let is_model = path.extension().is_some_and(|e| e == "safetensors");
+            if !is_model || &path == pinned || !path.is_file() {
+                continue;
+            }
+            let other = std::fs::read(&path)
+                .ok()
+                .is_none_or(|bytes| hex::encode(Sha256::digest(&bytes)) != self.config.model_id);
+            if other && std::fs::remove_file(&path).is_ok() {
+                info!(
+                    "semantic: removed {}, a model file this wats no longer uses",
+                    path.display()
+                );
+            }
+        }
+    }
+
     /// One batch: new posts first, then the history (unless `pause`).
     pub fn step(&self, store: &Store, pause: bool) -> Result<Step> {
         let model_id = &self.config.model_id;
-        // The state is this model's (ADR 0053 §6): on a first run, or with
-        // another model than the one that built the index, what is stored
-        // is history to embed again, newest first, and the other model's
-        // vectors go.
         let this_model = format!("model:{model_id}");
-        if store.semantic_state(&this_model)?.is_none() {
-            let dropped = store.drop_other_embeddings(model_id)?;
-            if dropped > 0 {
-                info!(
-                    "semantic: a new model; {dropped} vectors of the previous one dropped, reindexing"
-                );
+        // 0.5.1 kept `top`, `below` and `done` unprefixed, which 0.5.0
+        // reads after a rollback as its own (and skips its reindex): they
+        // move under this model's name. And it served its own model.
+        if store.semantic_state(&this_model)?.is_some() {
+            for name in ["top", "below", "done"] {
+                if let Some(v) = store.semantic_state(name)? {
+                    store.set_semantic_state(&self.key(name), v)?;
+                    store.delete_semantic_state(name)?;
+                }
             }
-            store.clear_semantic_state()?;
+        }
+        // An index 0.5.1 completed serves: recorded as such.
+        if store.semantic_state(&self.key("done"))?.is_some() {
+            store.set_semantic_state(&format!("serving:{model_id}"), 1)?;
+        }
+        // A model this index was not built with (ADR 0053 §6). A previous
+        // model with a complete index keeps serving while this one builds
+        // its own beside it, room allowing; otherwise its vectors go now
+        // and this one starts from nothing.
+        if store.semantic_state(&this_model)?.is_none() {
+            let serving = self.serving(store);
+            let keep = serving != *model_id
+                && self.config.file_of(&serving).is_some_and(|f| f.exists())
+                && self.room_for_two(store);
+            if keep {
+                info!("semantic: a new model; the previous one serves until its index is built");
+            } else {
+                let dropped = store.drop_other_embeddings(model_id)?;
+                if dropped > 0 {
+                    info!(
+                        "semantic: a new model; {dropped} vectors of the previous one dropped, \
+                         reindexing{}",
+                        if serving != *model_id {
+                            " (no room under storage.max for two indexes, or its file is gone)"
+                        } else {
+                            ""
+                        }
+                    );
+                }
+                store.clear_semantic_state()?;
+            }
             let max = store.max_seq()?;
-            store.set_semantic_state("top", max)?;
-            store.set_semantic_state("below", max.saturating_add(1))?;
+            store.set_semantic_state(&self.key("top"), max)?;
+            store.set_semantic_state(&self.key("below"), max.saturating_add(1))?;
+            store.delete_semantic_state(&self.key("done"))?;
             store.set_semantic_state(&this_model, 1)?;
             if let Ok(mut started) = self.started.lock() {
                 *started = None;
             }
         }
-        let top = store.semantic_state("top")?.unwrap_or(0);
+        let top = store.semantic_state(&self.key("top"))?.unwrap_or(0);
         let mut todo = store.embedding_todo(model_id, Some(top), None, BATCH)?;
         let new = !todo.is_empty();
-        let below = store.semantic_state("below")?.unwrap_or(0);
-        let backfilling = store.semantic_state("done")?.is_none();
+        let below = store.semantic_state(&self.key("below"))?.unwrap_or(0);
+        let backfilling = store.semantic_state(&self.key("done"))?.is_none();
         if todo.is_empty() {
             if pause || !backfilling {
                 // Rows above `top` that are not to embed: move past them.
                 let max = store.max_seq()?;
                 if max > top {
-                    store.set_semantic_state("top", max)?;
+                    store.set_semantic_state(&self.key("top"), max)?;
                 }
                 return Ok(Step::default());
             }
             todo = store.embedding_todo(model_id, None, Some(below), BATCH)?;
             if todo.is_empty() {
-                store.set_semantic_state("done", 1)?;
+                store.set_semantic_state(&self.key("done"), 1)?;
+                self.switch(store)?;
+                // Recorded, so that a release with another model lets this
+                // one serve while it builds its own index.
+                store.set_semantic_state(&format!("serving:{model_id}"), 1)?;
                 return Ok(Step {
                     embedded: 0,
                     finished: true,
@@ -326,9 +531,9 @@ impl Semantic {
         }
         let last = todo.last().map_or(0, |t| t.0);
         if new {
-            store.set_semantic_state("top", last)?;
+            store.set_semantic_state(&self.key("top"), last)?;
         } else {
-            store.set_semantic_state("below", last)?;
+            store.set_semantic_state(&self.key("below"), last)?;
         }
         Ok(Step {
             embedded,
@@ -336,13 +541,51 @@ impl Semantic {
         })
     }
 
+    /// The pinned model's index is complete: it serves from now on, and
+    /// the previous model's vectors and file go.
+    fn switch(&self, store: &Store) -> Result<()> {
+        let serving = self.serving(store);
+        if serving == self.config.model_id {
+            return Ok(());
+        }
+        for key in [
+            format!("serving:{serving}"),
+            format!("model:{serving}"),
+            format!("top:{serving}"),
+            format!("below:{serving}"),
+            format!("done:{serving}"),
+        ] {
+            store.delete_semantic_state(&key)?;
+        }
+        let dropped = store.drop_other_embeddings(&self.config.model_id)?;
+        if let Ok(mut models) = self.models.lock() {
+            models.remove(&serving);
+        }
+        info!(
+            "semantic: switched to {} ({dropped} vectors of the previous model dropped)",
+            MODEL_FILE
+        );
+        self.remove_stale_models(store);
+        Ok(())
+    }
+
     /// The `semantic` value of `status` (stable; see `docs/agent.md`):
-    /// `{"state": "ready" | "indexing" | "off", "embedded": N,
-    /// "total": N, "detail": "…"}`.
+    /// `{"state": "ready" | "indexing" | "off" | "downloading",
+    /// "embedded": N, "total": N, "detail": "…"}`, and during a model
+    /// change `"next": {"embedded": N, "total": N}`, the new model's index.
     pub fn status(&self, store: &Store) -> Value {
         let (embedded, total) = store
             .embedding_counts(&self.config.model_id)
             .unwrap_or((0, 0));
+        let serving = self.serving(store);
+        if serving != self.config.model_id
+            && self.config.file_of(&serving).is_some_and(|f| f.exists())
+        {
+            let (old, _) = store.embedding_counts(&serving).unwrap_or((0, 0));
+            return json!({"state": "ready", "embedded": old, "total": total,
+                          "model": "previous",
+                          "next": {"embedded": embedded, "total": total}});
+        }
         let off = self.off.lock().ok().and_then(|o| o.clone());
         let have_file = self.config.model_file.exists();
         let downloading = self.downloading.lock().ok().and_then(|d| *d);
@@ -357,7 +600,11 @@ impl Semantic {
             return json!({"state": "off", "embedded": embedded, "total": total,
                           "detail": detail});
         }
-        let done = store.semantic_state("done").ok().flatten().is_some();
+        let done = store
+            .semantic_state(&self.key("done"))
+            .ok()
+            .flatten()
+            .is_some();
         let state = if done && embedded >= total {
             "ready"
         } else {
@@ -382,12 +629,19 @@ impl Semantic {
     }
 
     fn work(&self, store: &Weak<Store>) {
+        let mut cleaned = false;
         while !self.stop.load(Ordering::SeqCst) {
             let Some(store) = store.upgrade() else { return };
             if !self.config.model_file.exists() {
                 drop(store);
                 std::thread::sleep(POLL * 5);
                 continue;
+            }
+            // Once per start, the pinned file there: other models' files go
+            // (after a switch, `switch` does it).
+            if !cleaned {
+                self.remove_stale_models(&store);
+                cleaned = true;
             }
             let pause = self.config.laptop_manners && busy_or_on_battery();
             let started = Instant::now();
@@ -467,11 +721,21 @@ impl Semantic {
     }
 }
 
+/// The start of an id, for logs.
+fn short(id: &str) -> &str {
+    id.get(..12).unwrap_or(id)
+}
+
 /// One line for `wats status`: "index 12,400 of 15,000 posts", "ready
 /// (15,000 posts)", "off: model not downloaded".
 pub fn summary(semantic: &Value) -> String {
     let n = |key: &str| thousands(semantic[key].as_u64().unwrap_or(0));
     match semantic["state"].as_str() {
+        Some("ready") if semantic.get("next").is_some() => format!(
+            "ready (previous model) · new model: index {} of {}",
+            thousands(semantic["next"]["embedded"].as_u64().unwrap_or(0)),
+            thousands(semantic["next"]["total"].as_u64().unwrap_or(0))
+        ),
         Some("ready") => format!("ready ({} posts)", n("embedded")),
         Some("indexing") => format!("index {} of {} posts", n("embedded"), n("total")),
         Some("downloading") => semantic["detail"]
@@ -641,7 +905,10 @@ mod tests {
         std::fs::write(dir.join(MODEL_FILE), b"fake").unwrap();
         let mut config = Config::new(dir.to_path_buf(), false);
         config.laptop_manners = false;
-        Semantic::new(config, Box::new(|_| Ok(Arc::new(Fake) as Arc<dyn Embed>)))
+        Semantic::new(
+            config,
+            Box::new(|_, _| Ok(Arc::new(Fake) as Arc<dyn Embed>)),
+        )
     }
 
     fn event(key: u8, ts: u64, text: &str) -> crate::event::Event {
@@ -719,7 +986,7 @@ mod tests {
             .unwrap()
             .block_on(download(MODEL_URL, &dest, &|_| {}))
             .unwrap();
-        let model = model_loader()(&dest).unwrap();
+        let model = model_loader()(&dest, MODEL_SHA256).unwrap();
         assert_eq!(model.query("hello").len(), super::super::DIM);
     }
 
@@ -754,7 +1021,10 @@ mod tests {
         assert_eq!(store.embedding_counts(MODEL_SHA256).unwrap(), (20, 20));
         let mut config = old.config().clone();
         config.model_id = "another-model".into();
-        let new = Semantic::new(config, Box::new(|_| Ok(Arc::new(Fake) as Arc<dyn Embed>)));
+        let new = Semantic::new(
+            config,
+            Box::new(|_, _| Ok(Arc::new(Fake) as Arc<dyn Embed>)),
+        );
         assert_eq!(new.status(&store)["state"], "indexing");
         let step = new.step(&store, false).unwrap();
         assert_eq!(step.embedded, BATCH);
@@ -771,9 +1041,158 @@ mod tests {
         // Back on the same model: nothing to do again.
         let again = Semantic::new(
             new.config().clone(),
-            Box::new(|_| Ok(Arc::new(Fake) as Arc<dyn Embed>)),
+            Box::new(|_, _| Ok(Arc::new(Fake) as Arc<dyn Embed>)),
         );
         assert_eq!(again.step(&store, false).unwrap(), Step::default());
+    }
+
+    /// 0.5.1's unprefixed keys move under the model's name, with no
+    /// reindex; afterwards no `top` is left for a 0.5.0 to misread.
+    #[test]
+    fn the_state_moves_under_the_model_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open_in_memory().unwrap();
+        for i in 0..5 {
+            ask(&store, 1, 100 + i, &format!("post {i}"));
+        }
+        let s = semantic(dir.path());
+        while !s.step(&store, false).unwrap().finished {}
+        // As 0.5.1 left it: the same model, unprefixed keys.
+        let top = store.semantic_state(&s.key("top")).unwrap().unwrap();
+        for name in ["top", "below", "done"] {
+            let v = store.semantic_state(&s.key(name)).unwrap().unwrap();
+            store.set_semantic_state(name, v).unwrap();
+            store.delete_semantic_state(&s.key(name)).unwrap();
+        }
+        let again = semantic(dir.path());
+        assert_eq!(again.step(&store, false).unwrap(), Step::default());
+        assert_eq!(store.embedding_counts(MODEL_SHA256).unwrap(), (5, 5));
+        assert_eq!(store.semantic_state("top").unwrap(), None);
+        assert_eq!(store.semantic_state(&again.key("top")).unwrap(), Some(top));
+        assert_eq!(again.status(&store)["state"], "ready");
+    }
+
+    fn sha(bytes: &[u8]) -> String {
+        hex::encode(Sha256::digest(bytes))
+    }
+
+    /// A model change with room for two indexes: the previous model keeps
+    /// answering with its complete index while the new one builds its
+    /// own; then the switch, and the previous vectors and file go.
+    #[test]
+    fn a_new_model_takes_over_smoothly() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open_in_memory().unwrap();
+        for i in 0..30 {
+            ask(&store, 1, 100 + i, &format!("history post number {i}"));
+        }
+        let target = ask(&store, 2, 500, "a brand new question about sorting");
+        // The previous release: its model, a complete index.
+        let old_file = dir.path().join("old-model.safetensors");
+        std::fs::write(&old_file, b"old").unwrap();
+        let old_id = sha(b"old");
+        let mut old_config = Config::new(dir.path().to_path_buf(), false);
+        old_config.model_file = old_file.clone();
+        old_config.model_id = old_id.clone();
+        old_config.laptop_manners = false;
+        let fake = || -> Loader { Box::new(|_, _| Ok(Arc::new(Fake) as Arc<dyn Embed>)) };
+        let old = Semantic::new(old_config, fake());
+        while !old.step(&store, false).unwrap().finished {}
+        assert_eq!(store.embedding_counts(&old_id).unwrap(), (31, 31));
+        // This release: a new model, the old one among the previous ones.
+        let new_file = dir.path().join(MODEL_FILE);
+        std::fs::write(&new_file, b"new").unwrap();
+        let mut config = Config::new(dir.path().to_path_buf(), false);
+        config.model_id = sha(b"new");
+        config.previous = vec![Previous {
+            id: old_id.clone(),
+            file: old_file.clone(),
+        }];
+        config.laptop_manners = false;
+        let new = Semantic::new(config, fake());
+        assert_eq!(new.step(&store, false).unwrap().embedded, BATCH);
+        // The previous index still answers, whole.
+        assert_eq!(store.embedding_counts(&old_id).unwrap(), (31, 31));
+        assert_eq!(new.serving(&store), old_id);
+        let hits = new
+            .hits(&store, "a brand new question about sorting", 5)
+            .unwrap();
+        assert_eq!(hits.first().map(|h| h.seq), Some(target));
+        let status = new.status(&store);
+        assert_eq!(status["state"], "ready", "{status}");
+        assert_eq!(status["next"]["embedded"], BATCH as u64);
+        assert_eq!(
+            summary(&status),
+            format!("ready (previous model) · new model: index {BATCH} of 31")
+        );
+        // Interrupted: a restart goes on with the transition.
+        let new = Semantic::new(new.config().clone(), fake());
+        while !new.step(&store, false).unwrap().finished {}
+        // The switch: the new model serves, the old vectors and file go.
+        assert_eq!(new.serving(&store), sha(b"new"));
+        assert_eq!(store.embedding_counts(&old_id).unwrap().0, 0);
+        assert_eq!(store.embedding_counts(&sha(b"new")).unwrap(), (31, 31));
+        assert!(!old_file.exists() && new_file.exists());
+        assert_eq!(new.status(&store)["state"], "ready");
+        assert!(new.status(&store).get("next").is_none());
+    }
+
+    /// No room under storage.max for two indexes: the old vectors go at
+    /// once, as in 0.5.1, and the new index builds from nothing.
+    #[test]
+    fn no_room_for_two_indexes_drops_first() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open_in_memory().unwrap();
+        for i in 0..10 {
+            ask(&store, 1, 100 + i, &format!("post {i}"));
+        }
+        let old_file = dir.path().join("old-model.safetensors");
+        std::fs::write(&old_file, b"old").unwrap();
+        let fake = || -> Loader { Box::new(|_, _| Ok(Arc::new(Fake) as Arc<dyn Embed>)) };
+        let mut old_config = Config::new(dir.path().to_path_buf(), false);
+        old_config.model_file = old_file.clone();
+        old_config.model_id = sha(b"old");
+        let old = Semantic::new(old_config, fake());
+        while !old.step(&store, false).unwrap().finished {}
+        let mut config = Config::new(dir.path().to_path_buf(), false);
+        config.model_id = "new-model".into();
+        config.previous = vec![Previous {
+            id: sha(b"old"),
+            file: old_file,
+        }];
+        let new = Semantic::new(config, fake());
+        new.set_free_bytes(Box::new(|| Some(100)));
+        new.step(&store, false).unwrap();
+        assert_eq!(store.embedding_counts(&sha(b"old")).unwrap().0, 0);
+        assert_eq!(new.serving(&store), "new-model");
+    }
+
+    /// Other `*.safetensors` files go once the pinned file is verified
+    /// (a shared model_dir too); never the pinned file, never a `.part`.
+    #[test]
+    fn stale_model_files_go_once_the_pinned_one_is_verified() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open_in_memory().unwrap();
+        let old = dir.path().join("bge-small-en-v1.5-f16.safetensors");
+        let part = dir.path().join("bge-small-en-v1.5-int8.part");
+        let other = dir.path().join("notes.txt");
+        let pinned = dir.path().join(MODEL_FILE);
+        for f in [&old, &part, &other] {
+            std::fs::write(f, b"x").unwrap();
+        }
+        let mut config = Config::new(dir.path().to_path_buf(), false);
+        config.model_id = sha(b"pinned");
+        let s = Semantic::new(config, model_loader());
+        // Not there yet (downloading): nothing goes.
+        s.remove_stale_models(&store);
+        assert!(old.exists());
+        // There, but not the pinned content: nothing goes.
+        std::fs::write(&pinned, b"tampered").unwrap();
+        s.remove_stale_models(&store);
+        assert!(old.exists());
+        std::fs::write(&pinned, b"pinned").unwrap();
+        s.remove_stale_models(&store);
+        assert!(!old.exists() && pinned.exists() && part.exists() && other.exists());
     }
 
     #[test]

@@ -317,7 +317,9 @@ impl Expect {
                  generating, several turns), reply with kind `claim` first"
             }
             Expect::AbstainUnlessDifferent => {
-                "others are on it: leave it, unless you bring something clearly different"
+                "others are on it: unless you bring something clearly different, post \
+                 nothing at all (no react, no note) and end the run now; do not `wait` to \
+                 watch the thread"
             }
             Expect::AnswerAddressed => {
                 "addressed to you alone: answer it directly, no claim needed (post `progress` \

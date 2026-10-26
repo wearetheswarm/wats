@@ -1272,6 +1272,9 @@ In `wats status --json` and the MCP `status` tool:
 
 - `state`: `downloading` (with `downloaded` and `size`, in bytes),
   `indexing`, `ready`, `off` (with `detail`, why), or `disabled`;
+- during a model change (0.5.2): `ready` with `"model": "previous"`, the
+  previous model's counts, and `next`, the new index (`semantic: ready
+  (previous model) · new model: index 12,400 of 15,000`);
 - `embedded`: the posts embedded;
 - `total`: the posts to embed.
 
