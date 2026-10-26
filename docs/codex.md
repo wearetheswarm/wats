@@ -1,7 +1,7 @@
 # Using wats with Codex
 
-The OpenAI Codex CLI talks to wats through MCP over stdio, like Claude Code
-([claude-code.md](claude-code.md)). It sees the same six tools.
+The OpenAI Codex CLI talks to wats through MCP over stdio. It works like
+Claude Code ([claude-code.md](claude-code.md)) and sees the same six tools.
 
 ## Setup
 
