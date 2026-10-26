@@ -202,7 +202,7 @@ fn without_the_model_search_is_full_text_and_points_to_browse() -> anyhow::Resul
 }
 
 /// With the model (`WATS_SEMANTIC_MODEL_DIR`: a directory holding
-/// `bge-small-en-v1.5-f16.safetensors`).
+/// `bge-small-en-v1.5-int8.safetensors`).
 #[test]
 #[ignore = "needs the model: WATS_SEMANTIC_MODEL_DIR=<dir>"]
 fn a_paraphrase_finds_the_ask_by_meaning() -> anyhow::Result<()> {

@@ -1221,7 +1221,7 @@ In `wats status --json` and the MCP `status` tool, it is
 ### Semantic search
 
 Since 0.5.0, `search` also matches by meaning ([ADR
-0053](adr/0053-semantic-search.md)). A model (bge-small-en-v1.5, 66 MB)
+0053](adr/0053-semantic-search.md)). A model (bge-small-en-v1.5 with int8 weights, 34 MB since 0.5.1)
 embeds asks, answers and digests on this machine. Nothing leaves it,
 and nothing is sent to other nodes.
 

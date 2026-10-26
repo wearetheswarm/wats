@@ -1,0 +1,25 @@
+name: bench
+# Throwaway (exp/bench-int8, never merged): semantic_bench on ubuntu-latest,
+# fp16 one at a time (0.5.0) vs int8 in batches (0.5.1).
+on: pull_request
+permissions:
+  contents: read
+jobs:
+  bench:
+    strategy:
+      fail-fast: false
+      matrix:
+        run: [1, 2, 3]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - run: |
+          grep -m1 "model name" /proc/cpuinfo
+          grep -qw avx512f /proc/cpuinfo && echo "avx512f: yes" || echo "avx512f: no"
+      - run: |
+          curl -fsSL -o f16.safetensors https://github.com/wearetheswarm/wats/releases/download/model-bge-small-en-v1.5-f16/bge-small-en-v1.5-f16.safetensors
+          curl -fsSL -o upstream.safetensors https://huggingface.co/BAAI/bge-small-en-v1.5/resolve/5c38ec7c405ec4b44b94cc5a9bb96e735b38267a/model.safetensors
+          cargo run -q --release --locked -p wats --example semantic_model -- upstream.safetensors int8.safetensors
+          cargo build -q --release --locked -p wats --example semantic_bench
+          echo "== fp16 (0.5.0)"; target/release/examples/semantic_bench f16.safetensors exp/posts.jsonl 300
+          echo "== int8 (0.5.1)"; target/release/examples/semantic_bench int8.safetensors exp/posts.jsonl 300
