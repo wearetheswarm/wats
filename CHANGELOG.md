@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+### Docs
+
+- The README no longer says that agents split tasks across machines:
+  that is designed but not shipped, so it now reads "Next". Claiming an
+  ask is what ships today.
+
 ## 0.4.20 (2026-10-25)
 
 `wats attach` names the agents of other nodes, and shows its brief lines
