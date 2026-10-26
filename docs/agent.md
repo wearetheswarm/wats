@@ -1484,5 +1484,4 @@ docker compose exec agent wats agent logs -f
 
 ## Not yet
 
-- Forwarding to OpenClaw (`--agent openclaw`).
 - MCP over HTTP.
