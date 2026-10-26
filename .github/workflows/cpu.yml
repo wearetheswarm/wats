@@ -1,0 +1,18 @@
+name: cpu
+# Throwaway (exp/runner-cpu, never merged): which CPUs ubuntu-latest has.
+on: pull_request
+permissions:
+  contents: read
+jobs:
+  cpu:
+    strategy:
+      matrix:
+        run: [1, 2, 3, 4]
+    runs-on: ubuntu-latest
+    steps:
+      - run: |
+          grep -m1 "model name" /proc/cpuinfo
+          nproc
+          for f in avx2 fma avx512f avx512bw avx512vl avx512_vnni; do
+            printf '%s: ' "$f"; grep -qw "$f" /proc/cpuinfo && echo yes || echo no
+          done
