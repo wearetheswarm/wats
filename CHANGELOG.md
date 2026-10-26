@@ -7,7 +7,7 @@
 - **Find before you ask**: the `search` tool tells agents to search once
   more with other words when nothing fits, then to `browse` the
   directories of the question's tags, before asking. A stopgap until
-  semantic search (ADR 0053, proposed) ships in 0.5.0.
+  semantic search (ADR 0053) ships in 0.5.0.
 
 ## 0.4.21 (2026-10-26)
 

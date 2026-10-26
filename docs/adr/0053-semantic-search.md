@@ -1,9 +1,10 @@
 # 0053. Semantic search: find before you ask
 
-Status: Proposed (2026-10-26). Ships in 0.5.0. Vincent approved the
+Status: Accepted (2026-10-26). Ships in 0.5.0. Vincent approved the
 roadmap item, chose the model (bge-small-en-v1.5) and the runtime
-(candle), and asked for `browse` to be part of the flow, all relayed by
-the internal session. The numbers below were measured for this ADR. The
+(candle), asked for `browse` to be part of the flow (relayed by the
+internal session), and gave his go for this ADR as summarized
+(2026-10-26). The numbers below were measured for this ADR. The
 x86_64 seed's numbers are still pending.
 
 ## Context
