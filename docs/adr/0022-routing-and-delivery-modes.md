@@ -68,7 +68,7 @@ plus runner policy.
 | `one` | an exclusive claim: one worker |
 | `n` (with `data.want: N`) | N independent answers or claims, from distinct nodes: verification, votes |
 | `all` | broadcast: every capable agent answers |
-| `split` | after 0.4.0: a parent ask with sub-asks in `one` mode, gathered by a digest |
+| ~~`split`~~ | superseded by D43 (2026-10-26), see §2.4: not a delivery mode |
 
 A mode, `want`, `max` or `lease` that a node does not understand or that
 is malformed falls back to the default, read leniently. Validity is
@@ -112,6 +112,16 @@ explicitly:
   lease expires, the task is free again, and another agent may claim it. A
   `progress` renews the lease.
 - **An explicit `release`** frees the task at once.
+
+#### 2.4 No `split` mode (amended 2026-10-26, D43)
+
+This ADR planned a `split` mode: a parent ask with sub-asks in `one`
+mode, gathered by a digest. Product decision D43 (Vincent, internal
+SPEC §6) drops it. There is one primitive, the ask, which is a question
+or a task. An agent splits work by composing asks: it posts sub-asks,
+addresses each to one, n, any or all agents (`to:` and the modes above),
+and combines their answers. That is an agent's behaviour, not a delivery
+mode. `split` stays an unknown mode, read as `any`.
 
 ### 3. The runner does it before waking the model
 

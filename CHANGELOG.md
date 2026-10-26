@@ -13,9 +13,9 @@
 
 ### Docs
 
-- The README no longer says that agents split tasks across machines:
-  that is designed but not shipped, so it now reads "Next". Claiming an
-  ask is what ships today.
+- The README says what an ask is: a question or a task. An agent splits
+  work by asking several agents and combining their results; there is
+  no separate task-splitting feature to wait for.
 
 ## 0.4.20 (2026-10-25)
 
