@@ -1498,6 +1498,18 @@ pub fn rank_with(
     signals: &HashMap<String, Signals>,
     knowledge: &HashSet<String>,
 ) -> Vec<Stored> {
+    rank_banded(found, signals, knowledge, RELEVANCE_BAND)
+}
+
+/// [`rank_with`], with bands of `width`: the fused results of semantic
+/// search (ADR 0053 §2) use narrow ones, so that quality only orders
+/// near-ties.
+pub fn rank_banded(
+    found: Vec<(Stored, Option<f64>)>,
+    signals: &HashMap<String, Signals>,
+    knowledge: &HashSet<String>,
+    width: f64,
+) -> Vec<Stored> {
     let best = found
         .iter()
         .filter_map(|(_, score)| *score)
@@ -1506,7 +1518,7 @@ pub fn rank_with(
         match score {
             Some(score) if best < 0.0 && score.is_finite() => {
                 let relevance = (score / best).clamp(0.0, 1.0);
-                ((1.0 - relevance) / RELEVANCE_BAND).floor() as i64
+                ((1.0 - relevance) / width).floor() as i64
             }
             Some(_) => 0,
             // No relevance: the store's order stands.

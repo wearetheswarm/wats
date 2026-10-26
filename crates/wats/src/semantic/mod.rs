@@ -9,6 +9,7 @@
 
 pub mod bert;
 pub mod engine;
+pub mod find;
 pub mod rank;
 pub mod tokenizer;
 
@@ -74,6 +75,21 @@ pub fn to_blob(v: &[f32]) -> Vec<u8> {
     v.iter()
         .flat_map(|x| bert::f32_to_f16(*x).to_le_bytes())
         .collect()
+}
+
+/// The background of the gate (ADR 0053 §2): 596 paragraphs of wats's
+/// docs (`tests/data/semantic-background.jsonl`), embedded with the
+/// pinned model by `examples/semantic_background.rs`.
+pub fn background() -> &'static Index {
+    static BACKGROUND: OnceLock<Index> = OnceLock::new();
+    BACKGROUND.get_or_init(|| {
+        let bytes = include_bytes!("background.bin");
+        let mut index = Index::default();
+        for (i, blob) in bytes.as_chunks::<{ DIM * 2 }>().0.iter().enumerate() {
+            index.push(i as i64, blob);
+        }
+        index
+    })
 }
 
 /// fp16 bits to f32, through a table (search reads every vector).
@@ -165,6 +181,14 @@ mod tests {
         index.remove(&[1].into_iter().collect());
         assert_eq!(index.len(), 1);
         assert_eq!(index.scores(&unit(1)), [(2, 1.0)]);
+    }
+
+    #[test]
+    fn the_background_is_there() {
+        assert_eq!(background().len(), 596);
+        // Unit vectors.
+        let first = background().scores(&[0.0; DIM]);
+        assert_eq!(first.len(), 596);
     }
 
     #[test]

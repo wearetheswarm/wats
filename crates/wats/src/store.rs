@@ -4,7 +4,7 @@
 //! (`seq`) that gives a stable cursor for `wait` and incremental reads.
 //! The index is computed locally from the events; nothing here is shared.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -254,6 +254,14 @@ END;
 CREATE TABLE IF NOT EXISTS semantic_state (
     key   TEXT PRIMARY KEY,
     value INTEGER NOT NULL
+) WITHOUT ROWID;
+-- The find-before-ask flow, counted per day (ADR 0053 §8): local, never
+-- sent.
+CREATE TABLE IF NOT EXISTS find_counters (
+    day   INTEGER NOT NULL,
+    name  TEXT NOT NULL,
+    value INTEGER NOT NULL,
+    PRIMARY KEY (day, name)
 ) WITHOUT ROWID;
 "#;
 
@@ -2045,6 +2053,16 @@ impl Store {
         }
     }
 
+    /// The understood event stored at `seq`.
+    pub fn get_seq(&self, seq: i64) -> Result<Option<Stored>> {
+        Ok(self
+            .query(
+                "SELECT seq, json FROM events WHERE seq = ? AND opaque = 0",
+                vec![seq.into()],
+            )?
+            .pop())
+    }
+
     pub fn get(&self, id: &str) -> Result<Option<Stored>> {
         Ok(self
             .query(
@@ -2565,6 +2583,38 @@ impl Store {
         Ok(self
             .conn()
             .execute("DELETE FROM embeddings WHERE model <> ?", [model])?)
+    }
+
+    /// Adds 1 to each of these find counters, for the day of `now`.
+    pub fn count_find(&self, names: &[&str], now: u64) -> Result<()> {
+        if names.is_empty() {
+            return Ok(());
+        }
+        let day = (now / 86_400) as i64;
+        let conn = self.conn();
+        for name in names {
+            conn.execute(
+                "INSERT INTO find_counters (day, name, value) VALUES (?1, ?2, 1)
+                 ON CONFLICT (day, name) DO UPDATE SET value = value + 1",
+                params![day, name],
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Each find counter's total, and the first day counted (Unix days).
+    pub fn find_counts(&self) -> Result<(BTreeMap<String, u64>, Option<i64>)> {
+        let conn = self.conn();
+        let mut stmt =
+            conn.prepare_cached("SELECT name, sum(value) FROM find_counters GROUP BY name")?;
+        let totals = stmt
+            .query_map([], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?.max(0) as u64))
+            })?
+            .collect::<rusqlite::Result<BTreeMap<_, _>>>()?;
+        let first: Option<i64> =
+            conn.query_row("SELECT min(day) FROM find_counters", [], |r| r.get(0))?;
+        Ok((totals, first))
     }
 
     /// A value of semantic search's state (`top`, `below`, `done`).

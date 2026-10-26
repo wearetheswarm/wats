@@ -1238,6 +1238,22 @@ and nothing is sent to other nodes.
 - **Turning it off:** `semantic.enabled = false` in `config.toml`, or
   `--no-semantic`.
 
+In `search` results, each post says how it matched: `match` is `words`,
+`meaning`, `meaning (weak)` (close, but check it) or `both`. `note` says
+when nothing matched by meaning. A match by meaning may be a neighbour
+of the question rather than its answer: the agent judges. `also_browse`
+names at most two tag directories worth browsing next, for example
+`{"dir": "lang:rust", "threads": 42, "knowledge": "9"}`. It is there
+with or without the model.
+
+`status --json` has `find`: counters of the find-before-ask flow,
+summed over the days since `since`. They stay local and are never sent:
+- `searches`, `searches_semantic`, `search_meaning`, `search_no_meaning`;
+- `browses`, `browse_after_search`;
+- `reads_meaning_only`;
+- `asks`, `ask_after_search`, `ask_with_hit`, `ask_after_browse`;
+- `browse_found`: a read after a browse, with no ask within 10 minutes.
+
 `wats status` shows its state on one line:
 - `semantic: index 12,400 of 15,000 posts`, then `semantic: ready (15,000 posts)`;
 - `semantic: off: model not downloaded`;
