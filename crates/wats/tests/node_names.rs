@@ -500,6 +500,7 @@ fn agent_config(data_dir: &Path) -> wats::agent::AgentConfig {
     wats::agent::AgentConfig {
         runtime: "claude".into(),
         profile: "helper".into(),
+        public_name: Default::default(),
         user: "alice".into(),
         about: "I answer questions about bees.".into(),
         caps: vec!["bees".into()],

@@ -116,6 +116,116 @@ pub fn os_user_profile() -> String {
     if name.is_empty() { "user".into() } else { name }
 }
 
+/// What a public name must not contain (ADR 0055 §7): the OS user name,
+/// the host name and its first label, and the home directory's name,
+/// lowercased, letters and digits only. Each with what it is, for the
+/// message.
+pub fn private_words() -> Vec<(&'static str, String)> {
+    let alnum = |s: &str| -> String {
+        s.chars()
+            .filter(|c| c.is_alphanumeric())
+            .flat_map(char::to_lowercase)
+            .collect()
+    };
+    let mut words = Vec::new();
+    for var in ["USER", "USERNAME", "LOGNAME"] {
+        if let Ok(user) = std::env::var(var) {
+            words.push(("the OS user name", alnum(&user)));
+        }
+    }
+    let host = wats_sys::hostname().or_else(|| std::env::var("COMPUTERNAME").ok());
+    if let Some(host) = host {
+        words.push(("the host name", alnum(&host)));
+        if let Some(first) = host.split('.').next() {
+            words.push(("the host name", alnum(first)));
+        }
+    }
+    if let Some(home) = std::env::home_dir()
+        && let Some(name) = home.file_name().and_then(|n| n.to_str())
+    {
+        words.push(("the home directory's name", alnum(name)));
+    }
+    words.retain(|(_, w)| w.len() >= 3 && w != "localhost" && w != "root");
+    words.dedup();
+    words
+}
+
+/// What in `words` ([`private_words`]) the public name `name` contains,
+/// if anything. A word of 5 characters or more counts anywhere in the
+/// name (`vincent-carluer-claude` holds `vincentcarluer`); a shorter one
+/// only as a whole part between `-` or `_`, so that a user `dev` does not
+/// forbid `devops`.
+pub fn leak<'a>(name: &str, words: &'a [(&'static str, String)]) -> Option<&'a str> {
+    let lower = name.to_lowercase();
+    let squeezed: String = lower.chars().filter(|c| c.is_alphanumeric()).collect();
+    let parts: Vec<&str> = lower.split(['-', '_', '.', ' ']).collect();
+    words
+        .iter()
+        .find(|(_, w)| {
+            if w.len() >= 5 {
+                squeezed.contains(w.as_str())
+            } else {
+                parts.contains(&w.as_str())
+            }
+        })
+        .map(|(what, _)| *what)
+}
+
+/// Refuse a name a user chose for others to see (an agent's table name,
+/// its `display_name`) when it holds the OS user, the host name or the
+/// home directory's name ([`leak`]).
+pub fn check_public(name: &str, what: &str) -> Result<(), String> {
+    match leak(name, &private_words()) {
+        Some(word) => Err(format!(
+            "{what} {name:?} contains {word}: others see it (ADR 0055), choose another"
+        )),
+        None => Ok(()),
+    }
+}
+
+/// An agent's name for others (`announce data.name`, ADR 0055 §9.1),
+/// apart from the profile its key is derived from: chosen, or generated
+/// from its public key.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PublicName {
+    /// `display_name`, or an explicit profile that is not the default
+    /// form, checked by [`leak`].
+    pub chosen: Option<String>,
+    /// The generated name's first part: the agent's name (empty: the
+    /// runtime's).
+    pub prefix: String,
+}
+
+impl PublicName {
+    /// The name: the chosen one, else `<prefix>-<adjective>-<creature>`
+    /// from `author` (its public id), never from the machine.
+    pub fn resolve(&self, runtime: &str, author: &str) -> String {
+        if let Some(chosen) = &self.chosen {
+            return chosen.clone();
+        }
+        let prefix = if self.prefix.is_empty() {
+            runtime
+        } else {
+            &self.prefix
+        };
+        generated(prefix, author)
+    }
+}
+
+/// `<prefix>-<adjective>-<creature>`, the two words picked by BLAKE3 of
+/// the author's public id: stable, nothing to store, and nothing of the
+/// machine in it.
+pub fn generated(prefix: &str, author: &str) -> String {
+    let hash = blake3::derive_key("wats agent name v1", author.as_bytes());
+    let pick = |bytes: &[u8], len: usize| {
+        usize::try_from(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])).unwrap_or(0)
+            % len
+    };
+    let adjective = crate::naming::ADJECTIVES[pick(&hash[0..4], crate::naming::ADJECTIVES.len())];
+    let creature = crate::naming::CREATURES[pick(&hash[4..8], crate::naming::CREATURES.len())];
+    format!("{prefix}-{adjective}-{creature}")
+}
+
 /// The profile of the old single agent: `<user>-agent`.
 pub fn legacy_profile(user: &str) -> String {
     format!("{user}-agent")
@@ -225,6 +335,52 @@ impl Member {
             .workdir
             .clone()
             .unwrap_or_else(|| self.work_dir.join("workspace"))
+    }
+
+    /// Its name for others ([`PublicName`]), and why a name its config
+    /// gives is not used (it holds the OS user, the host name or the home
+    /// directory's name). `user` is the OS user as a profile name.
+    ///
+    /// Chosen: `display_name`, else a `profile` that is not one of the
+    /// defaults (`<user>-<name>`, `<user>-agent`, `<user>-<name>-<node>`).
+    pub fn public_name(&self, user: &str) -> (PublicName, Option<String>) {
+        self.public_name_with(user, &private_words())
+    }
+
+    /// [`Member::public_name`] against `words`.
+    fn public_name_with(
+        &self,
+        user: &str,
+        words: &[(&'static str, String)],
+    ) -> (PublicName, Option<String>) {
+        let mut note = None;
+        let defaultish = |p: &str| {
+            p == default_profile(user, &self.name)
+                || p == legacy_profile(user)
+                || p.starts_with(&format!("{user}-{}-", self.name))
+        };
+        let candidate = match (&self.settings.display_name, &self.settings.profile) {
+            (Some(d), _) if !d.trim().is_empty() => Some(("display_name", d.trim().to_string())),
+            (_, Some(p)) if !defaultish(p) => Some(("profile", p.clone())),
+            _ => None,
+        };
+        let chosen = candidate.and_then(|(key, name)| match leak(&name, words) {
+            Some(word) => {
+                note = Some(format!(
+                    "agent {}: its {key} {name:?} contains {word}, so others see a generated \
+                     name instead (set agents.{}.display_name to choose one)",
+                    self.name, self.name
+                ));
+                None
+            }
+            None => Some(name),
+        });
+        let prefix = if leak(&self.name, words).is_some() {
+            String::new()
+        } else {
+            self.name.clone()
+        };
+        (PublicName { chosen, prefix }, note)
     }
 
     /// `claude as alice-agent`.
@@ -393,6 +549,79 @@ pub fn check_distinct(members: &[Member]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn words() -> Vec<(&'static str, String)> {
+        vec![
+            ("the OS user name", "vincentcarluer".into()),
+            ("the host name", "vincentsmacbookpro".into()),
+            ("the OS user name", "dev".into()),
+        ]
+    }
+
+    fn member(name: &str, profile: Option<&str>, display: Option<&str>) -> Member {
+        let settings = AgentSettings {
+            profile: profile.map(str::to_string),
+            display_name: display.map(str::to_string),
+            ..AgentSettings::default()
+        };
+        Member::new(name, Some("claude".into()), &settings, false, Path::new("/d"), "vincentcarluer")
+    }
+
+    /// ADR 0055 §7: long words count anywhere, short ones as a whole part.
+    #[test]
+    fn a_public_name_holding_the_user_or_host_leaks() {
+        let w = words();
+        assert_eq!(leak("vincent-carluer-claude", &w), Some("the OS user name"));
+        assert_eq!(leak("Vincents-MacBook-Pro-bot", &w), Some("the host name"));
+        assert_eq!(leak("dev-helper", &w), Some("the OS user name"));
+        assert_eq!(leak("devops", &w), None);
+        assert_eq!(leak("seed-postgres", &w), None);
+    }
+
+    /// ADR 0055 §9.1: the generated name comes from the public key only,
+    /// is stable, and is a valid lowercase name.
+    #[test]
+    fn a_generated_name_is_stable_and_plain() {
+        let a = generated("claude", "abc");
+        assert_eq!(a, generated("claude", "abc"));
+        assert_ne!(a, generated("claude", "abd").to_string() + "x");
+        let mut parts = a.splitn(3, '-');
+        assert_eq!(parts.next(), Some("claude"));
+        assert!(crate::naming::ADJECTIVES.contains(&parts.next().unwrap()));
+        assert!(crate::naming::CREATURES.contains(&parts.next().unwrap()));
+        assert!(crate::node::is_valid_profile(&a), "{a}");
+    }
+
+    /// ADR 0055 §9.1: the default profiles are not a chosen name; an
+    /// explicit one is, unless it leaks; display_name wins.
+    #[test]
+    fn the_public_name_leaves_the_os_user_out() {
+        let w = words();
+        let (name, note) = member("claude", None, None).public_name_with("vincentcarluer", &w);
+        assert_eq!(name, PublicName { chosen: None, prefix: "claude".into() });
+        assert!(note.is_none());
+        for default in ["vincentcarluer-claude", "vincentcarluer-agent", "vincentcarluer-claude-giddy_ant"] {
+            let (name, note) =
+                member("claude", Some(default), None).public_name_with("vincentcarluer", &w);
+            assert_eq!(name.chosen, None, "{default}");
+            assert!(note.is_none(), "{default}: the default form is no choice");
+        }
+        let (name, _) =
+            member("seed", Some("seed-postgres"), None).public_name_with("vincentcarluer", &w);
+        assert_eq!(name.chosen.as_deref(), Some("seed-postgres"));
+        let (name, note) =
+            member("rev", Some("vincent-carluer-rev"), None).public_name_with("vincentcarluer", &w);
+        assert_eq!(name.chosen, None);
+        assert!(note.unwrap().contains("the OS user name"));
+        let (name, _) = member("claude", Some("vincentcarluer-claude"), Some("helper-one"))
+            .public_name_with("vincentcarluer", &w);
+        assert_eq!(name.chosen.as_deref(), Some("helper-one"));
+        assert_eq!(name.resolve("claude", "k"), "helper-one");
+        // A table name that leaks gives the runtime as the prefix.
+        let (name, _) = member("dev", None, None).public_name_with("vincentcarluer", &w);
+        assert_eq!(name.prefix, "");
+        assert!(name.resolve("claude", "k").starts_with("claude-"));
+    }
 
     /// ADR 0044: a new agent on a second node of the machine is named
     /// after the node; on the default node, once it ran, or with its own

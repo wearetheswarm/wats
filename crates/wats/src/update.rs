@@ -733,6 +733,7 @@ pub const KEYS_SINCE: &[(&str, Version)] = &[
     ("gossip.ping", Version(0, 4, 11)),
     ("semantic.enabled", Version(0, 5, 0)),
     ("semantic.model_dir", Version(0, 5, 0)),
+    ("agent.display_name", Version(0, 5, 3)),
 ];
 
 /// The keys set in `data_dir`'s config.toml that wats `version` does not
