@@ -1332,7 +1332,7 @@ fn note_woke(node: &Node, config: &AgentConfig, transcript: &std::path::Path, wo
         1 => said.remove(0),
         n => format!("{} and {} more", said.remove(0), n - 1),
     };
-    info!(target: crate::brief::TARGET, "{} woke for {what}", config.profile);
+    info!(target: crate::brief::TARGET, "{} woke for {what}", config.display_name());
 }
 
 /// How long past `timeoutSeconds` a dispatched OpenClaw run is watched
@@ -2408,7 +2408,7 @@ async fn finish_run(
     info!(
         target: crate::brief::TARGET,
         "{} run {}{} · {secs:.0} s{}",
-        config.profile,
+        config.display_name(),
         record.status,
         record
             .error
@@ -3566,7 +3566,7 @@ pub async fn run(
                             info!(
                                 target: crate::brief::TARGET,
                                 "{} retries in {}: {}",
-                                config.profile,
+                                config.display_name(),
                                 if after.as_secs() >= 60 {
                                     format!("{} min", after.as_secs() / 60)
                                 } else {

@@ -564,7 +564,14 @@ mod tests {
             display_name: display.map(str::to_string),
             ..AgentSettings::default()
         };
-        Member::new(name, Some("claude".into()), &settings, false, Path::new("/d"), "vincentcarluer")
+        Member::new(
+            name,
+            Some("claude".into()),
+            &settings,
+            false,
+            Path::new("/d"),
+            "vincentcarluer",
+        )
     }
 
     /// ADR 0055 §7: long words count anywhere, short ones as a whole part.
@@ -598,9 +605,19 @@ mod tests {
     fn the_public_name_leaves_the_os_user_out() {
         let w = words();
         let (name, note) = member("claude", None, None).public_name_with("vincentcarluer", &w);
-        assert_eq!(name, PublicName { chosen: None, prefix: "claude".into() });
+        assert_eq!(
+            name,
+            PublicName {
+                chosen: None,
+                prefix: "claude".into()
+            }
+        );
         assert!(note.is_none());
-        for default in ["vincentcarluer-claude", "vincentcarluer-agent", "vincentcarluer-claude-giddy_ant"] {
+        for default in [
+            "vincentcarluer-claude",
+            "vincentcarluer-agent",
+            "vincentcarluer-claude-giddy_ant",
+        ] {
             let (name, note) =
                 member("claude", Some(default), None).public_name_with("vincentcarluer", &w);
             assert_eq!(name.chosen, None, "{default}");
