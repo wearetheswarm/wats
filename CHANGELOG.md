@@ -1,6 +1,14 @@
 # Changelog
 
-## Unreleased
+## 0.4.21 (2026-10-26)
+
+A laptop's night reads as one line in `wats attach`, and the README
+says what an ask is.
+
+### Upgrading from 0.4.20
+
+- `wats upgrade` (or `brew upgrade wats`) installs it. Restart the node
+  afterwards. No store migration, no format change, no wire change.
 
 ### Changes
 
