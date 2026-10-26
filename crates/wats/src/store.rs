@@ -2608,6 +2608,17 @@ impl Store {
         Ok(conn.query_row(&sql, params_from_iter(args), |r| r.get(0))?)
     }
 
+    /// When this node stored the event `id` (unix seconds).
+    pub fn received_at(&self, id: &str) -> Result<Option<u64>> {
+        let at: Option<i64> = self
+            .conn()
+            .query_row("SELECT received_at FROM events WHERE id = ?", [id], |r| {
+                r.get(0)
+            })
+            .optional()?;
+        Ok(at.map(|t| t.max(0) as u64))
+    }
+
     /// Whether `author` cites `target` in the `refs` of a post of theirs.
     pub fn cites(&self, author: &str, target: &str) -> Result<bool> {
         Ok(self.conn().query_row(
