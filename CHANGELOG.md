@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+### Changes
+
+- **The brief view shows the evidence that came with an answer:**
+  `answer from seed-postgres to your ask: … · 3 files attached
+  (test_run.txt, main.rs, …)`.
+
 ## 0.5.1 (2026-10-26)
 
 A smaller semantic search model, one agent per question in its field,

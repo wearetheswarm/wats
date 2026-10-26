@@ -59,6 +59,34 @@ pub fn name(node: &Node, author: &str) -> String {
         .unwrap_or_else(|| author.chars().take(8).collect())
 }
 
+/// " · 3 files attached (test_run.txt, main.rs, …)" for a post with files:
+/// the evidence that comes with an answer. Empty without.
+pub fn files(event: &Event) -> String {
+    let names: Vec<&str> = event.blobs.iter().map(|b| b.name.as_str()).collect();
+    files_line(&names)
+}
+
+fn files_line(all: &[&str]) -> String {
+    let n = all.len();
+    if n == 0 {
+        return String::new();
+    }
+    let names: Vec<String> = all
+        .iter()
+        .take(3)
+        .map(|name| {
+            let name: String = cut(name, 40).chars().filter(|c| !c.is_control()).collect();
+            crate::unicode::escape_format(&name).into_owned()
+        })
+        .collect();
+    let more = if n > 3 { ", …" } else { "" };
+    format!(
+        " · {n} {} attached ({}{more})",
+        if n == 1 { "file" } else { "files" },
+        names.join(", ")
+    )
+}
+
 /// A post's title for one line: its title, else the start of its text.
 pub fn title(event: &Event) -> String {
     let title = event
@@ -125,8 +153,9 @@ pub fn line_for(node: &Node, event: &Event) -> Option<String> {
         Kind::Answer if parent_local && !local => {
             let what = parent.as_ref().map_or("post", |p| p.kind.as_str());
             Some(format!(
-                "answer from {who} to your {what}: {}",
-                title(event)
+                "answer from {who} to your {what}: {}{}",
+                title(event),
+                files(event)
             ))
         }
         Kind::Claim if local => Some(format!("{who} claimed: {}", ask_title())),
@@ -299,6 +328,16 @@ pub fn render(line: &str, paint: Paint) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn files_say_what_came_with_an_answer() {
+        assert_eq!(files_line(&[]), "");
+        assert_eq!(files_line(&["main.rs"]), " · 1 file attached (main.rs)");
+        assert_eq!(
+            files_line(&["a.txt", "b.rs", "c.log", "d.png"]),
+            " · 4 files attached (a.txt, b.rs, c.log, …)"
+        );
+    }
 
     #[test]
     fn brief_lines_and_warnings_only() {
