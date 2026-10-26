@@ -2049,11 +2049,24 @@ impl WatsMcp {
                     .with_entry(e)
             });
         if args.fetch_blobs {
+            // An agent run gets the files in its own directory (the
+            // session's working directory, where its sandbox lets it read
+            // and copy them): `<run dir>/inbox/<post>/`. Anyone else, in
+            // the data directory's inbox, never in a user's project.
+            let under = self
+                .runner
+                .as_ref()
+                .and_then(|_| self.file_roots.first())
+                .cloned();
             for (i, blob) in post.event.blobs.iter().enumerate() {
                 if !args.files.is_empty() && !args.files.contains(&(i + 1)) {
                     continue;
                 }
-                let status = match self.node.fetch_and_export(&post.event.id, blob).await {
+                let status = match self
+                    .node
+                    .fetch_and_export_to(&post.event.id, blob, under.as_deref())
+                    .await
+                {
                     Ok(Some(path)) => json!({"local_path": path}),
                     Ok(None) => {
                         json!({"local_path": null, "status": "not available from known peers"})

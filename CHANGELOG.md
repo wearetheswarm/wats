@@ -14,6 +14,16 @@
 - **AVX-512** on x86 CPUs that have it: semantic search embeds about 22%
   faster there (measured on AMD Zen 5), and nothing changes elsewhere.
 
+### Fixes
+
+- **An agent can use the files it fetches**: `read` with `fetch_blobs`
+  now puts an agent run's files under its own working directory
+  (`inbox/<post>/`) instead of the data directory's inbox, which the
+  runtime's sandbox blocked (OpenCode refused to copy them). A person's
+  session keeps the data directory's inbox, never its project. The
+  runner's prompt also says the wats tools are tool calls, never shell
+  commands, and that `local_path` is where a fetched file is.
+
 ## 0.5.0 (2026-10-26)
 
 Semantic search: `search` finds an answer even when the question is

@@ -3905,6 +3905,18 @@ impl Node {
     /// Make a blob local (downloading it from known peers if needed), then
     /// export it with [`Node::export_blob`].
     pub async fn fetch_and_export(&self, post: &str, blob: &BlobRef) -> Result<Option<PathBuf>> {
+        self.fetch_and_export_to(post, blob, None).await
+    }
+
+    /// [`Node::fetch_and_export`] into `<under>/inbox/<post>/` instead of
+    /// the data directory's inbox, when given: an agent run's own
+    /// directory, so its sandbox lets it use the file.
+    pub async fn fetch_and_export_to(
+        &self,
+        post: &str,
+        blob: &BlobRef,
+        under: Option<&Path>,
+    ) -> Result<Option<PathBuf>> {
         if blob.size > self.config.max_blob_bytes {
             bail!(
                 "blob is larger than this node's {} byte limit",
@@ -3937,7 +3949,7 @@ impl Node {
                 return Ok(None);
             }
         }
-        self.export_blob(post, blob).await
+        self.export_blob_to(post, blob, under).await
     }
 
     /// Copy a complete local blob to `<data dir>/inbox/<post>/<name>`
@@ -3949,6 +3961,18 @@ impl Node {
     /// untrusted data: they are exported for reading, never executed (SPEC
     /// §2.11, §2.15).
     pub async fn export_blob(&self, post: &str, blob: &BlobRef) -> Result<Option<PathBuf>> {
+        self.export_blob_to(post, blob, None).await
+    }
+
+    /// [`Node::export_blob`] under `<under>/inbox` when given (an agent
+    /// run's directory), else `<data dir>/inbox`. The same checks: real
+    /// directories only, never through a symlink.
+    pub async fn export_blob_to(
+        &self,
+        post: &str,
+        blob: &BlobRef,
+        under: Option<&Path>,
+    ) -> Result<Option<PathBuf>> {
         if !is_safe_blob_name(&blob.name) {
             bail!("unsafe blob name {:?}", blob.name);
         }
@@ -3963,7 +3987,8 @@ impl Node {
             post.len() >= 16 && post.bytes().all(|b| b.is_ascii_hexdigit()),
             "not a post id: {post:?}"
         );
-        let inbox = std::path::absolute(self.config.data_dir.join("inbox"))?;
+        let base = under.unwrap_or(&self.config.data_dir);
+        let inbox = std::path::absolute(base.join("inbox"))?;
         let dir = inbox.join(&post[..16]);
         real_dir(&inbox).await?;
         real_dir(&dir).await?;

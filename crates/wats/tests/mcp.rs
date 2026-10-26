@@ -2554,6 +2554,66 @@ fn a_duplicate_folds_under_its_thread() -> anyhow::Result<()> {
     })
 }
 
+/// An agent run's `read` with `fetch_blobs` puts the files in its own
+/// directory (`<run dir>/inbox/<post>/`), where its sandbox lets it use
+/// them; a person's session still gets the data directory's inbox.
+#[test]
+fn an_agent_run_gets_files_in_its_own_directory() -> anyhow::Result<()> {
+    run(async move {
+        let dir = tempfile::tempdir()?;
+        let node = loopback_node(&dir.path().join("node"), None).await?;
+        let shared = dir.path().join("shared");
+        let run_dir = dir.path().join("workspace");
+        std::fs::create_dir_all(&shared)?;
+        std::fs::create_dir_all(&run_dir)?;
+        std::fs::write(shared.join("main.rs"), b"fn main() {}")?;
+        let human = client_for(WatsMcp::new(Arc::clone(&node), vec![shared.clone()])).await?;
+        let posted = structured(
+            &call(
+                &human,
+                "post",
+                json!({"title": "Review main.rs", "text": "Please review.", "kind": "ask",
+                       "blobs": [{"path": shared.join("main.rs").to_str().unwrap()}]}),
+            )
+            .await,
+        );
+        let id = posted["id"].as_str().unwrap().to_string();
+        let run = wats::node::RunnerRun {
+            id: "20261026T000000Z-events".into(),
+            events: vec![id.clone()],
+            ..Default::default()
+        };
+        let agent = client_for(
+            WatsMcp::new(Arc::clone(&node), vec![run_dir.clone()])
+                .with_profile("agent")?
+                .runner_session(run),
+        )
+        .await?;
+        let read = structured(&call(&agent, "read", json!({"id": id, "fetch_blobs": true})).await);
+        let path = std::path::PathBuf::from(
+            read["post"]["blobs"][0]["local_path"]
+                .as_str()
+                .expect("exported"),
+        );
+        assert!(
+            path.starts_with(run_dir.join("inbox").join(&id[..16])),
+            "{}",
+            path.display()
+        );
+        assert_eq!(std::fs::read(&path)?, b"fn main() {}");
+        // A person's session: the data directory's inbox, never its project.
+        let read = structured(&call(&human, "read", json!({"id": id, "fetch_blobs": true})).await);
+        let path =
+            std::path::PathBuf::from(read["post"]["blobs"][0]["local_path"].as_str().unwrap());
+        assert!(
+            path.starts_with(dir.path().join("node").join("inbox")),
+            "{}",
+            path.display()
+        );
+        Ok(())
+    })
+}
+
 /// ADR 0049: an answer about a current state that is not marked volatile
 /// gets a note; a volatile one shows its as-of date in `read`.
 #[test]
