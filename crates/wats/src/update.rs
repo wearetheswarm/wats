@@ -256,6 +256,19 @@ pub fn archive_name(version: Version, target: &str) -> String {
     format!("wats-{version}-{target}.tar.gz")
 }
 
+/// The HTTPS client of downloads from our releases (`wats upgrade`, the
+/// update check, semantic search's model).
+pub fn https_client() -> Result<reqwest::Client> {
+    // reqwest uses the process-wide rustls provider: ring, like iroh.
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    reqwest::Client::builder()
+        .user_agent(concat!("wats/", env!("CARGO_PKG_VERSION")))
+        .connect_timeout(Duration::from_secs(15))
+        .timeout(Duration::from_secs(600))
+        .build()
+        .context("set up HTTPS")
+}
+
 // ---------------------------------------------------------------------
 // Verification
 
@@ -718,6 +731,8 @@ pub const KEYS_SINCE: &[(&str, Version)] = &[
     ("sync.anti_entropy", Version(0, 4, 11)),
     ("gossip.active_view", Version(0, 4, 11)),
     ("gossip.ping", Version(0, 4, 11)),
+    ("semantic.enabled", Version(0, 5, 0)),
+    ("semantic.model_dir", Version(0, 5, 0)),
 ];
 
 /// The keys set in `data_dir`'s config.toml that wats `version` does not
@@ -947,14 +962,7 @@ impl Source {
     }
 
     fn client() -> Result<reqwest::Client> {
-        // reqwest uses the process-wide rustls provider: ring, like iroh.
-        let _ = rustls::crypto::ring::default_provider().install_default();
-        reqwest::Client::builder()
-            .user_agent(concat!("wats/", env!("CARGO_PKG_VERSION")))
-            .connect_timeout(Duration::from_secs(15))
-            .timeout(Duration::from_secs(600))
-            .build()
-            .context("set up HTTPS")
+        https_client()
     }
 
     async fn get(&self, url: &str, accept: &str, limit: usize) -> Result<Vec<u8>> {

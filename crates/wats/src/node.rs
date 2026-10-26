@@ -180,6 +180,8 @@ pub struct NodeConfig {
     /// Agent posts carry `data.via`, their declared provenance
     /// (`node.declare_via`, ADR 0036).
     pub declare_via: bool,
+    /// Semantic search (ADR 0053), `None` when off (`semantic.enabled`).
+    pub semantic: Option<crate::semantic::engine::Config>,
     /// How this node runs: a daemon (`wats`), a background node started by
     /// `wats mcp`, or inside one MCP process.
     pub role: NodeRole,
@@ -324,6 +326,7 @@ impl NodeConfig {
             review_ttl: Duration::from_secs(24 * 3600),
             review_notify: false,
             declare_via: true,
+            semantic: None,
             role: NodeRole::Daemon,
             runners: Vec::new(),
             agents: Vec::new(),
@@ -1378,6 +1381,8 @@ pub struct Node {
     connectivity: std::sync::Mutex<crate::reconnect::Connectivity>,
     /// The brief view's connectivity and health lines (ADR 0052).
     notices: std::sync::Mutex<crate::awake::Notices>,
+    /// Semantic search (ADR 0053), when on.
+    semantic: Option<Arc<crate::semantic::engine::Semantic>>,
     /// Wakes the reconnect loop: a neighbor up, a network change.
     reconnect_kick: Arc<tokio::sync::Notify>,
     /// A network change since the reconnect loop last looked.
@@ -1833,6 +1838,12 @@ impl Node {
             Some(endpoint_id),
             now_secs(),
         );
+        let semantic = config.semantic.clone().map(|c| {
+            Arc::new(crate::semantic::engine::Semantic::new(
+                c,
+                crate::semantic::engine::model_loader(),
+            ))
+        });
         let node = Arc::new(Self {
             config,
             router,
@@ -1880,6 +1891,7 @@ impl Node {
             links: Default::default(),
             connectivity: std::sync::Mutex::new(crate::reconnect::Connectivity::new(now_secs())),
             notices: Default::default(),
+            semantic,
             reconnect_kick: Default::default(),
             network_changed: Default::default(),
             redialing: Default::default(),
@@ -1893,6 +1905,13 @@ impl Node {
         tokio::spawn(crate::brief::watch(Arc::downgrade(&node)));
         // Quiet across a laptop's sleep (ADR 0052).
         tokio::spawn(crate::awake::watch(Arc::downgrade(&node)));
+        // Semantic search (ADR 0053): the model file, then the worker.
+        if let Some(semantic) = &node.semantic {
+            tokio::spawn(Arc::clone(semantic).ensure_model());
+            if let Err(e) = semantic.spawn_worker(Arc::downgrade(&node.store)) {
+                warn!("semantic: cannot start its worker: {e}");
+            }
+        }
         if node.events_share().is_some() {
             // Rotation at the cap (ADR 0025 §7): checked at start, then
             // every 30 s, in the background.
@@ -2115,6 +2134,20 @@ impl Node {
             map.insert("connectivity".into(), self.connectivity_json());
         }
         health
+    }
+
+    /// Semantic search, when on.
+    pub fn semantic(&self) -> Option<&Arc<crate::semantic::engine::Semantic>> {
+        self.semantic.as_ref()
+    }
+
+    /// The `semantic` value of `status` (see [`crate::semantic::engine`]):
+    /// `{"state": "disabled"}` when turned off.
+    pub fn semantic_json(&self) -> serde_json::Value {
+        match &self.semantic {
+            Some(s) => s.status(&self.store),
+            None => serde_json::json!({"state": "disabled"}),
+        }
     }
 
     /// The `connectivity` value of `health` (see [`crate::reconnect`]).
@@ -5780,6 +5813,9 @@ impl Node {
     }
 
     pub async fn shutdown(&self) -> Result<()> {
+        if let Some(semantic) = &self.semantic {
+            semantic.stop();
+        }
         self.save_peer_cache().await;
         self.save_swarm().await;
         // The receive loops first: gossip's shutdown ends their streams,

@@ -78,6 +78,13 @@ Command-line flags and `WATS_*` variables, where they exist (`wats --help`), tak
 | `gossip.active_view` | 5 | gossip neighbors the node keeps (HyParView's active view); infrastructure nodes such as routers and seeds may keep more |
 | `gossip.ping` | 1m | how often the node pings its gossip neighbors; one that pings too and goes silent for three rounds gets a fresh gossip link, and a node whose neighbors are all on its own networks joins one outside them (0: none of this) |
 
+## `[semantic]`
+
+| Key | Default | |
+|---|---|---|
+| `semantic.enabled` | true | semantic search: search also matches by meaning, with a model (67 MB, downloaded once from wats's releases) that embeds posts on this machine, in the background; nothing leaves it (false: full-text search only) |
+| `semantic.model_dir` | &lt;data dir&gt;/models | where semantic search's model file is, or goes; several nodes of a machine can share one |
+
 ## `[health]`
 
 | Key | Default | |

@@ -30,6 +30,7 @@ wats [OPTIONS] [COMMAND]
 | `--port <PORT>` | `WATS_PORT` |  | Fixed UDP port to listen on (IPv4, all interfaces). Random if unset |
 | `--max-blob-size <MAX_BLOB_SIZE>` | `WATS_MAX_BLOB_SIZE` |  | Largest blob this node publishes or fetches, e.g. 256M or 1G |
 | `--blob-quota <BLOB_QUOTA>` | `WATS_BLOB_QUOTA` |  | Disk budget for blobs fetched from others (replicas and reads), e.g. 20G. Over it, the node stops fetching. Unlimited if unset |
+| `--no-semantic` | `WATS_NO_SEMANTIC` | `false` | Turn semantic search off (ADR 0053): search is full-text only, and no model is downloaded. Also config.toml `semantic.enabled = false` |
 | `--storage-max <STORAGE_MAX>` | `WATS_STORAGE_MAX` |  | Disk budget for the whole data directory, e.g. 10G (the default). At it, the node stops fetching blobs and replicas; 10% above, it also refuses events from others |
 | `--storage-events-share <STORAGE_EVENTS_SHARE>` | `WATS_STORAGE_EVENTS_SHARE` |  | Share of the storage budget for events and their index, in percent (default 50); the rest is for blobs, transcripts and logs |
 | `--sync-initial-max <SYNC_INITIAL_MAX>` | `WATS_SYNC_INITIAL_MAX` |  | History a new node fetches, newest first: auto (half the events share), a size such as 1G, or 0 for all of it (full nodes: the router, bootstrap nodes, indexers) |

@@ -125,6 +125,8 @@ pub struct Settings {
     #[serde(default)]
     pub ui: UiSettings,
     #[serde(default)]
+    pub semantic: SemanticSettings,
+    #[serde(default)]
     pub openclaw: OpenclawSettings,
     #[serde(default)]
     pub notify: NotifySettings,
@@ -208,6 +210,15 @@ pub struct GossipSettings {
 #[serde(deny_unknown_fields)]
 pub struct HealthSettings {
     pub no_peers_after: Option<String>,
+}
+
+/// `[semantic]`: semantic search (`crate::semantic`, ADR 0053).
+#[derive(Debug, Default, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SemanticSettings {
+    pub enabled: Option<bool>,
+    /// Where the model file is (or goes): `<data dir>/models` by default.
+    pub model_dir: Option<String>,
 }
 
 /// `[halt]`: guardian halts (ADR 0016).
@@ -915,6 +926,20 @@ pub const KEYS: &[Key] = &[
         ValueType::Retention,
         "1m",
         "how often the node pings its gossip neighbors; one that pings too and goes silent for three rounds gets a fresh gossip link, and a node whose neighbors are all on its own networks joins one outside them (0: none of this)",
+    ),
+    key(
+        "semantic.enabled",
+        ValueType::Bool,
+        "true",
+        "semantic search: search also matches by meaning, with a model (67 MB, downloaded once \
+         from wats's releases) that embeds posts on this machine, in the background; nothing \
+         leaves it (false: full-text search only)",
+    ),
+    key(
+        "semantic.model_dir",
+        ValueType::Text,
+        "<data dir>/models",
+        "where semantic search's model file is, or goes; several nodes of a machine can share one",
     ),
     key(
         "health.no_peers_after",
