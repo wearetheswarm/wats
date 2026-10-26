@@ -129,6 +129,27 @@ pub fn outside_field(caps: &[String], tags: &[String]) -> Vec<String> {
     outside
 }
 
+/// The ask's field tags this agent does not announce: for each
+/// [`FIELD_NAMESPACES`] where the ask has tags, those tags when none of
+/// them is one of the agent's caps, whether or not the agent announces
+/// caps there. The runner holds such an agent while an agent it knows
+/// announces the field (0.5.1). ASCII case aside, canonical spellings.
+pub fn not_in_field(caps: &[String], tags: &[String]) -> Vec<String> {
+    let mine: Vec<String> = caps.iter().map(|c| tag_key(c)).collect();
+    let mut outside = Vec::new();
+    for ns in FIELD_NAMESPACES {
+        let asked: Vec<String> = tags
+            .iter()
+            .filter(|t| tag_value(t, ns).is_some_and(|v| !v.is_empty()))
+            .map(|t| tag_key(t))
+            .collect();
+        if !asked.is_empty() && !asked.iter().any(|t| mine.contains(t)) {
+            outside.extend(asked);
+        }
+    }
+    outside
+}
+
 /// How an ask wants to be served: its mode, routing tags and cap.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Request {
@@ -639,6 +660,16 @@ impl State {
     pub fn lost(&self, me: &str) -> Option<&Claim> {
         self.request.slots()?;
         self.claim_of(me).filter(|c| !self.winners.contains(&c.id))
+    }
+
+    /// Whether `one` or `n` is served by others: `me`'s claim lost the
+    /// tie-break, or `me` holds no claim and answers and winning claims of
+    /// others fill the slots. An answer from `me` would be one too many.
+    pub fn served_by_others(&self, me: &str) -> bool {
+        if self.lost(me).is_some() {
+            return true;
+        }
+        self.claim_of(me).is_none() && !self.answered.iter().any(|a| a == me) && self.full()
     }
 
     /// The soonest lease to run out.
@@ -1257,6 +1288,20 @@ mod tests {
         assert_eq!(before.request.mode, Mode::One);
         let after = state(&follow, &thread, T0 + 45);
         assert_eq!(after.answered, [id(2)]);
+    }
+
+    #[test]
+    fn not_in_field_ignores_whether_the_agent_has_a_field() {
+        let s = |v: &[&str]| v.iter().map(|t| t.to_string()).collect::<Vec<_>>();
+        // seed-docs: no lang: cap, yet not in lang:rust's field.
+        assert_eq!(
+            not_in_field(&s(&["docs-search", "web-fetch"]), &s(&["lang:rust"])),
+            s(&["lang:rust"])
+        );
+        assert!(not_in_field(&s(&["lang:rust", "code"]), &s(&["lang:Rust"])).is_empty());
+        assert!(not_in_field(&s(&["lang:rs"]), &s(&["lang:rust"])).is_empty());
+        // No field tag on the ask: nothing to wait for.
+        assert!(not_in_field(&s(&["devops"]), &s(&["project:x"])).is_empty());
     }
 
     #[test]

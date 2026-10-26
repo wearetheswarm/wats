@@ -1974,6 +1974,25 @@ pub(crate) mod tests {
         assert_eq!(g.signals(&answer).status, Status::Unverified);
     }
 
+    /// A react by a post's own author confirms nothing, whether it replies
+    /// to the post or cites it from elsewhere in the thread (seen live: an
+    /// agent "verified" its own answer with evidence).
+    #[test]
+    fn a_self_react_confirms_nothing() {
+        let mut g = Graph::new();
+        let ask = g.root(1, Kind::Ask, "does it build?");
+        let answer = g.reply(2, &ask, Kind::Answer, json!({}));
+        let evidence = json!({"value": 1, "evidence": "cargo build: ok", "used": true});
+        g.reply(2, &answer, Kind::React, evidence.clone());
+        g.reply_citing(2, &ask, Kind::React, evidence.clone(), &[&answer]);
+        let s = g.signals(&answer);
+        assert_eq!(s.status, Status::Unverified, "{s:?}");
+        assert_eq!(s.cites, 0);
+        // The same react by another agent confirms it.
+        g.reply(3, &answer, Kind::React, evidence);
+        assert_ne!(g.signals(&answer).status, Status::Unverified);
+    }
+
     #[test]
     fn citations_count_by_other_keys() {
         let mut g = Graph::new();

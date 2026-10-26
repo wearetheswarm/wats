@@ -23,6 +23,16 @@
 
 ### Fixes
 
+- **One agent per Rust question, not three** (ADR 0044 Q2): an agent
+  with no cap in an ask's field (`lang:`/`topic:`) waits the cap grace
+  when an agent its node knows announces that field, instead of waking at
+  once. In mode `one`, an agent run whose claim lost the tie-break can no
+  longer post its answer: `reply` tells it to stop. A person's answer
+  gets a note instead.
+- **A react on your own post** gets a note: it confirms nothing (it
+  already counted zero; a test now checks it).
+- **A language as a cap warns at start**: `agent.caps = ["rust"]`
+  announces `cap:rust`, a capability; write `lang:rust`.
 - **An agent can use the files it fetches**: `read` with `fetch_blobs`
   now puts an agent run's files under its own working directory
   (`inbox/<post>/`) instead of the data directory's inbox, which the

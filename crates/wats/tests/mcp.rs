@@ -2614,6 +2614,92 @@ fn an_agent_run_gets_files_in_its_own_directory() -> anyhow::Result<()> {
     })
 }
 
+/// 0.5.1: on an ask in mode `one`, an agent run whose claim lost the
+/// tie-break cannot post its answer (seen live: it answered anyway, a
+/// duplicate); a person gets a note instead.
+#[test]
+fn a_lost_claim_cannot_answer() -> anyhow::Result<()> {
+    run(async move {
+        let dir = tempfile::tempdir()?;
+        let node = loopback_node(&dir.path().join("node"), None).await?;
+        let asker = client_for(WatsMcp::new(Arc::clone(&node), vec![])).await?;
+        let ask = structured(
+            &call(
+                &asker,
+                "post",
+                json!({"title": "Does this build?", "text": "fn main() {}", "kind": "ask"}),
+            )
+            .await,
+        );
+        let ask_id = ask["id"].as_str().unwrap().to_string();
+        let first =
+            client_for(WatsMcp::new(Arc::clone(&node), vec![]).with_profile("first")?).await?;
+        structured(
+            &call(
+                &first,
+                "reply",
+                json!({"post_id": ask_id, "kind": "claim", "text": "On it."}),
+            )
+            .await,
+        );
+        // A later claim, from an agent run.
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+        let run = wats::node::RunnerRun {
+            id: "20261026T000000Z-events".into(),
+            events: vec![ask_id.clone()],
+            ..Default::default()
+        };
+        let agent = client_for(
+            WatsMcp::new(Arc::clone(&node), vec![])
+                .with_profile("agent")?
+                .runner_session(run),
+        )
+        .await?;
+        let claimed = structured(
+            &call(
+                &agent,
+                "reply",
+                json!({"post_id": ask_id, "kind": "claim", "text": "Mine."}),
+            )
+            .await,
+        );
+        assert!(
+            claimed["warning"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("older claim"),
+            "{claimed}"
+        );
+        let refused = call(
+            &agent,
+            "reply",
+            json!({"post_id": ask_id, "text": "It builds."}),
+        )
+        .await;
+        assert_eq!(refused.is_error, Some(true), "{refused:?}");
+        assert!(format!("{refused:?}").contains("not posted"), "{refused:?}");
+        // A person is told, not stopped.
+        let person =
+            client_for(WatsMcp::new(Arc::clone(&node), vec![]).with_profile("person")?).await?;
+        let posted = structured(
+            &call(
+                &person,
+                "reply",
+                json!({"post_id": ask_id, "text": "It builds."}),
+            )
+            .await,
+        );
+        assert!(
+            posted["note"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("served by others"),
+            "{posted}"
+        );
+        Ok(())
+    })
+}
+
 /// ADR 0049: an answer about a current state that is not marked volatile
 /// gets a note; a volatile one shows its as-of date in `read`.
 #[test]
