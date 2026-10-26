@@ -93,6 +93,8 @@ const MAX_ROWS: usize = 200_000;
 pub struct Policy {
     /// `reputation.threshold`.
     pub threshold: f64,
+    /// `reputation.node_flag` (ADR 0055 §6).
+    pub node_flag: f64,
     /// How long a table is reused once the store changed.
     pub ttl: Duration,
     /// How long a table is reused at most, changed store or not.
@@ -103,6 +105,7 @@ impl Default for Policy {
     fn default() -> Self {
         Self {
             threshold: DEFAULT_THRESHOLD,
+            node_flag: DEFAULT_NODE_FLAG,
             ttl: DEFAULT_TTL,
             max_age: MAX_AGE,
         }
@@ -229,6 +232,29 @@ impl Author {
     }
 }
 
+/// A node, as its agents' bindings show it (ADR 0055 §4–6).
+#[derive(Debug, Clone, Default)]
+pub struct Hive {
+    /// Its node key, hex.
+    pub key: String,
+    /// Its name, from its newest binding.
+    pub name: String,
+    name_ts: u64,
+    /// When this node first stored one of its bindings.
+    pub first_seen: u64,
+    /// Every agent ever bound to it.
+    pub agents: Vec<String>,
+    /// The sum of its agents' scores (ADR 0019 §2.6): what flags it.
+    pub weighted: f64,
+    /// Standing contradictions of its agents' posts.
+    pub contradicted: u64,
+}
+
+/// Default `reputation.node_flag` (ADR 0055 §6): a node whose agents'
+/// scores sum below it is flagged. −2 is one standing contradiction by a
+/// key this node fully trusts, or about ten by aged strangers.
+pub const DEFAULT_NODE_FLAG: f64 = -2.0;
+
 /// A network's reputation table, as this node sees it.
 #[derive(Debug)]
 pub struct Table {
@@ -247,6 +273,10 @@ pub struct Table {
     pub authors: HashMap<String, Author>,
     /// Signal rows it was built from.
     pub rows: usize,
+    /// The nodes its announces bind agents to, by node key.
+    pub hives: HashMap<String, Hive>,
+    /// Agent to the node keys it was ever validly bound to.
+    pub hive_of: HashMap<String, Vec<String>>,
 }
 
 impl Table {
@@ -261,7 +291,55 @@ impl Table {
             key: HashMap::new(),
             authors: HashMap::new(),
             rows: 0,
+            hives: HashMap::new(),
+            hive_of: HashMap::new(),
         }
+    }
+
+    /// The node `author` is bound to now: of the nodes it was ever bound
+    /// to, the one of its newest binding.
+    pub fn hive(&self, author: &str) -> Option<&Hive> {
+        self.hive_of
+            .get(author)
+            .and_then(|keys| keys.last())
+            .and_then(|k| self.hives.get(k))
+    }
+
+    /// `AmberHive#4f2a` for the node of key `key`: more of the key when
+    /// another node this table knows has the same name and start, so that
+    /// two nodes never read alike (ADR 0055 §3.2).
+    pub fn hive_label(&self, key: &str) -> Option<String> {
+        let hive = self.hives.get(key)?;
+        let mut len = crate::hive::SUFFIX;
+        while len < key.len()
+            && self.hives.values().any(|other| {
+                other.key != hive.key
+                    && other.name == hive.name
+                    && other.key.get(..len) == hive.key.get(..len)
+            })
+        {
+            len += 2;
+        }
+        Some(crate::hive::label(&hive.name, &hive.key, len))
+    }
+
+    /// Whether `a` and `b` were ever bound to one node.
+    pub fn same_hive(&self, a: &str, b: &str) -> bool {
+        match (self.hive_of.get(a), self.hive_of.get(b)) {
+            (Some(x), Some(y)) => x.iter().any(|k| y.contains(k)),
+            _ => false,
+        }
+    }
+
+    /// The lowest weighted score among the nodes `author` was ever bound
+    /// to (ADR 0055 §6): a bad node's agent cannot hide behind another.
+    pub fn hive_weighted(&self, author: &str) -> Option<f64> {
+        self.hive_of.get(author).and_then(|keys| {
+            keys.iter()
+                .filter_map(|k| self.hives.get(k))
+                .map(|h| h.weighted)
+                .reduce(f64::min)
+        })
     }
 
     /// The representative of `key`'s group (itself when alone).
@@ -314,6 +392,8 @@ impl Table {
             key: t.key.clone(),
             authors: t.authors.clone(),
             rows: t.rows,
+            hives: t.hives.clone(),
+            hive_of: t.hive_of.clone(),
         })
     }
 }
@@ -482,6 +562,46 @@ pub fn build(
             groups.union(&pair[0], &pair[1]);
         }
     }
+
+    // Node bindings (ADR 0055 §4): verified, every agent ever bound to a
+    // node is in one hard group with the others.
+    let mut bound: Vec<(String, u64, u64, crate::hive::Binding)> = store
+        .announce_nodes(net)?
+        .into_iter()
+        .filter_map(|(author, ts, received_at, node)| {
+            let value: serde_json::Value = serde_json::from_str(&node).ok()?;
+            let binding = crate::hive::verify(&value, net, &author)?;
+            Some((author, ts, received_at, binding))
+        })
+        .collect();
+    bound.sort_by_key(|(_, ts, _, _)| *ts);
+    for (author, ts, received_at, binding) in &bound {
+        let hive = table
+            .hives
+            .entry(binding.key.clone())
+            .or_insert_with(|| Hive {
+                key: binding.key.clone(),
+                first_seen: *received_at,
+                ..Hive::default()
+            });
+        hive.first_seen = hive.first_seen.min(*received_at);
+        if *ts >= hive.name_ts {
+            hive.name = binding.name.clone();
+            hive.name_ts = *ts;
+        }
+        if !hive.agents.contains(author) {
+            hive.agents.push(author.clone());
+        }
+        let keys = table.hive_of.entry(author.clone()).or_default();
+        keys.retain(|k| k != &binding.key);
+        keys.push(binding.key.clone());
+    }
+    for hive in table.hives.values() {
+        for pair in hive.agents.windows(2) {
+            groups.union(&pair[0], &pair[1]);
+        }
+    }
+    drop(bound);
 
     let rows = store.net_signal_rows(net, MAX_ROWS)?;
     table.rows = rows.len();
@@ -661,6 +781,22 @@ pub fn build(
         let author = table.authors.entry(key).or_default();
         author.score = score;
         author.counts = counts;
+    }
+    // Each node weighs what its agents score (ADR 0055 §6).
+    let authors = &table.authors;
+    for hive in table.hives.values_mut() {
+        hive.weighted = hive
+            .agents
+            .iter()
+            .filter_map(|a| authors.get(a))
+            .map(|a| a.score)
+            .sum();
+        hive.contradicted = hive
+            .agents
+            .iter()
+            .filter_map(|a| authors.get(a))
+            .map(|a| a.counts.contradicted)
+            .sum();
     }
     table.built = Instant::now();
     Ok(table)
@@ -876,6 +1012,7 @@ mod tests {
         };
         let policy = |ttl: Duration, max_age: Duration| Policy {
             threshold: DEFAULT_THRESHOLD,
+            node_flag: DEFAULT_NODE_FLAG,
             ttl,
             max_age,
         };
@@ -950,6 +1087,114 @@ mod tests {
             .get(&store, "public", &mine, &pow, &policy(hour, hour))
             .unwrap();
         assert!(theirs.local.contains("me"));
+    }
+
+    /// ADR 0055 §4–6: agents validly bound to one node are one group and
+    /// share its weighted score; a binding copied to another agent binds
+    /// nothing; a standing contradiction of one agent's answer flags the
+    /// node and lowers its other agents too.
+    #[test]
+    fn bound_agents_share_their_node() {
+        use crate::event::{Draft, Kind};
+        use ed25519_dalek::SigningKey;
+        let store = Store::open_in_memory().unwrap();
+        let t0 = 1_700_000_000;
+        let key = |seed: u8| SigningKey::from_bytes(&[seed; 32]);
+        let id = |seed: u8| crate::identity::author_id(&key(seed));
+        let node = key(50);
+        let sign = |seed: u8, draft: Draft, ts: u64| draft.sign(&key(seed), ts, 0).unwrap();
+        let announce = |binding: serde_json::Value| Draft {
+            net: "public".into(),
+            kind: Some(Kind::Announce),
+            title: Some("agent".into()),
+            text: "agent".into(),
+            data: serde_json::json!({ "node": binding })
+                .as_object()
+                .cloned()
+                .unwrap(),
+            ..Default::default()
+        };
+        for seed in [1, 2] {
+            let event = sign(
+                seed,
+                announce(crate::hive::bind(&node, "public", &id(seed), "AmberHive")),
+                t0,
+            );
+            store.insert(&event, t0).unwrap();
+        }
+        // Agent 3 copies agent 1's binding: no node.
+        let copied = sign(
+            3,
+            announce(crate::hive::bind(&node, "public", &id(1), "AmberHive")),
+            t0,
+        );
+        store.insert(&copied, t0).unwrap();
+        // Agent 1 answers; a profile of this node contradicts it with evidence.
+        let ask = sign(
+            7,
+            Draft {
+                net: "public".into(),
+                kind: Some(Kind::Ask),
+                title: Some("q".into()),
+                text: "q".into(),
+                ..Default::default()
+            },
+            t0,
+        );
+        store.insert(&ask, t0).unwrap();
+        let answer = sign(
+            1,
+            Draft {
+                net: "public".into(),
+                thread: Some(ask.id.clone()),
+                parent: Some(ask.id.clone()),
+                kind: Some(Kind::Answer),
+                text: "wrong".into(),
+                ..Default::default()
+            },
+            t0 + 1,
+        );
+        store.insert(&answer, t0 + 1).unwrap();
+        let contra = sign(
+            9,
+            Draft {
+                net: "public".into(),
+                thread: Some(ask.id.clone()),
+                parent: Some(answer.id.clone()),
+                kind: Some(Kind::React),
+                text: "fails".into(),
+                data: serde_json::json!({"value": -1, "evidence": "tests fail"})
+                    .as_object()
+                    .cloned()
+                    .unwrap(),
+                ..Default::default()
+            },
+            t0 + 2,
+        );
+        store.insert(&contra, t0 + 2).unwrap();
+        let pow = PowPolicy {
+            min_pow_bits: Some(256),
+            schedule: Vec::new(),
+        };
+        let local: HashSet<String> = [id(9)].into();
+        let table = Arc::new(build(&store, "public", &local, t0 + 10, &pow).unwrap());
+        let hive = table.hive(&id(2)).expect("agent 2 is bound");
+        assert_eq!(hive.name, "AmberHive");
+        assert_eq!(hive.key, crate::identity::author_id(&node));
+        assert_eq!(hive.agents.len(), 2);
+        assert!(
+            table.hive(&id(3)).is_none(),
+            "a copied binding binds nothing"
+        );
+        assert!(table.same_hive(&id(1), &id(2)));
+        assert_eq!(table.group_of(&id(1)), table.group_of(&id(2)));
+        assert!(hive.weighted < 0.0, "{}", hive.weighted);
+        assert_eq!(hive.contradicted, 1);
+        let grouping = Grouping::new(local).with_table(table);
+        assert!(grouping.flagged("public", &id(2), -1.0));
+        assert!(!grouping.flagged("public", &id(3), -1.0));
+        assert!(grouping.is_low("public", &id(2), 0.0), "its node is low");
+        assert!(!grouping.is_low("public", &id(3), 0.0));
     }
 
     #[test]

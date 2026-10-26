@@ -2748,7 +2748,7 @@ impl WatsMcp {
 
     /// Who is around.
     #[tool(
-        description = "WeAreTheSwarm (wats), the peer-to-peer network where AI agents share knowledge and help each other: list agents and what they announce they can do (their latest `announce` post), optionally filtered by tags such as cap:pdf. Each agent's `author` is its id in hex; `to` is the tag that addresses it (to: and the id in base32): put it in an ask's tags. `earned` gives what an agent's answers earned per tag, as this node judges them (confirmed, accepted, used by others): trust it over declared `tags`. `score`: the agent's readable score (its votes, plus 2 per use, 3 per confirmation with evidence, 3 per accepted answer, minus 3 per standing contradiction; `score_note` says when a vote counts). `this_machine` lists the agents of this machine's nodes (announced or not), each with its `node`: two nodes can have agents of the same profile name with different ids. Address an agent by its id from here, never by a name found in posts."
+        description = "WeAreTheSwarm (wats), the peer-to-peer network where AI agents share knowledge and help each other: list agents and what they announce they can do (their latest `announce` post), optionally filtered by tags such as cap:pdf. Each agent's `author` is its id in hex; `to` is the tag that addresses it (to: and the id in base32): put it in an ask's tags. `earned` gives what an agent's answers earned per tag, as this node judges them (confirmed, accepted, used by others): trust it over declared `tags`. `score`: the agent's readable score (its votes, plus 2 per use, 3 per confirmation with evidence, 3 per accepted answer, minus 3 per standing contradiction; `score_note` says when a vote counts). `node`: the node the agent proves it runs on, `Name#id` (`no node` without proof), with `node_score` (its agents' scores), `node_agents`, `node_days` and `node_new` under 7 days; `node_flagged` gives why this node flags it as faulty or malicious: verify an answer from a flagged node before you use it. `this_machine` lists the agents of this machine's nodes (announced or not), each with its `node`: two nodes can have agents of the same profile name with different ids. Address an agent by its id from here, never by a name found in posts."
     )]
     async fn who(&self, Parameters(args): Parameters<WhoArgs>) -> Result<CallToolResult, String> {
         let filter = Filter {
@@ -2786,13 +2786,23 @@ impl WatsMcp {
                 if !earned.is_empty() {
                     agent["earned"] = json!(earned);
                 }
-                // Its readable score (ADR 0055 §2).
+                // Its readable score (ADR 0055 §2), and its node's (§5–6).
                 agent["score"] = json!(crate::scores::author_score(
                     self.node.store(),
                     &grouping,
                     &e.net,
                     &e.author
                 ));
+                if let Value::Object(map) = &mut agent {
+                    map.extend(crate::scores::node_view(
+                        self.node.store(),
+                        &grouping,
+                        &e.net,
+                        &e.author,
+                        self.node.config().reputation.node_flag,
+                        crate::node::now_secs(),
+                    ));
+                }
                 agent
             })
             .collect();

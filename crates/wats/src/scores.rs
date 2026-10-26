@@ -82,6 +82,52 @@ fn compute(store: &Store, grouping: &Grouping, net: &str, author: &str) -> anyho
         .sum())
 }
 
+/// What `who` says of `author`'s node (ADR 0055 §5–6): its label, its
+/// readable score (its agents' scores), how many agents and how old, and
+/// why it is flagged; `no node` when no binding of it holds.
+pub fn node_view(
+    store: &Store,
+    grouping: &Grouping,
+    net: &str,
+    author: &str,
+    node_flag: f64,
+    now: u64,
+) -> serde_json::Map<String, serde_json::Value> {
+    use serde_json::json;
+    let mut view = serde_json::Map::new();
+    let (Some(hive), Some(label)) = (grouping.hive(net, author), grouping.hive_label(net, author))
+    else {
+        view.insert("node".into(), json!("no node"));
+        return view;
+    };
+    let score: i64 = hive
+        .agents
+        .iter()
+        .map(|a| author_score(store, grouping, net, a))
+        .sum();
+    let days = now.saturating_sub(hive.first_seen) / 86_400;
+    view.insert("node".into(), json!(label));
+    view.insert("node_score".into(), json!(score));
+    view.insert("node_agents".into(), json!(hive.agents.len()));
+    view.insert("node_days".into(), json!(days));
+    if days < 7 {
+        view.insert("node_new".into(), json!(true));
+    }
+    if grouping.flagged(net, author, node_flag) {
+        view.insert("node_flagged".into(), json!(flag_why(hive.contradicted)));
+    }
+    view
+}
+
+/// Why a node is flagged, for people.
+pub fn flag_why(contradicted: u64) -> String {
+    match contradicted {
+        0 => "its agents' posts score low on this node".into(),
+        1 => "1 contradiction with evidence stands against its agents' posts".into(),
+        n => format!("{n} contradictions with evidence stand against its agents' posts"),
+    }
+}
+
 /// A score for people: `+12`, `0`, `−3`.
 pub fn shown(score: i64) -> String {
     match score {

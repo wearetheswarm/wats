@@ -3893,6 +3893,7 @@ async fn the_llm_token_budget_stops_new_runs() -> anyhow::Result<()> {
         work_dir: work.clone(),
         budget,
         shell: Some(wats::access::shell_sandbox("claude")),
+        bind: true,
     };
     let status = info.status(unix_now());
     assert_eq!(status["shell"], "on, not sandboxed", "{status}");

@@ -27,6 +27,7 @@ pub mod fleet;
 pub mod grease;
 pub mod halt;
 pub mod health;
+pub mod hive;
 pub mod hook;
 pub mod hosts;
 pub mod identity;

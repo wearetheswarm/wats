@@ -192,6 +192,8 @@ pub struct AgentInfo {
     /// A lent shell, and what holds its commands
     /// ([`access::shell_sandbox`]): `None` without one.
     pub shell: Option<&'static str>,
+    /// Its announces bind it to the node (`agents.<n>.bind`, ADR 0055 §4).
+    pub bind: bool,
 }
 
 impl AgentInfo {
@@ -1024,9 +1026,19 @@ async fn announce_if_changed(node: &Arc<Node>, config: &AgentConfig) {
     // `name` in it: agents announced before 0.4.20 announce once more,
     // with their name.
     let fingerprint = blake3::hash(
-        json!([config.profile, about, tags, "name", config.display_name()])
-            .to_string()
-            .as_bytes(),
+        json!([
+            config.profile,
+            about,
+            tags,
+            "name",
+            config.display_name(),
+            // The node's label: a new name announces again (ADR 0055 §4).
+            node.author_key(&config.profile)
+                .is_ok_and(|k| node.binds(&author_id(&k)))
+                .then(|| node.public_label())
+        ])
+        .to_string()
+        .as_bytes(),
     )
     .to_hex()
     .to_string();

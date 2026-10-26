@@ -431,7 +431,30 @@ impl Grouping {
     /// Whether `a` and `b` are one key, or both this node's profiles: the
     /// groups a contradiction never comes from (a self-contradiction).
     pub fn same_hard(&self, net: &str, a: &str, b: &str) -> bool {
-        self.same_key(net, a, b) || (self.local.contains(a) && self.local.contains(b))
+        self.same_key(net, a, b)
+            || (self.local.contains(a) && self.local.contains(b))
+            || self.table(net).is_some_and(|t| t.same_hive(a, b))
+    }
+
+    /// The label of the node `key` is bound to in `net`, if any.
+    pub fn hive_label(&self, net: &str, key: &str) -> Option<String> {
+        let table = self.table(net)?;
+        table.hive_label(&table.hive(key)?.key)
+    }
+
+    /// The node `key` is bound to in `net` (ADR 0055 §4), if any.
+    pub fn hive(&self, net: &str, key: &str) -> Option<&crate::reputation::Hive> {
+        self.table(net).and_then(|t| t.hive(key))
+    }
+
+    /// Whether `key` was bound to a node whose agents' scores sum below
+    /// `node_flag` (ADR 0055 §6). Never one of this node's profiles.
+    pub fn flagged(&self, net: &str, key: &str, node_flag: f64) -> bool {
+        !self.local.contains(key)
+            && self
+                .table(net)
+                .and_then(|t| t.hive_weighted(key))
+                .is_some_and(|w| w < node_flag)
     }
 
     /// What a key's signals weigh in `net`: trust plus floor.
@@ -448,10 +471,16 @@ impl Grouping {
         self.table(net).map_or(0.0, |t| t.score(key))
     }
 
-    /// Whether `search` and `wait` leave out `key`'s posts: it scores below
-    /// `threshold`, and it is not one of this node's profiles.
+    /// Whether `search` and `wait` leave out `key`'s posts: it, or a node
+    /// it was bound to (ADR 0055 §6), scores below `threshold`, and it is
+    /// not one of this node's profiles.
     pub fn is_low(&self, net: &str, key: &str, threshold: f64) -> bool {
-        !self.local.contains(key) && self.score(net, key) < threshold
+        !self.local.contains(key)
+            && (self.score(net, key) < threshold
+                || self
+                    .table(net)
+                    .and_then(|t| t.hive_weighted(key))
+                    .is_some_and(|w| w < threshold))
     }
 }
 

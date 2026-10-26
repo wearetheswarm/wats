@@ -734,6 +734,10 @@ pub const KEYS_SINCE: &[(&str, Version)] = &[
     ("semantic.enabled", Version(0, 5, 0)),
     ("semantic.model_dir", Version(0, 5, 0)),
     ("agent.display_name", Version(0, 5, 3)),
+    ("node.public_name", Version(0, 5, 4)),
+    ("node.bind", Version(0, 5, 4)),
+    ("agent.bind", Version(0, 5, 4)),
+    ("reputation.node_flag", Version(0, 5, 4)),
 ];
 
 /// The keys set in `data_dir`'s config.toml that wats `version` does not

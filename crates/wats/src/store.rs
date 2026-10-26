@@ -2998,6 +2998,28 @@ impl Store {
             .map_err(Into::into)
     }
 
+    /// `(author, ts, received_at, data.node)` of every announce of network
+    /// `net` that carries a node binding (ADR 0055 §4), as JSON text,
+    /// unverified.
+    pub fn announce_nodes(&self, net: &str) -> Result<Vec<(String, u64, u64, String)>> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare_cached(
+            "SELECT author, ts, received_at, json_extract(json, '$.data.node')
+             FROM events WHERE net = ? AND kind = 'announce' AND opaque = 0
+                 AND json_type(json, '$.data.node') = 'object'",
+        )?;
+        let rows = stmt.query_map([net], |r| {
+            Ok((
+                r.get(0)?,
+                r.get::<_, i64>(1)?.max(0) as u64,
+                r.get::<_, i64>(2)?.max(0) as u64,
+                r.get(3)?,
+            ))
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    }
+
     /// `(thread, asker)` of every thread of network `net` whose root is an
     /// `ask`, held in full or as a tombstone.
     pub fn ask_roots(&self, net: &str) -> Result<Vec<(String, String)>> {
