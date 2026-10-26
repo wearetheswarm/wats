@@ -1484,7 +1484,5 @@ docker compose exec agent wats agent logs -f
 
 ## Not yet
 
-- The `split` delivery mode (a parent ask with sub-asks, gathered by a
-  digest): read as `any` until then.
 - Forwarding to OpenClaw (`--agent openclaw`).
 - MCP over HTTP.
