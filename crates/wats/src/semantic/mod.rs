@@ -27,6 +27,13 @@ pub const MODEL_SHA256: &str = "2d3e18fede3cfbf614b9ec4de9c3a933c0fd94e481f6a3c9
 pub const MODEL_BYTES: u64 = 33_788_328;
 /// Its file name, locally and as a release asset.
 pub const MODEL_FILE: &str = "bge-small-en-v1.5-int8.safetensors";
+/// Models of earlier releases (SHA-256, file name): one with a complete
+/// index keeps serving queries while the pinned one builds its own, then
+/// goes (ADR 0053 §6, 0.5.2).
+pub const PREVIOUS_MODELS: &[(&str, &str)] = &[(
+    "2e8ce3355bf8da29cfddf974901b6492e68fc540335047d87aee53cbb422fadc",
+    "bge-small-en-v1.5-f16.safetensors",
+)];
 /// A post is embedded from its first tokens: title, then body.
 pub const MAX_TOKENS: usize = 256;
 /// Posts embedded in one pass: each int8 layer is dequantized once per
@@ -45,11 +52,14 @@ impl Model {
     /// Loads the model from the bytes of its file, refused unless they
     /// are the pinned file.
     pub fn load(bytes: &[u8]) -> Result<Self> {
-        let sha = hex::encode(Sha256::digest(bytes));
-        ensure!(
-            sha == MODEL_SHA256,
-            "model file: SHA-256 {sha}, not {MODEL_SHA256}"
-        );
+        Self::load_verified(bytes, MODEL_SHA256)
+    }
+
+    /// Loads a model whose file must have SHA-256 `sha` (the pinned one,
+    /// or one of [`PREVIOUS_MODELS`]).
+    pub fn load_verified(bytes: &[u8], sha: &str) -> Result<Self> {
+        let got = hex::encode(Sha256::digest(bytes));
+        ensure!(got == sha, "model file: SHA-256 {got}, not {sha}");
         Ok(Model {
             bert: bert::Bert::load(bytes)?,
         })

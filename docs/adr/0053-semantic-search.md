@@ -387,6 +387,52 @@ laptops.
   Until it catches up, search uses vectors where they exist and words
   everywhere. 0.5.0 only did this on a node's first run, so a model
   change would have left the old history without vectors.
+- **State keys carry the model (amended, 0.5.2).** The backfill's state
+  is kept under the model's name (`top:<sha256>`, `below:…`, `done:…`).
+  - 0.5.1 kept them unprefixed, and 0.5.0 reads an unprefixed `top` as
+    its own. After a rollback from 0.5.1 to 0.5.0, the node ignored its
+    int8 vectors and embedded only newer posts, and `status` stuck at a
+    small count.
+  - A 0.5.2 node moves 0.5.1's keys under the model's name, with no
+    reindex. A rollback to 0.5.0 then finds no `top`, and reindexes with
+    its own model as on a first run.
+- **A model change is smooth (amended, 0.5.2; Vincent's rule).** 0.5.1
+  dropped the old vectors at once: search was words-only until the new
+  index was complete, which takes seconds today but hours on a big store
+  or a slow server. Since 0.5.2:
+  1. The new model downloads and is verified. Queries keep the previous
+     model and its complete vectors. The previous model must be one the
+     binary knows (`PREVIOUS_MODELS`, by SHA-256), and its file must still
+     be there.
+  2. The backfill builds the new model's vectors beside them, newest
+     first. The vectors are keyed by post and model (`embeddings` has a
+     `(seq, model)` key since 0.5.2), and the state by model
+     (`serving:<sha256>` names the model that answers).
+  3. When the new index is complete, queries switch to the new model and
+     its vectors, and the node logs one line, `semantic: switched to …`.
+  4. Then the previous model's vectors and its file are deleted.
+
+  **Costs:**
+  - **Disk:** both vector sets during the transition, about 2 × 77 MB at
+    100k posts, counted in `storage.max`.
+  - **Memory:** the serving model answers queries and the new one embeds,
+    so peak RAM is both while the backfill runs.
+
+  **Edge cases:**
+  - **Interrupted:** the transition resumes where it stopped.
+  - **No room:** when `storage.max` has no room for a second set (the
+    posts × about 830 bytes), the node falls back to 0.5.1's
+    drop-then-reindex, and logs why.
+  - **Status:** `semantic: ready (previous model) · new model: index N
+    of M`, and in JSON a `next` with the new index's counts.
+- **Model files no longer used go (0.5.2; Vincent's rule).** Once the
+  pinned file is there and verified, no download runs, and the pinned
+  model serves, the node deletes every other `*.safetensors` file in the
+  model directory whose SHA-256 is not the pinned one, and logs one line.
+  - This covers a shared `semantic.model_dir` too.
+  - It never touches the pinned file, nor a `.part` file.
+  - It happens once at each start, and after a switch.
+  - That is how 0.5.0's f16 file goes.
 - **Partial results are fine.** Search uses vectors where they exist and
   FTS everywhere. There is no "index not ready" error.
 - **Laptop manners:**
@@ -402,7 +448,8 @@ laptops.
   - It never starts before the model is in place.
 - **The model is loaded only when needed:** for a batch, a query or the
   backfill. It is unloaded after 10 idle minutes, so a laptop does not
-  hold 240 MB all day. A load takes about 35 ms.
+  hold it all day: about 140 MB of RSS on a Mac and 59 MB on x86 with
+  0.5.1's int8 weights (240 MB with 0.5.0's). A load takes 6 to 35 ms.
 - **Visible:**
   - `status` says `semantic index: 12,400 of 15,000 posts` (or `off:
     …`, or `ready`); `status --json` has `semantic: {state, embedded,
@@ -437,7 +484,8 @@ laptops.
 On by default for every node, laptops included. `semantic.enabled =
 false` in `config.toml` (or `--no-semantic`) turns it off. Why:
 - The model is 66.4 MB (33.8 MB since 0.5.1, int8), downloaded once.
-- The ~240 MB of RAM is held only while the model works, then released.
+- The RAM (about 240 MB with 0.5.0's weights; 140 MB on a Mac and 59 MB
+  on x86 since 0.5.1) is held only while the model works, then released.
 - The backfill runs at background priority, under a cap, paused on
   battery.
 
@@ -498,6 +546,7 @@ see the same posts, and only the local ranking differs.
   - three local tables, with no schema bump (0.4.21 still opens the
     store);
   - a 66.4 MB download on first start (33.8 MB since 0.5.1);
-  - about 240 MB of RAM while the model works;
+  - about 240 MB of RAM while the model works (140 MB on a Mac, 59 MB on
+    x86 since 0.5.1);
   - about 20 pure-Rust crates (`gemm`), and the vocabulary in the binary.
 - No wire change.

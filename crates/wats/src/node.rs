@@ -1907,6 +1907,14 @@ impl Node {
         tokio::spawn(crate::awake::watch(Arc::downgrade(&node)));
         // Semantic search (ADR 0053): the model file, then the worker.
         if let Some(semantic) = &node.semantic {
+            // Whether two indexes fit under storage.max during a model
+            // change (ADR 0053 §6).
+            let weak = Arc::downgrade(&node);
+            semantic.set_free_bytes(Box::new(move || {
+                let node = weak.upgrade()?;
+                let max = node.config.storage_max?;
+                Some(max.saturating_sub(node.storage_usage()))
+            }));
             tokio::spawn(Arc::clone(semantic).ensure_model());
             if let Err(e) = semantic.spawn_worker(Arc::downgrade(&node.store)) {
                 warn!("semantic: cannot start its worker: {e}");

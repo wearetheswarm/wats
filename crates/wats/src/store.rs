@@ -25,6 +25,19 @@ use crate::wire::RawEvent;
 
 const SCHEMA_VERSION: i64 = 7;
 
+/// The triggers that drop a post's vectors with its body (ADR 0053 §5),
+/// as in [`SCHEMA`]: created again after the embeddings table's move to a
+/// `(seq, model)` key (0.5.2).
+const EMBEDDINGS_TRIGGERS: &str = r#"
+CREATE TRIGGER IF NOT EXISTS embeddings_event_delete AFTER DELETE ON events BEGIN
+    DELETE FROM embeddings WHERE seq = old.seq;
+END;
+CREATE TRIGGER IF NOT EXISTS embeddings_body_change
+    AFTER UPDATE OF json, text, title, opaque ON events BEGIN
+    DELETE FROM embeddings WHERE seq = old.seq;
+END;
+"#;
+
 const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS events (
     seq         INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -238,11 +251,14 @@ CREATE TABLE IF NOT EXISTS rotation_log (
 -- schema bump: an older wats ignores the table, and the triggers, stored
 -- in the database, still drop a vector with its body whichever wats drops
 -- it (rotation, drop, retraction, eviction).
+-- One vector per post and model (0.5.2: while a new model builds its
+-- index, the previous one's still serves).
 CREATE TABLE IF NOT EXISTS embeddings (
-    seq   INTEGER PRIMARY KEY,
+    seq   INTEGER NOT NULL,
     model TEXT NOT NULL,
-    vec   BLOB NOT NULL
-);
+    vec   BLOB NOT NULL,
+    PRIMARY KEY (seq, model)
+) WITHOUT ROWID;
 CREATE TRIGGER IF NOT EXISTS embeddings_event_delete AFTER DELETE ON events BEGIN
     DELETE FROM embeddings WHERE seq = old.seq;
 END;
@@ -1157,6 +1173,35 @@ impl Store {
             }
         }
         conn.execute_batch(SCHEMA)?;
+        // 0.5.0 and 0.5.1 keyed vectors by `seq` alone: one per post. 0.5.2
+        // keeps one per post and model, so a previous model's index serves
+        // while a new one builds (ADR 0053 §6). Same table name, so an
+        // older wats still reads it after a rollback.
+        let keyed_by_model: bool = conn.query_row(
+            "SELECT EXISTS (SELECT 1 FROM pragma_table_info('embeddings')
+                            WHERE name = 'model' AND pk > 0)",
+            [],
+            |r| r.get(0),
+        )?;
+        if !keyed_by_model {
+            conn.execute_batch(&format!(
+                "BEGIN;
+                 DROP TRIGGER IF EXISTS embeddings_event_delete;
+                 DROP TRIGGER IF EXISTS embeddings_body_change;
+                 ALTER TABLE embeddings RENAME TO embeddings_by_seq;
+                 CREATE TABLE embeddings (
+                     seq   INTEGER NOT NULL,
+                     model TEXT NOT NULL,
+                     vec   BLOB NOT NULL,
+                     PRIMARY KEY (seq, model)
+                 ) WITHOUT ROWID;
+                 INSERT INTO embeddings (seq, model, vec)
+                     SELECT seq, model, vec FROM embeddings_by_seq;
+                 DROP TABLE embeddings_by_seq;
+                 {EMBEDDINGS_TRIGGERS}
+                 COMMIT;"
+            ))?;
+        }
         if (1..4).contains(&version) {
             // v2 -> v3: the event format was hardened before the freeze (ADR
             // 0010): events stored earlier hash differently and can no longer
@@ -2671,6 +2716,12 @@ impl Store {
                 |r| r.get(0),
             )
             .optional()?)
+    }
+
+    pub fn delete_semantic_state(&self, key: &str) -> Result<()> {
+        self.conn()
+            .execute("DELETE FROM semantic_state WHERE key = ?", [key])?;
+        Ok(())
     }
 
     /// Forgets where semantic search stood (a new model starts over).
@@ -5395,14 +5446,54 @@ mod tests {
         assert_eq!(store.embeddings_extent("m1").unwrap(), (1, answer_seq));
         assert!(!store.put_embedding(root_seq, "m1", &[1, 2]).unwrap());
         assert_eq!(store.embedding_counts("m1").unwrap(), (1, 1));
+        // One vector per post and model: m2's beside m1's, until m1's go.
         assert!(store.put_embedding(answer_seq, "m2", &[5]).unwrap());
-        assert_eq!(store.drop_other_embeddings("m2").unwrap(), 0);
+        assert_eq!(store.embeddings_extent("m1").unwrap().0, 1);
+        assert_eq!(store.drop_other_embeddings("m2").unwrap(), 1);
         assert_eq!(store.embeddings_extent("m1").unwrap().0, 0);
+        assert_eq!(store.embeddings_extent("m2").unwrap().0, 1);
         // The state survives.
         assert_eq!(store.semantic_state("below").unwrap(), None);
         store.set_semantic_state("below", 7).unwrap();
         store.set_semantic_state("below", 5).unwrap();
         assert_eq!(store.semantic_state("below").unwrap(), Some(5));
+    }
+
+    /// A 0.5.0/0.5.1 store (vectors keyed by `seq` alone) moves to the
+    /// `(seq, model)` key, its vectors kept, and its triggers still drop a
+    /// vector with its body.
+    #[test]
+    fn the_embeddings_table_moves_to_a_per_model_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("events.sqlite");
+        let root = post(1, 10, Kind::Ask, &[], "how do I sort a list");
+        {
+            let store = Store::open(&path).unwrap();
+            store.insert(&root, 10).unwrap();
+            // As 0.5.1 made it.
+            store
+                .conn()
+                .execute_batch(
+                    "DROP TRIGGER embeddings_event_delete; DROP TRIGGER embeddings_body_change;
+                     DROP TABLE embeddings;
+                     CREATE TABLE embeddings (seq INTEGER PRIMARY KEY, model TEXT NOT NULL, vec BLOB NOT NULL);
+                     CREATE TRIGGER embeddings_body_change AFTER UPDATE OF json, text, title, opaque
+                         ON events BEGIN DELETE FROM embeddings WHERE seq = old.seq; END;",
+                )
+                .unwrap();
+            let seq = store.get(&root.id).unwrap().unwrap().seq;
+            assert!(store.put_embedding(seq, "m1", &[1]).unwrap());
+        }
+        let store = Store::open(&path).unwrap();
+        let seq = store.get(&root.id).unwrap().unwrap().seq;
+        assert_eq!(store.embeddings_extent("m1").unwrap(), (1, seq));
+        assert!(store.put_embedding(seq, "m2", &[2]).unwrap());
+        assert_eq!(store.embeddings_extent("m1").unwrap().0, 1);
+        store
+            .drop_body(&root.id, DropReason::Own, None, None, 100)
+            .unwrap();
+        assert_eq!(store.embeddings_extent("m1").unwrap().0, 0);
+        assert_eq!(store.embeddings_extent("m2").unwrap().0, 0);
     }
 
     #[test]

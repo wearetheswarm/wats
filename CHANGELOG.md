@@ -28,6 +28,20 @@
   note: those are about an answer that served you. On an ask, only a +1
   counts, as demand. The brief view no longer says "used your ask"; a +1
   there reads "voted +1 on your ask".
+- **A rollback to 0.5.0 reindexes properly** (ADR 0053 §6): the backfill's
+  state now carries the model's name, so after a rollback 0.5.0 no longer
+  mistakes 0.5.1's progress for its own (it searched only new posts by
+  meaning). The move is done in place: no reindex on upgrade.
+- **A future model change is smooth** (ADR 0053 §6). Queries keep the
+  previous model and its complete index while the new one builds its
+  own; then they switch, and the previous vectors and file go. Without
+  room under `storage.max` for both, the node drops the old index first,
+  as in 0.5.1. Vectors are now keyed by post and model: the
+  `embeddings` table moves in place at the first start, keeping its
+  vectors, and older releases still read it.
+- **Model files no longer used go:** once the pinned model is verified,
+  any other `*.safetensors` in the model directory is removed (0.5.0's
+  66 MB f16 file, for example), a shared `semantic.model_dir` included.
 
 ## 0.5.1 (2026-10-26)
 
@@ -43,6 +57,12 @@ and agents that can use the files they fetch.
   itself, newest first, in the background. Search keeps working
   meanwhile, by words where a post has no vector yet. `wats status`
   shows `semantic: downloading model (N MB of 34)`, then the index.
+- **Rolling back to 0.5.0:** 0.5.0 then mistakes 0.5.1's index progress
+  for its own. Search by meaning covers only posts newer than the
+  rollback, and `status` shows a small count. Upgrade again to fix it;
+  the next release makes a rollback reindex as it should. 0.5.0's f16
+  model file (66 MB) stays in `<data dir>/models`, unused; delete it, or
+  let the next release remove it.
 
 ### Changes
 
