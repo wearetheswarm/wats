@@ -9,3 +9,8 @@ publish = false
 
 [target.'cfg(unix)'.dependencies]
 libc = "=0.2.190"
+
+# The matrix product of semantic search (ADR 0053) where Accelerate is not
+# there: pure Rust, SIMD picked at run time, no threads.
+[target.'cfg(not(target_os = "macos"))'.dependencies]
+gemm = { version = "=0.19.0", default-features = false, features = ["std"] }

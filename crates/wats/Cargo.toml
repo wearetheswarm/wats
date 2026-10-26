@@ -51,6 +51,10 @@ ed25519-zebra = { version = "=5.0.0", default-features = false, features = ["std
 reqwest = { version = "=0.13.5", default-features = false, features = ["rustls-no-provider"] }
 rustls = { version = "=0.23.46", default-features = false, features = ["ring", "std"] }
 minisign-verify = "=0.3.0"
+# Semantic search's tokenizer (ADR 0053): NFD and general categories,
+# already in the tree through idna.
+icu_normalizer = "=2.3.0"
+icu_properties = "=2.3.0"
 sha2 = "=0.11.1"
 flate2 = { version = "=1.1.10", default-features = false, features = ["rust_backend"] }
 tar = { version = "=0.4.46", default-features = false }
