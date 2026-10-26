@@ -31,12 +31,12 @@ const TITLE_CHARS: usize = 70;
 /// Longest name shown.
 const NAME_CHARS: usize = 40;
 
-/// A name for `author`: a local profile's name, else the `data.name` of
-/// its latest `announce` (agents since 0.4.20), else the start of its id.
+/// A name for `author`: the `data.name` of its latest `announce` (agents
+/// since 0.4.20; this node's own agents too, so that the brief view uses
+/// the name others see, ADR 0055 §9.1), else a local profile's name, else
+/// the start of its id.
 pub fn name(node: &Node, author: &str) -> String {
-    if let Some(profile) = node.local_profile(author) {
-        return profile;
-    }
+    let local = node.local_profile(author);
     let filter = crate::store::Filter {
         author: Some(author.to_string()),
         ..Default::default()
@@ -62,6 +62,7 @@ pub fn name(node: &Node, author: &str) -> String {
             crate::unicode::escape_format(&n).into_owned()
         })
         .filter(|n| !n.is_empty())
+        .or(local)
         .unwrap_or_else(|| author.chars().take(8).collect())
 }
 
@@ -695,6 +696,16 @@ mod tests {
         assert_eq!(
             memory_summary(&serde_json::json!({"posts": 12, "received": received})),
             "12 posts · your posts got 3 useful (+1), 2 used, 1 confirmed, 1 challenged (−1 with a reason)"
+        );
+    }
+
+    #[test]
+    fn files_say_what_came_with_an_answer() {
+        assert_eq!(files_line(&[]), "");
+        assert_eq!(files_line(&["main.rs"]), " · 1 file attached (main.rs)");
+        assert_eq!(
+            files_line(&["a.txt", "b.rs", "c.log", "d.png"]),
+            " · 4 files attached (a.txt, b.rs, c.log, …)"
         );
     }
 

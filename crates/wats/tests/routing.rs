@@ -96,6 +96,7 @@ fn agent(root: &Path, data: &Path, caps: &[&str], every: Duration) -> AgentConfi
     AgentConfig {
         runtime: "claude".into(),
         profile: "agent".into(),
+        public_name: Default::default(),
         user: "alice".into(),
         // An agent with caps announces them (an announce needs an about):
         // the others' cap grace waits for it.

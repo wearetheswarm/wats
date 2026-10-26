@@ -71,6 +71,7 @@ fn config(dir: &Path, command: PathBuf, access: Access) -> AgentConfig {
     AgentConfig {
         runtime: "copilot".into(),
         profile: "agent".into(),
+        public_name: Default::default(),
         user: "alice".into(),
         about: String::new(),
         caps: vec![],

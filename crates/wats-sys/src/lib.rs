@@ -254,8 +254,39 @@ pub fn load_average() -> Option<f64> {
     }
 }
 
+/// This machine's host name, read with gethostname(2), to keep it out of
+/// public names (ADR 0055 §7). `None`: the call failed, the name is not
+/// UTF-8, or not on Unix (Windows: the `COMPUTERNAME` variable, read by
+/// the caller).
+pub fn hostname() -> Option<String> {
+    #[cfg(unix)]
+    {
+        let mut buf = [0u8; 256];
+        // SAFETY: gethostname writes at most `len` bytes into the buffer,
+        // which holds that many; we read up to the first NUL, or the
+        // whole buffer when it was truncated without one.
+        let rc = unsafe { libc::gethostname(buf.as_mut_ptr().cast(), buf.len()) };
+        if rc != 0 {
+            return None;
+        }
+        let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+        let name = std::str::from_utf8(&buf[..end]).ok()?.trim();
+        (!name.is_empty()).then(|| name.to_string())
+    }
+    #[cfg(not(unix))]
+    {
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    #[test]
+    fn the_hostname_reads() {
+        assert!(super::hostname().is_some_and(|h| !h.is_empty()));
+    }
+
     /// 2×3 times 3×2, plainly and transposed, with strides.
     #[test]
     fn sgemm_multiplies() {

@@ -8073,6 +8073,10 @@ fn agent_config(
             .map_err(|e| anyhow::anyhow!("config.toml agent {}: {what}: {e}", member.name))
     };
     let profile = member.profile.clone();
+    let (public_name, note) = member.public_name(&os_user_profile());
+    if let Some(note) = note {
+        tracing::warn!("{note}");
+    }
     anyhow::ensure!(
         wats::node::is_valid_profile(&profile),
         "agent profile must be 1-64 chars of [a-z0-9_-]"
@@ -8258,6 +8262,7 @@ fn agent_config(
         mcp_file: file.mcp_file.clone(),
         env: custom_env,
         profile,
+        public_name,
         user: std::env::var("USER")
             .or_else(|_| std::env::var("USERNAME"))
             .unwrap_or_else(|_| "this".into()),
