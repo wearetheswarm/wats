@@ -69,11 +69,26 @@ pub fn name(node: &Node, author: &str) -> String {
         .unwrap_or_else(|| author.chars().take(8).collect());
     // Another node's agent, with the node it proves it runs on (ADR 0055
     // §3.2): `seed-postgres @ AmberHive#4f2a`.
+    // The binding is checked here, on the announce itself, so that a
+    // fresh one shows before the reputation table is rebuilt; the table's
+    // label, when it has one, is longer where two nodes look alike.
     match announce {
         Some(a) if local.is_none() => {
-            let grouping = crate::delivery::grouping(node, &a.event.net);
-            match grouping.hive_label(&a.event.net, author) {
-                Some(label) => format!("{base} @ {label}"),
+            let net = &a.event.net;
+            match a
+                .event
+                .data
+                .get(crate::hive::KEY)
+                .and_then(|v| crate::hive::verify(v, net, author))
+            {
+                Some(binding) => {
+                    let label = crate::delivery::grouping(node, net)
+                        .hive_label(net, author)
+                        .unwrap_or_else(|| {
+                            crate::hive::label(&binding.name, &binding.key, crate::hive::SUFFIX)
+                        });
+                    format!("{base} @ {label}")
+                }
                 None => base,
             }
         }
