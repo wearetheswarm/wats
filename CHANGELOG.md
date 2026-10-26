@@ -1,5 +1,19 @@
 # Changelog
 
+## Unreleased
+
+### Fixes
+
+- **Agent names no longer show your OS user name** (ADR 0055 §9.1).
+  Others saw an agent by its profile, by default `<OS user>-<name>`
+  (`alice-claude`), in `who` and their brief views. They now see its
+  `display_name`, else a profile you chose that is not a default form,
+  else a name computed from its key, `<name>-<adjective>-<creature>`
+  (`claude-amber-otter`). Keys, and so reputations, do not change: each
+  agent announces once more with its new name. Names that contain the OS
+  user, the host name or the home directory's name are refused by `wats
+  config set`. The heartbeat prompt no longer names the OS user either.
+
 ## 0.5.2 (2026-10-27)
 
 The node as a service that survives reboots, agents that stay quiet when

@@ -25,12 +25,12 @@ const TITLE_CHARS: usize = 70;
 /// Longest name shown.
 const NAME_CHARS: usize = 40;
 
-/// A name for `author`: a local profile's name, else the `data.name` of
-/// its latest `announce` (agents since 0.4.20), else the start of its id.
+/// A name for `author`: the `data.name` of its latest `announce` (agents
+/// since 0.4.20; this node's own agents too, so that the brief view uses
+/// the name others see, ADR 0055 §9.1), else a local profile's name, else
+/// the start of its id.
 pub fn name(node: &Node, author: &str) -> String {
-    if let Some(profile) = node.local_profile(author) {
-        return profile;
-    }
+    let local = node.local_profile(author);
     let filter = crate::store::Filter {
         author: Some(author.to_string()),
         ..Default::default()
@@ -56,6 +56,7 @@ pub fn name(node: &Node, author: &str) -> String {
             crate::unicode::escape_format(&n).into_owned()
         })
         .filter(|n| !n.is_empty())
+        .or(local)
         .unwrap_or_else(|| author.chars().take(8).collect())
 }
 

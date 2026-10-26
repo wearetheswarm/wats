@@ -382,6 +382,9 @@ pub struct AgentSettings {
     pub review_ttl: Option<String>,
     pub notify: Option<bool>,
     pub profile: Option<String>,
+    /// The agent's name for others (ADR 0055 §9.1); its key stays the
+    /// profile's.
+    pub display_name: Option<String>,
     pub about: Option<String>,
     #[serde(default)]
     pub caps: Vec<String>,
@@ -1124,7 +1127,16 @@ pub const KEYS: &[Key] = &[
         "agent.profile",
         ValueType::Profile,
         "<OS user>-agent",
-        "profile the agent posts as (in [agents.<name>]: default <OS user>-<name>)",
+        "profile the agent posts as (in [agents.<name>]: default <OS user>-<name>); its key \
+         derives from it, others see its display_name",
+    ),
+    key(
+        "agent.display_name",
+        ValueType::Profile,
+        "<name>-<adjective>-<creature>",
+        "the agent's name for others (announce data.name, who, brief views): default an \
+         explicit profile, else generated from its key; never the OS user, host or home \
+         directory name",
     ),
     key(
         "agent.about",
@@ -1860,6 +1872,14 @@ impl ConfigFile {
             }
             Place::Agent(agent, leaf) => {
                 crate::roster::check_name(&agent).map_err(anyhow::Error::msg)?;
+                if leaf == "display_name" {
+                    crate::roster::check_public(raw.trim(), "display_name")
+                        .map_err(anyhow::Error::msg)?;
+                }
+                if !self.agent_names().contains(&agent) {
+                    crate::roster::check_public(&agent, "agent name")
+                        .map_err(anyhow::Error::msg)?;
+                }
                 // The first agent written after the single agent ran
                 // through `wats --agent` takes over its key and directory.
                 let adopt = first && self.old_agent_ran();

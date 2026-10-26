@@ -99,6 +99,7 @@ async fn agent_wakes_on_asks_not_on_empty_heartbeats() -> anyhow::Result<()> {
     let config = AgentConfig {
         runtime: "claude".into(),
         profile: "agent".into(),
+        public_name: Default::default(),
         user: "alice".into(),
         about: "I review CSV files.\nAsk me about data quality.".into(),
         caps: vec!["csv".into(), "lang:en".into()],
@@ -155,10 +156,17 @@ async fn agent_wakes_on_asks_not_on_empty_heartbeats() -> anyhow::Result<()> {
     let (prompt, args) = runs(dir.path()).remove(0);
     assert!(prompt.starts_with(DEFAULT_HEARTBEAT.lines().next().unwrap()));
     assert!(prompt.contains(&wanted.id), "{prompt}");
+    // Its generated name, not its profile, and not the OS user (ADR 0055
+    // §9.1).
+    let me = wats::identity::author_id(&a.author_key("agent")?);
+    let shown = wats::roster::generated("claude", &me);
     assert!(
-        prompt.contains("You are agent, an autonomous agent serving the swarm from alice's node."),
+        prompt.contains(&format!(
+            "You are {shown}, an autonomous agent serving the swarm from your user's node."
+        )),
         "{prompt}"
     );
+    assert!(!prompt.contains("alice"), "{prompt}");
     assert!(
         prompt.contains("Your role: I review CSV files.\nAsk me about data quality."),
         "{prompt}"
@@ -273,6 +281,12 @@ async fn agent_wakes_on_asks_not_on_empty_heartbeats() -> anyhow::Result<()> {
         Some("I review CSV files.")
     );
     assert_eq!(posted[0].event.tags, ["cap:csv", "lang:en"]);
+    // Its name for others is generated from its key, not its profile
+    // (ADR 0055 §9.1).
+    assert_eq!(
+        posted[0].event.data["name"],
+        wats::roster::generated("claude", &agent_id).as_str()
+    );
 
     let _ = stop.send(());
     runner.await??;
@@ -316,6 +330,7 @@ async fn history_older_than_a_day_wakes_no_runner() -> anyhow::Result<()> {
     let config = AgentConfig {
         runtime: "claude".into(),
         profile: "agent".into(),
+        public_name: Default::default(),
         user: "alice".into(),
         about: "I answer questions.".into(),
         caps: vec![],
@@ -1112,6 +1127,7 @@ async fn budget_pauses_the_agent() -> anyhow::Result<()> {
     let config = AgentConfig {
         runtime: "claude".into(),
         profile: "agent".into(),
+        public_name: Default::default(),
         user: "alice".into(),
         about: String::new(),
         caps: vec![],
@@ -1285,6 +1301,7 @@ echo '{{"type":"turn.completed","usage":{{"input_tokens":10,"output_tokens":2}}}
     let config = AgentConfig {
         runtime: "codex".into(),
         profile: "agent".into(),
+        public_name: Default::default(),
         user: "alice".into(),
         about: String::new(),
         caps: vec![],
@@ -1651,6 +1668,7 @@ async fn swarm_only_agent_with_tools_warns_and_starts() -> anyhow::Result<()> {
     let config = AgentConfig {
         runtime: "claude".into(),
         profile: "agent".into(),
+        public_name: Default::default(),
         user: "alice".into(),
         about: String::new(),
         caps: vec![],
@@ -1722,6 +1740,7 @@ async fn workspace_access_opens_the_workspace() -> anyhow::Result<()> {
     let config = AgentConfig {
         runtime: "claude".into(),
         profile: "agent".into(),
+        public_name: Default::default(),
         user: "alice".into(),
         about: String::new(),
         caps: vec![],
@@ -2237,6 +2256,7 @@ async fn wakes_only_on_what_is_addressed_to_it() -> anyhow::Result<()> {
     let config = AgentConfig {
         runtime: "claude".into(),
         profile: "agent".into(),
+        public_name: Default::default(),
         user: "alice".into(),
         about: String::new(),
         caps: vec![],
@@ -2350,6 +2370,7 @@ async fn wake_limits_defer_and_survive_a_restart() -> anyhow::Result<()> {
     let config = AgentConfig {
         runtime: "claude".into(),
         profile: "agent".into(),
+        public_name: Default::default(),
         user: "alice".into(),
         about: String::new(),
         caps: vec![],
@@ -2465,6 +2486,7 @@ async fn loop_detector_pauses_a_thread_until_a_third_party_posts() -> anyhow::Re
     let config = AgentConfig {
         runtime: "claude".into(),
         profile: "agent".into(),
+        public_name: Default::default(),
         user: "alice".into(),
         about: String::new(),
         caps: vec![],
@@ -2760,6 +2782,7 @@ async fn openclaw_watches_a_dispatched_run() -> anyhow::Result<()> {
     let config = AgentConfig {
         runtime: "openclaw".into(),
         profile: "agent".into(),
+        public_name: Default::default(),
         user: "alice".into(),
         about: String::new(),
         caps: vec![],
@@ -2946,6 +2969,7 @@ async fn openclaw_forwards_wakes_to_the_gateway() -> anyhow::Result<()> {
     let config = AgentConfig {
         runtime: "openclaw".into(),
         profile: "agent".into(),
+        public_name: Default::default(),
         user: "alice".into(),
         about: String::new(),
         caps: vec![],
@@ -3157,6 +3181,7 @@ async fn asks_stored_before_the_runner_started_still_wake_it() -> anyhow::Result
     let config = AgentConfig {
         runtime: "claude".into(),
         profile: "agent".into(),
+        public_name: Default::default(),
         user: "alice".into(),
         about: String::new(),
         caps: vec![],
@@ -3270,6 +3295,7 @@ async fn heartbeats_offer_older_unanswered_asks() -> anyhow::Result<()> {
     let config = AgentConfig {
         runtime: "claude".into(),
         profile: "agent".into(),
+        public_name: Default::default(),
         user: "alice".into(),
         about: String::new(),
         caps: vec![],
@@ -3392,6 +3418,7 @@ async fn a_clarify_past_its_deadline_wakes_the_agent_for_its_default() -> anyhow
     let config = AgentConfig {
         runtime: "claude".into(),
         profile: "agent".into(),
+        public_name: Default::default(),
         user: "alice".into(),
         about: String::new(),
         caps: vec![],
@@ -3590,6 +3617,7 @@ async fn local_agents_wake_each_other_but_not_on_the_humans_posts() -> anyhow::R
         AgentConfig {
             runtime: "claude".into(),
             profile: format!("alice-{name}"),
+            public_name: Default::default(),
             user: "alice".into(),
             about: String::new(),
             caps: vec![],
@@ -3712,6 +3740,7 @@ fn budget_config(
     AgentConfig {
         runtime: "claude".into(),
         profile: "agent".into(),
+        public_name: Default::default(),
         user: "alice".into(),
         about: String::new(),
         caps: vec![],
@@ -4075,6 +4104,7 @@ async fn a_follow_up_ask_to_an_answer_wakes_its_author() -> anyhow::Result<()> {
     let config = AgentConfig {
         runtime: "claude".into(),
         profile: "agent".into(),
+        public_name: Default::default(),
         user: "alice".into(),
         about: String::new(),
         caps: vec![],
