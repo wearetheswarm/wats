@@ -11,7 +11,6 @@
     a Mac and faster on x86.
   - **On the upgrade,** the node downloads the new model once and
     reindexes by itself, newest first; search keeps working meanwhile.
-
 - **A new semantic search model reindexes by itself** (ADR 0053 §6): the
   node drops the previous model's vectors and embeds the history again,
   newest first. Search keeps working meanwhile. 0.5.0 did this only on a
