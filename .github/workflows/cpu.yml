@@ -1,18 +1,37 @@
 name: cpu
-# Throwaway (exp/runner-cpu, never merged): which CPUs ubuntu-latest has.
+# Throwaway (exp/runner-cpu, never merged): which CPUs ubuntu-latest has,
+# and gemm's AVX2 vs AVX-512 (x86-v4) kernels and int8 weights on them.
 on: pull_request
 permissions:
   contents: read
 jobs:
-  cpu:
+  bench:
     strategy:
+      fail-fast: false
       matrix:
-        run: [1, 2, 3, 4]
+        run: [1, 2, 3, 4, 5, 6]
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - run: |
           grep -m1 "model name" /proc/cpuinfo
-          nproc
-          for f in avx2 fma avx512f avx512bw avx512vl avx512_vnni; do
-            printf '%s: ' "$f"; grep -qw "$f" /proc/cpuinfo && echo yes || echo no
+          grep -qw avx512f /proc/cpuinfo && echo "avx512f: yes" || echo "avx512f: no"
+      - name: model and tokenizer
+        run: |
+          curl -fsSL -o model.safetensors https://github.com/wearetheswarm/wats/releases/download/model-bge-small-en-v1.5-f16/bge-small-en-v1.5-f16.safetensors
+          echo "2e8ce3355bf8da29cfddf974901b6492e68fc540335047d87aee53cbb422fadc  model.safetensors" | sha256sum -c -
+          curl -fsSL -o tokenizer.json https://huggingface.co/BAAI/bge-small-en-v1.5/resolve/5c38ec7c405ec4b44b94cc5a9bb96e735b38267a/tokenizer.json
+          echo "d241a60d5e8f04cc1b2b3e9ef7a4921b27bf526d9f6050ab90f9267a1f9e5c66  tokenizer.json" | sha256sum -c -
+      - name: build
+        working-directory: exp/bench
+        run: |
+          cargo build -q --release
+          cp target/release/bertproto ../../avx2
+          cargo build -q --release --features avx512 --target-dir t512
+          cp t512/release/bertproto ../../avx512
+      - name: bench (one thread, 256 tokens, 300 posts)
+        run: |
+          for bin in avx2 avx512; do
+            echo "== $bin fp16"; TRUNC=256 ./$bin model.safetensors tokenizer.json exp/bench/posts.jsonl none 300 2>&1 | tail -1
+            echo "== $bin int8 on the fly"; INT8=1 TRUNC=256 ./$bin model.safetensors tokenizer.json exp/bench/posts.jsonl none 300 2>&1 | tail -1
           done

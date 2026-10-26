@@ -1,0 +1,20 @@
+[package]
+name = "bertproto"
+# throwaway bench (exp/runner-cpu, never merged)
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+gemm = { version = "=0.19.0", default-features = false, features = ["std"] }
+tokenizers = "0.22"
+serde_json = "1"
+anyhow = "1"
+libc = "0.2"
+
+[features]
+amx = ["gemm/experimental-apple-amx"]
+avx512 = ["gemm/x86-v4"]
+
+[profile.release]
+debug = false
+[workspace]
