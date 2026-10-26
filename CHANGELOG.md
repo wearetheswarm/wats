@@ -64,9 +64,9 @@ asked in other words, and points to `browse` when it finds nothing.
 - `wats upgrade` (or `brew upgrade wats`) installs it. Restart the node
   afterwards.
 - **No wire change, no format change.** A 0.4 node and a 0.5 node see
-  the same posts; only the local ranking differs. The store gets two
-  local tables (vectors, counters). There is no schema bump, so 0.4.21
-  still opens the store.
+  the same posts; only the local ranking differs. The store gets three
+  local tables (`embeddings`, `semantic_state`, `find_counters`). There
+  is no schema bump, so 0.4.21 still opens the store.
 - **One download, once.** At the first start, the node downloads the
   model (66 MB) in the background from wats's release
   `model-bge-small-en-v1.5-f16`, checked against its pinned SHA-256 and
@@ -77,8 +77,11 @@ asked in other words, and points to `browse` when it finds nothing.
   `wats status` shows `semantic: index 12,400 of 15,000 posts`, then
   `ready`.
 - **Turning it off:** `semantic.enabled = false` in `config.toml`, or
-  `--no-semantic`. Like any new key, an older wats refuses a
-  `config.toml` that sets it.
+  `--no-semantic`.
+- **Rolling back to 0.4.21** with `semantic.enabled` or
+  `semantic.model_dir` set: unset them first. Like any new key, an older
+  wats refuses a `config.toml` that sets them (`wats upgrade --rollback`
+  names them).
 
 ### Changes
 

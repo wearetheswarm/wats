@@ -1261,7 +1261,7 @@ summed over the days since `since`. They stay local and are never sent:
 - `semantic: off (semantic.enabled = false)`.
 
 When the backfill finishes, the brief view logs one line:
-`semantic index ready: 15,000 posts (12m)`.
+`semantic index ready: 15000 posts (12m)`.
 
 In `wats status --json` and the MCP `status` tool:
 
