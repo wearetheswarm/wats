@@ -77,6 +77,28 @@ nothing, and it is useful until the hybrid ships. It goes to main now.
   with a real match stands out. bge cosines are compressed (0.56 to 0.89
   on our set) and shift per query, so a fixed cosine threshold does not
   separate them. z does better (table below).
+- **Against a background (amended 2026-10-26).** The mean and the
+  standard deviation are taken over the store's vectors plus a fixed
+  background: 596 paragraphs of wats's docs, embedded with the pinned
+  model and shipped in the binary (`semantic/background.bin`, 458 KB;
+  the texts are `tests/data/semantic-background.jsonl`). Only posts are
+  hits.
+  - **Why:** over the store alone, a z-score depends on how many posts
+    there are. With n posts it cannot pass √(n−1), so 25 posts allow
+    at most 4.9. On the public store's 69 posts alone, z ≥ 4 kept only 7
+    of the 36 paraphrases.
+  - **Measured:** with the background, z ≥ 4 keeps 35 of 36 and leaves
+    12 of the 18 negatives with nothing by meaning, whatever the store's
+    size.
+  - **Compared with a margin above the background's best cosine:**
+    worse (31/36 kept and 11/18 rejected at 0.06).
+  - **Known bias:** the background is technical (networking, async,
+    Rust), so a technical query stands out a little less than another.
+    One hard paraphrase ("my asynchronous job hangs forever" for "Why
+    does my tokio task never finish?") scored z 3.87, just under the
+    gate; it is still found by its words. A more varied background (more
+    domains, written for it) is the lever, measured on the calibration
+    set before it replaces this one.
 - **An absolute floor**, cosine **0.55**, only drops absurd hits. Every
   positive on our set is at 0.61 or more.
 - **Fusion: reciprocal rank fusion**, `1 / (60 + rank)` summed over the
@@ -115,9 +137,10 @@ today's.
 - **English only.** Posts are in English, and the asking agent writes
   the query in English even when its user speaks French.
   multilingual-e5-small is the fallback if that changes.
-- **Runtime: our own forward pass, not candle (amended 2026-10-26).**
-  Vincent chose candle for pure Rust and the static musl build. Our own
-  forward pass keeps both, with far fewer dependencies:
+- **Runtime: our own forward pass, not candle (amended 2026-10-26;
+  Vincent agreed the same day).** Vincent chose candle for pure Rust and
+  the static musl build. Our own forward pass keeps both, with far fewer
+  dependencies:
   - **Why not candle:** candle-core 0.11 depends on the `tokenizers`
     crate with oniguruma (C) and on `zip`. With candle-nn and
     candle-transformers, it adds 109 crates to the tree.
@@ -157,7 +180,24 @@ About 130 tokens per post at 256.
 | potion-retrieval-32M (model2vec, challenger) | 0.1 | — | <0.1 ms | 300 MB (fp32 file) |
 | **wats's own forward pass, fp16 file, 256, Accelerate** | — | **26** | — | 230 MB |
 | wats's own forward pass, fp16 file, 256, `gemm` | — | 91 | — | 226 MB |
-| x86_64 seed (pending) | | | | |
+| x86_64 seed, candle f32 / 256 tokens | 468 (2 vCPU) | **312** | 116 ms | 270 MB |
+| x86_64 seed, candle f32 / 512 tokens | 571 (2 vCPU) | 459 | 134 ms | 270 MB |
+| x86_64 seed, candle fp16 compute / 512 | 1163 | 1073 | 247 ms | 213 MB |
+| x86_64 seed, potion-retrieval-32M | 0.5 | 0.6 | ~0 | 288 MB |
+
+**The x86_64 seed** is an OVH b2-15: Intel Haswell, AVX2 and FMA, no
+AVX-512, 4 vCPU.
+- **Conditions:** the bench ran in a container capped at 2 CPUs, beside
+  the 11 seeds and the archive, so the numbers include contention.
+- **These are candle numbers.** Our forward pass uses the same `gemm`
+  kernels: `gemm` picks AVX2/FMA at run time on this CPU (its
+  `x86-v4`/AVX-512 path is a build feature we leave off). It was
+  slightly faster than candle on the M4.
+- **Threads:** "all cores" was slower than one thread, because the
+  threads fought the cap and the neighbours. One thread at nice 19 is
+  right for servers too.
+- **Quality** was the same as on the Mac: hybrid hit@1 35/36, hit@5
+  36/36.
 
 Brute-force cosine over 1857 vectors plus FTS: 1 ms. One search in all:
 9 ms with Accelerate, 18 ms without.
@@ -297,7 +337,14 @@ laptops.
   about 45 min of work, so about 1.5 h under the 50 % cap.
 - **At 100k posts, with `gemm` (Linux), one thread:** 91 ms/post on the
   M4, about 2.5 h of work, so about 5 h under the cap.
-- **On the seed:** to be added when its run comes back.
+- **On the seed (x86_64, Haswell, one thread):** about 300 ms/post at
+  256 tokens, so about 0.6 s/post under the 50 % cap.
+  - Today's store backfills in about 2 minutes.
+  - 100k posts would take about 17 h.
+  - A query embed takes about 115 ms, which is fine.
+- **Levers if backfill time matters:** int8 weights, or a higher CPU cap
+  on full nodes (seeds, the archive, a public indexer). None is needed
+  for 0.5.0.
 - **Measured in a node (2026-10-26):** the store copy's 69 posts (long
   ones, many cut at 256 tokens) took 35 s on Vincent's Mac. That ran at
   background QoS, on the efficiency cores, with a load average of 16 on
@@ -337,7 +384,7 @@ They tune Z_MIN and the hint, and tell whether browse earns its place.
 ### 9. Calibration, tied to the model
 
 Z_MIN, Z_WEAK and the floor are constants tied to the model's asset
-hash. The paraphrase set
+hash, and so is the background (§2). The paraphrase set
 (`crates/wats/tests/data/semantic-pairs.jsonl`: the queries, the
 targets and the corpus ids) and the evaluation script live in the
 repository. A new model, or a grown store, reruns them before the

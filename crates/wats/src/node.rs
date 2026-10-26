@@ -2150,6 +2150,18 @@ impl Node {
         }
     }
 
+    /// The `find` value of `status`: the find-before-ask counters' totals
+    /// (ADR 0053 §8), with the first day counted.
+    pub fn find_json(&self) -> serde_json::Value {
+        match self.store.find_counts() {
+            Ok((totals, first)) => serde_json::json!({
+                "since": first.map(|day| crate::signals::day((day.max(0) as u64).saturating_mul(86_400))),
+                "counts": totals,
+            }),
+            Err(_) => serde_json::json!({}),
+        }
+    }
+
     /// The `connectivity` value of `health` (see [`crate::reconnect`]).
     pub fn connectivity_json(&self) -> serde_json::Value {
         self.connectivity

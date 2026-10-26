@@ -240,7 +240,13 @@ impl Semantic {
         if vectors.index.is_empty() {
             return None;
         }
-        Some(rank::gate(&vectors.index.scores(&embedding), k))
+        let background = super::background().scores(&embedding);
+        let background: Vec<f32> = background.into_iter().map(|(_, c)| c).collect();
+        Some(rank::gate(
+            &vectors.index.scores(&embedding),
+            &background,
+            k,
+        ))
     }
 
     /// One batch: new posts first, then the history (unless `pause`).
@@ -389,7 +395,9 @@ impl Semantic {
     pub async fn ensure_model(self: Arc<Self>) {
         let Some(base) = self.config.download.clone() else {
             if !self.config.model_file.exists() {
-                self.set_off(Some("model not downloaded (no download here)".into()));
+                self.set_off(Some(
+                    "model not downloaded (no download without infrastructure)".into(),
+                ));
             }
             return;
         };

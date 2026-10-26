@@ -58,17 +58,25 @@ pub struct VectorHit {
 
 /// The gated vector hits among `scores` (each post's cosine with the
 /// query), best first, at most `k`.
-pub fn gate(scores: &[(i64, f32)], k: usize) -> Vec<VectorHit> {
-    let n = scores.len();
-    if n < 2 {
+///
+/// The distribution is the store's posts and `background`, the query's
+/// cosines with a fixed set of texts ([`super::background`]): in a small
+/// store, the posts alone are too few for a z-score to mean anything (with
+/// 69 posts, z ≥ 4 kept 7 of 36 paraphrases; with the background, 35).
+/// Only posts are hits.
+pub fn gate(scores: &[(i64, f32)], background: &[f32], k: usize) -> Vec<VectorHit> {
+    let n = scores.len() + background.len();
+    if n < 2 || scores.is_empty() {
         return Vec::new();
     }
-    let mean = scores.iter().map(|s| f64::from(s.1)).sum::<f64>() / n as f64;
-    let var = scores
-        .iter()
-        .map(|s| (f64::from(s.1) - mean).powi(2))
-        .sum::<f64>()
-        / n as f64;
+    let all = || {
+        scores
+            .iter()
+            .map(|s| f64::from(s.1))
+            .chain(background.iter().map(|&c| f64::from(c)))
+    };
+    let mean = all().sum::<f64>() / n as f64;
+    let var = all().map(|c| (c - mean).powi(2)).sum::<f64>() / n as f64;
     let std = var.sqrt();
     if std <= f64::EPSILON {
         return Vec::new();
@@ -156,12 +164,9 @@ pub fn fuse(words: &[i64], vectors: &[VectorHit], code: bool) -> Vec<Fused> {
     out
 }
 
-/// Whether two fusion scores are a near-tie (within 5 %), where the
-/// quality order may swap them (ADR 0053 §2).
-pub fn near_tie(a: f64, b: f64) -> bool {
-    let (hi, lo) = if a >= b { (a, b) } else { (b, a) };
-    hi <= 0.0 || lo / hi >= 0.95
-}
+/// The width of a near-tie between fusion scores, relative to the best
+/// (ADR 0053 §2): within it, the quality order applies.
+pub const NEAR_TIE: f64 = 0.05;
 
 #[cfg(test)]
 mod tests {
@@ -176,13 +181,24 @@ mod tests {
             .collect();
         scores.push((5000, 0.85));
         scores.push((5001, 0.66));
-        let hits = gate(&scores, 50);
+        let hits = gate(&scores, &[], 50);
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].seq, 5000);
         assert!(hits[0].z > Z_WEAK);
         // Everything alike: nothing stands out.
-        assert!(gate(&[(1, 0.7), (2, 0.7), (3, 0.7)], 50).is_empty());
-        assert!(gate(&[(1, 0.9)], 50).is_empty());
+        assert!(gate(&[(1, 0.7), (2, 0.7), (3, 0.7)], &[], 50).is_empty());
+        assert!(gate(&[(1, 0.9)], &[], 50).is_empty());
+    }
+
+    /// Three posts: alone, nothing could stand out; against the
+    /// background, the one close to the query does.
+    #[test]
+    fn a_small_store_gates_against_the_background() {
+        let background: Vec<f32> = (0..600).map(|i| 0.55 + (i % 9) as f32 * 0.01).collect();
+        let scores = [(1, 0.86), (2, 0.6), (3, 0.58)];
+        assert!(gate(&scores, &[], 50).is_empty());
+        let hits = gate(&scores, &background, 50);
+        assert_eq!(hits.iter().map(|h| h.seq).collect::<Vec<_>>(), [1]);
     }
 
     #[test]
@@ -192,7 +208,7 @@ mod tests {
             .map(|i| (i, 0.2 + (i % 5) as f32 * 0.005))
             .collect();
         scores.push((9, 0.5));
-        assert!(gate(&scores, 50).is_empty());
+        assert!(gate(&scores, &[], 50).is_empty());
     }
 
     #[test]
@@ -236,11 +252,5 @@ mod tests {
         assert_eq!(fused[0].seq, 1);
         let fused = fuse(&[1], &[hit(9, 8.0)], false);
         assert_eq!(fused[0].score, fused[1].score);
-    }
-
-    #[test]
-    fn near_ties() {
-        assert!(near_tie(1.0 / 61.0, 1.0 / 62.0));
-        assert!(!near_tie(2.0 / 61.0, 1.0 / 61.0));
     }
 }

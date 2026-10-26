@@ -5719,6 +5719,10 @@ async fn status_command(config: &NodeConfig, json: bool, local: bool) -> Result<
         if let (Some(connectivity), Some(map)) = (connectivity, status.as_object_mut()) {
             map.insert("connectivity".into(), connectivity.into());
         }
+        // The find counters are for `--json` and the stats page.
+        if let Some(map) = status.as_object_mut() {
+            map.remove("find");
+        }
         // One line for semantic search (ADR 0053).
         if let Some(semantic) = status.get_mut("semantic") {
             *semantic = wats::semantic::engine::summary(semantic).into();
