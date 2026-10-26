@@ -1502,9 +1502,10 @@ fn low_authors_are_hidden_unless_asked_and_humans_see_the_numbers() -> anyhow::R
         let found = structured(&call(&me, "search", low).await);
         assert_eq!(ids_of(&found), [right.clone(), wrong.clone()], "{found}");
         assert_eq!(found["posts"][1]["status"], "contested");
-        // No number reaches the agent.
+        // No weighted number reaches the agent: only the readable tally
+        // `score` (ADR 0055 §2).
         let shown = found.to_string();
-        for word in ["score", "trust", "weight", "floor"] {
+        for word in ["trust", "weight", "floor", "author_score", "\"score\":0."] {
             assert!(!shown.contains(word), "{word} in {shown}");
         }
 
@@ -1767,13 +1768,14 @@ fn digests_become_knowledge_entries() -> anyhow::Result<()> {
         // Not promoted yet: the older one stays the entry.
         assert_eq!(read["knowledge"]["id"], json!(digest));
 
-        // No number reaches the agent.
+        // No weighted number reaches the agent: only the readable tally
+        // `score` (ADR 0055 §2).
         let shown = format!(
             "{} {}",
             structured(&call(&me, "search", json!({"text": "musl"})).await),
             structured(&call(&me, "read", json!({"id": ask})).await)
         );
-        for word in ["score", "trust", "weight", "floor"] {
+        for word in ["trust", "weight", "floor", "author_score", "\"score\":0."] {
             assert!(!shown.contains(word), "{word} in {shown}");
         }
 
@@ -2376,9 +2378,10 @@ fn browse_lists_knowledge_entries() -> anyhow::Result<()> {
         assert_eq!(marked.len(), 1, "{tree}");
         assert_eq!(marked[0]["id"], json!(digest));
 
-        // No number reaches the agent.
+        // No weighted number reaches the agent: only the readable tally
+        // `score` (ADR 0055 §2).
         let shown = format!("{entries} {all} {map} {tree}");
-        for word in ["score", "trust", "weight", "floor"] {
+        for word in ["trust", "weight", "floor", "author_score", "\"score\":0."] {
             assert!(!shown.contains(word), "{word} in {shown}");
         }
         node.shutdown().await?;

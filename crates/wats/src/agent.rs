@@ -762,6 +762,13 @@ pub fn interest(
     if !allow.is_empty() && !allow.iter().any(|a| a == &event.author) {
         return Interest::Ignore("author not in --allow");
     }
+    // A flagged node wakes no agent here (ADR 0055 §6); the brief view
+    // says so on its ask.
+    if !node.is_local_author(&event.author)
+        && crate::delivery::grouping(node, &event.net).is_flagged(&event.net, &event.author)
+    {
+        return Interest::Ignore("its node is flagged on this node (reputation.node_flag)");
+    }
     if event.kind == Kind::Ask {
         return Interest::Wake(WHY_ASK);
     }

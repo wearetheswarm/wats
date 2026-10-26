@@ -476,6 +476,9 @@ impl State {
         let mut events: Vec<&Event> = replies_to(ask, thread);
         events.sort_by(|a, b| (a.ts, &a.id).cmp(&(b.ts, &b.id)));
         let by_asker = |e: &&Event| grouping.same_key(net, asker, &e.author);
+        // A flagged node's claims and answers hold nobody back (ADR 0055
+        // §6): otherwise junk answered first would stop others serving.
+        events.retain(|e| by_asker(e) || !grouping.is_flagged(net, &e.author));
 
         // The asker's accept: the latest `data.accept` true, unless a later
         // `data.accept` false on the same answer withdrew it (as in
@@ -1027,7 +1030,8 @@ pub fn lenient_notes(kind: &Kind, data: &serde_json::Map<String, Value>) -> Vec<
 /// How `node` groups keys in `net` (ADR 0019 §2.4): its own profiles
 /// together, and its reputation table's groups when it has one.
 pub fn grouping(node: &crate::node::Node, net: &str) -> Grouping {
-    let grouping = Grouping::new(node.local_authors());
+    let grouping =
+        Grouping::new(node.local_authors()).with_node_flag(node.config().reputation.node_flag);
     match node.reputation(net) {
         Ok(table) => grouping.with_table(table),
         Err(e) => {

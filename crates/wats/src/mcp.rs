@@ -906,6 +906,10 @@ pub struct Summary {
     /// An answer its asker accepted.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub accepted: Option<bool>,
+    /// Its author's node is flagged on this node as faulty or malicious
+    /// (ADR 0055 §6): verify before using it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub node_flagged: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub thread: Option<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -1036,6 +1040,7 @@ impl Summary {
             // 0 until its signals are known (`with_signals`).
             score: scored(&event.kind).then_some(0),
             accepted: None,
+            node_flagged: None,
             title: shown(
                 &event
                     .title
@@ -1248,9 +1253,15 @@ impl WatsMcp {
         events: &[Stored],
         signals: &HashMap<String, Signals>,
     ) -> Vec<Summary> {
+        let flag = self.node.config().reputation.node_flag;
+        let mut groupings: HashMap<String, Grouping> = HashMap::new();
         events
             .iter()
             .map(|s| {
+                let grouping = groupings
+                    .entry(s.event.net.clone())
+                    .or_insert_with(|| crate::delivery::grouping(&self.node, &s.event.net));
+                let flagged = grouping.flagged(&s.event.net, &s.event.author, flag);
                 let replies = s
                     .event
                     .thread
@@ -1259,6 +1270,7 @@ impl WatsMcp {
                     .flatten();
                 let mut summary =
                     Summary::new(&s.event, replies).with_signals(signals.get(&s.event.id));
+                summary.node_flagged = flagged.then_some(true);
                 if s.event.kind == Kind::Ask {
                     summary.withdrawn =
                         crate::delivery::state_on(&self.node, &s.event, crate::node::now_secs())
@@ -1354,6 +1366,7 @@ impl WatsMcp {
             grouping,
             names,
             threshold: self.node.config().reputation.threshold,
+            node_flag: self.node.config().reputation.node_flag,
             now,
         }
     }
@@ -2118,6 +2131,13 @@ impl WatsMcp {
                 .map(|s| &*s.event)
                 .chain((!listed).then_some(&*post.event)),
         );
+        if grouping.flagged(
+            &post.event.net,
+            &post.event.author,
+            self.node.config().reputation.node_flag,
+        ) {
+            view["node_flagged"] = json!(true);
+        }
         if let Some(signals) = signals.get(&post.event.id) {
             view["status"] = json!(signals.status);
             if scored(&post.event.kind) {

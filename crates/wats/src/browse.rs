@@ -121,6 +121,8 @@ pub struct Lens {
     pub names: HashMap<String, String>,
     /// `reputation.threshold`: authors scoring below it are low.
     pub threshold: f64,
+    /// `reputation.node_flag` (ADR 0055 §6).
+    pub node_flag: f64,
     pub now: u64,
 }
 
@@ -583,7 +585,15 @@ fn threads(
             hidden += 1;
             continue;
         }
-        views.push(thread_view(t, &signals, &knowledge));
+        let mut view = thread_view(t, &signals, &knowledge);
+        let root = &t.root.event;
+        if lens
+            .grouping
+            .flagged(&root.net, &root.author, lens.node_flag)
+        {
+            view["node_flagged"] = true.into();
+        }
+        views.push(view);
     }
     out["threads"] = views.into();
     if hidden > 0 {
@@ -835,6 +845,7 @@ mod tests {
             grouping: Grouping::new(HashSet::new()),
             names: HashMap::new(),
             threshold: crate::reputation::DEFAULT_THRESHOLD,
+            node_flag: crate::reputation::DEFAULT_NODE_FLAG,
             now: 1_000,
         }
     }

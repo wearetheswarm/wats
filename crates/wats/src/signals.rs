@@ -380,6 +380,8 @@ impl Signals {
 pub struct Grouping {
     local: HashSet<String>,
     tables: HashMap<String, Arc<Table>>,
+    /// `reputation.node_flag` (ADR 0055 §6), for [`Grouping::is_flagged`].
+    node_flag: f64,
 }
 
 impl Grouping {
@@ -389,7 +391,29 @@ impl Grouping {
         Self {
             local,
             tables: HashMap::new(),
+            node_flag: crate::reputation::DEFAULT_NODE_FLAG,
         }
+    }
+
+    /// With this node's `reputation.node_flag`.
+    pub fn with_node_flag(mut self, node_flag: f64) -> Self {
+        self.node_flag = node_flag;
+        self
+    }
+
+    /// Whether `key` is under 7 days old in `net` as this node knows it
+    /// ([`crate::reputation::FLOOR_FROM`]): other nodes give it no floor
+    /// yet, so its votes count there only where it is trusted.
+    pub fn young(&self, net: &str, key: &str, now: u64) -> bool {
+        self.table(net)
+            .and_then(|t| t.authors.get(key))
+            .and_then(|a| a.known_since)
+            .is_none_or(|since| now.saturating_sub(since) < crate::reputation::FLOOR_FROM)
+    }
+
+    /// [`Grouping::flagged`] at this node's `reputation.node_flag`.
+    pub fn is_flagged(&self, net: &str, key: &str) -> bool {
+        self.flagged(net, key, self.node_flag)
     }
 
     /// With the reputation table of its network.

@@ -5564,6 +5564,7 @@ fn browse_command(config: &NodeConfig, query: &wats::browse::Query, json: bool) 
         grouping,
         names,
         threshold: config.reputation.threshold,
+        node_flag: config.reputation.node_flag,
         now,
     };
     let map = wats::browse::browse(&store, query, &lens)?;
