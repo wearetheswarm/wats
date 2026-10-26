@@ -1223,6 +1223,7 @@ async fn reconnect_loop(weak: std::sync::Weak<Node>) {
                 .and_then(|mut c| c.online(peers, now_secs()));
             if let Some(transition) = transition {
                 transition.log();
+                node.brief_connectivity(&transition);
             }
             (starting, attempt, next, reported) = (false, 1, None, 0);
             if changed && last_catch_up.is_none_or(|t| t.elapsed() >= CATCH_UP_EVERY) {
@@ -1258,6 +1259,7 @@ async fn reconnect_loop(weak: std::sync::Weak<Node>) {
                 .and_then(|mut c| c.offline(attempt, wait, dialable, now_secs()));
             if let Some(transition) = transition {
                 transition.log();
+                node.brief_connectivity(&transition);
             }
         }
         if now >= at {
@@ -1374,6 +1376,8 @@ pub struct Node {
     usage: std::sync::Mutex<Option<(std::time::Instant, u64)>>,
     /// What the reconnect loop sees ([`crate::reconnect`]).
     connectivity: std::sync::Mutex<crate::reconnect::Connectivity>,
+    /// The brief view's connectivity and health lines (ADR 0052).
+    notices: std::sync::Mutex<crate::awake::Notices>,
     /// Wakes the reconnect loop: a neighbor up, a network change.
     reconnect_kick: Arc<tokio::sync::Notify>,
     /// A network change since the reconnect loop last looked.
@@ -1875,6 +1879,7 @@ impl Node {
             seed_ids,
             links: Default::default(),
             connectivity: std::sync::Mutex::new(crate::reconnect::Connectivity::new(now_secs())),
+            notices: Default::default(),
             reconnect_kick: Default::default(),
             network_changed: Default::default(),
             redialing: Default::default(),
@@ -1886,6 +1891,8 @@ impl Node {
         node.measure_storage().await;
         // Brief lines for `wats attach` (ADR 0051).
         tokio::spawn(crate::brief::watch(Arc::downgrade(&node)));
+        // Quiet across a laptop's sleep (ADR 0052).
+        tokio::spawn(crate::awake::watch(Arc::downgrade(&node)));
         if node.events_share().is_some() {
             // Rotation at the cap (ADR 0025 §7): checked at start, then
             // every 30 s, in the background.
@@ -2497,7 +2504,40 @@ impl Node {
         };
         for transition in transitions {
             transition.log();
+            let mono = std::time::Instant::now();
+            let lines = self.notices(|n| match &transition {
+                crate::health::Transition::Raised { what, detail } => {
+                    n.raised(*what, detail, mono);
+                    Vec::new()
+                }
+                crate::health::Transition::Changed { what, detail } => n.changed(*what, detail),
+                crate::health::Transition::Recovered { what, .. } => n.recovered(*what),
+            });
+            crate::awake::log(lines);
         }
+    }
+
+    /// Runs `f` on the brief view's connectivity and health state.
+    pub fn notices<T: Default>(&self, f: impl FnOnce(&mut crate::awake::Notices) -> T) -> T {
+        self.notices
+            .lock()
+            .map(|mut n| f(&mut n))
+            .unwrap_or_default()
+    }
+
+    /// Feeds a connectivity change to the brief view (ADR 0052).
+    fn brief_connectivity(&self, transition: &crate::reconnect::Transition) {
+        use crate::reconnect::Transition;
+        let (wall, mono) = (now_secs(), std::time::Instant::now());
+        let lines = self.notices(|n| match transition {
+            Transition::WentOffline { .. } => {
+                n.went_offline(wall, mono);
+                Vec::new()
+            }
+            Transition::BackOnline { .. } => n.back_online(wall, mono),
+            Transition::Retrying { .. } => Vec::new(),
+        });
+        crate::awake::log(lines);
     }
 
     /// The health checks: relay, bootstrap and peers every
