@@ -1947,16 +1947,19 @@ fn lent_servers(config: &AgentConfig) -> Vec<(String, serde_json::Value)> {
 /// Whether an agent this node knows of announces every one of `caps` on
 /// `net` (its latest `announce`): the capable agents an ask's grace waits
 /// for. On a store error, as if one did.
+/// Whether an agent this node knows announced `caps` in the last
+/// [`ANNOUNCED_WITHIN`], in any of its announces (seen live: held agents
+/// woke at 99 s of the cap grace, as if the capable agent had gone, while
+/// it held a live claim). Unknown (a store error): yes, they wait.
 fn someone_announces(node: &Node, net: &str, caps: &[String]) -> bool {
-    let filter = crate::store::Filter {
-        net: Some(net.to_string()),
-        tags: caps.to_vec(),
-        ..Default::default()
-    };
+    let since = unix_now().saturating_sub(ANNOUNCED_WITHIN.as_secs());
     node.store()
-        .latest_announces(&filter, 1)
-        .map_or(true, |found| !found.is_empty())
+        .announced_since(net, caps, since)
+        .unwrap_or(true)
 }
+
+/// How far back an announce counts for "an agent announces this".
+const ANNOUNCED_WITHIN: Duration = Duration::from_secs(7 * 24 * 3600);
 
 /// `agent.effort` as the runtime's own flag, unless the extra arguments
 /// already set one: Claude Code `--effort`, Codex `-c

@@ -1133,6 +1133,87 @@ async fn a_generalist_lets_the_field_go_first() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Neither a claim in the thread nor a re-announce of the capable agent
+/// ends the cap grace early (seen live: three held agents woke at 99 s of
+/// 120 while the capable agent held a live claim).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_claim_does_not_end_the_cap_grace() -> anyhow::Result<()> {
+    const GRACE: u64 = 6;
+    let dir = tempfile::tempdir()?;
+    let hub = node(&dir.path().join("hub"), &[], |_| {}).await?;
+    let grace = |c: &mut NodeConfig| c.cap_grace = Duration::from_secs(GRACE);
+    let a = node(&dir.path().join("a"), &[&hub], grace).await?;
+    a.wait_for_neighbor(PUBLIC_NET, Duration::from_secs(10))
+        .await?;
+    // A capable agent, not the asker.
+    let db = hub.author_key("db-agent")?;
+    hub.publish_as(
+        &db,
+        Draft {
+            net: PUBLIC_NET.into(),
+            kind: Some(Kind::Announce),
+            title: Some("db-agent".into()),
+            text: "I run databases.".into(),
+            tags: vec!["cap:db".into()],
+            ..Draft::default()
+        },
+        &[],
+    )
+    .await?;
+    let every = Duration::from_millis(200);
+    let ra = dir.path().join("ra");
+    let runner = start(
+        &a,
+        agent(&ra, &dir.path().join("a"), &["docs-search"], every),
+    );
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let ask = hub
+        .publish(
+            ask_with(
+                "Postgres 15 upsert fails?",
+                json!({"mode": "any"}),
+                &["cap:db".into()],
+            ),
+            &[],
+        )
+        .await?;
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    hub.publish_as(&db, reply(&ask, Kind::Claim, json!({"lease": 300})), &[])
+        .await?;
+    // And it announces again, without the cap: what it announced this week
+    // still counts, so the held agent stays held.
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    hub.publish_as(
+        &db,
+        Draft {
+            net: PUBLIC_NET.into(),
+            kind: Some(Kind::Announce),
+            title: Some("db-agent".into()),
+            text: "I run things.".into(),
+            ..Draft::default()
+        },
+        &[],
+    )
+    .await?;
+    tokio::time::sleep(Duration::from_secs(GRACE + 2)).await;
+    let woke: Vec<u64> = runs_for(&ra, &ask)
+        .iter()
+        .map(|(_, at)| at.duration_since(SystemTime::UNIX_EPOCH).unwrap().as_secs())
+        .collect();
+    assert!(
+        woke.is_empty(),
+        "woke for an ask a capable agent claimed, at ask.ts + {:?}",
+        woke.iter()
+            .map(|t| t.saturating_sub(ask.ts))
+            .collect::<Vec<_>>()
+    );
+    runner.stop().await?;
+    for n in [a, hub] {
+        n.shutdown().await?;
+    }
+    Ok(())
+}
+
 /// ADR 0048 §3, §4: a run that fails on an overloaded API is tried again,
 /// and declines nothing when the retry works; a run that keeps failing is
 /// final after two retries, and the next heartbeat offers what it missed.
