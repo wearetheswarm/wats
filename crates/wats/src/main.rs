@@ -531,6 +531,14 @@ enum Command {
         #[arg(long, default_value = "10s", value_parser = parse_duration)]
         timeout: Duration,
     },
+    /// The node as a per-user service, started at login and after a
+    /// reboot: a launch agent on macOS, a systemd user unit on Linux, for
+    /// the data directory (--dir, default ~/.wats). It restarts only after
+    /// a failure: `wats stop` keeps it stopped until the next login.
+    Service {
+        #[command(subcommand)]
+        action: ServiceAction,
+    },
     /// Several nodes on this machine, started and checked together (ADR
     /// 0028): `wats fleet up -n 6` creates six data directories under
     /// --base, each with its own key, port and agent workspace and the
@@ -746,6 +754,17 @@ enum Command {
         #[arg(long)]
         rollback: bool,
     },
+}
+
+#[derive(Debug, Subcommand)]
+enum ServiceAction {
+    /// Write the service and start the node through it (a node already
+    /// running in the data directory is stopped first).
+    Install,
+    /// Stop the service and remove it (the node stops).
+    Uninstall,
+    /// Whether the service is installed, and running.
+    Status,
 }
 
 #[derive(Debug, Subcommand)]
@@ -3538,7 +3557,141 @@ async fn offer_background(
     if !start {
         return Ok(());
     }
+    // The wizard also offers a service (0.5.2): a node that starts at each
+    // login and comes back after a reboot. Yes by default: testers on
+    // laptops lost their node after a reboot without noticing.
+    if wizard
+        && !detach
+        && wats::service::Manager::here().is_some()
+        && wats::firstrun::ask_yes_no(
+            &mut std::io::stdin().lock(),
+            &mut std::io::stdout(),
+            "Also start it at each login and after a reboot, as a service (`wats service install`)?",
+            true,
+        )?
+    {
+        let service = service_of(&dir)?;
+        let dry = wats::service::dry_run(args.hermetic);
+        return install_service(args, &dir, &service, user_id(), dry).await;
+    }
     start_detached(args, &dir).await
+}
+
+/// The service of `data_dir` for this user (`wats service`).
+fn service_of(data_dir: &std::path::Path) -> Result<wats::service::Service> {
+    let manager = wats::service::Manager::here()
+        .context("service mode is for macOS (launchd) and Linux (systemd) only")?;
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .context("HOME is not set")?;
+    let default = default_dir()?;
+    let node_name = std::fs::read_to_string(data_dir.join("node-name")).ok();
+    let name = wats::service::service_name(data_dir, &default, node_name.as_deref().map(str::trim));
+    Ok(wats::service::Service::of(manager, &home, &name))
+}
+
+/// This user's id, for `launchctl`'s `gui/<uid>` (read from HOME's owner:
+/// no `unsafe` here).
+#[cfg(unix)]
+fn user_id() -> u32 {
+    use std::os::unix::fs::MetadataExt;
+    std::env::var_os("HOME")
+        .and_then(|h| std::fs::metadata(h).ok())
+        .map_or(0, |m| m.uid())
+}
+
+/// `wats service install|uninstall|status`.
+#[cfg(unix)]
+async fn service_command(
+    args: &NodeArgs,
+    data_dir: &std::path::Path,
+    action: ServiceAction,
+) -> Result<()> {
+    let dir = std::path::absolute(data_dir)?;
+    let service = service_of(&dir)?;
+    let dry = wats::service::dry_run(args.hermetic);
+    let uid = user_id();
+    match action {
+        ServiceAction::Install => install_service(args, &dir, &service, uid, dry).await,
+        ServiceAction::Uninstall => {
+            if wats::service::uninstall(&service, uid, dry)? {
+                println!(
+                    "service removed ({}): the node no longer starts at login",
+                    service.file.display()
+                );
+            } else {
+                println!("no service installed for {}", tilde(&dir));
+            }
+            Ok(())
+        }
+        ServiceAction::Status => {
+            match wats::service::status(&service, uid, dry)? {
+                (false, _) => println!(
+                    "no service for {}: `wats service install` starts the node at login",
+                    tilde(&dir)
+                ),
+                (true, running) => println!(
+                    "service {} installed ({}){}",
+                    service.name,
+                    service.file.display(),
+                    match running {
+                        Some(true) => ", running",
+                        Some(false) =>
+                            ", not running (it starts at the next login, or: wats service install)",
+                        None => "",
+                    }
+                ),
+            }
+            Ok(())
+        }
+    }
+}
+
+#[cfg(not(unix))]
+async fn service_command(
+    _args: &NodeArgs,
+    _data_dir: &std::path::Path,
+    _action: ServiceAction,
+) -> Result<()> {
+    anyhow::bail!("service mode is for macOS (launchd) and Linux (systemd) only")
+}
+
+/// Writes the service of `dir` and starts the node through it; a node
+/// already running there is stopped first, so the service's takes over.
+#[cfg(unix)]
+async fn install_service(
+    args: &NodeArgs,
+    dir: &std::path::Path,
+    service: &wats::service::Service,
+    uid: u32,
+    dry: bool,
+) -> Result<()> {
+    let entry = NodeEntry::look(dir.to_path_buf()).await;
+    if entry.running && !dry {
+        stop_node(&entry, Duration::from_secs(10), "`wats service install`").await?;
+    }
+    let mut command: Vec<std::ffi::OsString> = vec![
+        wats::update::stable_exe()?.into(),
+        "--log-file".into(),
+        wats::background::log_path(dir).into(),
+    ];
+    command.extend(args.to_args(dir));
+    let path = std::env::var("PATH").unwrap_or_else(|_| "/usr/bin:/bin".into());
+    wats::service::install(service, &command, &path, dir, uid, dry)?;
+    println!(
+        "service installed ({}): the node starts now, at each login and after a reboot; \
+         it restarts only after a failure. Watch it: wats attach{} · remove it: wats service uninstall{}",
+        service.file.display(),
+        entry.dir_flag(),
+        entry.dir_flag(),
+    );
+    if service.manager == wats::service::Manager::Systemd {
+        println!(
+            "On a server with nobody logged in, also run `loginctl enable-linger $USER`, \
+             so that it starts at boot."
+        );
+    }
+    Ok(())
 }
 
 /// Start the node of `data_dir` in the background, as `wats --detach`
@@ -9007,6 +9160,9 @@ async fn async_main(mut cli: Cli) -> Result<()> {
         Some(Command::Stop { all, timeout, .. }) => {
             return stop_command(&cli.node, all, timeout).await;
         }
+        Some(Command::Service { action }) => {
+            return service_command(&cli.node, &data_dir, action).await;
+        }
         Some(Command::Fleet(fleet)) => return fleet_command(&cli.node, fleet, shutdown).await,
         Some(Command::Agent { name, action, .. }) => {
             return tokio::select! {
@@ -9154,7 +9310,8 @@ async fn async_main(mut cli: Cli) -> Result<()> {
             | Command::Attach { .. }
             | Command::Ps { .. }
             | Command::Stop { .. }
-            | Command::Fleet(_),
+            | Command::Fleet(_)
+            | Command::Service { .. },
         ) => {
             unreachable!("handled above")
         }

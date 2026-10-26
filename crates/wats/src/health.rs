@@ -210,6 +210,26 @@ struct Check {
 }
 
 impl Check {
+    /// [`Check::observe`] for a problem seen in the quiet time after a
+    /// wake: it is remembered from `now` at the latest, never raised.
+    fn observe_quietly(&mut self, problem: Option<Problem>, now: u64) -> Option<Transition> {
+        let problem = problem?;
+        if !self.applicable {
+            return None;
+        }
+        let bad = self.bad.get_or_insert_with(|| Bad {
+            since: now,
+            problem: problem.clone(),
+            problem_since: now,
+            logged: None,
+        });
+        if bad.problem != problem {
+            bad.problem = problem;
+            bad.problem_since = now;
+        }
+        None
+    }
+
     fn observe(&mut self, problem: Option<Problem>, now: u64) -> Option<Transition> {
         if !self.applicable {
             return None;
@@ -316,6 +336,9 @@ impl Plan {
 #[derive(Debug, Clone)]
 pub struct Health {
     checks: Vec<Check>,
+    /// No issue is raised before this (unix seconds): just after a wake
+    /// from sleep, as in the brief view (ADR 0052; 0.5.2).
+    quiet_until: u64,
 }
 
 impl Health {
@@ -340,6 +363,7 @@ impl Health {
                 // Blob collection is called stopped only once overdue.
                 check(What::Storage, plan.storage, Duration::ZERO),
             ],
+            quiet_until: 0,
         }
     }
 
@@ -355,10 +379,34 @@ impl Health {
         problem: Option<Problem>,
         now: u64,
     ) -> Option<Transition> {
-        self.checks
-            .iter_mut()
-            .find(|c| c.what == what)?
-            .observe(problem, now)
+        let quiet = now < self.quiet_until;
+        let check = self.checks.iter_mut().find(|c| c.what == what)?;
+        if quiet && problem.is_some() {
+            // Remember the problem from now on, but raise nothing yet.
+            if let Some(bad) = &mut check.bad
+                && bad.logged.is_none()
+            {
+                bad.since = bad.since.max(now);
+            }
+            return check.observe_quietly(problem, now);
+        }
+        check.observe(problem, now)
+    }
+
+    /// The machine woke from sleep at `now` (`crate::awake`): problems not
+    /// raised yet count from the wake, and none is raised for
+    /// [`crate::awake::AWAKE_GRACE`]. A laptop's relay, record and peers
+    /// come back by themselves; `status` read "degraded" for minutes.
+    pub fn woke(&mut self, now: u64) {
+        self.quiet_until = now.saturating_add(crate::awake::AWAKE_GRACE.as_secs());
+        for check in &mut self.checks {
+            if let Some(bad) = &mut check.bad
+                && bad.logged.is_none()
+            {
+                bad.since = now;
+                bad.problem_since = now;
+            }
+        }
     }
 
     pub fn is_degraded(&self) -> bool {
@@ -617,6 +665,42 @@ mod tests {
             0,
             Some(DEFAULT_NO_PEERS_AFTER),
         ))
+    }
+
+    /// After a wake, a problem seen before the sleep and still there is not
+    /// raised at once (its debounce passed while asleep), nor during the
+    /// wake's grace; it is raised once it lasts past both.
+    #[test]
+    fn a_wake_does_not_read_degraded() {
+        let mut h = all_on();
+        let p = || Some(Problem::new("relay.wearetheswarm.ai unreachable", None));
+        assert!(h.observe(What::Relay, p(), T0).is_none());
+        // Asleep 8 h; awake again, the relay still down for a moment.
+        let wake = T0 + 8 * 3600;
+        h.woke(wake);
+        assert!(h.observe(What::Relay, p(), wake + 10).is_none());
+        assert!(!h.is_degraded());
+        // Back before the grace ends: nothing raised, nothing recovered.
+        assert!(h.observe(What::Relay, None, wake + 60).is_none());
+        // Down for real later: raised after its debounce, as usual.
+        let later = wake + 600;
+        assert!(h.observe(What::Relay, p(), later).is_none());
+        let raised = h.observe(What::Relay, p(), later + RELAY_ALERT_AFTER.as_secs());
+        assert!(
+            matches!(raised, Some(Transition::Raised { .. })),
+            "{raised:?}"
+        );
+        // Down at the wake and still down past the grace: raised then.
+        let mut h = all_on();
+        assert!(h.observe(What::Relay, p(), T0).is_none());
+        h.woke(wake);
+        let grace = crate::awake::AWAKE_GRACE.as_secs();
+        assert!(h.observe(What::Relay, p(), wake + grace - 1).is_none());
+        let raised = h.observe(What::Relay, p(), wake + grace + RELAY_ALERT_AFTER.as_secs());
+        assert!(
+            matches!(raised, Some(Transition::Raised { .. })),
+            "{raised:?}"
+        );
     }
 
     fn fallback() -> Option<Problem> {
