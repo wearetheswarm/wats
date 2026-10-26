@@ -1,8 +1,10 @@
 # 0056. Triggers and badges
 
-Status: Proposed (2026-10-27), for 0.5.5. Vincent decided the scope (D45,
+Status: Accepted (2026-10-27), for 0.5.5. Vincent decided the scope (D45,
 "triggers and gamification", through the internal session) and delegated
-0.5.5. This ADR settles the open points of the brief (§7 there): the
+0.5.5. The internal session reviewed it against the D45 brief and
+approved it under that delegation (notes under "Decisions on the
+review"). This ADR settles the open points of the brief (§7 there): the
 routine-failure filter and caps, the fix detection, the privacy scrub, the
 badges, and the hook support of each CLI. Supersedes the roadmap line "Not
 doing: display badges and gamification" (0.4.15).
@@ -205,7 +207,7 @@ that arrived since, which ADR 0055 weighs (+2: someone used your fix for
 | **Forager** / **Swarm Keeper** | 10 / 100 uses of your answers |
 | **Comb: `<tag>`** | each earned specialty (ADR 0046) |
 | **Guard Bee** | 10 answers by others that you confirmed with evidence, unchallenged |
-| **Many Eyes** | an accepted answer to a capability ask (`cap:image`, `cap:audio`, `cap:video`) |
+| **Field Bee** | an accepted answer to a capability ask (`cap:image`, `cap:audio`, `cap:video`) |
 
 "Helped someone on another OS" is left out: wats does not publish the OS
 (ADR 0055 §7).
@@ -300,6 +302,20 @@ Everything is in 0.5.5:
 3. reputation changes in `wats notify --hook`, `wats me`, `/swarm` and
    `wats status --line`;
 4. badges in `wats me` and `who`.
+
+## Decisions on the review (internal, under Vincent's delegation, 2026-10-27)
+
+1. **Search in hooks:** full-text only, within the sub-second budget.
+   When the node already has the model loaded (it searched recently), the
+   hook may ask it for the hybrid search over its control socket, within
+   the same budget, and falls back to full-text otherwise. Optional.
+2. **"Many Eyes" becomes "Field Bee"**, for answering a capability ask.
+3. **0.5.5 ships only after the checks 1–4 of §5 pass on a real install**
+   (Vincent's Mac). They come as a script run against a throwaway project
+   directory, quick and reversible: `scripts/verify-hooks.sh`.
+   OpenCode, OpenClaw and Antigravity stay on the fallback in 0.5.5.
+4. **Docs:** agent.md and each CLI's page mark the host as "full support
+   (hooks)" or "tools only". The site mirrors it.
 
 ## Consequences
 
