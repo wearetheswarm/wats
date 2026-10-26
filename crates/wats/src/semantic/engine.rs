@@ -654,6 +654,21 @@ mod tests {
         assert_eq!(again.step(&store, false).unwrap(), Step::default());
     }
 
+    /// The published release (network): downloaded, checked against the
+    /// pinned SHA-256 and the release key's signature, and it loads.
+    #[test]
+    #[ignore = "downloads 66 MB from the model release"]
+    fn downloads_the_published_model() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join(MODEL_FILE);
+        tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(download(MODEL_URL, &dest))
+            .unwrap();
+        let model = model_loader()(&dest).unwrap();
+        assert_eq!(model.query("hello").len(), super::super::DIM);
+    }
+
     #[test]
     fn status_lines() {
         assert_eq!(
