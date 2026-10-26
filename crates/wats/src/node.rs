@@ -2122,6 +2122,14 @@ impl Node {
         self.router.endpoint()
     }
 
+    /// The machine woke from sleep: health issues wait for the wake's grace
+    /// ([`crate::health::Health::woke`]).
+    pub fn health_woke(&self, now: u64) {
+        if let Ok(mut health) = self.health.lock() {
+            health.woke(now);
+        }
+    }
+
     /// The `health` value of `status`: this node's view of the
     /// infrastructure (see [`crate::health`]).
     pub fn health_json(&self) -> serde_json::Value {

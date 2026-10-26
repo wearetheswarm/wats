@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+### Fixes
+
+- **`status` after a laptop wake** (ADR 0052): health no longer reads
+  `degraded` for minutes after a wake. Problems not raised yet count from
+  the wake, and none is raised for the brief view's 2-minute grace.
+
 ## 0.5.1 (2026-10-26)
 
 A smaller semantic search model, one agent per question in its field,
