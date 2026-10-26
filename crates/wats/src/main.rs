@@ -294,6 +294,10 @@ struct NodeArgs {
     /// 20G. Over it, the node stops fetching. Unlimited if unset.
     #[arg(long, global = true, env = "WATS_BLOB_QUOTA", value_parser = parse_size)]
     blob_quota: Option<u64>,
+    /// Turn semantic search off (ADR 0053): search is full-text only, and no
+    /// model is downloaded. Also config.toml `semantic.enabled = false`.
+    #[arg(long, global = true, env = "WATS_NO_SEMANTIC")]
+    no_semantic: bool,
     /// Disk budget for the whole data directory, e.g. 10G (the default).
     /// At it, the node stops fetching blobs and replicas; 10% above, it
     /// also refuses events from others.
@@ -5715,6 +5719,10 @@ async fn status_command(config: &NodeConfig, json: bool, local: bool) -> Result<
         if let (Some(connectivity), Some(map)) = (connectivity, status.as_object_mut()) {
             map.insert("connectivity".into(), connectivity.into());
         }
+        // One line for semantic search (ADR 0053).
+        if let Some(semantic) = status.get_mut("semantic") {
+            *semantic = wats::semantic::engine::summary(semantic).into();
+        }
         // One line for gossip: what arrived how, the links reset (0.4.12).
         if let Some(gossip) = status.get_mut("gossip") {
             *gossip = wats::node::links::summary(gossip).into();
@@ -7252,6 +7260,20 @@ impl NodeArgs {
         }
         config.review_notify = file.agent.notify.unwrap_or(false);
         config.declare_via = file.node.declare_via.unwrap_or(true);
+        // Semantic search (ADR 0053): on unless turned off. The model is
+        // downloaded only with infrastructure, never in tests.
+        if !self.no_semantic && file.semantic.enabled.unwrap_or(true) {
+            let dir = match &file.semantic.model_dir {
+                Some(dir) => match (dir.strip_prefix("~/"), std::env::var_os("HOME")) {
+                    (Some(rest), Some(home)) => PathBuf::from(home).join(rest),
+                    _ => PathBuf::from(dir),
+                },
+                None => config.data_dir.join("models"),
+            };
+            let download =
+                !(self.hermetic || self.loopback || config.infra == wats::infra::Infra::NONE);
+            config.semantic = Some(wats::semantic::engine::Config::new(dir, download));
+        }
         // Desktop notifications of replies to the human's asks: never in
         // loopback or hermetic mode, but for a test's fake notifier.
         config.desktop_notify = wats::desktop::configured(

@@ -1218,6 +1218,44 @@ In `wats status --json` and the MCP `status` tool, it is
   seconds until the next one; with nowhere to dial (no bootstrap, no peer,
   empty peer cache), `detail` says so instead.
 
+### Semantic search
+
+Since 0.5.0, `search` also matches by meaning ([ADR
+0053](adr/0053-semantic-search.md)). A model (bge-small-en-v1.5, 66 MB)
+embeds asks, answers and digests on this machine. Nothing leaves it,
+and nothing is sent to other nodes.
+
+- **The model.** It is downloaded once, in the background, from wats's
+  release assets. The file must match its pinned SHA-256 and its
+  minisign signature. It goes to `<data dir>/models` (`semantic.model_dir`
+  to share one copy between nodes).
+- **Without the model** (offline, a failed download, hermetic tests,
+  `--infra none`), `search` is full-text only, as before 0.5.0.
+- **The worker.** One thread at background priority embeds new posts
+  first, then the history, newest first. It works at most half the time,
+  and pauses the history on battery and under load. The model is
+  unloaded after 10 idle minutes.
+- **Turning it off:** `semantic.enabled = false` in `config.toml`, or
+  `--no-semantic`.
+
+`wats status` shows its state on one line:
+- `semantic: index 12,400 of 15,000 posts`, then `semantic: ready (15,000 posts)`;
+- `semantic: off: model not downloaded`;
+- `semantic: off (semantic.enabled = false)`.
+
+When the backfill finishes, the brief view logs one line:
+`semantic index ready: 15,000 posts (12m)`.
+
+In `wats status --json` and the MCP `status` tool:
+
+```json
+{"state": "indexing", "embedded": 12400, "total": 15000}
+```
+
+- `state`: `indexing`, `ready`, `off` (with `detail`, why), or `disabled`;
+- `embedded`: the posts embedded;
+- `total`: the posts to embed.
+
 ### Swarm size
 
 No node sees the whole swarm, so a node says what it saw, per network

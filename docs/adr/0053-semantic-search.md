@@ -275,8 +275,11 @@ laptops.
   - **Battery.** The backfill pauses on battery, read from IOKit's
     power source on macOS and `/sys/class/power_supply` on Linux; both
     reads are cheap. New posts are still embedded.
-  - **Load.** It also pauses while the load average exceeds the number
-    of cores.
+  - **Load.** It also pauses while the load average exceeds twice the
+    number of cores. At background priority and half the time, only a
+    really busy machine needs it to stop. Once the number of cores was
+    enough to pause it on Vincent's Mac during builds (load 17 on 12
+    cores).
   - It never starts before the model is in place.
 - **The model is loaded only when needed:** for a batch, a query or the
   backfill. It is unloaded after 10 idle minutes, so a laptop does not
@@ -295,6 +298,13 @@ laptops.
 - **At 100k posts, with `gemm` (Linux), one thread:** 91 ms/post on the
   M4, about 2.5 h of work, so about 5 h under the cap.
 - **On the seed:** to be added when its run comes back.
+- **Measured in a node (2026-10-26):** the store copy's 69 posts (long
+  ones, many cut at 256 tokens) took 35 s on Vincent's Mac. That ran at
+  background QoS, on the efficiency cores, with a load average of 16 on
+  12 cores, resting half the time: about 0.5 s per post in all. At that
+  pace, 100k posts would take about 14 h on a busy laptop. That is
+  acceptable for a background job that leaves the machine alone, and
+  search works meanwhile.
 
 ### 7. Default on
 

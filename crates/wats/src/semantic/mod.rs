@@ -8,6 +8,7 @@
 //!   memory.
 
 pub mod bert;
+pub mod engine;
 pub mod rank;
 pub mod tokenizer;
 

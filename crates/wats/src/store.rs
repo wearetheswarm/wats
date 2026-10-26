@@ -232,6 +232,29 @@ CREATE TABLE IF NOT EXISTS rotation_log (
     before  INTEGER NOT NULL,
     after   INTEGER NOT NULL
 );
+
+-- Semantic search (ADR 0053): each post's embedding, computed here and
+-- never shared, with the model it comes from (its file's SHA-256). No
+-- schema bump: an older wats ignores the table, and the triggers, stored
+-- in the database, still drop a vector with its body whichever wats drops
+-- it (rotation, drop, retraction, eviction).
+CREATE TABLE IF NOT EXISTS embeddings (
+    seq   INTEGER PRIMARY KEY,
+    model TEXT NOT NULL,
+    vec   BLOB NOT NULL
+);
+CREATE TRIGGER IF NOT EXISTS embeddings_event_delete AFTER DELETE ON events BEGIN
+    DELETE FROM embeddings WHERE seq = old.seq;
+END;
+CREATE TRIGGER IF NOT EXISTS embeddings_body_change
+    AFTER UPDATE OF json, text, title, opaque ON events BEGIN
+    DELETE FROM embeddings WHERE seq = old.seq;
+END;
+-- Where the backfill and the scan of new posts stand.
+CREATE TABLE IF NOT EXISTS semantic_state (
+    key   TEXT PRIMARY KEY,
+    value INTEGER NOT NULL
+) WITHOUT ROWID;
 "#;
 
 /// Events whose blobs one backfill transaction of `event_blobs` indexes.
@@ -2455,6 +2478,114 @@ impl Store {
             ));
         }
         Ok(out)
+    }
+
+    /// Posts semantic search embeds (ADR 0053 §5) that have no vector of
+    /// `model` yet: with `after`, those with a `seq` above it, oldest
+    /// first (new posts); with `before`, below it, newest first (the
+    /// backfill). Each with its title and body.
+    pub fn embedding_todo(
+        &self,
+        model: &str,
+        after: Option<i64>,
+        before: Option<i64>,
+        limit: usize,
+    ) -> Result<Vec<(i64, String, String)>> {
+        let (cond, order, bound) = match (after, before) {
+            (Some(a), _) => ("e.seq > ?2", "e.seq ASC", a),
+            (None, Some(b)) => ("e.seq < ?2", "e.seq DESC", b),
+            (None, None) => ("?2 = ?2", "e.seq DESC", 0),
+        };
+        let sql = format!(
+            "SELECT e.seq, e.title, e.text FROM events e
+             LEFT JOIN embeddings m ON m.seq = e.seq AND m.model = ?1
+             WHERE {cond} AND e.opaque = 0 AND e.kind IN ('ask', 'answer', '{}')
+                 AND m.seq IS NULL
+             ORDER BY {order} LIMIT ?3",
+            crate::knowledge::DIGEST_KIND
+        );
+        let conn = self.conn();
+        let mut stmt = conn.prepare_cached(&sql)?;
+        let rows = stmt.query_map(params![model, bound, limit as i64], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+        })?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// Stores the vector of post `seq`, unless its body is gone meanwhile.
+    pub fn put_embedding(&self, seq: i64, model: &str, vec: &[u8]) -> Result<bool> {
+        let n = self.conn().execute(
+            "INSERT OR REPLACE INTO embeddings (seq, model, vec)
+             SELECT ?1, ?2, ?3 WHERE EXISTS (SELECT 1 FROM events WHERE seq = ?1 AND opaque = 0)",
+            params![seq, model, vec],
+        )?;
+        Ok(n == 1)
+    }
+
+    /// The vectors of `model` with a `seq` above `after`, in `seq` order.
+    pub fn embeddings_after(&self, model: &str, after: i64) -> Result<Vec<(i64, Vec<u8>)>> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare_cached(
+            "SELECT seq, vec FROM embeddings WHERE model = ?1 AND seq > ?2 ORDER BY seq",
+        )?;
+        let rows = stmt.query_map(params![model, after], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// How many vectors of `model` there are, and the highest `seq` among
+    /// them: what tells the index in memory it is stale.
+    pub fn embeddings_extent(&self, model: &str) -> Result<(usize, i64)> {
+        let (n, max): (i64, Option<i64>) = self.conn().query_row(
+            "SELECT count(*), max(seq) FROM embeddings WHERE model = ?",
+            [model],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        Ok((n.max(0) as usize, max.unwrap_or(0)))
+    }
+
+    /// Posts embedded with `model`, and posts to embed in all.
+    pub fn embedding_counts(&self, model: &str) -> Result<(u64, u64)> {
+        let (done, total): (i64, i64) = self.conn().query_row(
+            &format!(
+                "SELECT
+                     (SELECT count(*) FROM embeddings m JOIN events e ON e.seq = m.seq
+                      WHERE m.model = ?1 AND e.opaque = 0),
+                     (SELECT count(*) FROM events WHERE opaque = 0
+                      AND kind IN ('ask', 'answer', '{}'))",
+                crate::knowledge::DIGEST_KIND
+            ),
+            [model],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        Ok((done.max(0) as u64, total.max(0) as u64))
+    }
+
+    /// Drops the vectors of other models (a new model re-embeds).
+    pub fn drop_other_embeddings(&self, model: &str) -> Result<usize> {
+        Ok(self
+            .conn()
+            .execute("DELETE FROM embeddings WHERE model <> ?", [model])?)
+    }
+
+    /// A value of semantic search's state (`top`, `below`, `done`).
+    pub fn semantic_state(&self, key: &str) -> Result<Option<i64>> {
+        Ok(self
+            .conn()
+            .query_row(
+                "SELECT value FROM semantic_state WHERE key = ?",
+                [key],
+                |r| r.get(0),
+            )
+            .optional()?)
+    }
+
+    pub fn set_semantic_state(&self, key: &str, value: i64) -> Result<()> {
+        self.conn().execute(
+            "INSERT INTO semantic_state (key, value) VALUES (?1, ?2)
+             ON CONFLICT (key) DO UPDATE SET value = excluded.value",
+            params![key, value],
+        )?;
+        Ok(())
     }
 
     /// The understood events that reply to one of `targets` (`parent`) or
@@ -5110,6 +5241,68 @@ mod tests {
             .search(Some(text), &Filter::default(), 10)
             .unwrap()
             .len()
+    }
+
+    #[test]
+    fn embeddings_follow_their_bodies() {
+        let store = Store::open_in_memory().unwrap();
+        let root = post(1, 10, Kind::Ask, &[], "how do I sort a list");
+        let answer = reply(&root, 2, 11, "use sort()");
+        let note = post(3, 12, Kind::Note, &[], "not embedded");
+        for (e, at) in [(&root, 10), (&answer, 11), (&note, 12)] {
+            store.insert(e, at).unwrap();
+        }
+        let seq = |e: &Event| store.get(&e.id).unwrap().unwrap().seq;
+        let (root_seq, answer_seq) = (seq(&root), seq(&answer));
+        // Newest first; the note is not a kind semantic search embeds.
+        let todo = store
+            .embedding_todo("m1", None, Some(i64::MAX), 10)
+            .unwrap();
+        let seqs: Vec<i64> = todo.iter().map(|t| t.0).collect();
+        assert_eq!(seqs, [answer_seq, root_seq]);
+        assert_eq!(todo[1].2, "how do I sort a list");
+        // New posts: oldest first, above a seq.
+        let todo = store
+            .embedding_todo("m1", Some(root_seq), None, 10)
+            .unwrap();
+        assert_eq!(todo.len(), 1);
+        assert!(store.put_embedding(root_seq, "m1", &[1, 2]).unwrap());
+        assert!(store.put_embedding(answer_seq, "m1", &[3, 4]).unwrap());
+        assert!(
+            store
+                .embedding_todo("m1", None, Some(i64::MAX), 10)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(store.embedding_counts("m1").unwrap(), (2, 2));
+        assert_eq!(store.embeddings_extent("m1").unwrap(), (2, answer_seq));
+        assert_eq!(
+            store.embeddings_after("m1", root_seq).unwrap(),
+            [(answer_seq, vec![3, 4])]
+        );
+        // Another model's vectors do not count, and are dropped on demand.
+        assert_eq!(
+            store
+                .embedding_todo("m2", None, Some(i64::MAX), 10)
+                .unwrap()
+                .len(),
+            2
+        );
+        // A dropped body takes its vector along, and gets no new one.
+        store
+            .drop_body(&root.id, DropReason::Own, None, None, 100)
+            .unwrap();
+        assert_eq!(store.embeddings_extent("m1").unwrap(), (1, answer_seq));
+        assert!(!store.put_embedding(root_seq, "m1", &[1, 2]).unwrap());
+        assert_eq!(store.embedding_counts("m1").unwrap(), (1, 1));
+        assert!(store.put_embedding(answer_seq, "m2", &[5]).unwrap());
+        assert_eq!(store.drop_other_embeddings("m2").unwrap(), 0);
+        assert_eq!(store.embeddings_extent("m1").unwrap().0, 0);
+        // The state survives.
+        assert_eq!(store.semantic_state("below").unwrap(), None);
+        store.set_semantic_state("below", 7).unwrap();
+        store.set_semantic_state("below", 5).unwrap();
+        assert_eq!(store.semantic_state("below").unwrap(), Some(5));
     }
 
     #[test]
