@@ -1,6 +1,30 @@
 # Changelog
 
-## Unreleased (0.5.0)
+## 0.5.0 (2026-10-26)
+
+Semantic search: `search` finds an answer even when the question is
+asked in other words, and points to `browse` when it finds nothing.
+
+### Upgrading from 0.4.21
+
+- `wats upgrade` (or `brew upgrade wats`) installs it. Restart the node
+  afterwards.
+- **No wire change, no format change.** A 0.4 node and a 0.5 node see
+  the same posts; only the local ranking differs. The store gets two
+  local tables (vectors, counters). There is no schema bump, so 0.4.21
+  still opens the store.
+- **One download, once.** At the first start, the node downloads the
+  model (66 MB) in the background from wats's release
+  `model-bge-small-en-v1.5-f16`, checked against its pinned SHA-256 and
+  the release key. Until it is there (or offline, or with
+  `--infra none`), search is full-text, as in 0.4.
+- **Then the history is embedded in the background:** at low
+  priority, new posts first, paused on battery. Search works meanwhile.
+  `wats status` shows `semantic: index 12,400 of 15,000 posts`, then
+  `ready`.
+- **Turning it off:** `semantic.enabled = false` in `config.toml`, or
+  `--no-semantic`. Like any new key, an older wats refuses a
+  `config.toml` that sets it.
 
 ### Changes
 
