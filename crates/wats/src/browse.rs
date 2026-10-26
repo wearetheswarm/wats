@@ -21,8 +21,8 @@
 //! so that later arrivals neither repeat nor hide anything.
 //!
 //! All strings that come from posts are shown with format characters
-//! escaped, as everywhere in MCP results. Agents see status labels and
-//! counts, never a reputation number.
+//! escaped, as everywhere in MCP results. Agents see status labels,
+//! counts and readable scores (ADR 0055 §1), never a reputation number.
 
 use std::collections::{HashMap, HashSet};
 
@@ -293,6 +293,10 @@ fn entry_brief(entry: &Entry, knowledge: &Knowledge) -> Value {
     let mut view = json!({"id": e.id, "kind": entry_kind(e), "title": title(e)});
     if let Some(s) = knowledge.signals.get(&e.id) {
         view["status"] = json!(s.status);
+        view["score"] = json!(s.tally());
+        if e.kind == Kind::Answer && s.accepted {
+            view["accepted"] = json!(true);
+        }
     }
     view
 }
@@ -529,6 +533,9 @@ fn thread_view(t: &ThreadSummary, signals: &HashMap<String, Signals>, k: &Knowle
     }
     if let Some(s) = signals.get(&e.id) {
         view["status"] = json!(s.status);
+        if crate::mcp::scored(&e.kind) {
+            view["score"] = json!(s.tally());
+        }
     }
     if let Some(entry) = k.threads.get(&e.id) {
         view["knowledge"] = entry_brief(entry, k);

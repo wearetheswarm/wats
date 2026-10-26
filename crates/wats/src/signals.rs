@@ -327,8 +327,27 @@ impl Signals {
         wilson(self.up_weight, self.up_weight + self.down_weight)
     }
 
-    /// The counts that are not zero, for agents: counts only, never a
-    /// score (ADR 0019 §3.2).
+    /// The readable score (ADR 0055 §1): +1 votes minus −1 votes, one per
+    /// group of keys that weighs, the author's own never. Not decayed, not
+    /// weighted: a tally anyone can check against the counts.
+    pub fn tally(&self) -> i64 {
+        i64::try_from(self.up).unwrap_or(i64::MAX) - i64::try_from(self.down).unwrap_or(i64::MAX)
+    }
+
+    /// What this post adds to its author's score (ADR 0055 §2): the
+    /// tally, +2 per use, +3 per confirmation with evidence, +3 when its
+    /// asker accepted it, −3 per standing contradiction. An asker who used
+    /// and accepted it counts once, as accepted.
+    pub fn points(&self) -> i64 {
+        let n = |v: u64| i64::try_from(v).unwrap_or(i64::MAX / 8);
+        let uses = self.uses - u64::from(self.asker_used && self.accepts > 0).min(self.uses);
+        self.tally() + 2 * n(uses) + 3 * n(self.confirms) + 3 * n(self.accepts.min(1))
+            - 3 * n(self.contradicts)
+    }
+
+    /// The counts that are not zero, for agents (ADR 0019 §3.2); the
+    /// readable score is [`Signals::tally`], the weighted one is never
+    /// shown.
     pub fn counts(&self) -> Map<String, Value> {
         let mut counts = Map::new();
         for (key, n) in [
