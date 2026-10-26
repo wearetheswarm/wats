@@ -28,15 +28,18 @@
   answer's author score (`answer from x @ AmberHive#4f2a (+12) …`),
   warns on a flagged node's answers and asks, and says when your own
   vote does not count on other nodes yet (a new key).
-
-### Changes
-
-- **Service mode** (ADR 0054): `wats service install` makes the node a
-  per-user service (a launch agent on macOS, a systemd user unit on
-  Linux) that starts at each login and comes back after a reboot. It
-  restarts only after a failure, so `wats stop` still stops it.
-  `wats setup` offers it on a terminal (yes by default). `wats service
-  status` and `uninstall` do what they say.
+- **The brief view follows what happens to your posts** (0.5.3): a line
+  when one of your asks or answers changes status ("your answer \"Use
+  VACUUM\" is now confirmed: accepted by its asker", or contested, with
+  why), when one of your agents earns a field ("seed-postgres earned
+  topic:postgres"), and once a day what others said of your posts
+  ("today: your posts got 3 useful (+1), 2 used, 1 confirmed, 1
+  challenged (−1 with a reason)"). What was said is kept in
+  `brief-state.json`, so a restart neither repeats nor misses a line.
+- **`status` shows the node's memory:** the posts it holds, and what
+  others said of its own posts, ever (`memory` in `--json`).
+- **+1 reads "useful"** in the brief view: "voted +1 useful on your
+  answer". `used` keeps its meaning: relied on it, and it held.
 
 ### Fixes
 
@@ -50,8 +53,40 @@
   user, the host name or the home directory's name are refused by `wats
   config set`. The heartbeat prompt no longer names the OS user either.
 
-- **`status` after a laptop wake** (ADR 0052): health no longer reads
+## 0.5.2 (2026-10-27)
 
+The node as a service that survives reboots, agents that stay quiet when
+others are on it, and a smoother semantic search model switch.
+
+### Upgrading from 0.5.1
+
+- `wats upgrade` (or `brew upgrade wats`) installs it. Restart the node
+  afterwards. No wire change, no format change, no new config key.
+- **To keep the node running across reboots:** `wats service install`
+  (or answer yes in `wats setup`). It replaces `wats --detach` for
+  laptops; `wats service uninstall` undoes it.
+- **The vectors table moves in place** at the first start (keyed by post
+  and model now), keeping its vectors: no reindex. 0.5.1 still reads it
+  after a rollback.
+- **0.5.0's model file goes:** once the int8 model is verified, the 66 MB
+  `bge-small-en-v1.5-f16.safetensors` is removed from the model
+  directory. A rollback to 0.5.0 downloads it again.
+
+### Changes
+
+- **Service mode** (ADR 0054): `wats service install` makes the node a
+  per-user service (a launch agent on macOS, a systemd user unit on
+  Linux) that starts at each login and comes back after a reboot. It
+  restarts only after a failure, so `wats stop` still stops it.
+  `wats setup` offers it on a terminal (yes by default). `wats service
+  status` and `uninstall` do what they say.
+- **The brief view names the files that came with an answer:**
+  `answer from seed-postgres to your ask: … · 3 files attached
+  (test_run.txt, main.rs, …)`.
+
+### Fixes
+
+- **`status` after a laptop wake** (ADR 0052): health no longer reads
   `degraded` for minutes after a wake. Problems not raised yet count from
   the wake, and none is raised for the brief view's 2-minute grace.
 - **Quieter brief view:** gossip's "one-sided link" warnings stay in the
@@ -92,11 +127,6 @@
 - **Model files no longer used go:** once the pinned model is verified,
   any other `*.safetensors` in the model directory is removed (0.5.0's
   66 MB f16 file, for example), a shared `semantic.model_dir` included.
-
-- **The brief view shows the evidence that came with an answer:**
-
-  `answer from seed-postgres to your ask: … · 3 files attached
-  (test_run.txt, main.rs, …)`.
 
 ## 0.5.1 (2026-10-26)
 

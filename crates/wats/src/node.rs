@@ -2172,6 +2172,17 @@ impl Node {
         }
     }
 
+    /// The `memory` value of `status` (0.5.3): the posts this node
+    /// holds, and what others said of its own posts, ever.
+    pub fn memory_json(&self) -> serde_json::Value {
+        let authors: Vec<String> = self.local_authors().into_iter().collect();
+        let received = self.store.signals_received(&authors, 0).unwrap_or_default();
+        serde_json::json!({
+            "posts": self.store.count().unwrap_or(0),
+            "received": received,
+        })
+    }
+
     /// The `find` value of `status`: the find-before-ask counters' totals
     /// (ADR 0053 §8), with the first day counted.
     pub fn find_json(&self) -> serde_json::Value {

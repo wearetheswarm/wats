@@ -5877,6 +5877,10 @@ async fn status_command(config: &NodeConfig, json: bool, local: bool) -> Result<
         if let Some(map) = status.as_object_mut() {
             map.remove("find");
         }
+        // One line for the node's memory (0.5.3).
+        if let Some(memory) = status.get_mut("memory") {
+            *memory = wats::brief::memory_summary(memory).into();
+        }
         // One line for semantic search (ADR 0053).
         if let Some(semantic) = status.get_mut("semantic") {
             *semantic = wats::semantic::engine::summary(semantic).into();
