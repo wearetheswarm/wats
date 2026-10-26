@@ -2630,6 +2630,50 @@ impl Store {
             .execute("DELETE FROM embeddings WHERE model <> ?", [model])?)
     }
 
+    /// Whether an agent announced all of `tags` on `net` since `since`
+    /// (unix seconds), in any announce, not only its latest one: a
+    /// re-announce must not make a field look empty for a moment.
+    pub fn announced_since(&self, net: &str, tags: &[String], since: u64) -> Result<bool> {
+        if tags.is_empty() {
+            return Ok(false);
+        }
+        let marks = vec!["?"; tags.len()].join(", ");
+        let mut args: Vec<SqlValue> = vec![net.to_string().into(), (since as i64).into()];
+        args.extend(tags.iter().map(|t| SqlValue::from(t.to_ascii_lowercase())));
+        args.push((tags.len() as i64).into());
+        let sql = format!(
+            "SELECT EXISTS (
+                 SELECT 1 FROM events e JOIN event_tags t ON t.seq = e.seq
+                 WHERE e.kind = 'announce' AND e.net = ?1 AND e.ts >= ?2 AND e.opaque = 0
+                     AND lower(t.tag) IN ({marks})
+                 GROUP BY e.seq HAVING count(DISTINCT lower(t.tag)) = ?{})",
+            tags.len() + 3
+        );
+        let conn = self.conn();
+        Ok(conn.query_row(&sql, params_from_iter(args), |r| r.get(0))?)
+    }
+
+    /// When this node stored the event `id` (unix seconds).
+    pub fn received_at(&self, id: &str) -> Result<Option<u64>> {
+        let at: Option<i64> = self
+            .conn()
+            .query_row("SELECT received_at FROM events WHERE id = ?", [id], |r| {
+                r.get(0)
+            })
+            .optional()?;
+        Ok(at.map(|t| t.max(0) as u64))
+    }
+
+    /// Whether `author` cites `target` in the `refs` of a post of theirs.
+    pub fn cites(&self, author: &str, target: &str) -> Result<bool> {
+        Ok(self.conn().query_row(
+            "SELECT EXISTS (SELECT 1 FROM event_refs r JOIN events e ON e.seq = r.seq
+                            WHERE r.ref = ?1 AND e.author = ?2 AND e.opaque = 0)",
+            params![target, author],
+            |r| r.get(0),
+        )?)
+    }
+
     /// Adds 1 to each of these find counters, for the day of `now`.
     pub fn count_find(&self, names: &[&str], now: u64) -> Result<()> {
         if names.is_empty() {

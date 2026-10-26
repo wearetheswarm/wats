@@ -1947,16 +1947,19 @@ fn lent_servers(config: &AgentConfig) -> Vec<(String, serde_json::Value)> {
 /// Whether an agent this node knows of announces every one of `caps` on
 /// `net` (its latest `announce`): the capable agents an ask's grace waits
 /// for. On a store error, as if one did.
+/// Whether an agent this node knows announced `caps` in the last
+/// [`ANNOUNCED_WITHIN`], in any of its announces (seen live: held agents
+/// woke at 99 s of the cap grace, as if the capable agent had gone, while
+/// it held a live claim). Unknown (a store error): yes, they wait.
 fn someone_announces(node: &Node, net: &str, caps: &[String]) -> bool {
-    let filter = crate::store::Filter {
-        net: Some(net.to_string()),
-        tags: caps.to_vec(),
-        ..Default::default()
-    };
+    let since = unix_now().saturating_sub(ANNOUNCED_WITHIN.as_secs());
     node.store()
-        .latest_announces(&filter, 1)
-        .map_or(true, |found| !found.is_empty())
+        .announced_since(net, caps, since)
+        .unwrap_or(true)
 }
+
+/// How far back an announce counts for "an agent announces this".
+const ANNOUNCED_WITHIN: Duration = Duration::from_secs(7 * 24 * 3600);
 
 /// `agent.effort` as the runtime's own flag, unless the extra arguments
 /// already set one: Claude Code `--effort`, Codex `-c
@@ -2541,6 +2544,15 @@ fn serve(node: &Node, me: &str, config: &AgentConfig, ask: &Event, now: u64) -> 
     };
     let request = &state.request;
     let mut urgent = false;
+    // Graces count from when the ask reached this node, if later than its
+    // `ts`: an ask can take a while to publish (seen live: 22 s), which
+    // ate into the grace of agents held for others.
+    let base = node
+        .store()
+        .received_at(&ask.id)
+        .ok()
+        .flatten()
+        .map_or(ask.ts, |at| at.max(ask.ts));
     // Once every addressee declined, it is served as an ask without `to:`
     // (ADR 0047 §2).
     if !request.to.is_empty() && !state.open_to_all() {
@@ -2571,7 +2583,14 @@ fn serve(node: &Node, me: &str, config: &AgentConfig, ask: &Event, now: u64) -> 
         // No grace when no agent this node knows of announces those caps:
         // nobody to wait for.
         if !request.capable(&mine) && someone_announces(node, &ask.net, &request.caps) {
-            let grace = ask.ts.saturating_add(node.config().cap_grace.as_secs());
+            // Others are on it: no need to wait for the grace's end.
+            if !state.claims.is_empty() || !state.answered.is_empty() {
+                return Serve::Drop(format!(
+                    "asks for {}, and an agent claimed or answered it",
+                    request.caps.join(" ")
+                ));
+            }
+            let grace = base.saturating_add(node.config().cap_grace.as_secs());
             if now < grace {
                 return Serve::Hold {
                     why: format!(
@@ -2625,7 +2644,7 @@ fn serve(node: &Node, me: &str, config: &AgentConfig, ask: &Event, now: u64) -> 
                         crate::specialty::proven_in(&record, &tags)
                     });
                 if proven_other {
-                    let grace = ask.ts.saturating_add(PROVEN_GRACE.as_secs());
+                    let grace = base.saturating_add(PROVEN_GRACE.as_secs());
                     if now < grace {
                         return Serve::Hold {
                             why: format!("agents with a track record in {} first", tags.join(" ")),
@@ -2656,7 +2675,13 @@ fn serve(node: &Node, me: &str, config: &AgentConfig, ask: &Event, now: u64) -> 
                 .collect();
         }
         if !outside.is_empty() {
-            let grace = ask.ts.saturating_add(node.config().cap_grace.as_secs());
+            if !state.claims.is_empty() || !state.answered.is_empty() {
+                return Serve::Drop(format!(
+                    "about {}, outside this agent's field, and an agent claimed or answered it",
+                    outside.join(" ")
+                ));
+            }
+            let grace = base.saturating_add(node.config().cap_grace.as_secs());
             if now < grace {
                 return Serve::Hold {
                     why: format!(
@@ -2749,6 +2774,16 @@ fn delivery_pass(
                 urgent,
                 jitter: wait,
             } => {
+                // Released after a hold: say on what, for the next time a
+                // wake looks early (seen live, unexplained by the logs).
+                if let Some(held) = queued.skipped.take() {
+                    let (claims, answered) = crate::delivery::state_on(node, &ask.event, now)
+                        .map_or((0, 0), |s| (s.claims.len(), s.answered.len()));
+                    info!(
+                        event = short(&queued.id),
+                        "agent wake released (was held: {held}); live claims {claims}, answers {answered}"
+                    );
+                }
                 queued.urgent = urgent;
                 if wait && queued.not_before.is_none() {
                     let delay = jitter(&node.config().claim_jitter);
