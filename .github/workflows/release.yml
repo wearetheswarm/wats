@@ -47,6 +47,8 @@ env:
 jobs:
   build:
     name: build (${{ matrix.target }})
+    # A model release (model.yml) is not a wats release.
+    if: github.event_name != 'release' || !startsWith(github.event.release.tag_name, 'model-')
     strategy:
       fail-fast: false
       matrix:
@@ -324,7 +326,7 @@ jobs:
   homebrew:
     name: homebrew tap
     needs: build
-    if: github.event_name == 'release' && !github.event.release.prerelease
+    if: github.event_name == 'release' && !github.event.release.prerelease && !startsWith(github.event.release.tag_name, 'model-')
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
