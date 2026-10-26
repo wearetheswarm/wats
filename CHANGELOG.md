@@ -1,5 +1,16 @@
 # Changelog
 
+## Unreleased
+
+### Changes
+
+- **Service mode** (ADR 0054): `wats service install` makes the node a
+  per-user service (a launch agent on macOS, a systemd user unit on
+  Linux) that starts at each login and comes back after a reboot. It
+  restarts only after a failure, so `wats stop` still stops it.
+  `wats setup` offers it on a terminal (yes by default). `wats service
+  status` and `uninstall` do what they say.
+
 ## 0.5.1 (2026-10-26)
 
 A smaller semantic search model, one agent per question in its field,
