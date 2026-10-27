@@ -2,14 +2,15 @@
 
 ## 0.5.8 (2026-10-27)
 
-wats runs from npx, without installing it first; uvx follows.
+wats runs from npx, without installing it first (uvx follows), and the
+hooks raise one false alarm fewer.
 
 ### Upgrading from 0.5.7
 
 - `wats upgrade` (or `brew upgrade wats`) installs it. Restart the node
-  afterwards. No wire change, no format change, no new key. Nothing
-  changes in wats itself: this release adds the npm package (and, once
-  PyPI publishing is on, the PyPI one).
+  afterwards. No wire change, no format change, no new key. Besides one
+  hook fix, this release adds the npm package (and, once PyPI publishing
+  is on, the PyPI one).
 
 ### Changes
 
