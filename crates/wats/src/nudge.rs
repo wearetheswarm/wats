@@ -100,6 +100,13 @@ pub enum Step {
         ok: bool,
         /// A build, test or run command.
         check: bool,
+        /// It writes a file (`> file`, `sed -i`, `tee`…): an edit made in
+        /// the shell.
+        #[serde(default)]
+        writes: bool,
+        /// The command, cut to [`CMD_CHARS`].
+        #[serde(default)]
+        cmd: String,
     },
     Edit,
     /// A swarm post read or found (its id, title).
@@ -177,13 +184,19 @@ pub struct Shell {
     pub output: String,
 }
 
+/// How much of a command a step keeps.
+const CMD_CHARS: usize = 300;
+
 /// The hook: what to print, if anything. Never fails.
 pub fn run(request: &Request) -> Option<String> {
     if std::env::var_os(crate::hook::AGENT_RUN_ENV).is_some() {
         return None;
     }
+    let event_name = ["hook_event_name", "hookEventName"]
+        .iter()
+        .find_map(|k| request.payload[*k].as_str());
     match handle(request) {
-        Ok(Some(text)) => Some(render(request.host, request.event, &cut(&text))),
+        Ok(Some(text)) => Some(render(request.host, request.event, event_name, &cut(&text))),
         Ok(None) => None,
         Err(e) => {
             log(&request.data_dir, &format!("{e:#}"));
@@ -200,16 +213,24 @@ fn cut(text: &str) -> String {
     }
 }
 
-/// The host's output form of a nudge (ADR 0056 §5).
-pub fn render(host: Host, event: Event, text: &str) -> String {
+/// The host's output form of a nudge (ADR 0056 §5). `event_name`: the
+/// payload's `hook_event_name`, which Claude Code wants echoed
+/// (`PostToolUseFailure` after a failed call, `PostToolUse` otherwise).
+pub fn render(host: Host, event: Event, event_name: Option<&str>, text: &str) -> String {
     match (host, event) {
-        (Host::Claude | Host::Codex | Host::Copilot, Event::PostTool) => json!({
-            "hookSpecificOutput": {
-                "hookEventName": "PostToolUse",
-                "additionalContext": text,
-            }
-        })
-        .to_string(),
+        (Host::Claude | Host::Codex | Host::Copilot, Event::PostTool) => {
+            let name = match event_name {
+                Some(n @ ("PostToolUse" | "PostToolUseFailure")) => n,
+                _ => "PostToolUse",
+            };
+            json!({
+                "hookSpecificOutput": {
+                    "hookEventName": name,
+                    "additionalContext": text,
+                }
+            })
+            .to_string()
+        }
         (Host::Claude | Host::Codex | Host::Copilot, Event::Stop) => {
             json!({"decision": "block", "reason": text}).to_string()
         }
@@ -591,6 +612,11 @@ pub fn routine(shell: &Shell) -> bool {
     false
 }
 
+/// What a signature shows for a path and for a quoted string: readable
+/// for the person and the model, and nothing of the project.
+const PATH_MARK: &str = "…/…";
+const QUOTE_MARK: &str = "'…'";
+
 /// The error's signature (ADR 0056 §1): its line, with paths, numbers,
 /// hex, quoted strings and names replaced, so that it says nothing of the
 /// project and matches the same error elsewhere.
@@ -600,17 +626,17 @@ pub fn signature(shell: &Shell, private: &[(&'static str, String)]) -> Option<St
     for word in line.split_whitespace() {
         let w = word.trim_matches(|c: char| c == ',' || c == ';');
         let token = if w.contains('/') || w.contains('\\') {
-            "<path>".to_string()
+            PATH_MARK.to_string()
         } else if (w.starts_with('\'') || w.starts_with('"') || w.starts_with('`')) && w.len() > 2 {
-            "<q>".to_string()
+            QUOTE_MARK.to_string()
         } else if w.chars().any(|c| c.is_ascii_digit())
             && w.chars()
                 .all(|c| c.is_ascii_hexdigit() || ":.-x".contains(c))
             && !w.starts_with("E0")
         {
-            "<n>".to_string()
+            "N".to_string()
         } else if crate::roster::leak(w, private).is_some() {
-            "<name>".to_string()
+            "…".to_string()
         } else {
             w.to_string()
         };
@@ -621,7 +647,7 @@ pub fn signature(shell: &Shell, private: &[(&'static str, String)]) -> Option<St
     let sig = out.join(" ");
     let sig: String = sig.chars().take(160).collect();
     (sig.split_whitespace()
-        .filter(|w| !w.starts_with('<'))
+        .filter(|w| ![PATH_MARK, QUOTE_MARK, "N", "…"].contains(w))
         .count()
         >= 2)
         .then_some(sig)
@@ -792,6 +818,8 @@ fn post_tool(request: &Request, session: &mut Session) -> Result<Option<String>>
             sig: sig.clone(),
             ok: !failed,
             check: is_check(&shell.command),
+            writes: writes(&shell.command),
+            cmd: shell.command.chars().take(CMD_CHARS).collect(),
         },
     );
     let Some(sig) = sig else {
@@ -839,9 +867,55 @@ fn push(session: &mut Session, step: Step) {
     session.turn.drain(..excess);
 }
 
+/// Whether a shell command writes a file: a redirection to a file (not
+/// `/dev/null`, not `2>&1`), or a command that edits in place.
+pub fn writes(command: &str) -> bool {
+    let words: Vec<&str> = command.split_whitespace().collect();
+    for (i, w) in words.iter().enumerate() {
+        let target = if let Some(rest) = w.strip_prefix(">>").or_else(|| w.strip_prefix('>')) {
+            if rest.starts_with('&') {
+                continue;
+            }
+            if rest.is_empty() {
+                words.get(i + 1).copied().unwrap_or_default()
+            } else {
+                rest
+            }
+        } else if let Some((_, rest)) = w.split_once('>') {
+            // `x>file` (not `2>`, `&>`).
+            if w.starts_with(|c: char| c.is_ascii_digit() || c == '&') || rest.starts_with('&') {
+                continue;
+            }
+            rest
+        } else {
+            continue;
+        };
+        if !target.is_empty() && target != "/dev/null" {
+            return true;
+        }
+    }
+    let c = format!(" {command} ");
+    [
+        " sed -i",
+        " perl -i",
+        " perl -pi",
+        " tee ",
+        " patch ",
+        " git apply",
+        " git checkout -- ",
+        " truncate ",
+        " mv ",
+        " cp ",
+    ]
+    .iter()
+    .any(|p| c.contains(p))
+}
+
 /// The fix found in a turn (ADR 0056 §1.2): a signature that failed twice
-/// or more (or a command that failed twice with it), then an edit, then
-/// the same command, or a build or test, passing.
+/// or more (or a command that failed twice with it), then an edit (a file
+/// tool, or a shell command that writes a file), then the same command,
+/// or a build or test, passing. The edit and the pass can be one shell
+/// call (`printf … > check.py && python3 check.py`).
 pub fn fix_in(turn: &[Step]) -> Option<String> {
     for (i, step) in turn.iter().enumerate() {
         let Step::Shell {
@@ -861,14 +935,21 @@ pub fn fix_in(turn: &[Step]) -> Option<String> {
         }
         let edit = turn[i + 1..]
             .iter()
-            .position(|s| *s == Step::Edit)
+            .position(|s| *s == Step::Edit || matches!(s, Step::Shell { writes: true, .. }))
             .map(|j| i + 1 + j);
         let Some(edit) = edit else {
             continue;
         };
-        let passed = turn[edit + 1..].iter().any(
-            |s| matches!(s, Step::Shell { ok: true, head: h2, check, .. } if h2 == head || *check),
-        );
+        // The edit's own call counts when it passed and ran the command.
+        let from = if turn[edit] == Step::Edit {
+            edit + 1
+        } else {
+            edit
+        };
+        let passed = turn[from..].iter().any(|s| {
+            matches!(s, Step::Shell { ok: true, head: h2, check, cmd, .. }
+                if h2 == head || *check || (!head.is_empty() && cmd.contains(head.as_str())))
+        });
         if passed {
             return Some(sig.clone());
         }
@@ -1029,7 +1110,7 @@ mod tests {
         let private = vec![("the OS user name", "vincentcarluer".to_string())];
         assert_eq!(
             signature(&s, &private).as_deref(),
-            Some("error[E0425]: cannot find value <q> in <path>")
+            Some("error[E0425]: cannot find value '…' in …/…")
         );
         // Python: the error, not the traceback's header.
         let py = failing(
@@ -1038,7 +1119,7 @@ mod tests {
         );
         assert_eq!(
             signature(&py, &private).as_deref(),
-            Some("ModuleNotFoundError: No module named <q>")
+            Some("ModuleNotFoundError: No module named '…'")
         );
         // Nothing that says what failed: no signature.
         assert_eq!(signature(&failing("x", "all good"), &private), None);
@@ -1055,12 +1136,14 @@ mod tests {
             sig: sig.map(str::to_string),
             ok,
             check,
+            writes: false,
+            cmd: head.into(),
         }
     }
 
     #[test]
     fn a_fix_needs_two_failures_an_edit_and_a_pass() {
-        let e = Some("error[E0425]: cannot find value <q>");
+        let e = Some("error[E0425]: cannot find value '…'");
         let fixed = [
             sh("cargo build", e, false, true),
             sh("cargo build", e, false, true),
@@ -1082,6 +1165,29 @@ mod tests {
             sh("cargo build", None, true, true),
         ];
         assert_eq!(fix_in(&once), None);
+        // Seen live (Claude Code): the edit in the shell, in the same call
+        // as the passing run.
+        let p = Some("ModuleNotFoundError: No module named '…'");
+        let in_shell = [
+            sh("python3 check.py", p, false, true),
+            sh("python3 check.py", p, false, true),
+            sh("cat check.py", None, true, false),
+            Step::Shell {
+                head: "printf".into(),
+                sig: None,
+                ok: true,
+                check: true,
+                writes: true,
+                cmd: "printf 'print(\"ok\")\\n' > check.py && python3 check.py".into(),
+            },
+        ];
+        assert_eq!(fix_in(&in_shell).as_deref(), p);
+        assert!(writes("printf 'x' > check.py && python3 check.py"));
+        assert!(writes("sed -i 's/a/b/' src/x.rs"));
+        assert!(writes("echo x>>notes.txt"));
+        assert!(!writes("cargo build 2>&1 | tail"));
+        assert!(!writes("ls > /dev/null"));
+        assert!(!writes("python3 check.py"));
         // Fixed but nothing passed afterwards.
         let open = [
             sh("cargo build", e, false, true),
@@ -1116,11 +1222,26 @@ mod tests {
     #[test]
     fn nudges_take_each_hosts_form() {
         let claude: Value =
-            serde_json::from_str(&render(Host::Claude, Event::PostTool, "x")).unwrap();
+            serde_json::from_str(&render(Host::Claude, Event::PostTool, None, "x")).unwrap();
         assert_eq!(claude["hookSpecificOutput"]["additionalContext"], "x");
-        let stop: Value = serde_json::from_str(&render(Host::Codex, Event::Stop, "y")).unwrap();
+        assert_eq!(claude["hookSpecificOutput"]["hookEventName"], "PostToolUse");
+        // Seen live: Claude Code refuses an output naming another event.
+        let failed: Value = serde_json::from_str(&render(
+            Host::Claude,
+            Event::PostTool,
+            Some("PostToolUseFailure"),
+            "x",
+        ))
+        .unwrap();
+        assert_eq!(
+            failed["hookSpecificOutput"]["hookEventName"],
+            "PostToolUseFailure"
+        );
+        let stop: Value =
+            serde_json::from_str(&render(Host::Codex, Event::Stop, None, "y")).unwrap();
         assert_eq!(stop["decision"], "block");
-        let vibe: Value = serde_json::from_str(&render(Host::Vibe, Event::PostTool, "z")).unwrap();
+        let vibe: Value =
+            serde_json::from_str(&render(Host::Vibe, Event::PostTool, None, "z")).unwrap();
         assert_eq!(vibe["hook_specific_output"]["additional_context"], "z");
     }
 }
