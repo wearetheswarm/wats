@@ -886,9 +886,9 @@ struct GuardianKey {
 enum MeAction {
     /// Whether your agents' fixes are shared at once (`share.auto`, ADR
     /// 0056 §2): `on` shares them after the privacy scrub, `off` has your
-    /// agents ask you each time; nothing prints the current state. For
-    /// you only: no wats tool changes it, and an agent must not run this
-    /// unless you asked.
+    /// agents ask you each time; without an argument, it prints the
+    /// current state. For you only: no wats tool changes it, and an agent
+    /// must not run this unless you asked.
     Autoshare {
         #[arg(value_parser = ["on", "off"])]
         state: Option<String>,
@@ -1269,6 +1269,10 @@ enum SetupTool {
         /// Remove that entry (with a backup copy too).
         #[arg(long)]
         remove: bool,
+        /// Remove the wats hooks only (hooks.toml) and keep the MCP server
+        /// (--remove removes both).
+        #[arg(long, conflicts_with_all = ["mcp", "agent", "remove"])]
+        remove_hooks: bool,
         /// Edit ./.vibe/config.toml, this project's, instead.
         #[arg(long)]
         project: bool,
@@ -1292,6 +1296,10 @@ enum SetupTool {
         /// Remove that entry (with a backup copy too).
         #[arg(long)]
         remove: bool,
+        /// Remove the wats hooks only (~/.copilot/hooks/wats.json) and keep
+        /// the MCP server (--remove removes both).
+        #[arg(long, conflicts_with_all = ["mcp", "agent", "remove"])]
+        remove_hooks: bool,
     },
     /// Antigravity CLI (`agy`): add wats as its MCP server in
     /// ~/.gemini/config/mcp_config.json, after a backup, and/or enable an
@@ -3390,8 +3398,17 @@ impl SetupTool {
                 ..
             } => *remove || *remove_hooks,
             SetupTool::Openclaw { remove, .. } | SetupTool::Opencode { remove, .. } => *remove,
-            SetupTool::Vibe { mcp, agent, .. } => !*mcp && !*agent,
-            SetupTool::Copilot { remove, .. } => *remove,
+            SetupTool::Vibe {
+                mcp,
+                agent,
+                remove_hooks,
+                ..
+            } => (!*mcp && !*agent) || *remove_hooks,
+            SetupTool::Copilot {
+                remove,
+                remove_hooks,
+                ..
+            } => *remove || *remove_hooks,
             SetupTool::Antigravity { remove, .. } => *remove,
             SetupTool::Custom { .. } => false,
         }
@@ -3667,7 +3684,11 @@ fn setup_tool_command(
             agent,
             keys,
             remove,
+            remove_hooks,
         } => {
+            if remove_hooks {
+                return remove_copilot_hooks();
+            }
             if remove {
                 remove_copilot_hooks()?;
                 return setup_json_host(node, data_dir, wats::hosts::Host::Copilot, (false, true));
@@ -3730,8 +3751,12 @@ fn setup_tool_command(
             agent,
             keys,
             remove,
+            remove_hooks,
             project,
         } => {
+            if remove_hooks {
+                return remove_vibe_hooks(project);
+            }
             if !agent || mcp || remove {
                 setup_vibe(node, data_dir, (mcp, remove, project))?;
                 if remove {
@@ -4173,9 +4198,21 @@ fn offer_integrations(
                 |profile| register_in_opencode(node, profile, path),
                 None,
             ),
-            "vibe" => setup_vibe(node, data_dir, (true, false, false)),
+            // With their hooks, as `wats setup vibe|copilot --mcp` (ADR 0056
+            // §5): asked one by one, yes at once otherwise.
+            "vibe" => setup_vibe(node, data_dir, (true, false, false)).and_then(|()| {
+                if !ask || want_hook(node, "Mistral Vibe", true)? {
+                    install_vibe_hooks(node, false)?;
+                }
+                Ok(())
+            }),
             other => match wats::hosts::Host::of_command(other) {
-                Some(host) => setup_json_host(node, data_dir, host, (true, false)),
+                Some(host) => setup_json_host(node, data_dir, host, (true, false)).and_then(|()| {
+                    if host == wats::hosts::Host::Copilot {
+                        install_copilot_hooks(node, ask)?;
+                    }
+                    Ok(())
+                }),
                 None => continue,
             },
         };
