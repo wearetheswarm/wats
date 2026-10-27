@@ -223,7 +223,11 @@ fn cut(text: &str) -> String {
 /// (`PostToolUseFailure` after a failed call, `PostToolUse` otherwise).
 pub fn render(host: Host, event: Event, event_name: Option<&str>, text: &str) -> String {
     match (host, event) {
-        (Host::Claude | Host::Codex | Host::Copilot, Event::PostTool) => {
+        // Copilot CLI wants `additionalContext` at the top level ("appended
+        // to textResultForLlm so the model sees it after the tool output");
+        // it drops `hookSpecificOutput` (seen on a real install).
+        (Host::Copilot, Event::PostTool) => json!({"additionalContext": text}).to_string(),
+        (Host::Claude | Host::Codex, Event::PostTool) => {
             let name = event_name
                 .filter(|n| matches!(*n, "PostToolUse" | "PostToolUseFailure"))
                 .unwrap_or("PostToolUse");
@@ -1325,6 +1329,9 @@ mod tests {
         );
         let stop: Value =
             serde_json::from_str(&render(Host::Codex, Event::Stop, None, "y")).unwrap();
+        let copilot: Value =
+            serde_json::from_str(&render(Host::Copilot, Event::PostTool, None, "c")).unwrap();
+        assert_eq!(copilot, json!({"additionalContext": "c"}));
         assert_eq!(stop["decision"], "block");
         let vibe: Value =
             serde_json::from_str(&render(Host::Vibe, Event::PostTool, None, "z")).unwrap();
