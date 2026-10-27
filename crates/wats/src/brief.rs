@@ -380,7 +380,11 @@ impl State {
                 count(signals.confirms.max(1), "reader", "readers")
             ),
             Status::Unverified => "its confirmation was withdrawn".to_string(),
-            _ => signals.why.clone().unwrap_or_else(|| "contradicted".into()),
+            Status::Stale => signals
+                .why
+                .clone()
+                .unwrap_or_else(|| "its confirmations are over a year old".into()),
+            Status::Contested => signals.why.clone().unwrap_or_else(|| "contradicted".into()),
         };
         Some(format!(
             "your {} \"{}\" is now {new}: {why}",
@@ -491,6 +495,38 @@ pub fn follow_lines(
     Some(lines)
 }
 
+/// Posts re-checked for decay each hour, at most.
+const DECAY_CHECKS: usize = 200;
+
+/// The lines of this node's confirmed posts that went stale since their
+/// status was recorded (decay needs no new signal, so nothing else would
+/// say it).
+pub fn decay_lines(node: &Node, state: &mut State, now: u64) -> Vec<String> {
+    let ids: Vec<String> = state
+        .status
+        .iter()
+        .filter(|(_, (status, _))| status == Status::Confirmed.as_str())
+        .map(|(id, _)| id.clone())
+        .take(DECAY_CHECKS)
+        .collect();
+    let store = node.store();
+    let mut lines = Vec::new();
+    for id in ids {
+        let Some(post) = store.get(&id).ok().flatten().map(|s| s.event) else {
+            continue;
+        };
+        let grouping = crate::delivery::grouping(node, &post.net);
+        if let Ok(signals) = crate::signals::compute(store, &grouping, &[&post])
+            && let Some(signals) = signals.get(&post.id)
+            && signals.status == Status::Stale
+            && let Some(line) = state.status_line(&post, signals, now)
+        {
+            lines.push(line);
+        }
+    }
+    lines
+}
+
 /// Log a brief line for each new live event of the node, a line when one
 /// of its posts changes status or one of its authors earns a field, and
 /// once a day what others said of its posts, until it is gone.
@@ -543,6 +579,13 @@ pub async fn watch(node: std::sync::Weak<Node>) {
                 crate::me::refresh(&node);
                 me_at = std::time::Instant::now();
                 let now = crate::node::now_secs();
+                let decayed = decay_lines(&node, &mut state, now);
+                for line in &decayed {
+                    info!(target: TARGET, "{line}");
+                }
+                if !decayed.is_empty() {
+                    state.save(&dir);
+                }
                 if let Some(since) = state.summary_due(now) {
                     let authors: Vec<String> = node.local_authors().into_iter().collect();
                     match node.store().signals_received(&authors, since) {
@@ -710,6 +753,22 @@ mod tests {
         state.save(dir.path());
         let mut again = State::load(dir.path(), 5000);
         assert_eq!(again.status_line(&post, &confirmed, 5100), None);
+        let stale = Signals {
+            status: Status::Stale,
+            ..Signals::default()
+        };
+        assert_eq!(
+            again
+                .status_line(&answer("s1", 2000), &confirmed, 5150)
+                .as_deref(),
+            Some("your answer \"Use VACUUM\" is now confirmed: accepted by its asker")
+        );
+        assert_eq!(
+            again
+                .status_line(&answer("s1", 2000), &stale, 5160)
+                .as_deref(),
+            Some("your answer \"Use VACUUM\" is now stale: its confirmations are over a year old")
+        );
         let contested = Signals {
             status: Status::Contested,
             why: Some("contradicted by 1 key: tests fail".into()),
