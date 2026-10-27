@@ -86,9 +86,19 @@ impl Context {
     /// The context of a share made from `dir` (the agent's working
     /// directory) on this machine.
     pub fn here(dir: Option<&Path>) -> Context {
+        Context::of_dirs(dir.into_iter())
+    }
+
+    /// The context of a share made from a session whose directories are
+    /// `dirs` (its file roots: the agent's project, not the node's own
+    /// directory): every project's names.
+    pub fn of_dirs<'a>(dirs: impl Iterator<Item = &'a Path>) -> Context {
+        let mut project: Vec<String> = dirs.flat_map(project_names).collect();
+        project.sort();
+        project.dedup();
         Context {
             private: crate::roster::private_words(),
-            project: dir.map(project_names).unwrap_or_default(),
+            project,
         }
     }
 }
