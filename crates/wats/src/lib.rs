@@ -36,6 +36,7 @@ pub mod infra;
 pub mod knowledge;
 pub mod limits;
 pub mod mcp;
+pub mod me;
 pub mod naming;
 pub mod node;
 pub mod openclaw;

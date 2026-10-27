@@ -32,29 +32,82 @@ pub const NEW_KEY_NOTE: &str =
 
 /// `author`'s score on `net` (ADR 0055 §2). Errors read as 0.
 pub fn author_score(store: &Store, grouping: &Grouping, net: &str, author: &str) -> i64 {
+    standing(store, grouping, net, author).score
+}
+
+/// What others made of an author's posts: its score, and its badges
+/// (ADR 0056 §4).
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
+pub struct Standing {
+    pub score: i64,
+    /// Badge names, in [`BADGES`] order, then one `Comb: <tag>` per earned
+    /// specialty.
+    pub badges: Vec<String>,
+    /// Useful votes (+1) received, uses of its answers.
+    pub useful: u64,
+    pub uses: u64,
+}
+
+/// The badges (ADR 0056 §4), in the order they are shown, with what earns
+/// each.
+pub const BADGES: &[(&str, &str)] = &[
+    ("First Buzz", "your first ask"),
+    ("Nectar", "your first answer"),
+    ("Royal Jelly", "your first answer accepted by its asker"),
+    ("Pollinator", "your first answer used by someone"),
+    (
+        "Waggle Dance",
+        "your first shared finding confirmed or used",
+    ),
+    ("Busy Bee", "10 useful votes (+1) received"),
+    ("Honeycomb", "100 useful votes received"),
+    ("Golden Hive", "1,000 useful votes received"),
+    ("Forager", "10 uses of your answers"),
+    ("Swarm Keeper", "100 uses of your answers"),
+    (
+        "Guard Bee",
+        "10 answers by others you confirmed with evidence, unchallenged",
+    ),
+    (
+        "Field Bee",
+        "an accepted answer to a capability ask (image, audio, video)",
+    ),
+];
+
+/// `author`'s standing on `net`, cached [`CACHE_FOR`]. Errors read as
+/// nothing earned.
+pub fn standing(store: &Store, grouping: &Grouping, net: &str, author: &str) -> Standing {
     let key = (net.to_string(), author.to_string());
     if let Ok(cache) = CACHE.lock()
-        && let Some((at, score)) = cache.get(&key)
+        && let Some((at, standing)) = cache.get(&key)
         && at.elapsed() < CACHE_FOR
     {
-        return *score;
+        return standing.clone();
     }
-    let score = compute(store, grouping, net, author).unwrap_or(0);
+    let standing = compute(store, grouping, net, author).unwrap_or_default();
     if let Ok(mut cache) = CACHE.lock() {
         if cache.len() > 2000 {
             cache.clear();
         }
-        cache.insert(key, (Instant::now(), score));
+        cache.insert(key, (Instant::now(), standing.clone()));
     }
-    score
+    standing
 }
 
-type Cache = HashMap<(String, String), (Instant, i64)>;
+type Cache = HashMap<(String, String), (Instant, Standing)>;
 
 static CACHE: std::sync::LazyLock<Mutex<Cache>> =
     std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
 
-fn compute(store: &Store, grouping: &Grouping, net: &str, author: &str) -> anyhow::Result<i64> {
+/// Capability tags whose accepted answer earns the Field Bee.
+const FIELD_CAPS: &[&str] = &["cap:image", "cap:audio", "cap:video"];
+
+fn compute(
+    store: &Store,
+    grouping: &Grouping,
+    net: &str,
+    author: &str,
+) -> anyhow::Result<Standing> {
     let filter = Filter {
         net: Some(net.to_string()),
         kinds: vec![
@@ -70,16 +123,124 @@ fn compute(store: &Store, grouping: &Grouping, net: &str, author: &str) -> anyho
         .into_iter()
         .map(|s| s.event)
         .collect();
+    let mut out = Standing::default();
+    let mut earned: Vec<&str> = Vec::new();
     if posts.is_empty() {
-        return Ok(0);
+        return Ok(out);
     }
     let refs: Vec<&Event> = posts.iter().map(|e| &**e).collect();
     let signals = crate::signals::compute(store, grouping, &refs)?;
-    Ok(posts
+    let root_of = |e: &Event| store.get(e.thread_root()).ok().flatten().map(|s| s.event);
+    for post in &posts {
+        let Some(s) = signals.get(&post.id) else {
+            continue;
+        };
+        out.score += s.points();
+        out.useful += s.up;
+        match post.kind {
+            Kind::Ask => earned.push("First Buzz"),
+            Kind::Answer => {
+                earned.push("Nectar");
+                out.uses += s.uses;
+                if s.accepted {
+                    earned.push("Royal Jelly");
+                }
+                if s.uses > 0 {
+                    earned.push("Pollinator");
+                }
+                if s.accepted || s.uses > 0 || s.status == crate::signals::Status::Confirmed {
+                    let root = root_of(post);
+                    let shared = root.as_ref().is_some_and(|r| {
+                        r.author == post.author
+                            && r.data.get("self_answered") == Some(&serde_json::json!(true))
+                    });
+                    if shared && (s.uses > 0 || s.status == crate::signals::Status::Confirmed) {
+                        earned.push("Waggle Dance");
+                    }
+                    if s.accepted
+                        && root.as_ref().is_some_and(|r| {
+                            r.tags
+                                .iter()
+                                .any(|t| FIELD_CAPS.contains(&crate::delivery::tag_key(t).as_str()))
+                        })
+                    {
+                        earned.push("Field Bee");
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    for (badge, n, at) in [
+        ("Busy Bee", out.useful, 10),
+        ("Honeycomb", out.useful, 100),
+        ("Golden Hive", out.useful, 1000),
+        ("Forager", out.uses, 10),
+        ("Swarm Keeper", out.uses, 100),
+    ] {
+        if n >= at {
+            earned.push(badge);
+        }
+    }
+    if guard_checks(store, grouping, net, author)? >= 10 {
+        earned.push("Guard Bee");
+    }
+    out.badges = BADGES
         .iter()
-        .filter_map(|p| signals.get(&p.id))
-        .map(|s| s.points())
-        .sum())
+        .map(|(name, _)| *name)
+        .filter(|name| earned.contains(name))
+        .map(str::to_string)
+        .collect();
+    out.badges.extend(
+        crate::specialty::earned(store, grouping, net, author)
+            .into_iter()
+            .map(|e| format!("Comb: {}", e.tag)),
+    );
+    Ok(out)
+}
+
+/// Answers by others that `author` confirmed with evidence and that no
+/// standing contradiction contests (the Guard Bee).
+fn guard_checks(
+    store: &Store,
+    grouping: &Grouping,
+    net: &str,
+    author: &str,
+) -> anyhow::Result<usize> {
+    let filter = Filter {
+        net: Some(net.to_string()),
+        kinds: vec![Kind::React],
+        author: Some(author.to_string()),
+        ..Filter::default()
+    };
+    let parents: Vec<std::sync::Arc<Event>> = store
+        .search(None, &filter, POSTS)?
+        .into_iter()
+        .filter(|r| {
+            r.event
+                .data
+                .get("value")
+                .and_then(serde_json::Value::as_i64)
+                == Some(1)
+                && r.event.data.get("evidence").is_some_and(|e| !e.is_null())
+        })
+        .filter_map(|r| r.event.parent.clone())
+        .filter_map(|p| store.get(&p).ok().flatten().map(|s| s.event))
+        .filter(|p| p.kind == Kind::Answer && p.author != author)
+        .collect();
+    if parents.len() < 10 {
+        return Ok(parents.len());
+    }
+    let refs: Vec<&Event> = parents.iter().map(|e| &**e).collect();
+    let signals = crate::signals::compute(store, grouping, &refs)?;
+    Ok(parents
+        .iter()
+        .filter(|p| {
+            signals
+                .get(&p.id)
+                .is_some_and(|s| s.status != crate::signals::Status::Contested)
+        })
+        .count())
 }
 
 /// What `who` says of `author`'s node (ADR 0055 §5–6): its label, its

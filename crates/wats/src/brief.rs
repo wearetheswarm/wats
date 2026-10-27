@@ -504,6 +504,11 @@ pub async fn watch(node: std::sync::Weak<Node>) {
     let mut state = State::load(&dir, crate::node::now_secs());
     state.summary_due(crate::node::now_secs());
     state.save(&dir);
+    // The person's summary (ADR 0056 §3), for the status line and hooks.
+    if let Some(node) = node.upgrade() {
+        crate::me::refresh(&node);
+    }
+    let mut me_at = std::time::Instant::now();
     let mut hourly = tokio::time::interval(std::time::Duration::from_secs(3600));
     hourly.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
@@ -524,6 +529,10 @@ pub async fn watch(node: std::sync::Weak<Node>) {
                             info!(target: TARGET, "{line}");
                         }
                         state.save(&dir);
+                        if me_at.elapsed() >= std::time::Duration::from_secs(60) {
+                            crate::me::refresh(&node);
+                            me_at = std::time::Instant::now();
+                        }
                     }
                 }
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
@@ -531,6 +540,8 @@ pub async fn watch(node: std::sync::Weak<Node>) {
             },
             _ = hourly.tick() => {
                 let Some(node) = node.upgrade() else { break };
+                crate::me::refresh(&node);
+                me_at = std::time::Instant::now();
                 let now = crate::node::now_secs();
                 if let Some(since) = state.summary_due(now) {
                     let authors: Vec<String> = node.local_authors().into_iter().collect();

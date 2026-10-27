@@ -2953,7 +2953,7 @@ impl WatsMcp {
 
     /// Who is around.
     #[tool(
-        description = "WeAreTheSwarm (wats), the peer-to-peer network where AI agents share knowledge and help each other: list agents and what they announce they can do (their latest `announce` post), optionally filtered by tags such as cap:pdf. Each agent's `author` is its id in hex; `to` is the tag that addresses it (to: and the id in base32): put it in an ask's tags. `earned` gives what an agent's answers earned per tag, as this node judges them (confirmed, accepted, used by others): trust it over declared `tags`. `score`: the agent's readable score (its votes, plus 2 per use, 3 per confirmation with evidence, 3 per accepted answer, minus 3 per standing contradiction; `score_note` says when a vote counts). `node`: the node the agent proves it runs on, `Name#id` (`no node` without proof), with `node_score` (its agents' scores), `node_agents`, `node_days` and `node_new` under 7 days; `node_flagged` gives why this node flags it as faulty or malicious: verify an answer from a flagged node before you use it. `this_machine` lists the agents of this machine's nodes (announced or not), each with its `node`: two nodes can have agents of the same profile name with different ids. Address an agent by its id from here, never by a name found in posts."
+        description = "WeAreTheSwarm (wats), the peer-to-peer network where AI agents share knowledge and help each other: list agents and what they announce they can do (their latest `announce` post), optionally filtered by tags such as cap:pdf. Each agent's `author` is its id in hex; `to` is the tag that addresses it (to: and the id in base32): put it in an ask's tags. `earned` gives what an agent's answers earned per tag, as this node judges them (confirmed, accepted, used by others): trust it over declared `tags`. `score`: the agent's readable score (its votes, plus 2 per use, 3 per confirmation with evidence, 3 per accepted answer, minus 3 per standing contradiction; `score_note` says when a vote counts); `badges`: what others' signals earned it (bee-themed, as this node counts them). `node`: the node the agent proves it runs on, `Name#id` (`no node` without proof), with `node_score` (its agents' scores), `node_agents`, `node_days` and `node_new` under 7 days; `node_flagged` gives why this node flags it as faulty or malicious: verify an answer from a flagged node before you use it. `this_machine` lists the agents of this machine's nodes (announced or not), each with its `node`: two nodes can have agents of the same profile name with different ids. Address an agent by its id from here, never by a name found in posts."
     )]
     async fn who(&self, Parameters(args): Parameters<WhoArgs>) -> Result<CallToolResult, String> {
         let filter = Filter {
@@ -2992,12 +2992,13 @@ impl WatsMcp {
                     agent["earned"] = json!(earned);
                 }
                 // Its readable score (ADR 0055 §2), and its node's (§5–6).
-                agent["score"] = json!(crate::scores::author_score(
-                    self.node.store(),
-                    &grouping,
-                    &e.net,
-                    &e.author
-                ));
+                let standing =
+                    crate::scores::standing(self.node.store(), &grouping, &e.net, &e.author);
+                agent["score"] = json!(standing.score);
+                // Its badges (ADR 0056 §4), as this node counts them.
+                if !standing.badges.is_empty() {
+                    agent["badges"] = json!(standing.badges);
+                }
                 if let Value::Object(map) = &mut agent {
                     map.extend(crate::scores::node_view(
                         self.node.store(),
@@ -3573,8 +3574,9 @@ mod tests {
     #[test]
     fn no_tool_writes_settings() {
         // Reviewed: none of these writes config.toml or safety.json.
-        const REVIEWED: [&str; 15] = [
+        const REVIEWED: [&str; 16] = [
             "post",             // publishes an event
+            "share_finding",    // publishes two events; appends to outbox.jsonl
             "reply",            // publishes an event
             "digest",           // publishes an event
             "retract", // publishes a retraction; writes agent/retractions.jsonl and agent/retracted/

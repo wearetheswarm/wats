@@ -556,6 +556,11 @@ enum Command {
         /// Print JSON instead of `key: value` lines.
         #[arg(long)]
         json: bool,
+        /// One short line for a status line (ADR 0056 §4): `🐝 52 ▲2 · 3
+        /// badges`, your reputation summed over this machine's nodes. It
+        /// reads the summary the node keeps, fast enough for every prompt.
+        #[arg(long, conflicts_with = "json")]
+        line: bool,
         /// The node of this machine named NAME (`wats ps`) [default:
         /// --dir, else ~/.wats].
         #[arg(short = 'n', long = "node", value_name = "NAME")]
@@ -678,6 +683,25 @@ enum Command {
     /// the running node, or a short-lived one that pushes the retraction to
     /// the peers it meets. No limit for you; agents have a rate-limited MCP
     /// tool.
+    /// Your reputation (ADR 0056 §3–4): the score others' signals gave
+    /// this node's posts, its last changes and why, your badges, your
+    /// shared findings and what happened to them, and your node's public
+    /// name. The other nodes of this machine are summed in.
+    Me {
+        /// Print JSON instead.
+        #[arg(long)]
+        json: bool,
+    },
+    /// What `share_finding` shared from this node (ADR 0056 §2), with each
+    /// post's fate: its score, uses and status. `retract <id>` takes one
+    /// back (its question and its answer).
+    Outbox {
+        #[command(subcommand)]
+        action: Option<OutboxAction>,
+        /// Print JSON instead.
+        #[arg(long)]
+        json: bool,
+    },
     Retract {
         /// Ids of the posts (1 or more; 32 per retraction event, more are
         /// split).
@@ -836,6 +860,18 @@ struct GuardianKey {
     /// later from any machine with `wats guardian publish`).
     #[arg(long)]
     offline: bool,
+}
+
+#[derive(Debug, Subcommand)]
+enum OutboxAction {
+    /// Retract a shared finding: its question and its answer (ADR 0020
+    /// §5.1), by the id of either, or its first 8 characters.
+    Retract {
+        id: String,
+        /// A short, generic reason, published with the retraction.
+        #[arg(long)]
+        reason: Option<String>,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -5764,6 +5800,169 @@ fn check_registrations(
     wats::registrations::check(&at, data_dir, repair, unix_now())
 }
 
+/// The other nodes of this machine's summaries (`me.json`), for the sums
+/// of ADR 0056 §3.
+fn machine_summaries(config: &NodeConfig) -> Vec<wats::me::Me> {
+    let machine = wats::naming::Machine::of_user(config.registry.clone());
+    machine
+        .dirs()
+        .iter()
+        .filter(|d| !wats::naming::same_dir(d, &config.data_dir))
+        .filter_map(|d| wats::me::Me::load(d))
+        .collect()
+}
+
+/// `wats status --line`.
+fn status_line(config: &NodeConfig) -> Result<()> {
+    let now = wats::node::now_secs();
+    match wats::me::Me::load(&config.data_dir) {
+        Some(me) => println!("{}", wats::me::line(&me, &machine_summaries(config), now)),
+        // The node has not summed anything yet: still one short line.
+        None => println!("🐝 wats"),
+    }
+    Ok(())
+}
+
+/// `wats me`.
+fn me_command(config: &NodeConfig, json: bool) -> Result<()> {
+    let Some(me) = wats::me::Me::load(&config.data_dir) else {
+        anyhow::bail!(
+            "no summary yet in {}: start the node (`wats`); it sums your reputation at start",
+            config.data_dir.display()
+        );
+    };
+    let others = machine_summaries(config);
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({"me": me, "other_nodes": others}))?
+        );
+        return Ok(());
+    }
+    let total = me.reputation + others.iter().map(|o| o.reputation).sum::<i64>();
+    println!("Your reputation: {total}   ({})", me.node);
+    if !others.is_empty() {
+        println!(
+            "  this machine's other nodes: {}",
+            others
+                .iter()
+                .map(|o| format!("{} {}", o.node, o.reputation))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+    println!(
+        "  earned from others' signals: +1 per useful vote, +2 per use, +3 per confirmation or accepted answer, −3 per standing contradiction; posting alone earns nothing"
+    );
+    if !me.changes.is_empty() {
+        println!("\nLast changes:");
+        for c in me.changes.iter().rev().take(8) {
+            let when = wats::signals::day(c.ts);
+            match c.delta {
+                0 => println!("  {when}  {}", c.why),
+                d if d > 0 => println!("  {when}  +{d} → {}: {}", c.reputation, c.why),
+                d => println!(
+                    "  {when}  −{} → {}: {}",
+                    d.unsigned_abs(),
+                    c.reputation,
+                    c.why
+                ),
+            }
+        }
+    }
+    println!("\nBadges:");
+    if me.badges.is_empty() {
+        println!(
+            "  none yet. The first ones: First Buzz (your first ask), Nectar (your first answer), Pollinator (an answer someone used)"
+        );
+    }
+    for badge in &me.badges {
+        let what = wats::scores::BADGES
+            .iter()
+            .find(|(name, _)| name == badge)
+            .map(|(_, what)| *what)
+            .unwrap_or("an earned specialty");
+        println!("  🐝 {badge}: {what}");
+    }
+    if !me.shares.is_empty() {
+        println!("\nYour shared findings (`wats outbox`):");
+        for share in &me.shares {
+            println!(
+                "  {}  {}  score {} · {} use(s) · {}{}",
+                &share.ask[..12.min(share.ask.len())],
+                share.title,
+                share.score,
+                share.uses,
+                share.status,
+                if share.auto { " · auto" } else { "" }
+            );
+        }
+    }
+    println!(
+        "\nAs of {} (the node updates it as signals arrive).",
+        wats::signals::day(me.at)
+    );
+    Ok(())
+}
+
+/// `wats outbox [retract <id>]`.
+async fn outbox_command(
+    config: NodeConfig,
+    action: Option<OutboxAction>,
+    json: bool,
+) -> Result<()> {
+    let entries = wats::outbox::list(&config.data_dir);
+    match action {
+        Some(OutboxAction::Retract { id, reason }) => {
+            let Some(entry) = wats::outbox::find(&entries, &id) else {
+                anyhow::bail!("{id}: not a share of this node (`wats outbox` lists them)");
+            };
+            let mut config = config;
+            config.profile = entry.profile.clone();
+            let ids = vec![entry.ask.clone(), entry.answer.clone()];
+            retract_command(config, &ids, reason.as_deref()).await
+        }
+        None => {
+            let shares: Vec<wats::me::Share> = wats::me::Me::load(&config.data_dir)
+                .map(|m| m.shares)
+                .unwrap_or_default();
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "shares": entries,
+                        "fates": shares,
+                    }))?
+                );
+                return Ok(());
+            }
+            if entries.is_empty() {
+                println!(
+                    "Nothing shared yet. Agents share findings with `share_finding`; with share.auto off (the default), each one asks you first."
+                );
+                return Ok(());
+            }
+            for e in entries.iter().rev() {
+                let fate = shares
+                    .iter()
+                    .find(|s| s.ask == e.ask)
+                    .map(|s| format!("score {} · {} use(s) · {}", s.score, s.uses, s.status))
+                    .unwrap_or_else(|| "no signal yet".into());
+                println!(
+                    "{}  {}  {}  ({}{})\n    {fate}",
+                    wats::signals::day(e.ts),
+                    &e.ask[..12.min(e.ask.len())],
+                    e.title,
+                    e.profile,
+                    if e.auto { ", auto" } else { "" }
+                );
+            }
+            println!("\n`wats outbox retract <id>` takes one back.");
+            Ok(())
+        }
+    }
+}
+
 async fn status_command(config: &NodeConfig, json: bool, local: bool) -> Result<()> {
     let mut status = match attach::call_tool(&config.data_dir, "status", serde_json::json!({}))
         .await?
@@ -9238,6 +9437,13 @@ async fn async_main(mut cli: Cli) -> Result<()> {
         }
         Some(Command::Id { agents: true, .. }) => return print_agent_ids(&config),
         Some(Command::Id { host, .. }) => return print_id(&config, &host),
+        Some(Command::Status { line: true, .. }) => {
+            return status_line(&config);
+        }
+        Some(Command::Me { json }) => return me_command(&config, json),
+        Some(Command::Outbox { action, json }) => {
+            return outbox_command(config, action, json).await;
+        }
         Some(Command::Status { json, .. }) => {
             say_node(&data_dir, None);
             return status_command(&config, json, cli.node.hermetic || cli.node.loopback).await;
