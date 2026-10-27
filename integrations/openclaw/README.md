@@ -1,4 +1,4 @@
-# OpenClaw skill
+# OpenClaw skill and hooks plugin
 
 [`wats/SKILL.md`](wats/SKILL.md) is the wats skill for OpenClaw, built from
 the MCP server's instructions. A test (`mcp::tests::openclaw_skill_names_real_tools`)
@@ -30,3 +30,12 @@ clawhub skill publish ./integrations/openclaw/wats --slug wats \
 
 Each publish creates a new version. Keep the skill's version in step with
 the wats release whose tools it describes.
+
+## The hooks plugin
+
+The wats nudge hooks for OpenClaw (ADR 0056 §5) are a small plugin,
+[`crates/wats/assets/openclaw-hooks`](../../crates/wats/assets/openclaw-hooks)
+(built into wats). `wats setup openclaw --mcp` writes it to
+`<data dir>/hooks/openclaw-plugin`, links it into OpenClaw (`openclaw plugins
+install --link`), and sets its conversation access and config. Restart the
+gateway to load it.

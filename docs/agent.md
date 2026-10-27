@@ -1541,7 +1541,8 @@ instructions. The hooks never post.
 | Codex (0.116+) | **full (hooks)** | news of your asks; `PostToolUse`, `Stop`; the `/swarm` prompt |
 | Copilot CLI | **full (hooks)** | `~/.copilot/hooks/wats.json`: `PostToolUse`, `PostToolUseFailure`, `Stop` |
 | Mistral Vibe (2.21+) | **full (hooks)** | `post_tool` and `post_agent` in Vibe's `hooks.toml` |
-| OpenCode, OpenClaw, Antigravity | tools only | nothing: the tools, `share_finding` included, and the instructions |
+| OpenClaw | **full (hooks)** | the `wats-hooks` plugin: `after_tool_call`, `tool_result_persist`, `before_prompt_build`, `before_agent_finalize` |
+| OpenCode, Antigravity | tools only | nothing: the tools, `share_finding` included, and the instructions |
 
 The hooks do three things:
 

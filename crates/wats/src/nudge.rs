@@ -46,6 +46,8 @@ pub enum Host {
     Codex,
     Copilot,
     Vibe,
+    /// Through the wats OpenClaw plugin, which takes plain text.
+    OpenClaw,
 }
 
 impl Host {
@@ -55,6 +57,7 @@ impl Host {
             "codex" => Some(Host::Codex),
             "copilot" => Some(Host::Copilot),
             "vibe" => Some(Host::Vibe),
+            "openclaw" => Some(Host::OpenClaw),
             _ => None,
         }
     }
@@ -65,6 +68,7 @@ impl Host {
             Host::Codex => "codex",
             Host::Copilot => "copilot",
             Host::Vibe => "vibe",
+            Host::OpenClaw => "openclaw",
         }
     }
 }
@@ -243,6 +247,8 @@ pub fn render(host: Host, event: Event, event_name: Option<&str>, text: &str) ->
         })
         .to_string(),
         (Host::Vibe, Event::Stop) => json!({"decision": "deny", "reason": text}).to_string(),
+        // The plugin puts it where the model reads it.
+        (Host::OpenClaw, _) => text.to_string(),
     }
 }
 
@@ -372,6 +378,7 @@ fn tool_input(payload: &Value) -> Value {
 
 const SHELL_TOOLS: &[&str] = &[
     "bash",
+    "exec",
     "shell",
     "exec_command",
     "local_shell",
@@ -451,6 +458,20 @@ pub fn shell(payload: &Value) -> Option<Shell> {
                         output.push('\n');
                     }
                 }
+                // OpenClaw: `{content: [{type: "text", text}], details: {…}}`.
+                if let Some(parts) = v["content"].as_array() {
+                    for part in parts {
+                        if let Some(t) = part["text"].as_str() {
+                            output.push_str(t);
+                            output.push('\n');
+                        }
+                    }
+                }
+                let details = &v["details"];
+                exit = exit
+                    .or_else(|| details["exitCode"].as_i64())
+                    .or_else(|| details["exit_code"].as_i64())
+                    .or_else(|| details["code"].as_i64());
             }
             Value::String(s) => {
                 output.push_str(s);
@@ -1086,6 +1107,19 @@ mod tests {
             "toolResult": {"resultType": "success",
                 "textResultForLlm": "ok\n<shellId: 3 completed with exit code 0>"}});
         assert_eq!(shell(&done).unwrap().exit, Some(0));
+        // OpenClaw, through its plugin: `exec`, a result with content and
+        // details.
+        let openclaw = json!({"session_id": "o1", "tool_name": "exec",
+            "tool_input": {"command": "python3 check.py"},
+            "tool_response": {"content": [{"type": "text", "text": "ModuleNotFoundError: No module named 'x'"}],
+                "details": {"exitCode": 1}}});
+        let s = shell(&openclaw).unwrap();
+        assert_eq!(s.exit, Some(1));
+        assert!(s.output.contains("ModuleNotFoundError"));
+        assert_eq!(
+            render(Host::OpenClaw, Event::PostTool, None, "plain"),
+            "plain"
+        );
         // Codex, PostToolUse: output text only.
         let codex = json!({"tool_name": "shell", "tool_input": {"command": ["bash", "-lc", "npm test"]},
             "tool_response": "FAIL src/a.test.ts\nError: expected 2"});

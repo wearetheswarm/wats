@@ -1,0 +1,14 @@
+{
+  "name": "@wearetheswarm/openclaw-wats-hooks",
+  "version": "0.5.6",
+  "description": "The wats nudge hooks for OpenClaw (ADR 0056): the swarm checked when a command fails, a fix offered for sharing, an answer relied on marked used",
+  "type": "module",
+  "license": "Apache-2.0",
+  "openclaw": {
+    "extensions": ["./index.js"],
+    "compat": {
+      "pluginApi": ">=2026.6.0",
+      "minGatewayVersion": "2026.6.0"
+    }
+  }
+}

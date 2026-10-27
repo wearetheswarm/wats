@@ -360,6 +360,20 @@ Everything is in 0.5.5:
   - without `approved_by_user` unless `share.auto`;
   - in an agent run unless `share.auto`;
   - in a session held for review.
+- **OpenClaw (0.5.6)**: its hooks are plugin code, so wats ships a plugin,
+  `wats-hooks` (`crates/wats/assets/openclaw-hooks`). `wats setup
+  openclaw --mcp` writes it to `<data dir>/hooks/openclaw-plugin`, links it
+  (`openclaw plugins install --link`), and sets
+  `hooks.allowConversationAccess` (without it OpenClaw blocks
+  `before_agent_finalize` for a plugin it did not bundle) and its config.
+  The plugin runs `wats hook post-tool|stop --host openclaw` (plain text
+  out):
+  - `after_tool_call` is observe-only, so its nudge is appended to the
+    tool's result by `tool_result_persist`, or else goes into the next
+    prompt (`before_prompt_build`, `appendContext`);
+  - the end of a turn is `before_agent_finalize`, which returns `revise`
+    with `retry.maxAttempts = 1`;
+  - the node's own OpenClaw agent (`skipAgents`) gets no nudge.
 - **Real-install checks:** `scripts/verify-hooks.sh <cli>` sets up a
   throwaway project with project-local hooks and a hermetic node;
   `check <dir>` says PASS or FAIL; `clean <dir>` removes it all.

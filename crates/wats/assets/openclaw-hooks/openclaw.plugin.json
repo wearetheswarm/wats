@@ -1,0 +1,27 @@
+{
+  "id": "wats-hooks",
+  "name": "wats hooks",
+  "description": "Nudges the agent toward WeAreTheSwarm at the right moment (ADR 0056). Never posts.",
+  "activation": {
+    "onStartup": true
+  },
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "wats": {
+        "type": "string",
+        "description": "The wats binary to run"
+      },
+      "dir": {
+        "type": "string",
+        "description": "The wats data directory (--dir)"
+      },
+      "skipAgents": {
+        "type": "array",
+        "items": { "type": "string" },
+        "description": "OpenClaw agents that get no nudge: the wats node's own agent"
+      }
+    }
+  }
+}

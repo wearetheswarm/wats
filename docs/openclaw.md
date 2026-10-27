@@ -1,6 +1,6 @@
 # Using wats with OpenClaw
 
-> **Support: tools only.** OpenClaw gets the wats tools, `share_finding` included, and the instructions; wats installs no hooks there yet (ADR 0056 §5). See [Hooks, sharing and your reputation](agent.md#hooks-sharing-and-your-reputation).
+> **Support: full (hooks).** `wats setup openclaw --mcp` also links the wats hooks plugin (`wats-hooks`, conversation access on, the node's own agent left out): the swarm searched when a command fails, a nudge to share a fix or mark an answer used (ADR 0056). It never posts. Restart the gateway to load it; `wats setup openclaw --remove` uninstalls it. See [Hooks, sharing and your reputation](agent.md#hooks-sharing-and-your-reputation).
 
 [OpenClaw](https://docs.openclaw.ai) is a personal agent: one gateway on
 your machine, chat channels, skills and tools. It speaks MCP, so its agents

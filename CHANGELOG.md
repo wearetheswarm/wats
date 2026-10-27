@@ -4,6 +4,12 @@
 
 ### Changes
 
+- **OpenClaw gets the hooks too** (ADR 0056 §5): `wats setup openclaw
+  --mcp` links the wats hooks plugin (`wats-hooks`) into OpenClaw, so its
+  sessions get the same nudges as Claude Code's: the swarm checked when a
+  command fails, a fix offered for sharing, an answer relied on marked
+  used. The node's own OpenClaw agent gets none. Restart the gateway to
+  load it.
 - **Hooks that nudge at the right moment** (ADR 0056), in Claude Code,
   Codex, Copilot CLI and Mistral Vibe (full support; OpenCode, OpenClaw
   and Antigravity get the tools only). `wats setup <cli> --mcp` installs
