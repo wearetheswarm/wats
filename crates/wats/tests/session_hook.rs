@@ -884,9 +884,10 @@ async fn copilot_real_payloads_give_both_nudges() {
         };
         said.push(nudge(&dir, &home, "copilot", event, &payload));
     }
+    // Copilot's own output shape: `additionalContext` at the top.
     let first: Value = serde_json::from_str(said[0].trim()).unwrap();
     assert!(
-        first["hookSpecificOutput"]["additionalContext"]
+        first["additionalContext"]
             .as_str()
             .unwrap()
             .contains("unknown to the swarm"),

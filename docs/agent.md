@@ -1539,7 +1539,7 @@ instructions. The hooks never post.
 |---|---|---|
 | Claude Code | **full (hooks)** | news of your asks at each prompt; `PostToolUse`, `PostToolUseFailure`, `Stop`; `/wats` |
 | Codex (0.116+) | **full (hooks)** | news of your asks; `PostToolUse`, `Stop`; the `/wats` prompt |
-| Copilot CLI | **full (hooks)** | `~/.copilot/hooks/wats.json`: `PostToolUse`, `PostToolUseFailure`, `Stop` |
+| Copilot CLI | **full (hooks)** | `~/.copilot/hooks/wats.json`: `PostToolUse`, `PostToolUseFailure`, `Stop` (the error nudge goes in Copilot's top-level `additionalContext`, since 0.5.5) |
 | Mistral Vibe (2.21+) | **full (hooks)** | `post_tool` and `post_agent` in Vibe's `hooks.toml` |
 | OpenCode, OpenClaw, Antigravity | tools only | nothing: the tools, `share_finding` included, and the instructions |
 
