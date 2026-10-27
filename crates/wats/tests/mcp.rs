@@ -2942,3 +2942,78 @@ fn asks_and_answers_carry_a_readable_score() -> anyhow::Result<()> {
         Ok(())
     })
 }
+
+/// ADR 0056 §2: `share_finding` needs the agent's check and the user's OK
+/// (share.auto off), refuses what looks private, replaces paths, and
+/// posts a self-answered ask with its answer, kept in the outbox.
+#[test]
+fn share_finding_scrubs_asks_and_keeps_an_outbox() -> anyhow::Result<()> {
+    run(async move {
+        let dir = tempfile::tempdir()?;
+        let node = loopback_node(&dir.path().join("n"), None).await?;
+        let me = client_for(WatsMcp::new(node.clone(), vec![])).await?;
+        let finding = |extra: Value| {
+            let mut args = json!({
+                "title": "cargo build on musl: cannot find -lgcc_s",
+                "problem": "rustc 1.91, target x86_64-unknown-linux-musl, linking fails in /home/someone/proj/target",
+                "fix": "Install musl-tools and set the linker to musl-gcc.",
+                "evidence": "cargo build --target x86_64-unknown-linux-musl: Finished",
+                "tags": ["lang:rust", "os:linux"],
+                "scrubbed": true,
+            });
+            args.as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            args
+        };
+        let refused = call(&me, "share_finding", finding(json!({}))).await;
+        assert_eq!(refused.is_error, Some(true));
+        assert!(
+            error_text(&refused).contains("approved_by_user"),
+            "{refused:?}"
+        );
+        let unchecked = call(
+            &me,
+            "share_finding",
+            finding(json!({"scrubbed": false, "approved_by_user": true})),
+        )
+        .await;
+        assert!(error_text(&unchecked).contains("scrubbed"));
+        let secret = call(
+            &me,
+            "share_finding",
+            finding(json!({"approved_by_user": true, "fix": "export TOKEN=ghp_abcdefghijklmnopqrstuvwxyz0123"})),
+        )
+        .await;
+        assert!(error_text(&secret).contains("secret"), "{secret:?}");
+        let shared = structured(
+            &call(
+                &me,
+                "share_finding",
+                finding(json!({"approved_by_user": true})),
+            )
+            .await,
+        );
+        assert!(
+            shared["note"]
+                .as_str()
+                .unwrap()
+                .contains("+2 when someone uses it")
+        );
+        assert_eq!(shared["replaced"], json!(["a path"]), "{shared}");
+        let ask = shared["ask"].as_str().unwrap();
+        let read = structured(&call(&me, "read", json!({"id": ask})).await);
+        assert_eq!(read["post"]["data"]["self_answered"], true, "{read}");
+        assert!(
+            read["post"]["text"].as_str().unwrap().contains("<path>"),
+            "{read}"
+        );
+        let answer = &read["thread"].as_array().unwrap()[1];
+        assert_eq!(answer["id"], shared["answer"]);
+        let outbox = wats::outbox::list(&dir.path().join("n"));
+        assert_eq!(outbox.len(), 1);
+        assert_eq!(outbox[0].ask, ask);
+        assert!(!outbox[0].auto);
+        Ok(())
+    })
+}

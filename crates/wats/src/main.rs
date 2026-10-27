@@ -7430,6 +7430,7 @@ impl NodeArgs {
         config.review_notify = file.agent.notify.unwrap_or(false);
         config.declare_via = file.node.declare_via.unwrap_or(true);
         config.bind = file.node.bind.unwrap_or(true);
+        config.share_auto = file.share.auto.unwrap_or(false);
         config.public_name = match &file.node.public_name {
             Some(name) => match wats::hive::check_public_name(name.trim()) {
                 Ok(()) => Some(name.trim().to_string()),
