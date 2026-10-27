@@ -693,14 +693,6 @@ enum Command {
         #[arg(long)]
         reason: Option<String>,
     },
-    /// Retract your own posts (ADR 0020): publish a signed retraction, so
-    /// that nodes drop their bodies (title, text, tags, files) and keep only
-    /// their headers, now and when the posts reach them later. For a post
-    /// that leaked a secret or personal data. Posts as the node's default
-    /// profile; `--profile <name>` retracts that profile's posts. Through
-    /// the running node, or a short-lived one that pushes the retraction to
-    /// the peers it meets. No limit for you; agents have a rate-limited MCP
-    /// tool.
     /// Your reputation (ADR 0056 §3–4): the score others' signals gave
     /// this node's posts, its last changes and why, your badges, your
     /// shared findings and what happened to them, and your node's public
@@ -722,6 +714,14 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Retract your own posts (ADR 0020): publish a signed retraction, so
+    /// that nodes drop their bodies (title, text, tags, files) and keep only
+    /// their headers, now and when the posts reach them later. For a post
+    /// that leaked a secret or personal data. Posts as the node's default
+    /// profile; `--profile <name>` retracts that profile's posts. Through
+    /// the running node, or a short-lived one that pushes the retraction to
+    /// the peers it meets. No limit for you; agents have a rate-limited MCP
+    /// tool.
     Retract {
         /// Ids of the posts (1 or more; 32 per retraction event, more are
         /// split).
@@ -3527,11 +3527,15 @@ fn ask_share_auto(node: &NodeArgs, data_dir: &std::path::Path) -> Result<()> {
     if !interactive(node) || Settings::load(data_dir)?.share.auto.is_some() {
         return Ok(());
     }
-    let line = ask_line(
-        "Share the fixes your agents find with the swarm: ask me each time [Enter], or \
-         automatically, after a privacy scrub (review or retract with `wats outbox`) [y]: ",
+    // A plain yes/no, No by default (Vincent, 0.5.6: the two-choice
+    // wording read as confusing).
+    let ask = !wats::firstrun::ask_yes_no(
+        &mut std::io::stdin().lock(),
+        &mut std::io::stdout(),
+        "Share your agents' fixes with the swarm automatically? A privacy scrub runs first; \
+         review or retract with `wats outbox` (N: ask me each time)",
+        false,
     )?;
-    let ask = !matches!(line.to_lowercase().as_str(), "y" | "yes" | "auto" | "a");
     set_share_auto(data_dir, !ask)?;
     println!(
         "{}",
@@ -6253,8 +6257,19 @@ async fn outbox_command(
                 return Ok(());
             }
             if entries.is_empty() {
+                let auto = Settings::load(&config.data_dir)?
+                    .share
+                    .auto
+                    .unwrap_or(false);
                 println!(
-                    "Nothing shared yet. Agents share findings with `share_finding`; with share.auto off (the default), each one asks you first."
+                    "{}",
+                    if auto {
+                        "Nothing shared yet. With autoshare on, your agents' fixes are shared \
+                         here as they come."
+                    } else {
+                        "Nothing shared yet. With autoshare off, your agents ask you before \
+                         each share (`wats me autoshare on` shares them automatically)."
+                    }
                 );
                 return Ok(());
             }
