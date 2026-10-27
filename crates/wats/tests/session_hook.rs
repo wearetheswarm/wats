@@ -708,3 +708,127 @@ async fn hook_holds_answers_until_the_ask_has_what_it_wants() {
         c.cancel().await.unwrap();
     }
 }
+
+/// `wats hook` as a host runs it, with `payload` on stdin: its stdout.
+fn nudge(dir: &Path, home: &Path, host: &str, event: &str, payload: &Value) -> String {
+    use std::io::Write;
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_wats"))
+        .env("WATS_HERMETIC", "1")
+        .env("HOME", home)
+        .env_remove("WATS_AGENT_RUN")
+        .args(["hook", event, "--host", host, "--dir"])
+        .arg(dir)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(payload.to_string().as_bytes())
+        .unwrap();
+    let out = child.wait_with_output().unwrap();
+    assert!(out.status.success());
+    assert!(
+        out.stderr.is_empty(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8(out.stdout).unwrap()
+}
+
+/// ADR 0056 §1: a failing build is looked up (unknown to an empty swarm:
+/// said once); two failures, an edit and a pass make a fix to share at
+/// the end of the turn; the continuation it asks for is never asked
+/// again; a routine failure says nothing; an agent run hears nothing.
+#[tokio::test(flavor = "multi_thread")]
+async fn nudges_follow_the_session() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    let dir = tmp.path().join("node");
+    // A store, so that the lookup runs.
+    let client = session(&dir, &home, "alice", None).await;
+    call(&client, "status", json!({})).await;
+    let fail = json!({"session_id": "s1", "tool_name": "Bash",
+        "tool_input": {"command": "cargo build"},
+        "error": "Exit code 101\nerror[E0599]: no method named `frobnicate` found for struct `Widget` in the current scope"});
+    let first = nudge(&dir, &home, "claude", "post-tool", &fail);
+    let first: Value = serde_json::from_str(first.trim()).unwrap();
+    let said = first["hookSpecificOutput"]["additionalContext"]
+        .as_str()
+        .unwrap();
+    assert!(said.contains("unknown to the swarm"), "{said}");
+    // The same error again: nothing (one per signature).
+    assert_eq!(nudge(&dir, &home, "claude", "post-tool", &fail), "");
+    let edit =
+        json!({"session_id": "s1", "tool_name": "Edit", "tool_input": {"file_path": "src/w.rs"}});
+    assert_eq!(nudge(&dir, &home, "claude", "post-tool", &edit), "");
+    let pass = json!({"session_id": "s1", "tool_name": "Bash",
+        "tool_input": {"command": "cargo build"}, "tool_response": {"stdout": "Finished", "stderr": ""}});
+    assert_eq!(nudge(&dir, &home, "claude", "post-tool", &pass), "");
+    let stop = nudge(
+        &dir,
+        &home,
+        "claude",
+        "stop",
+        &json!({"session_id": "s1", "stop_hook_active": false}),
+    );
+    let stop: Value = serde_json::from_str(stop.trim()).unwrap();
+    assert_eq!(stop["decision"], "block");
+    let reason = stop["reason"].as_str().unwrap();
+    assert!(
+        reason.contains("found a fix") && reason.contains("share_finding"),
+        "{reason}"
+    );
+    assert!(
+        reason.contains("approved_by_user"),
+        "share.auto is off: {reason}"
+    );
+    // The continuation it asked for: nothing more.
+    assert_eq!(
+        nudge(
+            &dir,
+            &home,
+            "claude",
+            "stop",
+            &json!({"session_id": "s1", "stop_hook_active": true})
+        ),
+        ""
+    );
+    // A routine failure, in another session.
+    let grep = json!({"session_id": "s2", "tool_name": "Bash", "tool_input": {"command": "grep -r foo ."},
+        "error": "Exit code 1\n"});
+    assert_eq!(nudge(&dir, &home, "claude", "post-tool", &grep), "");
+    // Vibe's payload, and its output form.
+    let vibe = json!({"session_id": "s3", "tool_name": "bash", "tool_input": {"command": "pytest"},
+        "tool_status": "success",
+        "tool_output": {"exit_code": 1, "stdout": "E   ModuleNotFoundError: No module named 'widgetlib'", "stderr": ""}});
+    let out: Value =
+        serde_json::from_str(nudge(&dir, &home, "vibe", "post-tool", &vibe).trim()).unwrap();
+    assert!(
+        out["hook_specific_output"]["additional_context"]
+            .as_str()
+            .unwrap()
+            .contains("swarm")
+    );
+    // An agent run hears nothing.
+    let mut quiet = std::process::Command::new(env!("CARGO_BIN_EXE_wats"));
+    quiet
+        .env("WATS_HERMETIC", "1")
+        .env("HOME", &home)
+        .env("WATS_AGENT_RUN", "1")
+        .args(["hook", "post-tool", "--host", "claude", "--dir"])
+        .arg(&dir)
+        .stdin(std::process::Stdio::null());
+    assert!(quiet.output().unwrap().stdout.is_empty());
+    let counters = wats::nudge::counters(&dir);
+    assert!(
+        counters.get("hook_post_tool").copied().unwrap_or(0) >= 5,
+        "{counters:?}"
+    );
+    assert_eq!(counters.get("nudge_fix"), Some(&1));
+    drop(client);
+}

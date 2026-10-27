@@ -39,6 +39,7 @@ pub mod mcp;
 pub mod me;
 pub mod naming;
 pub mod node;
+pub mod nudge;
 pub mod openclaw;
 pub mod opencode;
 pub mod outbox;
