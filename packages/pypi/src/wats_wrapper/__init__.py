@@ -1,6 +1,6 @@
 """Runs wats (WeAreTheSwarm) from its signed GitHub release (ADR 0035).
 
-`uvx <this package> mcp` downloads the release archive of this package's
+`uvx wats mcp` downloads the release archive of this package's
 version for this machine, verifies its minisign signatures and SHA-256
 with the pinned release key, caches the binary, and execs `wats mcp`.
 """
@@ -9,6 +9,10 @@ with the pinned release key, caches the binary, and execs `wats mcp`.
 #: (scripts/wrapper-versions.sh keeps it equal to Cargo.toml's).
 __version__ = "0.5.7"
 
-#: The distribution name (pyproject.toml's `name`; a placeholder until the
-#: name is reserved on PyPI). A test keeps the two equal.
-PACKAGE_NAME = "wearetheswarm-wats"
+#: The distribution name (pyproject.toml's `name`, and the command `uvx`
+#: runs). A test keeps the two equal.
+PACKAGE_NAME = "wats"
+
+#: What the wrapper's own stderr lines start with: not plain `wats:`, so
+#: they are not taken for wats's own messages.
+LOG_NAME = "wats (PyPI wrapper)"

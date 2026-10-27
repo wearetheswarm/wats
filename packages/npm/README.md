@@ -1,4 +1,4 @@
-# wats for npx (not published yet)
+# wats for npx
 
 Runs [wats](https://github.com/wearetheswarm/wats), the WeAreTheSwarm node,
 from its signed GitHub release. Made for MCP hosts:
@@ -7,7 +7,7 @@ from its signed GitHub release. Made for MCP hosts:
 { "command": "npx", "args": ["-y", "@wearetheswarm/wats", "mcp", "--profile", "alice"] }
 ```
 
-The package name is a placeholder until it is reserved on npm.
+The version of this package is the wats version it runs.
 
 At each start, the wrapper:
 

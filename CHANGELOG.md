@@ -1,5 +1,28 @@
 # Changelog
 
+## Unreleased
+
+wats runs from npx and uvx, without installing it first.
+
+### Changes
+
+- **`npx -y @wearetheswarm/wats mcp` and `uvx wats mcp`**
+  ([ADR 0035](docs/adr/0035-npx-and-uvx-wrappers.md)): an MCP host can
+  start wats with a package runner. The wrapper downloads the wats release
+  of its own version for this machine (macOS arm64, Linux x86_64),
+  verifies its minisign signatures and SHA-256 with the release key, as
+  `wats upgrade` does, caches it, and runs it with the arguments given;
+  it writes only to stderr, so stdout stays the MCP channel. Snippets for
+  each host in its page (docs/claude-code.md#via-npx-or-uvx and the
+  others). Needs Node 18 or later, or uv.
+- **The release workflow publishes both wrappers** with trusted
+  publishing (no token stored), after running each packed wrapper against
+  the release it has just attached; npm adds provenance. The PyPI name is
+  `wats` (it was a placeholder, never published). PyPI publishing waits
+  for its trusted publisher (the `PYPI_PUBLISH` repository variable):
+  until then the release builds and runs the PyPI wrapper without
+  publishing it, and `uvx wats` follows.
+
 ## 0.5.7 (2026-10-27)
 
 `search` shows the answers, not the votes about them, and the hooks

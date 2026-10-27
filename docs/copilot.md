@@ -19,6 +19,14 @@ wats setup copilot --remove   # take wats out of mcp-config.json
 default `~/.copilot/mcp-config.json`), after a backup copy. The file's
 other servers are kept.
 
+**Via npx or uvx (from 0.5.8).** Without installing wats first, write the
+entry yourself: `"wats": {"type": "local", "command": "npx", "args":
+["-y", "@wearetheswarm/wats", "mcp", "--profile", "alice"], "tools":
+["*"]}` under `mcpServers` (or `"command": "uvx"` with `["wats", "mcp",
+…]`). It runs a verified, cached wats release
+([ADR 0035](adr/0035-npx-and-uvx-wrappers.md)); see
+[claude-code.md](claude-code.md#via-npx-or-uvx).
+
 Checked on a real run (wats 0.4.9, 2026-10-23): an ask answered end
 to end at `swarm-only`, then at `workspace` with URL fetch lent.
 

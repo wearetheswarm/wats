@@ -49,14 +49,14 @@ MCP server.
 - Optionally add [`examples/claude-code/CLAUDE.md`](../examples/claude-code/CLAUDE.md)
   to your project's `CLAUDE.md` so the agent knows when to use the swarm.
 
-### Via npx or uvx (once published)
+### Via npx or uvx
 
-**Not available yet:** the npm and PyPI wrappers are built and tested
-([ADR 0035](adr/0035-npx-and-uvx-wrappers.md)), but neither is published,
-and the package names below are placeholders. Until then, install wats as
-above.
-
-Once published, a host can start wats without installing it first:
+From 0.5.8, a host can start wats without installing it first, through
+the npm package `@wearetheswarm/wats` or the PyPI package `wats`
+([ADR 0035](adr/0035-npx-and-uvx-wrappers.md)). It needs Node 18 or
+later (`npx`), or [uv](https://docs.astral.sh/uv/) (`uvx`). The npm
+package comes with 0.5.8; the PyPI one follows once its publishing is set
+up: until `uvx wats --version` works, use `npx`.
 
 ```json
 {
@@ -70,9 +70,10 @@ Once published, a host can start wats without installing it first:
 }
 ```
 
-or `"command": "uvx", "args": ["wearetheswarm-wats", "mcp",
-"--profile", "my-project"]`; for your user, `claude mcp add --scope user
-wats -- npx -y @wearetheswarm/wats mcp --profile <name>`.
+or `"command": "uvx", "args": ["wats", "mcp", "--profile",
+"my-project"]`; for your user, `claude mcp add --scope user wats -- npx
+-y @wearetheswarm/wats mcp --profile <name>` (or `-- uvx wats mcp
+--profile <name>`).
 
 - The wrapper downloads the wats release of its own version for this
   machine (macOS arm64, Linux x86_64; elsewhere it says how to install
@@ -80,9 +81,11 @@ wats -- npx -y @wearetheswarm/wats mcp --profile <name>`.
   SHA-256 with the release key, as `wats upgrade` does, caches the binary
   (`~/Library/Caches/wats-wrapper`, `~/.cache/wats-wrapper`), and runs
   `wats mcp` with the arguments given. Nothing runs when a check fails. A
-  cached version is checked again at each start, and works offline.
+  cached version is checked again at each start, and works offline. The
+  first start of a version downloads about 15 MB. The wrapper writes only
+  to stderr, so the MCP channel on stdout stays wats's own.
 - The wrapper's version is the wats version it runs. To pin it, write
-  `@wearetheswarm/wats@X.Y.Z` or `wearetheswarm-wats@X.Y.Z`; unpinned,
+  `@wearetheswarm/wats@X.Y.Z` or `wats@X.Y.Z`; unpinned,
   npx and uvx decide when to move to a newer one. Upgrade through the
   package, not with `wats upgrade`.
 - The wrapper never edits Claude Code's config: you add the entry. `wats

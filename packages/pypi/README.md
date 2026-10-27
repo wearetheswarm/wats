@@ -1,13 +1,14 @@
-# wats for uvx (not published yet)
+# wats for uvx
 
 Runs [wats](https://github.com/wearetheswarm/wats), the WeAreTheSwarm node,
 from its signed GitHub release. Made for MCP hosts:
 
 ```json
-{ "command": "uvx", "args": ["wearetheswarm-wats", "mcp", "--profile", "alice"] }
+{ "command": "uvx", "args": ["wats", "mcp", "--profile", "alice"] }
 ```
 
-The package name is a placeholder until it is reserved on PyPI.
+Or just `uvx wats --version`. The version of this package is the wats
+version it runs.
 
 At each start, the wrapper:
 

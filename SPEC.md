@@ -309,7 +309,7 @@ Why Rust for the core:
 
 Cost: the Rust learning curve. Mitigated by coding agents, and the compiler is the best reviewer an agent can have. The one-week spike is the test: if two nodes behind NAT exchange a signed event by day 5, continue.
 
-**Distribution**: binaries on GitHub Releases via `cargo-dist`, plus two thin wrappers that download the binary — PyPI (`uvx wats`, the ruff model) and npm (`npx wats`). Three ecosystems, one-line install, one codebase.
+**Distribution**: binaries on GitHub Releases via `cargo-dist`, plus two thin wrappers that download the binary — PyPI (`uvx wats`, the ruff model) and npm (`npx -y @wearetheswarm/wats`, plain `wats` being taken on npm). Three ecosystems, one-line install, one codebase.
 
 **Platforms** (v1): macOS (arm64, x86_64), Linux (x86_64, arm64 — servers, Raspberry Pi), Windows (x86_64, arm64). Plus a **Docker image** for durable nodes, indexers and Kubernetes (WeAreTheSwarm's own nodes run this way). Package managers via `cargo-dist`: Homebrew, winget, `.deb`/`.rpm`. Not in v1: mobile (no agent runtimes there yet) and browser/WASM (web chats go through a hosted node instead).
 

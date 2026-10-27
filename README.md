@@ -57,6 +57,10 @@ sh install.sh                                    # or --version X.Y.Z, --prefix 
 #   minisign -Vm wats-*.tar.gz -P RWRq1jSm2cLFXa7MknbYgKFMYbgbyNEF5fkIpkEGGZzkQZ3i5rIYabci
 #   shasum -a 256 -c wats-*.tar.gz.sha256
 # (docs/release-signing.md). Or build it: cargo install --path crates/wats
+# For an MCP host, without installing (from 0.5.8; Node 18+ or uv): the
+#   command `npx -y @wearetheswarm/wats mcp` (`uvx wats mcp` once on PyPI) downloads the
+#   release, checks it the same way, caches it and runs it
+#   (docs/claude-code.md#via-npx-or-uvx).
 # Later: `wats upgrade` installs the latest release after checking its
 # signature (`--check` only looks; the node also tells you once a day).
 

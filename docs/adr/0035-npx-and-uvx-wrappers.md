@@ -1,13 +1,16 @@
 # 0035. npx and uvx wrappers of the signed release binary
 
-Status: Proposed (2026-10-22). Built and tested; not published on npm or
-PyPI yet. Roadmap item D18, before the MCP registry listing.
+Status: Proposed (2026-10-22). Built and tested; published from 0.5.8
+(2026-10-27) as `@wearetheswarm/wats` on npm and `wats` on PyPI, by the
+release workflow ("Publishing" below). Roadmap item D18, before the MCP
+registry listing.
 
 Code: `packages/npm/` (`lib/verify.js`, `lib/fetch.js`, `lib/launcher.js`,
 `bin/wats.js`), `packages/pypi/` (`src/wats_wrapper/verify.py`,
 `launcher.py`, `ed25519_zip215.py`), the signed test fixtures in
 `packages/fixtures/` (`make-fixtures.sh`), `scripts/wrapper-versions.sh`,
-and the "npm and PyPI wrappers" step of `.github/workflows/ci.yml`.
+the "npm and PyPI wrappers" step of `.github/workflows/ci.yml`, and the
+`npm` and `pypi` jobs of `.github/workflows/release.yml`.
 
 ## Context
 
@@ -33,22 +36,27 @@ link of that chain.
 
 ## Decision
 
-### 1. Two packages, placeholder names
+### 1. Two packages, their names
 
 | | npm | PyPI |
 |---|---|---|
 | Directory | `packages/npm/` | `packages/pypi/` |
-| Name (placeholder) | `@wearetheswarm/wats` | `wearetheswarm-wats` |
+| Name | `@wearetheswarm/wats` | `wats` |
 | Where the name lives | `name` in `package.json` (the code reads it from there) | `name` in `pyproject.toml`, `PACKAGE_NAME` in `__init__.py` (a test keeps them and the script name equal) |
-| Command | `wats` (the only `bin`, which `npx` runs) | `wearetheswarm-wats` (what `uvx <name>` runs) and `wats` |
+| Command | `wats` (the only `bin`, which `npx` runs) | `wats` (the only script, which `uvx wats` runs) |
 | Runtime dependencies | none (Node ≥ 18) | none (Python ≥ 3.9) |
 | Build | none (`npm pack`) | `flit_core==3.12.0` (build time only) |
 
-The product owner reserves the real names; renaming is the one `name`
-(plus `PACKAGE_NAME` and the first script on PyPI) and the docs' snippets.
-A scoped npm name keeps a typosquatted `wats` from looking official; on
-PyPI, a plain `wats` would make `uvx wats mcp` work as SPEC §4 says, if it
-can be had.
+The product owner chose the names (2026-10-27): plain `wats` is taken on
+npm, so the scoped `@wearetheswarm/wats` (which also keeps a typosquatted
+name from looking official); on PyPI, `wats` was free, so `uvx wats mcp`
+works as SPEC §4 says. (Until 0.5.8 the PyPI name was a placeholder,
+`wearetheswarm-wats`, never published.) A rename is the one `name` (plus
+`PACKAGE_NAME` and the script on PyPI) and the docs' snippets.
+
+The PyPI wrapper's own stderr lines start with `wats (PyPI wrapper):`,
+not `wats:`, so they are not taken for wats's own messages; the npm
+wrapper's start with the package name.
 
 `packages/` sits outside the Cargo workspace, so Rust builds ignore it.
 
@@ -70,11 +78,10 @@ reads).
   tags of `deploy/` and `docs/docker.md`, the bug report template, the
   CHANGELOG).
 - Each package's tests also compare its version with Cargo.toml's.
-- **Proposed, not done:** the `Version` step of `release.yml` could run
-  `sh scripts/wrapper-versions.sh check` too, so that a release built
-  from an unchecked commit stops before signing. Left out of this change
-  so as not to touch the release workflow; CI on `main` already covers
-  the commits releases are tagged from.
+- The `Version` step of `release.yml` runs `sh scripts/wrapper-versions.sh
+  check` too (0.5.8), so a release built from an unchecked commit stops
+  before signing; the publishing jobs check it again, and that the
+  version is the tag's.
 
 A wrapper-only fix ships as the next wats release, not as a wrapper
 `X.Y.Z-1`: the version must stay a release version (the wrapper refuses
@@ -391,49 +398,61 @@ CI runs them on the Linux leg. The PyPI build backend is pinned
   version against a node of the old one until that node restarts, as
   after `wats upgrade`.
 
-## Publishing (not done)
+## Publishing (0.5.8)
 
-Nothing is published by this change: no name is reserved, no account or
-token exists. To publish, the product owner:
+From 0.5.8, `release.yml` publishes both wrappers once a release's
+archives are attached, with **trusted publishing**: the registry trusts an
+OIDC token that GitHub issues to that job, for this repository, this
+workflow file and this environment. No npm or PyPI token is stored
+anywhere.
 
-1. Reserves the names: the npm scope (`@wearetheswarm`, an npm
-   organization) or another name, and the PyPI project. Then sets the
-   names in `package.json`, `pyproject.toml` (`name`, the first script)
-   and `__init__.py` (`PACKAGE_NAME`), and in the docs' snippets, and
-   removes the "not published yet" notes.
-2. Sets up publishing without long-lived tokens: npm trusted publishing
-   (OIDC from GitHub Actions) for the package, and a PyPI trusted
-   publisher for the repository, the `release.yml` workflow and a
-   `publish` environment with required reviewers.
-3. Adds a job to `release.yml`, proposed as:
+- **Two jobs, `npm` and `pypi`**, each `needs: build` (so a wrapper is
+  never published before the release it downloads), each with its own
+  environment (`npm`, `pypi`) and `id-token: write`, on GitHub-hosted
+  runners. Prereleases and `model-` tags are left out, as for the tap. One
+  failing does not stop the other.
+- **Each job checks before it publishes:** `wrapper-versions.sh check`,
+  the package version against the tag, the package's offline tests; then
+  it packs (npm: `npm pack`; PyPI: `build==1.6.1` with the pinned
+  `flit_core`, sdist and wheel, `LICENSE` copied in) and **runs the packed
+  package against the release just attached**: it downloads the Linux
+  archive, verifies both signatures and the SHA-256 with the pinned key,
+  and must print `wats X.Y.Z` for `--version`. A wrapper that cannot run
+  its release is not published.
+- **npm:** Node 24 (`actions/setup-node`), npm 11.5.1 or later (trusted
+  publishing; upgraded to a pinned version when the runner's is older),
+  `npm publish --access public`, which adds a provenance attestation (the
+  repository is public). A version already on npm is skipped.
+- **PyPI:** `pypa/gh-action-pypi-publish` (pinned by SHA), which also
+  uploads attestations; `skip-existing: true`. It runs only when the
+  repository variable `PYPI_PUBLISH` is `true`, set once PyPI's trusted
+  publisher exists. Off, the job still builds and runs the wrapper, warns
+  that it did not publish, and succeeds, so a release is not held up by
+  PyPI; rerunning the job after switching it on publishes that version.
+  (0.5.8 ships with it off: the PyPI account was not ready.)
+- **A rerun is harmless:** a version already published is left as it is.
+  A wrapper fix ships as the next release (§2).
 
-   ```yaml
-   wrappers:
-     name: npm and PyPI wrappers
-     needs: build          # the four files of every target are attached
-     if: github.event_name == 'release' && !github.event.release.prerelease
-     runs-on: ubuntu-latest
-     environment: publish
-     permissions:
-       contents: read
-       id-token: write     # npm and PyPI trusted publishing
-     steps:
-       - uses: actions/checkout@<sha>
-       - run: sh scripts/wrapper-versions.sh check
-       # The tests again, then pack: LICENSE copied in, nothing else.
-       - run: node --test packages/npm/test/*.test.js
-       - run: python3 -m unittest discover -s packages/pypi/tests
-       - run: cp LICENSE packages/npm/ && cd packages/npm && npm publish --provenance --access public
-       - run: cp LICENSE packages/pypi/ && cd packages/pypi && python3 -m pip install build==<pinned> && python3 -m build
-       - uses: pypa/gh-action-pypi-publish@<sha>
-         with: { packages-dir: packages/pypi/dist }
-   ```
+**Bootstrap, once.** PyPI takes a *pending publisher*: the project `wats`,
+owner `wearetheswarm`, repository `wats`, workflow `release.yml`,
+environment `pypi`; the first publish creates the project. Then the
+`PYPI_PUBLISH` variable is set to `true`. A pending
+publisher does not reserve the name, so the release that uses it should
+follow soon. npm trusted publishing needs the package to exist first
+(`npm trust` and the package settings page both require it), so the
+first version is published by hand, from the tag of a release that exists
+(`npm publish --access public` in `packages/npm`, with 2FA, `LICENSE`
+copied in, after a dry run), then the trusted publisher is added (owner
+`wearetheswarm`, repository `wats`, workflow `release.yml`, environment
+`npm`), and every later version comes from the workflow. A by-hand
+version has no provenance.
 
-   It runs after the archives are attached, so a wrapper is never
-   published before the release it downloads. Before trusting it, a
-   smoke step can run the packed wrapper once against the release just
-   published (`npx -y ./wearetheswarm-wats-X.Y.Z.tgz --version`).
-4. Lists the server in the MCP registry with the `npx` (or `uvx`) command.
+**After a release**, the operators' release script also checks that both
+registries have the version and that `npx -y @wearetheswarm/wats@X.Y.Z
+--version` and `uvx wats@X.Y.Z --version` print it, in throwaway caches.
+
+**Then:** list the server in the MCP registry with the `npx` command
+(and `uvx` as an alternative).
 
 ## Alternatives not taken
 

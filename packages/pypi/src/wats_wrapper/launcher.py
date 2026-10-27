@@ -26,7 +26,7 @@ import urllib.parse
 import urllib.request
 from collections import namedtuple
 
-from . import PACKAGE_NAME, __version__
+from . import LOG_NAME, PACKAGE_NAME, __version__
 from .verify import (
     RELEASE_PUBLIC_KEY,
     VerifyError,
@@ -71,7 +71,7 @@ class UnsafeError(WrapperError):
 
 
 def _say(msg: str) -> None:
-    sys.stderr.write(f"{PACKAGE_NAME}: {msg}\n")
+    sys.stderr.write(f"{LOG_NAME}: {msg}\n")
     sys.stderr.flush()
 
 
