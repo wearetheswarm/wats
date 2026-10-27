@@ -180,6 +180,10 @@ pub struct NodeConfig {
     /// Agent posts carry `data.via`, their declared provenance
     /// (`node.declare_via`, ADR 0036).
     pub declare_via: bool,
+    /// `node.public_name` (ADR 0055 §3.2), checked; `None`: generated.
+    pub public_name: Option<String>,
+    /// `node.bind` (ADR 0055 §4).
+    pub bind: bool,
     /// Semantic search (ADR 0053), `None` when off (`semantic.enabled`).
     pub semantic: Option<crate::semantic::engine::Config>,
     /// How this node runs: a daemon (`wats`), a background node started by
@@ -326,6 +330,8 @@ impl NodeConfig {
             review_ttl: Duration::from_secs(24 * 3600),
             review_notify: false,
             declare_via: true,
+            public_name: None,
+            bind: true,
             semantic: None,
             role: NodeRole::Daemon,
             runners: Vec::new(),
@@ -2724,6 +2730,46 @@ impl Node {
 
     /// Author key of a profile (SPEC §2.2). Profile names are 1-64 chars of
     /// `[a-z0-9_-]`.
+    /// The node key (ADR 0055 §3.1).
+    pub fn node_key(&self) -> SigningKey {
+        self.root.node_key()
+    }
+
+    /// The node key's public id, hex.
+    pub fn node_id(&self) -> String {
+        author_id(&self.root.node_key())
+    }
+
+    /// Its public name (ADR 0055 §3.2): `node.public_name`, else the name
+    /// generated from its node key.
+    pub fn public_name(&self) -> String {
+        self.config
+            .public_name
+            .clone()
+            .unwrap_or_else(|| crate::hive::generated(&self.node_id()))
+    }
+
+    /// `AmberHive#4f2a`.
+    pub fn public_label(&self) -> String {
+        crate::hive::label(&self.public_name(), &self.node_id(), crate::hive::SUFFIX)
+    }
+
+    /// Whether `author`'s announces bind it to this node (ADR 0055 §4):
+    /// `node.bind`, and its agent's `bind`.
+    pub fn binds(&self, author: &str) -> bool {
+        if !self.config.bind {
+            return false;
+        }
+        let Some(profile) = self.local_profile(author) else {
+            return false;
+        };
+        !self
+            .config
+            .agents
+            .iter()
+            .any(|a| a.profile == profile && !a.bind)
+    }
+
     pub fn author_key(&self, profile: &str) -> Result<SigningKey> {
         if !is_valid_profile(profile) {
             bail!("profile name must be 1-64 chars of [a-z0-9_-]");
@@ -3340,6 +3386,18 @@ impl Node {
                 draft.parent.as_deref(),
                 &draft.refs,
             )?;
+        }
+        // A profile's announce carries the node's binding, or none: never
+        // one an agent wrote (ADR 0055 §4).
+        if draft.kind == Some(Kind::Announce) {
+            draft.data.remove(crate::hive::KEY);
+            let author = author_id(key);
+            if self.binds(&author) {
+                draft.data.insert(
+                    crate::hive::KEY.into(),
+                    crate::hive::bind(&self.node_key(), &draft.net, &author, &self.public_name()),
+                );
+            }
         }
         draft.blobs.extend(self.import(attachments).await?);
         let key = key.clone();

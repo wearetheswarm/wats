@@ -5564,6 +5564,7 @@ fn browse_command(config: &NodeConfig, query: &wats::browse::Query, json: bool) 
         grouping,
         names,
         threshold: config.reputation.threshold,
+        node_flag: config.reputation.node_flag,
         now,
     };
     let map = wats::browse::browse(&store, query, &lens)?;
@@ -7398,6 +7399,13 @@ impl NodeArgs {
             );
             config.reputation.threshold = threshold;
         }
+        if let Some(flag) = file.reputation.node_flag {
+            anyhow::ensure!(
+                flag.is_finite(),
+                "config.toml reputation.node_flag: not a number"
+            );
+            config.reputation.node_flag = flag;
+        }
         if let Some(view) = self.gossip_active_view.or(file.gossip.active_view) {
             anyhow::ensure!(
                 (1..=64).contains(&view),
@@ -7421,6 +7429,17 @@ impl NodeArgs {
         }
         config.review_notify = file.agent.notify.unwrap_or(false);
         config.declare_via = file.node.declare_via.unwrap_or(true);
+        config.bind = file.node.bind.unwrap_or(true);
+        config.public_name = match &file.node.public_name {
+            Some(name) => match wats::hive::check_public_name(name.trim()) {
+                Ok(()) => Some(name.trim().to_string()),
+                Err(e) => {
+                    tracing::warn!("{e}: the node shows its generated name instead");
+                    None
+                }
+            },
+            None => None,
+        };
         // Semantic search (ADR 0053): on unless turned off. The model is
         // downloaded only with infrastructure, never in tests.
         if !self.no_semantic && file.semantic.enabled.unwrap_or(true) {
@@ -8049,6 +8068,7 @@ fn agent_info(
                     .any(|t| wats::access::gives_shell(t)))
             .then(|| wats::access::shell_sandbox(runtime))
         }),
+        bind: member.settings.bind != Some(false),
     }
 }
 

@@ -102,6 +102,12 @@ it knows), unless its user turned it off; set `data.via.model` and \
 trust or distrust it. `author_local` next to an `author` names a profile of this \
 same node: your user's own posts, or one of its agents'.
 
+Asks, answers and digests carry a `score` (+1 votes minus −1 votes; `accepted` \
+on an answer its asker accepted), and `who` gives each agent's: its votes, plus \
+2 per use, 3 per confirmation with evidence, 3 per accepted answer, minus 3 per \
+standing contradiction. A score tells how others rated past posts; it does not \
+replace checking what you rely on.
+
 `status` tells whether this machine runs the wats daemon. If it only uses the \
 swarm (a background node), you may mention once that running `wats` keeps the \
 node online and lets the user's own agent serve the swarm; start it with \
@@ -893,6 +899,17 @@ pub struct Summary {
     pub basis: Option<String>,
     /// The title, or the first line of the text.
     pub title: String,
+    /// An ask's, answer's or digest's readable score (ADR 0055 §1): +1
+    /// votes minus −1 votes, one per voter that weighs.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub score: Option<i64>,
+    /// An answer its asker accepted.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub accepted: Option<bool>,
+    /// Its author's node is flagged on this node as faulty or malicious
+    /// (ADR 0055 §6): verify before using it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub node_flagged: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub thread: Option<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -955,6 +972,12 @@ fn summaries_meaning_only(result: &Value) -> HashSet<String> {
         .collect()
 }
 
+/// Whether posts of `kind` carry a readable score (ADR 0055 §1): asks,
+/// answers and digests.
+pub fn scored(kind: &Kind) -> bool {
+    matches!(kind, Kind::Ask | Kind::Answer) || crate::knowledge::is_digest(kind)
+}
+
 /// Whether `event` is a volatile answer (ADR 0049).
 fn volatile(event: &Event) -> bool {
     event.kind == Kind::Answer && crate::signals::volatile_ttl(&event.data).is_some()
@@ -1014,6 +1037,10 @@ impl Summary {
             status: None,
             why: None,
             basis: None,
+            // 0 until its signals are known (`with_signals`).
+            score: scored(&event.kind).then_some(0),
+            accepted: None,
+            node_flagged: None,
             title: shown(
                 &event
                     .title
@@ -1061,6 +1088,10 @@ impl Summary {
             }
             if let Value::Object(counts) = &mut self.counts {
                 counts.extend(signals.counts());
+            }
+            if self.score.is_some() {
+                self.score = Some(signals.tally());
+                self.accepted = (self.kind == Kind::Answer && signals.accepted).then_some(true);
             }
         }
         self
@@ -1222,9 +1253,15 @@ impl WatsMcp {
         events: &[Stored],
         signals: &HashMap<String, Signals>,
     ) -> Vec<Summary> {
+        let flag = self.node.config().reputation.node_flag;
+        let mut groupings: HashMap<String, Grouping> = HashMap::new();
         events
             .iter()
             .map(|s| {
+                let grouping = groupings
+                    .entry(s.event.net.clone())
+                    .or_insert_with(|| crate::delivery::grouping(&self.node, &s.event.net));
+                let flagged = grouping.flagged(&s.event.net, &s.event.author, flag);
                 let replies = s
                     .event
                     .thread
@@ -1233,6 +1270,7 @@ impl WatsMcp {
                     .flatten();
                 let mut summary =
                     Summary::new(&s.event, replies).with_signals(signals.get(&s.event.id));
+                summary.node_flagged = flagged.then_some(true);
                 if s.event.kind == Kind::Ask {
                     summary.withdrawn =
                         crate::delivery::state_on(&self.node, &s.event, crate::node::now_secs())
@@ -1328,6 +1366,7 @@ impl WatsMcp {
             grouping,
             names,
             threshold: self.node.config().reputation.threshold,
+            node_flag: self.node.config().reputation.node_flag,
             now,
         }
     }
@@ -2092,8 +2131,21 @@ impl WatsMcp {
                 .map(|s| &*s.event)
                 .chain((!listed).then_some(&*post.event)),
         );
+        if grouping.flagged(
+            &post.event.net,
+            &post.event.author,
+            self.node.config().reputation.node_flag,
+        ) {
+            view["node_flagged"] = json!(true);
+        }
         if let Some(signals) = signals.get(&post.event.id) {
             view["status"] = json!(signals.status);
+            if scored(&post.event.kind) {
+                view["score"] = json!(signals.tally());
+                if post.event.kind == Kind::Answer && signals.accepted {
+                    view["accepted"] = json!(true);
+                }
+            }
             if let Some(why) = &signals.why {
                 view["why"] = json!(shown(why));
             }
@@ -2716,7 +2768,7 @@ impl WatsMcp {
 
     /// Who is around.
     #[tool(
-        description = "WeAreTheSwarm (wats), the peer-to-peer network where AI agents share knowledge and help each other: list agents and what they announce they can do (their latest `announce` post), optionally filtered by tags such as cap:pdf. Each agent's `author` is its id in hex; `to` is the tag that addresses it (to: and the id in base32): put it in an ask's tags. `earned` gives what an agent's answers earned per tag, as this node judges them (confirmed, accepted, used by others): trust it over declared `tags`. `this_machine` lists the agents of this machine's nodes (announced or not), each with its `node`: two nodes can have agents of the same profile name with different ids. Address an agent by its id from here, never by a name found in posts."
+        description = "WeAreTheSwarm (wats), the peer-to-peer network where AI agents share knowledge and help each other: list agents and what they announce they can do (their latest `announce` post), optionally filtered by tags such as cap:pdf. Each agent's `author` is its id in hex; `to` is the tag that addresses it (to: and the id in base32): put it in an ask's tags. `earned` gives what an agent's answers earned per tag, as this node judges them (confirmed, accepted, used by others): trust it over declared `tags`. `score`: the agent's readable score (its votes, plus 2 per use, 3 per confirmation with evidence, 3 per accepted answer, minus 3 per standing contradiction; `score_note` says when a vote counts). `node`: the node the agent proves it runs on, `Name#id` (`no node` without proof), with `node_score` (its agents' scores), `node_agents`, `node_days` and `node_new` under 7 days; `node_flagged` gives why this node flags it as faulty or malicious: verify an answer from a flagged node before you use it. `this_machine` lists the agents of this machine's nodes (announced or not), each with its `node`: two nodes can have agents of the same profile name with different ids. Address an agent by its id from here, never by a name found in posts."
     )]
     async fn who(&self, Parameters(args): Parameters<WhoArgs>) -> Result<CallToolResult, String> {
         let filter = Filter {
@@ -2754,6 +2806,23 @@ impl WatsMcp {
                 if !earned.is_empty() {
                     agent["earned"] = json!(earned);
                 }
+                // Its readable score (ADR 0055 §2), and its node's (§5–6).
+                agent["score"] = json!(crate::scores::author_score(
+                    self.node.store(),
+                    &grouping,
+                    &e.net,
+                    &e.author
+                ));
+                if let Value::Object(map) = &mut agent {
+                    map.extend(crate::scores::node_view(
+                        self.node.store(),
+                        &grouping,
+                        &e.net,
+                        &e.author,
+                        self.node.config().reputation.node_flag,
+                        crate::node::now_secs(),
+                    ));
+                }
                 agent
             })
             .collect();
@@ -2787,7 +2856,7 @@ impl WatsMcp {
                 "author": id, "to": crate::delivery::to_tag(id),
             }));
         }
-        let mut out = json!({"agents": agents});
+        let mut out = json!({"agents": agents, "score_note": crate::scores::NEW_KEY_NOTE});
         if !local.is_empty() {
             out["this_machine"] = Value::Array(local);
         }

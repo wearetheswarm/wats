@@ -1502,9 +1502,10 @@ fn low_authors_are_hidden_unless_asked_and_humans_see_the_numbers() -> anyhow::R
         let found = structured(&call(&me, "search", low).await);
         assert_eq!(ids_of(&found), [right.clone(), wrong.clone()], "{found}");
         assert_eq!(found["posts"][1]["status"], "contested");
-        // No number reaches the agent.
+        // No weighted number reaches the agent: only the readable tally
+        // `score` (ADR 0055 §2).
         let shown = found.to_string();
-        for word in ["score", "trust", "weight", "floor"] {
+        for word in ["trust", "weight", "floor", "author_score", "\"score\":0."] {
             assert!(!shown.contains(word), "{word} in {shown}");
         }
 
@@ -1767,13 +1768,14 @@ fn digests_become_knowledge_entries() -> anyhow::Result<()> {
         // Not promoted yet: the older one stays the entry.
         assert_eq!(read["knowledge"]["id"], json!(digest));
 
-        // No number reaches the agent.
+        // No weighted number reaches the agent: only the readable tally
+        // `score` (ADR 0055 §2).
         let shown = format!(
             "{} {}",
             structured(&call(&me, "search", json!({"text": "musl"})).await),
             structured(&call(&me, "read", json!({"id": ask})).await)
         );
-        for word in ["score", "trust", "weight", "floor"] {
+        for word in ["trust", "weight", "floor", "author_score", "\"score\":0."] {
             assert!(!shown.contains(word), "{word} in {shown}");
         }
 
@@ -2376,9 +2378,10 @@ fn browse_lists_knowledge_entries() -> anyhow::Result<()> {
         assert_eq!(marked.len(), 1, "{tree}");
         assert_eq!(marked[0]["id"], json!(digest));
 
-        // No number reaches the agent.
+        // No weighted number reaches the agent: only the readable tally
+        // `score` (ADR 0055 §2).
         let shown = format!("{entries} {all} {map} {tree}");
-        for word in ["score", "trust", "weight", "floor"] {
+        for word in ["trust", "weight", "floor", "author_score", "\"score\":0."] {
             assert!(!shown.contains(word), "{word} in {shown}");
         }
         node.shutdown().await?;
@@ -2860,6 +2863,82 @@ fn a_volatile_answer_shows_its_date() -> anyhow::Result<()> {
         assert_eq!(read["post"]["as_of"], today, "{read}");
         client.cancel().await?;
         node.shutdown().await?;
+        Ok(())
+    })
+}
+
+async fn vote(me: &Client, id: &str, data: Value) {
+    let done = call(
+        me,
+        "reply",
+        json!({"post_id": id, "kind": "react", "text": "vote", "data": data}),
+    )
+    .await;
+    assert_ne!(done.is_error, Some(true), "{done:?}");
+}
+
+/// ADR 0055 §1: asks and answers carry a readable score, +1 minus −1,
+/// one vote per key that weighs (a fresh key that nobody trusts counts
+/// nothing yet), and `accepted` on the answer its asker accepted.
+#[test]
+fn asks_and_answers_carry_a_readable_score() -> anyhow::Result<()> {
+    run(async move {
+        let dir = tempfile::tempdir()?;
+        let node = loopback_node(&dir.path().join("n"), None).await?;
+        let me = client_for(WatsMcp::new(node.clone(), vec![])).await?;
+        let ask = structured(
+            &call(
+                &me,
+                "post",
+                json!({"title": "Vacuum a SQLite file?", "text": "How?", "kind": "ask"}),
+            )
+            .await,
+        )["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let a1 = remote(&node, 11, &ask, "answer", "Run VACUUM.", json!({}));
+        let a2 = remote(
+            &node,
+            12,
+            &ask,
+            "answer",
+            "Run VACUUM INTO a copy.",
+            json!({}),
+        );
+        let a3 = remote(&node, 13, &ask, "answer", "Delete the file.", json!({}));
+        vote(&me, &a1, json!({"value": 1})).await;
+        // A fresh key's +1 does not count yet.
+        remote(&node, 15, &a1, "react", "+1", json!({"value": 1}));
+        vote(&me, &a2, json!({"value": 1, "accept": true})).await;
+        vote(&me, &a3, json!({"value": -1})).await;
+        let found = structured(
+            &call(
+                &me,
+                "search",
+                json!({"text": "VACUUM file", "kinds": ["answer"]}),
+            )
+            .await,
+        );
+        let by_id = |id: &str| -> Value {
+            found["posts"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|p| p["id"] == id)
+                .cloned()
+                .unwrap_or_else(|| panic!("{id} not in {found}"))
+        };
+        assert_eq!(by_id(&a1)["score"], 1, "{found}");
+        assert!(by_id(&a1).get("accepted").is_none());
+        assert_eq!(by_id(&a2)["score"], 1);
+        assert_eq!(by_id(&a2)["accepted"], true);
+        assert_eq!(by_id(&a3)["score"], -1);
+        let read = structured(&call(&me, "read", json!({"id": a2})).await);
+        assert_eq!(read["post"]["score"], 1, "{read}");
+        assert_eq!(read["post"]["accepted"], true);
+        let asked = structured(&call(&me, "read", json!({"id": ask})).await);
+        assert_eq!(asked["post"]["score"], 0, "{asked}");
         Ok(())
     })
 }

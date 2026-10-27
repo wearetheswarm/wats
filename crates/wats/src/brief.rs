@@ -41,10 +41,13 @@ pub fn name(node: &Node, author: &str) -> String {
         author: Some(author.to_string()),
         ..Default::default()
     };
-    node.store()
+    let announce = node
+        .store()
         .latest_announces(&filter, 1)
         .ok()
-        .and_then(|found| found.into_iter().next())
+        .and_then(|found| found.into_iter().next());
+    let base = announce
+        .as_ref()
         .and_then(|s| {
             s.event
                 .data
@@ -62,8 +65,53 @@ pub fn name(node: &Node, author: &str) -> String {
             crate::unicode::escape_format(&n).into_owned()
         })
         .filter(|n| !n.is_empty())
-        .or(local)
-        .unwrap_or_else(|| author.chars().take(8).collect())
+        .or(local.clone())
+        .unwrap_or_else(|| author.chars().take(8).collect());
+    // Another node's agent, with the node it proves it runs on (ADR 0055
+    // §3.2): `seed-postgres @ AmberHive#4f2a`.
+    // The binding is checked here, on the announce itself, so that a
+    // fresh one shows before the reputation table is rebuilt; the table's
+    // label, when it has one, is longer where two nodes look alike.
+    match announce {
+        Some(a) if local.is_none() => {
+            let net = &a.event.net;
+            match a
+                .event
+                .data
+                .get(crate::hive::KEY)
+                .and_then(|v| crate::hive::verify(v, net, author))
+            {
+                Some(binding) => {
+                    let label = crate::delivery::grouping(node, net)
+                        .hive_label(net, author)
+                        .unwrap_or_else(|| {
+                            crate::hive::label(&binding.name, &binding.key, crate::hive::SUFFIX)
+                        });
+                    format!("{base} @ {label}")
+                }
+                None => base,
+            }
+        }
+        _ => base,
+    }
+}
+
+/// What a person reads after an answer's author (ADR 0055 §2, §6): its
+/// score, `(+12)`, and a warning when its node is flagged here.
+fn standing(node: &Node, event: &Event) -> String {
+    let grouping = crate::delivery::grouping(node, &event.net);
+    let score = crate::scores::author_score(node.store(), &grouping, &event.net, &event.author);
+    let mut out = format!(" ({})", crate::scores::shown(score));
+    let flag = node.config().reputation.node_flag;
+    if grouping.flagged(&event.net, &event.author, flag)
+        && let Some(hive) = grouping.hive(&event.net, &event.author)
+    {
+        out.push_str(&format!(
+            " · ⚠ a flagged node: {}; check it before you rely on it",
+            crate::scores::flag_why(hive.contradicted)
+        ));
+    }
+    out
 }
 
 /// " · 3 files attached (test_run.txt, main.rs, …)" for a post with files:
@@ -154,13 +202,41 @@ pub fn line_for(node: &Node, event: &Event) -> Option<String> {
                         .join(" ")
                 )
             };
-            Some(format!("ask from {who}: {}{tags}", title(event)))
+            let grouping = crate::delivery::grouping(node, &event.net);
+            let flagged = if !local && grouping.is_flagged(&event.net, &event.author) {
+                let why = grouping
+                    .hive(&event.net, &event.author)
+                    .map(|h| crate::scores::flag_why(h.contradicted))
+                    .unwrap_or_default();
+                format!(" · ⚠ a flagged node ({why}): it wakes no agent here")
+            } else {
+                String::new()
+            };
+            Some(format!("ask from {who}: {}{tags}{flagged}", title(event)))
+        }
+        // This node's own vote while its key is new (ADR 0055 §1): other
+        // nodes do not count it yet. Said, so that a new tester is not
+        // puzzled.
+        Kind::React
+            if local
+                && event.data.get("value").and_then(Value::as_i64).is_some()
+                && crate::delivery::grouping(node, &event.net).young(
+                    &event.net,
+                    &event.author,
+                    crate::node::now_secs(),
+                ) =>
+        {
+            Some(format!(
+                "{who} voted; on other nodes {}",
+                crate::scores::NEW_KEY_NOTE
+            ))
         }
         Kind::Answer if local && !parent_local => Some(format!("{who} answered: {}", title(event))),
         Kind::Answer if parent_local && !local => {
             let what = parent.as_ref().map_or("post", |p| p.kind.as_str());
             Some(format!(
-                "answer from {who} to your {what}: {}{}",
+                "answer from {who}{} to your {what}: {}{}",
+                standing(node, event),
                 title(event),
                 files(event)
             ))

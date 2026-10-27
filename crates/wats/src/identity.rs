@@ -6,7 +6,9 @@
 //! - the transport key (the Iroh endpoint id), so that the network address
 //!   of a node is not linkable to the authors it hosts;
 //! - one author key per profile (SPEC §2.2 "Profiles"), the default profile
-//!   being `"default"`.
+//!   being `"default"`;
+//! - the node key, its public identity (ADR 0055 §3.1), which only signs
+//!   bindings of its profiles.
 //!
 //! See `docs/adr/0003-key-derivation.md`.
 
@@ -16,6 +18,7 @@ use ed25519_dalek::SigningKey;
 
 const TRANSPORT_CONTEXT: &str = "wearetheswarm 2026-10-15 transport key v1";
 const PROFILE_CONTEXT: &str = "wearetheswarm 2026-10-15 profile key v1";
+const NODE_CONTEXT: &str = "wearetheswarm 2026-10-27 node key v1";
 
 /// Name of the profile used when none is given.
 pub const DEFAULT_PROFILE: &str = "default";
@@ -73,6 +76,13 @@ impl RootSecret {
     /// Secret bytes of the transport (Iroh endpoint) key.
     pub fn transport_key_bytes(&self) -> [u8; 32] {
         blake3::derive_key(TRANSPORT_CONTEXT, &self.0)
+    }
+
+    /// The node key (ADR 0055 §3.1): the node's public identity, which
+    /// signs its agents' bindings and never an event. Not the transport
+    /// key, so the node's address stays unlinkable to it.
+    pub fn node_key(&self) -> SigningKey {
+        SigningKey::from_bytes(&blake3::derive_key(NODE_CONTEXT, &self.0))
     }
 
     /// Author key of a profile.

@@ -3893,6 +3893,7 @@ async fn the_llm_token_budget_stops_new_runs() -> anyhow::Result<()> {
         work_dir: work.clone(),
         budget,
         shell: Some(wats::access::shell_sandbox("claude")),
+        bind: true,
     };
     let status = info.status(unix_now());
     assert_eq!(status["shell"], "on, not sandboxed", "{status}");
@@ -4272,9 +4273,16 @@ async fn brief_lines_tell_the_story() -> anyhow::Result<()> {
         )
         .await?;
     wait(announce.id.clone()).await;
+    // With the node it proves it runs on (ADR 0055 §3.2).
     assert_eq!(
         line(&ask).as_deref(),
-        Some("ask from seed-image: Latest stable Rust? [lang:rust]")
+        Some(
+            format!(
+                "ask from seed-image @ {}: Latest stable Rust? [lang:rust]",
+                b.public_label()
+            )
+            .as_str()
+        )
     );
     for n in [b, a] {
         n.shutdown().await?;

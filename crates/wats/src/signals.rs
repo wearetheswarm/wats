@@ -327,8 +327,27 @@ impl Signals {
         wilson(self.up_weight, self.up_weight + self.down_weight)
     }
 
-    /// The counts that are not zero, for agents: counts only, never a
-    /// score (ADR 0019 §3.2).
+    /// The readable score (ADR 0055 §1): +1 votes minus −1 votes, one per
+    /// group of keys that weighs, the author's own never. Not decayed, not
+    /// weighted: a tally anyone can check against the counts.
+    pub fn tally(&self) -> i64 {
+        i64::try_from(self.up).unwrap_or(i64::MAX) - i64::try_from(self.down).unwrap_or(i64::MAX)
+    }
+
+    /// What this post adds to its author's score (ADR 0055 §2): the
+    /// tally, +2 per use, +3 per confirmation with evidence, +3 when its
+    /// asker accepted it, −3 per standing contradiction. An asker who used
+    /// and accepted it counts once, as accepted.
+    pub fn points(&self) -> i64 {
+        let n = |v: u64| i64::try_from(v).unwrap_or(i64::MAX / 8);
+        let uses = self.uses - u64::from(self.asker_used && self.accepts > 0).min(self.uses);
+        self.tally() + 2 * n(uses) + 3 * n(self.confirms) + 3 * n(self.accepts.min(1))
+            - 3 * n(self.contradicts)
+    }
+
+    /// The counts that are not zero, for agents (ADR 0019 §3.2); the
+    /// readable score is [`Signals::tally`], the weighted one is never
+    /// shown.
     pub fn counts(&self) -> Map<String, Value> {
         let mut counts = Map::new();
         for (key, n) in [
@@ -361,6 +380,8 @@ impl Signals {
 pub struct Grouping {
     local: HashSet<String>,
     tables: HashMap<String, Arc<Table>>,
+    /// `reputation.node_flag` (ADR 0055 §6), for [`Grouping::is_flagged`].
+    node_flag: f64,
 }
 
 impl Grouping {
@@ -370,7 +391,29 @@ impl Grouping {
         Self {
             local,
             tables: HashMap::new(),
+            node_flag: crate::reputation::DEFAULT_NODE_FLAG,
         }
+    }
+
+    /// With this node's `reputation.node_flag`.
+    pub fn with_node_flag(mut self, node_flag: f64) -> Self {
+        self.node_flag = node_flag;
+        self
+    }
+
+    /// Whether `key` is under 7 days old in `net` as this node knows it
+    /// ([`crate::reputation::FLOOR_FROM`]): other nodes give it no floor
+    /// yet, so its votes count there only where it is trusted.
+    pub fn young(&self, net: &str, key: &str, now: u64) -> bool {
+        self.table(net)
+            .and_then(|t| t.authors.get(key))
+            .and_then(|a| a.known_since)
+            .is_none_or(|since| now.saturating_sub(since) < crate::reputation::FLOOR_FROM)
+    }
+
+    /// [`Grouping::flagged`] at this node's `reputation.node_flag`.
+    pub fn is_flagged(&self, net: &str, key: &str) -> bool {
+        self.flagged(net, key, self.node_flag)
     }
 
     /// With the reputation table of its network.
@@ -412,7 +455,30 @@ impl Grouping {
     /// Whether `a` and `b` are one key, or both this node's profiles: the
     /// groups a contradiction never comes from (a self-contradiction).
     pub fn same_hard(&self, net: &str, a: &str, b: &str) -> bool {
-        self.same_key(net, a, b) || (self.local.contains(a) && self.local.contains(b))
+        self.same_key(net, a, b)
+            || (self.local.contains(a) && self.local.contains(b))
+            || self.table(net).is_some_and(|t| t.same_hive(a, b))
+    }
+
+    /// The label of the node `key` is bound to in `net`, if any.
+    pub fn hive_label(&self, net: &str, key: &str) -> Option<String> {
+        let table = self.table(net)?;
+        table.hive_label(&table.hive(key)?.key)
+    }
+
+    /// The node `key` is bound to in `net` (ADR 0055 §4), if any.
+    pub fn hive(&self, net: &str, key: &str) -> Option<&crate::reputation::Hive> {
+        self.table(net).and_then(|t| t.hive(key))
+    }
+
+    /// Whether `key` was bound to a node whose agents' scores sum below
+    /// `node_flag` (ADR 0055 §6). Never one of this node's profiles.
+    pub fn flagged(&self, net: &str, key: &str, node_flag: f64) -> bool {
+        !self.local.contains(key)
+            && self
+                .table(net)
+                .and_then(|t| t.hive_weighted(key))
+                .is_some_and(|w| w < node_flag)
     }
 
     /// What a key's signals weigh in `net`: trust plus floor.
@@ -429,10 +495,16 @@ impl Grouping {
         self.table(net).map_or(0.0, |t| t.score(key))
     }
 
-    /// Whether `search` and `wait` leave out `key`'s posts: it scores below
-    /// `threshold`, and it is not one of this node's profiles.
+    /// Whether `search` and `wait` leave out `key`'s posts: it, or a node
+    /// it was bound to (ADR 0055 §6), scores below `threshold`, and it is
+    /// not one of this node's profiles.
     pub fn is_low(&self, net: &str, key: &str, threshold: f64) -> bool {
-        !self.local.contains(key) && self.score(net, key) < threshold
+        !self.local.contains(key)
+            && (self.score(net, key) < threshold
+                || self
+                    .table(net)
+                    .and_then(|t| t.hive_weighted(key))
+                    .is_some_and(|w| w < threshold))
     }
 }
 

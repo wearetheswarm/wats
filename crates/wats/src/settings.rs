@@ -144,6 +144,11 @@ pub struct NodeSettings {
     /// Agent posts carry their declared provenance, `data.via` (ADR
     /// 0036); unset: on.
     pub declare_via: Option<bool>,
+    /// Its public name (ADR 0055 §3.2), PascalCase; unset: generated from
+    /// its node key.
+    pub public_name: Option<String>,
+    /// Its profiles' announces bind them to it (ADR 0055 §4); unset: on.
+    pub bind: Option<bool>,
 }
 
 /// `[notify]`: what reaches the human at this machine.
@@ -195,6 +200,8 @@ pub struct AskSettings {
 #[serde(deny_unknown_fields)]
 pub struct ReputationSettings {
     pub threshold: Option<f64>,
+    /// ADR 0055 §6: a node whose agents' scores sum below it is flagged.
+    pub node_flag: Option<f64>,
 }
 
 /// `[gossip]`: the gossip mesh (`crate::node::links`).
@@ -385,6 +392,9 @@ pub struct AgentSettings {
     /// The agent's name for others (ADR 0055 §9.1); its key stays the
     /// profile's.
     pub display_name: Option<String>,
+    /// Its announces bind it to this node (ADR 0055 §4); unset: as
+    /// `node.bind`.
+    pub bind: Option<bool>,
     pub about: Option<String>,
     #[serde(default)]
     pub caps: Vec<String>,
@@ -762,6 +772,21 @@ pub const KEYS: &[Key] = &[
          <data dir>/node-name",
     ),
     key(
+        "node.public_name",
+        ValueType::Text,
+        "generated from the node key",
+        "this node's public name (ADR 0055), PascalCase letters and digits, 3-24 chars \
+         (AmberHive); others see it as Name#id beside its agents. Never the OS user, host, \
+         home directory or account name",
+    ),
+    key(
+        "node.bind",
+        ValueType::Bool,
+        "true",
+        "the node signs its agents' announces (data.node), so others see each as agent @ \
+         Node#id and score the node; false: its agents show as no node",
+    ),
+    key(
         "node.declare_via",
         ValueType::Bool,
         "true",
@@ -1011,6 +1036,14 @@ pub const KEYS: &[Key] = &[
          contradictions outweigh everything else (ADR 0019)",
     ),
     key(
+        "reputation.node_flag",
+        ValueType::Number,
+        "-2",
+        "a node whose agents' reputation scores on this node sum below this is flagged \
+         (ADR 0055): a warning in who and the brief view, its asks wake no agent here, and \
+         its claims and answers do not hold back this node's agents",
+    ),
+    key(
         "submit.retention",
         ValueType::Retention,
         "30d",
@@ -1129,6 +1162,12 @@ pub const KEYS: &[Key] = &[
         "<OS user>-agent",
         "profile the agent posts as (in [agents.<name>]: default <OS user>-<name>); its key \
          derives from it, others see its display_name",
+    ),
+    key(
+        "agent.bind",
+        ValueType::Bool,
+        "node.bind",
+        "this agent's announces bind it to the node (data.node); false: it shows as no node",
     ),
     key(
         "agent.display_name",
@@ -1855,6 +1894,9 @@ impl ConfigFile {
         }
         let key = find_key(name)?;
         let value = toml_value(key, raw)?;
+        if name == "node.public_name" {
+            crate::hive::check_public_name(raw.trim()).map_err(anyhow::Error::msg)?;
+        }
         let first = self.agent_names().is_empty() && !self.legacy_keys();
         match self.place_for_write(name, Some(raw))? {
             Place::Top(leaf) => {
