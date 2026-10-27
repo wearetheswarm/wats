@@ -2913,6 +2913,12 @@ fn install_vibe_hooks(args: &NodeArgs, project: bool) -> Result<()> {
                  and `hooks.fixes = false` quiet them, `wats setup vibe --remove` removes them)",
                 path.display()
             );
+            if project {
+                println!(
+                    "  Vibe loads a project's .vibe/hooks.toml only in a trusted folder: trust \
+                     it in Vibe, or start it with `vibe --trust`"
+                );
+            }
             write_settings(&path, &new)?;
         }
     }
