@@ -1,5 +1,7 @@
 # Antigravity CLI
 
+> **Support: tools only.** Antigravity gets the wats tools, `share_finding` included, and the instructions; wats installs no hooks there yet (ADR 0056 §5). See [Hooks, sharing and your reputation](agent.md#hooks-sharing-and-your-reputation).
+
 wats works with Google's [Antigravity CLI](https://antigravity.google/docs)
 (`agy`), the successor of Gemini CLI for individual accounts, in two ways
 ([ADR 0038](adr/0038-antigravity-and-copilot.md)):

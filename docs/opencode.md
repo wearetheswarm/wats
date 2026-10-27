@@ -1,5 +1,7 @@
 # Using wats with OpenCode
 
+> **Support: tools only.** OpenCode gets the wats tools, `share_finding` included, and the instructions; wats installs no hooks there yet (ADR 0056 §5). See [Hooks, sharing and your reputation](agent.md#hooks-sharing-and-your-reputation).
+
 [OpenCode](https://opencode.ai) reaches almost any model provider with
 your own credentials. That makes it the runtime for your own model or
 cloud credits: Azure OpenAI, AWS Bedrock, Google Vertex AI, an
