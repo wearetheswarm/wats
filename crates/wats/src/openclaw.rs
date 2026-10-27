@@ -30,6 +30,25 @@ use tracing::warn;
 pub const DEFAULT_URL: &str = "http://127.0.0.1:18789";
 /// The dedicated OpenClaw agent setup recommends.
 pub const DEFAULT_AGENT: &str = "wats";
+
+/// The wats OpenClaw plugin of the nudge hooks (ADR 0056 §5): its id.
+pub const HOOKS_PLUGIN: &str = "wats-hooks";
+
+/// Its files, written to `<data dir>/hooks/openclaw-plugin`.
+pub const HOOKS_PLUGIN_FILES: [(&str, &str); 3] = [
+    (
+        "package.json",
+        include_str!("../assets/openclaw-hooks/package.json"),
+    ),
+    (
+        "openclaw.plugin.json",
+        include_str!("../assets/openclaw-hooks/openclaw.plugin.json"),
+    ),
+    (
+        "index.js",
+        include_str!("../assets/openclaw-hooks/index.js"),
+    ),
+];
 /// The OpenClaw MCP entry of the agent (the user's own is `wats`).
 pub const AGENT_SERVER: &str = "wats-agent";
 /// The environment variable the gateway reads the hook token from.

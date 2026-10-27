@@ -3,6 +3,8 @@
 # CLI, quickly and reversibly:
 #
 #   sh scripts/verify-hooks.sh <claude|codex|copilot|vibe>   set up
+#   sh scripts/verify-hooks.sh openclaw --global             set up (OpenClaw
+#       has no project hooks: its config is backed up, then restored by clean)
 #   sh scripts/verify-hooks.sh check <dir>                   PASS / FAIL
 #   sh scripts/verify-hooks.sh clean <dir>                   remove it all
 #
@@ -65,12 +67,24 @@ clean)
     [ $# -eq 2 ] || usage
     dir=$2
     [ -f "$dir/.wats-host" ] || { echo "$dir: not a verify-hooks directory" >&2; exit 1; }
+    if [ -f "$dir/openclaw.json.bak" ]; then
+        openclaw plugins uninstall wats-hooks >/dev/null 2>&1 || true
+        cp "$dir/openclaw.json.bak" "$(cat "$dir/openclaw.json.path")"
+        echo "OpenClaw config restored; restart the gateway (openclaw gateway restart)"
+    fi
     "$WATS" --dir "$dir/.wats-node" stop >/dev/null 2>&1 || true
     rm -rf "$dir"
     echo "removed $dir"
     exit 0
     ;;
 claude | codex | copilot | vibe) host=$1 ;;
+openclaw)
+    [ "${2:-}" = "--global" ] || {
+        echo "OpenClaw has no project-local hooks: run it with --global (its config is backed up, and clean restores it)" >&2
+        exit 2
+    }
+    host=openclaw
+    ;;
 *) usage ;;
 esac
 
@@ -136,6 +150,18 @@ copilot)
 JSON
     run="cd $dir && copilot"
     ;;
+openclaw)
+    here=$(cd "$(dirname "$0")/.." && pwd)
+    plugin="$here/crates/wats/assets/openclaw-hooks"
+    [ -f "$plugin/index.js" ] || { echo "run it from a wats checkout ($plugin missing)" >&2; exit 1; }
+    conf=${OPENCLAW_CONFIG_PATH:-$HOME/.openclaw/openclaw.json}
+    cp "$conf" "$dir/openclaw.json.bak"
+    echo "$conf" >"$dir/openclaw.json.path"
+    openclaw plugins install --link "$plugin" >/dev/null
+    openclaw config set plugins.entries.wats-hooks.config \
+        "{\"wats\":\"$exe\",\"dir\":\"$node\",\"skipAgents\":[\"wats\"]}" --strict-json >/dev/null
+    run="openclaw gateway restart, then: openclaw agent --agent main --message-file $dir/prompt.txt"
+    ;;
 vibe)
     mkdir -p "$dir/.vibe"
     cat >"$dir/.vibe/hooks.toml" <<TOML
@@ -154,15 +180,23 @@ TOML
     ;;
 esac
 
+cat >"$dir/prompt.txt" <<TXT
+Run \`python3 $dir/check.py\`. It fails. Run it once more to see the error again,
+then fix $dir/check.py so that it prints ok (remove the import), run it again,
+and stop. In your final message, quote any message from "wats" you saw.
+TXT
+if [ "$host" = openclaw ]; then
+    scope="OpenClaw's config was backed up to $dir/openclaw.json.bak; clean restores it"
+else
+    scope="project-local hooks only; your global $host config is untouched"
+fi
 cat <<TXT
-Set up in $dir (project-local hooks only; your global $host config is untouched).
+Set up in $dir ($scope).
 
 1. Start the CLI there:
      $run
-2. Paste this prompt:
-     Run \`python3 check.py\`. It fails. Run it once more to see the error again,
-     then fix check.py so that it prints ok (remove the import), run it again,
-     and stop. In your final message, quote any message from "wats" you saw.
+2. Paste this prompt (it is in $dir/prompt.txt too):
+$(sed 's/^/     /' "$dir/prompt.txt")
 3. Exit the CLI, then:
      sh $0 check $dir
 4. When done:

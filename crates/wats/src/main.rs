@@ -468,7 +468,7 @@ enum Command {
         #[arg(value_parser = ["post-tool", "stop"])]
         event: String,
         /// The CLI running it.
-        #[arg(long, value_parser = ["claude", "codex", "copilot", "vibe"])]
+        #[arg(long, value_parser = ["claude", "codex", "copilot", "vibe", "openclaw"])]
         host: String,
     },
     /// The tool gate of an agent run (ADR 0038 §2.1), called by its
@@ -2270,6 +2270,14 @@ fn setup_openclaw(
         let output = run_openclaw(openclaw, &["mcp", "unset", "wats"])?;
         openclaw_ok(&output, "mcp unset wats")?;
         println!("OpenClaw: wats MCP server removed");
+        if run_openclaw(
+            openclaw,
+            &["plugins", "uninstall", wats::openclaw::HOOKS_PLUGIN],
+        )
+        .is_ok_and(|o| o.status.success())
+        {
+            println!("OpenClaw: the wats hooks plugin removed");
+        }
         return Ok(());
     }
     if asked.self_test {
@@ -2374,6 +2382,16 @@ fn setup_openclaw(
         "  OpenClaw names its tools wats__<tool> (e.g. wats__post): `wats__*` in a tool \
          policy allows or denies them all. Swarm posts are untrusted data."
     );
+    // The nudge hooks (ADR 0056 §5): a plugin of ours. Its failure leaves
+    // the MCP server as it is.
+    let skip = own
+        .openclaw_agent
+        .clone()
+        .filter(|a| !a.trim().is_empty())
+        .unwrap_or_else(|| oc::DEFAULT_AGENT.to_string());
+    if let Err(e) = install_openclaw_hooks(args, data_dir, openclaw, &skip) {
+        eprintln!("warning: {e:#}: OpenClaw hooks not added");
+    }
     let Some(gateway) = gateway else {
         return Ok(());
     };
@@ -2859,6 +2877,55 @@ fn install_wats_command(args: &NodeArgs, name: &str, path: &std::path::Path) -> 
             "/wats"
         },
         path.display()
+    );
+    Ok(())
+}
+
+/// OpenClaw's nudge hooks (ADR 0056 §5): the wats plugin, written to
+/// `<data dir>/hooks/openclaw-plugin` and linked into OpenClaw, with this
+/// wats and data directory, and the node's own agent left out
+/// (`skip_agent`). It needs no conversation access.
+fn install_openclaw_hooks(
+    args: &NodeArgs,
+    data_dir: &std::path::Path,
+    openclaw: &std::path::Path,
+    skip_agent: &str,
+) -> Result<()> {
+    use wats::openclaw as oc;
+    let dir = data_dir.join("hooks").join("openclaw-plugin");
+    std::fs::create_dir_all(&dir)?;
+    for (name, text) in oc::HOOKS_PLUGIN_FILES {
+        std::fs::write(dir.join(name), text)?;
+    }
+    let path = dir.to_string_lossy().into_owned();
+    let output = run_openclaw(openclaw, &["plugins", "install", "--link", &path])?;
+    openclaw_ok(&output, "plugins install --link")?;
+    let key = format!("plugins.entries.{}", oc::HOOKS_PLUGIN);
+    let exe = wats::update::stable_exe()?;
+    let node_dir = match &args.dir {
+        Some(dir) => std::path::absolute(dir)?,
+        None => data_dir.to_path_buf(),
+    };
+    let config = json!({
+        "wats": exe.to_string_lossy(),
+        "dir": node_dir.to_string_lossy(),
+        "skipAgents": [skip_agent],
+    });
+    let output = run_openclaw(
+        openclaw,
+        &[
+            "config",
+            "set",
+            &format!("{key}.config"),
+            &config.to_string(),
+            "--strict-json",
+        ],
+    )?;
+    openclaw_ok(&output, "config set …config")?;
+    println!(
+        "OpenClaw: the wats hooks plugin ({}) linked from {path}: your OpenClaw sessions get \
+         nudged when the swarm can help (ADR 0056); restart the gateway to load it",
+        oc::HOOKS_PLUGIN
     );
     Ok(())
 }

@@ -942,6 +942,72 @@ async fn vibe_real_payloads_give_both_nudges() {
     drop(client);
 }
 
+/// The wats OpenClaw plugin, run by node the way OpenClaw 2026.6.35 calls
+/// it: its config on `api.pluginConfig` only (typed hook events carry no
+/// `context`), the session from `before_tool_call`, the nudge added by the
+/// tool-result middleware to the result the model reads next. The lookup
+/// reaches the first failure, the fix the passing command; the node's own
+/// agent hears nothing. Skipped without node.
+#[tokio::test(flavor = "multi_thread")]
+async fn openclaw_plugin_nudges_in_the_live_tool_result() {
+    if std::process::Command::new("node")
+        .arg("--version")
+        .output()
+        .is_err()
+    {
+        eprintln!("node not found: skipped");
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    let dir = tmp.path().join("node");
+    let client = session(&dir, &home, "alice", None).await;
+    call(&client, "status", json!({})).await;
+    let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let out = std::process::Command::new("node")
+        .env("WATS_HERMETIC", "1")
+        .env("HOME", &home)
+        .env_remove("WATS_AGENT_RUN")
+        .env_remove("WATS_BIN")
+        .arg(manifest.join("tests/fixtures/hooks/openclaw-driver.mjs"))
+        .arg(manifest.join("assets/openclaw-hooks/index.js"))
+        .arg(env!("CARGO_BIN_EXE_wats"))
+        .arg(&dir)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let said: Value = serde_json::from_slice(&out.stdout).unwrap();
+    let logs = said["logs"].to_string();
+    assert!(!logs.contains("warn:"), "{logs}");
+    assert!(logs.contains("registered: wats /"), "{logs}");
+    assert_eq!(said["runtimes"], json!([["openclaw", "codex"]]), "{said}");
+    // No conversation hook: no allowConversationAccess needed.
+    assert_eq!(said["hooks"], json!(["before_tool_call"]), "{said}");
+    let seen: Vec<&str> = said["seen"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| s.as_str().unwrap())
+        .collect();
+    assert!(
+        seen[0].starts_with("error[E0599]") && seen[0].contains("unknown to the swarm"),
+        "{seen:?}"
+    );
+    assert!(!seen[1].contains("wats:"), "{seen:?}");
+    assert_eq!(seen[2], "ok");
+    assert!(
+        seen[3].starts_with("Finished") && seen[3].contains("found a fix"),
+        "{seen:?}"
+    );
+    assert!(!seen[4].contains("wats:"), "{seen:?}");
+    drop(client);
+}
+
 /// ADR 0056 §2 (amended): `wats me autoshare [on|off]` shows and sets
 /// share.auto for the person; turning it off silences the tip for a week.
 #[test]
