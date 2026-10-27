@@ -25,6 +25,9 @@
 - **A search that finds nothing is not an error:** a command that exits 1
   and says nothing, or a pipeline ending in `grep`/`rg` that finds
   nothing, no longer gets "unknown to the swarm".
+- **`/wats outbox` says what it lists:** the fixes `share_finding`
+  shared, not your other posts; and `wats setup` lists the `/wats`
+  subcommands (`/prompts:wats` on recent Codex).
 - **The setup wizard installs the Copilot CLI and Mistral Vibe hooks
   too**, as `wats setup copilot|vibe --mcp` does, and `wats setup
   copilot|vibe --remove-hooks` removes them, as for Claude Code and Codex.

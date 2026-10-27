@@ -471,7 +471,7 @@ fn setup_claude_adds_the_hook_once_and_removes_it() {
     assert!(command.contains("me autoshare") && command.contains("never run it on your own"));
     for sub in [
         " status`.",
-        " outbox`.",
+        " outbox`: the fixes `share_finding` shared",
         "`search <words>`",
         "`ask <question>`",
         " notify`",
