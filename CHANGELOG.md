@@ -24,6 +24,18 @@
   review or retract with `wats outbox` (N: ask me each time) [y/N]".
   Enter still means ask each time.
 
+- **The share scrub reads your project, not the node's directory**
+
+  (privacy): `share_finding` refuses the project's own names, read from
+  its working directory. A session attached to a running node runs inside
+  the node, so it read the node's directory instead. It now reads the
+  session's own directories (where its MCP host runs).
+- **The hooks no longer mistake one script for another:** every
+  `python3 - <<EOF` (or `bash -c`, `node -e`) counted as the same command,
+  so unrelated edits made a "fix". And an error that quotes code
+  (`AssertionError: if entries.is_empty() {`) keeps none of it in what the
+  hook says or searches.
+
 - **A shared finding earns no badge by being posted:** a self-answered
 
   question no longer counts for First Buzz (first ask) or Nectar (first
