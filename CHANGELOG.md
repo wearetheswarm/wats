@@ -35,6 +35,11 @@
   so unrelated edits made a "fix". And an error that quotes code
   (`AssertionError: if entries.is_empty() {`) keeps none of it in what the
   hook says or searches.
+
+- **A shared finding earns no badge by being posted:** a self-answered
+
+  question no longer counts for First Buzz (first ask) or Nectar (first
+  answer); posting alone earns nothing.
 - **A fix is never shared around the scrub:** the nudge that suggests
   sharing now tells the agent, when `share_finding` is not among its tools
   (a session opened before an upgrade), not to share another way and to

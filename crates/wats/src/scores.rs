@@ -137,10 +137,18 @@ fn compute(
         };
         out.score += s.points();
         out.useful += s.up;
+        // A shared finding (a self-answered question, ADR 0045 §4) earns
+        // no "first" by being posted: posting alone earns nothing.
+        let shared_ask = |e: &Event| e.data.get("self_answered") == Some(&serde_json::json!(true));
         match post.kind {
-            Kind::Ask => earned.push("First Buzz"),
+            Kind::Ask if !shared_ask(post) => earned.push("First Buzz"),
             Kind::Answer => {
-                earned.push("Nectar");
+                let own_share = root_of(post)
+                    .as_ref()
+                    .is_some_and(|r| r.author == post.author && shared_ask(r));
+                if !own_share {
+                    earned.push("Nectar");
+                }
                 out.uses += s.uses;
                 if s.accepted {
                     earned.push("Royal Jelly");
@@ -308,6 +316,50 @@ mod tests {
         assert_eq!(shown(12), "+12");
         assert_eq!(shown(0), "0");
         assert_eq!(shown(-3), "−3");
+    }
+
+    /// ADR 0056 §4: a shared finding (a self-answered question) earns
+    /// neither First Buzz nor Nectar by being posted.
+    #[test]
+    fn a_share_earns_no_first() {
+        use crate::event::Draft;
+        use ed25519_dalek::SigningKey;
+        let store = Store::open_in_memory().unwrap();
+        let key = SigningKey::from_bytes(&[3; 32]);
+        let ask = Draft {
+            net: "public".into(),
+            kind: Some(Kind::Ask),
+            title: Some("musl: cannot find -lgcc_s".into()),
+            text: "linking fails".into(),
+            data: serde_json::json!({"self_answered": true})
+                .as_object()
+                .cloned()
+                .unwrap(),
+            ..Draft::default()
+        }
+        .sign(&key, 10, 0)
+        .unwrap();
+        let answer = Draft {
+            net: "public".into(),
+            thread: Some(ask.id.clone()),
+            parent: Some(ask.id.clone()),
+            kind: Some(Kind::Answer),
+            text: "install musl-tools".into(),
+            ..Draft::default()
+        }
+        .sign(&key, 11, 0)
+        .unwrap();
+        store.insert(&ask, 10).unwrap();
+        store.insert(&answer, 11).unwrap();
+        let grouping = Grouping::new(Default::default());
+        let got = compute(&store, &grouping, "public", &ask.author).unwrap();
+        assert!(
+            !got.badges
+                .iter()
+                .any(|b| b == "First Buzz" || b == "Nectar"),
+            "{:?}",
+            got.badges
+        );
     }
 
     /// ADR 0055 §2: votes, plus 2 per use, 3 per confirmation, 3 for the
