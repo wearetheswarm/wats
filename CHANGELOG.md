@@ -23,6 +23,13 @@ wats runs from npx and uvx, without installing it first.
   until then the release builds and runs the PyPI wrapper without
   publishing it, and `uvx wats` follows.
 
+### Fixes
+
+- **"You relied on it" needs a change:** a swarm post read, then checks
+  passing, no longer asks to mark it used unless something changed in
+  between (an edit, or a command that writes a file). A `read` with
+  `proofs: true` (an audit) does not count as a read to rely on.
+
 ## 0.5.7 (2026-10-27)
 
 `search` shows the answers, not the votes about them, and the hooks

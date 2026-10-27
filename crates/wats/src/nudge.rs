@@ -1005,7 +1005,9 @@ fn post_tool(request: &Request, session: &mut Session) -> Result<Option<String>>
             count(&request.data_dir, &[&format!("nudge_{acted}")]);
         }
         match short {
-            "read" => {
+            // A read with proofs inspects the post (an audit), it does not
+            // use it.
+            "read" if input["proofs"].as_bool() != Some(true) => {
                 if let Some(id) = input["id"].as_str() {
                     let title = store(&request.data_dir)
                         .and_then(|s| s.get(id).ok().flatten())
@@ -1193,15 +1195,20 @@ pub fn fix_in(turn: &[Step]) -> Option<String> {
     None
 }
 
-/// The swarm post the turn relied on (ADR 0056 §1.3): read, then a build
-/// or test passing, with no react after the read.
+/// The swarm post the turn relied on (ADR 0056 §1.3): read, then a
+/// change (an edit, or a command that writes a file), then a build or test
+/// passing, with no react after the read. Commands that merely pass after
+/// a read did not use it.
 pub fn relied_in(turn: &[Step]) -> Option<(String, String)> {
     let (i, (id, title)) = turn.iter().enumerate().rev().find_map(|(i, s)| match s {
         Step::SwarmRead { id, title } => Some((i, (id.clone(), title.clone()))),
         _ => None,
     })?;
     let rest = &turn[i + 1..];
-    let passed = rest.iter().any(|s| {
+    let changed = rest
+        .iter()
+        .position(|s| matches!(s, Step::Edit | Step::Shell { writes: true, .. }))?;
+    let passed = rest[changed + 1..].iter().any(|s| {
         matches!(
             s,
             Step::Shell {
@@ -1544,7 +1551,7 @@ mod tests {
     }
 
     #[test]
-    fn a_post_relied_on_is_one_read_then_a_passing_check() {
+    fn a_post_relied_on_is_one_read_then_a_change_then_a_passing_check() {
         let read = Step::SwarmRead {
             id: "abc".into(),
             title: "musl needs musl-tools".into(),
@@ -1561,8 +1568,46 @@ mod tests {
             Step::React,
         ];
         assert_eq!(relied_in(&reacted), None);
-        let no_check = [read, sh("ls", None, true, false)];
+        let no_check = [read.clone(), Step::Edit, sh("ls", None, true, false)];
         assert_eq!(relied_in(&no_check), None);
+        // Seen live: a post read to inspect it, then unrelated checks
+        // passing, with nothing changed in between.
+        let no_change = [
+            read.clone(),
+            sh("cargo test", None, true, true),
+            sh("cargo build", None, true, true),
+        ];
+        assert_eq!(relied_in(&no_change), None);
+        // The change comes before the check that passes.
+        let check_then_edit = [read.clone(), sh("cargo test", None, true, true), Step::Edit];
+        assert_eq!(relied_in(&check_then_edit), None);
+        // A command that writes a file is a change too.
+        let mut written = sh("sed -i s/a/b/ Cargo.toml", None, true, false);
+        if let Step::Shell { writes, .. } = &mut written {
+            *writes = true;
+        }
+        let shell_change = [read, written, sh("cargo build", None, true, true)];
+        assert_eq!(relied_in(&shell_change).unwrap().0, "abc");
+    }
+
+    /// A read with proofs is an audit: it is not a read to rely on.
+    #[test]
+    fn a_read_with_proofs_is_not_recorded() {
+        let dir = tempfile::tempdir().unwrap();
+        let read = |input: Value| Request {
+            data_dir: dir.path().to_path_buf(),
+            host: Host::Claude,
+            event: Event::PostTool,
+            payload: json!({"hook_event_name": "PostToolUse", "tool_name": "mcp__wats__read", "tool_input": input}),
+            now: 1,
+            errors: true,
+            fixes: true,
+        };
+        let mut session = Session::default();
+        post_tool(&read(json!({"id": "abc", "proofs": true})), &mut session).unwrap();
+        assert!(session.turn.is_empty(), "{:?}", session.turn);
+        post_tool(&read(json!({"id": "abc"})), &mut session).unwrap();
+        assert!(matches!(&session.turn[..], [Step::SwarmRead { id, .. }] if id == "abc"));
     }
 
     /// The autoshare tip: once a day, never in the week after turning
