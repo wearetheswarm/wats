@@ -78,6 +78,8 @@ jobs:
             echo "::error::version $version does not match Cargo.toml ($crate)"
             exit 1
           fi
+          # The npm and PyPI wrappers run the release of their own version.
+          sh scripts/wrapper-versions.sh check
           {
             echo "version=$version"
             echo "short=$(git rev-parse --short=12 HEAD)"
@@ -398,3 +400,140 @@ jobs:
           git commit -q -m "wats ${TAG#v}"
           git push origin HEAD:main
           echo "### Homebrew tap: wats ${TAG#v}" >> "$GITHUB_STEP_SUMMARY"
+
+  # The npm and PyPI wrappers (ADR 0035): `npx -y @wearetheswarm/wats mcp`
+  # and `uvx wats mcp`. Once both archives are attached, each job packs its
+  # wrapper, runs the packed one against this very release (it downloads
+  # the Linux archive, verifies its signatures and SHA-256 with the pinned
+  # key, then runs `wats --version`), and only then publishes it, with
+  # trusted publishing: an OIDC token of this job, no token stored. npm adds
+  # provenance (public repository). Each job has its own environment (`npm`,
+  # `pypi`), which the registry's trusted publisher names. A version already
+  # on the registry is left as it is, so a rerun is harmless. Prereleases
+  # are left out.
+  npm:
+    name: npm wrapper
+    needs: build
+    if: github.event_name == 'release' && !github.event.release.prerelease && !startsWith(github.event.release.tag_name, 'model-')
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment: npm
+    permissions:
+      contents: read
+      id-token: write   # npm trusted publishing
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "24"
+
+      # Trusted publishing needs npm 11.5.1 or later.
+      - name: npm
+        run: |
+          if ! node -e 'const [a, b, c] = process.argv[1].split(".").map(Number);
+            process.exit(a > 11 || (a === 11 && (b > 5 || (b === 5 && c >= 1))) ? 0 : 1)' "$(npm --version)"; then
+            npm install -g npm@11.21.1
+          fi
+          npm --version
+
+      - name: Check
+        env:
+          TAG: ${{ github.event.release.tag_name }}
+        run: |
+          sh scripts/wrapper-versions.sh check
+          version="$(node -p 'require("./packages/npm/package.json").version')"
+          if [ "v$version" != "$TAG" ]; then
+            echo "::error::packages/npm is $version, the release is $TAG"
+            exit 1
+          fi
+          node --test packages/npm/test/*.test.js
+
+      - name: Pack
+        id: pack
+        run: |
+          cp LICENSE packages/npm/
+          cd packages/npm
+          tgz="$(npm pack --silent --pack-destination "$RUNNER_TEMP")"
+          tar -tzf "$RUNNER_TEMP/$tgz"
+          echo "tgz=$RUNNER_TEMP/$tgz" >> "$GITHUB_OUTPUT"
+
+      - name: Run the packed wrapper against this release
+        env:
+          TAG: ${{ github.event.release.tag_name }}
+          TGZ: ${{ steps.pack.outputs.tgz }}
+        run: |
+          out="$(cd "$RUNNER_TEMP" && WATS_WRAPPER_CACHE_DIR="$RUNNER_TEMP/wrapper-cache" \
+            npm exec --yes --package "$TGZ" -- wats --version)"
+          echo "$out"
+          if [ "$out" != "wats ${TAG#v}" ]; then
+            echo "::error::the packed wrapper printed '$out', not 'wats ${TAG#v}'"
+            exit 1
+          fi
+
+      - name: Publish
+        env:
+          TAG: ${{ github.event.release.tag_name }}
+        run: |
+          cd packages/npm
+          name="$(node -p 'require("./package.json").name')"
+          if npm view "$name@${TAG#v}" version >/dev/null 2>&1; then
+            echo "$name@${TAG#v} is already on npm"
+            exit 0
+          fi
+          npm publish --access public
+          echo "### npm: $name@${TAG#v}" >> "$GITHUB_STEP_SUMMARY"
+
+  pypi:
+    name: PyPI wrapper
+    needs: build
+    if: github.event_name == 'release' && !github.event.release.prerelease && !startsWith(github.event.release.tag_name, 'model-')
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment: pypi
+    permissions:
+      contents: read
+      id-token: write   # PyPI trusted publishing
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Check
+        env:
+          TAG: ${{ github.event.release.tag_name }}
+        run: |
+          sh scripts/wrapper-versions.sh check
+          version="$(sed -n 's/^__version__ = "\([^"]*\)"$/\1/p' packages/pypi/src/wats_wrapper/__init__.py)"
+          if [ "v$version" != "$TAG" ]; then
+            echo "::error::packages/pypi is $version, the release is $TAG"
+            exit 1
+          fi
+          python3 --version
+          python3 -m unittest discover -s packages/pypi/tests
+
+      # The sdist and the wheel. The backend is pinned in pyproject.toml
+      # (flit_core); `build` is pinned here.
+      - name: Build
+        run: |
+          cp LICENSE packages/pypi/
+          python3 -m venv "$RUNNER_TEMP/build"
+          "$RUNNER_TEMP/build/bin/pip" install --quiet build==1.6.1
+          "$RUNNER_TEMP/build/bin/python" -m build --outdir packages/pypi/dist packages/pypi
+          ls -l packages/pypi/dist
+
+      - name: Run the built wrapper against this release
+        env:
+          TAG: ${{ github.event.release.tag_name }}
+        run: |
+          python3 -m venv "$RUNNER_TEMP/smoke"
+          "$RUNNER_TEMP/smoke/bin/pip" install --quiet --no-deps packages/pypi/dist/*.whl
+          out="$(WATS_WRAPPER_CACHE_DIR="$RUNNER_TEMP/wrapper-cache" "$RUNNER_TEMP/smoke/bin/wats" --version)"
+          echo "$out"
+          if [ "$out" != "wats ${TAG#v}" ]; then
+            echo "::error::the built wrapper printed '$out', not 'wats ${TAG#v}'"
+            exit 1
+          fi
+
+      - uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2
+        with:
+          packages-dir: packages/pypi/dist
+          skip-existing: true

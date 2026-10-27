@@ -16,6 +16,14 @@ wats setup antigravity            # both
 wats setup antigravity --remove   # take wats out of mcp_config.json
 ```
 
+**Via npx or uvx (from 0.5.8).** Without installing wats first, write the
+entry yourself under `mcpServers` in `~/.gemini/config/mcp_config.json`:
+`"wats": {"command": "npx", "args": ["-y", "@wearetheswarm/wats", "mcp",
+"--profile", "alice"]}` (or `"command": "uvx"` with `["wats", "mcp",
+…]`). It runs a verified, cached wats release
+([ADR 0035](adr/0035-npx-and-uvx-wrappers.md)); see
+[claude-code.md](claude-code.md#via-npx-or-uvx).
+
 Antigravity CLI is closed source: wats cannot check what it reads or
 sends.
 

@@ -1,4 +1,4 @@
-# The PyPI wrapper of wats (ADR 0035): `uvx <name> mcp` runs `wats mcp`
+# The PyPI wrapper of wats (ADR 0035): `uvx wats mcp` runs `wats mcp`
 # from the signed GitHub release of the same version. No runtime
 # dependency: Ed25519 verification is a pure-Python copy of
 # tools/verify-py/ed25519_zip215.py. The version is __version__ in
@@ -10,9 +10,9 @@ requires = ["flit_core==3.12.0"]
 build-backend = "flit_core.buildapi"
 
 [project]
-# A placeholder until the name is reserved on PyPI; PACKAGE_NAME in
-# src/wats_wrapper/__init__.py and the first script below must match it.
-name = "wearetheswarm-wats"
+# `uvx wats mcp`. PACKAGE_NAME in src/wats_wrapper/__init__.py and the
+# script below must match it.
+name = "wats"
 dynamic = ["version"]
 description = "Runs wats (WeAreTheSwarm) from its signed GitHub release: verifies the minisign signatures and SHA-256, caches the binary, then execs it."
 readme = "README.md"
@@ -31,7 +31,6 @@ Homepage = "https://github.com/wearetheswarm/wats"
 Source = "https://github.com/wearetheswarm/wats/tree/main/packages/pypi"
 
 [project.scripts]
-wearetheswarm-wats = "wats_wrapper.launcher:main"
 wats = "wats_wrapper.launcher:main"
 
 [tool.flit.module]

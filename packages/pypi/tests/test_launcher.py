@@ -380,7 +380,7 @@ class Command(unittest.TestCase):
         out, err = p.communicate(b"", timeout=30)
         self.assertEqual(p.returncode, 1)
         self.assertEqual(out, b"")
-        self.assertRegex(err.decode(), r"(?m)^wearetheswarm-wats: .*refusing to run it")
+        self.assertRegex(err.decode(), r"(?m)^wats \(PyPI wrapper\): .*refusing to run it")
 
     def test_signals_reach_wats(self):
         p = self.run_harness(["wait-term"])
