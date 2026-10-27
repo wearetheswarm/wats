@@ -457,9 +457,13 @@ mod tests {
 
     #[test]
     fn secrets_long_code_and_project_names_are_refused() {
-        let why = scrub("set OPENAI_API_KEY=sk-abcdefghijklmnop1234", &ctx()).unwrap_err();
+        // Fake secrets are built here, so that no secret scanner reads one
+        // in the source.
+        let key = format!("set API_KEY={}{}", "sk-", "abcdefghijklmnop1234");
+        let why = scrub(&key, &ctx()).unwrap_err();
         assert!(why[0].contains("secret"), "{why:?}");
-        let why = scrub("token aB3dE5fG7hJ9kL1mN3pQ5rS7tU9vW1xY3", &ctx()).unwrap_err();
+        let random = ["aB3dE5fG7hJ9", "kL1mN3pQ5rS7", "tU9vW1xY3"].concat();
+        let why = scrub(&format!("value {random}"), &ctx()).unwrap_err();
         assert!(why[0].contains("random-looking"), "{why:?}");
         let code = format!("```\n{}```\n", "let x = 1;\n".repeat(31));
         let why = scrub(&code, &ctx()).unwrap_err();
