@@ -2706,6 +2706,9 @@ fn install_claude_hooks(args: &NodeArgs, profile: &str, scope: &str, ask: bool) 
         return Ok(());
     }
     let path = claude_settings(scope)?;
+    if let Some(dir) = path.parent() {
+        install_swarm_command(args, "Claude Code", &dir.join("commands").join("swarm.md"))?;
+    }
     let mut entries = CLAUDE_EVENTS
         .iter()
         .map(|e| Ok((*e, hook_command(args, Host::Claude, *e, profile)?)))
@@ -2717,7 +2720,7 @@ fn install_claude_hooks(args: &NodeArgs, profile: &str, scope: &str, ask: bool) 
     match wats::hook::claude_upsert(&text, &entries)
         .with_context(|| format!("{}: left as it is", path.display()))?
     {
-        None => println!("Claude Code: session hook already in {}", path.display()),
+        None => println!("Claude Code: hooks already in {}", path.display()),
         Some(new) => {
             println!(
                 "Claude Code: hooks (UserPromptSubmit, SessionStart; PostToolUse, \
@@ -2753,6 +2756,9 @@ fn install_codex_hooks(
         return Ok(());
     }
     let path = codex_config()?;
+    if let Some(dir) = path.parent() {
+        install_swarm_command(args, "Codex", &dir.join("prompts").join("swarm.md"))?;
+    }
     let version = wats::hook::codex_version(codex);
     let mut events: Vec<wats::hook::HookEvent> = wats::hook::codex_events(version).to_vec();
     let mut entries = events
@@ -2770,7 +2776,7 @@ fn install_codex_hooks(
     match wats::hook::codex_upsert(&text, feature, &entries)
         .with_context(|| format!("{}: left as it is", path.display()))?
     {
-        None => println!("Codex: session hook already in {}", path.display()),
+        None => println!("Codex: hooks already in {}", path.display()),
         Some(new) => {
             let names: Vec<String> = events
                 .iter()
@@ -2793,6 +2799,34 @@ fn install_codex_hooks(
             );
         }
     }
+    Ok(())
+}
+
+/// Write the `/swarm` command (ADR 0056 §4) to `path` (a Claude Code
+/// command, a Codex prompt), when it is ours or absent.
+fn install_swarm_command(args: &NodeArgs, name: &str, path: &std::path::Path) -> Result<()> {
+    let exe = wats::update::stable_exe()?;
+    let dir = match &args.dir {
+        Some(dir) => Some(std::path::absolute(dir)?.to_string_lossy().into_owned()),
+        None => None,
+    };
+    let text = wats::hook::swarm_command(&exe.to_string_lossy(), dir.as_deref());
+    let current = read_or_empty(path)?;
+    if current == text {
+        return Ok(());
+    }
+    if !current.is_empty() && !current.contains("wats /swarm") {
+        println!("{name}: {} is not ours: /swarm left out", path.display());
+        return Ok(());
+    }
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(path, text)?;
+    println!(
+        "{name}: /swarm (your reputation, badges and shares) in {}",
+        path.display()
+    );
     Ok(())
 }
 
@@ -2922,8 +2956,20 @@ fn remove_from_claude(scope: &str, claude: &std::path::Path) -> Result<()> {
 
 /// `wats setup claude --remove-hooks` (and the first step of --remove):
 /// our session hooks out of the scope's settings.json.
+/// Remove the `/swarm` command at `path`, when it is ours.
+fn remove_swarm_command(name: &str, path: &std::path::Path) {
+    if read_or_empty(path).is_ok_and(|t| t.contains("wats /swarm"))
+        && std::fs::remove_file(path).is_ok()
+    {
+        println!("{name}: /swarm removed ({})", path.display());
+    }
+}
+
 fn remove_claude_hooks(scope: &str) -> Result<()> {
     let path = claude_settings(scope)?;
+    if let Some(dir) = path.parent() {
+        remove_swarm_command("Claude Code", &dir.join("commands").join("swarm.md"));
+    }
     let text = read_or_empty(&path)?;
     match wats::hook::claude_remove(&text)
         .with_context(|| format!("{}: left as it is", path.display()))?
@@ -2966,6 +3012,9 @@ fn remove_from_codex(codex: &std::path::Path) -> Result<()> {
 /// other hooks may need it).
 fn remove_codex_hooks() -> Result<()> {
     let path = codex_config()?;
+    if let Some(dir) = path.parent() {
+        remove_swarm_command("Codex", &dir.join("prompts").join("swarm.md"));
+    }
     let text = read_or_empty(&path)?;
     match wats::hook::codex_remove(&text)
         .with_context(|| format!("{}: left as it is", path.display()))?

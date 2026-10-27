@@ -872,7 +872,7 @@ pub fn relied_in(turn: &[Step]) -> Option<(String, String)> {
             }
         )
     });
-    let reacted = rest.iter().any(|s| *s == Step::React);
+    let reacted = rest.contains(&Step::React);
     (passed && !reacted).then_some((id, title))
 }
 

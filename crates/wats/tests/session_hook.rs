@@ -461,8 +461,15 @@ fn setup_claude_adds_the_hook_once_and_removes_it() {
 
     let said = setup(&home, &data, &["claude", "--mcp", "--claude", claude]);
     assert!(
-        said.contains("session hook (UserPromptSubmit, SessionStart)"),
+        said.contains("hooks (UserPromptSubmit, SessionStart"),
         "{said}"
+    );
+    // The /swarm command (ADR 0056 §4).
+    let swarm = settings_dir.join("commands").join("swarm.md");
+    assert!(
+        std::fs::read_to_string(&swarm)
+            .unwrap()
+            .contains(" me` in the shell")
     );
     let found = backups(&settings_dir, "settings.json");
     assert_eq!(found.len(), 1, "{found:?}");
@@ -472,6 +479,24 @@ fn setup_claude_adds_the_hook_once_and_removes_it() {
     assert_eq!(v["model"], "opus");
     assert_eq!(v["env"]["FOO"], "1");
     assert_eq!(v["hooks"]["Stop"][0]["hooks"][0]["command"], "say done");
+    // The nudges (ADR 0056 §1), next to the user's own Stop hook.
+    for (event, arg) in [
+        ("PostToolUse", "post-tool"),
+        ("PostToolUseFailure", "post-tool"),
+        ("Stop", "stop"),
+    ] {
+        let groups = v["hooks"][event].as_array().unwrap();
+        let ours = groups.last().unwrap()["hooks"][0]["command"]
+            .as_str()
+            .unwrap();
+        assert!(
+            ours.ends_with(&format!(
+                " hook {arg} --host claude --dir {}",
+                data.display()
+            )),
+            "{ours}"
+        );
+    }
     let exe = std::fs::canonicalize(env!("CARGO_BIN_EXE_wats")).unwrap();
     for (event, arg) in [
         ("UserPromptSubmit", "user-prompt-submit"),
@@ -500,7 +525,7 @@ fn setup_claude_adds_the_hook_once_and_removes_it() {
 
     // Idempotent: nothing written, no new backup.
     let said = setup(&home, &data, &["claude", "--mcp", "--claude", claude]);
-    assert!(said.contains("session hook already in"), "{said}");
+    assert!(said.contains("hooks already in"), "{said}");
     assert_eq!(std::fs::read_to_string(&settings).unwrap(), text);
     assert_eq!(backups(&settings_dir, "settings.json").len(), 1);
 
@@ -513,12 +538,13 @@ fn setup_claude_adds_the_hook_once_and_removes_it() {
     );
     assert!(said.contains("session hook removed"), "{said}");
     assert!(!said.contains("MCP server"), "{said}");
+    assert!(!swarm.exists(), "/swarm goes with the hooks");
     assert!(!log.exists(), "the claude CLI ran");
     let removed: Value =
         serde_json::from_str(&std::fs::read_to_string(&settings).unwrap()).unwrap();
     assert_eq!(removed, serde_json::from_str::<Value>(original).unwrap());
     let said = setup(&home, &data, &["claude", "--mcp", "--claude", claude]);
-    assert!(said.contains("session hook (UserPromptSubmit"), "{said}");
+    assert!(said.contains("hooks (UserPromptSubmit"), "{said}");
     std::fs::remove_file(&log).unwrap();
 
     // --remove: the hook and the MCP server go; the user's settings stay.
@@ -641,7 +667,7 @@ fn setup_codex_hook_follows_detection() {
         }
         // Idempotent.
         let said = setup(&home, &data, &["codex", "--mcp", "--codex", codex]);
-        assert!(said.contains("session hook already in"), "{said}");
+        assert!(said.contains("hooks already in"), "{said}");
         assert_eq!(std::fs::read_to_string(&config).unwrap(), text);
         // --remove-hooks: the hook only.
         let said = setup(&home, &data, &["codex", "--remove-hooks", "--codex", codex]);

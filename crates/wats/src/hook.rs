@@ -655,6 +655,23 @@ pub fn shell_quote(s: &str) -> String {
     }
 }
 
+/// The `/swarm` command (ADR 0056 §4): a Claude Code command file
+/// (`commands/swarm.md`) and a Codex prompt (`prompts/swarm.md`), with
+/// the exact path of this wats.
+pub fn swarm_command(exe: &str, data_dir: Option<&str>) -> String {
+    let mut command = shell_quote(exe);
+    if let Some(dir) = data_dir {
+        command.push_str(&format!(" --dir {}", shell_quote(dir)));
+    }
+    format!(
+        "---\ndescription: Your WeAreTheSwarm reputation, badges and shared findings\n---\n\n\
+         <!-- wats /swarm (ADR 0056); `wats setup` rewrites this file -->\n\
+         Run `{command} me` in the shell and show its output to the user as it is, then say in \
+         one line what changed lately and what would earn more (an answer someone uses: +2; \
+         confirmed or accepted: +3). Do not post anything.\n"
+    )
+}
+
 /// What identifies our nudge hooks (ADR 0056 §1).
 pub const NUDGE_MARKERS: [&str; 2] = [" hook post-tool ", " hook stop "];
 
