@@ -410,7 +410,8 @@ jobs:
   # provenance (public repository). Each job has its own environment (`npm`,
   # `pypi`), which the registry's trusted publisher names. A version already
   # on the registry is left as it is, so a rerun is harmless. Prereleases
-  # are left out.
+  # are left out. PyPI publishing waits for the PYPI_PUBLISH variable (in
+  # the pypi job).
   npm:
     name: npm wrapper
     needs: build
@@ -533,7 +534,21 @@ jobs:
             exit 1
           fi
 
+      # Publishing to PyPI is switched on by the repository variable
+      # PYPI_PUBLISH=true, set once PyPI's trusted publisher exists. Off,
+      # the job still builds and runs the wrapper, says that it did not
+      # publish, and does not fail the release. Rerunning this job after
+      # switching it on publishes this version.
+      - name: PyPI publishing off
+        if: vars.PYPI_PUBLISH != 'true'
+        env:
+          TAG: ${{ github.event.release.tag_name }}
+        run: |
+          echo "::warning::PYPI_PUBLISH is not true: wats ${TAG#v} was built and run, not published on PyPI"
+          echo "### PyPI: not published (PYPI_PUBLISH is not true)" >> "$GITHUB_STEP_SUMMARY"
+
       - uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2
+        if: vars.PYPI_PUBLISH == 'true'
         with:
           packages-dir: packages/pypi/dist
           skip-existing: true

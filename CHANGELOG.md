@@ -18,7 +18,10 @@ wats runs from npx and uvx, without installing it first.
 - **The release workflow publishes both wrappers** with trusted
   publishing (no token stored), after running each packed wrapper against
   the release it has just attached; npm adds provenance. The PyPI name is
-  `wats` (it was a placeholder, never published).
+  `wats` (it was a placeholder, never published). PyPI publishing waits
+  for its trusted publisher (the `PYPI_PUBLISH` repository variable):
+  until then the release builds and runs the PyPI wrapper without
+  publishing it, and `uvx wats` follows.
 
 ## 0.5.7 (2026-10-27)
 

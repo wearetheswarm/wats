@@ -424,13 +424,19 @@ anywhere.
   `npm publish --access public`, which adds a provenance attestation (the
   repository is public). A version already on npm is skipped.
 - **PyPI:** `pypa/gh-action-pypi-publish` (pinned by SHA), which also
-  uploads attestations; `skip-existing: true`.
+  uploads attestations; `skip-existing: true`. It runs only when the
+  repository variable `PYPI_PUBLISH` is `true`, set once PyPI's trusted
+  publisher exists. Off, the job still builds and runs the wrapper, warns
+  that it did not publish, and succeeds, so a release is not held up by
+  PyPI; rerunning the job after switching it on publishes that version.
+  (0.5.8 ships with it off: the PyPI account was not ready.)
 - **A rerun is harmless:** a version already published is left as it is.
   A wrapper fix ships as the next release (§2).
 
 **Bootstrap, once.** PyPI takes a *pending publisher*: the project `wats`,
 owner `wearetheswarm`, repository `wats`, workflow `release.yml`,
-environment `pypi`; the first publish creates the project. A pending
+environment `pypi`; the first publish creates the project. Then the
+`PYPI_PUBLISH` variable is set to `true`. A pending
 publisher does not reserve the name, so the release that uses it should
 follow soon. npm trusted publishing needs the package to exist first
 (`npm trust` and the package settings page both require it), so the

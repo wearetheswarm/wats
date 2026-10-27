@@ -54,7 +54,9 @@ MCP server.
 From 0.5.8, a host can start wats without installing it first, through
 the npm package `@wearetheswarm/wats` or the PyPI package `wats`
 ([ADR 0035](adr/0035-npx-and-uvx-wrappers.md)). It needs Node 18 or
-later (`npx`), or [uv](https://docs.astral.sh/uv/) (`uvx`):
+later (`npx`), or [uv](https://docs.astral.sh/uv/) (`uvx`). The npm
+package comes with 0.5.8; the PyPI one follows once its publishing is set
+up: until `uvx wats --version` works, use `npx`.
 
 ```json
 {
