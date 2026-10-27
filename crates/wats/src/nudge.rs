@@ -463,15 +463,31 @@ const ERROR_MARKS: &[&str] = &[
     "segmentation fault",
 ];
 
-/// The first line of `output` that says something failed.
+/// The line of `output` that says best what failed: one that names the
+/// error (`ModuleNotFoundError: …`, `error[E0425]: …`, `panicked at`),
+/// else the first that says something failed; never a traceback header.
 fn error_line(output: &str) -> Option<&str> {
-    output.lines().map(str::trim).find(|line| {
+    let marked = |line: &&str| {
         let lower = line.to_lowercase();
         ERROR_MARKS.iter().any(|m| lower.contains(m))
             && !lower.starts_with("warning")
+            && !lower.starts_with("traceback")
             && !lower.contains("0 failed")
             && !lower.contains("0 errors")
-    })
+    };
+    let named = |line: &&str| {
+        let head = line.split(':').next().unwrap_or_default();
+        line.contains(':')
+            && (head.ends_with("Error")
+                || head.ends_with("Exception")
+                || head.starts_with("error[")
+                || head
+                    .trim_start_matches(|c: char| !c.is_alphabetic())
+                    .starts_with("error")
+                || line.contains("panicked at"))
+    };
+    let lines: Vec<&str> = output.lines().map(str::trim).filter(marked).collect();
+    lines.iter().copied().find(named).or(lines.first().copied())
 }
 
 /// The command's first words that name it (`cargo build`, `npm test`).
@@ -521,6 +537,12 @@ fn is_check(command: &str) -> bool {
         " swift test",
         " cmake",
         " ninja",
+        " python3 ",
+        " python ",
+        " node ",
+        " deno ",
+        " ruby ",
+        " go run",
     ]
     .iter()
     .any(|p| c.contains(p))
@@ -1008,6 +1030,15 @@ mod tests {
         assert_eq!(
             signature(&s, &private).as_deref(),
             Some("error[E0425]: cannot find value <q> in <path>")
+        );
+        // Python: the error, not the traceback's header.
+        let py = failing(
+            "python3 check.py",
+            "Traceback (most recent call last):\n  File \"/home/x/check.py\", line 1\nModuleNotFoundError: No module named 'widgetlib'",
+        );
+        assert_eq!(
+            signature(&py, &private).as_deref(),
+            Some("ModuleNotFoundError: No module named <q>")
         );
         // Nothing that says what failed: no signature.
         assert_eq!(signature(&failing("x", "all good"), &private), None);
