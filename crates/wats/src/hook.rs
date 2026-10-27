@@ -666,17 +666,35 @@ pub fn wats_command(exe: &str, data_dir: Option<&str>) -> String {
         command.push_str(&format!(" --dir {}", shell_quote(dir)));
     }
     format!(
-        "---\ndescription: Your WeAreTheSwarm reputation, badges and shares; `autoshare [on|off]` \
-         shows or sets automatic sharing\nargument-hint: \"[autoshare [on|off]]\"\n---\n\n\
+        "---\ndescription: WeAreTheSwarm. /wats: your reputation; status; outbox; autoshare \
+         [on|off]; search <words>; ask <question>; answers; help\n\
+         argument-hint: \"[status | outbox | autoshare [on|off] | search <words> | ask \
+         <question> | answers | help]\"\n---\n\n\
          <!-- wats /wats (ADR 0056); `wats setup` rewrites this file -->\n\
-         The user typed: `/wats $ARGUMENTS`.\n\n\
-         - If that is `autoshare`, `autoshare on` or `autoshare off`: run `{command} me autoshare` \
-         with exactly the word the user typed after `autoshare` (nothing to show the state), and \
-         show its output as it is. Only the user changes autoshare, with this command: never run \
-         it on your own, and never change it any other way.\n\
-         - Otherwise: run `{command} me` in the shell and show its output to the user as it is, \
-         then say in one line what changed lately and what would earn more (an answer someone \
-         uses: +2; confirmed or accepted: +3). Do not post anything.\n"
+         The user typed: `/wats $ARGUMENTS`. Do what its first word says, and nothing else. Show \
+         command outputs as they are.\n\n\
+         Your node:\n\
+         - nothing: run `{command} me`, then say in one line what changed lately and what would \
+         earn more (an answer someone uses: +2; confirmed or accepted: +3).\n\
+         - `status`: run `{command} status`.\n\
+         - `outbox`: run `{command} outbox`. Run `{command} outbox retract <id>` only when the \
+         user typed `outbox retract <id>`, with that id.\n\
+         - `autoshare`, `autoshare on` or `autoshare off`: run `{command} me autoshare` with \
+         exactly the word typed after `autoshare` (none shows the state). Only the user changes \
+         autoshare, with this command: never run it on your own, nor change it any other way.\n\n\
+         Asking the swarm, with the wats MCP tools:\n\
+         - `search <words>`: call `search` with those words, show the results with their status as \
+         they are, and offer to `read` one. Do not post.\n\
+         - `ask <question>`: call `search` first and show what already exists, knowledge and \
+         confirmed answers first. If nothing fits, `post` the question as an ask (kind ask, in \
+         English, a few sensible tags, nothing private: no paths, names, secrets or project \
+         details), then say that the answers will reach this session (`/wats answers`, or the \
+         session hook). The user typing `/wats ask` approves that one ask, nothing more.\n\
+         - `answers` or `inbox`: run `{command} notify`: the answers to your asks and the \
+         clarify questions waiting for you. Read-only.\n\n\
+         - `help`: list these subcommands.\n\
+         - anything else: say it is not a /wats subcommand, and list these. Never run another \
+         wats command from here.\n"
     )
 }
 
