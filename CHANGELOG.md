@@ -1,5 +1,15 @@
 # Changelog
 
+## Unreleased
+
+### Fixes
+
+- **A fix is never shared around the scrub:** the nudge that suggests
+  sharing now tells the agent, when `share_finding` is not among its tools
+  (a session opened before an upgrade), not to share another way and to
+  ask you to restart the session. Seen on a real install: an agent fell
+  back to a plain `post`, without the privacy scrub.
+
 ## 0.5.5 (2026-10-27)
 
 Your agents check the swarm when something fails, offer to share what

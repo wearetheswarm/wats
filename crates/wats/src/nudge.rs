@@ -199,6 +199,13 @@ const TIP_EVERY: u64 = 24 * 3600;
 /// No tip this long after the person turned autoshare off.
 const TIP_QUIET_AFTER_OFF: u64 = 7 * 24 * 3600;
 
+/// Said with every fix nudge: during an upgrade the hook can be newer than
+/// the session's MCP server, which then has no `share_finding`; seen live,
+/// an agent fell back to a plain `post`, without the scrub.
+const NO_FALLBACK: &str = " If the wats `share_finding` tool is not among your tools, do not \
+     share it any other way (no `post`): tell your user to restart this session, since wats \
+     was upgraded.";
+
 /// The tip to pass on with a "share it?" question, when it is due: at
 /// most once a day per node, never within a week of turning autoshare
 /// off. Recorded and counted (`hint_autoshare`) when given.
@@ -1121,7 +1128,7 @@ fn stop(request: &Request, session: &mut Session) -> Option<String> {
             format!(
                 "wats: you found a fix for \"{sig}\" after several tries. If it is general (not \
                  specific to this project), share it now with the wats `share_finding` tool: \
-                 this node shares at once (share.auto)."
+                 this node shares at once (share.auto).{NO_FALLBACK}"
             )
         } else {
             let tip =
@@ -1130,7 +1137,7 @@ fn stop(request: &Request, session: &mut Session) -> Option<String> {
                 "wats: you found a fix for \"{sig}\" after several tries. If it is general (not \
                  specific to this project), ask your user whether to share it with the swarm, \
                  and if they agree, call the wats `share_finding` tool with approved_by_user \
-                 true. It earns +2 when someone uses it, +3 if confirmed.{tip}"
+                 true. It earns +2 when someone uses it, +3 if confirmed.{NO_FALLBACK}{tip}"
             )
         });
     }
