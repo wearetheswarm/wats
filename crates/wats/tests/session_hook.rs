@@ -464,8 +464,11 @@ fn setup_claude_adds_the_hook_once_and_removes_it() {
         said.contains("hooks (UserPromptSubmit, SessionStart"),
         "{said}"
     );
-    // The /swarm command (ADR 0056 §4).
-    let swarm = settings_dir.join("commands").join("swarm.md");
+    // The /wats command (ADR 0056 §4), with autoshare for the user only.
+    let swarm = settings_dir.join("commands").join("wats.md");
+    let command = std::fs::read_to_string(&swarm).unwrap();
+    assert!(command.contains(" me` in the shell"), "{command}");
+    assert!(command.contains("me autoshare") && command.contains("never run it on your own"));
     assert!(
         std::fs::read_to_string(&swarm)
             .unwrap()
@@ -538,7 +541,7 @@ fn setup_claude_adds_the_hook_once_and_removes_it() {
     );
     assert!(said.contains("session hook removed"), "{said}");
     assert!(!said.contains("MCP server"), "{said}");
-    assert!(!swarm.exists(), "/swarm goes with the hooks");
+    assert!(!swarm.exists(), "/wats goes with the hooks");
     assert!(!log.exists(), "the claude CLI ran");
     let removed: Value =
         serde_json::from_str(&std::fs::read_to_string(&settings).unwrap()).unwrap();
@@ -929,4 +932,32 @@ async fn vibe_real_payloads_give_both_nudges() {
     assert_eq!(stop["decision"], "deny", "{said:?}");
     assert!(stop["reason"].as_str().unwrap().contains("found a fix"));
     drop(client);
+}
+
+/// ADR 0056 §2 (amended): `wats me autoshare [on|off]` shows and sets
+/// share.auto for the person; turning it off silences the tip for a week.
+#[test]
+fn autoshare_is_the_persons_switch() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().join("node");
+    let run = |args: &[&str]| {
+        let out = std::process::Command::new(env!("CARGO_BIN_EXE_wats"))
+            .env("WATS_HERMETIC", "1")
+            .env("HOME", tmp.path())
+            .arg("--dir")
+            .arg(&dir)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{out:?}");
+        String::from_utf8(out.stdout).unwrap()
+    };
+    assert!(run(&["me", "autoshare"]).starts_with("autoshare off"));
+    assert!(run(&["me", "autoshare", "on"]).starts_with("autoshare on"));
+    let config = std::fs::read_to_string(dir.join("config.toml")).unwrap();
+    assert!(config.contains("[share]\nauto = true"), "{config}");
+    assert!(run(&["me", "autoshare"]).starts_with("autoshare on"));
+    assert!(run(&["me", "autoshare", "off"]).starts_with("autoshare off"));
+    let state = std::fs::read_to_string(dir.join("hooks").join("autoshare.json")).unwrap();
+    assert!(state.contains("\"off_at\""), "{state}");
 }

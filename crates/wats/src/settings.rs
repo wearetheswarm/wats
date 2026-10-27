@@ -799,7 +799,8 @@ pub const KEYS: &[Key] = &[
         ValueType::Bool,
         "false",
         "share_finding posts a finding at once, after the privacy scrub, without asking you \
-         first (ADR 0056); wats outbox lists and retracts what was shared",
+         first (ADR 0056); `wats setup` asks (Enter: ask each time); `wats me autoshare on|off` \
+         or `/wats autoshare on|off` switches it; wats outbox lists and retracts what was shared",
     ),
     key(
         "hooks.errors",

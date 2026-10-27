@@ -2001,7 +2001,11 @@ impl WatsMcp {
         &self,
         Parameters(args): Parameters<ShareFindingArgs>,
     ) -> Result<CallToolResult, String> {
-        let auto = self.node.config().share_auto;
+        // Read now: `wats me autoshare` changes it while the node runs.
+        let auto = crate::settings::Settings::load(&self.node.config().data_dir)
+            .ok()
+            .and_then(|s| s.share.auto)
+            .unwrap_or(self.node.config().share_auto);
         if !args.scrubbed {
             return Err(
                 "check the finding first: nothing from the project, the machine or the \
@@ -2137,6 +2141,17 @@ impl WatsMcp {
                 .store()
                 .count_find(&["share_auto"], crate::node::now_secs())
                 .ok();
+            // The first automatic share says how to turn it off, once.
+            let told = data_dir.join("hooks").join("share-auto-told");
+            if !told.exists() {
+                tracing::info!(
+                    target: crate::brief::TARGET,
+                    "shares go out automatically (share.auto); `wats me autoshare off` or \
+                     `/wats autoshare off` asks you each time instead"
+                );
+                let _ = std::fs::create_dir_all(data_dir.join("hooks"));
+                let _ = std::fs::write(&told, "");
+            }
         }
         let mut out = json!({
             "ask": ask.id,
@@ -3245,7 +3260,10 @@ impl WatsMcp {
             "semantic": self.node.semantic_json(),
             "find": self.node.find_json(),
             "memory": self.node.memory_json(),
-            "share_auto": config.share_auto,
+            "share_auto": crate::settings::Settings::load(&config.data_dir)
+                .ok()
+                .and_then(|s| s.share.auto)
+                .unwrap_or(config.share_auto),
         });
         // Rotation at the cap (ADR 0025 §7), with an events share.
         if self.node.events_share().is_some() {
