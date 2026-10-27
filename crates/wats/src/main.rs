@@ -382,6 +382,11 @@ enum Command {
         /// default no), and never starts one otherwise.
         #[arg(short = 'd', long, global = true)]
         detach: bool,
+        /// Share the fixes your agents find at once, after the privacy
+        /// scrub (`share.auto = true`, ADR 0056 §2), without being asked:
+        /// for a setup without a terminal, which cannot ask.
+        #[arg(long, global = true)]
+        share_auto: bool,
     },
     /// Read or change `<data dir>/config.toml`, what a bare `wats` runs
     /// with. Flags and WATS_* variables override it.
@@ -701,6 +706,8 @@ enum Command {
     /// shared findings and what happened to them, and your node's public
     /// name. The other nodes of this machine are summed in.
     Me {
+        #[command(subcommand)]
+        action: Option<MeAction>,
         /// Print JSON instead.
         #[arg(long)]
         json: bool,
@@ -873,6 +880,19 @@ struct GuardianKey {
     /// later from any machine with `wats guardian publish`).
     #[arg(long)]
     offline: bool,
+}
+
+#[derive(Debug, Subcommand)]
+enum MeAction {
+    /// Whether your agents' fixes are shared at once (`share.auto`, ADR
+    /// 0056 §2): `on` shares them after the privacy scrub, `off` has your
+    /// agents ask you each time; nothing prints the current state. For
+    /// you only: no wats tool changes it, and an agent must not run this
+    /// unless you asked.
+    Autoshare {
+        #[arg(value_parser = ["on", "off"])]
+        state: Option<String>,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -2707,7 +2727,7 @@ fn install_claude_hooks(args: &NodeArgs, profile: &str, scope: &str, ask: bool) 
     }
     let path = claude_settings(scope)?;
     if let Some(dir) = path.parent() {
-        install_swarm_command(args, "Claude Code", &dir.join("commands").join("swarm.md"))?;
+        install_wats_command(args, "Claude Code", &dir.join("commands").join("wats.md"))?;
     }
     let mut entries = CLAUDE_EVENTS
         .iter()
@@ -2757,7 +2777,7 @@ fn install_codex_hooks(
     }
     let path = codex_config()?;
     if let Some(dir) = path.parent() {
-        install_swarm_command(args, "Codex", &dir.join("prompts").join("swarm.md"))?;
+        install_wats_command(args, "Codex", &dir.join("prompts").join("wats.md"))?;
     }
     let version = wats::hook::codex_version(codex);
     let mut events: Vec<wats::hook::HookEvent> = wats::hook::codex_events(version).to_vec();
@@ -2802,21 +2822,21 @@ fn install_codex_hooks(
     Ok(())
 }
 
-/// Write the `/swarm` command (ADR 0056 §4) to `path` (a Claude Code
+/// Write the `/wats` command (ADR 0056 §4) to `path` (a Claude Code
 /// command, a Codex prompt), when it is ours or absent.
-fn install_swarm_command(args: &NodeArgs, name: &str, path: &std::path::Path) -> Result<()> {
+fn install_wats_command(args: &NodeArgs, name: &str, path: &std::path::Path) -> Result<()> {
     let exe = wats::update::stable_exe()?;
     let dir = match &args.dir {
         Some(dir) => Some(std::path::absolute(dir)?.to_string_lossy().into_owned()),
         None => None,
     };
-    let text = wats::hook::swarm_command(&exe.to_string_lossy(), dir.as_deref());
+    let text = wats::hook::wats_command(&exe.to_string_lossy(), dir.as_deref());
     let current = read_or_empty(path)?;
     if current == text {
         return Ok(());
     }
-    if !current.is_empty() && !current.contains("wats /swarm") {
-        println!("{name}: {} is not ours: /swarm left out", path.display());
+    if !current.is_empty() && !current.contains("wats /wats") {
+        println!("{name}: {} is not ours: /wats left out", path.display());
         return Ok(());
     }
     if let Some(parent) = path.parent() {
@@ -2824,7 +2844,7 @@ fn install_swarm_command(args: &NodeArgs, name: &str, path: &std::path::Path) ->
     }
     std::fs::write(path, text)?;
     println!(
-        "{name}: /swarm (your reputation, badges and shares) in {}",
+        "{name}: /wats (your reputation, badges and shares; `/wats autoshare`) in {}",
         path.display()
     );
     Ok(())
@@ -2961,19 +2981,19 @@ fn remove_from_claude(scope: &str, claude: &std::path::Path) -> Result<()> {
 
 /// `wats setup claude --remove-hooks` (and the first step of --remove):
 /// our session hooks out of the scope's settings.json.
-/// Remove the `/swarm` command at `path`, when it is ours.
-fn remove_swarm_command(name: &str, path: &std::path::Path) {
-    if read_or_empty(path).is_ok_and(|t| t.contains("wats /swarm"))
+/// Remove the `/wats` command at `path`, when it is ours.
+fn remove_wats_command(name: &str, path: &std::path::Path) {
+    if read_or_empty(path).is_ok_and(|t| t.contains("wats /wats"))
         && std::fs::remove_file(path).is_ok()
     {
-        println!("{name}: /swarm removed ({})", path.display());
+        println!("{name}: /wats removed ({})", path.display());
     }
 }
 
 fn remove_claude_hooks(scope: &str) -> Result<()> {
     let path = claude_settings(scope)?;
     if let Some(dir) = path.parent() {
-        remove_swarm_command("Claude Code", &dir.join("commands").join("swarm.md"));
+        remove_wats_command("Claude Code", &dir.join("commands").join("wats.md"));
     }
     let text = read_or_empty(&path)?;
     match wats::hook::claude_remove(&text)
@@ -3018,7 +3038,7 @@ fn remove_from_codex(codex: &std::path::Path) -> Result<()> {
 fn remove_codex_hooks() -> Result<()> {
     let path = codex_config()?;
     if let Some(dir) = path.parent() {
-        remove_swarm_command("Codex", &dir.join("prompts").join("swarm.md"));
+        remove_wats_command("Codex", &dir.join("prompts").join("wats.md"));
     }
     let text = read_or_empty(&path)?;
     match wats::hook::codex_remove(&text)
@@ -3377,6 +3397,24 @@ impl SetupTool {
         }
     }
 
+    /// It registers wats as the MCP server of the person's own CLI (with
+    /// `--mcp`, or with neither flag): the sharing question follows.
+    fn sets_up_mcp(&self) -> bool {
+        if self.sets_nothing_up() {
+            return false;
+        }
+        match self {
+            SetupTool::Codex { mcp, agent, .. }
+            | SetupTool::Claude { mcp, agent, .. }
+            | SetupTool::Openclaw { mcp, agent, .. }
+            | SetupTool::Opencode { mcp, agent, .. }
+            | SetupTool::Copilot { mcp, agent, .. }
+            | SetupTool::Antigravity { mcp, agent, .. } => *mcp || !*agent,
+            SetupTool::Vibe { mcp, .. } => *mcp,
+            SetupTool::Custom { .. } => false,
+        }
+    }
+
     /// It sets up an agent (`--agent`, not a removal): "Add another
     /// agent?" follows.
     fn sets_up_an_agent(&self) -> bool {
@@ -3440,6 +3478,7 @@ async fn setup_command(
         if choices.runtime.is_some() {
             offer_more_agents(node, data_dir)?;
         }
+        ask_share_auto(node, data_dir)?;
         print!("{}", welcome::step(3, style));
         let changed = std::fs::read(&config).ok() != before;
         offer_background(node, data_dir, detach, false, changed, true).await?;
@@ -3454,15 +3493,57 @@ async fn setup_command(
         return Ok(());
     }
     let agent = tool.as_ref().is_some_and(SetupTool::sets_up_an_agent);
+    let mcp = tool.as_ref().is_some_and(SetupTool::sets_up_mcp);
     setup_tool_command(node, data_dir, tool)?;
     if !offer {
         return Ok(());
+    }
+    // Once per node, with the person's own CLI: a node set up before 0.5.5
+    // is asked at its next such setup.
+    if mcp && !yes {
+        ask_share_auto(node, data_dir)?;
     }
     if agent {
         offer_more_agents(node, data_dir)?;
     }
     let changed = std::fs::read(&config).ok() != before;
     offer_background(node, data_dir, detach, yes, changed, false).await
+}
+
+/// `share.auto` in config.toml (ADR 0056 §2).
+fn set_share_auto(data_dir: &std::path::Path, on: bool) -> Result<()> {
+    let mut file = ConfigFile::open(data_dir)?;
+    file.set("share.auto", if on { "true" } else { "false" })?;
+    file.save()?;
+    Ok(())
+}
+
+/// Ask whether the agents' fixes go out at once (ADR 0056 §2, Vincent
+/// 2026-10-27): ask each time by default (Enter). Only on a terminal, and only
+/// when config.toml does not say yet: without a terminal nobody saw the
+/// question, so it stays off unless `--share-auto`; an upgraded node keeps
+/// what it has, and is asked at its next setup.
+fn ask_share_auto(node: &NodeArgs, data_dir: &std::path::Path) -> Result<()> {
+    if !interactive(node) || Settings::load(data_dir)?.share.auto.is_some() {
+        return Ok(());
+    }
+    let line = ask_line(
+        "Share the fixes your agents find with the swarm: ask me each time [Enter], or \
+         automatically, after a privacy scrub (review or retract with `wats outbox`) [y]: ",
+    )?;
+    let ask = !matches!(line.to_lowercase().as_str(), "y" | "yes" | "auto" | "a");
+    set_share_auto(data_dir, !ask)?;
+    println!(
+        "{}",
+        if ask {
+            "Sharing: your agents ask you before each share (share.auto = false); \
+             `/wats autoshare on` or `wats me autoshare on` shares automatically."
+        } else {
+            "Sharing: automatic, after the privacy scrub (share.auto = true); `wats outbox` \
+             lists and retracts, `wats config set share.auto false` asks you each time instead."
+        }
+    );
+    Ok(())
 }
 
 /// `wats setup [tool]` itself.
@@ -4169,6 +4250,7 @@ async fn setup_wizard(node: &NodeArgs, data_dir: &std::path::Path) -> Result<boo
     if choices.runtime.is_some() {
         offer_more_agents(node, data_dir)?;
     }
+    ask_share_auto(node, data_dir)?;
     print!("{}", welcome::step(3, style));
     // The background, recommended (Enter), or `d` to choose: here, or not
     // now (ADR 0027, 0.4.5). Native Windows has no `--detach`: here.
@@ -6109,6 +6191,33 @@ fn me_command(config: &NodeConfig, json: bool) -> Result<()> {
         "\nAs of {} (the node updates it as signals arrive).",
         wats::signals::day(me.at)
     );
+    Ok(())
+}
+
+/// `wats me autoshare [on|off]`.
+fn autoshare_command(data_dir: &std::path::Path, state: Option<&str>) -> Result<()> {
+    let explain = |on: bool| {
+        if on {
+            "on: your agents' fixes are shared at once, after the privacy scrub; `wats outbox` \
+             lists and retracts them"
+        } else {
+            "off: your agents ask you before each share"
+        }
+    };
+    match state {
+        None => {
+            let on = Settings::load(data_dir)?.share.auto.unwrap_or(false);
+            println!("autoshare {}", explain(on));
+        }
+        Some(state) => {
+            let on = state == "on";
+            set_share_auto(data_dir, on)?;
+            if !on {
+                wats::nudge::autoshare_turned_off(data_dir, wats::node::now_secs());
+            }
+            println!("autoshare {}", explain(on));
+        }
+    }
     Ok(())
 }
 
@@ -9644,7 +9753,14 @@ async fn async_main(mut cli: Cli) -> Result<()> {
                 _ = shutdown => Ok(()),
             };
         }
-        Some(Command::Setup { tool, detach }) => {
+        Some(Command::Setup {
+            tool,
+            detach,
+            share_auto,
+        }) => {
+            if share_auto {
+                set_share_auto(&data_dir, true)?;
+            }
             // `wats --detach setup …` means `wats setup … --detach`.
             return setup_command(&cli.node, &data_dir, tool, detach || cli.daemon.detach).await;
         }
@@ -9690,7 +9806,11 @@ async fn async_main(mut cli: Cli) -> Result<()> {
         Some(Command::Status { line: true, .. }) => {
             return status_line(&config);
         }
-        Some(Command::Me { json }) => return me_command(&config, json),
+        Some(Command::Me {
+            action: Some(MeAction::Autoshare { state }),
+            ..
+        }) => return autoshare_command(&config.data_dir, state.as_deref()),
+        Some(Command::Me { json, .. }) => return me_command(&config, json),
         Some(Command::Outbox { action, json }) => {
             return outbox_command(config, action, json).await;
         }

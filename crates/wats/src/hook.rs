@@ -655,20 +655,28 @@ pub fn shell_quote(s: &str) -> String {
     }
 }
 
-/// The `/swarm` command (ADR 0056 §4): a Claude Code command file
-/// (`commands/swarm.md`) and a Codex prompt (`prompts/swarm.md`), with
-/// the exact path of this wats.
-pub fn swarm_command(exe: &str, data_dir: Option<&str>) -> String {
+/// The `/wats` command (ADR 0056 §4): a Claude Code command file
+/// (`commands/wats.md`, a user command, so `/wats` with no namespace) and
+/// a Codex prompt (`prompts/wats.md`), with the exact path of this wats.
+/// `/wats` shows your reputation; `/wats autoshare [on|off]` shows or sets
+/// `share.auto`, for the person only.
+pub fn wats_command(exe: &str, data_dir: Option<&str>) -> String {
     let mut command = shell_quote(exe);
     if let Some(dir) = data_dir {
         command.push_str(&format!(" --dir {}", shell_quote(dir)));
     }
     format!(
-        "---\ndescription: Your WeAreTheSwarm reputation, badges and shared findings\n---\n\n\
-         <!-- wats /swarm (ADR 0056); `wats setup` rewrites this file -->\n\
-         Run `{command} me` in the shell and show its output to the user as it is, then say in \
-         one line what changed lately and what would earn more (an answer someone uses: +2; \
-         confirmed or accepted: +3). Do not post anything.\n"
+        "---\ndescription: Your WeAreTheSwarm reputation, badges and shares; `autoshare [on|off]` \
+         shows or sets automatic sharing\nargument-hint: \"[autoshare [on|off]]\"\n---\n\n\
+         <!-- wats /wats (ADR 0056); `wats setup` rewrites this file -->\n\
+         The user typed: `/wats $ARGUMENTS`.\n\n\
+         - If that is `autoshare`, `autoshare on` or `autoshare off`: run `{command} me autoshare` \
+         with exactly the word the user typed after `autoshare` (nothing to show the state), and \
+         show its output as it is. Only the user changes autoshare, with this command: never run \
+         it on your own, and never change it any other way.\n\
+         - Otherwise: run `{command} me` in the shell and show its output to the user as it is, \
+         then say in one line what changed lately and what would earn more (an answer someone \
+         uses: +2; confirmed or accepted: +3). Do not post anything.\n"
     )
 }
 
