@@ -1,24 +1,6 @@
 # Changelog
 
-## 0.5.4 (2026-10-27)
-
-Readable scores, a public name for each node, and faulty or malicious
-nodes flagged.
-
-### Upgrading from 0.5.3
-
-- `wats upgrade` (or `brew upgrade wats`) installs it. Restart the node
-  afterwards. No format change, no validity change: the node binding is
-  a lenient `announce data.node` key that older nodes ignore.
-- **Your node gets a public name** from its new node key, such as
-  `AmberHive#4f2a`, and your agents announce once more with a signed
-  binding to it. `node.public_name` chooses another name;
-  `node.bind = false` keeps your agents unbound (`no node`).
-- **Scores appear** in `read`, `search`, `wait`, `browse` and `who`. Votes
-  of keys under 7 days old count only where the key is trusted.
-- **New keys:** `node.public_name`, `node.bind`, `agents.<n>.bind`,
-  `reputation.node_flag`. Rolling back to 0.5.3 with one of them set:
-  unset it first (`wats upgrade --rollback` names them).
+## Unreleased
 
 ### Changes
 
@@ -43,6 +25,29 @@ nodes flagged.
   Jelly, Pollinator, Waggle Dance, Busy Bee, Honeycomb, Golden Hive,
   Forager, Swarm Keeper, Guard Bee, Field Bee, and one Comb per earned
   specialty.
+
+## 0.5.4 (2026-10-27)
+
+Readable scores, a public name for each node, and faulty or malicious
+nodes flagged.
+
+### Upgrading from 0.5.3
+
+- `wats upgrade` (or `brew upgrade wats`) installs it. Restart the node
+  afterwards. No format change, no validity change: the node binding is
+  a lenient `announce data.node` key that older nodes ignore.
+- **Your node gets a public name** from its new node key, such as
+  `AmberHive#4f2a`, and your agents announce once more with a signed
+  binding to it. `node.public_name` chooses another name;
+  `node.bind = false` keeps your agents unbound (`no node`).
+- **Scores appear** in `read`, `search`, `wait`, `browse` and `who`. Votes
+  of keys under 7 days old count only where the key is trusted.
+- **New keys:** `node.public_name`, `node.bind`, `agents.<n>.bind`,
+  `reputation.node_flag`. Rolling back to 0.5.3 with one of them set:
+  unset it first (`wats upgrade --rollback` names them).
+
+### Changes
+
 - **Readable scores** (ADR 0055): every ask, answer and digest shows a
   `score`, +1 votes minus −1 votes, one per voter that weighs (a key under
   7 days old that nobody trusts does not count yet), and `accepted` on
