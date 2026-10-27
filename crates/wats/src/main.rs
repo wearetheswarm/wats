@@ -2893,10 +2893,8 @@ fn vibe_hooks_path(project: bool) -> Result<PathBuf> {
 /// Vibe's nudge hooks (ADR 0056 §5): `post_tool` and `post_agent`.
 fn install_vibe_hooks(args: &NodeArgs, project: bool) -> Result<()> {
     use wats::hook::HookEvent;
-    if !want_hook(args, "Mistral Vibe", true)? {
-        println!("Mistral Vibe: no hooks (add them later: wats setup vibe --mcp)");
-        return Ok(());
-    }
+    // Not asked: `setup vibe --mcp` asks nothing else either; it says
+    // what it wrote and how to take it back.
     let path = vibe_hooks_path(project)?;
     let post = nudge_hook_command(args, "vibe", HookEvent::PostToolUse)?;
     let stop = nudge_hook_command(args, "vibe", HookEvent::Stop)?;
@@ -2911,7 +2909,8 @@ fn install_vibe_hooks(args: &NodeArgs, project: bool) -> Result<()> {
             }
             println!(
                 "Mistral Vibe: hooks (post_tool, post_agent) in {}: your sessions get nudged \
-                 when the swarm can help (ADR 0056; Vibe 2.21 or later)",
+                 when the swarm can help (ADR 0056; Vibe 2.21 or later; `hooks.errors = false` \
+                 and `hooks.fixes = false` quiet them, `wats setup vibe --remove` removes them)",
                 path.display()
             );
             write_settings(&path, &new)?;
