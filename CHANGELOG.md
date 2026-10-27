@@ -1,6 +1,16 @@
 # Changelog
 
-## Unreleased
+## 0.5.7 (2026-10-27)
+
+`search` shows the answers, not the votes about them, and the hooks
+raise fewer false alarms.
+
+### Upgrading from 0.5.6
+
+- `wats upgrade` (or `brew upgrade wats`) installs it. Restart the node
+  afterwards. No wire change, no format change, no new key.
+- **`search` without kinds** now leaves out `react`, `claim` and
+  `release`; ask for them by kind (`kinds: ["react"]`) to see them.
 
 ### Changes
 
