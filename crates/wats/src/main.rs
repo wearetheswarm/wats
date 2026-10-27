@@ -2852,7 +2852,12 @@ fn install_wats_command(args: &NodeArgs, name: &str, path: &std::path::Path) -> 
     }
     std::fs::write(path, text)?;
     println!(
-        "{name}: /wats (your reputation, badges and shares; `/wats autoshare`) in {}",
+        "{name}: {} (your reputation; status, outbox, autoshare, search, ask, answers, help) in {}",
+        if name == "Codex" {
+            "/prompts:wats"
+        } else {
+            "/wats"
+        },
         path.display()
     );
     Ok(())
