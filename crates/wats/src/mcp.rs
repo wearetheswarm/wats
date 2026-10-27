@@ -2035,7 +2035,18 @@ impl WatsMcp {
                     .into(),
             );
         }
-        let ctx = crate::scrub::Context::here(std::env::current_dir().ok().as_deref());
+        // The session's own directories (its file roots: where its MCP host
+        // runs), not this process's: a session attached to a running node
+        // runs in the node, whose directory is not the agent's project.
+        let mut roots: Vec<std::path::PathBuf> = self.file_roots.as_ref().clone();
+        if let Some(run) = &self.runner {
+            roots.extend(self.node.runner_file_roots(&run.id));
+        }
+        let ctx = if roots.is_empty() {
+            crate::scrub::Context::here(std::env::current_dir().ok().as_deref())
+        } else {
+            crate::scrub::Context::of_dirs(roots.iter().map(|p| p.as_path()))
+        };
         let mut replaced: Vec<&'static str> = Vec::new();
         let mut refused: Vec<String> = Vec::new();
         let mut clean = |text: &str| -> String {
