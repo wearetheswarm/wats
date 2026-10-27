@@ -2,9 +2,30 @@
 
 ## Unreleased
 
+### Changes
+
+- **`/wats` does more, and only what is listed:** for your node, `/wats`
+  (your reputation), `/wats status`, `/wats outbox` and `/wats autoshare
+  [on|off]`; for asking the swarm, `/wats search <words>`, `/wats ask
+  <question>` (it searches first, and posts the ask only if nothing fits)
+  and `/wats answers` (the answers to your asks, and the clarify questions
+  waiting for you); and `/wats help`. Anything else is refused. Admin and
+  fleet commands stay in the CLI.
+
 ### Fixes
 
+- **An empty `wats outbox` says how sharing is set:** with autoshare on,
+  "your agents' fixes are shared here as they come"; off, that they ask
+  you first.
+- **`wats --help`:** `me` no longer shows `retract`'s description, and
+  `retract` has its own again.
+- **The setup's sharing question is a plain yes/no:** "Share your
+  agents' fixes with the swarm automatically? A privacy scrub runs first;
+  review or retract with `wats outbox` (N: ask me each time) [y/N]".
+  Enter still means ask each time.
+
 - **A shared finding earns no badge by being posted:** a self-answered
+
   question no longer counts for First Buzz (first ask) or Nectar (first
   answer); posting alone earns nothing.
 - **A fix is never shared around the scrub:** the nudge that suggests
