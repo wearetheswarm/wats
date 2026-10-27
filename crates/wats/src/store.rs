@@ -2653,6 +2653,53 @@ impl Store {
         Ok(conn.query_row(&sql, params_from_iter(args), |r| r.get(0))?)
     }
 
+    /// What others said of `authors`' posts, received since `since`
+    /// (unix seconds, by `received_at`): each reacting key's latest
+    /// `react` on each post, sorted as [`Received::add`] says. Reacts by
+    /// `authors` themselves do not count.
+    pub fn signals_received(&self, authors: &[String], since: u64) -> Result<Received> {
+        let mut received = Received::default();
+        if authors.is_empty() {
+            return Ok(received);
+        }
+        let marks = vec!["?"; authors.len()].join(", ");
+        let sql = format!(
+            "SELECT r.author, r.parent, r.ts, r.json FROM events p
+                 JOIN events r ON r.parent = p.id
+             WHERE p.author IN ({marks}) AND p.kind IN ('ask', 'answer', 'x.wearetheswarm.digest')
+                 AND r.kind = 'react' AND r.opaque = 0 AND r.received_at >= ?{}
+                 AND r.author NOT IN ({marks})",
+            authors.len() + 1
+        );
+        let mut args: Vec<SqlValue> = authors.iter().map(|a| SqlValue::from(a.clone())).collect();
+        args.push((since.min(i64::MAX as u64) as i64).into());
+        args.extend(authors.iter().map(|a| SqlValue::from(a.clone())));
+        let rows: Vec<(String, String, i64, String)> = {
+            let conn = self.conn();
+            let mut stmt = conn.prepare(&sql)?;
+            stmt.query_map(params_from_iter(args), |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+            })?
+            .collect::<std::result::Result<_, _>>()?
+        };
+        // The latest react of each key on each post.
+        let mut latest: HashMap<(String, String), (i64, String)> = HashMap::new();
+        for (author, parent, ts, json) in rows {
+            let entry = latest
+                .entry((author, parent))
+                .or_insert((ts, String::new()));
+            if ts >= entry.0 {
+                *entry = (ts, json);
+            }
+        }
+        for (_, json) in latest.into_values() {
+            if let Ok(event) = serde_json::from_str::<serde_json::Value>(&json) {
+                received.add(&event);
+            }
+        }
+        Ok(received)
+    }
+
     /// When this node stored the event `id` (unix seconds).
     pub fn received_at(&self, id: &str) -> Result<Option<u64>> {
         let at: Option<i64> = self
@@ -3264,6 +3311,70 @@ impl Store {
             .conn()
             .query_row("SELECT count(*) FROM events", [], |r| r.get(0))?;
         Ok(n as u64)
+    }
+}
+
+/// What others said of a node's posts ([`Store::signals_received`]), for
+/// people: each react counted once, as the first that fits of accepted,
+/// used, confirmed (+1 with evidence), useful (+1), challenged (−1 with a
+/// reason) and −1.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct Received {
+    pub useful: u64,
+    pub used: u64,
+    pub accepted: u64,
+    pub confirmed: u64,
+    pub challenged: u64,
+    pub down: u64,
+}
+
+impl Received {
+    /// Count one `react` (its JSON).
+    pub fn add(&mut self, react: &serde_json::Value) {
+        let data = &react["data"];
+        let value = data["value"].as_i64();
+        // As the ranking reads it (ADR 0045 §2): evidence, or a comment
+        // of some length.
+        let reasoned = data.get("evidence").is_some_and(|e| !e.is_null())
+            || react["title"]
+                .as_str()
+                .is_some_and(|t| t.trim().chars().count() >= crate::signals::REASON_CHARS);
+        if data["accept"].as_bool() == Some(true) {
+            self.accepted += 1;
+        } else if data["used"].as_bool() == Some(true) {
+            self.used += 1;
+        } else if value == Some(1) && data.get("evidence").is_some_and(|e| !e.is_null()) {
+            self.confirmed += 1;
+        } else if value == Some(1) {
+            self.useful += 1;
+        } else if value == Some(-1) && reasoned {
+            self.challenged += 1;
+        } else if value == Some(-1) {
+            self.down += 1;
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        *self == Received::default()
+    }
+
+    /// "3 useful (+1), 2 used, 1 confirmed, 1 challenged (−1 with a
+    /// reason)": the counts that are not 0.
+    pub fn phrase(&self) -> String {
+        [
+            (self.useful, "useful (+1)"),
+            (self.used, "used"),
+            (self.accepted, "accepted"),
+            (self.confirmed, "confirmed"),
+            (self.challenged, "challenged (−1 with a reason)"),
+            (self.down, "−1"),
+        ]
+        .into_iter()
+        .filter(|(n, _)| *n > 0)
+        .map(|(n, what)| format!("{n} {what}"))
+        .collect::<Vec<_>>()
+        .join(", ")
     }
 }
 
@@ -4999,6 +5110,84 @@ mod tests {
         let thread = store.thread(&root.id, 100).unwrap();
         assert_eq!(thread.len(), 2);
         assert_eq!(thread[0].event.id, root.id);
+    }
+
+    fn react(parent: &Event, key: u8, ts: u64, title: &str, data: serde_json::Value) -> Event {
+        Draft {
+            net: parent.net.clone(),
+            thread: Some(parent.thread_root().to_string()),
+            parent: Some(parent.id.clone()),
+            kind: Some(Kind::React),
+            title: (!title.is_empty()).then(|| title.to_string()),
+            text: "react".into(),
+            data: data.as_object().cloned().unwrap_or_default(),
+            ..Draft::default()
+        }
+        .sign(&SigningKey::from_bytes(&[key; 32]), ts, 0)
+        .unwrap()
+    }
+
+    /// 0.5.3: what others said of a node's posts, each key's latest react
+    /// once, its own reacts left out, by when they arrived.
+    #[test]
+    fn signals_received_count_each_keys_latest_react() {
+        let store = Store::open_in_memory().unwrap();
+        let ask = post(9, 10, Kind::Ask, &[], "How to vacuum?");
+        let mine = reply(&ask, 1, 11, "Run VACUUM.");
+        let me = mine.author.clone();
+        store.insert(&ask, 10).unwrap();
+        store.insert(&mine, 11).unwrap();
+        // Key 2 votes +1, then marks it used: counts once, as used.
+        store
+            .insert(&react(&mine, 2, 20, "", json!({"value": 1})), 20)
+            .unwrap();
+        store
+            .insert(&react(&mine, 2, 21, "", json!({"used": true})), 21)
+            .unwrap();
+        store
+            .insert(&react(&mine, 3, 22, "", json!({"value": 1})), 22)
+            .unwrap();
+        store
+            .insert(
+                &react(&mine, 4, 23, "fails on postgres 16", json!({"value": -1})),
+                23,
+            )
+            .unwrap();
+        store
+            .insert(&react(&mine, 5, 24, "", json!({"value": -1})), 24)
+            .unwrap();
+        store
+            .insert(&react(&mine, 9, 25, "", json!({"accept": true})), 500)
+            .unwrap();
+        // Our own react does not count.
+        store
+            .insert(&react(&mine, 1, 26, "", json!({"value": 1})), 26)
+            .unwrap();
+        let all = store
+            .signals_received(std::slice::from_ref(&me), 0)
+            .unwrap();
+        assert_eq!(
+            all,
+            Received {
+                useful: 1,
+                used: 1,
+                accepted: 1,
+                confirmed: 0,
+                challenged: 1,
+                down: 1,
+            }
+        );
+        let late = store
+            .signals_received(std::slice::from_ref(&me), 100)
+            .unwrap();
+        assert_eq!(
+            late,
+            Received {
+                accepted: 1,
+                ..Received::default()
+            }
+        );
+        assert!(store.signals_received(&[], 0).unwrap().is_empty());
     }
 
     #[test]

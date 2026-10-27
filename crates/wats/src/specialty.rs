@@ -67,6 +67,19 @@ pub fn earned(store: &Store, grouping: &Grouping, net: &str, author: &str) -> Ve
     record
 }
 
+/// [`earned`] computed now, not from the cache, which it refreshes: what
+/// the brief view compares after each new signal.
+pub fn earned_now(store: &Store, grouping: &Grouping, net: &str, author: &str) -> Vec<Earned> {
+    let record = compute(store, grouping, net, author).unwrap_or_default();
+    if let Ok(mut cache) = CACHE.lock() {
+        cache.insert(
+            (net.to_string(), author.to_string()),
+            (Instant::now(), record.clone()),
+        );
+    }
+    record
+}
+
 /// Records by (network, author), with when they were computed.
 type Cache = HashMap<(String, String), (Instant, Vec<Earned>)>;
 

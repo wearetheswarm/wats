@@ -4281,3 +4281,84 @@ async fn brief_lines_tell_the_story() -> anyhow::Result<()> {
     }
     Ok(())
 }
+
+/// 0.5.3: when the asker accepts an answer of this node's agent, the brief
+/// says the answer is now confirmed and that the agent earned the ask's
+/// field, once each.
+#[tokio::test(flavor = "multi_thread")]
+async fn brief_says_a_status_change_and_an_earned_field() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let a = node(&dir.path().join("a"), &[]).await?;
+    let b = node(&dir.path().join("b"), &[&a]).await?;
+    b.wait_for_neighbor(PUBLIC_NET, Duration::from_secs(10))
+        .await?;
+    let wait = |id: String| {
+        let a = Arc::clone(&a);
+        async move {
+            eventually("replicated", || a.store().get(&id).unwrap().is_some()).await;
+        }
+    };
+    let mut asked = ask("Latest stable Rust?");
+    asked.tags = vec!["lang:rust".into()];
+    let ask = b.publish(asked, &[]).await?;
+    wait(ask.id.clone()).await;
+    let agent = a.author_key("agent")?;
+    let answer = a
+        .publish_as(
+            &agent,
+            Draft {
+                net: PUBLIC_NET.into(),
+                kind: Some(Kind::Answer),
+                thread: Some(ask.id.clone()),
+                parent: Some(ask.id.clone()),
+                text: "Rust 1.99.1".into(),
+                ..Draft::default()
+            },
+            &[],
+        )
+        .await?;
+    eventually("the answer reaches b", || {
+        b.store().get(&answer.id).unwrap().is_some()
+    })
+    .await;
+    let accept = b
+        .publish(
+            Draft {
+                net: PUBLIC_NET.into(),
+                kind: Some(Kind::React),
+                thread: Some(ask.id.clone()),
+                parent: Some(answer.id.clone()),
+                text: "accepted".into(),
+                data: serde_json::json!({"value": 1, "accept": true})
+                    .as_object()
+                    .cloned()
+                    .unwrap(),
+                ..Draft::default()
+            },
+            &[],
+        )
+        .await?;
+    wait(accept.id.clone()).await;
+    let state_dir = tempfile::tempdir()?;
+    let mut state = wats::brief::State::load(state_dir.path(), 0);
+    let now = wats::node::now_secs();
+    let lines = wats::brief::follow_lines(&a, &accept, &mut state, now).unwrap();
+    assert_eq!(
+        lines,
+        [
+            "your answer \"Rust 1.99.1\" is now confirmed: accepted by its asker".to_string(),
+            "agent earned lang:rust".to_string(),
+        ]
+    );
+    // Said once.
+    assert_eq!(
+        wats::brief::follow_lines(&a, &accept, &mut state, now).unwrap(),
+        Vec::<String>::new()
+    );
+    // Not about this node's posts: nothing to follow.
+    assert!(wats::brief::follow_lines(&a, &ask, &mut state, now).is_none());
+    for n in [b, a] {
+        n.shutdown().await?;
+    }
+    Ok(())
+}
