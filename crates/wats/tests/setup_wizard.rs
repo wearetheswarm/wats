@@ -435,8 +435,9 @@ fn wizard_defaults_run_the_node_in_the_background() {
 fn step_three_detailed_runs_the_node_here_or_not_now() {
     let machine = Machine::new();
     machine.fake_vibe();
-    // No agent (0), quick (Enter), all (Enter), choose (d), here (2).
-    let child = machine.spawn(machine.wats(&[], true), "0\n\n\nd\n2\n");
+    // No agent (0), quick (Enter), all (Enter), sharing: ask each time
+    // (Enter), choose (d), here (2).
+    let child = machine.spawn(machine.wats(&[], true), "0\n\n\n\nd\n2\n");
     let (out, node) = machine.foreground(child);
     let said = text(&out.stdout);
     assert!(
@@ -451,7 +452,7 @@ fn step_three_detailed_runs_the_node_here_or_not_now() {
 
     let later = Machine::new();
     let out = later
-        .spawn(later.wats(&[], true), "\nd\n3\n")
+        .spawn(later.wats(&[], true), "\n\nd\n3\n")
         .wait_with_output()
         .unwrap();
     let said = text(&out.stdout);
@@ -475,9 +476,10 @@ fn quick_and_detailed_with_an_agent() {
         machine.fake_cli(name);
     }
     // Claude (Enter), quick (Enter), a subscription (1), the line
-    // edited; all (Enter); no other agent (Enter); not now (d, 3).
+    // edited; all (Enter); no other agent (Enter); sharing: ask each time
+    // (Enter); not now (d, 3).
     let out = machine
-        .spawn(machine.wats(&[], true), "\n\n1\nmin=90 usd=1\n\n\nd\n3\n")
+        .spawn(machine.wats(&[], true), "\n\n1\nmin=90 usd=1\n\n\n\nd\n3\n")
         .wait_with_output()
         .unwrap();
     let said = text(&out.stdout);
@@ -524,7 +526,7 @@ fn quick_and_detailed_with_an_agent() {
     assert!(calls.contains("codex mcp add wats -- "), "{calls}");
     let hooks = std::fs::read_to_string(machine.path("home/.claude/settings.json")).unwrap();
     assert!(hooks.contains("notify --hook"), "{hooks}");
-    assert!(machine.running().is_none());
+    assert!(machine.running().is_none(), "{said}");
     let config = std::fs::read_to_string(machine.data().join("config.toml")).unwrap();
     let set: Vec<&str> = config
         .lines()
@@ -539,7 +541,9 @@ fn quick_and_detailed_with_an_agent() {
             "tools = [\"Read\", \"Glob\", \"Grep\", \"Edit\", \"Write\", \"WebSearch\", \"WebFetch\"]",
             "caps = [\"web-search\", \"web-fetch\", \"web\"]",
             "security_auto = true",
-            "security_delay = \"1d\""
+            "security_delay = \"1d\"",
+            // Sharing: ask each time (ADR 0056 §2, Enter).
+            "auto = false"
         ],
         "{config}"
     );
@@ -657,7 +661,7 @@ fn setup_offers_to_restart_a_running_node() {
     // No agent CLI: quick (Enter, which sets update.security_auto: a
     // change), then n: not restarted.
     let out = machine
-        .spawn(machine.wats(&["setup"], true), "\nn\n")
+        .spawn(machine.wats(&["setup"], true), "\n\nn\n")
         .wait_with_output()
         .unwrap();
     let said = text(&out.stdout);

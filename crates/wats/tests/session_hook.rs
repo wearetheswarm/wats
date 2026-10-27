@@ -464,8 +464,11 @@ fn setup_claude_adds_the_hook_once_and_removes_it() {
         said.contains("hooks (UserPromptSubmit, SessionStart"),
         "{said}"
     );
-    // The /swarm command (ADR 0056 §4).
-    let swarm = settings_dir.join("commands").join("swarm.md");
+    // The /wats command (ADR 0056 §4), with autoshare for the user only.
+    let swarm = settings_dir.join("commands").join("wats.md");
+    let command = std::fs::read_to_string(&swarm).unwrap();
+    assert!(command.contains(" me` in the shell"), "{command}");
+    assert!(command.contains("me autoshare") && command.contains("never run it on your own"));
     assert!(
         std::fs::read_to_string(&swarm)
             .unwrap()
@@ -538,7 +541,7 @@ fn setup_claude_adds_the_hook_once_and_removes_it() {
     );
     assert!(said.contains("session hook removed"), "{said}");
     assert!(!said.contains("MCP server"), "{said}");
-    assert!(!swarm.exists(), "/swarm goes with the hooks");
+    assert!(!swarm.exists(), "/wats goes with the hooks");
     assert!(!log.exists(), "the claude CLI ran");
     let removed: Value =
         serde_json::from_str(&std::fs::read_to_string(&settings).unwrap()).unwrap();
@@ -857,4 +860,105 @@ async fn nudges_follow_the_session() {
     );
     assert_eq!(counters.get("nudge_fix"), Some(&1));
     drop(client);
+}
+
+/// Copilot CLI's real payloads (captured on a real install, paths
+/// neutralized): snake case with PascalCase event names, `result_type`
+/// "success" even after exit 1, the exit code only in the text, the edit
+/// a raw patch string. Two failures, the edit and the pass make a fix.
+#[tokio::test(flavor = "multi_thread")]
+async fn copilot_real_payloads_give_both_nudges() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    let dir = tmp.path().join("node");
+    let client = session(&dir, &home, "alice", None).await;
+    call(&client, "status", json!({})).await;
+    let fixture = include_str!("fixtures/hooks/copilot-session.jsonl");
+    let mut said = Vec::new();
+    for line in fixture.lines() {
+        let payload: Value = serde_json::from_str(line).unwrap();
+        let event = match payload["hook_event_name"].as_str() {
+            Some("Stop") => "stop",
+            _ => "post-tool",
+        };
+        said.push(nudge(&dir, &home, "copilot", event, &payload));
+    }
+    // Copilot's own output shape: `additionalContext` at the top.
+    let first: Value = serde_json::from_str(said[0].trim()).unwrap();
+    assert!(
+        first["additionalContext"]
+            .as_str()
+            .unwrap()
+            .contains("unknown to the swarm"),
+        "{said:?}"
+    );
+    let stop: Value = serde_json::from_str(said.last().unwrap().trim()).unwrap();
+    assert_eq!(stop["decision"], "block", "{said:?}");
+    assert!(stop["reason"].as_str().unwrap().contains("found a fix"));
+    drop(client);
+}
+
+/// Mistral Vibe 3.0.1's real payloads (captured on a real install, paths
+/// neutralized): namespaced tool names (`file_system.bash`), the exit code
+/// in `tool_output.returncode` with `tool_status` "success", commands
+/// behind `cd <dir> && `, and a `post_agent` with no turn data.
+#[tokio::test(flavor = "multi_thread")]
+async fn vibe_real_payloads_give_both_nudges() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    let dir = tmp.path().join("node");
+    let client = session(&dir, &home, "alice", None).await;
+    call(&client, "status", json!({})).await;
+    let fixture = include_str!("fixtures/hooks/vibe-session.jsonl");
+    let mut said = Vec::new();
+    for line in fixture.lines() {
+        let payload: Value = serde_json::from_str(line).unwrap();
+        let event = match payload["hook_event_name"].as_str() {
+            Some("post_agent") => "stop",
+            _ => "post-tool",
+        };
+        said.push(nudge(&dir, &home, "vibe", event, &payload));
+    }
+    let first: Value = serde_json::from_str(said[0].trim()).unwrap();
+    assert!(
+        first["hook_specific_output"]["additional_context"]
+            .as_str()
+            .unwrap()
+            .contains("unknown to the swarm"),
+        "{said:?}"
+    );
+    let stop: Value = serde_json::from_str(said.last().unwrap().trim()).unwrap();
+    assert_eq!(stop["decision"], "deny", "{said:?}");
+    assert!(stop["reason"].as_str().unwrap().contains("found a fix"));
+    drop(client);
+}
+
+/// ADR 0056 §2 (amended): `wats me autoshare [on|off]` shows and sets
+/// share.auto for the person; turning it off silences the tip for a week.
+#[test]
+fn autoshare_is_the_persons_switch() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().join("node");
+    let run = |args: &[&str]| {
+        let out = std::process::Command::new(env!("CARGO_BIN_EXE_wats"))
+            .env("WATS_HERMETIC", "1")
+            .env("HOME", tmp.path())
+            .arg("--dir")
+            .arg(&dir)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{out:?}");
+        String::from_utf8(out.stdout).unwrap()
+    };
+    assert!(run(&["me", "autoshare"]).starts_with("autoshare off"));
+    assert!(run(&["me", "autoshare", "on"]).starts_with("autoshare on"));
+    let config = std::fs::read_to_string(dir.join("config.toml")).unwrap();
+    assert!(config.contains("[share]\nauto = true"), "{config}");
+    assert!(run(&["me", "autoshare"]).starts_with("autoshare on"));
+    assert!(run(&["me", "autoshare", "off"]).starts_with("autoshare off"));
+    let state = std::fs::read_to_string(dir.join("hooks").join("autoshare.json")).unwrap();
+    assert!(state.contains("\"off_at\""), "{state}");
 }

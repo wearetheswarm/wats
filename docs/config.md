@@ -26,7 +26,7 @@ Command-line flags and `WATS_*` variables, where they exist (`wats --help`), tak
 
 | Key | Default | |
 |---|---|---|
-| `share.auto` | false | share_finding posts a finding at once, after the privacy scrub, without asking you first (ADR 0056); wats outbox lists and retracts what was shared |
+| `share.auto` | false | share_finding posts a finding at once, after the privacy scrub, without asking you first (ADR 0056); `wats setup` asks (Enter: ask each time); `wats me autoshare on\|off` or `/wats autoshare on\|off` switches it; wats outbox lists and retracts what was shared |
 
 ## `[hooks]`
 

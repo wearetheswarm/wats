@@ -163,6 +163,70 @@ pub fn count(data_dir: &Path, names: &[&str]) {
     }
 }
 
+/// When the autoshare tip was last given and when the person turned
+/// autoshare off (ADR 0056 §2), in `<data dir>/hooks/autoshare.json`.
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct Autoshare {
+    #[serde(default)]
+    tip_at: u64,
+    #[serde(default)]
+    off_at: u64,
+}
+
+fn autoshare_path(data_dir: &Path) -> PathBuf {
+    data_dir.join("hooks").join("autoshare.json")
+}
+
+fn load_autoshare(data_dir: &Path) -> Autoshare {
+    std::fs::read(autoshare_path(data_dir))
+        .ok()
+        .and_then(|b| serde_json::from_slice(&b).ok())
+        .unwrap_or_default()
+}
+
+fn save_autoshare(data_dir: &Path, state: &Autoshare) {
+    let _ = std::fs::create_dir_all(data_dir.join("hooks"));
+    if let Ok(bytes) = serde_json::to_vec(state) {
+        let _ = std::fs::write(autoshare_path(data_dir), bytes);
+    }
+}
+
+/// Record that the person turned autoshare off: no tip for a week.
+pub fn autoshare_turned_off(data_dir: &Path, now: u64) {
+    let mut state = load_autoshare(data_dir);
+    state.off_at = now;
+    save_autoshare(data_dir, &state);
+}
+
+/// The autoshare tip is given at most this often.
+const TIP_EVERY: u64 = 24 * 3600;
+/// No tip this long after the person turned autoshare off.
+const TIP_QUIET_AFTER_OFF: u64 = 7 * 24 * 3600;
+
+/// The tip to pass on with a "share it?" question, when it is due: at
+/// most once a day per node, never within a week of turning autoshare
+/// off. Recorded and counted (`hint_autoshare`) when given.
+fn autoshare_tip(data_dir: &Path, host: Host, now: u64) -> Option<String> {
+    let mut state = load_autoshare(data_dir);
+    if now.saturating_sub(state.tip_at) < TIP_EVERY
+        || (state.off_at > 0 && now.saturating_sub(state.off_at) < TIP_QUIET_AFTER_OFF)
+    {
+        return None;
+    }
+    state.tip_at = now;
+    save_autoshare(data_dir, &state);
+    count(data_dir, &["hint_autoshare"]);
+    let command = match host {
+        Host::Claude | Host::Codex => "`/wats autoshare on`",
+        _ => "`wats me autoshare on`",
+    };
+    Some(format!(
+        " With your question, pass this tip on to your user word for word: \"Tip: {command} \
+         shares fixes automatically (privacy scrub; review or retract with `wats outbox`).\" \
+         Never turn it on yourself."
+    ))
+}
+
 /// The hooks' counters so far.
 pub fn counters(data_dir: &Path) -> std::collections::BTreeMap<String, u64> {
     std::fs::read(data_dir.join("hooks").join("counters.json"))
@@ -227,7 +291,11 @@ fn cut(text: &str) -> String {
 /// (`PostToolUseFailure` after a failed call, `PostToolUse` otherwise).
 pub fn render(host: Host, event: Event, event_name: Option<&str>, text: &str) -> String {
     match (host, event) {
-        (Host::Claude | Host::Codex | Host::Copilot, Event::PostTool) => {
+        // Copilot CLI wants `additionalContext` at the top level ("appended
+        // to textResultForLlm so the model sees it after the tool output");
+        // it drops `hookSpecificOutput` (seen on a real install).
+        (Host::Copilot, Event::PostTool) => json!({"additionalContext": text}).to_string(),
+        (Host::Claude | Host::Codex, Event::PostTool) => {
             let name = event_name
                 .filter(|n| matches!(*n, "PostToolUse" | "PostToolUseFailure"))
                 .unwrap_or("PostToolUse");
@@ -400,12 +468,34 @@ const EDIT_TOOLS: &[&str] = &[
     "patch",
 ];
 
+/// A tool's own name, without a host's namespace (Vibe's
+/// `file_system.bash` is `bash`).
+fn bare(tool: &str) -> String {
+    tool.rsplit(['.', '/'])
+        .next()
+        .unwrap_or(tool)
+        .to_lowercase()
+}
+
 fn is_shell(tool: &str) -> bool {
-    SHELL_TOOLS.contains(&tool.to_lowercase().as_str())
+    SHELL_TOOLS.contains(&bare(tool).as_str())
 }
 
 fn is_edit(tool: &str) -> bool {
-    EDIT_TOOLS.contains(&tool.to_lowercase().as_str())
+    EDIT_TOOLS.contains(&bare(tool).as_str())
+}
+
+/// The command without the `cd <dir> && ` that some hosts put first
+/// (Vibe), so that the same command matches across calls.
+fn without_cd(command: &str) -> &str {
+    let mut rest = command.trim();
+    while let Some(after) = rest.strip_prefix("cd ") {
+        match after.split_once("&&") {
+            Some((_, tail)) => rest = tail.trim(),
+            None => break,
+        }
+    }
+    rest
 }
 
 /// A wats MCP tool's short name (`mcp__wats__read`, `wats_read`,
@@ -436,7 +526,9 @@ pub fn shell(payload: &Value) -> Option<Shell> {
     let mut exit: Option<i64> = None;
     let mut output = String::new();
     // Vibe: tool_output {exit_code, stdout, stderr}.
-    for key in ["tool_output", "tool_response", "toolResult"] {
+    // Copilot sends `tool_result` (snake case, with PascalCase event names
+    // in its hook file) or `toolResult`.
+    for key in ["tool_output", "tool_response", "tool_result", "toolResult"] {
         let v = &payload[key];
         match v {
             Value::Object(_) => {
@@ -452,7 +544,13 @@ pub fn shell(payload: &Value) -> Option<Shell> {
                             .as_f64()
                             .map(|f| f as i64)
                     });
-                for field in ["stdout", "stderr", "output", "textResultForLlm"] {
+                for field in [
+                    "stdout",
+                    "stderr",
+                    "output",
+                    "textResultForLlm",
+                    "text_result_for_llm",
+                ] {
                     if let Some(s) = v[field].as_str() {
                         output.push_str(s);
                         output.push('\n');
@@ -505,7 +603,7 @@ pub fn shell(payload: &Value) -> Option<Shell> {
         exit = exit.or(Some(1));
     }
     Some(Shell {
-        command,
+        command: without_cd(&command).to_string(),
         exit,
         output,
     })
@@ -1047,11 +1145,13 @@ fn stop(request: &Request, session: &mut Session) -> Option<String> {
                  this node shares at once (share.auto)."
             )
         } else {
+            let tip =
+                autoshare_tip(&request.data_dir, request.host, request.now).unwrap_or_default();
             format!(
                 "wats: you found a fix for \"{sig}\" after several tries. If it is general (not \
                  specific to this project), ask your user whether to share it with the swarm, \
                  and if they agree, call the wats `share_finding` tool with approved_by_user \
-                 true. It earns +2 when someone uses it, +3 if confirmed."
+                 true. It earns +2 when someone uses it, +3 if confirmed.{tip}"
             )
         });
     }
@@ -1107,6 +1207,14 @@ mod tests {
             "toolResult": {"resultType": "success",
                 "textResultForLlm": "ok\n<shellId: 3 completed with exit code 0>"}});
         assert_eq!(shell(&done).unwrap().exit, Some(0));
+        // Vibe 3: a namespaced tool, and the command behind a `cd`.
+        let vibe3 = json!({"tool_name": "file_system.bash",
+            "tool_input": {"timeout": 30, "command": "cd /tmp/p && python3 check.py"},
+            "tool_status": "success",
+            "tool_output": {"returncode": 1, "stderr": "ModuleNotFoundError: x", "stdout": ""}});
+        let s = shell(&vibe3).unwrap();
+        assert_eq!((s.command.as_str(), s.exit), ("python3 check.py", Some(1)));
+        assert!(is_edit("file_system.search_replace"));
         // OpenClaw, through its plugin: `exec`, a result with content and
         // details.
         let openclaw = json!({"session_id": "o1", "tool_name": "exec",
@@ -1301,6 +1409,36 @@ mod tests {
         assert_eq!(relied_in(&no_check), None);
     }
 
+    /// The autoshare tip: once a day, never in the week after turning
+    /// autoshare off, with the host's command.
+    #[test]
+    fn the_autoshare_tip_is_rare() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path();
+        let first = autoshare_tip(d, Host::Claude, 100_000).unwrap();
+        assert!(
+            first.contains("`/wats autoshare on`") && first.contains("Never turn it on yourself")
+        );
+        assert_eq!(
+            autoshare_tip(d, Host::Claude, 100_000 + 3600),
+            None,
+            "once a day"
+        );
+        assert!(
+            autoshare_tip(d, Host::Copilot, 100_000 + TIP_EVERY)
+                .unwrap()
+                .contains("`wats me autoshare on`")
+        );
+        autoshare_turned_off(d, 300_000);
+        assert_eq!(
+            autoshare_tip(d, Host::Claude, 300_000 + 2 * TIP_EVERY),
+            None,
+            "a week after off"
+        );
+        assert!(autoshare_tip(d, Host::Claude, 300_000 + TIP_QUIET_AFTER_OFF).is_some());
+        assert_eq!(counters(d).get("hint_autoshare"), Some(&3));
+    }
+
     #[test]
     fn nudges_take_each_hosts_form() {
         let claude: Value =
@@ -1321,6 +1459,9 @@ mod tests {
         );
         let stop: Value =
             serde_json::from_str(&render(Host::Codex, Event::Stop, None, "y")).unwrap();
+        let copilot: Value =
+            serde_json::from_str(&render(Host::Copilot, Event::PostTool, None, "c")).unwrap();
+        assert_eq!(copilot, json!({"additionalContext": "c"}));
         assert_eq!(stop["decision"], "block");
         let vibe: Value =
             serde_json::from_str(&render(Host::Vibe, Event::PostTool, None, "z")).unwrap();

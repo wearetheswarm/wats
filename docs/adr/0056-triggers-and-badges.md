@@ -180,9 +180,9 @@ comparing the score with the last value shown, kept in
 that arrived since, which ADR 0055 weighs (+2: someone used your fix for
 "…").
 
-### 4. `/swarm`, the status line, badges
+### 4. `/wats`, the status line, badges
 
-- **`wats me`** (and `/swarm`: a Claude Code command and a Codex prompt,
+- **`wats me`** (and `/wats`: a Claude Code command and a Codex prompt,
   installed by `wats setup`) shows:
   - your reputation and its last changes, with their reasons;
   - your recent shares and what happened to them;
@@ -299,9 +299,33 @@ Everything is in 0.5.5:
 1. `share_finding`, the scrub, `share.auto` and `wats outbox`;
 2. the error hook, the Stop hook and the used nudge, installed by `wats
    setup` for Claude Code, Codex, Copilot CLI and Vibe (§5);
-3. reputation changes in `wats notify --hook`, `wats me`, `/swarm` and
+3. reputation changes in `wats notify --hook`, `wats me`, `/wats` and
    `wats status --line`;
 4. badges in `wats me` and `who`.
+
+## Amendment (Vincent, 2026-10-27): asking, and the person's switch
+
+- **`wats setup` asks** whether the agents' fixes are shared
+  automatically. Enter keeps asking each time (`share.auto = false`); `y`
+  turns it on. Without a terminal nobody saw the question, so it stays
+  off unless `--share-auto`. A node upgraded from 0.5.4 keeps what it has
+  and is asked at its next setup.
+- **The person's switch:** `/wats autoshare [on|off]` in Claude Code and
+  Codex, `wats me autoshare [on|off]` everywhere; without an argument it
+  shows the state. No MCP tool changes `share.auto`, and the command's own
+  text tells the agent never to run it unless the user asked. The node
+  reads `share.auto` at each `share_finding`, so the switch needs no
+  restart.
+- **The first automatic share** says once, in the brief view, how to turn
+  it off.
+- **A tip with the "share it?" question,** when autoshare is off: the fix
+  nudge asks the agent to pass on, word for word, "Tip: `/wats autoshare
+  on` shares fixes automatically (privacy scrub; review or retract with
+  `wats outbox`)" (`wats me autoshare on` outside Claude Code and Codex).
+  At most once a day per node, never within a week of turning autoshare
+  off, counted as `hint_autoshare`.
+- **The command is `/wats`**, not `/swarm`: wats is the product's name,
+  "the swarm" the network's.
 
 ## Decisions on the review (internal, under Vincent's delegation, 2026-10-27)
 
