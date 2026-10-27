@@ -16,11 +16,11 @@ import { execFileSync } from "node:child_process";
 
 const TIMEOUT_MS = 5000;
 
-/** Run `wats hook <event>`; its stdout, or "" on any failure. */
-function wats(config, event, payload) {
-  const exe = (config && config.wats) || process.env.WATS_BIN || "wats";
+/** Run `wats hook <event>`; its stdout, or "" on any failure (logged). */
+function wats(config, event, payload, logger) {
+  const exe = config.wats || process.env.WATS_BIN || "wats";
   const args = ["hook", event, "--host", "openclaw"];
-  if (config && config.dir) {
+  if (config.dir) {
     args.push("--dir", config.dir);
   }
   try {
@@ -28,20 +28,32 @@ function wats(config, event, payload) {
       input: JSON.stringify(payload),
       timeout: TIMEOUT_MS,
       encoding: "utf8",
-      stdio: ["pipe", "pipe", "ignore"],
+      stdio: ["pipe", "pipe", "pipe"],
     }).trim();
-  } catch {
+  } catch (err) {
+    // Never the payload: it holds the tool's output.
+    const why = (err && (err.code || (err.stderr && String(err.stderr).trim()))) || err;
+    logger?.warn?.(`[wats-hooks] \`${exe} hook ${event}\` failed: ${String(why).slice(0, 300)}`);
     return "";
   }
 }
 
-function pluginConfig(event) {
-  return (event && event.context && event.context.pluginConfig) || {};
+/**
+ * The plugin's config: what OpenClaw resolved at registration
+ * (`api.pluginConfig`), else what a hook event carries. OpenClaw
+ * 2026.6.35 does not put `event.context.pluginConfig` on typed hooks.
+ */
+function configOf(api, event) {
+  return (
+    (api && api.pluginConfig) ||
+    (event && event.context && event.context.pluginConfig) ||
+    {}
+  );
 }
 
 /** The wats node's own agent runs for the swarm: no nudge there. */
-function skipped(event, ctx) {
-  const skip = pluginConfig(event).skipAgents || [];
+function skipped(config, ctx) {
+  const skip = config.skipAgents || [];
   return Boolean(ctx && ctx.agentId && skip.includes(ctx.agentId));
 }
 
@@ -69,35 +81,44 @@ export default {
     // Nudges waiting to reach the model, by tool call, then by session.
     const byCall = new Map();
     const bySession = new Map();
+    const logger = api.logger;
+    const start = configOf(api);
+    logger?.info?.(
+      `[wats-hooks] registered: wats ${start.wats || "from PATH"}, dir ${start.dir || "default"}, skip ${(start.skipAgents || []).join(",") || "none"}`,
+    );
 
     api.on("after_tool_call", async (event, ctx) => {
-      if (skipped(event, ctx)) {
+      const config = configOf(api, event);
+      if (skipped(config, ctx)) {
         return;
       }
       const session = (ctx && (ctx.sessionId || ctx.sessionKey)) || "default";
-      const text = wats(pluginConfig(event), "post-tool", {
+      logger?.debug?.(`[wats-hooks] after_tool_call ${event.toolName} (${session})`);
+      const text = wats(config, "post-tool", {
         session_id: session,
         hook_event_name: "after_tool_call",
         tool_name: event.toolName,
         tool_input: event.params || {},
         tool_response: event.result,
         error: event.error,
-      });
+      }, logger);
+      const callId = event.toolCallId || (ctx && ctx.toolCallId);
       if (text) {
-        if (event.toolCallId) {
-          byCall.set(event.toolCallId, { text, session });
+        if (callId) {
+          byCall.set(callId, { text, session });
         } else {
           bySession.set(session, text);
         }
       }
     });
 
-    api.on("tool_result_persist", (event) => {
-      const pending = event.toolCallId && byCall.get(event.toolCallId);
+    api.on("tool_result_persist", (event, ctx) => {
+      const callId = event.toolCallId || (ctx && ctx.toolCallId);
+      const pending = callId && byCall.get(callId);
       if (!pending) {
         return undefined;
       }
-      byCall.delete(event.toolCallId);
+      byCall.delete(callId);
       const message = withNudge(event.message, pending.text);
       if (!message) {
         bySession.set(pending.session, pending.text);
@@ -123,14 +144,16 @@ export default {
     });
 
     api.on("before_agent_finalize", async (event, ctx) => {
-      if (event.stopHookActive || skipped(event, ctx)) {
+      const config = configOf(api, event);
+      if (event.stopHookActive || skipped(config, ctx)) {
         return undefined;
       }
-      const text = wats(pluginConfig(event), "stop", {
+      logger?.debug?.("[wats-hooks] before_agent_finalize");
+      const text = wats(config, "stop", {
         session_id: event.sessionId || event.sessionKey || "default",
         hook_event_name: "before_agent_finalize",
         stop_hook_active: false,
-      });
+      }, logger);
       if (!text) {
         return undefined;
       }

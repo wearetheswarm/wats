@@ -9,7 +9,8 @@
   sessions get the same nudges as Claude Code's: the swarm checked when a
   command fails, a fix offered for sharing, an answer relied on marked
   used. The node's own OpenClaw agent gets none. Restart the gateway to
-  load it.
+  load it. The plugin logs to the gateway log (`openclaw logs`) when it
+  loads, and when `wats` fails.
 - **`/wats` does more, and only what is listed:** for your node, `/wats`
   (your reputation), `/wats status`, `/wats outbox` and `/wats autoshare
   [on|off]`; for asking the swarm, `/wats search <words>`, `/wats ask

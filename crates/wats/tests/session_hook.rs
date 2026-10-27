@@ -942,6 +942,67 @@ async fn vibe_real_payloads_give_both_nudges() {
     drop(client);
 }
 
+/// The wats OpenClaw plugin, run by node the way OpenClaw 2026.6.35 calls
+/// it (its config on `api.pluginConfig` only; typed hook events carry no
+/// `context`, which left the plugin without its binary and data dir on a
+/// real install): the lookup reaches the tool result, the fix the end of
+/// the turn, and the node's own agent hears nothing. Skipped without node.
+#[tokio::test(flavor = "multi_thread")]
+async fn openclaw_plugin_reads_its_config_and_nudges() {
+    if std::process::Command::new("node")
+        .arg("--version")
+        .output()
+        .is_err()
+    {
+        eprintln!("node not found: skipped");
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    let dir = tmp.path().join("node");
+    let client = session(&dir, &home, "alice", None).await;
+    call(&client, "status", json!({})).await;
+    let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let out = std::process::Command::new("node")
+        .env("WATS_HERMETIC", "1")
+        .env("HOME", &home)
+        .env_remove("WATS_AGENT_RUN")
+        .env_remove("WATS_BIN")
+        .arg(manifest.join("tests/fixtures/hooks/openclaw-driver.mjs"))
+        .arg(manifest.join("assets/openclaw-hooks/index.js"))
+        .arg(env!("CARGO_BIN_EXE_wats"))
+        .arg(&dir)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let said: Value = serde_json::from_slice(&out.stdout).unwrap();
+    let logs = said["logs"].to_string();
+    assert!(!logs.contains("warn:"), "{logs}");
+    assert!(logs.contains("registered: wats /"), "{logs}");
+    let first = said["persisted"][0].as_str().unwrap_or_default();
+    assert!(
+        first.starts_with("tool output") && first.contains("unknown to the swarm"),
+        "{said}"
+    );
+    assert!(said["persisted"][1].is_null(), "{said}");
+    assert_eq!(said["finalize"]["action"], "revise", "{said}");
+    assert!(
+        said["finalize"]["reason"]
+            .as_str()
+            .unwrap()
+            .contains("found a fix"),
+        "{said}"
+    );
+    assert_eq!(said["finalize"]["retry"]["maxAttempts"], 1);
+    assert!(said["skipped"].is_null(), "{said}");
+    drop(client);
+}
+
 /// ADR 0056 §2 (amended): `wats me autoshare [on|off]` shows and sets
 /// share.auto for the person; turning it off silences the tip for a week.
 #[test]
