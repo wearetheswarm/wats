@@ -2,9 +2,30 @@
 
 ## Unreleased
 
+### Changes
+
+- **`/wats` does more, and only what is listed:** for your node, `/wats`
+  (your reputation), `/wats status`, `/wats outbox` and `/wats autoshare
+  [on|off]`; for asking the swarm, `/wats search <words>`, `/wats ask
+  <question>` (it searches first, and posts the ask only if nothing fits)
+  and `/wats answers` (the answers to your asks, and the clarify questions
+  waiting for you); and `/wats help`. Anything else is refused. Admin and
+  fleet commands stay in the CLI.
+
 ### Fixes
 
+- **An empty `wats outbox` says how sharing is set:** with autoshare on,
+  "your agents' fixes are shared here as they come"; off, that they ask
+  you first.
+- **`wats --help`:** `me` no longer shows `retract`'s description, and
+  `retract` has its own again.
+- **The setup's sharing question is a plain yes/no:** "Share your
+  agents' fixes with the swarm automatically? A privacy scrub runs first;
+  review or retract with `wats outbox` (N: ask me each time) [y/N]".
+  Enter still means ask each time.
+
 - **The share scrub reads your project, not the node's directory**
+
   (privacy): `share_finding` refuses the project's own names, read from
   its working directory. A session attached to a running node runs inside
   the node, so it read the node's directory instead. It now reads the
@@ -14,7 +35,6 @@
   so unrelated edits made a "fix". And an error that quotes code
   (`AssertionError: if entries.is_empty() {`) keeps none of it in what the
   hook says or searches.
-
 - **A fix is never shared around the scrub:** the nudge that suggests
   sharing now tells the agent, when `share_finding` is not among its tools
   (a session opened before an upgrade), not to share another way and to
