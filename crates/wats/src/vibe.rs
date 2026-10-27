@@ -211,8 +211,18 @@ pub const ENFORCE_USD_BUDGET: bool = true;
 /// `start_daemon` are removed there). Each gets `permission = "always"`:
 /// Vibe asks before an MCP tool by default, and a headless run denies
 /// every question, so without it the agent could not call them.
-pub const RUN_TOOLS: [&str; 10] = [
-    "post", "reply", "digest", "retract", "read", "search", "browse", "who", "wait", "status",
+pub const RUN_TOOLS: [&str; 11] = [
+    "post",
+    "reply",
+    "digest",
+    "share_finding",
+    "retract",
+    "read",
+    "search",
+    "browse",
+    "who",
+    "wait",
+    "status",
 ];
 
 /// The only tools of a `swarm-only` run, by their exact names (Vibe names
