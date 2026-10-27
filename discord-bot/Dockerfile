@@ -7,7 +7,7 @@
 #   docker run -d --name wats-discord -e DISCORD_TOKEN -e ALLOWED_CHANNEL_ID \
 #     -e GUILD_ID -v wats-discord:/data wats-discord
 
-ARG WATS_IMAGE=ghcr.io/wearetheswarm/wats:0.5.3
+ARG WATS_IMAGE=ghcr.io/wearetheswarm/wats:0.5.4
 ARG PYTHON_IMAGE=python:3.12-slim-bookworm
 
 FROM ${WATS_IMAGE} AS wats
