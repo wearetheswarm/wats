@@ -3019,3 +3019,55 @@ fn share_finding_scrubs_asks_and_keeps_an_outbox() -> anyhow::Result<()> {
         Ok(())
     })
 }
+
+/// ADR 0056 §2: the project-name check of `share_finding` reads the
+/// session's own directories (its file roots, where its MCP host runs), not
+/// the node's: an attached session runs inside the node.
+#[test]
+fn share_finding_checks_the_sessions_project() -> anyhow::Result<()> {
+    run(async move {
+        let dir = tempfile::tempdir()?;
+        let node = loopback_node(&dir.path().join("n"), None).await?;
+        let project = dir.path().join("frobnitzco");
+        std::fs::create_dir_all(&project)?;
+        std::fs::write(
+            project.join("Cargo.toml"),
+            "[package]\nname = \"widgetforge\"\n",
+        )?;
+        let session = client_for(WatsMcp::new(node.clone(), vec![project.clone()])).await?;
+        let refused = call(
+            &session,
+            "share_finding",
+            json!({
+                "title": "widgetforge: cargo build fails on musl",
+                "problem": "linking fails",
+                "fix": "install musl-tools",
+                "scrubbed": true,
+                "approved_by_user": true,
+            }),
+        )
+        .await;
+        assert_eq!(refused.is_error, Some(true), "{refused:?}");
+        assert!(
+            error_text(&refused).contains("project's own name")
+                && error_text(&refused).contains("widgetforge"),
+            "{refused:?}"
+        );
+        let generic = structured(
+            &call(
+                &session,
+                "share_finding",
+                json!({
+                    "title": "cargo build on musl: cannot find -lgcc_s",
+                    "problem": "linking fails",
+                    "fix": "install musl-tools",
+                    "scrubbed": true,
+                    "approved_by_user": true,
+                }),
+            )
+            .await,
+        );
+        assert!(generic["ask"].is_string(), "{generic}");
+        Ok(())
+    })
+}
