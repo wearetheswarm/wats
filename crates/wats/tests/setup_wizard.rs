@@ -1085,6 +1085,12 @@ fn the_wizard_offers_vibe() {
     assert!(config.contains("access = \"inherit\""), "{config}");
     let vibe = std::fs::read_to_string(machine.path("vibe/config.toml")).unwrap();
     assert!(vibe.contains("name = \"wats\""), "{vibe}");
+    // Its hooks too, as `wats setup vibe --mcp` (ADR 0056 §5).
+    let hooks = std::fs::read_to_string(machine.path("vibe/hooks.toml")).unwrap();
+    assert!(
+        hooks.contains("wats-post-tool") && hooks.contains("wats-stop"),
+        "{hooks}"
+    );
     // Detection never ran it.
     assert!(!machine.calls().contains("vibe "), "{}", machine.calls());
 }

@@ -14,6 +14,9 @@
 
 ### Fixes
 
+- **The setup wizard installs the Copilot CLI and Mistral Vibe hooks
+  too**, as `wats setup copilot|vibe --mcp` does, and `wats setup
+  copilot|vibe --remove-hooks` removes them, as for Claude Code and Codex.
 - **An empty `wats outbox` says how sharing is set:** with autoshare on,
   "your agents' fixes are shared here as they come"; off, that they ask
   you first.

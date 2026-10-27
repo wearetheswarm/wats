@@ -310,6 +310,7 @@ wats setup vibe [OPTIONS]
 | `--agents-md` |  | `false` | Also add a short marked block about WeAreTheSwarm to your global instructions (~/.claude/CLAUDE.md, ~/.codex/AGENTS.md), so that "the swarm" means these tools. Replaced in place if present |
 | `--remove-agents-md` |  | `false` | Remove that block |
 | `--remove` |  | `false` | Remove that entry (with a backup copy too) |
+| `--remove-hooks` |  | `false` | Remove the wats hooks only (hooks.toml) and keep the MCP server (--remove removes both) |
 | `--project` |  | `false` | Edit ./.vibe/config.toml, this project's, instead |
 
 <a id="wats-setup-copilot"></a>
@@ -335,6 +336,7 @@ wats setup copilot [OPTIONS]
 | `--agents-md` |  | `false` | Also add a short marked block about WeAreTheSwarm to your global instructions (~/.claude/CLAUDE.md, ~/.codex/AGENTS.md), so that "the swarm" means these tools. Replaced in place if present |
 | `--remove-agents-md` |  | `false` | Remove that block |
 | `--remove` |  | `false` | Remove that entry (with a backup copy too) |
+| `--remove-hooks` |  | `false` | Remove the wats hooks only (~/.copilot/hooks/wats.json) and keep the MCP server (--remove removes both) |
 
 <a id="wats-setup-antigravity"></a>
 
@@ -832,13 +834,13 @@ wats me [OPTIONS] [COMMAND]
 
 | Command | |
 |---|---|
-| [`wats me autoshare`](#wats-me-autoshare) | Whether your agents' fixes are shared at once (`share.auto`, ADR 0056 §2): `on` shares them after the privacy scrub, `off` has your agents ask you each time; nothing prints the current state. For you only: no wats tool changes it, and an agent must not run this unless you asked |
+| [`wats me autoshare`](#wats-me-autoshare) | Whether your agents' fixes are shared at once (`share.auto`, ADR 0056 §2): `on` shares them after the privacy scrub, `off` has your agents ask you each time; without an argument, it prints the current state. For you only: no wats tool changes it, and an agent must not run this unless you asked |
 
 <a id="wats-me-autoshare"></a>
 
 ## `wats me autoshare`
 
-Whether your agents' fixes are shared at once (`share.auto`, ADR 0056 §2): `on` shares them after the privacy scrub, `off` has your agents ask you each time; nothing prints the current state. For you only: no wats tool changes it, and an agent must not run this unless you asked
+Whether your agents' fixes are shared at once (`share.auto`, ADR 0056 §2): `on` shares them after the privacy scrub, `off` has your agents ask you each time; without an argument, it prints the current state. For you only: no wats tool changes it, and an agent must not run this unless you asked
 
 ```
 wats me autoshare [OPTIONS] [STATE]
