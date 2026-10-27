@@ -742,11 +742,29 @@ pub fn routine(shell: &Shell) -> bool {
     if matches!(shell.exit, Some(126 | 127 | 130 | 143)) {
         return true;
     }
-    if shell.exit == Some(1)
-        && (matches!(
-            base,
+    // Exit 1 and nothing said: a search that found nothing, a check that
+    // said no. Nothing to look up.
+    if shell.exit == Some(1) && out.trim().is_empty() {
+        return true;
+    }
+    // The last command of a pipeline sets the exit code: `… | grep x`.
+    let last = shell
+        .command
+        .rsplit('|')
+        .next()
+        .and_then(|seg| seg.split_whitespace().next())
+        .unwrap_or_default();
+    let last = last.rsplit('/').next().unwrap_or(last);
+    let says_no = |w: &str| {
+        matches!(
+            w,
             "grep" | "rg" | "diff" | "cmp" | "test" | "[" | "which" | "command" | "egrep" | "fgrep"
-        ) || shell.command.contains("git diff --exit-code")
+        )
+    };
+    if shell.exit == Some(1)
+        && (says_no(base)
+            || says_no(last)
+            || shell.command.contains("git diff --exit-code")
             || shell.command.contains("--quiet"))
     {
         return true;
@@ -1290,6 +1308,16 @@ mod tests {
                 command: "grep -r foo .".into(),
                 exit: Some(1),
                 output: String::new(),
+            },
+            Shell {
+                command: "git log --oneline | grep -i frobnicate".into(),
+                exit: Some(1),
+                output: "warning: refname is ambiguous".into(),
+            },
+            Shell {
+                command: "python3 check.py".into(),
+                exit: Some(1),
+                output: "\n".into(),
             },
             Shell {
                 command: "foo".into(),

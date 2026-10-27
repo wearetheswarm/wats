@@ -2,19 +2,24 @@
 //
 // OpenClaw's hooks are plugin code, not commands, so this plugin runs
 // `wats hook post-tool|stop --host openclaw` itself, with a JSON payload on
-// stdin, and puts what wats prints where the model reads it:
+// stdin, and adds what wats prints to the tool result the model reads next:
 //
-// - after a tool call (`after_tool_call`, observe-only), the nudge is kept
-//   and added to the tool's result as it is written (`tool_result_persist`),
-//   so the model reads it on its next pass; if that already happened, it
-//   goes into the next prompt (`before_prompt_build`);
-// - at the end of a turn (`before_agent_finalize`), a nudge asks for one
-//   more pass (`revise`, at most once).
+// - `before_tool_call` notes each call's session and agent (the tool-result
+//   middleware gets neither);
+// - the tool-result middleware runs `wats hook post-tool`, and after a
+//   command that passed, `wats hook stop` (the fix found), and appends the
+//   nudge to that result, in the same run. OpenClaw 2026.6.35 refuses
+//   `before_agent_finalize` revisions after a tool with side effects
+//   (every fix), and `tool_result_persist` only changes the stored
+//   transcript, so neither reaches the model.
 //
 // wats never posts from a hook; it reads its store only and always exits 0.
+// A failure here never changes the tool's result.
 import { execFileSync } from "node:child_process";
 
 const TIMEOUT_MS = 5000;
+const MAX_PENDING = 512;
+const SHELLS = new Set(["exec", "bash", "shell", "process"]);
 
 /** Run `wats hook <event>`; its stdout, or "" on any failure (logged). */
 function wats(config, event, payload, logger) {
@@ -51,25 +56,20 @@ function configOf(api, event) {
   );
 }
 
-/** The wats node's own agent runs for the swarm: no nudge there. */
-function skipped(config, ctx) {
-  const skip = config.skipAgents || [];
-  return Boolean(ctx && ctx.agentId && skip.includes(ctx.agentId));
+/** A tool result with `text` added, as model-visible content. */
+function withNudge(result, text) {
+  const note = { type: "text", text: `\n\n${text}` };
+  const content = Array.isArray(result && result.content) ? result.content : [];
+  return { ...result, content: [...content, note] };
 }
 
-/** Add `text` to a tool-result message, as model-visible content. */
-function withNudge(message, text) {
-  if (!message || typeof message !== "object") {
-    return undefined;
+/** Did this shell result pass? Its exit code, else no error flag. */
+function passed(event) {
+  const details = (event.result && event.result.details) || {};
+  if (typeof details.exitCode === "number") {
+    return details.exitCode === 0;
   }
-  const note = { type: "text", text: `\n\n${text}` };
-  if (Array.isArray(message.content)) {
-    return { ...message, content: [...message.content, note] };
-  }
-  if (typeof message.content === "string") {
-    return { ...message, content: `${message.content}\n\n${text}` };
-  }
-  return { ...message, content: [note] };
+  return event.isError !== true && details.status !== "failed";
 }
 
 export default {
@@ -78,94 +78,77 @@ export default {
   description:
     "Nudges the agent toward WeAreTheSwarm at the right moment (ADR 0056). Never posts.",
   register(api) {
-    // Nudges waiting to reach the model, by tool call, then by session.
-    const byCall = new Map();
-    const bySession = new Map();
     const logger = api.logger;
     const start = configOf(api);
+    // Each tool call's session and agent, from before_tool_call.
+    const calls = new Map();
     logger?.info?.(
       `[wats-hooks] registered: wats ${start.wats || "from PATH"}, dir ${start.dir || "default"}, skip ${(start.skipAgents || []).join(",") || "none"}`,
     );
 
-    api.on("after_tool_call", async (event, ctx) => {
-      const config = configOf(api, event);
-      if (skipped(config, ctx)) {
-        return;
+    api.on("before_tool_call", (event, ctx) => {
+      const id = event.toolCallId || (ctx && ctx.toolCallId);
+      if (!id) {
+        return undefined;
       }
-      const session = (ctx && (ctx.sessionId || ctx.sessionKey)) || "default";
-      logger?.debug?.(`[wats-hooks] after_tool_call ${event.toolName} (${session})`);
-      const text = wats(config, "post-tool", {
-        session_id: session,
-        hook_event_name: "after_tool_call",
-        tool_name: event.toolName,
-        tool_input: event.params || {},
-        tool_response: event.result,
-        error: event.error,
-      }, logger);
-      const callId = event.toolCallId || (ctx && ctx.toolCallId);
-      if (text) {
-        if (callId) {
-          byCall.set(callId, { text, session });
-        } else {
-          bySession.set(session, text);
+      calls.set(id, {
+        session: (ctx && (ctx.sessionId || ctx.sessionKey)) || "default",
+        agent: ctx && ctx.agentId,
+      });
+      while (calls.size > MAX_PENDING) {
+        calls.delete(calls.keys().next().value);
+      }
+      return undefined;
+    });
+
+    const middleware = (event) => {
+      try {
+        const call = calls.get(event.toolCallId);
+        if (!call) {
+          return undefined;
         }
-      }
-    });
-
-    api.on("tool_result_persist", (event, ctx) => {
-      const callId = event.toolCallId || (ctx && ctx.toolCallId);
-      const pending = callId && byCall.get(callId);
-      if (!pending) {
-        return undefined;
-      }
-      byCall.delete(callId);
-      const message = withNudge(event.message, pending.text);
-      if (!message) {
-        bySession.set(pending.session, pending.text);
-        return undefined;
-      }
-      return { message };
-    });
-
-    api.on("before_prompt_build", async (_event, ctx) => {
-      const session = (ctx && (ctx.sessionId || ctx.sessionKey)) || "default";
-      const leftover = [];
-      for (const [id, pending] of byCall) {
-        if (pending.session === session) {
-          leftover.push(pending.text);
-          byCall.delete(id);
+        calls.delete(event.toolCallId);
+        const config = configOf(api, event);
+        if (call.agent && (config.skipAgents || []).includes(call.agent)) {
+          return undefined;
         }
-      }
-      if (bySession.has(session)) {
-        leftover.push(bySession.get(session));
-        bySession.delete(session);
-      }
-      return leftover.length ? { appendContext: leftover.join("\n\n") } : undefined;
-    });
-
-    api.on("before_agent_finalize", async (event, ctx) => {
-      const config = configOf(api, event);
-      if (event.stopHookActive || skipped(config, ctx)) {
+        logger?.debug?.(`[wats-hooks] tool result ${event.toolName} (${call.session})`);
+        const said = [];
+        const tool = wats(
+          config,
+          "post-tool",
+          {
+            session_id: call.session,
+            hook_event_name: "tool_result",
+            tool_name: event.toolName,
+            tool_input: event.args || {},
+            tool_response: event.result,
+          },
+          logger,
+        );
+        if (tool) {
+          said.push(tool);
+        }
+        if (SHELLS.has(event.toolName) && passed(event)) {
+          const fix = wats(
+            config,
+            "stop",
+            { session_id: call.session, hook_event_name: "tool_result", stop_hook_active: false },
+            logger,
+          );
+          if (fix) {
+            said.push(fix);
+          }
+        }
+        if (said.length === 0) {
+          return undefined;
+        }
+        return { result: withNudge(event.result, said.join("\n\n")) };
+      } catch (err) {
+        logger?.warn?.(`[wats-hooks] tool result: ${String(err).slice(0, 300)}`);
         return undefined;
       }
-      logger?.debug?.("[wats-hooks] before_agent_finalize");
-      const text = wats(config, "stop", {
-        session_id: event.sessionId || event.sessionKey || "default",
-        hook_event_name: "before_agent_finalize",
-        stop_hook_active: false,
-      }, logger);
-      if (!text) {
-        return undefined;
-      }
-      return {
-        action: "revise",
-        reason: text,
-        retry: {
-          instruction: text,
-          idempotencyKey: `wats-stop-${event.turnId || event.runId || event.sessionId}`,
-          maxAttempts: 1,
-        },
-      };
-    });
+    };
+    api.registerAgentToolResultMiddleware(middleware, { runtimes: ["openclaw", "codex"] });
   },
 };

@@ -2877,9 +2877,9 @@ fn install_wats_command(args: &NodeArgs, name: &str, path: &std::path::Path) -> 
 }
 
 /// OpenClaw's nudge hooks (ADR 0056 §5): the wats plugin, written to
-/// `<data dir>/hooks/openclaw-plugin` and linked into OpenClaw, with the
-/// conversation access its end-of-turn hook needs, this wats and data
-/// directory, and the node's own agent left out (`skip_agent`).
+/// `<data dir>/hooks/openclaw-plugin` and linked into OpenClaw, with this
+/// wats and data directory, and the node's own agent left out
+/// (`skip_agent`). It needs no conversation access.
 fn install_openclaw_hooks(
     args: &NodeArgs,
     data_dir: &std::path::Path,
@@ -2896,16 +2896,6 @@ fn install_openclaw_hooks(
     let output = run_openclaw(openclaw, &["plugins", "install", "--link", &path])?;
     openclaw_ok(&output, "plugins install --link")?;
     let key = format!("plugins.entries.{}", oc::HOOKS_PLUGIN);
-    let output = run_openclaw(
-        openclaw,
-        &[
-            "config",
-            "set",
-            &format!("{key}.hooks.allowConversationAccess"),
-            "true",
-        ],
-    )?;
-    openclaw_ok(&output, "config set …allowConversationAccess")?;
     let exe = wats::update::stable_exe()?;
     let node_dir = match &args.dir {
         Some(dir) => std::path::absolute(dir)?,

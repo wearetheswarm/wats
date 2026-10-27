@@ -512,7 +512,7 @@ fn setup_openclaw_mcp_through_its_cli() {
     assert!(said.contains("checked: `openclaw mcp show wats`"), "{said}");
     let first = calls();
     // The MCP server, then the hooks plugin (ADR 0056 §5).
-    assert_eq!(first.len(), 5, "{first:?}");
+    assert_eq!(first.len(), 4, "{first:?}");
     let plugin = data.join("hooks").join("openclaw-plugin");
     assert_eq!(
         first[2],
@@ -521,16 +521,7 @@ fn setup_openclaw_mcp_through_its_cli() {
     );
     assert!(plugin.join("index.js").exists() && plugin.join("openclaw.plugin.json").exists());
     assert_eq!(
-        first[3],
-        [
-            "config",
-            "set",
-            "plugins.entries.wats-hooks.hooks.allowConversationAccess",
-            "true"
-        ]
-    );
-    assert_eq!(
-        first[4][..3],
+        first[3][..3],
         ["config", "set", "plugins.entries.wats-hooks.config"]
     );
     assert_eq!(first[0][..3], ["mcp", "set", "wats"], "{first:?}");
@@ -543,8 +534,8 @@ fn setup_openclaw_mcp_through_its_cli() {
     let out = setup(&path_with, &["--mcp"]);
     assert!(out.status.success(), "{out:?}");
     let again = calls();
-    assert_eq!(again.len(), 10, "{again:?}");
-    assert_eq!(again[5], first[0]);
+    assert_eq!(again.len(), 8, "{again:?}");
+    assert_eq!(again[4], first[0]);
     let kept: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(&entry).unwrap()).unwrap();
     assert_eq!(kept, expected);
@@ -681,12 +672,12 @@ fn setup_openclaw_agent_tokens_entries_and_block() {
     let (hooks, runner) = (token("hooks.token"), token("runner.token"));
     let exe = std::fs::canonicalize(env!("CARGO_BIN_EXE_wats")).unwrap();
     let all = calls();
-    assert_eq!(all.len(), 8, "{all:?}");
+    assert_eq!(all.len(), 7, "{all:?}");
     assert_eq!(all[0][..3], ["mcp", "set", "wats"]);
     assert_eq!(all[1], ["mcp", "show", "wats"]);
     assert_eq!(all[2][..2], ["plugins", "install"]);
-    assert_eq!(all[5][..3], ["mcp", "set", "wats-agent"]);
-    let agent: serde_json::Value = serde_json::from_str(&all[5][3]).unwrap();
+    assert_eq!(all[4][..3], ["mcp", "set", "wats-agent"]);
+    let agent: serde_json::Value = serde_json::from_str(&all[4][3]).unwrap();
     assert_eq!(
         agent,
         serde_json::json!({
@@ -695,8 +686,8 @@ fn setup_openclaw_agent_tokens_entries_and_block() {
             "env": {"WATS_RUNNER_TOKEN": runner},
         })
     );
-    assert_eq!(all[6], ["mcp", "show", "wats-agent"]);
-    assert_eq!(all[7], ["config", "validate"]);
+    assert_eq!(all[5], ["mcp", "show", "wats-agent"]);
+    assert_eq!(all[6], ["config", "validate"]);
     assert!(
         said.contains("token: \"${WATS_OPENCLAW_HOOKS_TOKEN}\""),
         "{said}"
@@ -842,8 +833,8 @@ esac
     let said = String::from_utf8_lossy(&out.stdout).into_owned();
     assert!(out.status.success(), "{out:?}");
     let all = calls();
-    // After the MCP servers and the hooks plugin's three calls.
-    let config: Vec<&[String]> = all[7..].iter().map(Vec::as_slice).collect();
+    // After the MCP servers and the hooks plugin's two calls.
+    let config: Vec<&[String]> = all[6..].iter().map(Vec::as_slice).collect();
     assert_eq!(
         config,
         [

@@ -943,12 +943,13 @@ async fn vibe_real_payloads_give_both_nudges() {
 }
 
 /// The wats OpenClaw plugin, run by node the way OpenClaw 2026.6.35 calls
-/// it (its config on `api.pluginConfig` only; typed hook events carry no
-/// `context`, which left the plugin without its binary and data dir on a
-/// real install): the lookup reaches the tool result, the fix the end of
-/// the turn, and the node's own agent hears nothing. Skipped without node.
+/// it: its config on `api.pluginConfig` only (typed hook events carry no
+/// `context`), the session from `before_tool_call`, the nudge added by the
+/// tool-result middleware to the result the model reads next. The lookup
+/// reaches the first failure, the fix the passing command; the node's own
+/// agent hears nothing. Skipped without node.
 #[tokio::test(flavor = "multi_thread")]
-async fn openclaw_plugin_reads_its_config_and_nudges() {
+async fn openclaw_plugin_nudges_in_the_live_tool_result() {
     if std::process::Command::new("node")
         .arg("--version")
         .output()
@@ -984,22 +985,26 @@ async fn openclaw_plugin_reads_its_config_and_nudges() {
     let logs = said["logs"].to_string();
     assert!(!logs.contains("warn:"), "{logs}");
     assert!(logs.contains("registered: wats /"), "{logs}");
-    let first = said["persisted"][0].as_str().unwrap_or_default();
+    assert_eq!(said["runtimes"], json!([["openclaw", "codex"]]), "{said}");
+    // No conversation hook: no allowConversationAccess needed.
+    assert_eq!(said["hooks"], json!(["before_tool_call"]), "{said}");
+    let seen: Vec<&str> = said["seen"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| s.as_str().unwrap())
+        .collect();
     assert!(
-        first.starts_with("tool output") && first.contains("unknown to the swarm"),
-        "{said}"
+        seen[0].starts_with("error[E0599]") && seen[0].contains("unknown to the swarm"),
+        "{seen:?}"
     );
-    assert!(said["persisted"][1].is_null(), "{said}");
-    assert_eq!(said["finalize"]["action"], "revise", "{said}");
+    assert!(!seen[1].contains("wats:"), "{seen:?}");
+    assert_eq!(seen[2], "ok");
     assert!(
-        said["finalize"]["reason"]
-            .as_str()
-            .unwrap()
-            .contains("found a fix"),
-        "{said}"
+        seen[3].starts_with("Finished") && seen[3].contains("found a fix"),
+        "{seen:?}"
     );
-    assert_eq!(said["finalize"]["retry"]["maxAttempts"], 1);
-    assert!(said["skipped"].is_null(), "{said}");
+    assert!(!seen[4].contains("wats:"), "{seen:?}");
     drop(client);
 }
 

@@ -5,6 +5,12 @@
   "activation": {
     "onStartup": true
   },
+  "contracts": {
+    "agentToolResultMiddleware": [
+      "openclaw",
+      "codex"
+    ]
+  },
   "configSchema": {
     "type": "object",
     "additionalProperties": false,
@@ -19,7 +25,9 @@
       },
       "skipAgents": {
         "type": "array",
-        "items": { "type": "string" },
+        "items": {
+          "type": "string"
+        },
         "description": "OpenClaw agents that get no nudge: the wats node's own agent"
       }
     }

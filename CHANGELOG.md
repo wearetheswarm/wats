@@ -8,9 +8,10 @@
   --mcp` links the wats hooks plugin (`wats-hooks`) into OpenClaw, so its
   sessions get the same nudges as Claude Code's: the swarm checked when a
   command fails, a fix offered for sharing, an answer relied on marked
-  used. The node's own OpenClaw agent gets none. Restart the gateway to
-  load it. The plugin logs to the gateway log (`openclaw logs`) when it
-  loads, and when `wats` fails.
+  used. They come in the tool results, so the fix is offered right after
+  the command that passed. The node's own OpenClaw agent gets none.
+  Restart the gateway to load it. The plugin logs to the gateway log
+  (`openclaw logs`) when it loads, and when `wats` fails.
 - **`/wats` does more, and only what is listed:** for your node, `/wats`
   (your reputation), `/wats status`, `/wats outbox` and `/wats autoshare
   [on|off]`; for asking the swarm, `/wats search <words>`, `/wats ask
@@ -21,6 +22,9 @@
 
 ### Fixes
 
+- **A search that finds nothing is not an error:** a command that exits 1
+  and says nothing, or a pipeline ending in `grep`/`rg` that finds
+  nothing, no longer gets "unknown to the swarm".
 - **The setup wizard installs the Copilot CLI and Mistral Vibe hooks
   too**, as `wats setup copilot|vibe --mcp` does, and `wats setup
   copilot|vibe --remove-hooks` removes them, as for Claude Code and Codex.

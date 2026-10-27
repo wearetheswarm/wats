@@ -270,7 +270,7 @@ known, a zero exit is never a failure.
    `additional_context` reaching the model.
 5. OpenCode 1.19 and OpenClaw, for the later plugins: OpenCode's
    `tool.execute.after` `metadata.exit`; OpenClaw's `exec` result shape
-   and `allowConversationAccess`.
+   and its tool-result middleware.
 
 ### 6. Measurement
 
@@ -389,17 +389,24 @@ Everything is in 0.5.5:
 - **OpenClaw (0.5.6)**: its hooks are plugin code, so wats ships a plugin,
   `wats-hooks` (`crates/wats/assets/openclaw-hooks`). `wats setup
   openclaw --mcp` writes it to `<data dir>/hooks/openclaw-plugin`, links it
-  (`openclaw plugins install --link`), and sets
-  `hooks.allowConversationAccess` (without it OpenClaw blocks
-  `before_agent_finalize` for a plugin it did not bundle) and its config.
-  The plugin runs `wats hook post-tool|stop --host openclaw` (plain text
-  out):
-  - `after_tool_call` is observe-only, so its nudge is appended to the
-    tool's result by `tool_result_persist`, or else goes into the next
-    prompt (`before_prompt_build`, `appendContext`);
-  - the end of a turn is `before_agent_finalize`, which returns `revise`
-    with `retry.maxAttempts = 1`;
-  - the node's own OpenClaw agent (`skipAgents`) gets no nudge.
+  (`openclaw plugins install --link`) and sets its config (this wats, the
+  data directory, `skipAgents`). It needs no conversation access. The
+  plugin runs `wats hook post-tool|stop --host openclaw` (plain text out)
+  from OpenClaw's tool-result middleware
+  (`api.registerAgentToolResultMiddleware`, declared in the manifest's
+  `contracts.agentToolResultMiddleware`, runtimes `openclaw` and `codex`),
+  and appends the nudge to the result the model reads next, in the same
+  run:
+  - `post-tool` on every tool result; after a command that passed, `stop`
+    too, so the fix found reaches the model before its final answer;
+  - the middleware gets no session, so `before_tool_call` notes each
+    call's session and agent by tool call id;
+  - the node's own OpenClaw agent (`skipAgents`) gets no nudge;
+  - seen on OpenClaw 2026.6.35, so not used: typed hook events carry no
+    `context.pluginConfig` (the plugin reads `api.pluginConfig`);
+    `tool_result_persist` changes only the stored transcript; and
+    `before_agent_finalize` `revise` is refused after any tool with side
+    effects (an `exec`, an edit), which every fix has.
 - **Real-install checks:** `scripts/verify-hooks.sh <cli>` sets up a
   throwaway project with project-local hooks and a hermetic node;
   `check <dir>` says PASS or FAIL; `clean <dir>` removes it all.

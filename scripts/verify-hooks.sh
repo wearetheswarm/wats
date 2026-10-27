@@ -158,7 +158,6 @@ openclaw)
     cp "$conf" "$dir/openclaw.json.bak"
     echo "$conf" >"$dir/openclaw.json.path"
     openclaw plugins install --link "$plugin" >/dev/null
-    openclaw config set plugins.entries.wats-hooks.hooks.allowConversationAccess true >/dev/null
     openclaw config set plugins.entries.wats-hooks.config \
         "{\"wats\":\"$exe\",\"dir\":\"$node\",\"skipAgents\":[\"wats\"]}" --strict-json >/dev/null
     run="openclaw gateway restart, then: openclaw agent --agent main --message-file $dir/prompt.txt"
