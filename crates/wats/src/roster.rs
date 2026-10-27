@@ -153,12 +153,14 @@ pub fn private_words() -> Vec<(&'static str, String)> {
 /// What in `words` ([`private_words`]) the public name `name` contains,
 /// if anything. A word of 5 characters or more counts anywhere in the
 /// name (`vincent-carluer-claude` holds `vincentcarluer`); a shorter one
-/// only as a whole part between `-` or `_`, so that a user `dev` does not
-/// forbid `devops`.
+/// only as a whole part: between `-`, `_`, `.` or spaces, or a word of a
+/// PascalCase or camelCase name (`BobHive` holds `bob`), so that a user
+/// `dev` does not forbid `devops`.
 pub fn leak<'a>(name: &str, words: &'a [(&'static str, String)]) -> Option<&'a str> {
     let lower = name.to_lowercase();
     let squeezed: String = lower.chars().filter(|c| c.is_alphanumeric()).collect();
-    let parts: Vec<&str> = lower.split(['-', '_', '.', ' ']).collect();
+    let parts = name_parts(name);
+    let parts: Vec<&str> = parts.iter().map(String::as_str).collect();
     words
         .iter()
         .find(|(_, w)| {
@@ -169,6 +171,32 @@ pub fn leak<'a>(name: &str, words: &'a [(&'static str, String)]) -> Option<&'a s
             }
         })
         .map(|(what, _)| *what)
+}
+
+/// The words of a name, lowercased: split at `-`, `_`, `.` and spaces,
+/// then where a lowercase letter or a digit meets a capital, and where
+/// letters meet digits (`BobHive2` → `bob`, `hive`, `2`).
+fn name_parts(name: &str) -> Vec<String> {
+    let mut parts = Vec::new();
+    for chunk in name.split(['-', '_', '.', ' ']) {
+        let mut word = String::new();
+        let mut prev: Option<char> = None;
+        for c in chunk.chars() {
+            let boundary = prev.is_some_and(|p| {
+                (c.is_uppercase() && (p.is_lowercase() || p.is_ascii_digit()))
+                    || (c.is_ascii_digit() != p.is_ascii_digit() && c.is_alphanumeric())
+            });
+            if boundary && !word.is_empty() {
+                parts.push(std::mem::take(&mut word).to_lowercase());
+            }
+            word.push(c);
+            prev = Some(c);
+        }
+        if !word.is_empty() {
+            parts.push(word.to_lowercase());
+        }
+    }
+    parts
 }
 
 /// Refuse a name a user chose for others to see (an agent's table name,
@@ -582,6 +610,12 @@ mod tests {
         assert_eq!(leak("Vincents-MacBook-Pro-bot", &w), Some("the host name"));
         assert_eq!(leak("dev-helper", &w), Some("the OS user name"));
         assert_eq!(leak("devops", &w), None);
+        // A PascalCase or camelCase word is a part too.
+        let bob = vec![("the OS user name", "bob".to_string())];
+        assert_eq!(leak("BobHive", &bob), Some("the OS user name"));
+        assert_eq!(leak("helperBob2", &bob), Some("the OS user name"));
+        assert_eq!(leak("Bobcat", &bob), None, "a longer word is not the name");
+        assert_eq!(leak("AmberHive", &bob), None);
         assert_eq!(leak("seed-postgres", &w), None);
     }
 

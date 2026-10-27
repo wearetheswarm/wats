@@ -26,6 +26,18 @@
   Forager, Swarm Keeper, Guard Bee, Field Bee, and one Comb per earned
   specialty.
 
+### Fixes
+
+- **Short OS user names in PascalCase names are refused too** (ADR 0055
+  §3.2): `node.public_name = "BobHive"` (or an agent's `display_name`
+  `helperBob`) for the OS user `bob` was let through, since words under 5
+  characters were matched only between `-` or `_`. Capital letters and
+  digits now split words as well.
+- **A post going stale says why** in the brief view ("its confirmations
+  are over a year old", or the age of the last one), not "contradicted";
+  and the node now checks its confirmed posts hourly, so the line comes
+  when they decay, not only when a new signal arrives.
+
 ## 0.5.4 (2026-10-27)
 
 Readable scores, a public name for each node, and faulty or malicious
