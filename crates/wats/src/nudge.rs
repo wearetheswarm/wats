@@ -100,6 +100,11 @@ pub enum Step {
         ok: bool,
         /// A build, test or run command.
         check: bool,
+        /// What failed, for the fix detection: the signature, else the
+        /// command's first words, for a failure that is not routine even
+        /// when its output says nothing usable (Copilot may elide it).
+        #[serde(default)]
+        fail: Option<String>,
         /// It writes a file (`> file`, `sed -i`, `tee`…): an edit made in
         /// the shell.
         #[serde(default)]
@@ -219,10 +224,9 @@ fn cut(text: &str) -> String {
 pub fn render(host: Host, event: Event, event_name: Option<&str>, text: &str) -> String {
     match (host, event) {
         (Host::Claude | Host::Codex | Host::Copilot, Event::PostTool) => {
-            let name = match event_name {
-                Some(n @ ("PostToolUse" | "PostToolUseFailure")) => n,
-                _ => "PostToolUse",
-            };
+            let name = event_name
+                .filter(|n| matches!(*n, "PostToolUse" | "PostToolUseFailure"))
+                .unwrap_or("PostToolUse");
             json!({
                 "hookSpecificOutput": {
                     "hookEventName": name,
@@ -429,11 +433,18 @@ pub fn shell(payload: &Value) -> Option<Shell> {
         let v = &payload[key];
         match v {
             Value::Object(_) => {
+                // Copilot: `toolTelemetry.metrics.exit_code` (a float); its
+                // `resultType` says success even after a non-zero exit.
                 exit = exit
                     .or_else(|| v["exit_code"].as_i64())
                     .or_else(|| v["returncode"].as_i64())
                     .or_else(|| v["exit"].as_i64())
-                    .or_else(|| v["metadata"]["exit"].as_i64());
+                    .or_else(|| v["metadata"]["exit"].as_i64())
+                    .or_else(|| {
+                        v["toolTelemetry"]["metrics"]["exit_code"]
+                            .as_f64()
+                            .map(|f| f as i64)
+                    });
                 for field in ["stdout", "stderr", "output", "textResultForLlm"] {
                     if let Some(s) = v[field].as_str() {
                         output.push_str(s);
@@ -447,6 +458,15 @@ pub fn shell(payload: &Value) -> Option<Shell> {
             }
             _ => {}
         }
+    }
+    // Copilot's text: "<shellId: 3 completed with exit code 0>".
+    if exit.is_none()
+        && let Some(i) = output.rfind("completed with exit code ")
+    {
+        exit = output[i + "completed with exit code ".len()..]
+            .split(|c: char| !c.is_ascii_digit())
+            .next()
+            .and_then(|n| n.parse().ok());
     }
     // Claude's PostToolUseFailure: `error` = "Exit code N\n<output>".
     if let Some(error) = payload["error"].as_str() {
@@ -806,11 +826,13 @@ fn post_tool(request: &Request, session: &mut Session) -> Result<Option<String>>
         None => is_check(&shell.command) && error_line(&shell.output).is_some(),
     };
     let private = crate::roster::private_words();
-    let sig = if failed && !routine(&shell) {
+    let real = failed && !routine(&shell);
+    let sig = if real {
         signature(&shell, &private)
     } else {
         None
     };
+    let fail = real.then(|| sig.clone().unwrap_or_else(|| head(&shell.command)));
     push(
         session,
         Step::Shell {
@@ -818,6 +840,7 @@ fn post_tool(request: &Request, session: &mut Session) -> Result<Option<String>>
             sig: sig.clone(),
             ok: !failed,
             check: is_check(&shell.command),
+            fail,
             writes: writes(&shell.command),
             cmd: shell.command.chars().take(CMD_CHARS).collect(),
         },
@@ -920,7 +943,7 @@ pub fn fix_in(turn: &[Step]) -> Option<String> {
     for (i, step) in turn.iter().enumerate() {
         let Step::Shell {
             head,
-            sig: Some(sig),
+            fail: Some(sig),
             ok: false,
             ..
         } = step
@@ -928,7 +951,7 @@ pub fn fix_in(turn: &[Step]) -> Option<String> {
             continue;
         };
         let again = turn[i + 1..].iter().position(|s| {
-            matches!(s, Step::Shell { sig: Some(s2), ok: false, head: h2, .. } if s2 == sig || h2 == head)
+            matches!(s, Step::Shell { fail: Some(s2), ok: false, head: h2, .. } if s2 == sig || h2 == head)
         });
         if again.is_none() {
             continue;
@@ -1053,6 +1076,16 @@ mod tests {
             "tool_status": "success",
             "tool_output": {"command": "pytest", "exit_code": 1, "stdout": "1 failed", "stderr": ""}});
         assert_eq!(shell(&vibe).unwrap().exit, Some(1));
+        // Copilot, postToolUse: success in name, exit 1 in its telemetry.
+        let copilot = json!({"toolName": "bash", "toolArgs": {"command": "python3 check.py"},
+            "toolResult": {"resultType": "success", "textResultForLlm": "[elided]",
+                "toolTelemetry": {"metrics": {"exit_code": 1.0},
+                    "properties": {"shell_error_category": "command_nonzero_exit"}}}});
+        assert_eq!(shell(&copilot).unwrap().exit, Some(1));
+        let done = json!({"toolName": "bash", "toolArgs": {"command": "python3 check.py"},
+            "toolResult": {"resultType": "success",
+                "textResultForLlm": "ok\n<shellId: 3 completed with exit code 0>"}});
+        assert_eq!(shell(&done).unwrap().exit, Some(0));
         // Codex, PostToolUse: output text only.
         let codex = json!({"tool_name": "shell", "tool_input": {"command": ["bash", "-lc", "npm test"]},
             "tool_response": "FAIL src/a.test.ts\nError: expected 2"});
@@ -1136,6 +1169,7 @@ mod tests {
             sig: sig.map(str::to_string),
             ok,
             check,
+            fail: if ok { None } else { sig.map(str::to_string) },
             writes: false,
             cmd: head.into(),
         }
@@ -1177,6 +1211,7 @@ mod tests {
                 sig: None,
                 ok: true,
                 check: true,
+                fail: None,
                 writes: true,
                 cmd: "printf 'print(\"ok\")\\n' > check.py && python3 check.py".into(),
             },
@@ -1188,6 +1223,19 @@ mod tests {
         assert!(!writes("cargo build 2>&1 | tail"));
         assert!(!writes("ls > /dev/null"));
         assert!(!writes("python3 check.py"));
+        // Seen live (Copilot): the output elided, so no signature; the
+        // failure still counts, by its command.
+        let blind = |ok: bool| Step::Shell {
+            head: "python3 check.py".into(),
+            sig: None,
+            ok,
+            check: true,
+            fail: (!ok).then(|| "python3 check.py".to_string()),
+            writes: false,
+            cmd: "python3 check.py".into(),
+        };
+        let elided = [blind(false), blind(false), Step::Edit, blind(true)];
+        assert_eq!(fix_in(&elided).as_deref(), Some("python3 check.py"));
         // Fixed but nothing passed afterwards.
         let open = [
             sh("cargo build", e, false, true),

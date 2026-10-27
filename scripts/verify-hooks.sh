@@ -150,7 +150,7 @@ name = "wats-stop"
 type = "post_agent"
 command = "$stop"
 TOML
-    run="cd $dir && vibe   (trust the folder when Vibe asks)"
+    run="cd $dir && vibe --trust   (Vibe loads a project's .vibe/hooks.toml only in a trusted folder; --trust trusts it for this run)"
     ;;
 esac
 
