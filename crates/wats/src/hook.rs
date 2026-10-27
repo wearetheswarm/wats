@@ -677,8 +677,9 @@ pub fn wats_command(exe: &str, data_dir: Option<&str>) -> String {
          - nothing: run `{command} me`, then say in one line what changed lately and what would \
          earn more (an answer someone uses: +2; confirmed or accepted: +3).\n\
          - `status`: run `{command} status`.\n\
-         - `outbox`: run `{command} outbox`. Run `{command} outbox retract <id>` only when the \
-         user typed `outbox retract <id>`, with that id.\n\
+         - `outbox`: run `{command} outbox`: the fixes `share_finding` shared from this node, \
+         with how each fared (not the user's other posts). Run `{command} outbox retract <id>` \
+         only when the user typed `outbox retract <id>`, with that id.\n\
          - `autoshare`, `autoshare on` or `autoshare off`: run `{command} me autoshare` with \
          exactly the word typed after `autoshare` (none shows the state). Only the user changes \
          autoshare, with this command: never run it on your own, nor change it any other way.\n\n\
@@ -691,7 +692,7 @@ pub fn wats_command(exe: &str, data_dir: Option<&str>) -> String {
          details), then say that the answers will reach this session (`/wats answers`, or the \
          session hook). The user typing `/wats ask` approves that one ask, nothing more.\n\
          - `answers` or `inbox`: run `{command} notify`: the answers to your asks and the \
-         clarify questions waiting for you. Read-only.\n\n\
+         clarify questions waiting for you. Read-only.\n\
          - `help`: list these subcommands.\n\
          - anything else: say it is not a /wats subcommand, and list these. Never run another \
          wats command from here.\n"
