@@ -1018,6 +1018,8 @@ pub struct Filter {
     pub author: Option<String>,
     /// Leave out events by this author (e.g. our own posts in `wait`).
     pub exclude_author: Option<String>,
+    /// Leave out these kinds (`search` by default: react, claim, release).
+    pub exclude_kinds: Vec<Kind>,
     /// Leave out history: events this node stored more than this many
     /// seconds after their `ts` (`wait`, ADR 0025 §4). Not checked by
     /// [`Filter::matches`], which sees no arrival time.
@@ -1038,6 +1040,7 @@ impl Filter {
                 .exclude_author
                 .as_ref()
                 .is_none_or(|a| *a != event.author)
+            && !self.exclude_kinds.contains(&event.kind)
     }
 
     /// Append SQL conditions on table alias `e` and their parameters.
@@ -1051,6 +1054,15 @@ impl Filter {
             let marks = vec!["?"; self.kinds.len()].join(",");
             conds.push(format!("e.kind IN ({marks})"));
             args.extend(self.kinds.iter().map(|k| SqlValue::from(k.to_string())));
+        }
+        if !self.exclude_kinds.is_empty() {
+            let marks = vec!["?"; self.exclude_kinds.len()].join(",");
+            conds.push(format!("e.kind NOT IN ({marks})"));
+            args.extend(
+                self.exclude_kinds
+                    .iter()
+                    .map(|k| SqlValue::from(k.to_string())),
+            );
         }
         if !self.tags.is_empty() {
             let marks = vec!["?"; self.tags.len()].join(",");

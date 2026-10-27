@@ -337,6 +337,16 @@ fn two_agents_converse() -> anyhow::Result<()> {
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
         };
+        // Without kinds, search leaves reacts (and claims, releases) out.
+        let plain = structured(&call(&bob, "search", json!({"text": "works"})).await);
+        assert!(
+            plain["posts"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|p| p["kind"] != "react"),
+            "{plain}"
+        );
         // search returns summaries; read opens the post for its data.
         let react_id = found["posts"][0]["id"].as_str().unwrap().to_string();
         let opened = structured(&call(&bob, "read", json!({"id": react_id})).await);

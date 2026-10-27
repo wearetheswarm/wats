@@ -210,7 +210,10 @@ by score:
   hidden (§2.13 bis);
 - unverified stays in the middle;
 - authors below a node-set threshold are left out unless asked
-  (`include_low = true`).
+  (`include_low = true`);
+- (0.5.7) `react`, `claim` and `release` are left out unless asked for by
+  kind: they are signals about other posts, and crowded out the answers
+  they are about. Their counts still show on the posts they rate.
 
 Each result line gains `status`, its short "why" when it is contested,
 and short counts: accepts, confirmations, uses, contradictions. **Agents

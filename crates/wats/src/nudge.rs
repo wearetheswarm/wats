@@ -616,6 +616,41 @@ pub fn shell(payload: &Value) -> Option<Shell> {
     })
 }
 
+/// The first word of the command that ran last, which sets the exit code:
+/// past the last `|`, `||`, `&&` or `;` of the last line (`grep -c x f` in
+/// `sed -n 1,9p f; grep -c x f`).
+fn last_command(command: &str) -> &str {
+    let line = command
+        .lines()
+        .map(str::trim)
+        .rfind(|l| !l.is_empty())
+        .unwrap_or_default();
+    let words: Vec<&str> = line.split_whitespace().collect();
+    let after = words
+        .iter()
+        .rposition(|w| {
+            matches!(*w, "|" | "||" | "&&" | ";") || (w.ends_with(';') && !w.ends_with("\\;"))
+        })
+        .map_or(0, |i| i + 1);
+    words
+        .get(after..)
+        .and_then(|rest| rest.iter().find(|w| !w.contains('=')))
+        .copied()
+        .unwrap_or_default()
+}
+
+/// Whether the error word of `line` sits inside a quote or code span
+/// (`` (`AssertionError: …`) keeps none of it ``): prose about an error,
+/// seen live in a changelog an agent printed, not the error itself.
+fn quoted_mark(line: &str) -> bool {
+    let lower = line.to_lowercase();
+    let Some(at) = ERROR_MARKS.iter().filter_map(|m| lower.find(m)).min() else {
+        return false;
+    };
+    let before = &lower[..at];
+    before.matches('`').count() % 2 == 1 || before.matches('"').count() % 2 == 1
+}
+
 /// Lines that say something failed.
 const ERROR_MARKS: &[&str] = &[
     "error",
@@ -641,6 +676,7 @@ fn error_line(output: &str) -> Option<&str> {
             && !lower.starts_with("traceback")
             && !lower.contains("0 failed")
             && !lower.contains("0 errors")
+            && !quoted_mark(line)
     };
     let named = |line: &&str| {
         let head = line.split(':').next().unwrap_or_default();
@@ -747,13 +783,8 @@ pub fn routine(shell: &Shell) -> bool {
     if shell.exit == Some(1) && out.trim().is_empty() {
         return true;
     }
-    // The last command of a pipeline sets the exit code: `… | grep x`.
-    let last = shell
-        .command
-        .rsplit('|')
-        .next()
-        .and_then(|seg| seg.split_whitespace().next())
-        .unwrap_or_default();
+    // The last command sets the exit code: `… | grep x`, `…; grep -c x f`.
+    let last = last_command(&shell.command);
     let last = last.rsplit('/').next().unwrap_or(last);
     let says_no = |w: &str| {
         matches!(
@@ -1302,12 +1333,40 @@ mod tests {
     }
 
     #[test]
+    fn an_error_quoted_in_prose_is_no_error() {
+        // Seen live: a changelog an agent printed, quoting an error.
+        let prose = Shell {
+            command: "make check".into(),
+            exit: Some(2),
+            output: "- **The hooks no longer mistake one script for another:**\n  (`AssertionError: if entries.is_empty() {`) keeps none of it in what the\n  said \"Error: boom\" in a sentence".into(),
+        };
+        assert_eq!(signature(&prose, &[]), None);
+        // The real thing still counts, backticks after the error word.
+        let real = Shell {
+            command: "cargo build".into(),
+            exit: Some(101),
+            output: "error[E0599]: no method named `frobnicate` found for struct `Widget` in the current scope".into(),
+        };
+        assert!(signature(&real, &[]).is_some());
+        assert_eq!(last_command("a | grep x"), "grep");
+        assert_eq!(last_command("find . -exec rm {} \\;"), "find");
+        assert_eq!(last_command("cd x && LC_ALL=C grep -c y f"), "grep");
+    }
+
+    #[test]
     fn routine_failures_stay_quiet() {
         let quiet = [
             Shell {
                 command: "grep -r foo .".into(),
                 exit: Some(1),
                 output: String::new(),
+            },
+            Shell {
+                // Seen live: a heredoc script, a print, then a count of
+                // conflict markers that found none (exit 1).
+                command: "python3 - <<'EOF'\nprint(1)\nEOF\nsed -n 5,58p CHANGELOG.md; grep -c '<<<<<<<\\|>>>>>>>' CHANGELOG.md".into(),
+                exit: Some(1),
+                output: "- **Fixed:** a crash\n0".into(),
             },
             Shell {
                 command: "git log --oneline | grep -i frobnicate".into(),

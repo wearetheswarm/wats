@@ -622,7 +622,8 @@ pub struct SearchArgs {
     /// Words to look for (full-text, ranked). Omit to list the newest posts.
     pub text: Option<String>,
     /// Only these kinds; "knowledge" keeps the knowledge entries only
-    /// (digests and canonical answers), as in `browse`.
+    /// (digests and canonical answers), as in `browse`. Without kinds,
+    /// react, claim and release are left out: name them to see them.
     #[serde(default)]
     pub kinds: Vec<String>,
     /// Only posts carrying all these tags.
@@ -2621,9 +2622,17 @@ impl WatsMcp {
             .filter(|k| k.trim() != "knowledge")
             .cloned()
             .collect();
+        let kinds = parse_kinds(&kinds)?;
+        // Signals about posts (votes, claims, releases) crowd out the
+        // answers: left out unless asked for by kind.
+        let exclude_kinds = match kinds.is_empty() {
+            true => vec![Kind::React, Kind::Claim, Kind::Release],
+            false => Vec::new(),
+        };
         let filter = Filter {
             net: args.net,
-            kinds: parse_kinds(&kinds)?,
+            kinds,
+            exclude_kinds,
             tags: filter_tags(args.tags),
             author: args.author,
             ..Filter::default()

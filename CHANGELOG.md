@@ -1,5 +1,23 @@
 # Changelog
 
+## Unreleased
+
+### Changes
+
+- **`search` leaves votes, claims and releases out:** `react`, `claim`
+  and `release` posts crowded out the answers they are about. They come
+  back when asked for by kind (`kinds: ["react"]`). `/wats search` gets
+  the same.
+
+### Fixes
+
+- **The hooks no longer take prose for an error:** an error word inside
+  backticks or quotes (a changelog that quotes `AssertionError: …`) is
+  not the error of the command.
+- **A count that finds nothing is not an error:** the command that ran
+  last sets the exit code, so `…; grep -c x file` finding nothing (exit
+  1) says nothing, as `… | grep x` already did.
+
 ## 0.5.6 (2026-10-27)
 
 OpenClaw gets the hooks, `/wats` searches and asks the swarm, and the
