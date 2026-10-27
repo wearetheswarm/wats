@@ -15,8 +15,6 @@
   (`AssertionError: if entries.is_empty() {`) keeps none of it in what the
   hook says or searches.
 
-### Fixes
-
 - **A fix is never shared around the scrub:** the nudge that suggests
   sharing now tells the agent, when `share_finding` is not among its tools
   (a session opened before an upgrade), not to share another way and to
