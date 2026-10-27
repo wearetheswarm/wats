@@ -393,12 +393,34 @@ const EDIT_TOOLS: &[&str] = &[
     "patch",
 ];
 
+/// A tool's own name, without a host's namespace (Vibe's
+/// `file_system.bash` is `bash`).
+fn bare(tool: &str) -> String {
+    tool.rsplit(['.', '/'])
+        .next()
+        .unwrap_or(tool)
+        .to_lowercase()
+}
+
 fn is_shell(tool: &str) -> bool {
-    SHELL_TOOLS.contains(&tool.to_lowercase().as_str())
+    SHELL_TOOLS.contains(&bare(tool).as_str())
 }
 
 fn is_edit(tool: &str) -> bool {
-    EDIT_TOOLS.contains(&tool.to_lowercase().as_str())
+    EDIT_TOOLS.contains(&bare(tool).as_str())
+}
+
+/// The command without the `cd <dir> && ` that some hosts put first
+/// (Vibe), so that the same command matches across calls.
+fn without_cd(command: &str) -> &str {
+    let mut rest = command.trim();
+    while let Some(after) = rest.strip_prefix("cd ") {
+        match after.split_once("&&") {
+            Some((_, tail)) => rest = tail.trim(),
+            None => break,
+        }
+    }
+    rest
 }
 
 /// A wats MCP tool's short name (`mcp__wats__read`, `wats_read`,
@@ -429,7 +451,9 @@ pub fn shell(payload: &Value) -> Option<Shell> {
     let mut exit: Option<i64> = None;
     let mut output = String::new();
     // Vibe: tool_output {exit_code, stdout, stderr}.
-    for key in ["tool_output", "tool_response", "toolResult"] {
+    // Copilot sends `tool_result` (snake case, with PascalCase event names
+    // in its hook file) or `toolResult`.
+    for key in ["tool_output", "tool_response", "tool_result", "toolResult"] {
         let v = &payload[key];
         match v {
             Value::Object(_) => {
@@ -445,7 +469,13 @@ pub fn shell(payload: &Value) -> Option<Shell> {
                             .as_f64()
                             .map(|f| f as i64)
                     });
-                for field in ["stdout", "stderr", "output", "textResultForLlm"] {
+                for field in [
+                    "stdout",
+                    "stderr",
+                    "output",
+                    "textResultForLlm",
+                    "text_result_for_llm",
+                ] {
                     if let Some(s) = v[field].as_str() {
                         output.push_str(s);
                         output.push('\n');
@@ -484,7 +514,7 @@ pub fn shell(payload: &Value) -> Option<Shell> {
         exit = exit.or(Some(1));
     }
     Some(Shell {
-        command,
+        command: without_cd(&command).to_string(),
         exit,
         output,
     })
@@ -1086,6 +1116,14 @@ mod tests {
             "toolResult": {"resultType": "success",
                 "textResultForLlm": "ok\n<shellId: 3 completed with exit code 0>"}});
         assert_eq!(shell(&done).unwrap().exit, Some(0));
+        // Vibe 3: a namespaced tool, and the command behind a `cd`.
+        let vibe3 = json!({"tool_name": "file_system.bash",
+            "tool_input": {"timeout": 30, "command": "cd /tmp/p && python3 check.py"},
+            "tool_status": "success",
+            "tool_output": {"returncode": 1, "stderr": "ModuleNotFoundError: x", "stdout": ""}});
+        let s = shell(&vibe3).unwrap();
+        assert_eq!((s.command.as_str(), s.exit), ("python3 check.py", Some(1)));
+        assert!(is_edit("file_system.search_replace"));
         // Codex, PostToolUse: output text only.
         let codex = json!({"tool_name": "shell", "tool_input": {"command": ["bash", "-lc", "npm test"]},
             "tool_response": "FAIL src/a.test.ts\nError: expected 2"});

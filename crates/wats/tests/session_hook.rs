@@ -858,3 +858,75 @@ async fn nudges_follow_the_session() {
     assert_eq!(counters.get("nudge_fix"), Some(&1));
     drop(client);
 }
+
+/// Copilot CLI's real payloads (captured on a real install, paths
+/// neutralized): snake case with PascalCase event names, `result_type`
+/// "success" even after exit 1, the exit code only in the text, the edit
+/// a raw patch string. Two failures, the edit and the pass make a fix.
+#[tokio::test(flavor = "multi_thread")]
+async fn copilot_real_payloads_give_both_nudges() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    let dir = tmp.path().join("node");
+    let client = session(&dir, &home, "alice", None).await;
+    call(&client, "status", json!({})).await;
+    let fixture = include_str!("fixtures/hooks/copilot-session.jsonl");
+    let mut said = Vec::new();
+    for line in fixture.lines() {
+        let payload: Value = serde_json::from_str(line).unwrap();
+        let event = match payload["hook_event_name"].as_str() {
+            Some("Stop") => "stop",
+            _ => "post-tool",
+        };
+        said.push(nudge(&dir, &home, "copilot", event, &payload));
+    }
+    let first: Value = serde_json::from_str(said[0].trim()).unwrap();
+    assert!(
+        first["hookSpecificOutput"]["additionalContext"]
+            .as_str()
+            .unwrap()
+            .contains("unknown to the swarm"),
+        "{said:?}"
+    );
+    let stop: Value = serde_json::from_str(said.last().unwrap().trim()).unwrap();
+    assert_eq!(stop["decision"], "block", "{said:?}");
+    assert!(stop["reason"].as_str().unwrap().contains("found a fix"));
+    drop(client);
+}
+
+/// Mistral Vibe 3.0.1's real payloads (captured on a real install, paths
+/// neutralized): namespaced tool names (`file_system.bash`), the exit code
+/// in `tool_output.returncode` with `tool_status` "success", commands
+/// behind `cd <dir> && `, and a `post_agent` with no turn data.
+#[tokio::test(flavor = "multi_thread")]
+async fn vibe_real_payloads_give_both_nudges() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    let dir = tmp.path().join("node");
+    let client = session(&dir, &home, "alice", None).await;
+    call(&client, "status", json!({})).await;
+    let fixture = include_str!("fixtures/hooks/vibe-session.jsonl");
+    let mut said = Vec::new();
+    for line in fixture.lines() {
+        let payload: Value = serde_json::from_str(line).unwrap();
+        let event = match payload["hook_event_name"].as_str() {
+            Some("post_agent") => "stop",
+            _ => "post-tool",
+        };
+        said.push(nudge(&dir, &home, "vibe", event, &payload));
+    }
+    let first: Value = serde_json::from_str(said[0].trim()).unwrap();
+    assert!(
+        first["hook_specific_output"]["additional_context"]
+            .as_str()
+            .unwrap()
+            .contains("unknown to the swarm"),
+        "{said:?}"
+    );
+    let stop: Value = serde_json::from_str(said.last().unwrap().trim()).unwrap();
+    assert_eq!(stop["decision"], "deny", "{said:?}");
+    assert!(stop["reason"].as_str().unwrap().contains("found a fix"));
+    drop(client);
+}
