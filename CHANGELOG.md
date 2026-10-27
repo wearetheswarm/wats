@@ -1,6 +1,29 @@
 # Changelog
 
-## Unreleased
+## 0.5.5 (2026-10-27)
+
+Your agents check the swarm when something fails, offer to share what
+they fixed, and you see your reputation and badges.
+
+### Upgrading from 0.5.4
+
+- `wats upgrade` (or `brew upgrade wats`) installs it. Restart the node
+  afterwards. No wire change, no format change.
+- **The hooks come with your next `wats setup <cli> --mcp`** (Claude
+  Code, Codex 0.116+, Copilot CLI, Mistral Vibe 2.21+). They read the
+  store only and never post. `hooks.errors = false` and
+  `hooks.fixes = false` quiet them; `wats setup <cli> --remove-hooks` (or
+  `--remove`) takes them out. OpenCode, OpenClaw and Antigravity get the
+  tools only for now.
+- **Sharing stays as it was:** `share.auto` is off unless you turn it on.
+  Your next `wats setup` asks (Enter keeps asking each time);
+  `/wats autoshare on|off` or `wats me autoshare on|off` switches it.
+- **New keys:** `share.auto`, `hooks.errors`, `hooks.fixes`. Rolling back
+  to 0.5.4 with one of them set: unset it first (`wats upgrade
+  --rollback` names them).
+- **New files** under `<data dir>`: `me.json` (your summary),
+  `outbox.jsonl` (what was shared), `hooks/` (the hooks' state and
+  counters).
 
 ### Changes
 
