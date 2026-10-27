@@ -203,6 +203,13 @@ const TIP_EVERY: u64 = 24 * 3600;
 /// No tip this long after the person turned autoshare off.
 const TIP_QUIET_AFTER_OFF: u64 = 7 * 24 * 3600;
 
+/// Said with every fix nudge: during an upgrade the hook can be newer than
+/// the session's MCP server, which then has no `share_finding`; seen live,
+/// an agent fell back to a plain `post`, without the scrub.
+const NO_FALLBACK: &str = " If the wats `share_finding` tool is not among your tools, do not \
+     share it any other way (no `post`): tell your user to restart this session, since wats \
+     was upgraded.";
+
 /// The tip to pass on with a "share it?" question, when it is due: at
 /// most once a day per node, never within a week of turning autoshare
 /// off. Recorded and counted (`hint_autoshare`) when given.
@@ -651,18 +658,33 @@ fn error_line(output: &str) -> Option<&str> {
 }
 
 /// The command's first words that name it (`cargo build`, `npm test`).
+///
+/// A command that runs a script given inline or on stdin (`python3 - <<EOF`,
+/// `bash -c '…'`, `node -e …`) gets a short hash of the whole command too:
+/// two different scripts are not the same command (seen live: every
+/// `python3 - <<EOF` counted as one, and made a "fix" of unrelated edits).
 fn head(command: &str) -> String {
     let words: Vec<&str> = command
         .split_whitespace()
         .skip_while(|w| w.contains('=') || *w == "sudo" || *w == "env")
         .take(2)
         .collect();
-    words
+    let head = words
         .iter()
         .take_while(|w| !w.starts_with('-'))
         .copied()
         .collect::<Vec<_>>()
-        .join(" ")
+        .join(" ");
+    let inline = command.contains("<<")
+        || command
+            .split_whitespace()
+            .any(|w| matches!(w, "-" | "-c" | "-e" | "--eval" | "-command"));
+    if inline {
+        let hash = blake3::hash(command.as_bytes()).to_hex();
+        format!("{head}#{}", &hash[..8])
+    } else {
+        head
+    }
 }
 
 /// A build, test or run command.
@@ -751,6 +773,21 @@ pub fn routine(shell: &Shell) -> bool {
     false
 }
 
+/// Whether a word of an error line is a piece of code: brackets, braces,
+/// operators, or a call (`entries.is_empty()`), but not a Rust error code
+/// (`error[E0425]:`).
+fn looks_like_code(w: &str) -> bool {
+    let error_code = w.starts_with("error[") || w.starts_with("warning[");
+    !error_code
+        && (w.chars().any(|c| "(){}[];=<>|&".contains(c))
+            || w.contains("::")
+            || w.contains("->")
+            || (w.contains('.')
+                && !w.ends_with('.')
+                && w.split('.').all(|p| !p.is_empty())
+                && w.chars().any(|c| c == '_')))
+}
+
 /// What a signature shows for a path and for a quoted string: readable
 /// for the person and the model, and nothing of the project.
 const PATH_MARK: &str = "…/…";
@@ -766,6 +803,10 @@ pub fn signature(shell: &Shell, private: &[(&'static str, String)]) -> Option<St
         let w = word.trim_matches(|c: char| c == ',' || c == ';');
         let token = if w.contains('/') || w.contains('\\') {
             PATH_MARK.to_string()
+        } else if looks_like_code(w) {
+            // An error that quotes the project's code (`AssertionError: if
+            // entries.is_empty() {`, seen live) must not carry it.
+            "…".to_string()
         } else if (w.starts_with('\'') || w.starts_with('"') || w.starts_with('`')) && w.len() > 2 {
             QUOTE_MARK.to_string()
         } else if w.chars().any(|c| c.is_ascii_digit())
@@ -785,8 +826,12 @@ pub fn signature(shell: &Shell, private: &[(&'static str, String)]) -> Option<St
     }
     let sig = out.join(" ");
     let sig: String = sig.chars().take(160).collect();
+    // Two words that say something, past the error's class (`error[E…]:`,
+    // `AssertionError:`), and not the bare keywords left of quoted code.
+    const EMPTY: [&str; 8] = ["if", "else", "for", "while", "let", "return", "fn", "def"];
     (sig.split_whitespace()
-        .filter(|w| ![PATH_MARK, QUOTE_MARK, "N", "…"].contains(w))
+        .skip(1)
+        .filter(|w| ![PATH_MARK, QUOTE_MARK, "N", "…"].contains(w) && !EMPTY.contains(w))
         .count()
         >= 2)
         .then_some(sig)
@@ -1142,7 +1187,7 @@ fn stop(request: &Request, session: &mut Session) -> Option<String> {
             format!(
                 "wats: you found a fix for \"{sig}\" after several tries. If it is general (not \
                  specific to this project), share it now with the wats `share_finding` tool: \
-                 this node shares at once (share.auto)."
+                 this node shares at once (share.auto).{NO_FALLBACK}"
             )
         } else {
             let tip =
@@ -1151,7 +1196,7 @@ fn stop(request: &Request, session: &mut Session) -> Option<String> {
                 "wats: you found a fix for \"{sig}\" after several tries. If it is general (not \
                  specific to this project), ask your user whether to share it with the swarm, \
                  and if they agree, call the wats `share_finding` tool with approved_by_user \
-                 true. It earns +2 when someone uses it, +3 if confirmed.{tip}"
+                 true. It earns +2 when someone uses it, +3 if confirmed.{NO_FALLBACK}{tip}"
             )
         });
     }
@@ -1296,6 +1341,30 @@ mod tests {
             signature(&py, &private).as_deref(),
             Some("ModuleNotFoundError: No module named '…'")
         );
+        // An error quoting the project's code keeps none of it.
+        let quoted = failing(
+            "python3 x.py",
+            "AssertionError: if entries.is_empty() { println!(x) }",
+        );
+        assert_eq!(
+            signature(&quoted, &private),
+            None,
+            "nothing generic is left"
+        );
+        let mixed = failing(
+            "cargo build",
+            "error[E0599]: no method named `frob` found for Vec<u8> in scope",
+        );
+        assert_eq!(
+            signature(&mixed, &private).as_deref(),
+            Some("error[E0599]: no method named '…' found for … in scope")
+        );
+        // Inline scripts are told apart.
+        assert_ne!(
+            head("python3 - <<'EOF'\nprint(1)\nEOF"),
+            head("python3 - <<'EOF'\nprint(2)\nEOF")
+        );
+        assert_eq!(head("cargo build --release"), "cargo build");
         // Nothing that says what failed: no signature.
         assert_eq!(signature(&failing("x", "all good"), &private), None);
         assert_eq!(

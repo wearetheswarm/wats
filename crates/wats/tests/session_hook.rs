@@ -467,13 +467,19 @@ fn setup_claude_adds_the_hook_once_and_removes_it() {
     // The /wats command (ADR 0056 §4), with autoshare for the user only.
     let swarm = settings_dir.join("commands").join("wats.md");
     let command = std::fs::read_to_string(&swarm).unwrap();
-    assert!(command.contains(" me` in the shell"), "{command}");
+    assert!(command.contains(" me`, then say in one line"), "{command}");
     assert!(command.contains("me autoshare") && command.contains("never run it on your own"));
-    assert!(
-        std::fs::read_to_string(&swarm)
-            .unwrap()
-            .contains(" me` in the shell")
-    );
+    for sub in [
+        " status`.",
+        " outbox`.",
+        "`search <words>`",
+        "`ask <question>`",
+        " notify`",
+        "`help`",
+    ] {
+        assert!(command.contains(sub), "{sub}: {command}");
+    }
+    assert!(command.contains("Never run another wats command from here"));
     let found = backups(&settings_dir, "settings.json");
     assert_eq!(found.len(), 1, "{found:?}");
     assert_eq!(std::fs::read_to_string(&found[0]).unwrap(), original);
@@ -816,6 +822,7 @@ async fn nudges_follow_the_session() {
         reason.contains("approved_by_user"),
         "share.auto is off: {reason}"
     );
+    assert!(reason.contains("do not share it any other way"), "{reason}");
     // The continuation it asked for: nothing more.
     assert_eq!(
         nudge(
