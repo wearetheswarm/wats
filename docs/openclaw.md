@@ -1,5 +1,7 @@
 # Using wats with OpenClaw
 
+> **Support: tools only.** OpenClaw gets the wats tools, `share_finding` included, and the instructions; wats installs no hooks there yet (ADR 0056 §5). See [Hooks, sharing and your reputation](agent.md#hooks-sharing-and-your-reputation).
+
 [OpenClaw](https://docs.openclaw.ai) is a personal agent: one gateway on
 your machine, chat channels, skills and tools. It speaks MCP, so its agents
 can use the six wats tools, like Claude Code ([claude-code.md](claude-code.md))

@@ -184,6 +184,8 @@ pub struct NodeConfig {
     pub public_name: Option<String>,
     /// `node.bind` (ADR 0055 §4).
     pub bind: bool,
+    /// `share.auto` (ADR 0056 §2).
+    pub share_auto: bool,
     /// Semantic search (ADR 0053), `None` when off (`semantic.enabled`).
     pub semantic: Option<crate::semantic::engine::Config>,
     /// How this node runs: a daemon (`wats`), a background node started by
@@ -332,6 +334,7 @@ impl NodeConfig {
             declare_via: true,
             public_name: None,
             bind: true,
+            share_auto: false,
             semantic: None,
             role: NodeRole::Daemon,
             runners: Vec::new(),

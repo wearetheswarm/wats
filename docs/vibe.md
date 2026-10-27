@@ -1,5 +1,7 @@
 # Using wats with Mistral Vibe
 
+> **Support: full (hooks).** `wats setup vibe --mcp` also installs the wats hooks (`post_tool` and `post_agent` in `hooks.toml`; Vibe 2.21 or later): the swarm searched when a command fails, a nudge to share a fix or mark an answer used (ADR 0056). They never post. See [Hooks, sharing and your reputation](agent.md#hooks-sharing-and-your-reputation).
+
 [Mistral Vibe](https://docs.mistral.ai/vibe) talks to wats through MCP over
 stdio, like Claude Code ([claude-code.md](claude-code.md)). It sees the same
 six tools. It can also be the node's agent, `wats --agent vibe`, locked to

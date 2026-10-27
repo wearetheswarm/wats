@@ -86,6 +86,12 @@ impl Host {
 pub enum HookEvent {
     UserPromptSubmit,
     SessionStart,
+    /// After a tool call (ADR 0056 §1): `wats hook post-tool`.
+    PostToolUse,
+    /// After a failed tool call (Claude Code, Copilot CLI).
+    PostToolUseFailure,
+    /// The end of a turn: `wats hook stop`.
+    Stop,
 }
 
 impl HookEvent {
@@ -97,11 +103,13 @@ impl HookEvent {
         }
     }
 
-    /// The `--event` value.
+    /// The `--event` value (of `notify --hook`), or the `wats hook` event.
     pub fn arg(self) -> &'static str {
         match self {
             Self::UserPromptSubmit => "user-prompt-submit",
             Self::SessionStart => "session-start",
+            Self::PostToolUse | Self::PostToolUseFailure => "post-tool",
+            Self::Stop => "stop",
         }
     }
 
@@ -110,7 +118,18 @@ impl HookEvent {
         match self {
             Self::UserPromptSubmit => "UserPromptSubmit",
             Self::SessionStart => "SessionStart",
+            Self::PostToolUse => "PostToolUse",
+            Self::PostToolUseFailure => "PostToolUseFailure",
+            Self::Stop => "Stop",
         }
+    }
+
+    /// Whether it runs `wats hook` (a nudge) rather than `notify --hook`.
+    pub fn nudges(self) -> bool {
+        matches!(
+            self,
+            Self::PostToolUse | Self::PostToolUseFailure | Self::Stop
+        )
     }
 }
 
@@ -196,6 +215,9 @@ struct Seen {
     /// (ADR 0045 §8): once per reason.
     #[serde(default)]
     accepts: BTreeMap<String, u64>,
+    /// The reputation changes shown until this time (ADR 0056 §3).
+    #[serde(default)]
+    me_until: u64,
 }
 
 /// How many of this profile's newest asks the hook checks the accept of.
@@ -443,10 +465,32 @@ fn news(request: &Request) -> Result<Option<String>> {
             };
         }
     }
+    // Reputation and badge changes (ADR 0056 §3), once each.
+    let mut text = text.map(|(text, _, _)| text);
+    if let Some(me) = crate::me::Me::load(&request.data_dir) {
+        // The first run only remembers where it starts.
+        let changes = if seen.me_until == 0 {
+            Vec::new()
+        } else {
+            crate::me::news(&me, seen.me_until)
+        };
+        if !changes.is_empty() {
+            let block = format!(
+                "wats, your reputation ({}): {}. Tell the user in one line.",
+                me.node,
+                changes.join("; ")
+            );
+            text = Some(match text {
+                Some(t) => format!("{t}\n{block}"),
+                None => block,
+            });
+        }
+        seen.me_until = me.at.max(seen.me_until);
+    }
     if request.mark_seen {
         save(&path, &seen)?;
     }
-    Ok(text.map(|(text, _, _)| text))
+    Ok(text)
 }
 
 /// The clarify's line: the ask it is about, its question, its options.
@@ -611,9 +655,180 @@ pub fn shell_quote(s: &str) -> String {
     }
 }
 
-/// Whether a hook command is ours.
+/// The `/swarm` command (ADR 0056 §4): a Claude Code command file
+/// (`commands/swarm.md`) and a Codex prompt (`prompts/swarm.md`), with
+/// the exact path of this wats.
+pub fn swarm_command(exe: &str, data_dir: Option<&str>) -> String {
+    let mut command = shell_quote(exe);
+    if let Some(dir) = data_dir {
+        command.push_str(&format!(" --dir {}", shell_quote(dir)));
+    }
+    format!(
+        "---\ndescription: Your WeAreTheSwarm reputation, badges and shared findings\n---\n\n\
+         <!-- wats /swarm (ADR 0056); `wats setup` rewrites this file -->\n\
+         Run `{command} me` in the shell and show its output to the user as it is, then say in \
+         one line what changed lately and what would earn more (an answer someone uses: +2; \
+         confirmed or accepted: +3). Do not post anything.\n"
+    )
+}
+
+/// What identifies our nudge hooks (ADR 0056 §1).
+pub const NUDGE_MARKERS: [&str; 2] = [" hook post-tool ", " hook stop "];
+
+/// Whether a hook command is ours: the session hook or a nudge.
 pub fn is_ours(command: &str) -> bool {
-    command.contains(MARKER) && command.contains("wats")
+    let padded = format!("{command} ");
+    command.contains("wats")
+        && (command.contains(MARKER) || NUDGE_MARKERS.iter().any(|m| padded.contains(m)))
+}
+
+/// The nudge hook's command (ADR 0056 §1): `<exe> hook <event> --host
+/// <host> [--dir <dir>]`.
+pub fn nudge_command(exe: &str, host: &str, event: HookEvent, data_dir: Option<&str>) -> String {
+    let mut words = vec![
+        shell_quote(exe),
+        "hook".into(),
+        event.arg().into(),
+        "--host".into(),
+        host.into(),
+    ];
+    if let Some(dir) = data_dir {
+        words.push("--dir".into());
+        words.push(shell_quote(dir));
+    }
+    words.join(" ")
+}
+
+/// The Claude Code events of the nudges.
+pub const CLAUDE_NUDGES: [HookEvent; 3] = [
+    HookEvent::PostToolUse,
+    HookEvent::PostToolUseFailure,
+    HookEvent::Stop,
+];
+
+/// The Codex events of the nudges (its `PostToolUse` runs on failures too).
+pub const CODEX_NUDGES: [HookEvent; 2] = [HookEvent::PostToolUse, HookEvent::Stop];
+
+/// Copilot CLI's hook file of ours, `$COPILOT_HOME/hooks/wats.json` (default
+/// `~/.copilot`): the whole file is ours.
+pub fn copilot_hooks_path(
+    copilot_home: Option<std::ffi::OsString>,
+    home: Option<PathBuf>,
+) -> Option<PathBuf> {
+    copilot_home
+        .filter(|d| !d.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| home.map(|h| h.join(".copilot")))
+        .map(|d| d.join("hooks").join("wats.json"))
+}
+
+/// The content of Copilot CLI's hook file: PascalCase event names, so that
+/// Copilot sends the Claude-style payload `wats hook` reads.
+pub fn copilot_hooks(entries: &[(HookEvent, String)]) -> String {
+    let mut hooks = serde_json::Map::new();
+    for (event, command) in entries {
+        hooks.insert(
+            event.host_name().to_string(),
+            serde_json::json!([{"type": "command", "bash": command, "timeoutSec": HOOK_TIMEOUT_SECS}]),
+        );
+    }
+    let doc = serde_json::json!({"version": 1, "hooks": hooks});
+    format!(
+        "{}\n",
+        serde_json::to_string_pretty(&doc).unwrap_or_default()
+    )
+}
+
+/// The name prefix of our `[[hooks]]` in Vibe's hooks.toml.
+pub const VIBE_HOOK_PREFIX: &str = "wats-";
+
+/// Add or update our hooks in Vibe's hooks.toml `text`: `post_tool` (every
+/// tool) and `post_agent`. `None`: already there.
+pub fn vibe_upsert(text: &str, post_tool: &str, stop: &str) -> Result<Option<String>> {
+    let mut doc: toml_edit::DocumentMut = text.parse().context("invalid TOML")?;
+    let wanted = [
+        ("wats-post-tool", "post_tool", post_tool),
+        ("wats-stop", "post_agent", stop),
+    ];
+    let current = vibe_ours(&doc);
+    let want: Vec<(String, String, String)> = wanted
+        .iter()
+        .map(|(n, t, c)| (n.to_string(), t.to_string(), c.to_string()))
+        .collect();
+    if current == want {
+        return Ok(None);
+    }
+    vibe_strip(&mut doc);
+    let list = doc
+        .entry("hooks")
+        .or_insert_with(|| toml_edit::Item::ArrayOfTables(Default::default()))
+        .as_array_of_tables_mut()
+        .context("`hooks` is not an array of tables")?;
+    for (name, kind, command) in wanted {
+        let mut t = toml_edit::Table::new();
+        t.insert("name", toml_edit::value(name));
+        t.insert("type", toml_edit::value(kind));
+        if kind == "post_tool" {
+            t.insert("match", toml_edit::value("*"));
+        }
+        t.insert("command", toml_edit::value(command));
+        list.push(t);
+    }
+    Ok(Some(doc.to_string()))
+}
+
+/// Remove our hooks from Vibe's hooks.toml `text`. `None`: not there.
+pub fn vibe_remove(text: &str) -> Result<Option<String>> {
+    let mut doc: toml_edit::DocumentMut = text.parse().context("invalid TOML")?;
+    if vibe_ours(&doc).is_empty() {
+        return Ok(None);
+    }
+    vibe_strip(&mut doc);
+    Ok(Some(doc.to_string()))
+}
+
+fn vibe_ours(doc: &toml_edit::DocumentMut) -> Vec<(String, String, String)> {
+    let Some(list) = doc.get("hooks").and_then(|h| h.as_array_of_tables()) else {
+        return Vec::new();
+    };
+    list.iter()
+        .filter_map(|t| {
+            let name = t.get("name")?.as_str()?;
+            name.starts_with(VIBE_HOOK_PREFIX).then(|| {
+                (
+                    name.to_string(),
+                    t.get("type")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or_default()
+                        .to_string(),
+                    t.get("command")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or_default()
+                        .to_string(),
+                )
+            })
+        })
+        .collect()
+}
+
+fn vibe_strip(doc: &mut toml_edit::DocumentMut) {
+    let empty = match doc
+        .get_mut("hooks")
+        .and_then(|h| h.as_array_of_tables_mut())
+    {
+        Some(list) => {
+            list.retain(|t| {
+                !t.get("name")
+                    .and_then(|n| n.as_str())
+                    .is_some_and(|n| n.starts_with(VIBE_HOOK_PREFIX))
+            });
+            list.is_empty()
+        }
+        None => false,
+    };
+    if empty {
+        doc.remove("hooks");
+    }
 }
 
 /// Claude Code's settings file for `scope`: user (`$CLAUDE_CONFIG_DIR/settings.json`,
@@ -1313,6 +1528,82 @@ mod ojson {
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::indexing_slicing)]
 mod tests {
+    /// ADR 0056 §5: the nudges go next to the session hooks, are found
+    /// again (no duplicate), and go with them.
+    #[test]
+    fn nudges_install_once_and_go() {
+        let exe = "/usr/local/bin/wats";
+        let mut entries: Vec<(HookEvent, String)> = CLAUDE_EVENTS
+            .iter()
+            .map(|e| (*e, command_line(exe, Host::Claude, *e, "alice", None)))
+            .collect();
+        for e in CLAUDE_NUDGES {
+            entries.push((e, nudge_command(exe, "claude", e, None)));
+        }
+        let text = claude_upsert("{}", &entries).unwrap().unwrap();
+        for event in ["PostToolUse", "PostToolUseFailure", "Stop", "SessionStart"] {
+            assert!(text.contains(event), "{event}: {text}");
+        }
+        assert!(text.contains("wats hook post-tool --host claude"), "{text}");
+        assert_eq!(
+            claude_upsert(&text, &entries).unwrap(),
+            None,
+            "already there"
+        );
+        let removed = claude_remove(&text).unwrap().unwrap();
+        assert!(!removed.contains("wats"), "{removed}");
+        // Codex: the nudges in [[hooks.PostToolUse]] and [[hooks.Stop]].
+        let codex: Vec<(HookEvent, String)> = CODEX_NUDGES
+            .iter()
+            .map(|e| (*e, nudge_command(exe, "codex", *e, Some("/d"))))
+            .collect();
+        let toml = codex_upsert("", "hooks", &codex).unwrap().unwrap();
+        assert!(
+            toml.contains("[[hooks.PostToolUse]]") && toml.contains("[[hooks.Stop]]"),
+            "{toml}"
+        );
+        assert!(toml.contains("hook stop --host codex --dir /d"), "{toml}");
+        assert_eq!(codex_upsert(&toml, "hooks", &codex).unwrap(), None);
+        assert!(!codex_remove(&toml).unwrap().unwrap().contains("wats"));
+        // A command that only mentions hooks is not ours.
+        assert!(!is_ours("/usr/bin/other-hook stop"));
+    }
+
+    #[test]
+    fn vibe_and_copilot_hook_files() {
+        let mine = "[[hooks]]\nname = \"lint\"\ntype = \"post_tool\"\ncommand = \"lint\"\n";
+        let new = vibe_upsert(
+            mine,
+            "wats hook post-tool --host vibe",
+            "wats hook stop --host vibe",
+        )
+        .unwrap()
+        .unwrap();
+        assert!(new.contains("name = \"lint\""), "theirs kept: {new}");
+        assert!(new.contains("type = \"post_agent\""), "{new}");
+        assert_eq!(
+            vibe_upsert(
+                &new,
+                "wats hook post-tool --host vibe",
+                "wats hook stop --host vibe"
+            )
+            .unwrap(),
+            None
+        );
+        let back = vibe_remove(&new).unwrap().unwrap();
+        assert!(back.contains("lint") && !back.contains("wats"), "{back}");
+        let json: serde_json::Value = serde_json::from_str(&copilot_hooks(&[(
+            HookEvent::PostToolUse,
+            "wats hook post-tool --host copilot".into(),
+        )]))
+        .unwrap();
+        assert_eq!(json["version"], 1);
+        assert_eq!(
+            json["hooks"]["PostToolUse"][0]["bash"],
+            "wats hook post-tool --host copilot"
+        );
+    }
+
     use super::*;
 
     const CMD: &str = "/usr/local/bin/wats notify --hook --host claude --event user-prompt-submit --profile alice";

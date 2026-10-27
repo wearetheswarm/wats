@@ -738,6 +738,9 @@ pub const KEYS_SINCE: &[(&str, Version)] = &[
     ("node.bind", Version(0, 5, 4)),
     ("agent.bind", Version(0, 5, 4)),
     ("reputation.node_flag", Version(0, 5, 4)),
+    ("share.auto", Version(0, 5, 5)),
+    ("hooks.errors", Version(0, 5, 5)),
+    ("hooks.fixes", Version(0, 5, 5)),
 ];
 
 /// The keys set in `data_dir`'s config.toml that wats `version` does not

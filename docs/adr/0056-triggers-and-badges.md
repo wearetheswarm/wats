@@ -317,6 +317,53 @@ Everything is in 0.5.5:
 4. **Docs:** agent.md and each CLI's page mark the host as "full support
    (hooks)" or "tools only". The site mirrors it.
 
+## Implementation notes (0.5.5)
+
+- **The turn is read from a journal, not the transcript.** `wats hook
+  post-tool` runs after every tool call and records each step in
+  `<data dir>/hooks/session-<id>.json`: a shell command (its first words,
+  whether it failed, its error's signature, whether it is a build, test
+  or run), an edit, a swarm read, a react. `wats hook stop` reads the
+  turn from there. That works the same in every host, and does not
+  depend on when a host flushes its transcript.
+- **A failure** is an exit code other than 0 where the host gives one
+  (Claude Code's `PostToolUseFailure`, Vibe's `exit_code`). Where it does
+  not (Codex, Copilot's `postToolUse`), it is a build, test or run
+  command whose output has an error line.
+- **The error line** is the one that names the error
+  (`ModuleNotFoundError: …`, `error[E0425]: …`, `panicked at`), never a
+  traceback header. **The lookup** is full-text, over the line's
+  distinctive words, and needs about 60% of them in the hit.
+- **Outputs:**
+  - Claude Code, Codex, Copilot: `hookSpecificOutput.additionalContext`
+    after a tool; `{"decision": "block", "reason"}` at Stop, never when
+    `stop_hook_active`.
+  - Vibe: `hook_specific_output.additional_context`, and `decision:
+    deny` with the reason at `post_agent`.
+- **Copilot** gets PascalCase event names, so it sends the Claude-style
+  payload.
+- **Our entries are recognized** by ` hook post-tool ` or ` hook stop `
+  in the command (and `notify --hook` as before). In Vibe's `hooks.toml`
+  they are recognized by the `wats-` name prefix.
+- **Counters** go to `<data dir>/hooks/counters.json`, since a hook reads
+  the store only: `hook_post_tool`, `hook_stop`, `nudge_error`,
+  `nudge_fix`, `nudge_relied`, and the nudges acted on (`nudge_search`,
+  `nudge_share`, `nudge_used`).
+- **The summary** (`me.json`) is written by the node:
+  - at start, then at most once a minute after a sign about its posts,
+    and hourly;
+  - `wats status --line` reads that file;
+  - the session hook reads it too, and tells each change once.
+- **`share_finding`** posts the ask (`data.self_answered`, mode `n`,
+  want 1) and the answer (`data.evidence`). It is refused:
+  - without `scrubbed`;
+  - without `approved_by_user` unless `share.auto`;
+  - in an agent run unless `share.auto`;
+  - in a session held for review.
+- **Real-install checks:** `scripts/verify-hooks.sh <cli>` sets up a
+  throwaway project with project-local hooks and a hermetic node;
+  `check <dir>` says PASS or FAIL; `clean <dir>` removes it all.
+
 ## Consequences
 
 - Agents get nudged at the moment it matters, from facts, not memory.

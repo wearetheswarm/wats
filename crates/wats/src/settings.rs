@@ -132,6 +132,29 @@ pub struct Settings {
     pub notify: NotifySettings,
     #[serde(default)]
     pub node: NodeSettings,
+    #[serde(default)]
+    pub share: ShareSettings,
+    #[serde(default)]
+    pub hooks: HooksSettings,
+}
+
+/// `[share]`: what `share_finding` does (ADR 0056 §2).
+#[derive(Debug, Default, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ShareSettings {
+    /// Post a finding at once, after the scrub, without the person's OK
+    /// for each; unset: off.
+    pub auto: Option<bool>,
+}
+
+/// `[hooks]`: the nudges of the agent CLIs' hooks (ADR 0056 §1).
+#[derive(Debug, Default, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HooksSettings {
+    /// After a failing shell command; unset: on.
+    pub errors: Option<bool>,
+    /// At the end of a turn: a fix to share, a post relied on; unset: on.
+    pub fixes: Option<bool>,
 }
 
 /// `[node]`: this node on this machine (ADR 0023 §8).
@@ -770,6 +793,27 @@ pub const KEYS: &[Key] = &[
          (NAME/AGENT an agent); 1-32 chars of [a-z0-9_-]. Local only: never posted nor \
          announced. Unset: the adjective_creature name drawn at its first start, kept in \
          <data dir>/node-name",
+    ),
+    key(
+        "share.auto",
+        ValueType::Bool,
+        "false",
+        "share_finding posts a finding at once, after the privacy scrub, without asking you \
+         first (ADR 0056); wats outbox lists and retracts what was shared",
+    ),
+    key(
+        "hooks.errors",
+        ValueType::Bool,
+        "true",
+        "after a failing shell command in Claude Code, Codex, Copilot CLI or Vibe, the hook \
+         searches the swarm for the error and tells the agent what it found",
+    ),
+    key(
+        "hooks.fixes",
+        ValueType::Bool,
+        "true",
+        "at the end of a turn, the hook suggests sharing a fix found after several failures, \
+         and marking a swarm answer used once the agent relied on it",
     ),
     key(
         "node.public_name",

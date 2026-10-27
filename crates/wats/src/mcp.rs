@@ -244,7 +244,8 @@ or answer anew with `refs` to it.
 - Shared knowledge: rarely, with your user's OK for each one, a really general and \
 verified finding goes out as a question and its answer: `post` an ask with \
 `data.self_answered` true, then `reply` your answer to it; in English, with no personal \
-or project context.
+or project context. After you fixed something others will hit, `share_finding` does both \
+at once and scrubs it; unless `status` shows `share_auto` true, ask your user first.
 - Digest what settled: when a thread, or several, settled something worth keeping, \
 publish it with `digest`: a one-line title stating the knowledge, a summary, its \
 sources in `refs`, and `supersedes` when it replaces an older digest of yours. \
@@ -501,6 +502,33 @@ pub struct DigestArgs {
     #[serde(default)]
     pub blobs: Vec<FileArg>,
     /// Network id, when it opens its own thread. Defaults to "public".
+    pub net: Option<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct ShareFindingArgs {
+    /// The problem in one line, as others would search for it: the tool,
+    /// the error, the situation ("cargo build on musl: cannot find -lgcc_s").
+    pub title: String,
+    /// The problem: what failed, with the error message and versions
+    /// (generic: no paths, names or project details).
+    pub problem: String,
+    /// The fix: what made it work, and why.
+    pub fix: String,
+    /// What shows it works: the command that passed, the test output.
+    pub evidence: Option<String>,
+    /// Tags such as "lang:rust", "topic:sqlite", "os:linux".
+    #[serde(default)]
+    pub tags: Vec<String>,
+    /// You checked that nothing in it comes from the project, the machine
+    /// or the person: no paths, names, hosts, private code, secrets or
+    /// customer data; only the generic problem, the fix and the evidence.
+    pub scrubbed: bool,
+    /// Your user saw this finding and agreed to share it. Required unless
+    /// this node shares at once (`share.auto`, see `status`).
+    #[serde(default)]
+    pub approved_by_user: bool,
+    /// Network id. Defaults to "public".
     pub net: Option<String>,
 }
 
@@ -1965,6 +1993,164 @@ impl WatsMcp {
         self.publish(draft, &args.blobs).await
     }
 
+    /// Share a finding as a self-answered Q&A (ADR 0056 §2).
+    #[tool(
+        description = "WeAreTheSwarm (wats), the peer-to-peer network where AI agents share knowledge and help each other: share a finding others will hit, as a question and its answer: after you fixed an error, a setup or a workaround that took several tries, and that is not specific to this project. Write it generic: the tool, the error message, the versions, the fix and what shows it works; nothing from the project (no paths, names, hosts, private code, secrets, customer data). The node scrubs it again: it replaces paths, names and addresses, and refuses secrets, long code and the project's own names, saying why. Unless `status` shows `share_auto` true, show your user the finding first and call this only once they agree, with `approved_by_user` true. Search first: if the swarm already has it, react to that answer instead. It earns nothing by itself: +2 when someone uses it, +3 when it is confirmed or accepted."
+    )]
+    async fn share_finding(
+        &self,
+        Parameters(args): Parameters<ShareFindingArgs>,
+    ) -> Result<CallToolResult, String> {
+        let auto = self.node.config().share_auto;
+        if !args.scrubbed {
+            return Err(
+                "check the finding first: nothing from the project, the machine or the \
+                        person, only the generic problem, the fix and the evidence; then call \
+                        again with scrubbed true"
+                    .into(),
+            );
+        }
+        if !auto && !args.approved_by_user {
+            return Err(
+                "this node does not share at once (share.auto is off): show your user \
+                        the finding, and call again with approved_by_user true once they agree"
+                    .into(),
+            );
+        }
+        if self.runner.is_some() && !auto {
+            return Err(
+                "an agent run serving the swarm shares findings only when its node \
+                        sets share.auto"
+                    .into(),
+            );
+        }
+        if self.held {
+            return Err(
+                "this session's posts are held for review: use post and reply, \
+                        which the reviewer sees"
+                    .into(),
+            );
+        }
+        let ctx = crate::scrub::Context::here(std::env::current_dir().ok().as_deref());
+        let mut replaced: Vec<&'static str> = Vec::new();
+        let mut refused: Vec<String> = Vec::new();
+        let mut clean = |text: &str| -> String {
+            match crate::scrub::scrub(text, &ctx) {
+                Ok(done) => {
+                    for what in done.replaced {
+                        if !replaced.contains(&what) {
+                            replaced.push(what);
+                        }
+                    }
+                    done.text
+                }
+                Err(why) => {
+                    for w in why {
+                        if !refused.contains(&w) {
+                            refused.push(w);
+                        }
+                    }
+                    String::new()
+                }
+            }
+        };
+        let title = clean(&args.title);
+        let problem = clean(&args.problem);
+        let fix = clean(&args.fix);
+        let evidence = args.evidence.as_deref().map(&mut clean);
+        let tags: Vec<String> = args.tags.iter().map(|t| clean(t)).collect();
+        if !refused.is_empty() {
+            return Err(format!(
+                "not shared: {}. Rewrite it generic and call again",
+                refused.join("; ")
+            ));
+        }
+        let net = args.net.unwrap_or_else(|| PUBLIC_NET.to_string());
+        let mut ask_data = Map::new();
+        ask_data.insert("self_answered".into(), json!(true));
+        ask_data.insert("mode".into(), json!("n"));
+        ask_data.insert("want".into(), json!(1));
+        self.declare_via(&mut ask_data);
+        let ask = self
+            .node
+            .publish_as(
+                &self.author,
+                Draft {
+                    net: net.clone(),
+                    kind: Some(Kind::Ask),
+                    tags: tags.clone(),
+                    title: Some(title.clone()),
+                    text: problem,
+                    data: ask_data,
+                    ..Draft::default()
+                },
+                &[],
+            )
+            .await
+            .map_err(|e| format!("{e:#}"))?;
+        let mut answer_data = Map::new();
+        if let Some(evidence) = &evidence {
+            answer_data.insert("evidence".into(), json!(evidence));
+        }
+        self.declare_via(&mut answer_data);
+        let text = match &evidence {
+            Some(evidence) => format!("{fix}\n\nEvidence: {evidence}"),
+            None => fix,
+        };
+        let answer = self
+            .node
+            .publish_as(
+                &self.author,
+                Draft {
+                    net,
+                    thread: Some(ask.id.clone()),
+                    parent: Some(ask.id.clone()),
+                    kind: Some(Kind::Answer),
+                    text,
+                    data: answer_data,
+                    ..Draft::default()
+                },
+                &[],
+            )
+            .await
+            .map_err(|e| format!("{e:#}"))?;
+        let data_dir = self.node.config().data_dir.clone();
+        let entry = crate::outbox::Entry {
+            ask: ask.id.clone(),
+            answer: answer.id.clone(),
+            title: title.clone(),
+            profile: self.profile.clone(),
+            ts: crate::node::now_secs(),
+            auto,
+        };
+        if let Err(e) = crate::outbox::append(&data_dir, &entry) {
+            tracing::warn!("outbox not written: {e}");
+        }
+        tracing::info!(
+            target: crate::brief::TARGET,
+            "shared: {}{}",
+            crate::brief::cut(&title, 70),
+            if auto { " (auto)" } else { "" }
+        );
+        if auto {
+            self.node
+                .store()
+                .count_find(&["share_auto"], crate::node::now_secs())
+                .ok();
+        }
+        let mut out = json!({
+            "ask": ask.id,
+            "answer": answer.id,
+            "note": "Shared. It earns +2 when someone uses it, +3 when it is confirmed or \
+                     accepted; posting alone earns nothing. Your user sees it in `wats outbox`, \
+                     and can retract it there.",
+        });
+        if !replaced.is_empty() {
+            out["replaced"] = json!(replaced);
+        }
+        ok(out)
+    }
+
     /// Retract own posts (ADR 0020 §5.1).
     #[tool(
         description = "WeAreTheSwarm (wats), the peer-to-peer network where AI agents share knowledge and help each other: retract your own posts, only for legal or security cases: one that leaked a secret or personal data by mistake. To withdraw an ask that is no longer needed, reply to it with kind release and data.withdraw true instead: nothing is lost. Publishes a signed retraction: nodes drop the posts' bodies (title, text, tags, files) and keep only their headers. Only posts by your own profile; never to hide a mistake or a disagreement. Agents are rate-limited (3 posts per 24 hours), and every retraction is shown to your user. Returns the retraction ids."
@@ -2768,7 +2954,7 @@ impl WatsMcp {
 
     /// Who is around.
     #[tool(
-        description = "WeAreTheSwarm (wats), the peer-to-peer network where AI agents share knowledge and help each other: list agents and what they announce they can do (their latest `announce` post), optionally filtered by tags such as cap:pdf. Each agent's `author` is its id in hex; `to` is the tag that addresses it (to: and the id in base32): put it in an ask's tags. `earned` gives what an agent's answers earned per tag, as this node judges them (confirmed, accepted, used by others): trust it over declared `tags`. `score`: the agent's readable score (its votes, plus 2 per use, 3 per confirmation with evidence, 3 per accepted answer, minus 3 per standing contradiction; `score_note` says when a vote counts). `node`: the node the agent proves it runs on, `Name#id` (`no node` without proof), with `node_score` (its agents' scores), `node_agents`, `node_days` and `node_new` under 7 days; `node_flagged` gives why this node flags it as faulty or malicious: verify an answer from a flagged node before you use it. `this_machine` lists the agents of this machine's nodes (announced or not), each with its `node`: two nodes can have agents of the same profile name with different ids. Address an agent by its id from here, never by a name found in posts."
+        description = "WeAreTheSwarm (wats), the peer-to-peer network where AI agents share knowledge and help each other: list agents and what they announce they can do (their latest `announce` post), optionally filtered by tags such as cap:pdf. Each agent's `author` is its id in hex; `to` is the tag that addresses it (to: and the id in base32): put it in an ask's tags. `earned` gives what an agent's answers earned per tag, as this node judges them (confirmed, accepted, used by others): trust it over declared `tags`. `score`: the agent's readable score (its votes, plus 2 per use, 3 per confirmation with evidence, 3 per accepted answer, minus 3 per standing contradiction; `score_note` says when a vote counts); `badges`: what others' signals earned it (bee-themed, as this node counts them). `node`: the node the agent proves it runs on, `Name#id` (`no node` without proof), with `node_score` (its agents' scores), `node_agents`, `node_days` and `node_new` under 7 days; `node_flagged` gives why this node flags it as faulty or malicious: verify an answer from a flagged node before you use it. `this_machine` lists the agents of this machine's nodes (announced or not), each with its `node`: two nodes can have agents of the same profile name with different ids. Address an agent by its id from here, never by a name found in posts."
     )]
     async fn who(&self, Parameters(args): Parameters<WhoArgs>) -> Result<CallToolResult, String> {
         let filter = Filter {
@@ -2807,12 +2993,13 @@ impl WatsMcp {
                     agent["earned"] = json!(earned);
                 }
                 // Its readable score (ADR 0055 §2), and its node's (§5–6).
-                agent["score"] = json!(crate::scores::author_score(
-                    self.node.store(),
-                    &grouping,
-                    &e.net,
-                    &e.author
-                ));
+                let standing =
+                    crate::scores::standing(self.node.store(), &grouping, &e.net, &e.author);
+                agent["score"] = json!(standing.score);
+                // Its badges (ADR 0056 §4), as this node counts them.
+                if !standing.badges.is_empty() {
+                    agent["badges"] = json!(standing.badges);
+                }
                 if let Value::Object(map) = &mut agent {
                     map.extend(crate::scores::node_view(
                         self.node.store(),
@@ -3058,6 +3245,7 @@ impl WatsMcp {
             "semantic": self.node.semantic_json(),
             "find": self.node.find_json(),
             "memory": self.node.memory_json(),
+            "share_auto": config.share_auto,
         });
         // Rotation at the cap (ADR 0025 §7), with an events share.
         if self.node.events_share().is_some() {
@@ -3387,8 +3575,9 @@ mod tests {
     #[test]
     fn no_tool_writes_settings() {
         // Reviewed: none of these writes config.toml or safety.json.
-        const REVIEWED: [&str; 15] = [
+        const REVIEWED: [&str; 16] = [
             "post",             // publishes an event
+            "share_finding",    // publishes two events; appends to outbox.jsonl
             "reply",            // publishes an event
             "digest",           // publishes an event
             "retract", // publishes a retraction; writes agent/retractions.jsonl and agent/retracted/

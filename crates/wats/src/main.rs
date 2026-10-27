@@ -453,6 +453,19 @@ enum Command {
         #[arg(long, default_value = "user-prompt-submit", value_parser = ["user-prompt-submit", "session-start"])]
         event: String,
     },
+    /// A nudge hook of an agent CLI (ADR 0056 §1), run after each tool
+    /// call (`post-tool`) and at the end of a turn (`stop`): reads the
+    /// host's payload on stdin, prints a nudge into the agent's context or
+    /// nothing, always exits 0. Installed by `wats setup`. Not for people.
+    #[command(hide = true)]
+    Hook {
+        /// post-tool or stop.
+        #[arg(value_parser = ["post-tool", "stop"])]
+        event: String,
+        /// The CLI running it.
+        #[arg(long, value_parser = ["claude", "codex", "copilot", "vibe"])]
+        host: String,
+    },
     /// The tool gate of an agent run (ADR 0038 §2.1), called by its
     /// runtime's hook: reads the hook payload on stdin, prints the
     /// decision. Not for people.
@@ -556,6 +569,11 @@ enum Command {
         /// Print JSON instead of `key: value` lines.
         #[arg(long)]
         json: bool,
+        /// One short line for a status line (ADR 0056 §4): `🐝 52 ▲2 · 3
+        /// badges`, your reputation summed over this machine's nodes. It
+        /// reads the summary the node keeps, fast enough for every prompt.
+        #[arg(long, conflicts_with = "json")]
+        line: bool,
         /// The node of this machine named NAME (`wats ps`) [default:
         /// --dir, else ~/.wats].
         #[arg(short = 'n', long = "node", value_name = "NAME")]
@@ -678,6 +696,25 @@ enum Command {
     /// the running node, or a short-lived one that pushes the retraction to
     /// the peers it meets. No limit for you; agents have a rate-limited MCP
     /// tool.
+    /// Your reputation (ADR 0056 §3–4): the score others' signals gave
+    /// this node's posts, its last changes and why, your badges, your
+    /// shared findings and what happened to them, and your node's public
+    /// name. The other nodes of this machine are summed in.
+    Me {
+        /// Print JSON instead.
+        #[arg(long)]
+        json: bool,
+    },
+    /// What `share_finding` shared from this node (ADR 0056 §2), with each
+    /// post's fate: its score, uses and status. `retract <id>` takes one
+    /// back (its question and its answer).
+    Outbox {
+        #[command(subcommand)]
+        action: Option<OutboxAction>,
+        /// Print JSON instead.
+        #[arg(long)]
+        json: bool,
+    },
     Retract {
         /// Ids of the posts (1 or more; 32 per retraction event, more are
         /// split).
@@ -836,6 +873,18 @@ struct GuardianKey {
     /// later from any machine with `wats guardian publish`).
     #[arg(long)]
     offline: bool,
+}
+
+#[derive(Debug, Subcommand)]
+enum OutboxAction {
+    /// Retract a shared finding: its question and its answer (ADR 0020
+    /// §5.1), by the id of either, or its first 8 characters.
+    Retract {
+        id: String,
+        /// A short, generic reason, published with the retraction.
+        #[arg(long)]
+        reason: Option<String>,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -2579,6 +2628,22 @@ fn hook_command(
     ))
 }
 
+/// The nudge hook command for `host` (ADR 0056 §1): this binary, `hook
+/// <event> --host <host>`, and the data directory when given.
+fn nudge_hook_command(args: &NodeArgs, host: &str, event: wats::hook::HookEvent) -> Result<String> {
+    let exe = wats::update::stable_exe()?;
+    let dir = match &args.dir {
+        Some(dir) => Some(std::path::absolute(dir)?.to_string_lossy().into_owned()),
+        None => None,
+    };
+    Ok(wats::hook::nudge_command(
+        &exe.to_string_lossy(),
+        host,
+        event,
+        dir.as_deref(),
+    ))
+}
+
 /// Whether to add the session hook: asked on a terminal (default yes)
 /// when `ask`, yes otherwise (the wizard's "all" of step 2 says yes).
 fn want_hook(args: &NodeArgs, name: &str, ask: bool) -> Result<bool> {
@@ -2589,8 +2654,10 @@ fn want_hook(args: &NodeArgs, name: &str, ask: bool) -> Result<bool> {
         &mut std::io::stdin().lock(),
         &mut std::io::stdout(),
         &format!(
-            "Add a session hook, so that {name} hears of the answers and clarifies to your asks \
-             at each prompt (`wats notify --hook`, read-only, silent when nothing is new)?"
+            "Add the wats hooks, so that {name} hears of the answers and clarifies to your asks \
+             at each prompt, searches the swarm when a command fails, and is reminded to share \
+             a fix or mark an answer used (`wats notify --hook`, `wats hook`: read-only, they \
+             never post, silent when there is nothing to say)?"
         ),
         true,
     )
@@ -2639,19 +2706,26 @@ fn install_claude_hooks(args: &NodeArgs, profile: &str, scope: &str, ask: bool) 
         return Ok(());
     }
     let path = claude_settings(scope)?;
-    let entries = CLAUDE_EVENTS
+    if let Some(dir) = path.parent() {
+        install_swarm_command(args, "Claude Code", &dir.join("commands").join("swarm.md"))?;
+    }
+    let mut entries = CLAUDE_EVENTS
         .iter()
         .map(|e| Ok((*e, hook_command(args, Host::Claude, *e, profile)?)))
         .collect::<Result<Vec<_>>>()?;
+    for e in wats::hook::CLAUDE_NUDGES {
+        entries.push((e, nudge_hook_command(args, "claude", e)?));
+    }
     let text = read_or_empty(&path)?;
     match wats::hook::claude_upsert(&text, &entries)
         .with_context(|| format!("{}: left as it is", path.display()))?
     {
-        None => println!("Claude Code: session hook already in {}", path.display()),
+        None => println!("Claude Code: hooks already in {}", path.display()),
         Some(new) => {
             println!(
-                "Claude Code: session hook (UserPromptSubmit, SessionStart) in {}: your sessions \
-                 hear of the answers and clarifies to your asks",
+                "Claude Code: hooks (UserPromptSubmit, SessionStart; PostToolUse, \
+                 PostToolUseFailure, Stop) in {}: your sessions hear of the answers and clarifies \
+                 to your asks, and get nudged when the swarm can help (ADR 0056)",
                 path.display()
             );
             write_settings(&path, &new)?;
@@ -2682,16 +2756,27 @@ fn install_codex_hooks(
         return Ok(());
     }
     let path = codex_config()?;
-    let events = wats::hook::codex_events(wats::hook::codex_version(codex));
-    let entries = events
+    if let Some(dir) = path.parent() {
+        install_swarm_command(args, "Codex", &dir.join("prompts").join("swarm.md"))?;
+    }
+    let version = wats::hook::codex_version(codex);
+    let mut events: Vec<wats::hook::HookEvent> = wats::hook::codex_events(version).to_vec();
+    let mut entries = events
         .iter()
         .map(|e| Ok((*e, hook_command(args, Host::Codex, *e, profile)?)))
         .collect::<Result<Vec<_>>>()?;
+    // The nudges (ADR 0056 §5), where Codex has PostToolUse and Stop.
+    if version.is_some_and(|v| v >= wats::hook::CODEX_PROMPT_HOOK_SINCE) {
+        for e in wats::hook::CODEX_NUDGES {
+            entries.push((e, nudge_hook_command(args, "codex", e)?));
+            events.push(e);
+        }
+    }
     let text = read_or_empty(&path)?;
     match wats::hook::codex_upsert(&text, feature, &entries)
         .with_context(|| format!("{}: left as it is", path.display()))?
     {
-        None => println!("Codex: session hook already in {}", path.display()),
+        None => println!("Codex: hooks already in {}", path.display()),
         Some(new) => {
             let names: Vec<String> = events
                 .iter()
@@ -2713,6 +2798,136 @@ fn install_codex_hooks(
                  not install only after that"
             );
         }
+    }
+    Ok(())
+}
+
+/// Write the `/swarm` command (ADR 0056 §4) to `path` (a Claude Code
+/// command, a Codex prompt), when it is ours or absent.
+fn install_swarm_command(args: &NodeArgs, name: &str, path: &std::path::Path) -> Result<()> {
+    let exe = wats::update::stable_exe()?;
+    let dir = match &args.dir {
+        Some(dir) => Some(std::path::absolute(dir)?.to_string_lossy().into_owned()),
+        None => None,
+    };
+    let text = wats::hook::swarm_command(&exe.to_string_lossy(), dir.as_deref());
+    let current = read_or_empty(path)?;
+    if current == text {
+        return Ok(());
+    }
+    if !current.is_empty() && !current.contains("wats /swarm") {
+        println!("{name}: {} is not ours: /swarm left out", path.display());
+        return Ok(());
+    }
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(path, text)?;
+    println!(
+        "{name}: /swarm (your reputation, badges and shares) in {}",
+        path.display()
+    );
+    Ok(())
+}
+
+/// Copilot CLI's nudge hooks (ADR 0056 §5), in a hook file of their own.
+fn install_copilot_hooks(args: &NodeArgs, ask: bool) -> Result<()> {
+    use wats::hook::HookEvent;
+    if !want_hook(args, "Copilot CLI", ask)? {
+        println!("Copilot CLI: no hooks (add them later: wats setup copilot --mcp)");
+        return Ok(());
+    }
+    let path =
+        wats::hook::copilot_hooks_path(std::env::var_os("COPILOT_HOME"), std::env::home_dir())
+            .context("no home directory: set COPILOT_HOME")?;
+    let entries = [
+        HookEvent::PostToolUse,
+        HookEvent::PostToolUseFailure,
+        HookEvent::Stop,
+    ]
+    .into_iter()
+    .map(|e| Ok((e, nudge_hook_command(args, "copilot", e)?)))
+    .collect::<Result<Vec<_>>>()?;
+    let new = wats::hook::copilot_hooks(&entries);
+    if read_or_empty(&path)? == new {
+        println!("Copilot CLI: hooks already in {}", path.display());
+        return Ok(());
+    }
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    println!(
+        "Copilot CLI: hooks (PostToolUse, PostToolUseFailure, Stop) in {}: your sessions get \
+         nudged when the swarm can help (ADR 0056)",
+        path.display()
+    );
+    write_settings(&path, &new)
+}
+
+/// Remove Copilot CLI's hook file of ours.
+fn remove_copilot_hooks() -> Result<()> {
+    let Some(path) =
+        wats::hook::copilot_hooks_path(std::env::var_os("COPILOT_HOME"), std::env::home_dir())
+    else {
+        return Ok(());
+    };
+    match std::fs::remove_file(&path) {
+        Ok(()) => println!("Copilot CLI: hooks removed ({})", path.display()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e).with_context(|| format!("remove {}", path.display())),
+    }
+    Ok(())
+}
+
+/// Vibe's hooks.toml: `.vibe/` with --project, else Vibe's home.
+fn vibe_hooks_path(project: bool) -> Result<PathBuf> {
+    Ok(if project {
+        std::path::absolute(".vibe")?
+    } else {
+        wats::vibe::home(std::env::var_os("VIBE_HOME"), std::env::home_dir())
+            .context("no home directory: set VIBE_HOME")?
+    }
+    .join("hooks.toml"))
+}
+
+/// Vibe's nudge hooks (ADR 0056 §5): `post_tool` and `post_agent`.
+fn install_vibe_hooks(args: &NodeArgs, project: bool) -> Result<()> {
+    use wats::hook::HookEvent;
+    // Not asked: `setup vibe --mcp` asks nothing else either; it says
+    // what it wrote and how to take it back.
+    let path = vibe_hooks_path(project)?;
+    let post = nudge_hook_command(args, "vibe", HookEvent::PostToolUse)?;
+    let stop = nudge_hook_command(args, "vibe", HookEvent::Stop)?;
+    let text = read_or_empty(&path)?;
+    match wats::hook::vibe_upsert(&text, &post, &stop)
+        .with_context(|| format!("{}: left as it is", path.display()))?
+    {
+        None => println!("Mistral Vibe: hooks already in {}", path.display()),
+        Some(new) => {
+            if let Some(dir) = path.parent() {
+                std::fs::create_dir_all(dir)?;
+            }
+            println!(
+                "Mistral Vibe: hooks (post_tool, post_agent) in {}: your sessions get nudged \
+                 when the swarm can help (ADR 0056; Vibe 2.21 or later; `hooks.errors = false` \
+                 and `hooks.fixes = false` quiet them, `wats setup vibe --remove` removes them)",
+                path.display()
+            );
+            write_settings(&path, &new)?;
+        }
+    }
+    Ok(())
+}
+
+/// Remove our hooks from Vibe's hooks.toml.
+fn remove_vibe_hooks(project: bool) -> Result<()> {
+    let path = vibe_hooks_path(project)?;
+    let text = read_or_empty(&path)?;
+    if let Some(new) = wats::hook::vibe_remove(&text)
+        .with_context(|| format!("{}: left as it is", path.display()))?
+    {
+        println!("Mistral Vibe: hooks removed from {}", path.display());
+        write_settings(&path, &new)?;
     }
     Ok(())
 }
@@ -2740,8 +2955,20 @@ fn remove_from_claude(scope: &str, claude: &std::path::Path) -> Result<()> {
 
 /// `wats setup claude --remove-hooks` (and the first step of --remove):
 /// our session hooks out of the scope's settings.json.
+/// Remove the `/swarm` command at `path`, when it is ours.
+fn remove_swarm_command(name: &str, path: &std::path::Path) {
+    if read_or_empty(path).is_ok_and(|t| t.contains("wats /swarm"))
+        && std::fs::remove_file(path).is_ok()
+    {
+        println!("{name}: /swarm removed ({})", path.display());
+    }
+}
+
 fn remove_claude_hooks(scope: &str) -> Result<()> {
     let path = claude_settings(scope)?;
+    if let Some(dir) = path.parent() {
+        remove_swarm_command("Claude Code", &dir.join("commands").join("swarm.md"));
+    }
     let text = read_or_empty(&path)?;
     match wats::hook::claude_remove(&text)
         .with_context(|| format!("{}: left as it is", path.display()))?
@@ -2784,6 +3011,9 @@ fn remove_from_codex(codex: &std::path::Path) -> Result<()> {
 /// other hooks may need it).
 fn remove_codex_hooks() -> Result<()> {
     let path = codex_config()?;
+    if let Some(dir) = path.parent() {
+        remove_swarm_command("Codex", &dir.join("prompts").join("swarm.md"));
+    }
     let text = read_or_empty(&path)?;
     match wats::hook::codex_remove(&text)
         .with_context(|| format!("{}: left as it is", path.display()))?
@@ -3348,8 +3578,10 @@ fn setup_tool_command(
             remove,
         } => {
             if remove {
+                remove_copilot_hooks()?;
                 return setup_json_host(node, data_dir, wats::hosts::Host::Copilot, (false, true));
             }
+            let hooks: HookStep = Some(Box::new(move |_: &str| install_copilot_hooks(node, true)));
             setup_tool(
                 node,
                 data_dir,
@@ -3357,7 +3589,7 @@ fn setup_tool_command(
                 (mcp, agent),
                 &keys,
                 |profile| register_json_host(node, wats::hosts::Host::Copilot, profile),
-                None,
+                hooks,
             )
         }
         SetupTool::Antigravity {
@@ -3411,6 +3643,11 @@ fn setup_tool_command(
         } => {
             if !agent || mcp || remove {
                 setup_vibe(node, data_dir, (mcp, remove, project))?;
+                if remove {
+                    remove_vibe_hooks(project)?;
+                } else if mcp {
+                    install_vibe_hooks(node, project)?;
+                }
             }
             if !agent {
                 return Ok(());
@@ -5764,6 +6001,169 @@ fn check_registrations(
     wats::registrations::check(&at, data_dir, repair, unix_now())
 }
 
+/// The other nodes of this machine's summaries (`me.json`), for the sums
+/// of ADR 0056 §3.
+fn machine_summaries(config: &NodeConfig) -> Vec<wats::me::Me> {
+    let machine = wats::naming::Machine::of_user(config.registry.clone());
+    machine
+        .dirs()
+        .iter()
+        .filter(|d| !wats::naming::same_dir(d, &config.data_dir))
+        .filter_map(|d| wats::me::Me::load(d))
+        .collect()
+}
+
+/// `wats status --line`.
+fn status_line(config: &NodeConfig) -> Result<()> {
+    let now = wats::node::now_secs();
+    match wats::me::Me::load(&config.data_dir) {
+        Some(me) => println!("{}", wats::me::line(&me, &machine_summaries(config), now)),
+        // The node has not summed anything yet: still one short line.
+        None => println!("🐝 wats"),
+    }
+    Ok(())
+}
+
+/// `wats me`.
+fn me_command(config: &NodeConfig, json: bool) -> Result<()> {
+    let Some(me) = wats::me::Me::load(&config.data_dir) else {
+        anyhow::bail!(
+            "no summary yet in {}: start the node (`wats`); it sums your reputation at start",
+            config.data_dir.display()
+        );
+    };
+    let others = machine_summaries(config);
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({"me": me, "other_nodes": others}))?
+        );
+        return Ok(());
+    }
+    let total = me.reputation + others.iter().map(|o| o.reputation).sum::<i64>();
+    println!("Your reputation: {total}   ({})", me.node);
+    if !others.is_empty() {
+        println!(
+            "  this machine's other nodes: {}",
+            others
+                .iter()
+                .map(|o| format!("{} {}", o.node, o.reputation))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+    println!(
+        "  earned from others' signals: +1 per useful vote, +2 per use, +3 per confirmation or accepted answer, −3 per standing contradiction; posting alone earns nothing"
+    );
+    if !me.changes.is_empty() {
+        println!("\nLast changes:");
+        for c in me.changes.iter().rev().take(8) {
+            let when = wats::signals::day(c.ts);
+            match c.delta {
+                0 => println!("  {when}  {}", c.why),
+                d if d > 0 => println!("  {when}  +{d} → {}: {}", c.reputation, c.why),
+                d => println!(
+                    "  {when}  −{} → {}: {}",
+                    d.unsigned_abs(),
+                    c.reputation,
+                    c.why
+                ),
+            }
+        }
+    }
+    println!("\nBadges:");
+    if me.badges.is_empty() {
+        println!(
+            "  none yet. The first ones: First Buzz (your first ask), Nectar (your first answer), Pollinator (an answer someone used)"
+        );
+    }
+    for badge in &me.badges {
+        let what = wats::scores::BADGES
+            .iter()
+            .find(|(name, _)| name == badge)
+            .map(|(_, what)| *what)
+            .unwrap_or("an earned specialty");
+        println!("  🐝 {badge}: {what}");
+    }
+    if !me.shares.is_empty() {
+        println!("\nYour shared findings (`wats outbox`):");
+        for share in &me.shares {
+            println!(
+                "  {}  {}  score {} · {} use(s) · {}{}",
+                &share.ask[..12.min(share.ask.len())],
+                share.title,
+                share.score,
+                share.uses,
+                share.status,
+                if share.auto { " · auto" } else { "" }
+            );
+        }
+    }
+    println!(
+        "\nAs of {} (the node updates it as signals arrive).",
+        wats::signals::day(me.at)
+    );
+    Ok(())
+}
+
+/// `wats outbox [retract <id>]`.
+async fn outbox_command(
+    config: NodeConfig,
+    action: Option<OutboxAction>,
+    json: bool,
+) -> Result<()> {
+    let entries = wats::outbox::list(&config.data_dir);
+    match action {
+        Some(OutboxAction::Retract { id, reason }) => {
+            let Some(entry) = wats::outbox::find(&entries, &id) else {
+                anyhow::bail!("{id}: not a share of this node (`wats outbox` lists them)");
+            };
+            let mut config = config;
+            config.profile = entry.profile.clone();
+            let ids = vec![entry.ask.clone(), entry.answer.clone()];
+            retract_command(config, &ids, reason.as_deref()).await
+        }
+        None => {
+            let shares: Vec<wats::me::Share> = wats::me::Me::load(&config.data_dir)
+                .map(|m| m.shares)
+                .unwrap_or_default();
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "shares": entries,
+                        "fates": shares,
+                    }))?
+                );
+                return Ok(());
+            }
+            if entries.is_empty() {
+                println!(
+                    "Nothing shared yet. Agents share findings with `share_finding`; with share.auto off (the default), each one asks you first."
+                );
+                return Ok(());
+            }
+            for e in entries.iter().rev() {
+                let fate = shares
+                    .iter()
+                    .find(|s| s.ask == e.ask)
+                    .map(|s| format!("score {} · {} use(s) · {}", s.score, s.uses, s.status))
+                    .unwrap_or_else(|| "no signal yet".into());
+                println!(
+                    "{}  {}  {}  ({}{})\n    {fate}",
+                    wats::signals::day(e.ts),
+                    &e.ask[..12.min(e.ask.len())],
+                    e.title,
+                    e.profile,
+                    if e.auto { ", auto" } else { "" }
+                );
+            }
+            println!("\n`wats outbox retract <id>` takes one back.");
+            Ok(())
+        }
+    }
+}
+
 async fn status_command(config: &NodeConfig, json: bool, local: bool) -> Result<()> {
     let mut status = match attach::call_tool(&config.data_dir, "status", serde_json::json!({}))
         .await?
@@ -7430,6 +7830,7 @@ impl NodeArgs {
         config.review_notify = file.agent.notify.unwrap_or(false);
         config.declare_via = file.node.declare_via.unwrap_or(true);
         config.bind = file.node.bind.unwrap_or(true);
+        config.share_auto = file.share.auto.unwrap_or(false);
         config.public_name = match &file.node.public_name {
             Some(name) => match wats::hive::check_public_name(name.trim()) {
                 Ok(()) => Some(name.trim().to_string()),
@@ -9001,6 +9402,45 @@ fn hook_invocation() -> bool {
 /// `wats notify [--hook]`, before any runtime, log or panic hook is set
 /// up: the session hook must be fast and silent. With --hook, it prints
 /// the host's format or nothing, and always exits 0.
+/// `wats hook`: never fails, never writes to stderr.
+fn nudge_command(node: &NodeArgs, event: &str, host: &str) {
+    use std::io::{Read, Write};
+    std::panic::set_hook(Box::new(|_| {}));
+    let output = std::panic::catch_unwind(|| -> Option<String> {
+        let data_dir = node.data_dir().ok()?;
+        let mut input = Vec::new();
+        std::io::stdin()
+            .lock()
+            .take(4 * 1024 * 1024)
+            .read_to_end(&mut input)
+            .ok()?;
+        let payload: serde_json::Value = serde_json::from_slice(&input).unwrap_or_default();
+        let settings = Settings::load(&data_dir).ok();
+        let request = wats::nudge::Request {
+            data_dir,
+            host: wats::nudge::Host::parse(host)?,
+            event: wats::nudge::Event::parse(event)?,
+            payload,
+            now: wats::node::now_secs(),
+            errors: settings
+                .as_ref()
+                .and_then(|s| s.hooks.errors)
+                .unwrap_or(true),
+            fixes: settings
+                .as_ref()
+                .and_then(|s| s.hooks.fixes)
+                .unwrap_or(true),
+        };
+        wats::nudge::run(&request)
+    })
+    .ok()
+    .flatten();
+    if let Some(text) = output {
+        let mut stdout = std::io::stdout().lock();
+        let _ = writeln!(stdout, "{text}");
+    }
+}
+
 fn notify_command(node: &NodeArgs, hook: bool, host: &str, event: &str) -> Result<()> {
     use std::io::Write;
     if hook {
@@ -9064,6 +9504,10 @@ fn main() -> Result<()> {
     cli.node.normalize();
     if let Some(Command::Notify { hook, host, event }) = &cli.command {
         return notify_command(&cli.node, *hook, host, event);
+    }
+    if let Some(Command::Hook { event, host }) = &cli.command {
+        nudge_command(&cli.node, event, host);
+        return Ok(());
     }
     if let Some(Command::Gate {
         host,
@@ -9237,6 +9681,13 @@ async fn async_main(mut cli: Cli) -> Result<()> {
         }
         Some(Command::Id { agents: true, .. }) => return print_agent_ids(&config),
         Some(Command::Id { host, .. }) => return print_id(&config, &host),
+        Some(Command::Status { line: true, .. }) => {
+            return status_line(&config);
+        }
+        Some(Command::Me { json }) => return me_command(&config, json),
+        Some(Command::Outbox { action, json }) => {
+            return outbox_command(config, action, json).await;
+        }
         Some(Command::Status { json, .. }) => {
             say_node(&data_dir, None);
             return status_command(&config, json, cli.node.hermetic || cli.node.loopback).await;
@@ -9330,6 +9781,7 @@ async fn async_main(mut cli: Cli) -> Result<()> {
             | Command::Guardian { .. }
             | Command::Resume
             | Command::Notify { .. }
+            | Command::Hook { .. }
             | Command::Inbox { .. }
             | Command::Attach { .. }
             | Command::Ps { .. }
