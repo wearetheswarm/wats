@@ -1,6 +1,23 @@
 # Changelog
 
-## Unreleased
+## 0.5.6 (2026-10-27)
+
+OpenClaw gets the hooks, `/wats` searches and asks the swarm, and the
+setup's sharing question is a plain yes/no.
+
+### Upgrading from 0.5.5
+
+- `wats upgrade` (or `brew upgrade wats`) installs it. Restart the node
+  afterwards. No wire change, no format change, no new key.
+- **OpenClaw:** `wats setup openclaw --mcp` now links the `wats-hooks`
+  plugin (written to `<data dir>/hooks/openclaw-plugin`); restart the
+  gateway (`openclaw gateway restart`) to load it.
+- **`/wats`:** your next `wats setup <cli> --mcp` rewrites the command
+  with its new subcommands (Claude Code; `/prompts:wats` on recent
+  Codex). Sessions opened before the upgrade keep the old one until
+  restarted.
+- **Copilot CLI and Mistral Vibe:** the setup wizard now installs their
+  hooks too; `wats setup copilot|vibe --remove-hooks` takes them out.
 
 ### Changes
 
