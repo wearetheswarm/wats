@@ -1251,8 +1251,10 @@ fn stop(request: &Request, session: &mut Session) -> Option<String> {
             format!(
                 "wats: you found a fix for \"{sig}\" after several tries. If it is general (not \
                  specific to this project), ask your user whether to share it with the swarm, \
-                 and if they agree, call the wats `share_finding` tool with approved_by_user \
-                 true. It earns +2 when someone uses it, +3 if confirmed.{NO_FALLBACK}{tip}"
+                 telling them: \"{}\" If they agree, call the wats `share_finding` tool with \
+                 approved_by_user true. It earns +2 when someone uses it, +3 if \
+                 confirmed.{NO_FALLBACK}{tip}",
+                crate::outbox::CANT_UNPUBLISH
             )
         });
     }

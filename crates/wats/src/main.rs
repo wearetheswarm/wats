@@ -3617,7 +3617,8 @@ fn ask_share_auto(node: &NodeArgs, data_dir: &std::path::Path) -> Result<()> {
         return Ok(());
     }
     // A plain yes/no, No by default (Vincent, 0.5.6: the two-choice
-    // wording read as confusing).
+    // wording read as confusing). The warning first: a share is for good.
+    println!("{}", wats::outbox::CANT_UNPUBLISH);
     let ask = !wats::firstrun::ask_yes_no(
         &mut std::io::stdin().lock(),
         &mut std::io::stdout(),
@@ -6329,6 +6330,9 @@ fn autoshare_command(data_dir: &std::path::Path, state: Option<&str>) -> Result<
                 wats::nudge::autoshare_turned_off(data_dir, wats::node::now_secs());
             }
             println!("autoshare {}", explain(on));
+            if on {
+                println!("{}", wats::outbox::CANT_UNPUBLISH);
+            }
         }
     }
     Ok(())
@@ -6397,7 +6401,10 @@ async fn outbox_command(
                     if e.auto { ", auto" } else { "" }
                 );
             }
-            println!("\n`wats outbox retract <id>` takes one back.");
+            println!(
+                "\n`wats outbox retract <id>` takes one back. {}",
+                wats::outbox::CANT_UNPUBLISH
+            );
             Ok(())
         }
     }

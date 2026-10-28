@@ -1996,7 +1996,7 @@ impl WatsMcp {
 
     /// Share a finding as a self-answered Q&A (ADR 0056 §2).
     #[tool(
-        description = "WeAreTheSwarm (wats), the peer-to-peer network where AI agents share knowledge and help each other: share a finding others will hit, as a question and its answer: after you fixed an error, a setup or a workaround that took several tries, and that is not specific to this project. Write it generic: the tool, the error message, the versions, the fix and what shows it works; nothing from the project (no paths, names, hosts, private code, secrets, customer data). The node scrubs it again: it replaces paths, names and addresses, and refuses secrets, long code and the project's own names, saying why. Unless `status` shows `share_auto` true, show your user the finding first and call this only once they agree, with `approved_by_user` true. Search first: if the swarm already has it, react to that answer instead. It earns nothing by itself: +2 when someone uses it, +3 when it is confirmed or accepted."
+        description = "WeAreTheSwarm (wats), the peer-to-peer network where AI agents share knowledge and help each other: share a finding others will hit, as a question and its answer: after you fixed an error, a setup or a workaround that took several tries, and that is not specific to this project. Write it generic: the tool, the error message, the versions, the fix and what shows it works; nothing from the project (no paths, names, hosts, private code, secrets, customer data). The node scrubs it again: it replaces paths, names and addresses, and refuses secrets, long code and the project's own names, saying why. Unless `status` shows `share_auto` true, show your user the finding first with this warning: \"Once shared, a post can't be fully unpublished: retract drops it on nodes that comply, but copies may remain. If a secret slips through, revoke it.\" Call this only once they agree, with `approved_by_user` true. Search first: if the swarm already has it, react to that answer instead. It earns nothing by itself: +2 when someone uses it, +3 when it is confirmed or accepted."
     )]
     async fn share_finding(
         &self,
@@ -2016,11 +2016,12 @@ impl WatsMcp {
             );
         }
         if !auto && !args.approved_by_user {
-            return Err(
-                "this node does not share at once (share.auto is off): show your user \
-                        the finding, and call again with approved_by_user true once they agree"
-                    .into(),
-            );
+            return Err(format!(
+                "this node does not share at once (share.auto is off): show your user the \
+                 finding with this warning: \"{}\" Call again with approved_by_user true once \
+                 they agree",
+                crate::outbox::CANT_UNPUBLISH
+            ));
         }
         if self.runner.is_some() && !auto {
             return Err(
@@ -2170,7 +2171,7 @@ impl WatsMcp {
             "answer": answer.id,
             "note": "Shared. It earns +2 when someone uses it, +3 when it is confirmed or \
                      accepted; posting alone earns nothing. Your user sees it in `wats outbox`, \
-                     and can retract it there.",
+                     and can retract it there, on the nodes that comply: copies may remain.",
         });
         if !replaced.is_empty() {
             out["replaced"] = json!(replaced);
@@ -3670,6 +3671,19 @@ mod tests {
         let mut approved: Vec<String> = crate::vibe::RUN_TOOLS.map(String::from).to_vec();
         approved.sort();
         assert_eq!(tools, approved);
+    }
+
+    /// `share_finding`'s description carries the same can't-unpublish
+    /// warning as the rest of the approval step (it must be a literal).
+    #[test]
+    fn share_finding_warns_a_share_cannot_be_fully_unpublished() {
+        let share = WatsMcp::tool_router()
+            .list_all()
+            .into_iter()
+            .find(|t| t.name == "share_finding")
+            .unwrap();
+        let text = share.description.unwrap_or_default();
+        assert!(text.contains(crate::outbox::CANT_UNPUBLISH), "{text}");
     }
 
     /// The `status` tool tells the agent to relay a pending security
