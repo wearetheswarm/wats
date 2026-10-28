@@ -17,7 +17,6 @@ use tracing::info;
 use crate::event::{Event, Kind};
 use crate::node::Node;
 use crate::signals::{Grouping, Signals, Status};
-use crate::specialty::Earned;
 
 /// The tracing target of brief lines.
 pub const TARGET: &str = "brief";
@@ -401,19 +400,24 @@ impl State {
         &mut self,
         who: &str,
         author: &str,
-        earned: &[Earned],
+        earned: &[String],
         ts: u64,
     ) -> Vec<String> {
-        let tags: Vec<String> = earned.iter().map(|e| e.tag.clone()).collect();
-        let before = match self.earned.insert(author.to_string(), tags) {
-            Some(before) => before,
-            None if ts < self.seeded_before => return Vec::new(),
-            None => Vec::new(),
-        };
-        earned
+        // Only grows (ADR 0057): a tag withdrawn and earned again is not
+        // said twice.
+        let seen = self.earned.contains_key(author);
+        let known = self.earned.entry(author.to_string()).or_default();
+        let new: Vec<String> = earned
             .iter()
-            .filter(|e| !before.contains(&e.tag))
-            .map(|e| format!("{who} earned {}", e.tag))
+            .filter(|tag| !known.contains(tag))
+            .cloned()
+            .collect();
+        known.extend(new.iter().cloned());
+        if !seen && ts < self.seeded_before {
+            return Vec::new();
+        }
+        new.iter()
+            .map(|tag| format!("{who} earned {tag}"))
             .collect()
     }
 
@@ -489,7 +493,14 @@ pub fn follow_lines(
         lines.push(line);
     }
     if post.kind == Kind::Answer {
-        let earned = crate::specialty::earned_now(store, &grouping, &post.net, &post.author);
+        // The ledger's specialties (ADR 0057): kept once earned, so one
+        // that decays is not announced again when it comes back.
+        let earned: Vec<String> =
+            crate::scores::standing_now(store, &grouping, &post.net, &post.author)
+                .badges
+                .iter()
+                .filter_map(|b| b.strip_prefix("Comb: ").map(str::to_string))
+                .collect();
         lines.extend(state.earned_lines(&name(node, &post.author), &post.author, &earned, post.ts));
     }
     Some(lines)
@@ -789,11 +800,7 @@ mod tests {
     fn an_earned_field_is_said_once() {
         let dir = tempfile::tempdir().unwrap();
         let mut state = State::load(dir.path(), 1000);
-        let pg = Earned {
-            tag: "topic:postgres".into(),
-            accepted: 1,
-            ..Earned::default()
-        };
+        let pg = "topic:postgres".to_string();
         assert_eq!(
             state.earned_lines("seed-postgres", "k1", std::slice::from_ref(&pg), 2000),
             ["seed-postgres earned topic:postgres"]

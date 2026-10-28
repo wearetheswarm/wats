@@ -30,6 +30,10 @@ pub struct Earned {
     pub confirmed: u64,
     pub accepted: u64,
     pub used: u64,
+    /// The answers it counts (what a badge for it keeps as evidence, ADR
+    /// 0057).
+    #[serde(skip)]
+    pub posts: Vec<String>,
 }
 
 impl Earned {
@@ -67,19 +71,6 @@ pub fn earned(store: &Store, grouping: &Grouping, net: &str, author: &str) -> Ve
     record
 }
 
-/// [`earned`] computed now, not from the cache, which it refreshes: what
-/// the brief view compares after each new signal.
-pub fn earned_now(store: &Store, grouping: &Grouping, net: &str, author: &str) -> Vec<Earned> {
-    let record = compute(store, grouping, net, author).unwrap_or_default();
-    if let Ok(mut cache) = CACHE.lock() {
-        cache.insert(
-            (net.to_string(), author.to_string()),
-            (Instant::now(), record.clone()),
-        );
-    }
-    record
-}
-
 /// Records by (network, author), with when they were computed.
 type Cache = HashMap<(String, String), (Instant, Vec<Earned>)>;
 
@@ -92,22 +83,45 @@ fn compute(
     net: &str,
     author: &str,
 ) -> anyhow::Result<Vec<Earned>> {
+    compute_at(store, grouping, net, author, &[], crate::node::now_secs())
+}
+
+/// [`compute`] as of `now`, over the latest answers and the answers
+/// `extra` (a badge's evidence, ADR 0057).
+pub fn compute_at(
+    store: &Store,
+    grouping: &Grouping,
+    net: &str,
+    author: &str,
+    extra: &[String],
+    now: u64,
+) -> anyhow::Result<Vec<Earned>> {
     let filter = Filter {
         net: Some(net.to_string()),
         kinds: vec![Kind::Answer],
         author: Some(author.to_string()),
         ..Filter::default()
     };
-    let answers: Vec<std::sync::Arc<Event>> = store
+    let mut answers: Vec<std::sync::Arc<Event>> = store
         .search(None, &filter, ANSWERS)?
         .into_iter()
         .map(|s| s.event)
         .collect();
+    for id in extra {
+        if answers.iter().any(|a| &a.id == id) {
+            continue;
+        }
+        if let Some(stored) = store.get(id)?
+            && filter.matches(&stored.event)
+        {
+            answers.push(stored.event);
+        }
+    }
     if answers.is_empty() {
         return Ok(Vec::new());
     }
     let refs: Vec<&Event> = answers.iter().map(|e| &**e).collect();
-    let signals = crate::signals::compute(store, grouping, &refs)?;
+    let signals = crate::signals::compute_at(store, grouping, &refs, now)?;
     let mut roots: HashMap<String, Vec<String>> = HashMap::new();
     let mut by_tag: BTreeMap<String, Earned> = BTreeMap::new();
     for answer in &answers {
@@ -141,6 +155,7 @@ fn compute(
             entry.confirmed += u64::from(confirmed);
             entry.accepted += u64::from(accepted);
             entry.used += u64::from(used);
+            entry.posts.push(answer.id.clone());
         }
     }
     let mut list: Vec<Earned> = by_tag.into_values().collect();

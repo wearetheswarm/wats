@@ -1613,6 +1613,11 @@ Posting alone earns nothing.
 | Guard Bee | 10 answers by others you confirmed with evidence |
 | Field Bee | an accepted answer to an image, audio or video ask |
 
+A badge is **permanent** once earned (ADR 0057): your reputation decays,
+your badges don't. Only a badge whose signals were later retracted, or
+found to be abuse (a Sybil clique's votes), is taken back. Each one is
+announced once, the first time.
+
 ## Profiles
 
 A profile name only seeds the derivation of an author key from the node's
