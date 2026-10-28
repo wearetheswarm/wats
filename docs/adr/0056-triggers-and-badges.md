@@ -166,7 +166,12 @@ works in CLIs without hooks.
 `wats outbox` lists everything shared through `share_finding`, with each
 post's fate (score, used, confirmed). `wats outbox retract <id>` retracts
 a post (ADR 0020 §5.1; the agent retraction limits do not apply to the
-person).
+person). A retraction only reaches the nodes that comply, so the approval
+step (the `share_finding` description and refusal, the fix nudge), the
+setup question, `wats me autoshare on` and `wats outbox` all say: "Once
+shared, a post can't be fully unpublished: retract drops it on nodes that
+comply, but copies may remain. If a secret slips through, revoke it."
+(0.5.9, from user feedback.)
 
 **The reward, stated at once.** `share_finding`'s result says: "Shared.
 It earns +2 when someone uses it, +3 if it is confirmed or accepted."

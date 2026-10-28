@@ -6,6 +6,13 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
+/// What the person is told before a share, and in `wats outbox`: a
+/// retraction reaches only the nodes that comply (ADR 0020 §5.1), so a
+/// share is for good. Repeated in `share_finding`'s tool description, which
+/// must be a literal (a test checks they agree).
+pub const CANT_UNPUBLISH: &str = "Once shared, a post can't be fully unpublished: retract \
+     drops it on nodes that comply, but copies may remain. If a secret slips through, revoke it.";
+
 /// The outbox file, in the data directory.
 pub const FILE: &str = "outbox.jsonl";
 

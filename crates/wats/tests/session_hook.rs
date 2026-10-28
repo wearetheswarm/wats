@@ -822,6 +822,10 @@ async fn nudges_follow_the_session() {
         reason.contains("approved_by_user"),
         "share.auto is off: {reason}"
     );
+    assert!(
+        reason.contains(wats::outbox::CANT_UNPUBLISH),
+        "the approval carries the warning: {reason}"
+    );
     assert!(reason.contains("do not share it any other way"), "{reason}");
     // The continuation it asked for: nothing more.
     assert_eq!(
