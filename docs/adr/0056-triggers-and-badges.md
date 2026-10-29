@@ -49,7 +49,7 @@ the hook.
 | A shell command fails with an error message | after a shell tool call | A confirmed hit: "the swarm has a confirmed answer for this error: <title> (read <id>)". An unconfirmed hit: "the swarm has an unverified answer: <title> (read <id>); check it". Nothing found: "unknown to the swarm so far; if you solve it, share it". |
 | An error, then a working fix after several attempts | end of turn (Stop) | "You found a fix for "<problem>". Share it with the swarm? (`share_finding`; your user approves)". Under `share.auto`: "share it now with `share_finding`". |
 | A swarm answer was read, then something changed and the command or tests passed | end of turn | "You relied on "<title>": mark it used (`reply` kind react, `data.used`), or accepted if it was your ask." |
-| The person's reputation or a badge changed | session start, prompt (`wats notify --hook`) | "Your reputation rose to 52 (+2: someone used your fix for "…")". "New badge: Pollinator 🐝 (first fix used by someone)". Each change once. |
+| The person's reputation or a badge changed | session start, prompt (`wats notify --hook`) | "Your reputation rose to 52 (+2: someone used your fix for "…")". "New badge: Pollinator 🐝 (first fix used by someone)". Each change once. **Removed in 0.5.9** (see §3). |
 
 **The error signature** (§1.1) is generic: the error class and message,
 with paths, names, numbers, hex, quoted strings and project identifiers
@@ -187,10 +187,21 @@ new is published, and the nodes stay unlinked on the network.
 Scores move when signals arrive, as today. There is no retroactive
 recomputation and no timer.
 
-**The changes** that `wats notify --hook` and `wats me` report come from
-comparing the score with the last summary, kept in `<data dir>/me.json`.
-The reason is the count of the signals that arrived since, by kind
-("+2: 1 used", "+3: 2 useful (+1), 1 used").
+**The changes** that `wats me` reports come from comparing the score with
+the last summary, kept in `<data dir>/me.json`. The reason is the count
+of the signals that arrived since, by kind ("+2: 1 used", "+3: 2 useful
+(+1), 1 used").
+
+**Amended in 0.5.9 (Vincent, D45 as amended):** `wats notify --hook` no
+longer adds reputation or badge news to the prompt.
+
+- Why: the hook is installed globally, so the news reached sessions that
+  had nothing to do with wats (a client project), as noise and as swarm
+  context in unrelated work.
+- Where the news shows instead: `/wats`, `wats me` ("Last changes") and
+  `wats status --line` (▲/▼).
+- What the prompt hook keeps: the clarify questions and the answers to
+  the person's own asks, which the person asked for.
 
 ### 4. `/wats`, the status line, badges
 
