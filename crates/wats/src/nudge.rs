@@ -651,6 +651,27 @@ fn quoted_mark(line: &str) -> bool {
     before.matches('`').count() % 2 == 1 || before.matches('"').count() % 2 == 1
 }
 
+/// Whether a line is tagged as a warning in its first words (`12:01:02
+/// [WARN] [glob-loader] … check your content config file for errors`,
+/// `npm WARN …`): what it says, not a failure.
+fn warn_tagged(lower: &str) -> bool {
+    let mark = ERROR_MARKS
+        .iter()
+        .filter_map(|m| lower.find(m))
+        .min()
+        .unwrap_or(lower.len());
+    let mut at = 0;
+    for w in lower.split_whitespace().take(3) {
+        let start = at + lower[at..].find(w).unwrap_or(0);
+        at = start + w.len();
+        let tag = w.trim_matches(|c: char| !c.is_alphabetic());
+        if start < mark && matches!(tag, "warn" | "warning" | "warnings") {
+            return true;
+        }
+    }
+    false
+}
+
 /// Lines that say something failed.
 const ERROR_MARKS: &[&str] = &[
     "error",
@@ -673,6 +694,7 @@ fn error_line(output: &str) -> Option<&str> {
         let lower = line.to_lowercase();
         ERROR_MARKS.iter().any(|m| lower.contains(m))
             && !lower.starts_with("warning")
+            && !warn_tagged(&lower)
             && !lower.starts_with("traceback")
             && !lower.contains("0 failed")
             && !lower.contains("0 errors")
@@ -946,12 +968,18 @@ pub fn lookup(store: &Store, sig: &str) -> Option<(String, String, bool)> {
         ..Filter::default()
     };
     let found = store.search(Some(&words.join(" ")), &filter, 8).ok()?;
+    // A confirmed answer needs 3 in 5 of the error's words; one that "may
+    // fit" needs 4 in 5, and 3 at least: a weak hit said "unverified" was
+    // still a wrong lead (seen live: a Postgres answer offered for a JS
+    // error).
     let need = (words.len() * 3).div_ceil(5).max(2);
+    let need_unverified = (words.len() * 4).div_ceil(5).max(3);
     let grouping = crate::signals::Grouping::new(Default::default());
     for hit in found {
         let e = &hit.event;
         let text = format!("{} {}", e.title.as_deref().unwrap_or_default(), e.text).to_lowercase();
-        if words.iter().filter(|w| text.contains(w.as_str())).count() < need {
+        let matched = words.iter().filter(|w| text.contains(w.as_str())).count();
+        if matched < need {
             continue;
         }
         // An ask: its best answer, if it has one.
@@ -971,6 +999,9 @@ pub fn lookup(store: &Store, sig: &str) -> Option<(String, String, bool)> {
                     .map(|s| s.status == crate::signals::Status::Confirmed)
             })
             .unwrap_or(false);
+        if !confirmed && matched < need_unverified {
+            continue;
+        }
         let title = store
             .get(post.thread_root())
             .ok()
@@ -1031,9 +1062,21 @@ fn post_tool(request: &Request, session: &mut Session) -> Result<Option<String>>
         push(session, Step::Edit);
         return Ok(None);
     }
-    let Some(shell) = shell(payload) else {
+    let Some(mut shell) = shell(payload) else {
         return Ok(None);
     };
+    // Claude Code sends a failed call to `PostToolUseFailure` (with
+    // `error`); `PostToolUse` comes only after a call that passed. Its
+    // payload has no exit code, so the error lines a passing command
+    // printed read as a failure (seen live: a grep that printed `throw new
+    // Error(…)`, `make … | tail` showing a curl 404, an Astro [WARN]).
+    if request.host == Host::Claude
+        && shell.exit.is_none()
+        && payload.get("error").is_none()
+        && payload["hook_event_name"].as_str() != Some("PostToolUseFailure")
+    {
+        shell.exit = Some(0);
+    }
     let failed = match shell.exit {
         Some(code) => code != 0,
         // No exit code: a failure only when the output says so, for a
@@ -1610,6 +1653,126 @@ mod tests {
         assert!(session.turn.is_empty(), "{:?}", session.turn);
         post_tool(&read(json!({"id": "abc"})), &mut session).unwrap();
         assert!(matches!(&session.turn[..], [Step::SwarmRead { id, .. }] if id == "abc"));
+    }
+
+    /// Seen live on 0.5.8: Claude Code's `PostToolUse` comes after a call
+    /// that passed, whatever its output says. Error text there is no
+    /// failure: no lookup, and no failure for the Stop hook's fix.
+    #[test]
+    fn a_passing_claude_call_is_no_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let call = |host: Host, command: &str, stdout: &str| Request {
+            data_dir: dir.path().to_path_buf(),
+            host,
+            event: Event::PostTool,
+            payload: json!({"hook_event_name": "PostToolUse", "tool_name": "Bash",
+                "tool_input": {"command": command},
+                "tool_response": {"stdout": stdout, "stderr": ""}}),
+            now: 1,
+            errors: true,
+            fixes: true,
+        };
+        let astro = "12:01:02 [WARN] [glob-loader] The collection \"docs\" does not exist or \
+                     is empty. Please check your content config file for errors.";
+        for (command, out) in [
+            (
+                "grep -rn Error src/",
+                "src/a.js:3:  throw new Error(\"bad widget state\")",
+            ),
+            (
+                "make release VERSION=0.5.8 | tail -40",
+                "curl: (56) The requested URL returned error: 404",
+            ),
+            ("npm run build", astro),
+        ] {
+            let mut session = Session::default();
+            assert_eq!(
+                post_tool(&call(Host::Claude, command, out), &mut session).unwrap(),
+                None
+            );
+            assert!(
+                matches!(
+                    &session.turn[..],
+                    [Step::Shell {
+                        ok: true,
+                        fail: None,
+                        ..
+                    }]
+                ),
+                "{command}: {:?}",
+                session.turn
+            );
+        }
+        // Codex says no exit code, and its `PostToolUse` runs on failures
+        // too: the output still decides, but a [WARN] line is no failure.
+        let mut session = Session::default();
+        post_tool(&call(Host::Codex, "npm run build", astro), &mut session).unwrap();
+        assert!(matches!(&session.turn[..], [Step::Shell { ok: true, .. }]));
+        let broken = "src/x.ts(3,1): error TS2304: Cannot find name 'widgetz'.";
+        post_tool(&call(Host::Codex, "npm run build", broken), &mut session).unwrap();
+        assert!(matches!(&session.turn[1], Step::Shell { ok: false, .. }));
+        // Claude Code's failures still count.
+        let mut session = Session::default();
+        let mut failed = call(Host::Claude, "npm run build", "");
+        failed.payload = json!({"hook_event_name": "PostToolUseFailure", "tool_name": "Bash",
+            "tool_input": {"command": "npm run build"}, "error": format!("Exit code 2\n{broken}")});
+        post_tool(&failed, &mut session).unwrap();
+        assert!(matches!(
+            &session.turn[..],
+            [Step::Shell {
+                ok: false,
+                fail: Some(_),
+                ..
+            }]
+        ));
+    }
+
+    /// A warning tag ahead of the error word: a warning, not a failure.
+    #[test]
+    fn a_warning_line_is_no_error_line() {
+        for line in [
+            "12:01:02 [WARN] [glob-loader] Please check your content config file for errors.",
+            "npm WARN deprecated widget@1.0.0: install failed once, use 2.x",
+            "warning: unused variable `x`",
+        ] {
+            assert_eq!(error_line(line), None, "{line}");
+        }
+        for line in [
+            "error: warning treated as an error: unused import",
+            "Error: the build failed; see warnings above",
+        ] {
+            assert_eq!(error_line(line), Some(line), "{line}");
+        }
+    }
+
+    /// An answer that "may fit" needs most of the error's words; a confirmed
+    /// one, three in five.
+    #[test]
+    fn an_unverified_lead_needs_a_close_match() {
+        use crate::event::Draft;
+        use ed25519_dalek::SigningKey;
+        let store = Store::open_in_memory().unwrap();
+        let key = SigningKey::from_bytes(&[5; 32]);
+        let answer = |title: &str, ts: u64| {
+            Draft {
+                net: "public".into(),
+                kind: Some(Kind::Answer),
+                title: Some(title.into()),
+                text: "retry with a backoff".into(),
+                ..Draft::default()
+            }
+            .sign(&key, ts, 0)
+            .unwrap()
+        };
+        let sig = "error: connection refused while fetching weather from upstream";
+        // 4 of its 6 words: enough once confirmed, not for a lead.
+        let weak = answer("weather fetching: connection refused", 10);
+        store.insert(&weak, 10).unwrap();
+        assert_eq!(lookup(&store, sig), None);
+        let close = answer("connection refused while fetching weather upstream", 11);
+        store.insert(&close, 11).unwrap();
+        let (id, _, confirmed) = lookup(&store, sig).unwrap();
+        assert_eq!((id, confirmed), (close.id.clone(), false));
     }
 
     /// The autoshare tip: once a day, never in the week after turning

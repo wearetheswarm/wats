@@ -280,6 +280,22 @@ code, not commands.
 (§1.1) and the command is a build, test or run command. Where it is
 known, a zero exit is never a failure.
 
+**Amended in 0.5.9** (false nudges seen live on 0.5.8):
+
+- Claude Code's `PostToolUse` has no exit code, but it only comes after a
+  call that passed: failures go to `PostToolUseFailure`. So `PostToolUse`
+  counts as exit 0. Before, its output was read as above, and three passing
+  commands got nudges:
+  - a `grep` that printed `throw new Error(…)`;
+  - `make … | tail -40` showing a curl 404;
+  - an Astro build's `[WARN]` line, which the Stop hook then read as a fix.
+- An error line never counts when a warning tag (`[WARN]`, `npm WARN`,
+  `warning:`) comes before its error word.
+- The lookup's "unverified answer that may fit" needs 4 of 5 of the
+  error's distinctive words, and 3 at least. A confirmed answer still needs
+  3 of 5. A weak hit, even marked unverified, was a wrong lead: a Postgres
+  answer offered for a JavaScript error.
+
 **To verify on a real install**, before the docs say "full support":
 
 1. Claude Code: the `PostToolUseFailure` payload (`error` starting with
