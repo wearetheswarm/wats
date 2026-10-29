@@ -66,6 +66,8 @@ const MAX_API_BYTES: usize = 4 * 1024 * 1024;
 pub fn target() -> Option<&'static str> {
     if cfg!(all(target_arch = "x86_64", target_os = "linux")) {
         Some("x86_64-unknown-linux-musl")
+    } else if cfg!(all(target_arch = "aarch64", target_os = "linux")) {
+        Some("aarch64-unknown-linux-musl")
     } else if cfg!(all(target_arch = "aarch64", target_os = "macos")) {
         Some("aarch64-apple-darwin")
     } else {
@@ -1153,7 +1155,7 @@ pub async fn upgrade_command(opts: UpgradeOptions) -> Result<()> {
         .map(|v| Version::parse(v).with_context(|| format!("{v:?} is not a version X.Y.Z")))
         .transpose()?;
     let target = target().context(
-        "no prebuilt release for this platform (releases ship x86_64 Linux and Apple silicon macOS); build from source",
+        "no prebuilt release for this platform (releases ship x86_64 and arm64 Linux, and Apple silicon macOS); build from source",
     )?;
     let source = Source::from_env(opts.url.as_deref());
     println!("looking up releases at {}", source.base());

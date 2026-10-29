@@ -7,6 +7,7 @@ const test = require('node:test');
 
 const launcher = require('../lib/launcher');
 const { noProxy, proxyFor, download } = require('../lib/fetch');
+const LINUX_ARM = 'aarch64-unknown-linux-musl';
 const { ROOT, VERSION, LINUX, DARWIN, NAME, TEST_KEY, tmpdir, mirror, serve, options } = require('./helpers');
 
 const posix = process.platform !== 'win32';
@@ -22,12 +23,12 @@ test('the package version is the workspace version', () => {
 test('release targets match the release workflow', () => {
   assert.equal(launcher.releaseTarget('linux', 'x64'), LINUX);
   assert.equal(launcher.releaseTarget('darwin', 'arm64'), DARWIN);
-  assert.equal(launcher.releaseTarget('linux', 'arm64'), null);
+  assert.equal(launcher.releaseTarget('linux', 'arm64'), LINUX_ARM);
   assert.equal(launcher.releaseTarget('darwin', 'x64'), null);
   assert.equal(launcher.releaseTarget('win32', 'x64'), null);
   const workflow = fs.readFileSync(path.join(ROOT, '.github', 'workflows', 'release.yml'), 'utf8');
   const targets = [...workflow.matchAll(/- target: (\S+)/g)].map((m) => m[1]).sort();
-  assert.deepEqual(targets, [DARWIN, LINUX].sort());
+  assert.deepEqual(targets, [DARWIN, LINUX, LINUX_ARM].sort());
 });
 
 test('an unsupported platform says how to install otherwise, and downloads nothing', async () => {

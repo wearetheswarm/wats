@@ -176,9 +176,9 @@ MCP host's `env` cannot swap the key.
 
 ### 5. Platforms
 
-The targets of `release.yml`: Linux x86_64 (any libc: the binary is
-static musl) and macOS arm64. Anything else (Linux arm64, macOS x86_64,
-Windows) fails before any download with how to install otherwise: `cargo
+The targets of `release.yml`: Linux x86_64 and, from 0.5.9, Linux arm64
+(any libc: the binaries are static musl), and macOS arm64. Anything else
+(macOS x86_64, Windows) fails before any download with how to install otherwise: `cargo
 install --locked --git https://github.com/wearetheswarm/wats --tag
 vX.Y.Z wats`, then register `wats mcp` directly; WSL on Windows; an arm64
 runtime on an Apple silicon Mac whose Node or Python runs under Rosetta.

@@ -29,7 +29,7 @@ command -v minisign >/dev/null 2>&1 || die "minisign is needed"
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/wats-brew.XXXXXX")"
 trap 'rm -rf "$WORK"' EXIT INT TERM
 
-for target in aarch64-apple-darwin x86_64-unknown-linux-musl; do
+for target in aarch64-apple-darwin x86_64-unknown-linux-musl aarch64-unknown-linux-musl; do
     file="wats-$VERSION-$target.tar.gz.sha256"
     for f in "$file" "$file.minisig"; do
         curl --proto '=https,file' --tlsv1.2 -fsSL -o "$WORK/$f" "$BASE/v$VERSION/$f" \

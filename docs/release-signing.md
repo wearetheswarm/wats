@@ -77,6 +77,9 @@ minisign -Vm wats-X.Y.Z-x86_64-unknown-linux-musl.tar.gz -P RWRq1jSm2cLFXa7MknbY
 shasum -a 256 -c wats-X.Y.Z-x86_64-unknown-linux-musl.tar.gz.sha256
 ```
 
+On Linux arm64 (from 0.5.9) the archive is
+`wats-X.Y.Z-aarch64-unknown-linux-musl.tar.gz`, signed the same way.
+
 `minisign -V` prints `Signature and comment signature verified` and the
 trusted comment, which holds the signing time and the file name
 (`file:wats-X.Y.Z-<target>.tar.gz`). Check that the file name and version are

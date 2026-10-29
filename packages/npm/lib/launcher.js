@@ -46,17 +46,18 @@ class UnsafeError extends Error {}
 /** The release target for this OS and CPU (release.yml's matrix), or null. */
 function releaseTarget(platform = process.platform, arch = process.arch) {
   if (platform === 'linux' && arch === 'x64') return 'x86_64-unknown-linux-musl';
+  if (platform === 'linux' && arch === 'arm64') return 'aarch64-unknown-linux-musl';
   if (platform === 'darwin' && arch === 'arm64') return 'aarch64-apple-darwin';
   return null;
 }
 
 function unsupportedMessage(platform, arch, version) {
   const lines = [
-    `no prebuilt wats for ${platform} ${arch}: releases ship macOS arm64 (Apple silicon) and Linux x86_64 only.`,
+    `no prebuilt wats for ${platform} ${arch}: releases ship macOS arm64 (Apple silicon), and Linux x86_64 and arm64, only.`,
     'Install wats another way, then point your MCP host at `wats mcp` directly:',
     `  build it from source: cargo install --locked --git https://github.com/wearetheswarm/wats --tag v${version} wats`,
   ];
-  if (platform === 'win32') lines.push('  on Windows, use WSL (Linux x86_64) for now.');
+  if (platform === 'win32') lines.push('  on Windows, use WSL for now.');
   if (platform === 'darwin' && arch === 'x64') {
     lines.push('  on an Apple silicon Mac, run an arm64 Node rather than one under Rosetta.');
   }

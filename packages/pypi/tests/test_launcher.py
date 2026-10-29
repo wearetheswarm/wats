@@ -12,6 +12,7 @@ from helpers import (
     DARWIN,
     HERE,
     LINUX,
+    LINUX_ARM,
     NAME,
     PKG,
     ROOT,
@@ -51,11 +52,12 @@ class Metadata(unittest.TestCase):
         self.assertEqual(launcher.release_target("Linux", "x86_64"), LINUX)
         self.assertEqual(launcher.release_target("Linux", "amd64"), LINUX)
         self.assertEqual(launcher.release_target("Darwin", "arm64"), DARWIN)
-        self.assertIsNone(launcher.release_target("Linux", "aarch64"))
+        self.assertEqual(launcher.release_target("Linux", "aarch64"), LINUX_ARM)
+        self.assertEqual(launcher.release_target("Linux", "arm64"), LINUX_ARM)
         self.assertIsNone(launcher.release_target("Darwin", "x86_64"))
         self.assertIsNone(launcher.release_target("Windows", "AMD64"))
         workflow = read(os.path.join(ROOT, ".github", "workflows", "release.yml"))
-        self.assertEqual(sorted(re.findall(r"- target: (\S+)", workflow)), sorted([DARWIN, LINUX]))
+        self.assertEqual(sorted(re.findall(r"- target: (\S+)", workflow)), sorted([DARWIN, LINUX, LINUX_ARM]))
 
     def test_the_cache_root_follows_the_platform(self):
         home = "/home/u"

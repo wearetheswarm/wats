@@ -4,7 +4,7 @@
 #   sh install.sh [--version X.Y.Z] [--prefix DIR]
 #
 # Downloads the release archive for this machine (macOS arm64, Linux
-# x86_64), verifies its minisign signature and its checksum's signature
+# x86_64 or arm64), verifies its minisign signature and its checksum's signature
 # against the release key pinned below, checks the file names in the signed
 # comments and the SHA-256, then installs `wats` into ~/.local/bin (or
 # --prefix). Any failure stops before anything is installed. Never uses
@@ -70,7 +70,8 @@ if [ -z "$TARGET" ]; then
     case "$os/$arch" in
         Darwin/arm64) TARGET="aarch64-apple-darwin" ;;
         Linux/x86_64|Linux/amd64) TARGET="x86_64-unknown-linux-musl" ;;
-        *) die "no prebuilt wats for $os $arch yet (macOS arm64 and Linux x86_64 only). Build it from source: cargo install --path crates/wats" ;;
+        Linux/aarch64|Linux/arm64) TARGET="aarch64-unknown-linux-musl" ;;
+        *) die "no prebuilt wats for $os $arch yet (macOS arm64, Linux x86_64 and arm64 only). Build it from source (Rust and a C compiler): cargo install --locked --git https://github.com/wearetheswarm/wats wats" ;;
     esac
 fi
 

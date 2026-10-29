@@ -81,6 +81,8 @@ def release_target(system: str | None = None, machine: str | None = None) -> str
     machine = (machine if machine is not None else platform.machine()).lower()
     if system == "Linux" and machine in ("x86_64", "amd64"):
         return "x86_64-unknown-linux-musl"
+    if system == "Linux" and machine in ("aarch64", "arm64"):
+        return "aarch64-unknown-linux-musl"
     if system == "Darwin" and machine in ("arm64", "aarch64"):
         return "aarch64-apple-darwin"
     return None
@@ -88,14 +90,14 @@ def release_target(system: str | None = None, machine: str | None = None) -> str
 
 def unsupported_message(system: str, machine: str, version: str) -> str:
     lines = [
-        f"no prebuilt wats for {system} {machine}: releases ship macOS arm64 (Apple silicon)"
-        " and Linux x86_64 only.",
+        f"no prebuilt wats for {system} {machine}: releases ship macOS arm64 (Apple silicon),"
+        " and Linux x86_64 and arm64, only.",
         "Install wats another way, then point your MCP host at `wats mcp` directly:",
         "  build it from source: cargo install --locked --git"
         f" https://github.com/wearetheswarm/wats --tag v{version} wats",
     ]
     if system == "Windows":
-        lines.append("  on Windows, use WSL (Linux x86_64) for now.")
+        lines.append("  on Windows, use WSL for now.")
     if system == "Darwin" and machine.lower() in ("x86_64", "amd64"):
         lines.append("  on an Apple silicon Mac, run an arm64 Python rather than one under Rosetta.")
     lines.append("See https://github.com/wearetheswarm/wats#quickstart-60-seconds")

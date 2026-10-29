@@ -76,7 +76,7 @@ or `"command": "uvx", "args": ["wats", "mcp", "--profile",
 --profile <name>`).
 
 - The wrapper downloads the wats release of its own version for this
-  machine (macOS arm64, Linux x86_64; elsewhere it says how to install
+  machine (macOS arm64, Linux x86_64 or arm64; elsewhere it says how to install
   otherwise), verifies its minisign signatures, their file names and its
   SHA-256 with the release key, as `wats upgrade` does, caches the binary
   (`~/Library/Caches/wats-wrapper`, `~/.cache/wats-wrapper`), and runs

@@ -9,6 +9,8 @@ name: release
 #                              packaged into the image (Dockerfile.release,
 #                              distroless static) and pushed to GHCR:
 #                              ghcr.io/wearetheswarm/wats:X.Y.Z and :sha-<short>
+#   aarch64-unknown-linux-musl static, Linux / WSL on arm64 (0.5.9), built
+#                              natively on ubuntu-24.04-arm
 #   aarch64-apple-darwin       Apple silicon (macOS minutes cost ~10x; once
 #                              per release)
 # Each binary is attached to the release as wats-X.Y.Z-<target>.tar.gz plus
@@ -55,6 +57,8 @@ jobs:
         include:
           - target: x86_64-unknown-linux-musl
             os: ubuntu-latest
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-24.04-arm
           - target: aarch64-apple-darwin
             os: macos-latest
     runs-on: ${{ matrix.os }}
@@ -94,6 +98,11 @@ jobs:
         env:
           TARGET: ${{ matrix.target }}
         run: |
+          # The arm64 runner image may come without rustup.
+          if ! command -v rustup >/dev/null; then
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable
+            export PATH="$HOME/.cargo/bin:$PATH"
+          fi
           rustup target add "$TARGET"
           cargo build --release --locked --target "$TARGET" -p wats
 
@@ -151,7 +160,7 @@ jobs:
           MINISIGN_MACOS_SHA256: 89000b19535765f9cffc65a65d64a820f433ef6db8020667f7570e06bf6aac63
         run: |
           case "$RUNNER_OS-$RUNNER_ARCH" in
-            Linux-X64)   asset="minisign-$MINISIGN_VERSION-linux.tar.gz"; sha="$MINISIGN_LINUX_SHA256" ;;
+            Linux-X64|Linux-ARM64) asset="minisign-$MINISIGN_VERSION-linux.tar.gz"; sha="$MINISIGN_LINUX_SHA256" ;;
             macOS-ARM64) asset="minisign-$MINISIGN_VERSION-macos.zip";    sha="$MINISIGN_MACOS_SHA256" ;;
             *) echo "::error::no pinned minisign for $RUNNER_OS-$RUNNER_ARCH"; exit 1 ;;
           esac
@@ -162,7 +171,8 @@ jobs:
           echo "$sha  $dir/$asset" | shasum -a 256 -c -
           case "$asset" in
             *.tar.gz) tar -xzf "$dir/$asset" -C "$dir"
-                      cp "$dir/minisign-linux/x86_64/minisign" "$dir/bin/minisign" ;;
+                      cpu=x86_64; [ "$RUNNER_ARCH" = ARM64 ] && cpu=aarch64
+                      cp "$dir/minisign-linux/$cpu/minisign" "$dir/bin/minisign" ;;
             *.zip)    unzip -q "$dir/$asset" minisign -d "$dir/bin" ;;
           esac
           chmod +x "$dir/bin/minisign"
@@ -343,7 +353,7 @@ jobs:
           MINISIGN_MACOS_SHA256: 89000b19535765f9cffc65a65d64a820f433ef6db8020667f7570e06bf6aac63
         run: |
           case "$RUNNER_OS-$RUNNER_ARCH" in
-            Linux-X64)   asset="minisign-$MINISIGN_VERSION-linux.tar.gz"; sha="$MINISIGN_LINUX_SHA256" ;;
+            Linux-X64|Linux-ARM64) asset="minisign-$MINISIGN_VERSION-linux.tar.gz"; sha="$MINISIGN_LINUX_SHA256" ;;
             macOS-ARM64) asset="minisign-$MINISIGN_VERSION-macos.zip";    sha="$MINISIGN_MACOS_SHA256" ;;
             *) echo "::error::no pinned minisign for $RUNNER_OS-$RUNNER_ARCH"; exit 1 ;;
           esac
@@ -354,7 +364,8 @@ jobs:
           echo "$sha  $dir/$asset" | shasum -a 256 -c -
           case "$asset" in
             *.tar.gz) tar -xzf "$dir/$asset" -C "$dir"
-                      cp "$dir/minisign-linux/x86_64/minisign" "$dir/bin/minisign" ;;
+                      cpu=x86_64; [ "$RUNNER_ARCH" = ARM64 ] && cpu=aarch64
+                      cp "$dir/minisign-linux/$cpu/minisign" "$dir/bin/minisign" ;;
             *.zip)    unzip -q "$dir/$asset" minisign -d "$dir/bin" ;;
           esac
           chmod +x "$dir/bin/minisign"
