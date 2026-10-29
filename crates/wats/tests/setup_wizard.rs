@@ -543,7 +543,7 @@ fn quick_and_detailed_with_an_agent() {
             "security_auto = true",
             "security_delay = \"1d\"",
             // Sharing: ask each time (ADR 0056 §2, Enter).
-            "auto = false"
+            "mode = \"ask\""
         ],
         "{config}"
     );
