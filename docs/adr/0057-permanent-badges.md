@@ -1,9 +1,10 @@
 # 0057. Badges are permanent
 
-Status: Proposed (2026-10-28), for 0.5.9. Vincent decided the rule (SPEC
+Status: Accepted (2026-10-28), for 0.5.9. Vincent decided the rule (SPEC
 D45, amended in the internal repo at 62e5f39, through the internal
 session): badges are permanent once earned, like on Stack Overflow. The
-internal session approved the plan below. Amends ADR 0056 §4.
+internal session reviewed this ADR against D45 and approved it, and
+suggested the seed (§6). Amends ADR 0056 §4.
 
 ## Context
 
@@ -117,7 +118,19 @@ a rare case.
   that is withdrawn and earned again isn't said twice while the daemon
   runs.
 
-### 5. What stays dynamic
+### 5. The seed at the upgrade
+
+The first time a node writes its summary with 0.5.9, it seeds the
+ledger once (`store_meta` key `badges_seeded`). For each of its own
+profiles, the seed reads every post, not just the latest 200, and
+records what they earn now. Everything it records is marked announced.
+
+This brings back the badges the window had dropped, without announcing
+them. Stores are small today (216 posts on the archive node), so a
+single full pass is cheap. Other authors' rows are filled as `who`
+computes them.
+
+### 6. What stays dynamic
 
 These still read the current signals and decay as before:
 
@@ -133,11 +146,10 @@ Only the badges are permanent.
 - Badges stop churning. A badge reported once stays until its evidence
   is retracted or discounted.
 - Upgrading:
-  - a badge that already dropped before the upgrade comes back only if
-    it is earned again;
-  - when it is, it is reported once;
-  - badges held at the upgrade are recorded and marked announced,
-    silently.
+  - the seed (§5) brings back, silently, the badges the window had
+    dropped, as long as their signals still earn them;
+  - a badge that only decay or weights had taken comes back once it is
+    earned again, and is reported once.
 - The ledger grows by one row per (network, author, badge) this node
   computes, a few hundred bytes each.
 - A re-check costs one standing computation per held badge that the

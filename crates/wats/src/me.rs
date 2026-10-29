@@ -94,6 +94,14 @@ pub fn compute(node: &Node, prev: Option<&Me>, now: u64) -> Me {
     authors.sort();
     let mut reputation = 0i64;
     let mut badges: Vec<String> = Vec::new();
+    if store.take_badge_seed().unwrap_or(false) {
+        for net in &node.config().nets {
+            let grouping = crate::delivery::grouping(node, net);
+            for author in &authors {
+                crate::scores::seed(store, &grouping, net, author);
+            }
+        }
+    }
     for net in &node.config().nets {
         let grouping = crate::delivery::grouping(node, net);
         for author in &authors {

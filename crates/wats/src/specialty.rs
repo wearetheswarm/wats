@@ -83,11 +83,19 @@ fn compute(
     net: &str,
     author: &str,
 ) -> anyhow::Result<Vec<Earned>> {
-    compute_at(store, grouping, net, author, &[], crate::node::now_secs())
+    compute_at(
+        store,
+        grouping,
+        net,
+        author,
+        &[],
+        crate::node::now_secs(),
+        ANSWERS,
+    )
 }
 
-/// [`compute`] as of `now`, over the latest answers and the answers
-/// `extra` (a badge's evidence, ADR 0057).
+/// [`compute`] as of `now`, over the latest `window` answers and the
+/// answers `extra` (a badge's evidence, ADR 0057).
 pub fn compute_at(
     store: &Store,
     grouping: &Grouping,
@@ -95,6 +103,7 @@ pub fn compute_at(
     author: &str,
     extra: &[String],
     now: u64,
+    window: usize,
 ) -> anyhow::Result<Vec<Earned>> {
     let filter = Filter {
         net: Some(net.to_string()),
@@ -103,7 +112,7 @@ pub fn compute_at(
         ..Filter::default()
     };
     let mut answers: Vec<std::sync::Arc<Event>> = store
-        .search(None, &filter, ANSWERS)?
+        .search(None, &filter, window)?
         .into_iter()
         .map(|s| s.event)
         .collect();

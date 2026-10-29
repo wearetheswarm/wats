@@ -2832,6 +2832,17 @@ impl Store {
         Ok(())
     }
 
+    /// True once, the first time it is asked: the ledger is to be seeded
+    /// (ADR 0057 §5).
+    pub fn take_badge_seed(&self) -> Result<bool> {
+        let conn = self.conn();
+        if meta(&conn, "badges_seeded")?.is_some() {
+            return Ok(false);
+        }
+        set_meta(&conn, "badges_seeded", 1)?;
+        Ok(true)
+    }
+
     /// Mark `badge` announced; false when it already was (or is not
     /// recorded).
     pub fn badge_announce(&self, net: &str, author: &str, badge: &str, now: u64) -> Result<bool> {

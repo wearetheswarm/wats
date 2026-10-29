@@ -175,6 +175,29 @@ fn settle(
     order(kept)
 }
 
+/// Seed the ledger at the upgrade to 0.5.9 (ADR 0057 §5): what all of
+/// `author`'s posts on `net` earn now, not only the latest, recorded and
+/// marked announced, silently: it brings back the badges the window had
+/// dropped, without saying them again.
+pub fn seed(store: &Store, grouping: &Grouping, net: &str, author: &str) {
+    let now = crate::node::now_secs();
+    let Ok(all) = compute_in(store, grouping, net, author, &[], now, SEED_WINDOW) else {
+        return;
+    };
+    for badge in &all.badges {
+        let evidence = all.evidence.get(badge).cloned().unwrap_or_default();
+        if store.badge_earn(net, author, badge, now, &evidence).is_ok() {
+            let _ = store.badge_announce(net, author, badge, now);
+        }
+    }
+    if let Ok(mut cache) = CACHE.lock() {
+        cache.remove(&(net.to_string(), author.to_string()));
+    }
+}
+
+/// The posts a seed reads: all of them, in practice.
+const SEED_WINDOW: usize = 1_000_000;
+
 /// Whether the kept `badge` is due for a re-check, and if so marks it.
 fn recheck_due(net: &str, author: &str, badge: &str) -> bool {
     let key = (net.to_string(), author.to_string(), badge.to_string());
@@ -232,6 +255,19 @@ fn compute_at(
     extra: &[String],
     now: u64,
 ) -> anyhow::Result<Standing> {
+    compute_in(store, grouping, net, author, extra, now, POSTS)
+}
+
+/// [`compute_at`] over the latest `window` posts (and reacts, and answers).
+fn compute_in(
+    store: &Store,
+    grouping: &Grouping,
+    net: &str,
+    author: &str,
+    extra: &[String],
+    now: u64,
+    window: usize,
+) -> anyhow::Result<Standing> {
     let filter = Filter {
         net: Some(net.to_string()),
         kinds: vec![
@@ -243,7 +279,7 @@ fn compute_at(
         ..Filter::default()
     };
     let mut posts: Vec<std::sync::Arc<Event>> = store
-        .search(None, &filter, POSTS)?
+        .search(None, &filter, window)?
         .into_iter()
         .map(|s| s.event)
         .collect();
@@ -348,7 +384,7 @@ fn compute_at(
             earned.push(badge);
         }
     }
-    let guarded = guard_checks(store, grouping, net, author, extra, now)?;
+    let guarded = guard_checks(store, grouping, net, author, extra, now, window)?;
     if guarded.len() >= 10 {
         earned.push("Guard Bee");
         by.insert("Guard Bee", guarded);
@@ -359,7 +395,7 @@ fn compute_at(
         .filter(|name| earned.contains(name))
         .map(str::to_string)
         .collect();
-    for e in crate::specialty::compute_at(store, grouping, net, author, extra, now)? {
+    for e in crate::specialty::compute_at(store, grouping, net, author, extra, now, window)? {
         let badge = format!("Comb: {}", e.tag);
         out.badges.push(badge.clone());
         out.evidence.insert(badge, e.posts);
@@ -382,6 +418,7 @@ fn guard_checks(
     author: &str,
     extra: &[String],
     now: u64,
+    window: usize,
 ) -> anyhow::Result<Vec<String>> {
     let filter = Filter {
         net: Some(net.to_string()),
@@ -390,7 +427,7 @@ fn guard_checks(
         ..Filter::default()
     };
     let mut reacts: Vec<std::sync::Arc<Event>> = store
-        .search(None, &filter, POSTS)?
+        .search(None, &filter, window)?
         .into_iter()
         .map(|r| r.event)
         .collect();
@@ -672,6 +709,13 @@ mod tests {
         )
         .unwrap();
         assert!(with.evidence["First Buzz"].contains(&ask.id));
+        // The upgrade's seed reads every post, and says nothing.
+        seed(&store, &grouping, "public", &ask.author);
+        let rows = store.badges_earned("public", &ask.author).unwrap();
+        let buzz = rows.iter().find(|r| r.badge == "First Buzz").unwrap();
+        assert!(buzz.evidence.contains(&ask.id) && buzz.announced);
+        assert!(store.take_badge_seed().unwrap());
+        assert!(!store.take_badge_seed().unwrap(), "once");
     }
 
     /// ADR 0057: a badge is announced once, even when it is held again
