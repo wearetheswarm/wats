@@ -383,7 +383,7 @@ enum Command {
         #[arg(short = 'd', long, global = true)]
         detach: bool,
         /// Share the fixes your agents find at once, after the privacy
-        /// scrub (`share.auto = true`, ADR 0056 §2), without being asked:
+        /// scrub (`share.mode = "auto"`, ADR 0056 §2), without being asked:
         /// for a setup without a terminal, which cannot ask.
         #[arg(long, global = true)]
         share_auto: bool,
@@ -884,11 +884,19 @@ struct GuardianKey {
 
 #[derive(Debug, Subcommand)]
 enum MeAction {
-    /// Whether your agents' fixes are shared at once (`share.auto`, ADR
-    /// 0056 §2): `on` shares them after the privacy scrub, `off` has your
-    /// agents ask you each time; without an argument, it prints the
-    /// current state. For you only: no wats tool changes it, and an agent
-    /// must not run this unless you asked.
+    /// What happens to the fixes your agents find (`share.mode`, ADR 0056
+    /// §2): `ask` (the default) has the hooks suggest sharing one and your
+    /// agents ask you before each share; `auto` shares them at once, after
+    /// the privacy scrub; `off` never suggests it (you can still ask your
+    /// agent to share one, and approve it). Without an argument, it prints
+    /// the current level. For you only: no wats tool changes it, and an
+    /// agent must not run this unless you asked.
+    Sharing {
+        #[arg(value_parser = ["ask", "auto", "off"])]
+        level: Option<String>,
+    },
+    /// The older switch: `on` is `wats me sharing auto`, `off` is `wats me
+    /// sharing ask`; without an argument, it prints the current level.
     Autoshare {
         #[arg(value_parser = ["on", "off"])]
         state: Option<String>,
@@ -2870,7 +2878,7 @@ fn install_wats_command(args: &NodeArgs, name: &str, path: &std::path::Path) -> 
     }
     std::fs::write(path, text)?;
     println!(
-        "{name}: {} (your reputation; status, outbox, autoshare, search, ask, answers, help) in {}",
+        "{name}: {} (your reputation; status, outbox, sharing, search, ask, answers, help) in {}",
         if name == "Codex" {
             "/prompts:wats"
         } else {
@@ -3567,7 +3575,7 @@ async fn setup_command(
         if choices.runtime.is_some() {
             offer_more_agents(node, data_dir)?;
         }
-        ask_share_auto(node, data_dir)?;
+        ask_share_mode(node, data_dir)?;
         print!("{}", welcome::step(3, style));
         let changed = std::fs::read(&config).ok() != before;
         offer_background(node, data_dir, detach, false, changed, true).await?;
@@ -3590,7 +3598,7 @@ async fn setup_command(
     // Once per node, with the person's own CLI: a node set up before 0.5.5
     // is asked at its next such setup.
     if mcp && !yes {
-        ask_share_auto(node, data_dir)?;
+        ask_share_mode(node, data_dir)?;
     }
     if agent {
         offer_more_agents(node, data_dir)?;
@@ -3599,43 +3607,50 @@ async fn setup_command(
     offer_background(node, data_dir, detach, yes, changed, false).await
 }
 
-/// `share.auto` in config.toml (ADR 0056 §2).
-fn set_share_auto(data_dir: &std::path::Path, on: bool) -> Result<()> {
+/// `share.mode` in config.toml (ADR 0056 §2); the older `share.auto` goes,
+/// so that the two never disagree.
+fn set_share_mode(data_dir: &std::path::Path, level: ShareMode) -> Result<()> {
     let mut file = ConfigFile::open(data_dir)?;
-    file.set("share.auto", if on { "true" } else { "false" })?;
+    file.set("share.mode", level.as_str())?;
+    file.unset("share.auto")?;
     file.save()?;
     Ok(())
 }
 
-/// Ask whether the agents' fixes go out at once (ADR 0056 §2, Vincent
-/// 2026-10-27): ask each time by default (Enter). Only on a terminal, and only
-/// when config.toml does not say yet: without a terminal nobody saw the
-/// question, so it stays off unless `--share-auto`; an upgraded node keeps
-/// what it has, and is asked at its next setup.
-fn ask_share_auto(node: &NodeArgs, data_dir: &std::path::Path) -> Result<()> {
-    if !interactive(node) || Settings::load(data_dir)?.share.auto.is_some() {
+/// What a sharing level means, for the person.
+fn sharing_explained(level: ShareMode) -> &'static str {
+    match level {
+        ShareMode::Ask => {
+            "ask: when your agents fix something others will hit, they offer to share it and \
+             ask you first"
+        }
+        ShareMode::Auto => {
+            "auto: your agents' fixes are shared at once, after the privacy scrub; `wats outbox` \
+             lists and retracts them"
+        }
+        ShareMode::Off => {
+            "off: your agents never suggest sharing a fix; you can still ask one to share \
+             something, and approve it"
+        }
+    }
+}
+
+/// Ask how the agents' fixes are shared (ADR 0056 §2): ask (Enter), auto
+/// or off. Only on a terminal, and only when config.toml does not say yet:
+/// without a terminal nobody saw the question, so it stays ask unless
+/// `--share-auto`; an upgraded node keeps what it has, and is asked at its
+/// next setup. The warning first: a share is for good.
+fn ask_share_mode(node: &NodeArgs, data_dir: &std::path::Path) -> Result<()> {
+    if !interactive(node) || Settings::load(data_dir)?.share.chosen() {
         return Ok(());
     }
-    // A plain yes/no, No by default (Vincent, 0.5.6: the two-choice
-    // wording read as confusing). The warning first: a share is for good.
-    println!("{}", wats::outbox::CANT_UNPUBLISH);
-    let ask = !wats::firstrun::ask_yes_no(
-        &mut std::io::stdin().lock(),
-        &mut std::io::stdout(),
-        "Share your agents' fixes with the swarm automatically? A privacy scrub runs first; \
-         review or retract with `wats outbox` (N: ask me each time)",
-        false,
-    )?;
-    set_share_auto(data_dir, !ask)?;
+    println!("{}", wats::outbox::warning());
+    let level =
+        wats::firstrun::ask_share_mode(&mut std::io::stdin().lock(), &mut std::io::stdout())?;
+    set_share_mode(data_dir, level)?;
     println!(
-        "{}",
-        if ask {
-            "Sharing: your agents ask you before each share (share.auto = false); \
-             `/wats autoshare on` or `wats me autoshare on` shares automatically."
-        } else {
-            "Sharing: automatic, after the privacy scrub (share.auto = true); `wats outbox` \
-             lists and retracts, `wats config set share.auto false` asks you each time instead."
-        }
+        "Sharing: {} (`/wats sharing` or `wats me sharing ask|auto|off` changes it).",
+        sharing_explained(level)
     );
     Ok(())
 }
@@ -4364,7 +4379,7 @@ async fn setup_wizard(node: &NodeArgs, data_dir: &std::path::Path) -> Result<boo
     if choices.runtime.is_some() {
         offer_more_agents(node, data_dir)?;
     }
-    ask_share_auto(node, data_dir)?;
+    ask_share_mode(node, data_dir)?;
     print!("{}", welcome::step(3, style));
     // The background, recommended (Enter), or `d` to choose: here, or not
     // now (ADR 0027, 0.4.5). Native Windows has no `--detach`: here.
@@ -5487,7 +5502,7 @@ fn config_command(node: &NodeArgs, data_dir: &std::path::Path, action: ConfigAct
     Ok(())
 }
 
-use wats::settings::{ConfigFile, Settings, parse_duration, parse_size};
+use wats::settings::{ConfigFile, Settings, ShareMode, parse_duration, parse_size};
 
 /// `wats config set node.name <name>`: refused when another node of this
 /// machine has that name, which `-n` could then not tell apart.
@@ -6308,30 +6323,21 @@ fn me_command(config: &NodeConfig, json: bool) -> Result<()> {
     Ok(())
 }
 
-/// `wats me autoshare [on|off]`.
-fn autoshare_command(data_dir: &std::path::Path, state: Option<&str>) -> Result<()> {
-    let explain = |on: bool| {
-        if on {
-            "on: your agents' fixes are shared at once, after the privacy scrub; `wats outbox` \
-             lists and retracts them"
-        } else {
-            "off: your agents ask you before each share"
-        }
-    };
-    match state {
+/// `wats me sharing [ask|auto|off]` (and `wats me autoshare [on|off]`).
+fn sharing_command(data_dir: &std::path::Path, level: Option<ShareMode>) -> Result<()> {
+    match level {
         None => {
-            let on = Settings::load(data_dir)?.share.auto.unwrap_or(false);
-            println!("autoshare {}", explain(on));
+            let level = Settings::load(data_dir)?.share.level();
+            println!("sharing {}", sharing_explained(level));
         }
-        Some(state) => {
-            let on = state == "on";
-            set_share_auto(data_dir, on)?;
-            if !on {
+        Some(level) => {
+            set_share_mode(data_dir, level)?;
+            if level != ShareMode::Auto {
                 wats::nudge::autoshare_turned_off(data_dir, wats::node::now_secs());
             }
-            println!("autoshare {}", explain(on));
-            if on {
-                println!("{}", wats::outbox::CANT_UNPUBLISH);
+            println!("sharing {}", sharing_explained(level));
+            if level != ShareMode::Off {
+                println!("{}", wats::outbox::warning());
             }
         }
     }
@@ -6370,18 +6376,19 @@ async fn outbox_command(
                 return Ok(());
             }
             if entries.is_empty() {
-                let auto = Settings::load(&config.data_dir)?
-                    .share
-                    .auto
-                    .unwrap_or(false);
+                let level = Settings::load(&config.data_dir)?.share.level();
                 println!(
                     "{}",
-                    if auto {
-                        "Nothing shared yet. With autoshare on, your agents' fixes are shared \
-                         here as they come."
-                    } else {
-                        "Nothing shared yet. With autoshare off, your agents ask you before \
-                         each share (`wats me autoshare on` shares them automatically)."
+                    match level {
+                        ShareMode::Auto =>
+                            "Nothing shared yet. With sharing auto, your agents' fixes are \
+                             shared here as they come.",
+                        ShareMode::Ask =>
+                            "Nothing shared yet. With sharing ask, your agents ask you before \
+                             each share (`wats me sharing auto` shares them automatically).",
+                        ShareMode::Off =>
+                            "Nothing shared yet. With sharing off, your agents don't suggest \
+                             sharing; ask one to share a fix if you want to.",
                     }
                 );
                 return Ok(());
@@ -6403,7 +6410,7 @@ async fn outbox_command(
             }
             println!(
                 "\n`wats outbox retract <id>` takes one back. {}",
-                wats::outbox::CANT_UNPUBLISH
+                wats::outbox::warning()
             );
             Ok(())
         }
@@ -8076,7 +8083,7 @@ impl NodeArgs {
         config.review_notify = file.agent.notify.unwrap_or(false);
         config.declare_via = file.node.declare_via.unwrap_or(true);
         config.bind = file.node.bind.unwrap_or(true);
-        config.share_auto = file.share.auto.unwrap_or(false);
+        config.share_auto = file.share.level() == wats::settings::ShareMode::Auto;
         config.public_name = match &file.node.public_name {
             Some(name) => match wats::hive::check_public_name(name.trim()) {
                 Ok(()) => Some(name.trim().to_string()),
@@ -9890,7 +9897,7 @@ async fn async_main(mut cli: Cli) -> Result<()> {
             share_auto,
         }) => {
             if share_auto {
-                set_share_auto(&data_dir, true)?;
+                set_share_mode(&data_dir, ShareMode::Auto)?;
             }
             // `wats --detach setup …` means `wats setup … --detach`.
             return setup_command(&cli.node, &data_dir, tool, detach || cli.daemon.detach).await;
@@ -9938,9 +9945,28 @@ async fn async_main(mut cli: Cli) -> Result<()> {
             return status_line(&config);
         }
         Some(Command::Me {
+            action: Some(MeAction::Sharing { level }),
+            ..
+        }) => {
+            let level = level
+                .map(|l| l.parse())
+                .transpose()
+                .map_err(anyhow::Error::msg)?;
+            return sharing_command(&config.data_dir, level);
+        }
+        Some(Command::Me {
             action: Some(MeAction::Autoshare { state }),
             ..
-        }) => return autoshare_command(&config.data_dir, state.as_deref()),
+        }) => {
+            let level = state.map(|s| {
+                if s == "on" {
+                    ShareMode::Auto
+                } else {
+                    ShareMode::Ask
+                }
+            });
+            return sharing_command(&config.data_dir, level);
+        }
         Some(Command::Me { json, .. }) => return me_command(&config, json),
         Some(Command::Outbox { action, json }) => {
             return outbox_command(config, action, json).await;

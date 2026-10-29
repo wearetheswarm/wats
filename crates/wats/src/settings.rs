@@ -142,9 +142,61 @@ pub struct Settings {
 #[derive(Debug, Default, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ShareSettings {
-    /// Post a finding at once, after the scrub, without the person's OK
-    /// for each; unset: off.
+    /// How the agents' fixes are shared; unset: from `auto`, else ask.
+    pub mode: Option<ShareMode>,
+    /// The older switch, read when `mode` is unset: true is `auto`.
     pub auto: Option<bool>,
+}
+
+impl ShareSettings {
+    /// The sharing level in force (ADR 0056 §2, amended in 0.5.10).
+    pub fn level(&self) -> ShareMode {
+        self.mode.unwrap_or(if self.auto == Some(true) {
+            ShareMode::Auto
+        } else {
+            ShareMode::Ask
+        })
+    }
+
+    /// Whether the person chose a level already.
+    pub fn chosen(&self) -> bool {
+        self.mode.is_some() || self.auto.is_some()
+    }
+}
+
+/// `share.mode`: what happens to a fix the agents find.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ShareMode {
+    /// The hooks suggest sharing; the person approves each share.
+    Ask,
+    /// Shared at once, after the privacy scrub.
+    Auto,
+    /// The hooks never suggest it; the person can still share on purpose,
+    /// approving it.
+    Off,
+}
+
+impl ShareMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ShareMode::Ask => "ask",
+            ShareMode::Auto => "auto",
+            ShareMode::Off => "off",
+        }
+    }
+}
+
+impl std::str::FromStr for ShareMode {
+    type Err = String;
+    fn from_str(s: &str) -> std::result::Result<Self, String> {
+        match s.trim() {
+            "ask" => Ok(ShareMode::Ask),
+            "auto" => Ok(ShareMode::Auto),
+            "off" => Ok(ShareMode::Off),
+            other => Err(format!("{other}: the levels are ask, auto and off")),
+        }
+    }
 }
 
 /// `[hooks]`: the nudges of the agent CLIs' hooks (ADR 0056 §1).
@@ -691,6 +743,8 @@ pub enum ValueType {
     Bool,
     /// Comma-separated on the command line, an array of strings in the file.
     List,
+    /// `ask`, `auto` or `off` (`share.mode`).
+    ShareMode,
 }
 
 /// One configuration key.
@@ -795,12 +849,21 @@ pub const KEYS: &[Key] = &[
          <data dir>/node-name",
     ),
     key(
+        "share.mode",
+        ValueType::ShareMode,
+        "ask",
+        "what happens to the fixes your agents find (ADR 0056): ask (the hooks suggest sharing \
+         one, you approve each share), auto (shared at once, after the privacy scrub) or off (no \
+         share suggestions; you can still ask your agent to share one, and approve it). `wats \
+         setup` asks (Enter: ask); `wats me sharing <level>` or `/wats sharing <level>` switches \
+         it; wats outbox lists and retracts what was shared",
+    ),
+    key(
         "share.auto",
         ValueType::Bool,
         "false",
-        "share_finding posts a finding at once, after the privacy scrub, without asking you \
-         first (ADR 0056); `wats setup` asks (Enter: ask each time); `wats me autoshare on|off` \
-         or `/wats autoshare on|off` switches it; wats outbox lists and retracts what was shared",
+        "the older switch, read only when share.mode is unset: true is share.mode auto, false \
+         is ask (`wats me autoshare on|off` sets share.mode)",
     ),
     key(
         "hooks.errors",
@@ -1531,6 +1594,7 @@ fn toml_value(key: &Key, raw: &str) -> Result<toml_edit::Value> {
             }
             raw.into()
         }
+        ValueType::ShareMode => raw.parse::<ShareMode>().map_err(invalid)?.as_str().into(),
         // Stored by its current name (`locked` → `swarm-only`).
         ValueType::Access => raw
             .parse::<crate::access::Access>()

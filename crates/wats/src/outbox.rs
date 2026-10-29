@@ -6,12 +6,20 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
-/// What the person is told before a share, and in `wats outbox`: a
-/// retraction reaches only the nodes that comply (ADR 0020 §5.1), so a
-/// share is for good. Repeated in `share_finding`'s tool description, which
-/// must be a literal (a test checks they agree).
+/// What the person is told where they choose how sharing goes (the setup
+/// question, `wats me sharing`) and in `wats outbox`: a retraction reaches
+/// only the nodes that comply (ADR 0020 §5.1), so a share is for good. Not
+/// at each share: the person decided once (Vincent, 0.5.10).
 pub const CANT_UNPUBLISH: &str = "Once shared, a post can't be fully unpublished: retract \
      drops it on nodes that comply, but copies may remain. If a secret slips through, revoke it.";
+
+/// The page that says what sharing means (`docs/sharing.md` on the site).
+pub const SHARING_DOC: &str = "https://wearetheswarm.ai/docs/reference/sharing/#what-sharing-means";
+
+/// [`CANT_UNPUBLISH`] and where to read more.
+pub fn warning() -> String {
+    format!("{CANT_UNPUBLISH} What sharing means: {SHARING_DOC}")
+}
 
 /// The outbox file, in the data directory.
 pub const FILE: &str = "outbox.jsonl";
@@ -27,7 +35,7 @@ pub struct Entry {
     pub profile: String,
     /// Unix seconds.
     pub ts: u64,
-    /// Shared under `share.auto`, without the person's OK for it.
+    /// Shared under `share.mode` auto, without the person's OK for it.
     pub auto: bool,
 }
 

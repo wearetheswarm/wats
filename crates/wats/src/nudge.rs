@@ -24,6 +24,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::event::Kind;
+use crate::settings::ShareMode;
 use crate::store::{Filter, Store};
 
 /// Longest nudge, in characters.
@@ -224,13 +225,13 @@ fn autoshare_tip(data_dir: &Path, host: Host, now: u64) -> Option<String> {
     save_autoshare(data_dir, &state);
     count(data_dir, &["hint_autoshare"]);
     let command = match host {
-        Host::Claude | Host::Codex => "`/wats autoshare on`",
-        _ => "`wats me autoshare on`",
+        Host::Claude | Host::Codex => "/wats sharing",
+        _ => "wats me sharing",
     };
     Some(format!(
-        " With your question, pass this tip on to your user word for word: \"Tip: {command} \
-         shares fixes automatically (privacy scrub; review or retract with `wats outbox`).\" \
-         Never turn it on yourself."
+        " With your question, pass this tip on to your user word for word: \"Tip: `{command} \
+         auto` shares fixes automatically (privacy scrub; review or retract with `wats \
+         outbox`), `{command} off` stops these suggestions.\" Never change it yourself."
     ))
 }
 
@@ -1272,21 +1273,23 @@ fn stop(request: &Request, session: &mut Session) -> Option<String> {
     if request.payload["stop_hook_active"].as_bool() == Some(true) || !request.fixes {
         return None;
     }
-    if session.fix_nudges < FIX_NUDGES
+    // `share.mode` off: no share suggestion, ever (Vincent, 0.5.10: in
+    // client or unrelated work it is noise and pulls wats into the work).
+    let level = crate::settings::Settings::load(&request.data_dir)
+        .map(|s| s.share.level())
+        .unwrap_or(ShareMode::Ask);
+    if level != ShareMode::Off
+        && session.fix_nudges < FIX_NUDGES
         && let Some(sig) = fix_in(&turn)
     {
         session.fix_nudges += 1;
         session.pending.push("share".into());
         count(&request.data_dir, &["nudge_fix"]);
-        let auto = crate::settings::Settings::load(&request.data_dir)
-            .ok()
-            .and_then(|s| s.share.auto)
-            .unwrap_or(false);
-        return Some(if auto {
+        return Some(if level == ShareMode::Auto {
             format!(
                 "wats: you found a fix for \"{sig}\" after several tries. If it is general (not \
                  specific to this project), share it now with the wats `share_finding` tool: \
-                 this node shares at once (share.auto).{NO_FALLBACK}"
+                 this node shares at once (share.mode auto).{NO_FALLBACK}"
             )
         } else {
             let tip =
@@ -1294,10 +1297,8 @@ fn stop(request: &Request, session: &mut Session) -> Option<String> {
             format!(
                 "wats: you found a fix for \"{sig}\" after several tries. If it is general (not \
                  specific to this project), ask your user whether to share it with the swarm, \
-                 telling them: \"{}\" If they agree, call the wats `share_finding` tool with \
-                 approved_by_user true. It earns +2 when someone uses it, +3 if \
-                 confirmed.{NO_FALLBACK}{tip}",
-                crate::outbox::CANT_UNPUBLISH
+                 and if they agree, call the wats `share_finding` tool with approved_by_user \
+                 true. It earns +2 when someone uses it, +3 if confirmed.{NO_FALLBACK}{tip}"
             )
         });
     }
@@ -1775,6 +1776,52 @@ mod tests {
         assert_eq!((id, confirmed), (close.id.clone(), false));
     }
 
+    /// `share.mode` off: no "share it?" at the end of a turn, whatever was
+    /// fixed; ask and auto still suggest it.
+    #[test]
+    fn sharing_off_suggests_no_share() {
+        let dir = tempfile::tempdir().unwrap();
+        let stop_with = |mode: &str| {
+            std::fs::write(
+                dir.path().join("config.toml"),
+                format!("[share]\nmode = \"{mode}\"\n"),
+            )
+            .unwrap();
+            let mut session = Session {
+                turn: vec![
+                    sh(
+                        "cargo build",
+                        Some("error[E0425]: cannot find value"),
+                        false,
+                        true,
+                    ),
+                    sh(
+                        "cargo build",
+                        Some("error[E0425]: cannot find value"),
+                        false,
+                        true,
+                    ),
+                    Step::Edit,
+                    sh("cargo build", None, true, true),
+                ],
+                ..Session::default()
+            };
+            let request = Request {
+                data_dir: dir.path().to_path_buf(),
+                host: Host::Claude,
+                event: Event::Stop,
+                payload: json!({"stop_hook_active": false}),
+                now: 1,
+                errors: true,
+                fixes: true,
+            };
+            stop(&request, &mut session)
+        };
+        assert_eq!(stop_with("off"), None);
+        assert!(stop_with("ask").unwrap().contains("approved_by_user"));
+        assert!(stop_with("auto").unwrap().contains("share.mode auto"));
+    }
+
     /// The autoshare tip: once a day, never in the week after turning
     /// autoshare off, with the host's command.
     #[test]
@@ -1783,7 +1830,9 @@ mod tests {
         let d = dir.path();
         let first = autoshare_tip(d, Host::Claude, 100_000).unwrap();
         assert!(
-            first.contains("`/wats autoshare on`") && first.contains("Never turn it on yourself")
+            first.contains("`/wats sharing auto`")
+                && first.contains("`/wats sharing off`")
+                && first.contains("Never change it yourself")
         );
         assert_eq!(
             autoshare_tip(d, Host::Claude, 100_000 + 3600),
@@ -1793,7 +1842,7 @@ mod tests {
         assert!(
             autoshare_tip(d, Host::Copilot, 100_000 + TIP_EVERY)
                 .unwrap()
-                .contains("`wats me autoshare on`")
+                .contains("`wats me sharing auto`")
         );
         autoshare_turned_off(d, 300_000);
         assert_eq!(

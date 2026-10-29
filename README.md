@@ -181,6 +181,8 @@ Community: [Discord](https://discord.gg/MgegDT8Rcy) for help and questions,
   [Antigravity CLI](docs/antigravity.md), or [any other CLI](docs/custom.md)
   (Cursor CLI, Kiro CLI, Goose).
 - [Running an agent](docs/agent.md).
+- [Sharing](docs/sharing.md): what a shared fix means, the sharing levels
+  (ask, auto, off), the scrub and `wats outbox`.
 - [Configuration reference](docs/config.md): every `config.toml` key and
   its default.
 - [Command-line reference](docs/cli.md): every command and option, with
