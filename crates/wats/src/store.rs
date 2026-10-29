@@ -279,7 +279,41 @@ CREATE TABLE IF NOT EXISTS find_counters (
     value INTEGER NOT NULL,
     PRIMARY KEY (day, name)
 ) WITHOUT ROWID;
+-- Badges as this node saw them earned (ADR 0057): kept once earned, with
+-- the posts that earned them (a JSON array of ids), so that neither decay
+-- nor the window of latest posts takes one back; only a re-check of that
+-- evidence as of `earned_at` can (`withdrawn_at`). `first_at` never
+-- changes; `announced_at` is set when "your reputation" first says it,
+-- so a badge is announced once, whoever recorded it. Local, never sent;
+-- no schema bump (an older wats ignores it).
+CREATE TABLE IF NOT EXISTS badges_earned (
+    net          TEXT NOT NULL,
+    author       TEXT NOT NULL,
+    badge        TEXT NOT NULL,
+    first_at     INTEGER NOT NULL,
+    earned_at    INTEGER NOT NULL,
+    evidence     TEXT NOT NULL,
+    withdrawn_at INTEGER,
+    announced_at INTEGER,
+    PRIMARY KEY (net, author, badge)
+) WITHOUT ROWID;
 "#;
+
+/// A badge as recorded in `badges_earned` (ADR 0057).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BadgeEarned {
+    pub badge: String,
+    /// Its first earn: the only one announced.
+    pub first_at: u64,
+    /// Its latest earn, which `evidence` is from.
+    pub earned_at: u64,
+    /// The posts that earned it.
+    pub evidence: Vec<String>,
+    /// Taken back (ADR 0057): not shown, until earned again.
+    pub withdrawn: bool,
+    /// Already said in "your reputation": never said again.
+    pub announced: bool,
+}
 
 /// Events whose blobs one backfill transaction of `event_blobs` indexes.
 const EVENT_BLOBS_BATCH: i64 = 5_000;
@@ -2747,6 +2781,86 @@ impl Store {
                 params![day, name],
             )?;
         }
+        Ok(())
+    }
+
+    /// The badges `author` earned on `net` as this node saw them (ADR
+    /// 0057), withdrawn ones included, oldest first.
+    pub fn badges_earned(&self, net: &str, author: &str) -> Result<Vec<BadgeEarned>> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare_cached(
+            "SELECT badge, first_at, earned_at, evidence, withdrawn_at, announced_at
+             FROM badges_earned
+             WHERE net = ?1 AND author = ?2 ORDER BY first_at, badge",
+        )?;
+        let rows = stmt
+            .query_map(params![net, author], |r| {
+                Ok(BadgeEarned {
+                    badge: r.get(0)?,
+                    first_at: r.get::<_, i64>(1)?.max(0) as u64,
+                    earned_at: r.get::<_, i64>(2)?.max(0) as u64,
+                    evidence: serde_json::from_str(&r.get::<_, String>(3)?).unwrap_or_default(),
+                    withdrawn: r.get::<_, Option<i64>>(4)?.is_some(),
+                    announced: r.get::<_, Option<i64>>(5)?.is_some(),
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// Record that `author` earned `badge` on `net` at `at`, from the posts
+    /// `evidence`: a first earn, or a withdrawn badge earned again (which
+    /// keeps its `first_at`). A badge already held is left as it was.
+    pub fn badge_earn(
+        &self,
+        net: &str,
+        author: &str,
+        badge: &str,
+        at: u64,
+        evidence: &[String],
+    ) -> Result<()> {
+        let evidence = serde_json::to_string(evidence)?;
+        self.conn().execute(
+            "INSERT INTO badges_earned (net, author, badge, first_at, earned_at, evidence)
+             VALUES (?1, ?2, ?3, ?4, ?4, ?5)
+             ON CONFLICT (net, author, badge) DO UPDATE
+             SET earned_at = excluded.earned_at, evidence = excluded.evidence,
+                 withdrawn_at = NULL
+             WHERE withdrawn_at IS NOT NULL",
+            params![net, author, badge, at as i64, evidence],
+        )?;
+        Ok(())
+    }
+
+    /// True once, the first time it is asked: the ledger is to be seeded
+    /// (ADR 0057 §5).
+    pub fn take_badge_seed(&self) -> Result<bool> {
+        let conn = self.conn();
+        if meta(&conn, "badges_seeded")?.is_some() {
+            return Ok(false);
+        }
+        set_meta(&conn, "badges_seeded", 1)?;
+        Ok(true)
+    }
+
+    /// Mark `badge` announced; false when it already was (or is not
+    /// recorded).
+    pub fn badge_announce(&self, net: &str, author: &str, badge: &str, now: u64) -> Result<bool> {
+        let n = self.conn().execute(
+            "UPDATE badges_earned SET announced_at = ?4
+             WHERE net = ?1 AND author = ?2 AND badge = ?3 AND announced_at IS NULL",
+            params![net, author, badge, now as i64],
+        )?;
+        Ok(n > 0)
+    }
+
+    /// Take back a badge whose evidence no longer earns it (ADR 0057).
+    pub fn badge_withdraw(&self, net: &str, author: &str, badge: &str, now: u64) -> Result<()> {
+        self.conn().execute(
+            "UPDATE badges_earned SET withdrawn_at = ?4
+             WHERE net = ?1 AND author = ?2 AND badge = ?3",
+            params![net, author, badge, now as i64],
+        )?;
         Ok(())
     }
 

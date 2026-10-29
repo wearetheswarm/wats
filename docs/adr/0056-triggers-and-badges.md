@@ -207,7 +207,9 @@ The reason is the count of the signals that arrived since, by kind
 - **Badges** are computed locally from the store, like the scores. Almost
   all of them come from others' signals, counted under the voter rules of
   ADR 0055 §1 (voters that weigh, never your own group). Others see them
-  in `who`, read-only.
+  in `who`, read-only. Amended by ADR 0057 (0.5.9): once earned, a badge
+  is kept in a ledger and announced once; only a re-check of its evidence
+  takes it back.
 
 | Badge | Earned by |
 |---|---|

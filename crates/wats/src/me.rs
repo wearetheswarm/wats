@@ -94,6 +94,14 @@ pub fn compute(node: &Node, prev: Option<&Me>, now: u64) -> Me {
     authors.sort();
     let mut reputation = 0i64;
     let mut badges: Vec<String> = Vec::new();
+    if store.take_badge_seed().unwrap_or(false) {
+        for net in &node.config().nets {
+            let grouping = crate::delivery::grouping(node, net);
+            for author in &authors {
+                crate::scores::seed(store, &grouping, net, author);
+            }
+        }
+    }
     for net in &node.config().nets {
         let grouping = crate::delivery::grouping(node, net);
         for author in &authors {
@@ -132,13 +140,27 @@ pub fn compute(node: &Node, prev: Option<&Me>, now: u64) -> Me {
                 why,
             });
         }
-        for badge in badges.iter().filter(|b| !prev.badges.contains(b)) {
+        for badge in &badges {
+            // Shown before (a badge held at the upgrade to 0.5.9): marked
+            // said, silently.
+            if prev.badges.contains(badge) {
+                first_time(node, &authors, badge, now);
+                continue;
+            }
+            if !first_time(node, &authors, badge, now) {
+                continue;
+            }
             changes.push(Change {
                 ts: now,
                 reputation,
                 delta: 0,
                 why: format!("new badge: {badge}"),
             });
+        }
+    } else {
+        // The first summary says nothing new: what it shows is marked said.
+        for badge in &badges {
+            first_time(node, &authors, badge, now);
         }
     }
     let excess = changes.len().saturating_sub(CHANGES);
@@ -151,6 +173,30 @@ pub fn compute(node: &Node, prev: Option<&Me>, now: u64) -> Me {
         shares: shares(node),
         at: now,
     }
+}
+
+/// Whether `badge` is said for the first time (ADR 0057): the ledger
+/// marks it announced for the first of `authors`' records that holds it
+/// unannounced. A badge the ledger does not hold (a read-only store) is
+/// new.
+fn first_time(node: &Node, authors: &[String], badge: &str, now: u64) -> bool {
+    let store = node.store();
+    let mut recorded = false;
+    let mut first = false;
+    for net in &node.config().nets {
+        for author in authors {
+            let Ok(rows) = store.badges_earned(net, author) else {
+                continue;
+            };
+            if rows.iter().any(|r| r.badge == badge) {
+                recorded = true;
+                first |= store
+                    .badge_announce(net, author, badge, now)
+                    .unwrap_or(false);
+            }
+        }
+    }
+    first || !recorded
 }
 
 /// The node's latest shares, with their fate.

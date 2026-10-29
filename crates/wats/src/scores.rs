@@ -46,6 +46,10 @@ pub struct Standing {
     /// Useful votes (+1) received, uses of its answers.
     pub useful: u64,
     pub uses: u64,
+    /// Per badge, the posts that earned it (ADR 0057): what the ledger
+    /// keeps, and what a re-check reads again.
+    #[serde(skip)]
+    pub evidence: HashMap<String, Vec<String>>,
 }
 
 /// The badges (ADR 0056 §4), in the order they are shown, with what earns
@@ -84,7 +88,7 @@ pub fn standing(store: &Store, grouping: &Grouping, net: &str, author: &str) -> 
     {
         return standing.clone();
     }
-    let standing = compute(store, grouping, net, author).unwrap_or_default();
+    let standing = standing_now(store, grouping, net, author);
     if let Ok(mut cache) = CACHE.lock() {
         if cache.len() > 2000 {
             cache.clear();
@@ -92,6 +96,135 @@ pub fn standing(store: &Store, grouping: &Grouping, net: &str, author: &str) -> 
         cache.insert(key, (Instant::now(), standing.clone()));
     }
     standing
+}
+
+/// [`standing`] computed now, not from the cache (which it refreshes):
+/// the brief view's, after each new signal. Its badges are the ledger's
+/// (ADR 0057): kept once earned.
+pub fn standing_now(store: &Store, grouping: &Grouping, net: &str, author: &str) -> Standing {
+    let now = crate::node::now_secs();
+    let mut standing = compute_at(store, grouping, net, author, &[], now).unwrap_or_default();
+    standing.badges = settle(store, grouping, net, author, &standing, now);
+    if let Ok(mut cache) = CACHE.lock() {
+        cache.insert(
+            (net.to_string(), author.to_string()),
+            (Instant::now(), standing.clone()),
+        );
+    }
+    standing
+}
+
+/// How often a kept badge that the current signals no longer earn is
+/// re-checked on its evidence (ADR 0057): daily, so that a trust table
+/// recomputed in between does not make it come and go.
+const RECHECK_EVERY: Duration = Duration::from_secs(24 * 3600);
+
+/// When each kept badge (network, author, badge) was last re-checked.
+type Rechecked = HashMap<(String, String, String), Instant>;
+
+static RECHECKED: std::sync::LazyLock<Mutex<Rechecked>> =
+    std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// The badges to show for `author` on `net` (ADR 0057): every badge this
+/// node saw it earn, kept whatever happens to the signals since (decay, the
+/// window of latest posts, a recomputed trust table). What `current` earns
+/// and the ledger lacks is recorded now, with its evidence. A held badge
+/// that `current` lacks is re-checked, daily, on its evidence as of when it
+/// was earned, with today's store and grouping: it is withdrawn only when
+/// that no longer earns it (its signals were retracted, or are now
+/// discounted, as a Sybil clique's are). Without the ledger (a read-only
+/// store), `current`'s badges.
+fn settle(
+    store: &Store,
+    grouping: &Grouping,
+    net: &str,
+    author: &str,
+    current: &Standing,
+    now: u64,
+) -> Vec<String> {
+    let Ok(rows) = store.badges_earned(net, author) else {
+        return current.badges.clone();
+    };
+    let mut kept: Vec<String> = Vec::new();
+    for row in rows.iter().filter(|r| !r.withdrawn) {
+        if current.badges.contains(&row.badge) || !recheck_due(net, author, &row.badge) {
+            kept.push(row.badge.clone());
+            continue;
+        }
+        match compute_at(store, grouping, net, author, &row.evidence, row.earned_at) {
+            Ok(then) if !then.badges.contains(&row.badge) => {
+                tracing::info!(
+                    "badge {} of {author} withdrawn: the signals that earned it were \
+                     retracted or are discounted now",
+                    row.badge
+                );
+                let _ = store.badge_withdraw(net, author, &row.badge, now);
+            }
+            _ => kept.push(row.badge.clone()),
+        }
+    }
+    for badge in &current.badges {
+        if rows.iter().any(|r| &r.badge == badge && !r.withdrawn) {
+            continue;
+        }
+        let evidence = current.evidence.get(badge).cloned().unwrap_or_default();
+        // Shown even when it can't be recorded (a read-only store).
+        let _ = store.badge_earn(net, author, badge, now, &evidence);
+        kept.push(badge.clone());
+    }
+    order(kept)
+}
+
+/// Seed the ledger at the upgrade to 0.5.9 (ADR 0057 §5): what all of
+/// `author`'s posts on `net` earn now, not only the latest, recorded and
+/// marked announced, silently: it brings back the badges the window had
+/// dropped, without saying them again.
+pub fn seed(store: &Store, grouping: &Grouping, net: &str, author: &str) {
+    let now = crate::node::now_secs();
+    let Ok(all) = compute_in(store, grouping, net, author, &[], now, SEED_WINDOW) else {
+        return;
+    };
+    for badge in &all.badges {
+        let evidence = all.evidence.get(badge).cloned().unwrap_or_default();
+        if store.badge_earn(net, author, badge, now, &evidence).is_ok() {
+            let _ = store.badge_announce(net, author, badge, now);
+        }
+    }
+    if let Ok(mut cache) = CACHE.lock() {
+        cache.remove(&(net.to_string(), author.to_string()));
+    }
+}
+
+/// The posts a seed reads: all of them, in practice.
+const SEED_WINDOW: usize = 1_000_000;
+
+/// Whether the kept `badge` is due for a re-check, and if so marks it.
+fn recheck_due(net: &str, author: &str, badge: &str) -> bool {
+    let key = (net.to_string(), author.to_string(), badge.to_string());
+    let Ok(mut map) = RECHECKED.lock() else {
+        return true;
+    };
+    if map.get(&key).is_some_and(|at| at.elapsed() < RECHECK_EVERY) {
+        return false;
+    }
+    if map.len() > 10_000 {
+        map.clear();
+    }
+    map.insert(key, Instant::now());
+    true
+}
+
+/// Named badges in [`BADGES`] order, then the `Comb:` ones as earned.
+fn order(mut badges: Vec<String>) -> Vec<String> {
+    let rank = |b: &String| {
+        BADGES
+            .iter()
+            .position(|(name, _)| name == b)
+            .unwrap_or(usize::MAX)
+    };
+    badges.sort_by_key(rank);
+    badges.dedup();
+    badges
 }
 
 type Cache = HashMap<(String, String), (Instant, Standing)>;
@@ -102,11 +235,38 @@ static CACHE: std::sync::LazyLock<Mutex<Cache>> =
 /// Capability tags whose accepted answer earns the Field Bee.
 const FIELD_CAPS: &[&str] = &["cap:image", "cap:audio", "cap:video"];
 
+#[cfg(test)]
 fn compute(
     store: &Store,
     grouping: &Grouping,
     net: &str,
     author: &str,
+) -> anyhow::Result<Standing> {
+    compute_at(store, grouping, net, author, &[], crate::node::now_secs())
+}
+
+/// What `author`'s latest posts on `net`, and the posts `extra` (a
+/// badge's evidence), earn as of `now`, from the signals alone (no ledger).
+fn compute_at(
+    store: &Store,
+    grouping: &Grouping,
+    net: &str,
+    author: &str,
+    extra: &[String],
+    now: u64,
+) -> anyhow::Result<Standing> {
+    compute_in(store, grouping, net, author, extra, now, POSTS)
+}
+
+/// [`compute_at`] over the latest `window` posts (and reacts, and answers).
+fn compute_in(
+    store: &Store,
+    grouping: &Grouping,
+    net: &str,
+    author: &str,
+    extra: &[String],
+    now: u64,
+    window: usize,
 ) -> anyhow::Result<Standing> {
     let filter = Filter {
         net: Some(net.to_string()),
@@ -118,18 +278,42 @@ fn compute(
         author: Some(author.to_string()),
         ..Filter::default()
     };
-    let posts: Vec<std::sync::Arc<Event>> = store
-        .search(None, &filter, POSTS)?
+    let mut posts: Vec<std::sync::Arc<Event>> = store
+        .search(None, &filter, window)?
         .into_iter()
         .map(|s| s.event)
         .collect();
+    for id in extra {
+        if posts.iter().any(|p| &p.id == id) {
+            continue;
+        }
+        if let Some(stored) = store.get(id)?
+            && filter.matches(&stored.event)
+        {
+            posts.push(stored.event);
+        }
+    }
     let mut out = Standing::default();
     let mut earned: Vec<&str> = Vec::new();
+    // Per badge, the posts behind it.
+    let mut by: HashMap<&str, Vec<String>> = HashMap::new();
+    fn note(
+        by: &mut HashMap<&'static str, Vec<String>>,
+        earned: &mut Vec<&'static str>,
+        badge: &'static str,
+        id: &str,
+    ) {
+        earned.push(badge);
+        let ids = by.entry(badge).or_default();
+        if !ids.iter().any(|i| i == id) {
+            ids.push(id.to_string());
+        }
+    }
     if posts.is_empty() {
         return Ok(out);
     }
     let refs: Vec<&Event> = posts.iter().map(|e| &**e).collect();
-    let signals = crate::signals::compute(store, grouping, &refs)?;
+    let signals = crate::signals::compute_at(store, grouping, &refs, now)?;
     let root_of = |e: &Event| store.get(e.thread_root()).ok().flatten().map(|s| s.event);
     for post in &posts {
         let Some(s) = signals.get(&post.id) else {
@@ -137,24 +321,34 @@ fn compute(
         };
         out.score += s.points();
         out.useful += s.up;
+        if s.up > 0 {
+            for badge in ["Busy Bee", "Honeycomb", "Golden Hive"] {
+                by.entry(badge).or_default().push(post.id.clone());
+            }
+        }
         // A shared finding (a self-answered question, ADR 0045 §4) earns
         // no "first" by being posted: posting alone earns nothing.
         let shared_ask = |e: &Event| e.data.get("self_answered") == Some(&serde_json::json!(true));
         match post.kind {
-            Kind::Ask if !shared_ask(post) => earned.push("First Buzz"),
+            Kind::Ask if !shared_ask(post) => note(&mut by, &mut earned, "First Buzz", &post.id),
             Kind::Answer => {
                 let own_share = root_of(post)
                     .as_ref()
                     .is_some_and(|r| r.author == post.author && shared_ask(r));
                 if !own_share {
-                    earned.push("Nectar");
+                    note(&mut by, &mut earned, "Nectar", &post.id);
                 }
                 out.uses += s.uses;
+                if s.uses > 0 {
+                    for badge in ["Forager", "Swarm Keeper"] {
+                        by.entry(badge).or_default().push(post.id.clone());
+                    }
+                }
                 if s.accepted {
-                    earned.push("Royal Jelly");
+                    note(&mut by, &mut earned, "Royal Jelly", &post.id);
                 }
                 if s.uses > 0 {
-                    earned.push("Pollinator");
+                    note(&mut by, &mut earned, "Pollinator", &post.id);
                 }
                 if s.accepted || s.uses > 0 || s.status == crate::signals::Status::Confirmed {
                     let root = root_of(post);
@@ -163,7 +357,7 @@ fn compute(
                             && r.data.get("self_answered") == Some(&serde_json::json!(true))
                     });
                     if shared && (s.uses > 0 || s.status == crate::signals::Status::Confirmed) {
-                        earned.push("Waggle Dance");
+                        note(&mut by, &mut earned, "Waggle Dance", &post.id);
                     }
                     if s.accepted
                         && root.as_ref().is_some_and(|r| {
@@ -172,7 +366,7 @@ fn compute(
                                 .any(|t| FIELD_CAPS.contains(&crate::delivery::tag_key(t).as_str()))
                         })
                     {
-                        earned.push("Field Bee");
+                        note(&mut by, &mut earned, "Field Bee", &post.id);
                     }
                 }
             }
@@ -190,8 +384,10 @@ fn compute(
             earned.push(badge);
         }
     }
-    if guard_checks(store, grouping, net, author)? >= 10 {
+    let guarded = guard_checks(store, grouping, net, author, extra, now, window)?;
+    if guarded.len() >= 10 {
         earned.push("Guard Bee");
+        by.insert("Guard Bee", guarded);
     }
     out.badges = BADGES
         .iter()
@@ -199,56 +395,77 @@ fn compute(
         .filter(|name| earned.contains(name))
         .map(str::to_string)
         .collect();
-    out.badges.extend(
-        crate::specialty::earned(store, grouping, net, author)
-            .into_iter()
-            .map(|e| format!("Comb: {}", e.tag)),
-    );
+    for e in crate::specialty::compute_at(store, grouping, net, author, extra, now, window)? {
+        let badge = format!("Comb: {}", e.tag);
+        out.badges.push(badge.clone());
+        out.evidence.insert(badge, e.posts);
+    }
+    for badge in &out.badges {
+        if let Some(ids) = by.remove(badge.as_str()) {
+            out.evidence.insert(badge.clone(), ids);
+        }
+    }
     Ok(out)
 }
 
-/// Answers by others that `author` confirmed with evidence and that no
-/// standing contradiction contests (the Guard Bee).
+/// The reacts by which `author` confirmed with evidence an answer by
+/// someone else that no standing contradiction contests (the Guard Bee),
+/// among its latest reacts and the reacts `extra`, as of `now`.
 fn guard_checks(
     store: &Store,
     grouping: &Grouping,
     net: &str,
     author: &str,
-) -> anyhow::Result<usize> {
+    extra: &[String],
+    now: u64,
+    window: usize,
+) -> anyhow::Result<Vec<String>> {
     let filter = Filter {
         net: Some(net.to_string()),
         kinds: vec![Kind::React],
         author: Some(author.to_string()),
         ..Filter::default()
     };
-    let parents: Vec<std::sync::Arc<Event>> = store
-        .search(None, &filter, POSTS)?
+    let mut reacts: Vec<std::sync::Arc<Event>> = store
+        .search(None, &filter, window)?
+        .into_iter()
+        .map(|r| r.event)
+        .collect();
+    for id in extra {
+        if reacts.iter().any(|r| &r.id == id) {
+            continue;
+        }
+        if let Some(stored) = store.get(id)?
+            && filter.matches(&stored.event)
+        {
+            reacts.push(stored.event);
+        }
+    }
+    let checks: Vec<(String, std::sync::Arc<Event>)> = reacts
         .into_iter()
         .filter(|r| {
-            r.event
-                .data
-                .get("value")
-                .and_then(serde_json::Value::as_i64)
-                == Some(1)
-                && r.event.data.get("evidence").is_some_and(|e| !e.is_null())
+            r.data.get("value").and_then(serde_json::Value::as_i64) == Some(1)
+                && r.data.get("evidence").is_some_and(|e| !e.is_null())
         })
-        .filter_map(|r| r.event.parent.clone())
-        .filter_map(|p| store.get(&p).ok().flatten().map(|s| s.event))
-        .filter(|p| p.kind == Kind::Answer && p.author != author)
+        .filter_map(|r| {
+            let parent = store.get(r.parent.as_deref()?).ok().flatten()?.event;
+            (parent.kind == Kind::Answer && parent.author != author).then(|| (r.id.clone(), parent))
+        })
         .collect();
-    if parents.len() < 10 {
-        return Ok(parents.len());
+    if checks.len() < 10 {
+        return Ok(checks.into_iter().map(|(id, _)| id).collect());
     }
-    let refs: Vec<&Event> = parents.iter().map(|e| &**e).collect();
-    let signals = crate::signals::compute(store, grouping, &refs)?;
-    Ok(parents
-        .iter()
-        .filter(|p| {
+    let refs: Vec<&Event> = checks.iter().map(|(_, p)| &**p).collect();
+    let signals = crate::signals::compute_at(store, grouping, &refs, now)?;
+    Ok(checks
+        .into_iter()
+        .filter(|(_, p)| {
             signals
                 .get(&p.id)
                 .is_some_and(|s| s.status != crate::signals::Status::Contested)
         })
-        .count())
+        .map(|(id, _)| id)
+        .collect())
 }
 
 /// What `who` says of `author`'s node (ADR 0055 §5–6): its label, its
@@ -360,6 +577,161 @@ mod tests {
             "{:?}",
             got.badges
         );
+    }
+
+    /// ADR 0057: a badge stays once earned, whatever decay does; a
+    /// retraction of the signal that earned it takes it back; earned again,
+    /// it keeps its first earn.
+    #[test]
+    fn badges_stay_unless_their_evidence_is_retracted() {
+        use crate::event::Draft;
+        use crate::store::DropReason;
+        use ed25519_dalek::SigningKey;
+        let store = Store::open_in_memory().unwrap();
+        let asker = SigningKey::from_bytes(&[41; 32]);
+        let helper = SigningKey::from_bytes(&[42; 32]);
+        let ask = Draft {
+            net: "public".into(),
+            kind: Some(Kind::Ask),
+            title: Some("why does the borrow fail?".into()),
+            text: "E0502".into(),
+            ..Draft::default()
+        }
+        .sign(&asker, 1000, 0)
+        .unwrap();
+        let answer = Draft {
+            net: "public".into(),
+            thread: Some(ask.id.clone()),
+            parent: Some(ask.id.clone()),
+            kind: Some(Kind::Answer),
+            text: "clone it first".into(),
+            ..Draft::default()
+        }
+        .sign(&helper, 1010, 0)
+        .unwrap();
+        let accept = |ts: u64| {
+            Draft {
+                net: "public".into(),
+                thread: Some(ask.id.clone()),
+                parent: Some(answer.id.clone()),
+                kind: Some(Kind::React),
+                text: "it works".into(),
+                data: serde_json::json!({"accept": true})
+                    .as_object()
+                    .cloned()
+                    .unwrap(),
+                ..Draft::default()
+            }
+            .sign(&asker, ts, 0)
+            .unwrap()
+        };
+        let first = accept(1020);
+        for e in [&ask, &answer, &first] {
+            store.insert(e, e.ts).unwrap();
+        }
+        let grouping = Grouping::new(Default::default());
+        let me = answer.author.clone();
+        let at = |now: u64| {
+            let current = compute_at(&store, &grouping, "public", &me, &[], now).unwrap();
+            settle(&store, &grouping, "public", &me, &current, now)
+        };
+        let rejudge = || RECHECKED.lock().unwrap().retain(|k, _| k.1 != me);
+        assert!(at(2000).contains(&"Royal Jelly".to_string()));
+        // Three years on, the accept has decayed: still held.
+        let later = 2000 + 3 * 365 * 86_400;
+        let decayed = compute_at(&store, &grouping, "public", &me, &[], later).unwrap();
+        assert!(
+            !decayed.badges.contains(&"Royal Jelly".to_string()),
+            "{decayed:?}"
+        );
+        assert!(at(later).contains(&"Royal Jelly".to_string()));
+        // The accept retracted: the re-check as of the earn takes it back.
+        store
+            .drop_body(&first.id, DropReason::Retraction, None, None, 3000)
+            .unwrap();
+        rejudge();
+        assert!(!at(3000).contains(&"Royal Jelly".to_string()));
+        let row = |b: &str| {
+            store
+                .badges_earned("public", &me)
+                .unwrap()
+                .into_iter()
+                .find(|r| r.badge == b)
+                .unwrap()
+        };
+        assert!(row("Royal Jelly").withdrawn);
+        // Accepted again: back, with its first earn.
+        let again = accept(4000);
+        store.insert(&again, 4000).unwrap();
+        assert!(at(4100).contains(&"Royal Jelly".to_string()));
+        let back = row("Royal Jelly");
+        assert!(!back.withdrawn);
+        assert_eq!(back.first_at, 2000);
+        assert_eq!(back.earned_at, 4100);
+        assert_eq!(back.evidence, vec![answer.id.clone()]);
+    }
+
+    /// ADR 0057: a re-check reads the evidence even when the latest posts
+    /// no longer reach it (the window that made First Buzz come and go).
+    #[test]
+    fn the_evidence_reaches_past_the_window() {
+        use crate::event::Draft;
+        use ed25519_dalek::SigningKey;
+        let store = Store::open_in_memory().unwrap();
+        let key = SigningKey::from_bytes(&[43; 32]);
+        let draft = |kind: Kind, text: String| Draft {
+            net: "public".into(),
+            kind: Some(kind),
+            title: Some(text.clone()),
+            text,
+            ..Draft::default()
+        };
+        let ask = draft(Kind::Ask, "first question".into())
+            .sign(&key, 100, 0)
+            .unwrap();
+        store.insert(&ask, 100).unwrap();
+        for i in 0..POSTS as u64 {
+            let note = draft(Kind::Ask, format!("question {i}"))
+                .sign(&key, 200 + i, 0)
+                .unwrap();
+            store.insert(&note, 200 + i).unwrap();
+        }
+        let grouping = Grouping::new(Default::default());
+        let window = compute_at(&store, &grouping, "public", &ask.author, &[], 1000).unwrap();
+        assert!(!window.evidence["First Buzz"].contains(&ask.id));
+        let with = compute_at(
+            &store,
+            &grouping,
+            "public",
+            &ask.author,
+            std::slice::from_ref(&ask.id),
+            1000,
+        )
+        .unwrap();
+        assert!(with.evidence["First Buzz"].contains(&ask.id));
+        // The upgrade's seed reads every post, and says nothing.
+        seed(&store, &grouping, "public", &ask.author);
+        let rows = store.badges_earned("public", &ask.author).unwrap();
+        let buzz = rows.iter().find(|r| r.badge == "First Buzz").unwrap();
+        assert!(buzz.evidence.contains(&ask.id) && buzz.announced);
+        assert!(store.take_badge_seed().unwrap());
+        assert!(!store.take_badge_seed().unwrap(), "once");
+    }
+
+    /// ADR 0057: a badge is announced once, even when it is held again
+    /// after a withdrawal.
+    #[test]
+    fn a_badge_is_announced_once() {
+        let store = Store::open_in_memory().unwrap();
+        store.badge_earn("public", "k", "Nectar", 10, &[]).unwrap();
+        assert!(store.badge_announce("public", "k", "Nectar", 11).unwrap());
+        store.badge_withdraw("public", "k", "Nectar", 12).unwrap();
+        store.badge_earn("public", "k", "Nectar", 13, &[]).unwrap();
+        assert!(!store.badge_announce("public", "k", "Nectar", 14).unwrap());
+        let rows = store.badges_earned("public", "k").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].announced && !rows[0].withdrawn);
+        assert_eq!((rows[0].first_at, rows[0].earned_at), (10, 13));
     }
 
     /// ADR 0055 §2: votes, plus 2 per use, 3 per confirmation, 3 for the
