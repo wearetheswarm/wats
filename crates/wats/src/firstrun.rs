@@ -536,6 +536,34 @@ pub fn ask_yes_no(
     }
 }
 
+/// "When your agents fix something others will hit? [A = ask me each time
+/// / s = share automatically / n = never suggest it]"; Enter is ask (ADR
+/// 0056 §2, amended in 0.5.10).
+pub fn ask_share_mode(
+    input: &mut impl BufRead,
+    out: &mut impl Write,
+) -> Result<crate::settings::ShareMode> {
+    use crate::settings::ShareMode;
+    loop {
+        write!(
+            out,
+            "When your agents fix something others will hit, share it with the swarm? A privacy \
+             scrub runs first; `wats outbox` reviews and retracts. [A = ask me each time / s = \
+             share automatically / n = never suggest it]: "
+        )?;
+        let answer = match read_answer(input, out)? {
+            Some(answer) => answer.to_lowercase(),
+            None => return Ok(ShareMode::Ask),
+        };
+        match answer.as_str() {
+            "" | "a" | "ask" => return Ok(ShareMode::Ask),
+            "s" | "auto" | "y" | "yes" => return Ok(ShareMode::Auto),
+            "n" | "no" | "off" | "never" => return Ok(ShareMode::Off),
+            _ => writeln!(out, "  answer a (ask), s (automatically) or n (never)")?,
+        }
+    }
+}
+
 /// Step 2 of the wizard (ADR 0027, 0.4.5): set up wats in all the agent
 /// CLIs found at once, one by one, or none.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3319,6 +3347,33 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(dir.path().join(FILE_NAME)).unwrap(),
             before
+        );
+    }
+
+    /// The sharing question: ask (Enter), automatically, or never.
+    #[test]
+    fn the_sharing_question_has_three_levels() {
+        use crate::settings::ShareMode;
+        let level = |input: &str| {
+            let mut out = Vec::new();
+            let answer = ask_share_mode(&mut input.as_bytes(), &mut out).unwrap();
+            (answer, String::from_utf8(out).unwrap())
+        };
+        let (ask, said) = level("");
+        assert_eq!(ask, ShareMode::Ask);
+        assert!(
+            said.contains(
+                "[A = ask me each time / s = share automatically / n = never suggest it]"
+            ),
+            "{said}"
+        );
+        assert_eq!(level("s\n").0, ShareMode::Auto);
+        assert_eq!(level("n\n").0, ShareMode::Off);
+        let (again, said) = level("maybe\noff\n");
+        assert_eq!(again, ShareMode::Off);
+        assert!(
+            said.contains("answer a (ask), s (automatically) or n (never)"),
+            "{said}"
         );
     }
 

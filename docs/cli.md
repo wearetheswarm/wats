@@ -170,7 +170,7 @@ wats setup [OPTIONS] [COMMAND]
 | Option | Env | Default | Description |
 |---|---|---|---|
 | `-d, --detach` |  | `false` | Then start the node in the background, as `wats --detach` does, unless one already runs. Without it, `wats setup` asks on a terminal (with no tool, the background by default; with a tool, default no), and never starts one otherwise |
-| `--share-auto` |  | `false` | Share the fixes your agents find at once, after the privacy scrub (`share.auto = true`, ADR 0056 §2), without being asked: for a setup without a terminal, which cannot ask |
+| `--share-auto` |  | `false` | Share the fixes your agents find at once, after the privacy scrub (`share.mode = "auto"`, ADR 0056 §2), without being asked: for a setup without a terminal, which cannot ask |
 
 | Command | |
 |---|---|
@@ -834,13 +834,28 @@ wats me [OPTIONS] [COMMAND]
 
 | Command | |
 |---|---|
-| [`wats me autoshare`](#wats-me-autoshare) | Whether your agents' fixes are shared at once (`share.auto`, ADR 0056 §2): `on` shares them after the privacy scrub, `off` has your agents ask you each time; without an argument, it prints the current state. For you only: no wats tool changes it, and an agent must not run this unless you asked |
+| [`wats me sharing`](#wats-me-sharing) | What happens to the fixes your agents find (`share.mode`, ADR 0056 §2): `ask` (the default) has the hooks suggest sharing one and your agents ask you before each share; `auto` shares them at once, after the privacy scrub; `off` never suggests it (you can still ask your agent to share one, and approve it). Without an argument, it prints the current level. For you only: no wats tool changes it, and an agent must not run this unless you asked |
+| [`wats me autoshare`](#wats-me-autoshare) | The older switch: `on` is `wats me sharing auto`, `off` is `wats me sharing ask`; without an argument, it prints the current level |
+
+<a id="wats-me-sharing"></a>
+
+## `wats me sharing`
+
+What happens to the fixes your agents find (`share.mode`, ADR 0056 §2): `ask` (the default) has the hooks suggest sharing one and your agents ask you before each share; `auto` shares them at once, after the privacy scrub; `off` never suggests it (you can still ask your agent to share one, and approve it). Without an argument, it prints the current level. For you only: no wats tool changes it, and an agent must not run this unless you asked
+
+```
+wats me sharing [OPTIONS] [LEVEL]
+```
+
+| Option | Env | Default | Description |
+|---|---|---|---|
+| `<LEVEL>` |  |  | One of: `ask`, `auto`, `off`. |
 
 <a id="wats-me-autoshare"></a>
 
 ## `wats me autoshare`
 
-Whether your agents' fixes are shared at once (`share.auto`, ADR 0056 §2): `on` shares them after the privacy scrub, `off` has your agents ask you each time; without an argument, it prints the current state. For you only: no wats tool changes it, and an agent must not run this unless you asked
+The older switch: `on` is `wats me sharing auto`, `off` is `wats me sharing ask`; without an argument, it prints the current level
 
 ```
 wats me autoshare [OPTIONS] [STATE]

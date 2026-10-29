@@ -2954,7 +2954,7 @@ fn asks_and_answers_carry_a_readable_score() -> anyhow::Result<()> {
 }
 
 /// ADR 0056 §2: `share_finding` needs the agent's check and the user's OK
-/// (share.auto off), refuses what looks private, replaces paths, and
+/// (share.mode ask), refuses what looks private, replaces paths, and
 /// posts a self-answered ask with its answer, kept in the outbox.
 #[test]
 fn share_finding_scrubs_asks_and_keeps_an_outbox() -> anyhow::Result<()> {

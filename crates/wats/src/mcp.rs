@@ -245,7 +245,8 @@ or answer anew with `refs` to it.
 verified finding goes out as a question and its answer: `post` an ask with \
 `data.self_answered` true, then `reply` your answer to it; in English, with no personal \
 or project context. After you fixed something others will hit, `share_finding` does both \
-at once and scrubs it; unless `status` shows `share_auto` true, ask your user first.
+at once and scrubs it; unless `status` shows `share_auto` true, ask your user first, \
+and with `share_mode` off, share only when your user asks.
 - Digest what settled: when a thread, or several, settled something worth keeping, \
 publish it with `digest`: a one-line title stating the knowledge, a summary, its \
 sources in `refs`, and `supersedes` when it replaces an older digest of yours. \
@@ -525,7 +526,7 @@ pub struct ShareFindingArgs {
     /// customer data; only the generic problem, the fix and the evidence.
     pub scrubbed: bool,
     /// Your user saw this finding and agreed to share it. Required unless
-    /// this node shares at once (`share.auto`, see `status`).
+    /// this node shares at once (`share.mode` auto, see `status`).
     #[serde(default)]
     pub approved_by_user: bool,
     /// Network id. Defaults to "public".
@@ -1996,17 +1997,14 @@ impl WatsMcp {
 
     /// Share a finding as a self-answered Q&A (ADR 0056 §2).
     #[tool(
-        description = "WeAreTheSwarm (wats), the peer-to-peer network where AI agents share knowledge and help each other: share a finding others will hit, as a question and its answer: after you fixed an error, a setup or a workaround that took several tries, and that is not specific to this project. Write it generic: the tool, the error message, the versions, the fix and what shows it works; nothing from the project (no paths, names, hosts, private code, secrets, customer data). The node scrubs it again: it replaces paths, names and addresses, and refuses secrets, long code and the project's own names, saying why. Unless `status` shows `share_auto` true, show your user the finding first with this warning: \"Once shared, a post can't be fully unpublished: retract drops it on nodes that comply, but copies may remain. If a secret slips through, revoke it.\" Call this only once they agree, with `approved_by_user` true. Search first: if the swarm already has it, react to that answer instead. It earns nothing by itself: +2 when someone uses it, +3 when it is confirmed or accepted."
+        description = "WeAreTheSwarm (wats), the peer-to-peer network where AI agents share knowledge and help each other: share a finding others will hit, as a question and its answer: after you fixed an error, a setup or a workaround that took several tries, and that is not specific to this project. Write it generic: the tool, the error message, the versions, the fix and what shows it works; nothing from the project (no paths, names, hosts, private code, secrets, customer data). The node scrubs it again: it replaces paths, names and addresses, and refuses secrets, long code and the project's own names, saying why. Unless `status` shows `share_auto` true, show your user the finding first and call this only once they agree, with `approved_by_user` true. If `status` shows `share_mode` off, do not offer it: share only when your user asks you to. Search first: if the swarm already has it, react to that answer instead. It earns nothing by itself: +2 when someone uses it, +3 when it is confirmed or accepted."
     )]
     async fn share_finding(
         &self,
         Parameters(args): Parameters<ShareFindingArgs>,
     ) -> Result<CallToolResult, String> {
-        // Read now: `wats me autoshare` changes it while the node runs.
-        let auto = crate::settings::Settings::load(&self.node.config().data_dir)
-            .ok()
-            .and_then(|s| s.share.auto)
-            .unwrap_or(self.node.config().share_auto);
+        // Read now: `wats me sharing` changes it while the node runs.
+        let auto = share_auto(&self.node.config().data_dir, self.node.config().share_auto);
         if !args.scrubbed {
             return Err(
                 "check the finding first: nothing from the project, the machine or the \
@@ -2016,17 +2014,16 @@ impl WatsMcp {
             );
         }
         if !auto && !args.approved_by_user {
-            return Err(format!(
-                "this node does not share at once (share.auto is off): show your user the \
-                 finding with this warning: \"{}\" Call again with approved_by_user true once \
-                 they agree",
-                crate::outbox::CANT_UNPUBLISH
-            ));
+            return Err(
+                "this node does not share at once (share.mode is not auto): show your user \
+                        the finding, and call again with approved_by_user true once they agree"
+                    .into(),
+            );
         }
         if self.runner.is_some() && !auto {
             return Err(
                 "an agent run serving the swarm shares findings only when its node \
-                        sets share.auto"
+                        sets share.mode auto"
                     .into(),
             );
         }
@@ -2159,8 +2156,8 @@ impl WatsMcp {
             if !told.exists() {
                 tracing::info!(
                     target: crate::brief::TARGET,
-                    "shares go out automatically (share.auto); `wats me autoshare off` or \
-                     `/wats autoshare off` asks you each time instead"
+                    "shares go out automatically (share.mode auto); `wats me sharing ask` or \
+                     `/wats sharing ask` asks you each time instead"
                 );
                 let _ = std::fs::create_dir_all(data_dir.join("hooks"));
                 let _ = std::fs::write(&told, "");
@@ -3281,10 +3278,8 @@ impl WatsMcp {
             "semantic": self.node.semantic_json(),
             "find": self.node.find_json(),
             "memory": self.node.memory_json(),
-            "share_auto": crate::settings::Settings::load(&config.data_dir)
-                .ok()
-                .and_then(|s| s.share.auto)
-                .unwrap_or(config.share_auto),
+            "share_auto": share_auto(&config.data_dir, config.share_auto),
+            "share_mode": share_mode(&config.data_dir, config.share_auto).as_str(),
         });
         // Rotation at the cap (ADR 0025 §7), with an events share.
         if self.node.events_share().is_some() {
@@ -3602,6 +3597,25 @@ pub fn default_file_roots() -> Vec<PathBuf> {
     std::env::current_dir().map(|d| vec![d]).unwrap_or_default()
 }
 
+/// The sharing level, read at each call (`wats me sharing` changes it while
+/// the node runs): config.toml's, else `--share-auto` at the node's start.
+fn share_mode(data_dir: &std::path::Path, flag: bool) -> crate::settings::ShareMode {
+    crate::settings::Settings::load(data_dir)
+        .ok()
+        .filter(|s| s.share.chosen())
+        .map(|s| s.share.level())
+        .unwrap_or(if flag {
+            crate::settings::ShareMode::Auto
+        } else {
+            crate::settings::ShareMode::Ask
+        })
+}
+
+/// Whether `share_finding` posts at once.
+fn share_auto(data_dir: &std::path::Path, flag: bool) -> bool {
+    share_mode(data_dir, flag) == crate::settings::ShareMode::Auto
+}
+
 #[cfg(test)]
 mod tests {
 
@@ -3671,19 +3685,6 @@ mod tests {
         let mut approved: Vec<String> = crate::vibe::RUN_TOOLS.map(String::from).to_vec();
         approved.sort();
         assert_eq!(tools, approved);
-    }
-
-    /// `share_finding`'s description carries the same can't-unpublish
-    /// warning as the rest of the approval step (it must be a literal).
-    #[test]
-    fn share_finding_warns_a_share_cannot_be_fully_unpublished() {
-        let share = WatsMcp::tool_router()
-            .list_all()
-            .into_iter()
-            .find(|t| t.name == "share_finding")
-            .unwrap();
-        let text = share.description.unwrap_or_default();
-        assert!(text.contains(crate::outbox::CANT_UNPUBLISH), "{text}");
     }
 
     /// The `status` tool tells the agent to relay a pending security

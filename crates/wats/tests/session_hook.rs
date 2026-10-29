@@ -495,7 +495,12 @@ fn setup_claude_adds_the_hook_once_and_removes_it() {
     let swarm = settings_dir.join("commands").join("wats.md");
     let command = std::fs::read_to_string(&swarm).unwrap();
     assert!(command.contains(" me`, then say in one line"), "{command}");
-    assert!(command.contains("me autoshare") && command.contains("never run it on your own"));
+    assert!(
+        command.contains("me sharing")
+            && command.contains("me autoshare")
+            && command.contains("never run them on your own"),
+        "{command}"
+    );
     for sub in [
         " status`.",
         " outbox`: the fixes `share_finding` shared",
@@ -847,11 +852,11 @@ async fn nudges_follow_the_session() {
     );
     assert!(
         reason.contains("approved_by_user"),
-        "share.auto is off: {reason}"
+        "share.mode is ask: {reason}"
     );
     assert!(
-        reason.contains(wats::outbox::CANT_UNPUBLISH),
-        "the approval carries the warning: {reason}"
+        !reason.contains(wats::outbox::CANT_UNPUBLISH),
+        "the warning is for where the level is chosen, not each share: {reason}"
     );
     assert!(reason.contains("do not share it any other way"), "{reason}");
     // The continuation it asked for: nothing more.
@@ -1039,10 +1044,13 @@ async fn openclaw_plugin_nudges_in_the_live_tool_result() {
     drop(client);
 }
 
-/// ADR 0056 §2 (amended): `wats me autoshare [on|off]` shows and sets
-/// share.auto for the person; turning it off silences the tip for a week.
+/// ADR 0056 §2 (amended in 0.5.10): `wats me sharing [ask|auto|off]`
+/// shows and sets share.mode for the person, `wats me autoshare [on|off]`
+/// still works (on is auto, off is ask), and an older `share.auto` is
+/// read until a level is set. The warning, with its link, comes with a
+/// level that shares; leaving auto silences the tip for a week.
 #[test]
-fn autoshare_is_the_persons_switch() {
+fn sharing_is_the_persons_choice() {
     let tmp = tempfile::tempdir().unwrap();
     let dir = tmp.path().join("node");
     let run = |args: &[&str]| {
@@ -1057,12 +1065,36 @@ fn autoshare_is_the_persons_switch() {
         assert!(out.status.success(), "{out:?}");
         String::from_utf8(out.stdout).unwrap()
     };
-    assert!(run(&["me", "autoshare"]).starts_with("autoshare off"));
-    assert!(run(&["me", "autoshare", "on"]).starts_with("autoshare on"));
-    let config = std::fs::read_to_string(dir.join("config.toml")).unwrap();
-    assert!(config.contains("[share]\nauto = true"), "{config}");
-    assert!(run(&["me", "autoshare"]).starts_with("autoshare on"));
-    assert!(run(&["me", "autoshare", "off"]).starts_with("autoshare off"));
+    let config = || std::fs::read_to_string(dir.join("config.toml")).unwrap_or_default();
+    assert!(run(&["me", "sharing"]).starts_with("sharing ask"));
+    // An older node's switch.
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("config.toml"), "[share]\nauto = true\n").unwrap();
+    assert!(run(&["me", "sharing"]).starts_with("sharing auto"));
+    assert!(run(&["me", "autoshare"]).starts_with("sharing auto"));
+    let off = run(&["me", "sharing", "off"]);
+    assert!(off.starts_with("sharing off"), "{off}");
+    assert!(!off.contains(wats::outbox::SHARING_DOC), "{off}");
+    assert!(
+        config().contains("mode = \"off\"") && !config().contains("auto ="),
+        "{}",
+        config()
+    );
     let state = std::fs::read_to_string(dir.join("hooks").join("autoshare.json")).unwrap();
     assert!(state.contains("\"off_at\""), "{state}");
+    let on = run(&["me", "autoshare", "on"]);
+    assert!(on.starts_with("sharing auto"), "{on}");
+    assert!(on.contains(&wats::outbox::warning()), "{on}");
+    assert!(config().contains("mode = \"auto\""), "{}", config());
+    assert!(run(&["me", "autoshare", "off"]).starts_with("sharing ask"));
+    assert!(run(&["config", "get", "share.mode"]).contains("ask"));
+    let wrong = std::process::Command::new(env!("CARGO_BIN_EXE_wats"))
+        .env("WATS_HERMETIC", "1")
+        .env("HOME", tmp.path())
+        .arg("--dir")
+        .arg(&dir)
+        .args(["config", "set", "share.mode", "sometimes"])
+        .output()
+        .unwrap();
+    assert!(!wrong.status.success());
 }

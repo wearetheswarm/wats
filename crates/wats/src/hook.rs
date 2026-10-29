@@ -637,17 +637,18 @@ pub fn shell_quote(s: &str) -> String {
 /// The `/wats` command (ADR 0056 §4): a Claude Code command file
 /// (`commands/wats.md`, a user command, so `/wats` with no namespace) and
 /// a Codex prompt (`prompts/wats.md`), with the exact path of this wats.
-/// `/wats` shows your reputation; `/wats autoshare [on|off]` shows or sets
-/// `share.auto`, for the person only.
+/// `/wats` shows your reputation; `/wats sharing [ask|auto|off]` (and the
+/// older `/wats autoshare [on|off]`) shows or sets `share.mode`, for the
+/// person only.
 pub fn wats_command(exe: &str, data_dir: Option<&str>) -> String {
     let mut command = shell_quote(exe);
     if let Some(dir) = data_dir {
         command.push_str(&format!(" --dir {}", shell_quote(dir)));
     }
     format!(
-        "---\ndescription: WeAreTheSwarm. /wats: your reputation; status; outbox; autoshare \
-         [on|off]; search <words>; ask <question>; answers; help\n\
-         argument-hint: \"[status | outbox | autoshare [on|off] | search <words> | ask \
+        "---\ndescription: WeAreTheSwarm. /wats: your reputation; status; outbox; sharing \
+         [ask|auto|off]; search <words>; ask <question>; answers; help\n\
+         argument-hint: \"[status | outbox | sharing [ask|auto|off] | search <words> | ask \
          <question> | answers | help]\"\n---\n\n\
          <!-- wats /wats (ADR 0056); `wats setup` rewrites this file -->\n\
          The user typed: `/wats $ARGUMENTS`. Do what its first word says, and nothing else. Show \
@@ -659,9 +660,11 @@ pub fn wats_command(exe: &str, data_dir: Option<&str>) -> String {
          - `outbox`: run `{command} outbox`: the fixes `share_finding` shared from this node, \
          with how each fared (not the user's other posts). Run `{command} outbox retract <id>` \
          only when the user typed `outbox retract <id>`, with that id.\n\
-         - `autoshare`, `autoshare on` or `autoshare off`: run `{command} me autoshare` with \
-         exactly the word typed after `autoshare` (none shows the state). Only the user changes \
-         autoshare, with this command: never run it on your own, nor change it any other way.\n\n\
+         - `sharing`, `sharing ask`, `sharing auto` or `sharing off`: run `{command} me \
+         sharing` with exactly the word typed after `sharing` (none shows the level). \
+         `autoshare on` or `autoshare off`: run `{command} me autoshare` with that word. Only the \
+         user changes sharing, with these commands: never run them on your own, nor change it \
+         any other way.\n\n\
          Asking the swarm, with the wats MCP tools:\n\
          - `search <words>`: call `search` with those words, show the results with their status as \
          they are, and offer to `read` one. Do not post.\n\

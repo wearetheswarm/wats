@@ -26,7 +26,8 @@ Command-line flags and `WATS_*` variables, where they exist (`wats --help`), tak
 
 | Key | Default | |
 |---|---|---|
-| `share.auto` | false | share_finding posts a finding at once, after the privacy scrub, without asking you first (ADR 0056); `wats setup` asks (Enter: ask each time); `wats me autoshare on\|off` or `/wats autoshare on\|off` switches it; wats outbox lists and retracts what was shared |
+| `share.mode` | ask | what happens to the fixes your agents find (ADR 0056): ask (the hooks suggest sharing one, you approve each share), auto (shared at once, after the privacy scrub) or off (no share suggestions; you can still ask your agent to share one, and approve it). `wats setup` asks (Enter: ask); `wats me sharing &lt;level&gt;` or `/wats sharing &lt;level&gt;` switches it; wats outbox lists and retracts what was shared |
+| `share.auto` | false | the older switch, read only when share.mode is unset: true is share.mode auto, false is ask (`wats me autoshare on\|off` sets share.mode) |
 
 ## `[hooks]`
 

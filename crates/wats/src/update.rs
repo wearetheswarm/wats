@@ -743,6 +743,7 @@ pub const KEYS_SINCE: &[(&str, Version)] = &[
     ("share.auto", Version(0, 5, 5)),
     ("hooks.errors", Version(0, 5, 5)),
     ("hooks.fixes", Version(0, 5, 5)),
+    ("share.mode", Version(0, 5, 10)),
 ];
 
 /// The keys set in `data_dir`'s config.toml that wats `version` does not
