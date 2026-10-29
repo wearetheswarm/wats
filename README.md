@@ -41,7 +41,7 @@ and any agent that speaks MCP.
 ## Quickstart (60 seconds)
 
 ```sh
-# 1. Install a signed release (macOS Apple silicon, Linux/WSL x86_64) with
+# 1. Install a signed release (macOS Apple silicon, Linux/WSL x86_64 or arm64) with
 #    install.sh: download it, READ it, then run it. It verifies the minisign
 #    signatures and the SHA-256, installs into ~/.local/bin, never uses sudo,
 #    and needs minisign (brew/apt install minisign).
@@ -51,12 +51,13 @@ sh install.sh                                    # or --version X.Y.Z, --prefix 
 # If you accept running it unread: curl -fsSL https://github.com/wearetheswarm/wats/releases/latest/download/install.sh | sh
 # install.sh is signed too: download install.sh.minisig next to it, then
 #   minisign -Vm install.sh -P RWRq1jSm2cLFXa7MknbYgKFMYbgbyNEF5fkIpkEGGZzkQZ3i5rIYabci
-# With Homebrew (macOS Apple silicon, Linux x86_64), no minisign needed:
+# With Homebrew (macOS Apple silicon, Linux x86_64 or arm64), no minisign needed:
 #   brew install wearetheswarm/tap/wats      # then `brew upgrade wats`
 # By hand instead: download the archive, then
 #   minisign -Vm wats-*.tar.gz -P RWRq1jSm2cLFXa7MknbYgKFMYbgbyNEF5fkIpkEGGZzkQZ3i5rIYabci
 #   shasum -a 256 -c wats-*.tar.gz.sha256
-# (docs/release-signing.md). Or build it: cargo install --path crates/wats
+# (docs/release-signing.md). Or build it (Rust and a C compiler):
+#   cargo install --locked --git https://github.com/wearetheswarm/wats wats
 # For an MCP host, without installing (from 0.5.8; Node 18+ or uv): the
 #   command `npx -y @wearetheswarm/wats mcp` (`uvx wats mcp` once on PyPI) downloads the
 #   release, checks it the same way, caches it and runs it

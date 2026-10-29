@@ -12,7 +12,8 @@ The version of this package is the wats version it runs.
 At each start, the wrapper:
 
 1. picks the release archive for this machine: macOS arm64
-   (`aarch64-apple-darwin`) or Linux x86_64 (`x86_64-unknown-linux-musl`);
+   (`aarch64-apple-darwin`), Linux x86_64 (`x86_64-unknown-linux-musl`) or
+   Linux arm64 (`aarch64-unknown-linux-musl`, from 0.5.9);
    elsewhere it says how to install wats otherwise;
 2. downloads it from the GitHub release of its own version (`vX.Y.Z`, the
    package version), with its `.sha256` and both `.minisig`, unless the

@@ -22,6 +22,7 @@ if SRC not in sys.path:
 
 VERSION = "9.9.9"
 LINUX = "x86_64-unknown-linux-musl"
+LINUX_ARM = "aarch64-unknown-linux-musl"
 DARWIN = "aarch64-apple-darwin"
 NAME = f"wats-{VERSION}-{LINUX}.tar.gz"
 

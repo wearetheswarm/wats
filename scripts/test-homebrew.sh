@@ -23,7 +23,7 @@ mirror() {
     dir="$T/$1/v$V"
     mkdir -p "$dir"
     n=1
-    for target in aarch64-apple-darwin x86_64-unknown-linux-musl; do
+    for target in aarch64-apple-darwin x86_64-unknown-linux-musl aarch64-unknown-linux-musl; do
         archive="wats-$V-$target.tar.gz"
         printf '%064d  %s\n' "$n" "$archive" > "$dir/$archive.sha256"
         minisign -S -s "$T/test.key" -m "$dir/$archive.sha256" >/dev/null < /dev/null
@@ -41,6 +41,8 @@ run() {
 expect_ok() {
     if run "$1" && grep -q "sha256 \"$(printf '%064d' 1)\"" "$T/out-$1/Formula/wats.rb" \
         && grep -q "sha256 \"$(printf '%064d' 2)\"" "$T/out-$1/Formula/wats.rb" \
+        && grep -q "sha256 \"$(printf '%064d' 3)\"" "$T/out-$1/Formula/wats.rb" \
+        && grep -q "releases/download/v$V/wats-$V-aarch64-unknown-linux-musl.tar.gz\"" "$T/out-$1/Formula/wats.rb" \
         && grep -q "releases/download/v$V/wats-$V-aarch64-apple-darwin.tar.gz\"" "$T/out-$1/Formula/wats.rb"; then
         echo "ok    $1"
     else
