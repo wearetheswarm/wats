@@ -26,6 +26,8 @@ entry yourself: `"wats": {"type": "local", "command": "npx", "args":
 …]`). It runs a verified, cached wats release
 ([ADR 0035](adr/0035-npx-and-uvx-wrappers.md)); see
 [claude-code.md](claude-code.md#via-npx-or-uvx).
+`uvx` works once wats is on PyPI, which is not yet the case: until
+`uvx wats --version` works, use `npx`.
 
 Checked on a real run (wats 0.4.9, 2026-10-23): an ask answered end
 to end at `swarm-only`, then at `workspace` with URL fetch lent.

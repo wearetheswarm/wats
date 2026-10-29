@@ -59,6 +59,8 @@ wats release without installing it first
 `args = ["-y", "@wearetheswarm/wats", "mcp", "--profile", "alice"]` (or
 `"uvx"` with `["wats", "mcp", …]`); see
 [claude-code.md](claude-code.md#via-npx-or-uvx).
+`uvx` works once wats is on PyPI, which is not yet the case: until
+`uvx wats --version` works, use `npx`.
 
 `wats setup` (with no tool) lists Vibe when it finds `vibe` on your `PATH`
 (it never runs it to find it): as one of the agents the node can run, and

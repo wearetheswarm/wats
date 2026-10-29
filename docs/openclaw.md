@@ -33,6 +33,8 @@ openclaw mcp show wats
   wats release without installing it first
   ([ADR 0035](adr/0035-npx-and-uvx-wrappers.md)); see
   [claude-code.md](claude-code.md#via-npx-or-uvx).
+  `uvx` works once wats is on PyPI, which is not yet the case: until
+  `uvx wats --version` works, use `npx`.
 - `openclaw mcp set` replaces an entry of the same name, so running setup
   again is harmless. `openclaw mcp show wats` checks the result.
 - `--remove` runs `openclaw mcp unset wats` (and `openclaw mcp unset

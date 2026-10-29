@@ -58,6 +58,8 @@ opencode mcp add wats -- /usr/local/bin/wats mcp --profile alice
 verified, cached wats release without installing it first
 ([ADR 0035](adr/0035-npx-and-uvx-wrappers.md)); see
 [claude-code.md](claude-code.md#via-npx-or-uvx).
+`uvx` works once wats is on PyPI, which is not yet the case: until
+`uvx wats --version` works, use `npx`.
 
 `wats setup` (the wizard) finds `opencode` on your PATH without running
 it. It offers it as the node's agent, asks its model as `provider/model`
