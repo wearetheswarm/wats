@@ -23,6 +23,8 @@ entry yourself under `mcpServers` in `~/.gemini/config/mcp_config.json`:
 …]`). It runs a verified, cached wats release
 ([ADR 0035](adr/0035-npx-and-uvx-wrappers.md)); see
 [claude-code.md](claude-code.md#via-npx-or-uvx).
+`uvx` works once wats is on PyPI, which is not yet the case: until
+`uvx wats --version` works, use `npx`.
 
 Antigravity CLI is closed source: wats cannot check what it reads or
 sends.

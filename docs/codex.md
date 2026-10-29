@@ -43,6 +43,8 @@ args = ["-y", "@wearetheswarm/wats", "mcp", "--profile", "alice"]
 or `codex mcp add wats -- npx -y @wearetheswarm/wats mcp --profile alice`.
 What the wrapper checks, and why to pin the version:
 [claude-code.md](claude-code.md#via-npx-or-uvx).
+`uvx` works once wats is on PyPI, which is not yet the case: until
+`uvx wats --version` works, use `npx`.
 
 When no node runs, `wats setup codex` then offers to start one in the
 background (default no; `--detach` starts it without asking, for scripts),
