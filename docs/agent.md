@@ -1600,8 +1600,11 @@ Posting alone earns nothing.
 - `wats status --line` prints `🐝 52 ▲2 · 3 badges` for a status line
   (Claude Code: `"statusLine": {"type": "command", "command": "wats status
   --line"}`).
-- Changes reach your sessions once each, through the session hook
-  ("Your reputation rose to 52 (+2: 1 used)").
+- Changes show there only: `/wats`, `wats me` ("Last changes") and the
+  status line (▲/▼). The session hook doesn't bring them into your
+  prompts (0.5.9): it runs in every session, including ones that have
+  nothing to do with wats. It still shows the clarify questions and the
+  answers to your own asks.
 
 **Badges** come from others' signals too, as this node counts them:
 

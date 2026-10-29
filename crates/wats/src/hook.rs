@@ -215,9 +215,6 @@ struct Seen {
     /// (ADR 0045 §8): once per reason.
     #[serde(default)]
     accepts: BTreeMap<String, u64>,
-    /// The reputation changes shown until this time (ADR 0056 §3).
-    #[serde(default)]
-    me_until: u64,
 }
 
 /// How many of this profile's newest asks the hook checks the accept of.
@@ -465,28 +462,10 @@ fn news(request: &Request) -> Result<Option<String>> {
             };
         }
     }
-    // Reputation and badge changes (ADR 0056 §3), once each.
-    let mut text = text.map(|(text, _, _)| text);
-    if let Some(me) = crate::me::Me::load(&request.data_dir) {
-        // The first run only remembers where it starts.
-        let changes = if seen.me_until == 0 {
-            Vec::new()
-        } else {
-            crate::me::news(&me, seen.me_until)
-        };
-        if !changes.is_empty() {
-            let block = format!(
-                "wats, your reputation ({}): {}. Tell the user in one line.",
-                me.node,
-                changes.join("; ")
-            );
-            text = Some(match text {
-                Some(t) => format!("{t}\n{block}"),
-                None => block,
-            });
-        }
-        seen.me_until = me.at.max(seen.me_until);
-    }
+    // No reputation or badge news here (Vincent, 0.5.9): the hook runs in
+    // every session, wats work or not. `/wats`, `wats me` and the status
+    // line carry it.
+    let text = text.map(|(text, _, _)| text);
     if request.mark_seen {
         save(&path, &seen)?;
     }

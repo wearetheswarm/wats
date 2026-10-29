@@ -114,6 +114,33 @@ async fn hook_lists_a_pending_clarify_and_a_new_answer_once() {
     let ask_id = ask["id"].as_str().unwrap().to_string();
     // Nothing new yet.
     assert_eq!(hook("alice", "claude", "user-prompt-submit"), "");
+    // Reputation and badge news stays out of the prompt (0.5.9): the hook
+    // runs in every session, wats work or not.
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let summary = |at: u64, changes: Vec<wats::me::Change>| wats::me::Me {
+        node: "AmberHive#4f2a".into(),
+        reputation: 5,
+        badges: vec!["Pollinator".into()],
+        changes,
+        at,
+        ..wats::me::Me::default()
+    };
+    summary(now - 10, Vec::new()).save(&dir);
+    assert_eq!(hook("alice", "claude", "user-prompt-submit"), "");
+    summary(
+        now + 5,
+        vec![wats::me::Change {
+            ts: now + 5,
+            reputation: 5,
+            delta: 2,
+            why: "1 used".into(),
+        }],
+    )
+    .save(&dir);
+    assert_eq!(hook("alice", "claude", "user-prompt-submit"), "");
 
     // Bob asks a clarify: listed with its id and options, then not again
     // in the same burst of prompts.

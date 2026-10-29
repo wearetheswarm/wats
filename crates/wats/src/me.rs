@@ -221,32 +221,6 @@ pub fn line(me: &Me, others: &[Me], now: u64) -> String {
     out
 }
 
-/// The changes `shown` (the last one the person saw) has not seen yet,
-/// for the notify hook: "Your reputation rose to 52 (+2: 1 used)".
-pub fn news(me: &Me, shown_until: u64) -> Vec<String> {
-    me.changes
-        .iter()
-        .filter(|c| c.ts > shown_until)
-        .map(|c| {
-            if c.delta == 0 {
-                format!("New {} 🐝", c.why.trim_start_matches("new "))
-            } else if c.delta > 0 {
-                format!(
-                    "Your reputation rose to {} (+{}: {})",
-                    c.reputation, c.delta, c.why
-                )
-            } else {
-                format!(
-                    "Your reputation fell to {} (−{}: {})",
-                    c.reputation,
-                    c.delta.unsigned_abs(),
-                    c.why
-                )
-            }
-        })
-        .collect()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -281,48 +255,5 @@ mod tests {
         // A day later, no arrow.
         assert_eq!(line(&a, &[], now + RECENT), "🐝 52 · 3 badges");
         assert_eq!(line(&me(0, Vec::new(), &[]), &[], now), "🐝 0");
-    }
-
-    #[test]
-    fn news_tells_each_change_once() {
-        let a = me(
-            52,
-            vec![
-                Change {
-                    ts: 10,
-                    reputation: 50,
-                    delta: 2,
-                    why: "2 useful (+1)".into(),
-                },
-                Change {
-                    ts: 20,
-                    reputation: 52,
-                    delta: 2,
-                    why: "1 used".into(),
-                },
-                Change {
-                    ts: 20,
-                    reputation: 52,
-                    delta: 0,
-                    why: "new badge: Pollinator".into(),
-                },
-                Change {
-                    ts: 30,
-                    reputation: 49,
-                    delta: -3,
-                    why: "1 challenged (−1 with a reason)".into(),
-                },
-            ],
-            &[],
-        );
-        assert_eq!(
-            news(&a, 10),
-            [
-                "Your reputation rose to 52 (+2: 1 used)",
-                "New badge: Pollinator 🐝",
-                "Your reputation fell to 49 (−3: 1 challenged (−1 with a reason))",
-            ]
-        );
-        assert!(news(&a, 30).is_empty());
     }
 }
