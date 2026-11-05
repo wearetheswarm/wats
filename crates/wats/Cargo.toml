@@ -21,10 +21,10 @@ ed25519-dalek = "=3.0.0"
 getrandom = "=0.4.3"
 hex = "=0.4.3"
 iroh = { version = "=1.4.1", default-features = false, features = ["metrics", "fast-apple-datapath", "tls-ring"] }
-iroh-blobs = "=0.103.1"
+iroh-blobs = "=0.104.0"
 # The verified chunks of a blob fetched without a store (blob repair,
 # src/node.rs): the version iroh-blobs uses.
-bao-tree = { version = "=0.16.1", default-features = false }
+bao-tree = { version = "=0.17.0", default-features = false }
 # The blob store's database, opened once before iroh-blobs does (which
 # hangs when it cannot): the version iroh-blobs uses.
 redb = "=4.4.0"
@@ -32,14 +32,14 @@ iroh-gossip = "=0.101.0"
 iroh-relay = { version = "=1.4.1", default-features = false }
 iroh-tickets = "=1.0.0"
 n0-future = "=0.3.2"
-rmcp = { version = "=3.5.1", features = ["server", "macros", "transport-io"] }
-rusqlite = { version = "=0.40.2", features = ["bundled"] }
+rmcp = { version = "=3.8.0", features = ["server", "macros", "transport-io"] }
+rusqlite = { version = "=0.41.1", features = ["bundled"] }
 schemars = "=1.2.3"
 serde = { version = "=1.0.229", features = ["derive"] }
 serde_json = "=1.0.154"
 serde_json_canonicalizer = "=0.4.1"
 thiserror = "=2.0.21"
-tokio = { version = "=1.53.3", features = ["full"] }
+tokio = { version = "=1.54.1", features = ["full"] }
 toml = { version = "=1.1.8", default-features = false, features = ["std", "serde", "parse"] }
 toml_edit = { version = "=0.25.17", default-features = false, features = ["parse", "display"] }
 tracing = "=0.1.44"
@@ -60,7 +60,7 @@ flate2 = { version = "=1.1.10", default-features = false, features = ["rust_back
 tar = { version = "=0.4.46", default-features = false }
 # The sealed inbox (src/inbox.rs, ADR 0015 §5): HPKE with X-Wing,
 # HKDF-SHA256 and ChaCha20-Poly1305.
-hpke = { version = "=0.14.1", default-features = false, features = ["alloc", "getrandom", "x25519", "mlkem", "chacha"] }
+hpke = { version = "=0.15.1", default-features = false, features = ["alloc", "getrandom", "x25519", "mlkem", "chacha"] }
 # The OS calls that need `unsafe` (this crate forbids it): whether SIGHUP
 # is inherited ignored (`nohup`), ADR 0031 §3.
 wats-sys = { path = "../wats-sys" }
@@ -74,7 +74,7 @@ nix = { version = "=0.31.3", default-features = false, features = ["signal"] }
 # A local relay server for the relay chaos test (tests/reconnect.rs). Never
 # a normal dependency: the shipped binary has no relay server.
 iroh-relay = { version = "=1.4.1", default-features = false, features = ["server"] }
-rmcp = { version = "=3.5.1", features = ["client", "transport-child-process"] }
+rmcp = { version = "=3.8.0", features = ["client", "transport-child-process"] }
 tempfile = "=3.27.0"
 
 # musl's allocator is slow under concurrency; static Linux builds use

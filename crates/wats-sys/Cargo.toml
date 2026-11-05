@@ -8,7 +8,7 @@ repository.workspace = true
 publish = false
 
 [target.'cfg(unix)'.dependencies]
-libc = "=0.2.190"
+libc = "=0.2.191"
 
 # The matrix product of semantic search (ADR 0053) where Accelerate is not
 # there: pure Rust, SIMD picked at run time (AVX-512 with `x86-v4` when the
