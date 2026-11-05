@@ -758,6 +758,41 @@ impl Drop for BlobHold {
 /// in the order the hand-offs happen (an import's temporary tag before its
 /// tag, a hold before its tag), so a blob handed from one to the next
 /// meanwhile is seen in one of them. Logs, at INFO, what the run deletes.
+/// Every [`crate::memwatch::EVERY`]: the resident size against the levels
+/// already reported, and how late the tick woke (see [`crate::memwatch`]).
+async fn memory_watch(weak: std::sync::Weak<Node>) {
+    use crate::memwatch::{EVERY, STALL, STALL_LOG_EVERY, Step, Watch, mib};
+    let mut watch = Watch::default();
+    let mut stall_logged: Option<std::time::Instant> = None;
+    loop {
+        let slept = std::time::Instant::now();
+        tokio::time::sleep(EVERY).await;
+        let late = slept.elapsed().saturating_sub(EVERY);
+        let Some(node) = weak.upgrade() else { break };
+        if late >= STALL && stall_logged.is_none_or(|t| t.elapsed() >= STALL_LOG_EVERY) {
+            stall_logged = Some(std::time::Instant::now());
+            warn!(
+                "the node was stalled for {} s (a tick woke late: blocked or starved); {}",
+                late.as_secs(),
+                node.load_line()
+            );
+        }
+        let Some(rss) = wats_sys::resident_bytes() else {
+            continue;
+        };
+        match watch.step(rss) {
+            Step::Quiet => {}
+            Step::Up { level } => warn!(
+                "memory: {} MiB resident (over {} MiB); {}",
+                mib(rss),
+                mib(level),
+                node.load_line()
+            ),
+            Step::Down { .. } => info!("memory: back to {} MiB resident", mib(rss)),
+        }
+    }
+}
+
 async fn blobs_to_keep(keep: &BlobKeep, store: &Store) -> Result<HashSet<Hash>> {
     let blobs = keep.blobs.get().context("blob store not open yet")?;
     let mut live = HashSet::new();
@@ -1413,6 +1448,9 @@ pub struct Node {
     challenger: crate::challenge::Challenger,
     /// `/wats` requests being served.
     in_flight: std::sync::atomic::AtomicUsize,
+    /// The MCP sessions attached to this node (set once its socket
+    /// listens), for the memory watch.
+    mcp_sessions: std::sync::OnceLock<crate::attach::Sessions>,
     /// What the blob collection keeps besides tags (see [`BlobKeep`]).
     blob_keep: Arc<BlobKeep>,
     /// Tokens of the agent runs in progress: an MCP session presenting one
@@ -1889,6 +1927,7 @@ impl Node {
                 reputable,
             ),
             in_flight: Default::default(),
+            mcp_sessions: Default::default(),
             blob_keep,
             runner_tokens: Default::default(),
             local_authors: Default::default(),
@@ -1946,6 +1985,14 @@ impl Node {
                         tokio::time::sleep(every).await;
                     }
                 }
+            }));
+        }
+        {
+            // The memory watch (see [`crate::memwatch`]).
+            let weak = Arc::downgrade(&node);
+            tokio::spawn(supervise("memory watch", move || {
+                let weak = weak.clone();
+                async move { memory_watch(weak).await }
             }));
         }
         if node.config.storage_max.is_some() {
@@ -3700,6 +3747,39 @@ impl Node {
 
     pub fn is_runner_token(&self, token: &str) -> bool {
         self.runner_run(token).is_some()
+    }
+
+    /// The MCP sessions attached to this node, counted for the memory
+    /// watch. Set once, when its socket listens.
+    pub fn set_mcp_sessions(&self, sessions: crate::attach::Sessions) {
+        let _ = self.mcp_sessions.set(sessions);
+    }
+
+    /// What the node is doing, for a memory or stall line: what could
+    /// explain a spike.
+    fn load_line(&self) -> String {
+        let tasks = tokio::runtime::Handle::try_current()
+            .map(|h| h.metrics().num_alive_tasks().to_string())
+            .unwrap_or_else(|_| "?".into());
+        let history = self
+            .config
+            .nets
+            .iter()
+            .filter(|net| self.history_running(net))
+            .cloned()
+            .collect::<Vec<_>>();
+        format!(
+            "mcp sessions {}, /wats requests in flight {}, tasks {tasks}, gossip neighbors {}, peers known {}, history pass {}",
+            self.mcp_sessions.get().map_or(0, |s| s.active()),
+            self.in_flight.load(std::sync::atomic::Ordering::Relaxed),
+            self.neighbors_of(PUBLIC_NET).len(),
+            self.known_peers().len(),
+            if history.is_empty() {
+                "none".to_string()
+            } else {
+                history.join(", ")
+            },
+        )
     }
 
     async fn measure_storage(&self) {

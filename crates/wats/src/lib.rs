@@ -37,6 +37,7 @@ pub mod knowledge;
 pub mod limits;
 pub mod mcp;
 pub mod me;
+pub mod memwatch;
 pub mod naming;
 pub mod node;
 pub mod nudge;

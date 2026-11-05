@@ -2599,6 +2599,14 @@ impl Node {
         Ok(())
     }
 
+    /// Whether a history pass of `net` is running now.
+    pub(super) fn history_running(&self, net: &str) -> bool {
+        self.history
+            .progress
+            .lock()
+            .is_ok_and(|p| p.get(net).is_some_and(|p| p.running))
+    }
+
     /// Whether a pending range of `net` remains.
     fn history_pending(&self, net: &str) -> bool {
         self.store
