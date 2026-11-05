@@ -136,6 +136,7 @@ pub fn serve(node: Arc<Node>) -> Result<Sessions> {
         std::fs::metadata(&path)?.uid()
     };
     let sessions = Sessions::default();
+    node.set_mcp_sessions(sessions.clone());
     let counter = sessions.clone();
     let listener = Arc::new(listener);
     let accept_loop = move || {

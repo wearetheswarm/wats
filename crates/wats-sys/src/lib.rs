@@ -279,8 +279,60 @@ pub fn hostname() -> Option<String> {
     }
 }
 
+/// This process's resident memory in bytes, for the node's memory watch:
+/// `VmRSS` of /proc/self/status on Linux, proc_pidinfo(PROC_PIDTASKINFO)
+/// on macOS (what `top` shows as RSS, without the compressed part).
+/// `None`: the read failed, or another system.
+pub fn resident_bytes() -> Option<u64> {
+    #[cfg(target_os = "linux")]
+    {
+        let status = std::fs::read_to_string("/proc/self/status").ok()?;
+        let line = status.lines().find(|l| l.starts_with("VmRSS:"))?;
+        let kib: u64 = line
+            .trim_start_matches("VmRSS:")
+            .trim()
+            .trim_end_matches("kB")
+            .trim()
+            .parse()
+            .ok()?;
+        kib.checked_mul(1024)
+    }
+    #[cfg(target_os = "macos")]
+    {
+        // SAFETY: `libc::proc_taskinfo` is a plain C struct, for which all
+        // zero bytes is a valid value. proc_pidinfo writes at most
+        // `buffersize` bytes, the struct's size, into it, and returns how
+        // many it wrote; it reads nothing else of ours.
+        let mut info: libc::proc_taskinfo = unsafe { std::mem::zeroed() };
+        let size = std::mem::size_of::<libc::proc_taskinfo>();
+        let wrote = unsafe {
+            libc::proc_pidinfo(
+                libc::getpid(),
+                libc::PROC_PIDTASKINFO,
+                0,
+                (&mut info as *mut libc::proc_taskinfo).cast(),
+                size as libc::c_int,
+            )
+        };
+        (wrote as usize == size).then_some(info.pti_resident_size)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn the_resident_size_reads() {
+        // A running test binary holds at least a megabyte, and far less
+        // than a terabyte.
+        let bytes = super::resident_bytes().unwrap();
+        assert!((1 << 20..1 << 40).contains(&bytes), "{bytes}");
+    }
+
     #[cfg(unix)]
     #[test]
     fn the_hostname_reads() {
