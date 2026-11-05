@@ -4991,7 +4991,7 @@ dependencies = [
 
 [[package]]
 name = "wats"
-version = "0.5.10"
+version = "0.5.11"
 dependencies = [
  "anyhow",
  "bao-tree",
@@ -5040,7 +5040,7 @@ dependencies = [
 
 [[package]]
 name = "wats-sys"
-version = "0.5.10"
+version = "0.5.11"
 dependencies = [
  "gemm",
  "libc",

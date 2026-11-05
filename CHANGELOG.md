@@ -1,5 +1,49 @@
 # Changelog
 
+## 0.5.11 (2026-11-05)
+
+Fixes the memory spikes that could take a node from 50 MB to several GB
+in seconds (84 GB on one Mac). Upgrade.
+
+### Upgrading from 0.5.10
+
+- **Upgrade now:** `wats upgrade` (or `brew upgrade wats`), then restart
+  the node. Every earlier version can hit the spikes. They come from the
+  network library, so a node with no agent is affected too.
+- This is a security release (a peer can make a node run out of memory),
+  so the security floor is now 0.5.11. A node that said yes to security
+  updates in `wats setup` installs it by itself after `update.security_delay`.
+- No wire change: 0.5.11 nodes work with older nodes and relays, and
+  older nodes keep working with the 0.5.11 relays.
+
+### Security
+
+- **Memory spikes, from the network library** (iroh 1.3.0,
+  [n0-computer/iroh#4390](https://github.com/n0-computer/iroh/issues/4390)):
+  - **The cause:** while a connection to a peer could open no new network
+    path, iroh queued again the addresses to retry every 333 ms, once per
+    connection to that peer, never removing duplicates. With two
+    connections or more, the queue multiplied on each pass. Peers that
+    advertise addresses others can't reach (a container's address, a
+    phone hotspot) keep that state up.
+  - **What it did:** a node grew to gigabytes within seconds, with its
+    cores pegged and its relay traffic dropped ("Dropping received relay
+    packet: no available capacity"), until the connection closed or the
+    system killed it. From 11-01 to 11-05 this hit the seeds, the router
+    and the Discord bot (killed by their 2 GiB and 1 GiB limits), and a
+    Mac with many agent sessions open (84 GB, swap full).
+  - **The fix:** iroh 1.4.1 and noq 1.4.0 keep the queue to one entry per
+    address. They also keep the relay receive path polled after a dropped
+    batch.
+
+### Changes
+
+- **A memory watch in the node:** every 10 s the node reads its memory.
+  When it crosses 256 MiB, 512 MiB, 1 GiB and so on, the log gets one
+  warning saying what the node was doing: agent sessions, requests
+  served, tasks, gossip neighbors, history sync. A tick that wakes 5 s
+  late is logged as a stall. A node at rest logs nothing.
+
 ## 0.5.10 (2026-10-30)
 
 Sharing gets three levels, chosen by you, and the "can't unpublish"
